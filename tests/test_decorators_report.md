@@ -2,121 +2,121 @@
 
 | 用例 (文件::函数名) | 修饰器 |
 | --- | --- |
-| benchmarks/patch/test_patch.py::test_output_tokens_assigned_with_metrics | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_output_tokens_not_assigned_without_metrics | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_output_tokens_assigned_multiple_metrics | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_output_tokens_with_audio_and_text | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_output_tokens_with_missing_num_tokens_out | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_output_tokens_initialization | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_mix_request_func_output_has_text_latency | (无) |
-| benchmarks/patch/test_patch.py::test_text_latency_initial_value | (无) |
-| benchmarks/patch/test_patch.py::test_text_latency_assigned_with_text_response | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_text_latency_updated_with_multiple_text_chunks | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_text_latency_with_only_audio_response | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_text_latency_not_affected_by_metrics | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_text_latency_mixed_modalities | @pytest.mark.asyncio |
-| benchmarks/patch/test_patch.py::test_text_latency_value_consistency | @pytest.mark.asyncio |
-| benchmarks/test_serve_cli.py::test_bench_serve_chat | @pytest.mark.core_model \| @pytest.mark.benchmark \| @hardware_test(res={"cuda": "L4"}, num_cards=3) \| @pytest.mark.parametrize("omni_server", test_params, indirect=True) |
-| comfyui/test_comfyui_integration.py::test_image_generation_node | @pytest.mark.asyncio \| @pytest.mark.parametrize(     "server_case,model,image_input",     [         pytest.param(             ServerCase(                 served_model="Tongyi-MAI/Z-Image-Turbo",                 stage_list=["diffusion"],                 stage_configs=[{"stage_type": "diffusion"}],                 outputs=[_build_diffusion_image_output_for_images_endpoint()],             ),             "Tongyi-MAI/Z-Image-Turbo",             False,             id="text-to-image-dalle-endpoint",         ),         pytest.param(             ServerCase(                 served_model="ByteDance-Seed/BAGEL-7B-MoT",                 stage_list=["diffusion"],                 stage_configs=[{"stage_type": "diffusion"}],                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],             ),             "ByteDance-Seed/BAGEL-7B-MoT",             False,             id="text-to-image-bagel-chat-endpoint",         ),         pytest.param(             ServerCase(                 served_model="Qwen/Qwen-Image-Edit",                 stage_list=["diffusion"],                 stage_configs=[{"stage_type": "diffusion"}],                 outputs=[_build_diffusion_image_output_for_images_endpoint()],             ),             "Qwen/Qwen-Image-Edit",             True,             id="image-to-image-dalle-endpoint",         ),         pytest.param(             ServerCase(                 served_model="ByteDance-Seed/BAGEL-7B-MoT",                 stage_list=["diffusion"],                 stage_configs=[{"stage_type": "diffusion"}],                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],             ),             "ByteDance-Seed/BAGEL-7B-MoT",             True,             id="image-to-image-bagel-chat-endpoint",         ),     ],     indirect=["server_case"], ) \| @pytest.mark.parametrize(     "sampling_case",     [         pytest.param(SamplingCase(kind=SamplingKind.IMAGE_NONE, sampling_params=None), id="no-sampling-params"),         pytest.param(             SamplingCase(kind=SamplingKind.IMAGE_DIFFUSION_SINGLE, sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS),             id="single-diffusion-sampling-params",         ),     ],     indirect=["sampling_case"], ) |
-| comfyui/test_comfyui_integration.py::test_understanding_node | @pytest.mark.asyncio \| @pytest.mark.parametrize(     "server_case",     [         pytest.param(             ServerCase(                 served_model="Qwen/Qwen2.5-Omni-7B",                 stage_list=[                     MagicMock(is_comprehension=True, model_stage="llm"),                     MagicMock(is_comprehension=False, model_stage="llm"),                     MagicMock(is_comprehension=False, model_stage="llm"),                 ],                 stage_configs=[                     {"stage_type": "llm"},                     {"stage_type": "llm"},                     {"stage_type": "llm"},                 ],                 outputs=[_build_audio_chat_output(), _build_text_output("Understanding response")],             ),             id="multimodal-understanding",         )     ],     indirect=["server_case"], ) \| @pytest.mark.parametrize(     "sampling_case",     [         pytest.param(SamplingCase(kind=SamplingKind.UNDERSTANDING_NONE, sampling_params=None), id="no-sampling-params"),         pytest.param(             SamplingCase(kind=SamplingKind.UNDERSTANDING_AR_LIST, sampling_params=AR_LIST_SAMPLING_PARAMS),             id="ar-sampling-params-list",         ),     ],     indirect=["sampling_case"], ) |
-| comfyui/test_comfyui_integration.py::test_tts_nodes | @pytest.mark.asyncio \| @pytest.mark.parametrize(     "server_case,node_cls,call_kwargs",     [         pytest.param(             ServerCase(                 served_model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",                 stage_list=["llm"],                 stage_configs=[{"stage_type": "llm"}],                 outputs=[_build_audio_speech_output()],             ),             VLLMOmniTTS,             {                 "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",                 "input": "Hello from TTS test",                 "voice": "Vivian",                 "response_format": "wav",                 "speed": 1.0,                 "model_specific_params": None,             },             id="tts",         ),         pytest.param(             ServerCase(                 served_model="Qwen/Qwen3-TTS-12Hz-1.7B-Base",                 stage_list=["llm"],                 stage_configs=[{"stage_type": "llm"}],                 outputs=[_build_audio_speech_output()],             ),             VLLMOmniVoiceClone,             {                 "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",                 "input": "Hello from voice clone test",                 "voice": "Vivian",                 "response_format": "wav",                 "speed": 1.0,                 "ref_audio": {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000},                 "ref_text": "Reference transcript",                 "x_vector_only_mode": False,                 "model_specific_params": None,             },             id="tts-voice-clone",         ),     ],     indirect=["server_case"], ) \| @pytest.mark.parametrize(     "sampling_case",     [         pytest.param(SamplingCase(kind=SamplingKind.TTS_NONE, sampling_params=None), id="no-sampling-params"),         pytest.param(             SamplingCase(kind=SamplingKind.TTS_DIFFUSION_SINGLE, sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS),             id="single-diffusion-sampling-params",         ),     ],     indirect=["sampling_case"], ) |
-| diffusion/attention/test_attention_sp.py::test_sequence_parallel | @pytest.mark.parametrize(     "test_model_cls",     [         TestMultiLayerAttentionModel,     ], ) \| @pytest.mark.parametrize("ulysses_degree", [2]) \| @pytest.mark.parametrize("ring_degree", [2]) \| @pytest.mark.parametrize("batch_size", [2]) \| @pytest.mark.parametrize("seq_len", [16]) \| @pytest.mark.parametrize("num_heads", [8]) \| @pytest.mark.parametrize("head_size", [8]) \| @pytest.mark.parametrize("causal", [False]) \| @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16]) \| @pytest.mark.parametrize("use_sync", [False]) \| @pytest.mark.parametrize("dynamic", [False]) \| @pytest.mark.parametrize("use_compile", [False]) \| @pytest.mark.parametrize("attn_backend", ["sdpa", "flash_attn"]) |
+| benchmarks/patch/test_patch.py::test_output_tokens_assigned_with_metrics | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_output_tokens_not_assigned_without_metrics | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_output_tokens_assigned_multiple_metrics | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_output_tokens_with_audio_and_text | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_output_tokens_with_missing_num_tokens_out | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_output_tokens_initialization | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_mix_request_func_output_has_text_latency | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_text_latency_initial_value | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_text_latency_assigned_with_text_response | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_text_latency_updated_with_multiple_text_chunks | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_text_latency_with_only_audio_response | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_text_latency_not_affected_by_metrics | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_text_latency_mixed_modalities | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/patch/test_patch.py::test_text_latency_value_consistency | @pytest.mark.core_model \| @pytest.mark.benchmark \| @pytest.mark.cpu |
+| benchmarks/test_serve_cli.py::test_bench_serve_chat | @pytest.mark.core_model \| @pytest.mark.benchmark \| @hardware_test(res={"cuda": "L4"}, num_cards=3) |
+| comfyui/test_comfyui_integration.py::test_image_generation_node | (无) |
+| comfyui/test_comfyui_integration.py::test_understanding_node | (无) |
+| comfyui/test_comfyui_integration.py::test_tts_nodes | (无) |
+| diffusion/attention/test_attention_sp.py::test_sequence_parallel | (无) |
 | diffusion/attention/test_flash_attn.py::test_padding_equivalence | @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU") |
 | diffusion/attention/test_flash_attn.py::test_fa_vs_sdpa | @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU") |
-| diffusion/cache/test_cache_backends.py::test_init_with_dict | (无) |
-| diffusion/cache/test_cache_backends.py::test_init_with_config_object | (无) |
-| diffusion/cache/test_cache_backends.py::test_enable_single_transformer | @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit") |
-| diffusion/cache/test_cache_backends.py::test_refresh | @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit") |
-| diffusion/cache/test_cache_backends.py::test_init | (无) |
-| diffusion/cache/test_cache_backends.py::test_enable | @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook") |
-| diffusion/cache/test_cache_backends.py::test_enable_with_coefficients | @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook") |
-| diffusion/cache/test_cache_backends.py::test_refresh | @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook") |
-| diffusion/cache/test_cache_backends.py::test_get_cache_backend_none | (无) |
-| diffusion/cache/test_cache_backends.py::test_get_cache_backend_cache_dit | (无) |
-| diffusion/cache/test_cache_backends.py::test_get_cache_backend_tea_cache | (无) |
-| diffusion/cache/test_cache_backends.py::test_get_cache_backend_invalid | (无) |
-| diffusion/distributed/test_cfg_parallel.py::test_predict_noise_maybe_with_cfg | @pytest.mark.parametrize("cfg_parallel_size", [2]) \| @pytest.mark.parametrize("dtype", [torch.bfloat16]) \| @pytest.mark.parametrize("batch_size", [2]) \| @pytest.mark.parametrize("cfg_normalize", [False, True]) |
-| diffusion/distributed/test_cfg_parallel.py::test_predict_noise_without_cfg | @pytest.mark.parametrize("dtype", [torch.bfloat16]) |
-| diffusion/distributed/test_comm.py::test_4d_identity | @pytest.mark.parametrize("world_size", [2, 4]) \| @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16]) \| @pytest.mark.parametrize("batch_size", [2]) \| @pytest.mark.parametrize("seq_len_per_rank", [8]) \| @pytest.mark.parametrize("num_heads", [8]) \| @pytest.mark.parametrize("head_size", [32]) \| @pytest.mark.parametrize("use_sync", [False, True]) |
-| diffusion/distributed/test_comm.py::test_5d_identity | @pytest.mark.parametrize("world_size", [2, 4]) \| @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16]) \| @pytest.mark.parametrize("batch_size", [2]) \| @pytest.mark.parametrize("seq_len_per_rank", [8]) \| @pytest.mark.parametrize("num_heads", [8]) \| @pytest.mark.parametrize("head_size", [32]) \| @pytest.mark.parametrize("use_sync", [False, True]) |
-| diffusion/distributed/test_comm.py::test_ring_p2p | @pytest.mark.parametrize("world_size", [2, 4]) \| @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16]) \| @pytest.mark.parametrize("batch_size", [2]) \| @pytest.mark.parametrize("num_heads", [8]) \| @pytest.mark.parametrize("head_size", [128]) |
+| diffusion/cache/test_cache_backends.py::test_init_with_dict | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/cache/test_cache_backends.py::test_init_with_config_object | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/cache/test_cache_backends.py::test_enable_single_transformer | @pytest.mark.core_model \| @pytest.mark.cpu \| @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit") |
+| diffusion/cache/test_cache_backends.py::test_refresh | @pytest.mark.core_model \| @pytest.mark.cpu \| @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit") |
+| diffusion/cache/test_cache_backends.py::test_init | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/cache/test_cache_backends.py::test_enable | @pytest.mark.core_model \| @pytest.mark.cpu \| @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook") |
+| diffusion/cache/test_cache_backends.py::test_enable_with_coefficients | @pytest.mark.core_model \| @pytest.mark.cpu \| @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook") |
+| diffusion/cache/test_cache_backends.py::test_refresh | @pytest.mark.core_model \| @pytest.mark.cpu \| @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook") |
+| diffusion/cache/test_cache_backends.py::test_get_cache_backend_none | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/cache/test_cache_backends.py::test_get_cache_backend_cache_dit | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/cache/test_cache_backends.py::test_get_cache_backend_tea_cache | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/cache/test_cache_backends.py::test_get_cache_backend_invalid | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/distributed/test_cfg_parallel.py::test_predict_noise_maybe_with_cfg | (无) |
+| diffusion/distributed/test_cfg_parallel.py::test_predict_noise_without_cfg | (无) |
+| diffusion/distributed/test_comm.py::test_4d_identity | (无) |
+| diffusion/distributed/test_comm.py::test_5d_identity | (无) |
+| diffusion/distributed/test_comm.py::test_ring_p2p | (无) |
 | diffusion/distributed/test_distributed_vae_executor.py::test_balance_tasks | (无) |
 | diffusion/distributed/test_distributed_vae_executor.py::test_compute_global_padding_shape | (无) |
 | diffusion/distributed/test_distributed_vae_executor.py::test_pack_and_unpack | (无) |
 | diffusion/distributed/test_distributed_vae_executor.py::test_is_distributed_enabled | (无) |
-| diffusion/distributed/test_hsdp.py::test_default_values | (无) |
-| diffusion/distributed/test_hsdp.py::test_custom_values | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_disabled_by_default | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_auto_shard_size | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_auto_shard_size_fails_standalone | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_standalone_mode | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_standalone_with_replicate | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_with_replicate | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_explicit_shard_size_valid | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_explicit_shard_size_invalid | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_replicate_size_exceeds_world_size | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_combined_world_size | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_standalone_world_size | (无) |
-| diffusion/distributed/test_hsdp.py::test_hsdp_cannot_use_with_tp | (无) |
-| diffusion/distributed/test_hsdp.py::test_from_dict_with_hsdp | (无) |
-| diffusion/distributed/test_hsdp.py::test_condition_matches_blocks | (无) |
-| diffusion/distributed/test_hsdp.py::test_model_with_shard_conditions | (无) |
-| diffusion/distributed/test_parallel_state_sp_groups.py::test_set_seq_parallel_pg_uses_explicit_sp_groups | @pytest.mark.cpu \| @pytest.mark.parametrize(     "rank, expected_ulysses, expected_ring",     [         (0, [0, 2], [0]),         (1, [1, 3], [1]),         (2, [0, 2], [2]),         (3, [1, 3], [3]),     ], ) |
-| diffusion/distributed/test_parallel_state_sp_groups.py::test_set_seq_parallel_pg_validates_sp_group_ranks | @pytest.mark.cpu |
-| diffusion/distributed/test_sp_plan_hooks.py::test_valid_simple_plan | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_valid_partial_input_plan | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_invalid_plan_type | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_invalid_module_key_type | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_invalid_output_index_without_split_output | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_model_with_sp_plan | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_model_without_sp_plan | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_sequence_parallel_input_repr | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_sequence_parallel_output_repr | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_sequence_parallel_partial_input_repr | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_sequence_parallel_partial_input_with_int_source | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_get_parameter_from_kwargs | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_get_parameter_from_args | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_parameter_caching | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_root_module | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_simple_submodule | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_nested_submodule | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_module_list_by_index | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_wildcard_modulelist | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_module_dict | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_invalid_submodule_raises | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_multiple_wildcards_raises | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_plan_validation_before_apply | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_valid_plan_structure_for_model | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_zimage_transformer_sp_plan | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_qwen_image_transformer_sp_plan | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_shard_tensor_simulation | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_partial_shard_simulation | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_gather_tensor_simulation | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_padding_simulation | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_unwrap_simple_module | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_unwrap_sequential_single | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_unwrap_nested_wrapper | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_hook_init | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_hook_initialize | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_hook_init_single_output | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_hook_init_multiple_outputs | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_resolve_int_source | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_resolve_string_source_from_tensor | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_resolve_text_len_caching | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_input_hook_name | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_output_hook_name | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_apply_sp_registers_hooks | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_remove_sp_removes_hooks | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_apply_sp_with_wildcard | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_skip_shard_on_wrong_dims | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_config_defaults_invalid | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_config_ulysses_only | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_config_ring_only | (无) |
-| diffusion/distributed/test_sp_plan_hooks.py::test_config_hybrid | (无) |
+| diffusion/distributed/test_hsdp.py::test_default_values | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_custom_values | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_disabled_by_default | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_auto_shard_size | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_auto_shard_size_fails_standalone | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_standalone_mode | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_standalone_with_replicate | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_with_replicate | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_explicit_shard_size_valid | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_explicit_shard_size_invalid | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_replicate_size_exceeds_world_size | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_combined_world_size | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_standalone_world_size | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_hsdp_cannot_use_with_tp | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_from_dict_with_hsdp | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_condition_matches_blocks | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_hsdp.py::test_model_with_shard_conditions | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_parallel_state_sp_groups.py::test_set_seq_parallel_pg_uses_explicit_sp_groups | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_parallel_state_sp_groups.py::test_set_seq_parallel_pg_validates_sp_group_ranks | @pytest.mark.diffusion \| @pytest.mark.parallel \| @pytest.mark.cpu |
+| diffusion/distributed/test_sp_plan_hooks.py::test_valid_simple_plan | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_valid_partial_input_plan | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_invalid_plan_type | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_invalid_module_key_type | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_invalid_output_index_without_split_output | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_model_with_sp_plan | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_model_without_sp_plan | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_sequence_parallel_input_repr | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_sequence_parallel_output_repr | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_sequence_parallel_partial_input_repr | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_sequence_parallel_partial_input_with_int_source | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_get_parameter_from_kwargs | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_get_parameter_from_args | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_parameter_caching | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_root_module | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_simple_submodule | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_nested_submodule | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_module_list_by_index | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_wildcard_modulelist | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_module_dict | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_invalid_submodule_raises | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_multiple_wildcards_raises | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_plan_validation_before_apply | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_valid_plan_structure_for_model | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_zimage_transformer_sp_plan | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_qwen_image_transformer_sp_plan | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_shard_tensor_simulation | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_partial_shard_simulation | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_gather_tensor_simulation | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_padding_simulation | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_unwrap_simple_module | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_unwrap_sequential_single | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_unwrap_nested_wrapper | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_hook_init | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_hook_initialize | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_hook_init_single_output | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_hook_init_multiple_outputs | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_resolve_int_source | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_resolve_string_source_from_tensor | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_resolve_text_len_caching | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_input_hook_name | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_output_hook_name | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_apply_sp_registers_hooks | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_remove_sp_removes_hooks | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_apply_sp_with_wildcard | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_skip_shard_on_wrong_dims | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_config_defaults_invalid | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_config_ulysses_only | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_config_ring_only | @pytest.mark.diffusion \| @pytest.mark.parallel |
+| diffusion/distributed/test_sp_plan_hooks.py::test_config_hybrid | @pytest.mark.diffusion \| @pytest.mark.parallel |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_spatial_scale_factor_uses_block_out_channels_len_minus_1 | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_spatial_scale_factor_defaults_to_8_on_missing_or_empty | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_spatial_scale_factor_defaults_to_8_on_exception | (无) |
-| diffusion/distributed/test_vae_patch_parallel.py::test_factor_pp_grid | @pytest.mark.parametrize(     ("pp_size", "expected"),     [         (0, (1, 1)),         (1, (1, 1)),         (2, (1, 2)),         (3, (1, 3)),         (4, (2, 2)),         (6, (2, 3)),         (8, (2, 4)),         (12, (3, 4)),         (16, (4, 4)),     ], ) |
+| diffusion/distributed/test_vae_patch_parallel.py::test_factor_pp_grid | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_world_rank_pp_size | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_out_channels_defaults_to_3 | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_out_channels_reads_config | (无) |
@@ -125,21 +125,21 @@
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_tiling_params_returns_none_if_missing | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_tiling_params_parses_types | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_distributed_tiled_decode_stitches_tiles | (无) |
-| diffusion/lora/test_base_linear.py::test_diffusion_base_linear_apply_multi_slice | (无) |
-| diffusion/lora/test_base_linear.py::test_diffusion_base_linear_reset_lora_disables_fast_path | (无) |
-| diffusion/lora/test_base_linear.py::test_diffusion_base_linear_apply_respects_inactive_slices | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_supported_modules_are_stable_with_wrapped_layers | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_replace_layers_does_not_rewrap_base_layer | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_replaces_packed_layer_when_targeting_sublayers | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_activates_fused_lora_on_packed_layer | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_activates_packed_lora_from_sublayers | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_evicts_lru_adapter_when_cache_full | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_does_not_evict_pinned_adapter | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_warns_when_all_adapters_pinned | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_applies_multiple_scales_correctly | (无) |
-| diffusion/lora/test_lora_manager.py::test_lora_manager_scales_correctly_with_rank_changes | (无) |
-| diffusion/lora/test_lora_manager.py::test_scale_keys_are_rounded | (无) |
-| diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_resolve_cfg_layout | @pytest.mark.parametrize(     ("cfg", "cfg_img", "has_image_conditions", "expected_cfg_mult", "expected_cfg_img"),     [         (1.0, 1.0, False, 1, 1.0),         (7.5, 1.0, False, 2, 1.0),         (7.5, 8.0, False, 2, 1.0),         (7.5, 1.5, True, 3, 1.5),     ], ) |
+| diffusion/lora/test_base_linear.py::test_diffusion_base_linear_apply_multi_slice | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_base_linear.py::test_diffusion_base_linear_reset_lora_disables_fast_path | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_base_linear.py::test_diffusion_base_linear_apply_respects_inactive_slices | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_supported_modules_are_stable_with_wrapped_layers | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_replace_layers_does_not_rewrap_base_layer | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_replaces_packed_layer_when_targeting_sublayers | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_activates_fused_lora_on_packed_layer | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_activates_packed_lora_from_sublayers | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_evicts_lru_adapter_when_cache_full | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_does_not_evict_pinned_adapter | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_warns_when_all_adapters_pinned | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_applies_multiple_scales_correctly | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_lora_manager_scales_correctly_with_rank_changes | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/lora/test_lora_manager.py::test_scale_keys_are_rounded | @pytest.mark.core_model \| @pytest.mark.cpu |
+| diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_resolve_cfg_layout | (无) |
 | diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_build_captions_ignores_image_cfg_without_image_conditions | (无) |
 | diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_build_captions_enables_three_way_cfg_when_image_conditions_exist | (无) |
 | diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_decoding_non_parallel_uses_cfg_mult_for_sampling_and_duplication | (无) |
@@ -159,67 +159,67 @@
 | diffusion/quantization/test_fp8_config.py::test_quantization_dict_not_mutated | (无) |
 | diffusion/quantization/test_fp8_config.py::test_quantization_conflicting_methods_warning | (无) |
 | diffusion/quantization/test_fp8_config.py::test_fp8_delegates_to_vllm_config | (无) |
-| diffusion/test_diffusers_loader.py::test_strict_check_only_validates_source_prefix_parameters | (无) |
-| diffusion/test_diffusers_loader.py::test_strict_check_raises_when_source_parameters_are_missing | (无) |
-| diffusion/test_diffusers_loader.py::test_empty_source_prefix_keeps_full_model_strict_check | (无) |
-| diffusion/test_diffusion_model_runner.py::test_execute_model_skips_cache_summary_without_active_cache_backend | (无) |
-| diffusion/test_diffusion_model_runner.py::test_execute_model_emits_cache_summary_with_active_cache_dit_backend | (无) |
-| diffusion/test_diffusion_model_runner.py::test_load_model_clears_cache_backend_for_unsupported_pipeline | (无) |
-| diffusion/test_diffusion_worker.py::test_load_weights_calls_pipeline | (无) |
-| diffusion/test_diffusion_worker.py::test_load_weights_empty_iterable | (无) |
-| diffusion/test_diffusion_worker.py::test_sleep_level_1 | (无) |
-| diffusion/test_diffusion_worker.py::test_sleep_level_2 | (无) |
-| diffusion/test_diffusion_worker.py::test_sleep_memory_freed_validation | (无) |
-| diffusion/test_diffusion_worker.py::test_sleep_falls_back_to_device_memory_when_nvml_unavailable | (无) |
-| diffusion/test_diffusion_worker.py::test_wake_up_without_buffers | (无) |
-| diffusion/test_diffusion_worker.py::test_wake_up_with_buffers | (无) |
-| diffusion/test_diffusion_worker.py::test_wake_up_partial_buffer_restore | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_results_are_correctly_routed | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_results_are_correctly_routed | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_results_are_correctly_routed | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_serial_add_req_returns_correct_result | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_serial_add_req_multiple_sequential | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_serial_collective_rpc_single_rank | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_serial_collective_rpc_all_ranks | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_serial_add_req_then_collective_rpc | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_serial_add_req_error_propagation | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_serial_collective_rpc_error_propagation | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_collective_rpc_closed_executor_raises | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_rpc_times_out_when_lock_held_directly | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_rpc_times_out_when_add_req_stalled_on_worker | (无) |
-| diffusion/test_multiproc_executor_concurrency.py::test_rpc_without_timeout_still_waits_for_lock | (无) |
-| diffusion/test_worker_wrapper_base.py::test_basic_initialization | (无) |
-| diffusion/test_worker_wrapper_base.py::test_prepare_worker_class_without_extension | (无) |
-| diffusion/test_worker_wrapper_base.py::test_prepare_worker_class_with_extension_class | (无) |
-| diffusion/test_worker_wrapper_base.py::test_prepare_worker_class_with_extension_string | (无) |
-| diffusion/test_worker_wrapper_base.py::test_generate_delegation | (无) |
-| diffusion/test_worker_wrapper_base.py::test_execute_model_delegation | (无) |
-| diffusion/test_worker_wrapper_base.py::test_load_weights_delegation | (无) |
-| diffusion/test_worker_wrapper_base.py::test_sleep_delegation | (无) |
-| diffusion/test_worker_wrapper_base.py::test_wake_up_delegation | (无) |
-| diffusion/test_worker_wrapper_base.py::test_shutdown_delegation | (无) |
-| diffusion/test_worker_wrapper_base.py::test_execute_method_success | (无) |
-| diffusion/test_worker_wrapper_base.py::test_execute_method_with_no_args | (无) |
-| diffusion/test_worker_wrapper_base.py::test_execute_method_error | (无) |
-| diffusion/test_worker_wrapper_base.py::test_execute_method_invalid_type | (无) |
-| diffusion/test_worker_wrapper_base.py::test_getattr_delegation | (无) |
-| diffusion/test_worker_wrapper_base.py::test_getattr_method_access | (无) |
-| diffusion/test_worker_wrapper_base.py::test_getattr_missing_attribute | (无) |
-| diffusion/test_worker_wrapper_base.py::test_extension_conflict_warning | (无) |
-| diffusion/test_worker_wrapper_base.py::test_multiple_extensions_same_class | (无) |
-| diffusion/test_worker_wrapper_base.py::test_re_init_pipeline_basic | (无) |
-| diffusion/test_worker_wrapper_base.py::test_re_init_pipeline_cleanup | (无) |
-| diffusion/test_worker_wrapper_base.py::test_re_init_pipeline_none_pipeline | (无) |
-| diffusion/test_worker_wrapper_base.py::test_custom_pipeline_args_initialization | (无) |
-| diffusion/test_worker_wrapper_base.py::test_custom_pipeline_with_explicit_extension | (无) |
-| diffusion/test_worker_wrapper_base.py::test_re_init_pipeline_multiple_calls | (无) |
-| distributed/omni_connectors/test_adapter_and_flow.py::test_send_success | (无) |
-| distributed/omni_connectors/test_adapter_and_flow.py::test_send_fail | (无) |
-| distributed/omni_connectors/test_adapter_and_flow.py::test_recv_success | (无) |
-| distributed/omni_connectors/test_adapter_and_flow.py::test_recv_no_connector | (无) |
-| distributed/omni_connectors/test_adapter_and_flow.py::test_shm_connector_flow | (无) |
-| distributed/omni_connectors/test_adapter_and_flow.py::test_get_connectors_for_stage | (无) |
-| distributed/omni_connectors/test_adapter_and_flow.py::test_recv_with_missing_metadata | (无) |
+| diffusion/test_diffusers_loader.py::test_strict_check_only_validates_source_prefix_parameters | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusers_loader.py::test_strict_check_raises_when_source_parameters_are_missing | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusers_loader.py::test_empty_source_prefix_keeps_full_model_strict_check | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_model_runner.py::test_execute_model_skips_cache_summary_without_active_cache_backend | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_model_runner.py::test_execute_model_emits_cache_summary_with_active_cache_dit_backend | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_model_runner.py::test_load_model_clears_cache_backend_for_unsupported_pipeline | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_load_weights_calls_pipeline | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_load_weights_empty_iterable | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_sleep_level_1 | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_sleep_level_2 | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_sleep_memory_freed_validation | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_sleep_falls_back_to_device_memory_when_nvml_unavailable | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_wake_up_without_buffers | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_wake_up_with_buffers | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_diffusion_worker.py::test_wake_up_partial_buffer_restore | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_multiproc_executor_concurrency.py::test_results_are_correctly_routed | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_results_are_correctly_routed | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_results_are_correctly_routed | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_serial_add_req_returns_correct_result | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_serial_add_req_multiple_sequential | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_serial_collective_rpc_single_rank | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_serial_collective_rpc_all_ranks | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_serial_add_req_then_collective_rpc | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_serial_add_req_error_propagation | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_serial_collective_rpc_error_propagation | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_collective_rpc_closed_executor_raises | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_rpc_times_out_when_lock_held_directly | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_rpc_times_out_when_add_req_stalled_on_worker | @pytest.mark.diffusion |
+| diffusion/test_multiproc_executor_concurrency.py::test_rpc_without_timeout_still_waits_for_lock | @pytest.mark.diffusion |
+| diffusion/test_worker_wrapper_base.py::test_basic_initialization | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_prepare_worker_class_without_extension | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_prepare_worker_class_with_extension_class | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_prepare_worker_class_with_extension_string | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_generate_delegation | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_execute_model_delegation | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_load_weights_delegation | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_sleep_delegation | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_wake_up_delegation | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_shutdown_delegation | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_execute_method_success | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_execute_method_with_no_args | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_execute_method_error | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_execute_method_invalid_type | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_getattr_delegation | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_getattr_method_access | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_getattr_missing_attribute | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_extension_conflict_warning | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_multiple_extensions_same_class | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_re_init_pipeline_basic | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_re_init_pipeline_cleanup | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_re_init_pipeline_none_pipeline | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_custom_pipeline_args_initialization | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_custom_pipeline_with_explicit_extension | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| diffusion/test_worker_wrapper_base.py::test_re_init_pipeline_multiple_calls | @pytest.mark.core_model \| @pytest.mark.diffusion \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_adapter_and_flow.py::test_send_success | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_adapter_and_flow.py::test_send_fail | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_adapter_and_flow.py::test_recv_success | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_adapter_and_flow.py::test_recv_no_connector | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_adapter_and_flow.py::test_shm_connector_flow | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_adapter_and_flow.py::test_get_connectors_for_stage | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_adapter_and_flow.py::test_recv_with_missing_metadata | @pytest.mark.core_model \| @pytest.mark.cpu |
 | distributed/omni_connectors/test_basic_connectors.py::test_basic_serialization | (无) |
 | distributed/omni_connectors/test_basic_connectors.py::test_tensor_serialization | (无) |
 | distributed/omni_connectors/test_basic_connectors.py::test_ndarray_serialization | (无) |
@@ -228,221 +228,221 @@
 | distributed/omni_connectors/test_basic_connectors.py::test_put_get_inline | (无) |
 | distributed/omni_connectors/test_basic_connectors.py::test_put_get_shm | (无) |
 | distributed/omni_connectors/test_basic_connectors.py::test_get_invalid_metadata | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_create_connector_config_parsing | @pytest.mark.parametrize(     ("raw_cfg", "expected_name", "expected_extra"),     [         (None, "SharedMemoryConnector", {}),         (SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}), "YuanrongConnector", {"k": "v"}),     ], ) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_load_poll | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_save_async | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_update_request_payload | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_process_and_restore_queues | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_postprocess_scheduler_output | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_clears_all_state | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_infers_external_id | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_idempotent | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_request_id_reuse_not_polluted | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_preserves_pending_save | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_only_affects_target_request | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_after_poll_flow | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_generation_scheduler_calls_cleanup_on_finished | (无) |
-| distributed/omni_connectors/test_kv_flow.py::test_manager_extraction | (无) |
-| distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_tuple_layout | (无) |
-| distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_mismatched_kv_block_counts | (无) |
-| distributed/omni_connectors/test_kv_flow.py::test_normalize_layer_kv_rejects_invalid_inputs | @pytest.mark.parametrize(     "invalid_case",     ["invalid_stacked_shape", "invalid_tuple_length", "non_tensor_entries"], ) |
-| distributed/omni_connectors/test_kv_flow.py::test_manager_reception | (无) |
-| distributed/omni_connectors/test_kv_flow.py::test_integration_flow | (无) |
-| distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_no_connector | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_basic_alloc_free | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_alignment | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_exhaustion_and_recovery | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_thread_safety | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_double_free_exact_is_safe | @pytest.mark.slow |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_double_free_after_merge_is_safe | @pytest.mark.slow |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_partial_overlap_raises_corruption | @pytest.mark.slow |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_merge_adjacent_blocks | @pytest.mark.slow |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_fragmentation_and_defrag | @pytest.mark.slow |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_tensor_view | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_context_manager_releases_buffer | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_initialization | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_put_tensor_bytes_object | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_cleanup_releases_buffer | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_pool_exhaustion_and_recovery | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_tensor_e2e | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_bytes_e2e | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_object_e2e | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_zero_copy_e2e | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_large_tensor_100mb | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_mixed_types_sequential | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_concurrent_put | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_auto_cleanup | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_close_releases_resources | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_context_manager | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_double_close_safe | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_gpu_pool_init | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_gpu_pool_put_cpu_and_gpu_tensor | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_gpu_e2e_transfer | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_concurrent_put_get_integrity | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_concurrent_put_get_threaded_both_sides | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_small_tensor_1_element | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_empty_bytes_rejected | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_large_tensor_500mb | (无) |
-| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_rapid_alloc_free_cycle | (无) |
-| distributed/omni_connectors/test_omni_connector_configs.py::test_load_qwen_yaml_configs | @pytest.mark.skipif(len(config_files) == 0, reason="No config files found or directory missing") \| @pytest.mark.parametrize("yaml_file", config_files, ids=lambda p: p.name) |
-| engine/test_async_omni_engine_abort.py::test_abort | @pytest.mark.core_model \| @pytest.mark.omni \| @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1) \| @pytest.mark.asyncio |
-| entrypoints/openai_api/test_image_server.py::test_parse_size_valid | (无) |
-| entrypoints/openai_api/test_image_server.py::test_parse_size_invalid | (无) |
-| entrypoints/openai_api/test_image_server.py::test_parse_size_negative | (无) |
-| entrypoints/openai_api/test_image_server.py::test_parse_size_edge_cases | (无) |
-| entrypoints/openai_api/test_image_server.py::test_encode_image_base64 | (无) |
-| entrypoints/openai_api/test_image_server.py::test_client | @pytest.fixture |
-| entrypoints/openai_api/test_image_server.py::test_health_endpoint | (无) |
-| entrypoints/openai_api/test_image_server.py::test_health_endpoint_no_engine | (无) |
-| entrypoints/openai_api/test_image_server.py::test_models_endpoint | (无) |
-| entrypoints/openai_api/test_image_server.py::test_models_endpoint_no_engine | (无) |
-| entrypoints/openai_api/test_image_server.py::test_generate_single_image | (无) |
-| entrypoints/openai_api/test_image_server.py::test_generate_images_async_omni_sampling_params | (无) |
-| entrypoints/openai_api/test_image_server.py::test_generate_multiple_images | (无) |
-| entrypoints/openai_api/test_image_server.py::test_with_negative_prompt | (无) |
-| entrypoints/openai_api/test_image_server.py::test_with_seed | (无) |
-| entrypoints/openai_api/test_image_server.py::test_with_seed_zero | (无) |
-| entrypoints/openai_api/test_image_server.py::test_with_custom_parameters | (无) |
-| entrypoints/openai_api/test_image_server.py::test_invalid_size | (无) |
-| entrypoints/openai_api/test_image_server.py::test_invalid_size_parse_error | (无) |
-| entrypoints/openai_api/test_image_server.py::test_missing_prompt | (无) |
-| entrypoints/openai_api/test_image_server.py::test_invalid_n_parameter | (无) |
-| entrypoints/openai_api/test_image_server.py::test_url_response_format_not_supported | (无) |
-| entrypoints/openai_api/test_image_server.py::test_model_not_loaded | (无) |
-| entrypoints/openai_api/test_image_server.py::test_different_image_sizes | (无) |
-| entrypoints/openai_api/test_image_server.py::test_parameter_validation | (无) |
-| entrypoints/openai_api/test_image_server.py::test_parameters_passed_through | (无) |
-| entrypoints/openai_api/test_image_server.py::test_model_field_omitted_works | (无) |
-| entrypoints/openai_api/test_image_server.py::test_image_edit_images_processing | (无) |
-| entrypoints/openai_api/test_image_server.py::test_image_edit_parameter_pass | (无) |
-| entrypoints/openai_api/test_image_server.py::test_image_edit_parameter_default | (无) |
-| entrypoints/openai_api/test_image_server.py::test_image_edit_parameter_default_single_stage | (无) |
-| entrypoints/openai_api/test_image_server.py::test_image_edit_compression_jpeg | (无) |
-| entrypoints/openai_api/test_image_server.py::test_image_edit_compression_png | (无) |
-| entrypoints/openai_api/test_image_server.py::test_image_edit_with_seed_zero | (无) |
-| entrypoints/openai_api/test_image_server.py::test_image_edit_with_seed_zero_single_stage | (无) |
-| entrypoints/openai_api/test_serving_chat_metrics.py::test_omni_chat_completion_response_metrics | (无) |
-| entrypoints/openai_api/test_serving_chat_metrics.py::test_omni_chat_completion_stream_response_metrics | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_openai_sampling_fields_contains_expected_fields | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_preserves_yaml_defaults_when_no_request_params | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_temperature_overrides_yaml_default | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_top_p_overrides_yaml_default | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_max_tokens_overrides_yaml_default | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_max_tokens_uses_yaml_default_when_not_specified | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_seed_overrides_yaml_default | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_frequency_penalty_overrides | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_presence_penalty_overrides | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_non_comprehension_stages_use_cloned_defaults | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_multiple_params_override_together | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_apply_request_overrides_clones_params | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_apply_request_overrides_preserves_defaults | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_apply_request_overrides_applies_values | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_finds_first_stage | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_finds_second_stage | (无) |
-| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_raises_when_not_found | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_app | @pytest.fixture |
-| entrypoints/openai_api/test_serving_speech.py::test_stereo_to_mono_conversion | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_unsupported_format_fallback | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_mono_audio_preservation | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_stereo_audio_preservation | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment_bypass | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment_stereo_handling | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_create_speech_success | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_create_speech_mp3_format | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_create_speech_invalid_format | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_speed_parameter_is_used | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_list_voices_endpoint | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_is_tts_detection_no_stage | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_is_tts_detection_with_tts_stage | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_estimate_prompt_len_fallback | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_validate_tts_request_basic | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_validate_tts_request_task_types | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_build_tts_params | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_load_supported_speakers | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_max_instructions_length_default | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_max_instructions_length_cli_override | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_max_instructions_length_stage_config | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_max_instructions_length_cli_overrides_stage_config | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_validate_instructions_length_uses_cached_value | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_stream_validation_errors | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_stream_valid | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_sse_stream_format_is_blocked | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_streaming | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_non_streaming_unchanged | (无) |
-| entrypoints/openai_api/test_video_server.py::test_client | @pytest.fixture |
-| entrypoints/openai_api/test_video_server.py::test_t2v_video_generation_form | (无) |
-| entrypoints/openai_api/test_video_server.py::test_i2v_video_generation_form | (无) |
-| entrypoints/openai_api/test_video_server.py::test_seconds_defaults_fps_and_frames | (无) |
-| entrypoints/openai_api/test_video_server.py::test_size_param_sets_width_height | (无) |
-| entrypoints/openai_api/test_video_server.py::test_sampling_params_pass_through | (无) |
-| entrypoints/openai_api/test_video_server.py::test_missing_handler_returns_503 | (无) |
-| entrypoints/openai_api/test_video_server.py::test_missing_prompt_returns_422 | (无) |
-| entrypoints/openai_api/test_video_server.py::test_invalid_size_format_raises_validation_error | (无) |
-| entrypoints/openai_api/test_video_server.py::test_invalid_size_parse_returns_500 | (无) |
-| entrypoints/openai_api/test_video_server.py::test_invalid_response_format_raises_validation_error | (无) |
-| entrypoints/openai_api/test_video_server.py::test_invalid_seconds_returns_422 | (无) |
-| entrypoints/openai_api/test_video_server.py::test_invalid_n_raises_validation_error | (无) |
-| entrypoints/openai_api/test_video_server.py::test_negative_prompt_and_seed_pass_through | (无) |
-| entrypoints/openai_api/test_video_server.py::test_invalid_lora_returns_400 | (无) |
-| entrypoints/openai_api/test_video_server.py::test_video_request_validation | (无) |
-| entrypoints/test_async_omni_diffusion_config.py::test_default_stage_config_includes_cache_backend | (无) |
-| entrypoints/test_async_omni_diffusion_config.py::test_default_cache_config_used_when_missing | (无) |
-| entrypoints/test_async_omni_diffusion_config.py::test_default_stage_devices_from_sequence_parallel | (无) |
-| entrypoints/test_cfg_companion_tracker.py::test_companion_tracker_initialization | (无) |
-| entrypoints/test_cfg_companion_tracker.py::test_expand_prompts_registers_companions | (无) |
-| entrypoints/test_cfg_companion_tracker.py::test_companion_lifecycle_success | (无) |
-| entrypoints/test_cfg_companion_tracker.py::test_companion_lifecycle_failure | (无) |
-| entrypoints/test_cfg_companion_tracker.py::test_companion_lifecycle_timeout | (无) |
-| entrypoints/test_omni_diffusion.py::test_initialize_stage_configs_called_when_none | (无) |
-| entrypoints/test_omni_diffusion.py::test_generate_raises_on_length_mismatch | (无) |
-| entrypoints/test_omni_diffusion.py::test_generate_pipeline_and_final_outputs | (无) |
-| entrypoints/test_omni_diffusion.py::test_generate_pipeline_with_batch_input | (无) |
-| entrypoints/test_omni_diffusion.py::test_generate_no_final_output_returns_empty | (无) |
-| entrypoints/test_omni_diffusion.py::test_generate_sampling_params_none_use_default | (无) |
-| entrypoints/test_omni_diffusion.py::test_wait_for_stages_ready_timeout | (无) |
-| entrypoints/test_omni_diffusion.py::test_generate_handles_error_messages | (无) |
-| entrypoints/test_omni_diffusion.py::test_close_sends_shutdown_signal | (无) |
-| entrypoints/test_omni_input_preprocessor.py::test_process_tokens_keeps_additional_information | (无) |
-| entrypoints/test_omni_input_preprocessor.py::test_process_text_keeps_additional_information | (无) |
-| entrypoints/test_omni_input_preprocessor.py::test_process_text_multimodal_skips_empty_payloads | (无) |
-| entrypoints/test_omni_llm.py::test_initialize_stage_configs_called_when_none | (无) |
-| entrypoints/test_omni_llm.py::test_generate_raises_on_length_mismatch | (无) |
-| entrypoints/test_omni_llm.py::test_generate_pipeline_and_final_outputs | (无) |
-| entrypoints/test_omni_llm.py::test_generate_no_final_output_returns_empty | (无) |
-| entrypoints/test_omni_llm.py::test_generate_sampling_params_none_use_default | (无) |
-| entrypoints/test_omni_llm.py::test_wait_for_stages_ready_timeout | (无) |
-| entrypoints/test_omni_llm.py::test_generate_handles_error_messages | (无) |
-| entrypoints/test_omni_llm.py::test_close_sends_shutdown_signal | (无) |
-| entrypoints/test_omni_new_request_data.py::test_omni_new_request_data_copies_payloads | (无) |
-| entrypoints/test_omni_new_request_data.py::test_omni_new_request_data_allows_missing_payloads | (无) |
-| entrypoints/test_omni_stage_diffusion_config.py::test_build_od_config_includes_diffusion_fields | (无) |
-| entrypoints/test_omni_stage_diffusion_config.py::test_build_od_config_respects_explicit_config | (无) |
-| entrypoints/test_stage_utils.py::test_set_stage_devices_respects_logical_ids | @pytest.mark.usefixtures("clean_gpu_memory_between_tests") |
-| entrypoints/test_stage_utils.py::test_set_stage_devices_npu_platform | @pytest.mark.usefixtures("clean_gpu_memory_between_tests") |
-| entrypoints/test_utils.py::test_simple_dict | (无) |
-| entrypoints/test_utils.py::test_dict_with_nested_values | (无) |
-| entrypoints/test_utils.py::test_dict_with_dataclass_values | (无) |
-| entrypoints/test_utils.py::test_dict_with_counter_values | (无) |
-| entrypoints/test_utils.py::test_empty_dict | (无) |
-| entrypoints/test_utils.py::test_dict_with_set_values | (无) |
-| entrypoints/test_utils.py::test_dict_with_none_values | (无) |
-| entrypoints/test_utils.py::test_dict_with_mixed_types | (无) |
-| entrypoints/test_utils.py::test_dict_preserves_key_types | (无) |
-| entrypoints/test_utils.py::test_dict_with_recursive_structure | (无) |
-| entrypoints/test_utils.py::test_integration_with_convert_dataclasses | (无) |
-| entrypoints/test_utils.py::test_uses_filter_dict_like_object | (无) |
-| entrypoints/test_utils.py::test_simple_filtering | (无) |
-| entrypoints/test_utils.py::test_invalid_dataclass_raises_error | (无) |
-| entrypoints/test_utils.py::test_invalid_kwargs_type_raises_error | (无) |
-| entrypoints/test_utils.py::test_filters_omni_engine_args_unknown_fields | (无) |
-| entrypoints/test_utils.py::test_filters_omni_diffusion_config_union_dataclass | (无) |
-| metrics/test_stats.py::test_orchestrator_aggregator_builds_summary | (无) |
-| metrics/test_stats.py::test_build_and_log_summary_e2e_only | (无) |
-| metrics/test_stats.py::test_build_and_log_summary_multiple_requests | (无) |
-| model_executor/models/qwen2_5_omni/test_audio_length.py::test_resolve_max_mel_frames_default | (无) |
-| model_executor/models/qwen2_5_omni/test_audio_length.py::test_resolve_max_mel_frames_explicit | (无) |
-| model_executor/models/qwen2_5_omni/test_audio_length.py::test_cap_and_align_mel_length_no_mismatch | @pytest.mark.parametrize("repeats", [2, 4]) \| @pytest.mark.parametrize("code_len", [0, 1, 32768]) \| @pytest.mark.parametrize("max_mel_frames", [None, -1, 0, 1, 6000, 30000]) |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_create_connector_config_parsing | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_load_poll | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_save_async | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_update_request_payload | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_process_and_restore_queues | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_postprocess_scheduler_output | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_clears_all_state | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_infers_external_id | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_idempotent | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_request_id_reuse_not_polluted | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_preserves_pending_save | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_only_affects_target_request | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_cleanup_after_poll_flow | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_generation_scheduler_calls_cleanup_on_finished | @pytest.mark.core_model \| @pytest.mark.cpu |
+| distributed/omni_connectors/test_kv_flow.py::test_manager_extraction | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.cache |
+| distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_tuple_layout | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.cache |
+| distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_mismatched_kv_block_counts | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.cache |
+| distributed/omni_connectors/test_kv_flow.py::test_normalize_layer_kv_rejects_invalid_inputs | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.cache |
+| distributed/omni_connectors/test_kv_flow.py::test_manager_reception | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.cache |
+| distributed/omni_connectors/test_kv_flow.py::test_integration_flow | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.cache |
+| distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_no_connector | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.cache |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_basic_alloc_free | @pytest.mark.cpu \| @pytest.mark.parallel |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_alignment | @pytest.mark.cpu \| @pytest.mark.parallel |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_exhaustion_and_recovery | @pytest.mark.cpu \| @pytest.mark.parallel |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_thread_safety | @pytest.mark.cpu \| @pytest.mark.parallel |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_double_free_exact_is_safe | @pytest.mark.cpu \| @pytest.mark.parallel \| @pytest.mark.slow |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_double_free_after_merge_is_safe | @pytest.mark.cpu \| @pytest.mark.parallel \| @pytest.mark.slow |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_partial_overlap_raises_corruption | @pytest.mark.cpu \| @pytest.mark.parallel \| @pytest.mark.slow |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_merge_adjacent_blocks | @pytest.mark.cpu \| @pytest.mark.parallel \| @pytest.mark.slow |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_fragmentation_and_defrag | @pytest.mark.cpu \| @pytest.mark.parallel \| @pytest.mark.slow |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_tensor_view | @pytest.mark.cpu \| @pytest.mark.parallel |
+| distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::test_context_manager_releases_buffer | @pytest.mark.cpu \| @pytest.mark.parallel |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_initialization | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_put_tensor_bytes_object | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_cleanup_releases_buffer | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_pool_exhaustion_and_recovery | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_tensor_e2e | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_bytes_e2e | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_object_e2e | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_zero_copy_e2e | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_large_tensor_100mb | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_mixed_types_sequential | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_concurrent_put | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_auto_cleanup | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_close_releases_resources | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_context_manager | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_double_close_safe | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_gpu_pool_init | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_gpu_pool_put_cpu_and_gpu_tensor | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_gpu_e2e_transfer | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_concurrent_put_get_integrity | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_concurrent_put_get_threaded_both_sides | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_small_tensor_1_element | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_empty_bytes_rejected | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_large_tensor_500mb | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_rapid_alloc_free_cycle | @pytest.mark.parallel \| @pytest.mark.gpu |
+| distributed/omni_connectors/test_omni_connector_configs.py::test_load_qwen_yaml_configs | @pytest.mark.skipif(len(config_files) == 0, reason="No config files found or directory missing") |
+| engine/test_async_omni_engine_abort.py::test_abort | @pytest.mark.core_model \| @pytest.mark.omni \| @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1) |
+| entrypoints/openai_api/test_image_server.py::test_parse_size_valid | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_parse_size_invalid | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_parse_size_negative | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_parse_size_edge_cases | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_encode_image_base64 | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_client | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.fixture |
+| entrypoints/openai_api/test_image_server.py::test_health_endpoint | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_health_endpoint_no_engine | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_models_endpoint | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_models_endpoint_no_engine | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_generate_single_image | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_generate_images_async_omni_sampling_params | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_generate_multiple_images | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_with_negative_prompt | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_with_seed | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_with_seed_zero | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_with_custom_parameters | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_invalid_size | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_invalid_size_parse_error | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_missing_prompt | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_invalid_n_parameter | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_url_response_format_not_supported | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_model_not_loaded | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_different_image_sizes | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_parameter_validation | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_parameters_passed_through | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_model_field_omitted_works | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_image_edit_images_processing | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_image_edit_parameter_pass | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_image_edit_parameter_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_image_edit_parameter_default_single_stage | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_image_edit_compression_jpeg | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_image_edit_compression_png | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_image_edit_with_seed_zero | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_image_server.py::test_image_edit_with_seed_zero_single_stage | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_metrics.py::test_omni_chat_completion_response_metrics | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_metrics.py::test_omni_chat_completion_stream_response_metrics | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_openai_sampling_fields_contains_expected_fields | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_preserves_yaml_defaults_when_no_request_params | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_temperature_overrides_yaml_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_top_p_overrides_yaml_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_max_tokens_overrides_yaml_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_max_tokens_uses_yaml_default_when_not_specified | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_seed_overrides_yaml_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_frequency_penalty_overrides | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_request_presence_penalty_overrides | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_non_comprehension_stages_use_cloned_defaults | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_multiple_params_override_together | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_apply_request_overrides_clones_params | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_apply_request_overrides_preserves_defaults | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_apply_request_overrides_applies_values | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_finds_first_stage | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_finds_second_stage | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_raises_when_not_found | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_app | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.fixture |
+| entrypoints/openai_api/test_serving_speech.py::test_stereo_to_mono_conversion | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_unsupported_format_fallback | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_mono_audio_preservation | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_stereo_audio_preservation | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment_bypass | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment_stereo_handling | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_create_speech_success | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_create_speech_mp3_format | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_create_speech_invalid_format | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_speed_parameter_is_used | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_list_voices_endpoint | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_is_tts_detection_no_stage | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_is_tts_detection_with_tts_stage | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_estimate_prompt_len_fallback | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_validate_tts_request_basic | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_validate_tts_request_task_types | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_build_tts_params | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_load_supported_speakers | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_max_instructions_length_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_max_instructions_length_cli_override | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_max_instructions_length_stage_config | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_max_instructions_length_cli_overrides_stage_config | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_validate_instructions_length_uses_cached_value | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_stream_validation_errors | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_stream_valid | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_sse_stream_format_is_blocked | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_streaming | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_serving_speech.py::test_non_streaming_unchanged | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_client | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.fixture |
+| entrypoints/openai_api/test_video_server.py::test_t2v_video_generation_form | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_i2v_video_generation_form | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_seconds_defaults_fps_and_frames | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_size_param_sets_width_height | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_sampling_params_pass_through | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_missing_handler_returns_503 | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_missing_prompt_returns_422 | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_invalid_size_format_raises_validation_error | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_invalid_size_parse_returns_500 | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_invalid_response_format_raises_validation_error | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_invalid_seconds_returns_422 | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_invalid_n_raises_validation_error | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_negative_prompt_and_seed_pass_through | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_invalid_lora_returns_400 | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/openai_api/test_video_server.py::test_video_request_validation | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_async_omni_diffusion_config.py::test_default_stage_config_includes_cache_backend | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_async_omni_diffusion_config.py::test_default_cache_config_used_when_missing | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_async_omni_diffusion_config.py::test_default_stage_devices_from_sequence_parallel | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_cfg_companion_tracker.py::test_companion_tracker_initialization | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_cfg_companion_tracker.py::test_expand_prompts_registers_companions | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_cfg_companion_tracker.py::test_companion_lifecycle_success | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_cfg_companion_tracker.py::test_companion_lifecycle_failure | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_cfg_companion_tracker.py::test_companion_lifecycle_timeout | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_initialize_stage_configs_called_when_none | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_generate_raises_on_length_mismatch | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_generate_pipeline_and_final_outputs | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_generate_pipeline_with_batch_input | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_generate_no_final_output_returns_empty | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_generate_sampling_params_none_use_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_wait_for_stages_ready_timeout | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_generate_handles_error_messages | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_diffusion.py::test_close_sends_shutdown_signal | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_input_preprocessor.py::test_process_tokens_keeps_additional_information | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_input_preprocessor.py::test_process_text_keeps_additional_information | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_input_preprocessor.py::test_process_text_multimodal_skips_empty_payloads | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_llm.py::test_initialize_stage_configs_called_when_none | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_llm.py::test_generate_raises_on_length_mismatch | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_llm.py::test_generate_pipeline_and_final_outputs | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_llm.py::test_generate_no_final_output_returns_empty | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_llm.py::test_generate_sampling_params_none_use_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_llm.py::test_wait_for_stages_ready_timeout | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_llm.py::test_generate_handles_error_messages | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_llm.py::test_close_sends_shutdown_signal | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_new_request_data.py::test_omni_new_request_data_copies_payloads | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_new_request_data.py::test_omni_new_request_data_allows_missing_payloads | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_stage_diffusion_config.py::test_build_od_config_includes_diffusion_fields | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_omni_stage_diffusion_config.py::test_build_od_config_respects_explicit_config | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_stage_utils.py::test_set_stage_devices_respects_logical_ids | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.usefixtures("clean_gpu_memory_between_tests") |
+| entrypoints/test_stage_utils.py::test_set_stage_devices_npu_platform | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.usefixtures("clean_gpu_memory_between_tests") |
+| entrypoints/test_utils.py::test_simple_dict | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_dict_with_nested_values | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_dict_with_dataclass_values | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_dict_with_counter_values | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_empty_dict | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_dict_with_set_values | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_dict_with_none_values | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_dict_with_mixed_types | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_dict_preserves_key_types | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_dict_with_recursive_structure | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_integration_with_convert_dataclasses | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_uses_filter_dict_like_object | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_simple_filtering | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_invalid_dataclass_raises_error | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_invalid_kwargs_type_raises_error | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_filters_omni_engine_args_unknown_fields | @pytest.mark.core_model \| @pytest.mark.cpu |
+| entrypoints/test_utils.py::test_filters_omni_diffusion_config_union_dataclass | @pytest.mark.core_model \| @pytest.mark.cpu |
+| metrics/test_stats.py::test_orchestrator_aggregator_builds_summary | @pytest.mark.core_model \| @pytest.mark.cpu |
+| metrics/test_stats.py::test_build_and_log_summary_e2e_only | @pytest.mark.core_model \| @pytest.mark.cpu |
+| metrics/test_stats.py::test_build_and_log_summary_multiple_requests | @pytest.mark.core_model \| @pytest.mark.cpu |
+| model_executor/models/qwen2_5_omni/test_audio_length.py::test_resolve_max_mel_frames_default | @pytest.mark.core_model \| @pytest.mark.cpu |
+| model_executor/models/qwen2_5_omni/test_audio_length.py::test_resolve_max_mel_frames_explicit | @pytest.mark.core_model \| @pytest.mark.cpu |
+| model_executor/models/qwen2_5_omni/test_audio_length.py::test_cap_and_align_mel_length_no_mismatch | @pytest.mark.core_model \| @pytest.mark.cpu |
 | model_executor/models/qwen2_5_omni/test_qwen2_5_omni_embed.py::test_non_interleaved_audio_then_video | (无) |
 | model_executor/models/qwen2_5_omni/test_qwen2_5_omni_embed.py::test_non_interleaved_with_image | (无) |
 | model_executor/models/qwen2_5_omni/test_qwen2_5_omni_embed.py::test_no_audio | (无) |
@@ -453,53 +453,53 @@
 | model_executor/models/qwen2_5_omni/test_qwen2_5_omni_embed.py::test_text_positions_unchanged | (无) |
 | model_executor/models/qwen2_5_omni/test_qwen2_5_omni_embed.py::test_interleaved_use_audio_in_video | (无) |
 | model_executor/models/qwen2_5_omni/test_qwen2_5_omni_embed.py::test_basic_interleaved | (无) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_exact_size_numerical_equivalence | @pytest.mark.parametrize("seq_len", [25, 50, 100]) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_padded_output_shape_and_length | @pytest.mark.parametrize("seq_len", [10, 30, 47, 73, 99]) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_padded_interior_positions_close | @pytest.mark.parametrize("seq_len", [10, 30, 47, 73, 99]) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_padded_output_bounded | @pytest.mark.parametrize("seq_len", [10, 30, 47, 73, 99]) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_fallback_eager_exact_match | @pytest.mark.parametrize("seq_len", [101, 150, 200]) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_chunked_decode_shape_match | @pytest.mark.parametrize("total_len", [60, 100, 150, 250]) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_chunked_decode_exact_size_equivalence | @pytest.mark.parametrize("total_len", [50, 100]) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_single_frame | (无) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_disabled_wrapper_matches_eager | (无) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_batch_size_gt1_falls_back | (无) |
-| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_deterministic_across_calls | (无) |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_exact_size_numerical_equivalence | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_padded_output_shape_and_length | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_padded_interior_positions_close | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_padded_output_bounded | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_fallback_eager_exact_match | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_chunked_decode_shape_match | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_chunked_decode_exact_size_equivalence | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_single_frame | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_disabled_wrapper_matches_eager | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_batch_size_gt1_falls_back | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
+| model_executor/models/qwen3_tts/test_cuda_graph_decoder.py::test_deterministic_across_calls | @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required") |
 | model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py::test_talker2code2wav_async_chunk_does_not_emit_empty_chunk_when_not_finished | (无) |
 | model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py::test_talker2code2wav_async_chunk_flushes_tail_when_finished_without_pooler_output | (无) |
 | model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py::test_talker2code2wav_async_chunk_emits_eof_marker_when_finished_with_no_frames | (无) |
-| test_outputs.py::test_from_diffusion | (无) |
-| test_outputs.py::test_from_pipeline | (无) |
-| test_outputs.py::test_prompt_token_ids_property | (无) |
-| test_outputs.py::test_prompt_token_ids_none_when_no_request_output | (无) |
-| test_outputs.py::test_outputs_property | (无) |
-| test_outputs.py::test_outputs_empty_when_no_request_output | (无) |
-| test_outputs.py::test_encoder_prompt_token_ids_property | (无) |
-| test_outputs.py::test_num_cached_tokens_property | (无) |
-| test_outputs.py::test_multimodal_output_property | (无) |
-| test_outputs.py::test_to_dict_diffusion | (无) |
-| test_outputs.py::test_to_dict_pipeline | (无) |
-| worker/test_gpu_generation_model_runner.py::test_sample_tokens_tensor_output | (无) |
-| worker/test_gpu_generation_model_runner.py::test_sample_tokens_list_output | (无) |
-| worker/test_gpu_generation_model_runner.py::test_sample_tokens_list_allows_none_output | (无) |
-| worker/test_gpu_generation_model_runner.py::test_sample_tokens_dict_output | (无) |
-| worker/test_omni_gpu_model_runner.py::test_talker_mtp_forward_cpu_updates_inputs_and_info | (无) |
-| worker/test_omni_gpu_model_runner.py::test_talker_mtp_forward_cpu_empty_batch_noop | (无) |
-| worker/test_omni_gpu_model_runner.py::test_update_intermediate_buffer_writes_to_buffer_and_setattr | (无) |
-| worker/test_omni_gpu_model_runner.py::test_update_intermediate_buffer_accumulates | (无) |
-| worker/test_omni_gpu_model_runner.py::test_update_intermediate_buffer_skips_empty_update | (无) |
-| worker/test_omni_gpu_model_runner.py::test_update_intermediate_buffer_skips_unknown_req_id | (无) |
-| worker/test_omni_gpu_model_runner.py::test_maybe_attach_mimo_audio_req_infos_enriches_dict | (无) |
-| worker/test_omni_gpu_model_runner.py::test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input | (无) |
-| worker/test_process_gpu_memory.py::test_empty | (无) |
-| worker/test_process_gpu_memory.py::test_integer_indices | (无) |
-| worker/test_process_gpu_memory.py::test_uuids | (无) |
-| worker/test_process_gpu_memory.py::test_mig_ids | (无) |
-| worker/test_process_gpu_memory.py::test_spaces | (无) |
-| worker/test_process_gpu_memory.py::test_returns_memory_for_current_process | @pytest.mark.skipif(not os.path.exists("/dev/nvidia0"), reason="No GPU") |
-| worker/test_process_gpu_memory.py::test_raises_on_invalid_device | (无) |
-| worker/test_process_gpu_memory.py::test_returns_zero_when_process_not_found | (无) |
-| worker/test_process_gpu_memory.py::test_uses_uuid_when_provided | (无) |
-| worker/test_process_gpu_memory.py::test_raises_on_invalid_uuid | (无) |
-| worker/test_process_gpu_memory.py::test_returns_none_on_nvml_init_failure | (无) |
-| worker/test_process_gpu_memory.py::test_returns_true_when_nvml_works | (无) |
-| worker/test_process_gpu_memory.py::test_returns_false_when_nvml_fails | (无) |
+| test_outputs.py::test_from_diffusion | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_from_pipeline | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_prompt_token_ids_property | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_prompt_token_ids_none_when_no_request_output | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_outputs_property | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_outputs_empty_when_no_request_output | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_encoder_prompt_token_ids_property | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_num_cached_tokens_property | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_multimodal_output_property | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_to_dict_diffusion | @pytest.mark.core_model \| @pytest.mark.cpu |
+| test_outputs.py::test_to_dict_pipeline | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_gpu_generation_model_runner.py::test_sample_tokens_tensor_output | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_gpu_generation_model_runner.py::test_sample_tokens_list_output | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_gpu_generation_model_runner.py::test_sample_tokens_list_allows_none_output | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_gpu_generation_model_runner.py::test_sample_tokens_dict_output | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_omni_gpu_model_runner.py::test_talker_mtp_forward_cpu_updates_inputs_and_info | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_omni_gpu_model_runner.py::test_talker_mtp_forward_cpu_empty_batch_noop | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_omni_gpu_model_runner.py::test_update_intermediate_buffer_writes_to_buffer_and_setattr | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_omni_gpu_model_runner.py::test_update_intermediate_buffer_accumulates | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_omni_gpu_model_runner.py::test_update_intermediate_buffer_skips_empty_update | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_omni_gpu_model_runner.py::test_update_intermediate_buffer_skips_unknown_req_id | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_omni_gpu_model_runner.py::test_maybe_attach_mimo_audio_req_infos_enriches_dict | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_omni_gpu_model_runner.py::test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_empty | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_integer_indices | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_uuids | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_mig_ids | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_spaces | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_returns_memory_for_current_process | @pytest.mark.core_model \| @pytest.mark.cpu \| @pytest.mark.skipif(not os.path.exists("/dev/nvidia0"), reason="No GPU") |
+| worker/test_process_gpu_memory.py::test_raises_on_invalid_device | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_returns_zero_when_process_not_found | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_uses_uuid_when_provided | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_raises_on_invalid_uuid | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_returns_none_on_nvml_init_failure | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_returns_true_when_nvml_works | @pytest.mark.core_model \| @pytest.mark.cpu |
+| worker/test_process_gpu_memory.py::test_returns_false_when_nvml_fails | @pytest.mark.core_model \| @pytest.mark.cpu |

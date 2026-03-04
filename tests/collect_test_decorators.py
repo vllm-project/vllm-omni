@@ -10,6 +10,44 @@ import ast
 TESTS_ROOT = Path(__file__).resolve().parent
 EXCLUDE_DIRS = {"e2e", "examples", "perf"}
 
+# 暂不统计的修饰器（按前缀匹配）
+SKIP_DECORATOR_PREFIXES = ("@pytest.mark.parametrize", "@pytest.mark.asyncio")
+
+
+def _get_pytestmark_from_module(tree: ast.Module, text: str) -> list[str]:
+    """从模块 AST 中提取 pytestmark 的标记列表，返回带 @ 的字符串列表。"""
+    marks: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id != "pytestmark":
+            continue
+        value = node.value
+        if isinstance(value, ast.List):
+            for elt in value.elts:
+                src = ast.get_source_segment(text, elt)
+                if src:
+                    s = src.strip()
+                    if not s.startswith("@"):
+                        s = "@" + s
+                    marks.append(s)
+        else:
+            src = ast.get_source_segment(text, value)
+            if src:
+                s = src.strip()
+                if not s.startswith("@"):
+                    s = "@" + s
+                marks.append(s)
+        break
+    return marks
+
+
+def _should_skip_decorator(dec_src: str) -> bool:
+    """是否跳过该修饰器（不纳入统计）。"""
+    s = dec_src.strip()
+    return any(s.startswith(prefix) for prefix in SKIP_DECORATOR_PREFIXES)
+
 
 def should_skip(rel_path: Path) -> bool:
     """rel_path 为相对于 TESTS_ROOT 的路径，如 entrypoints/test_foo.py 或 e2e/xxx/test.py"""
@@ -17,30 +55,31 @@ def should_skip(rel_path: Path) -> bool:
 
 
 def collect_decorators_and_tests(file_path: Path) -> list[tuple[str, list[str]]]:
-    """返回 [(test_func_name, [decorator1_src, decorator2_src, ...]), ...]，使用 AST 支持多行修饰器。"""
+    """返回 [(test_func_name, [decorator1_src, ...]), ...]，使用 AST 支持多行修饰器；含模块级 pytestmark，排除 parametrize/asyncio。"""
     text = file_path.read_text(encoding="utf-8", errors="replace")
     try:
         tree = ast.parse(text, filename=str(file_path))
     except SyntaxError as e:
         raise RuntimeError(f"AST 解析失败: {e}") from e
 
+    file_marks = _get_pytestmark_from_module(tree, text)
     results: list[tuple[str, list[str]]] = []
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
-            decorators: list[str] = []
+            decorators: list[str] = list(file_marks)  # 先加入文件级 pytestmark
             for dec in node.decorator_list:
                 src = ast.get_source_segment(text, dec)
                 if src is None:
-                    # 回退：尽量给一个可读表示
                     try:
                         src = "@(" + ast.unparse(dec) + ")"  # type: ignore[attr-defined]
                     except Exception:
                         src = "@<unknown_decorator>"
-                # 确保带上前导 @，有些情况下 get_source_segment 可能只返回表达式
                 src = src.strip()
                 if not src.startswith("@"):
                     src = "@" + src
+                if _should_skip_decorator(src):
+                    continue
                 decorators.append(src)
             results.append((node.name, decorators))
 
