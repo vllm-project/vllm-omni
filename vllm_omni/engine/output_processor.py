@@ -120,6 +120,9 @@ class OmniRequestState(RequestState):
                             # When the audio tensor shape is inconsistent, torch.cat will fail.
                             # We need to use torch.cat in -1 dimension.
                             continue
+                        elif k == "sr":
+                            # Sample rate is a constant scalar, keep last value.
+                            self.mm_accumulated[k] = v[-1]
                         else:
                             self.mm_accumulated[k] = torch.cat(v, dim=0)
                     except Exception:

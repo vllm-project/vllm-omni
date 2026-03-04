@@ -638,12 +638,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
     def _get_tokenizer(self):
         if self._tokenizer is None:
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path,
-                trust_remote_code=True,
-                fix_mistral_regex=True,
-                use_fast=True,
-            )
+            import transformers
+
+            kwargs = dict(trust_remote_code=True, use_fast=True)
+            if transformers.__version__ < "5":
+                kwargs["fix_mistral_regex"] = True
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_path, **kwargs)
             self._tokenizer.padding_side = "left"
         return self._tokenizer
 
