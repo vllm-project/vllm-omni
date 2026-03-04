@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -33,8 +34,8 @@ def test_hunyuan_image3_preprocess_builds_joint_image_info(mocker: MockerFixture
     class _DummyImageProcessor:
         def __init__(self, _cfg):
             self.reso_group = SimpleNamespace(
-                get_target_size=lambda width, height: (width, height),
-                get_base_size_and_ratio_index=lambda width, height: (1024, 3),
+                get_target_size=lambda width, height: (np.int64(width), np.int64(height)),
+                get_base_size_and_ratio_index=lambda width, height: (np.int64(1024), np.int64(3)),
             )
             self.vae_processor = lambda image: torch.zeros(3, image.size[1], image.size[0])
             self.vision_encoder_processor = _DummyVisionProcessor()
@@ -58,6 +59,10 @@ def test_hunyuan_image3_preprocess_builds_joint_image_info(mocker: MockerFixture
     assert cond_info_payload["vae_image_info"]["image_tensor"].shape == (3, 16, 32)
     assert cond_info_payload["vae_image_info"]["token_width"] == 2
     assert cond_info_payload["vae_image_info"]["token_height"] == 1
+    assert isinstance(cond_info_payload["vae_image_info"]["image_width"], int)
+    assert isinstance(cond_info_payload["vae_image_info"]["image_height"], int)
+    assert isinstance(cond_info_payload["vae_image_info"]["base_size"], int)
+    assert isinstance(cond_info_payload["vae_image_info"]["ratio_index"], int)
     assert tuple(cond_info_payload["vision_encoder_kwargs"]["spatial_shapes"].tolist()) == (2, 5)
     roundtrip_cond_info = hy3_module._joint_image_info_from_payload(cond_info_payload)
     assert isinstance(roundtrip_cond_info, hy3_module.JointImageInfo)

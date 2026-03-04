@@ -113,17 +113,23 @@ def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_hei
     return resized.crop((left, top, right, bottom))
 
 
+def _to_python_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
     return {
         "image_type": image_info.image_type,
         "image_tensor": image_info.image_tensor,
-        "image_width": image_info.image_width,
-        "image_height": image_info.image_height,
-        "token_width": image_info.token_width,
-        "token_height": image_info.token_height,
-        "image_token_length": image_info.image_token_length,
-        "base_size": image_info.base_size,
-        "ratio_index": image_info.ratio_index,
+        "image_width": _to_python_scalar(image_info.image_width),
+        "image_height": _to_python_scalar(image_info.image_height),
+        "token_width": _to_python_scalar(image_info.token_width),
+        "token_height": _to_python_scalar(image_info.token_height),
+        "image_token_length": _to_python_scalar(image_info.image_token_length),
+        "base_size": _to_python_scalar(image_info.base_size),
+        "ratio_index": _to_python_scalar(image_info.ratio_index),
         "add_timestep_token": image_info.add_timestep_token,
         "add_guidance_token": image_info.add_guidance_token,
         "use_front_boi_token": image_info.use_front_boi_token,
@@ -132,6 +138,8 @@ def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
 
 
 def _to_tensor_if_needed(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, list):
         return torch.tensor(value)
     return value
@@ -198,9 +206,13 @@ def get_hunyuan_image_3_pre_process_func(
         orig_width, orig_height = pil_image.size
 
         target_width, target_height = image_processor.reso_group.get_target_size(orig_width, orig_height)
+        target_width = int(target_width)
+        target_height = int(target_height)
         vae_input = _resize_and_crop_center(pil_image, target_width, target_height)
         vae_tensor = image_processor.vae_processor(vae_input)
         base_size, ratio_idx = image_processor.reso_group.get_base_size_and_ratio_index(orig_width, orig_height)
+        base_size = int(base_size)
+        ratio_idx = int(ratio_idx)
 
         vae_info = ImageInfo(
             image_type="vae",
