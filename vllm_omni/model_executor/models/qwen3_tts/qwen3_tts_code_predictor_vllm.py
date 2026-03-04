@@ -397,7 +397,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         bsz = int(inputs_embeds.shape[0])
         qlen = 2
         # Flatten to token-major.
-        hs = inputs_embeds.to(dtype=torch.bfloat16).reshape(bsz * qlen, -1)
+        model_dtype = next(self.model.parameters()).dtype
+        hs = inputs_embeds.to(dtype=model_dtype).reshape(bsz * qlen, -1)
         hs = self.small_to_mtp_projection(hs)
 
         query_lens = torch.full((bsz,), qlen, dtype=torch.int32)
@@ -498,11 +499,15 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         for step in range(1, num_groups):
             # Sample or argmax from logits.
             if do_sample and temperature > 0:
-                scaled = logits / temperature
+                scaled = logits.float() / temperature
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(top_k, dim=-1)
                     scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                 probs = torch.softmax(scaled, dim=-1)
+                # Guard against NaN/Inf from lower-precision dtypes.
+                probs = probs.clamp(min=0.0)
+                row_sums = probs.sum(dim=-1, keepdim=True)
+                probs = torch.where(row_sums > 0, probs / row_sums, torch.ones_like(probs) / probs.shape[-1])
                 next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
             else:
                 next_ids = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
