@@ -161,7 +161,7 @@ def _run_zimage_generate(
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
-    if not current_omni_platform.is_available() and current_omni_platform.device_count() < 2:
+    if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 devices.")
 
     enforce_eager = False
