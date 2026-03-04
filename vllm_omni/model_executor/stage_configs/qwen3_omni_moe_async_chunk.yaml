@@ -29,6 +29,9 @@ stage_args:
     final_output: true
     final_output_type: text
     is_comprehension: true
+    # Use named connector to apply runtime.connectors.extra.
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
     default_sampling_params:
       temperature: 0.4
       top_p: 0.9
@@ -60,6 +63,9 @@ stage_args:
     engine_input_source: [0]
     # final_output: true
     # final_output_type: text
+    # Distributed connector configuration
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -99,3 +105,13 @@ stage_args:
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
+
+runtime:
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        # Align with Omni: small chunks with sufficient context overlap.
+        codec_chunk_frames: 25 # code2wav decode chunk size
+        codec_left_context_frames: 25 # code2wav left context size
