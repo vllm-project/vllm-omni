@@ -468,6 +468,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             params["max_new_tokens"] = [2048]
 
+        if request.initial_codec_chunk_frames is not None:
+            params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
+
         # VoiceDesign requires non_streaming_mode (match offline script behaviour).
         # CustomVoice and Base rely on the model default (True and False respectively).
         if params["task_type"][0] == "VoiceDesign":
