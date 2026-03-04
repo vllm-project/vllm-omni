@@ -13,6 +13,7 @@ import logging
 import os
 import smtplib
 import sys
+from email.header import Header
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -123,7 +124,7 @@ def _send_mail(
     subject = _build_subject(prefix=prefix, date_str=date_str)
 
     msg = MIMEMultipart()
-    msg["Subject"] = subject
+    msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(body, "plain", "utf-8"))
