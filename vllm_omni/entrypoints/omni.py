@@ -13,6 +13,7 @@ from typing import Any, Literal, overload
 
 import huggingface_hub
 import msgspec.msgpack
+import torch
 import zmq
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
@@ -217,8 +218,11 @@ class OmniBase:
         # We temporally create a default config for diffusion stage.
         # In the future, we should merge the default config with the user-provided config.
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
-        if "dtype" in kwargs:
-            kwargs["dtype"] = str(kwargs["dtype"])
+        if "dtype" in kwargs and not isinstance(kwargs["dtype"], str):
+            if not isinstance(kwargs["dtype"], torch.dtype):
+                raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(kwargs['dtype']).__name__}")
+            kwargs["dtype"] = str(kwargs["dtype"]).removeprefix("torch.")
+
         cache_backend = kwargs.get("cache_backend", "none")
         cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
         # TODO: hack, calculate devices based on parallel config.
