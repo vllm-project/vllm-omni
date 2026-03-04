@@ -25,7 +25,6 @@ from transformers import AutoProcessor, Mistral3ForConditionalGeneration, Pixtra
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
@@ -149,8 +148,7 @@ def get_flux2_post_process_func(
     return post_process_func
 
 
-# Adapted from
-# https://github.com/black-forest-labs/flux2/blob/5a5d316b1b42f6b59a8c9194b77c8256be848432/src/flux2/text_encoder.py#L68
+# Copied from diffusers.pipelines.flux2.pipeline_flux2.format_input
 def format_input(
     prompts: list[str],
     system_message: str = SYSTEM_MESSAGE,
@@ -216,8 +214,7 @@ def format_input(
         return messages
 
 
-# Adapted from
-# https://github.com/black-forest-labs/flux2/blob/5a5d316b1b42f6b59a8c9194b77c8256be848432/src/flux2/text_encoder.py#L49C5-L66C19
+# Copied from diffusers.pipelines.flux2.pipeline_flux2._validate_and_process_images
 def _validate_and_process_images(
     images: list[list[PIL.Image.Image]] | list[PIL.Image.Image],
     image_processor: Flux2ImageProcessor,
@@ -243,8 +240,7 @@ def _validate_and_process_images(
     return images
 
 
-# Taken from
-# https://github.com/black-forest-labs/flux2/blob/5a5d316b1b42f6b59a8c9194b77c8256be848432/src/flux2/sampling.py#L251
+# Copied from diffusers.pipelines.flux2.pipeline_flux2.compute_empirical_mu
 def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     a1, b1 = 8.73809524e-05, 1.89833333
     a2, b2 = 0.00016927, 0.45666666
@@ -335,7 +331,7 @@ def retrieve_latents(encoder_output: torch.Tensor, generator: torch.Generator = 
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
+class Flux2Pipeline(nn.Module, SupportImageInput):
     """Flux2 pipeline for text-to-image generation."""
 
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
@@ -449,6 +445,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         return prompt_embeds
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._prepare_text_ids
     def _prepare_text_ids(
         x: torch.Tensor,  # (B, L, D) or (L, D)
         t_coord: torch.Tensor | None = None,
@@ -468,6 +465,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         return torch.stack(out_ids)
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._prepare_latent_ids
     def _prepare_latent_ids(
         latents: torch.Tensor,  # (B, C, H, W)
     ):
@@ -500,6 +498,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         return latent_ids
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._prepare_image_ids
     def _prepare_image_ids(
         image_latents: list[torch.Tensor],  # [(1, C, H, W), (1, C, H, W), ...]
         scale: int = 10,
@@ -550,6 +549,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         return image_latent_ids
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._patchify_latents
     def _patchify_latents(latents):
         batch_size, num_channels_latents, height, width = latents.shape
         latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
@@ -558,6 +558,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         return latents
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._unpatchify_latents
     def _unpatchify_latents(latents):
         batch_size, num_channels_latents, height, width = latents.shape
         latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), 2, 2, height, width)
@@ -566,6 +567,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         return latents
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._pack_latents
     def _pack_latents(latents):
         """
         pack latents: (batch_size, num_channels, height, width) -> (batch_size, height * width, num_channels)
@@ -577,6 +579,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         return latents
 
     @staticmethod
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._unpack_latents_with_ids
     def _unpack_latents_with_ids(x: torch.Tensor, x_ids: torch.Tensor) -> list[torch.Tensor]:
         """
         using position ids to scatter tokens into place
@@ -602,6 +605,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         return torch.stack(x_list, dim=0)
 
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline.upsample_prompt
     def upsample_prompt(
         self,
         prompt: str | list[str],
@@ -699,6 +703,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         text_ids = text_ids.to(device)
         return prompt_embeds, text_ids
 
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._encode_vae_image
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
         if image.ndim != 4:
             raise ValueError(f"Expected image dims 4, got {image.ndim}.")
@@ -712,6 +717,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         return image_latents
 
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline.prepare_latents
     def prepare_latents(
         self,
         batch_size,
@@ -745,6 +751,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         latents = self._pack_latents(latents)  # [B, C, H, W] -> [B, H*W, C]
         return latents, latent_ids
 
+    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline.prepare_image_latents
     def prepare_image_latents(
         self,
         images: list[torch.Tensor],
