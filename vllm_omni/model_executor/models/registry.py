@@ -1,4 +1,8 @@
-from vllm.model_executor.models.registry import _VLLM_MODELS, _LazyRegisteredModel, _ModelRegistry
+from vllm.model_executor.models.registry import (
+    _VLLM_MODELS,
+    _LazyRegisteredModel,
+    _ModelRegistry,
+)
 
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (
@@ -47,6 +51,31 @@ _OMNI_MODELS = {
         "qwen3_omni",
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
+    ),
+    "MammothModa2Qwen2ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen2ForCausalLM",
+    ),
+    "MammothModa2ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ARForConditionalGeneration",
+    ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
+    "MammothModa2ForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
+    "Mammothmoda2Model": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
     ),
     "Qwen3TTSForConditionalGeneration": (
         "qwen3_tts",
@@ -97,7 +126,6 @@ _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,
     **_OMNI_MODELS,
 }
-
 
 OmniModelRegistry = _ModelRegistry(
     {
