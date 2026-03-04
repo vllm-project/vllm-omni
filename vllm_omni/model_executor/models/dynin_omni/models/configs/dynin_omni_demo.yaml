@@ -1,0 +1,82 @@
+wandb:
+  enable: false
+  entity: null
+  resume: "auto"
+
+experiment:
+  project: "dynin-omni-demo"
+  name: "dynin-omni-demo"
+  output_dir: "results/dynin_omni_demo"
+
+model:
+  vq_model_image:
+    type: "magvitv2"
+    repo_id: "showlab/magvitv2"
+    vq_model_name: ${model.vq_model_image.repo_id}
+  vq_model_audio:
+    type: "emova"
+    repo_id: "Emova-ollm/emova_speech_tokenizer_hf"
+    vq_model_name: ${model.vq_model_audio.repo_id}
+  dynin_omni:
+    repo_id: "snu-aidas/dynin-omni_vllm"
+    tokenizer_repo_id: "snu-aidas/dynin-omni_vllm"
+    pretrained_model_path: ${model.dynin_omni.repo_id}
+    tokenizer_path: ${model.dynin_omni.tokenizer_repo_id}
+    local_files_only: false
+    w_clip_vit: false
+    new_vocab_size: 138752
+    llm_vocab_size: 126464
+    codebook_size: 8192
+    num_vq_tokens: 1024
+    num_new_special_tokens: 0
+    tie_word_embeddings: false
+
+dataset:
+  hf:
+    cache_dir: "datasets/huggingface"
+  params:
+    resolution: 336
+    t2i_resolution: 512
+    i2i_source_resolution: 336
+    i2i_target_resolution: 336
+    validation_prompts_file: "validation/data/text/t2i_metadata.jsonl"
+    mmu_image_root: "validation/data/image"
+    video_root: "validation/data/video"
+    video_caption_dataset:
+      num_frames: 8
+      sample_method: "uniform_sequential"
+  preprocessing:
+    max_seq_length: 128
+    max_seq_length_text: 1024
+    max_aud_length: 512
+    max_aud_length_short: 256
+
+training:
+  noise_type: "mask"
+  cond_dropout_prob: 0.0
+  batch_size: 1
+  batch_size_t2i: 1
+  guidance_scale: 3.5
+  generation_timesteps: 20
+
+mask_schedule:
+  schedule: "cosine"
+
+# Validation / inference defaults (for validation/*.py scripts)
+question:
+  - "Please describe this input in detail."
+
+mmu_model_path: ${model.dynin_omni.repo_id}
+mmu_image_root: ${dataset.params.mmu_image_root}
+video_image_root: ${dataset.params.video_root}
+mmu_output_file: "results/mmu_inference_results.json"
+mmu_i2t_max_new_tokens: 1024
+mmu_i2t_steps: 512
+mmu_i2t_block_length: 1024
+mmu_v2t_num_frames: 5
+mmu_v2t_sample_method: "uniform_sequential"
+mmu_v2t_max_new_tokens: 128
+mmu_v2t_steps: 128
+mmu_v2t_block_length: 128
+
+t2i_model_path: ${model.dynin_omni.repo_id}
