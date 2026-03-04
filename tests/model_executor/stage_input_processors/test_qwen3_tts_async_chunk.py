@@ -13,8 +13,16 @@ _FRAME = [1, 2, 3, 4]  # 4-codebook frame
 _Q = len(_FRAME)  # num quantizers
 
 
-def _req(rid: str, *, finished: bool):
-    return SimpleNamespace(external_req_id=rid, is_finished=lambda: finished)
+def _req(rid: str, *, finished: bool, initial_codec_chunk_frames: int | None = None):
+    ai = None
+    if initial_codec_chunk_frames is not None:
+        entry = SimpleNamespace(list_data=[initial_codec_chunk_frames])
+        ai = SimpleNamespace(entries={"initial_codec_chunk_frames": entry})
+    return SimpleNamespace(
+        external_req_id=rid,
+        is_finished=lambda: finished,
+        additional_information=ai,
+    )
 
 
 def _tm(*, chunk_frames=25, left_context=25, initial_chunk=0):
@@ -33,14 +41,13 @@ def _tm(*, chunk_frames=25, left_context=25, initial_chunk=0):
     )
 
 
-def _call(tm, rid, *, n_frames, put_req=0, finished=False):
-    """Feed n_frames into transfer_manager and call the gate function."""
+def _call(tm, rid, *, n_frames, put_req=0, finished=False, req_ic=None):
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(n_frames)]
     tm.put_req_chunk[rid] = put_req
     return talker2code2wav_async_chunk(
         transfer_manager=tm,
         pooling_output={"audio_codes": torch.zeros((0,))},
-        request=_req(rid, finished=finished),
+        request=_req(rid, finished=finished, initial_codec_chunk_frames=req_ic),
         is_finished=finished,
     )
 
@@ -131,3 +138,17 @@ def test_streaming_decoding_with_variable_initial(config, state, expected):
         assert payload is not None
         assert payload["left_context_size"] == exp_ctx
         assert len(payload["code_predictor_codes"]) == _Q * exp_window
+
+
+def test_per_request_override_activates_initial_phase():
+    tm = _tm(initial_chunk=0)
+    payload = _call(tm, "r-override", n_frames=10, req_ic=10)
+    assert payload is not None
+    assert payload["left_context_size"] == 0
+    assert len(payload["code_predictor_codes"]) == _Q * 10
+
+
+def test_per_request_override_wins_over_stage_config():
+    tm = _tm(initial_chunk=5)
+    payload = _call(tm, "r-override2", n_frames=10, put_req=0, req_ic=15)
+    assert payload is None
