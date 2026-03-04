@@ -85,6 +85,11 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image3",
+        "hunyuan_image3",
+        "HunyuanImage3ForConditionalGeneration",
+    ),
 }
 
 
