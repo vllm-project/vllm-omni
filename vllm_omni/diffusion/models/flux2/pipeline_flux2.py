@@ -1017,10 +1017,6 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
         )
         self._num_timesteps = len(timesteps)
 
-        # handle guidance
-        guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
-        guidance = guidance.expand(latents.shape[0])
-
         # 7. Denoising loop
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
@@ -1042,18 +1038,22 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,  # (B, image_seq_len, C)
                 timestep=timestep / 1000,
-                guidance=guidance,
+                guidance=None,
                 encoder_hidden_states=prompt_embeds,
                 txt_ids=text_ids,  # B, text_seq_len, 4
                 img_ids=latent_image_ids,  # B, image_seq_len, 4
-                joint_attention_kwargs=self._attention_kwargs,
+                joint_attention_kwargs=self.attention_kwargs,
                 return_dict=False,
             )[0]
 
             noise_pred = noise_pred[:, : latents.size(1) :]
 
             # compute the previous noisy sample x_t -> x_t-1
+            latents_dtype = latents.dtype
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            if latents.dtype != latents_dtype and torch.backends.mps.is_available():
+                latents = latents.to(latents_dtype)
 
             if callback_on_step_end is not None:
                 callback_kwargs = {}
