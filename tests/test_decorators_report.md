@@ -17,10 +17,10 @@
 | benchmarks/patch/test_patch.py::test_text_latency_mixed_modalities | @pytest.mark.asyncio |
 | benchmarks/patch/test_patch.py::test_text_latency_value_consistency | @pytest.mark.asyncio |
 | benchmarks/test_serve_cli.py::test_bench_serve_chat | @pytest.mark.core_model \| @pytest.mark.benchmark \| @hardware_test(res={"cuda": "L4"}, num_cards=3) \| @pytest.mark.parametrize("omni_server", test_params, indirect=True) |
-| comfyui/test_comfyui_integration.py::test_image_generation_node | (无) |
-| comfyui/test_comfyui_integration.py::test_understanding_node | (无) |
-| comfyui/test_comfyui_integration.py::test_tts_nodes | (无) |
-| diffusion/attention/test_attention_sp.py::test_sequence_parallel | @pytest.mark.parametrize("ulysses_degree", [2]) \| @pytest.mark.parametrize("ring_degree", [2]) \| @pytest.mark.parametrize("batch_size", [2]) \| @pytest.mark.parametrize("seq_len", [16]) \| @pytest.mark.parametrize("num_heads", [8]) \| @pytest.mark.parametrize("head_size", [8]) \| @pytest.mark.parametrize("causal", [False]) \| @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # [torch.float16, torch.bfloat16] \| @pytest.mark.parametrize("use_sync", [False]) \| @pytest.mark.parametrize("dynamic", [False]) \| @pytest.mark.parametrize("use_compile", [False]) \| @pytest.mark.parametrize("attn_backend", ["sdpa", "flash_attn"]) |
+| comfyui/test_comfyui_integration.py::test_image_generation_node | @pytest.mark.asyncio \| @pytest.mark.parametrize(     "server_case,model,image_input",     [         pytest.param(             ServerCase(                 served_model="Tongyi-MAI/Z-Image-Turbo",                 stage_list=["diffusion"],                 stage_configs=[{"stage_type": "diffusion"}],                 outputs=[_build_diffusion_image_output_for_images_endpoint()],             ),             "Tongyi-MAI/Z-Image-Turbo",             False,             id="text-to-image-dalle-endpoint",         ),         pytest.param(             ServerCase(                 served_model="ByteDance-Seed/BAGEL-7B-MoT",                 stage_list=["diffusion"],                 stage_configs=[{"stage_type": "diffusion"}],                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],             ),             "ByteDance-Seed/BAGEL-7B-MoT",             False,             id="text-to-image-bagel-chat-endpoint",         ),         pytest.param(             ServerCase(                 served_model="Qwen/Qwen-Image-Edit",                 stage_list=["diffusion"],                 stage_configs=[{"stage_type": "diffusion"}],                 outputs=[_build_diffusion_image_output_for_images_endpoint()],             ),             "Qwen/Qwen-Image-Edit",             True,             id="image-to-image-dalle-endpoint",         ),         pytest.param(             ServerCase(                 served_model="ByteDance-Seed/BAGEL-7B-MoT",                 stage_list=["diffusion"],                 stage_configs=[{"stage_type": "diffusion"}],                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],             ),             "ByteDance-Seed/BAGEL-7B-MoT",             True,             id="image-to-image-bagel-chat-endpoint",         ),     ],     indirect=["server_case"], ) \| @pytest.mark.parametrize(     "sampling_case",     [         pytest.param(SamplingCase(kind=SamplingKind.IMAGE_NONE, sampling_params=None), id="no-sampling-params"),         pytest.param(             SamplingCase(kind=SamplingKind.IMAGE_DIFFUSION_SINGLE, sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS),             id="single-diffusion-sampling-params",         ),     ],     indirect=["sampling_case"], ) |
+| comfyui/test_comfyui_integration.py::test_understanding_node | @pytest.mark.asyncio \| @pytest.mark.parametrize(     "server_case",     [         pytest.param(             ServerCase(                 served_model="Qwen/Qwen2.5-Omni-7B",                 stage_list=[                     MagicMock(is_comprehension=True, model_stage="llm"),                     MagicMock(is_comprehension=False, model_stage="llm"),                     MagicMock(is_comprehension=False, model_stage="llm"),                 ],                 stage_configs=[                     {"stage_type": "llm"},                     {"stage_type": "llm"},                     {"stage_type": "llm"},                 ],                 outputs=[_build_audio_chat_output(), _build_text_output("Understanding response")],             ),             id="multimodal-understanding",         )     ],     indirect=["server_case"], ) \| @pytest.mark.parametrize(     "sampling_case",     [         pytest.param(SamplingCase(kind=SamplingKind.UNDERSTANDING_NONE, sampling_params=None), id="no-sampling-params"),         pytest.param(             SamplingCase(kind=SamplingKind.UNDERSTANDING_AR_LIST, sampling_params=AR_LIST_SAMPLING_PARAMS),             id="ar-sampling-params-list",         ),     ],     indirect=["sampling_case"], ) |
+| comfyui/test_comfyui_integration.py::test_tts_nodes | @pytest.mark.asyncio \| @pytest.mark.parametrize(     "server_case,node_cls,call_kwargs",     [         pytest.param(             ServerCase(                 served_model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",                 stage_list=["llm"],                 stage_configs=[{"stage_type": "llm"}],                 outputs=[_build_audio_speech_output()],             ),             VLLMOmniTTS,             {                 "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",                 "input": "Hello from TTS test",                 "voice": "Vivian",                 "response_format": "wav",                 "speed": 1.0,                 "model_specific_params": None,             },             id="tts",         ),         pytest.param(             ServerCase(                 served_model="Qwen/Qwen3-TTS-12Hz-1.7B-Base",                 stage_list=["llm"],                 stage_configs=[{"stage_type": "llm"}],                 outputs=[_build_audio_speech_output()],             ),             VLLMOmniVoiceClone,             {                 "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",                 "input": "Hello from voice clone test",                 "voice": "Vivian",                 "response_format": "wav",                 "speed": 1.0,                 "ref_audio": {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000},                 "ref_text": "Reference transcript",                 "x_vector_only_mode": False,                 "model_specific_params": None,             },             id="tts-voice-clone",         ),     ],     indirect=["server_case"], ) \| @pytest.mark.parametrize(     "sampling_case",     [         pytest.param(SamplingCase(kind=SamplingKind.TTS_NONE, sampling_params=None), id="no-sampling-params"),         pytest.param(             SamplingCase(kind=SamplingKind.TTS_DIFFUSION_SINGLE, sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS),             id="single-diffusion-sampling-params",         ),     ],     indirect=["sampling_case"], ) |
+| diffusion/attention/test_attention_sp.py::test_sequence_parallel | @pytest.mark.parametrize(     "test_model_cls",     [         TestMultiLayerAttentionModel,     ], ) \| @pytest.mark.parametrize("ulysses_degree", [2]) \| @pytest.mark.parametrize("ring_degree", [2]) \| @pytest.mark.parametrize("batch_size", [2]) \| @pytest.mark.parametrize("seq_len", [16]) \| @pytest.mark.parametrize("num_heads", [8]) \| @pytest.mark.parametrize("head_size", [8]) \| @pytest.mark.parametrize("causal", [False]) \| @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16]) \| @pytest.mark.parametrize("use_sync", [False]) \| @pytest.mark.parametrize("dynamic", [False]) \| @pytest.mark.parametrize("use_compile", [False]) \| @pytest.mark.parametrize("attn_backend", ["sdpa", "flash_attn"]) |
 | diffusion/attention/test_flash_attn.py::test_padding_equivalence | @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU") |
 | diffusion/attention/test_flash_attn.py::test_fa_vs_sdpa | @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU") |
 | diffusion/cache/test_cache_backends.py::test_init_with_dict | (无) |
@@ -61,7 +61,7 @@
 | diffusion/distributed/test_hsdp.py::test_from_dict_with_hsdp | (无) |
 | diffusion/distributed/test_hsdp.py::test_condition_matches_blocks | (无) |
 | diffusion/distributed/test_hsdp.py::test_model_with_shard_conditions | (无) |
-| diffusion/distributed/test_parallel_state_sp_groups.py::test_set_seq_parallel_pg_uses_explicit_sp_groups | (无) |
+| diffusion/distributed/test_parallel_state_sp_groups.py::test_set_seq_parallel_pg_uses_explicit_sp_groups | @pytest.mark.cpu \| @pytest.mark.parametrize(     "rank, expected_ulysses, expected_ring",     [         (0, [0, 2], [0]),         (1, [1, 3], [1]),         (2, [0, 2], [2]),         (3, [1, 3], [3]),     ], ) |
 | diffusion/distributed/test_parallel_state_sp_groups.py::test_set_seq_parallel_pg_validates_sp_group_ranks | @pytest.mark.cpu |
 | diffusion/distributed/test_sp_plan_hooks.py::test_valid_simple_plan | (无) |
 | diffusion/distributed/test_sp_plan_hooks.py::test_valid_partial_input_plan | (无) |
@@ -116,7 +116,7 @@
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_spatial_scale_factor_uses_block_out_channels_len_minus_1 | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_spatial_scale_factor_defaults_to_8_on_missing_or_empty | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_spatial_scale_factor_defaults_to_8_on_exception | (无) |
-| diffusion/distributed/test_vae_patch_parallel.py::test_factor_pp_grid | (无) |
+| diffusion/distributed/test_vae_patch_parallel.py::test_factor_pp_grid | @pytest.mark.parametrize(     ("pp_size", "expected"),     [         (0, (1, 1)),         (1, (1, 1)),         (2, (1, 2)),         (3, (1, 3)),         (4, (2, 2)),         (6, (2, 3)),         (8, (2, 4)),         (12, (3, 4)),         (16, (4, 4)),     ], ) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_world_rank_pp_size | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_out_channels_defaults_to_3 | (无) |
 | diffusion/distributed/test_vae_patch_parallel.py::test_get_vae_out_channels_reads_config | (无) |
@@ -139,7 +139,7 @@
 | diffusion/lora/test_lora_manager.py::test_lora_manager_applies_multiple_scales_correctly | (无) |
 | diffusion/lora/test_lora_manager.py::test_lora_manager_scales_correctly_with_rank_changes | (无) |
 | diffusion/lora/test_lora_manager.py::test_scale_keys_are_rounded | (无) |
-| diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_resolve_cfg_layout | (无) |
+| diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_resolve_cfg_layout | @pytest.mark.parametrize(     ("cfg", "cfg_img", "has_image_conditions", "expected_cfg_mult", "expected_cfg_img"),     [         (1.0, 1.0, False, 1, 1.0),         (7.5, 1.0, False, 2, 1.0),         (7.5, 8.0, False, 2, 1.0),         (7.5, 1.5, True, 3, 1.5),     ], ) |
 | diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_build_captions_ignores_image_cfg_without_image_conditions | (无) |
 | diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_build_captions_enables_three_way_cfg_when_image_conditions_exist | (无) |
 | diffusion/models/nextstep_1_1/test_nextstep_cfg_parallel_layout.py::test_decoding_non_parallel_uses_cfg_mult_for_sampling_and_duplication | (无) |
@@ -228,7 +228,7 @@
 | distributed/omni_connectors/test_basic_connectors.py::test_put_get_inline | (无) |
 | distributed/omni_connectors/test_basic_connectors.py::test_put_get_shm | (无) |
 | distributed/omni_connectors/test_basic_connectors.py::test_get_invalid_metadata | (无) |
-| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_create_connector_config_parsing | (无) |
+| distributed/omni_connectors/test_chunk_transfer_adapter.py::test_create_connector_config_parsing | @pytest.mark.parametrize(     ("raw_cfg", "expected_name", "expected_extra"),     [         (None, "SharedMemoryConnector", {}),         (SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}), "YuanrongConnector", {"k": "v"}),     ], ) |
 | distributed/omni_connectors/test_chunk_transfer_adapter.py::test_load_poll | (无) |
 | distributed/omni_connectors/test_chunk_transfer_adapter.py::test_save_async | (无) |
 | distributed/omni_connectors/test_chunk_transfer_adapter.py::test_update_request_payload | (无) |
@@ -245,7 +245,7 @@
 | distributed/omni_connectors/test_kv_flow.py::test_manager_extraction | (无) |
 | distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_tuple_layout | (无) |
 | distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_mismatched_kv_block_counts | (无) |
-| distributed/omni_connectors/test_kv_flow.py::test_normalize_layer_kv_rejects_invalid_inputs | (无) |
+| distributed/omni_connectors/test_kv_flow.py::test_normalize_layer_kv_rejects_invalid_inputs | @pytest.mark.parametrize(     "invalid_case",     ["invalid_stacked_shape", "invalid_tuple_length", "non_tensor_entries"], ) |
 | distributed/omni_connectors/test_kv_flow.py::test_manager_reception | (无) |
 | distributed/omni_connectors/test_kv_flow.py::test_integration_flow | (无) |
 | distributed/omni_connectors/test_kv_flow.py::test_manager_extraction_no_connector | (无) |
@@ -340,6 +340,7 @@
 | entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_finds_first_stage | (无) |
 | entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_finds_second_stage | (无) |
 | entrypoints/openai_api/test_serving_chat_sampling_params.py::test_get_comprehension_stage_index_raises_when_not_found | (无) |
+| entrypoints/openai_api/test_serving_speech.py::test_app | @pytest.fixture |
 | entrypoints/openai_api/test_serving_speech.py::test_stereo_to_mono_conversion | (无) |
 | entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment | (无) |
 | entrypoints/openai_api/test_serving_speech.py::test_unsupported_format_fallback | (无) |
@@ -347,7 +348,6 @@
 | entrypoints/openai_api/test_serving_speech.py::test_stereo_audio_preservation | (无) |
 | entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment_bypass | (无) |
 | entrypoints/openai_api/test_serving_speech.py::test_speed_adjustment_stereo_handling | (无) |
-| entrypoints/openai_api/test_serving_speech.py::test_app | @pytest.fixture |
 | entrypoints/openai_api/test_serving_speech.py::test_create_speech_success | (无) |
 | entrypoints/openai_api/test_serving_speech.py::test_create_speech_mp3_format | (无) |
 | entrypoints/openai_api/test_serving_speech.py::test_create_speech_invalid_format | (无) |
@@ -478,7 +478,6 @@
 | test_outputs.py::test_multimodal_output_property | (无) |
 | test_outputs.py::test_to_dict_diffusion | (无) |
 | test_outputs.py::test_to_dict_pipeline | (无) |
-| utils.py::test_multi_platform | (无) |
 | worker/test_gpu_generation_model_runner.py::test_sample_tokens_tensor_output | (无) |
 | worker/test_gpu_generation_model_runner.py::test_sample_tokens_list_output | (无) |
 | worker/test_gpu_generation_model_runner.py::test_sample_tokens_list_allows_none_output | (无) |
