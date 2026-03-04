@@ -552,10 +552,6 @@ class Flux2Transformer2DModel(nn.Module):
     """
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
-    }
 
     def __init__(
         self,
@@ -575,6 +571,7 @@ class Flux2Transformer2DModel(nn.Module):
         guidance_embeds: bool = True,
     ):
         super().__init__()
+        self.stacked_params_mapping = None
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.config = SimpleNamespace(
@@ -724,13 +721,15 @@ class Flux2Transformer2DModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
+            (".to_qkv.", ".to_q.", "q"),
+            (".to_qkv.", ".to_k.", "k"),
+            (".to_qkv.", ".to_v.", "v"),
             (".add_kv_proj", ".add_q_proj", "q"),
             (".add_kv_proj", ".add_k_proj", "k"),
             (".add_kv_proj", ".add_v_proj", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 
@@ -740,25 +739,32 @@ class Flux2Transformer2DModel(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if "to_qkvkv_mlp_proj" in name:
-                name = name.replace("to_qkvkv_mlp_proj", "to_qkv_mlp_proj")
-            if "to_qkv_mlp_proj" in name:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-                continue
+            original_name = name
+            mapped = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in original_name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                name = original_name.replace(weight_name, param_name)
+                param = params_dict.get(name)
+                if param is None:
+                    break
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                mapped = True
                 break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+            if mapped:
+                continue
+
+            name = original_name
+            if name not in params_dict and ".to_out.0." in name:
+                name = name.replace(".to_out.0.", ".to_out.")
+            # Some GGUF checkpoints include quantized tensors for modules that
+            # are intentionally left unquantized in this model.
+            param = params_dict.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
