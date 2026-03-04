@@ -22,8 +22,8 @@ def collect_decorators_and_tests(file_path: Path) -> list[tuple[str, list[str]]]
     result = []
 
     for i, line in enumerate(lines):
-        # 匹配 def test_xxx 或类内的 def test_xxx
-        m = re.match(r"^(\s*)def (test_\w+)\s*\(", line)
+        # 匹配 def test_xxx / async def test_xxx（包括类内方法）
+        m = re.match(r"^(\s*)(?:async\s+)?def (test_\w+)\s*\(", line)
         if not m:
             continue
         indent, func_name = m.group(1), m.group(2)

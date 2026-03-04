@@ -2,9 +2,24 @@
 
 | 用例 (文件::函数名) | 修饰器 |
 | --- | --- |
+| benchmarks/patch/test_patch.py::test_output_tokens_assigned_with_metrics | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_output_tokens_not_assigned_without_metrics | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_output_tokens_assigned_multiple_metrics | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_output_tokens_with_audio_and_text | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_output_tokens_with_missing_num_tokens_out | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_output_tokens_initialization | @pytest.mark.asyncio |
 | benchmarks/patch/test_patch.py::test_mix_request_func_output_has_text_latency | (无) |
 | benchmarks/patch/test_patch.py::test_text_latency_initial_value | (无) |
+| benchmarks/patch/test_patch.py::test_text_latency_assigned_with_text_response | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_text_latency_updated_with_multiple_text_chunks | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_text_latency_with_only_audio_response | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_text_latency_not_affected_by_metrics | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_text_latency_mixed_modalities | @pytest.mark.asyncio |
+| benchmarks/patch/test_patch.py::test_text_latency_value_consistency | @pytest.mark.asyncio |
 | benchmarks/test_serve_cli.py::test_bench_serve_chat | @pytest.mark.core_model \| @pytest.mark.benchmark \| @hardware_test(res={"cuda": "L4"}, num_cards=3) \| @pytest.mark.parametrize("omni_server", test_params, indirect=True) |
+| comfyui/test_comfyui_integration.py::test_image_generation_node | (无) |
+| comfyui/test_comfyui_integration.py::test_understanding_node | (无) |
+| comfyui/test_comfyui_integration.py::test_tts_nodes | (无) |
 | diffusion/attention/test_attention_sp.py::test_sequence_parallel | @pytest.mark.parametrize("ulysses_degree", [2]) \| @pytest.mark.parametrize("ring_degree", [2]) \| @pytest.mark.parametrize("batch_size", [2]) \| @pytest.mark.parametrize("seq_len", [16]) \| @pytest.mark.parametrize("num_heads", [8]) \| @pytest.mark.parametrize("head_size", [8]) \| @pytest.mark.parametrize("causal", [False]) \| @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # [torch.float16, torch.bfloat16] \| @pytest.mark.parametrize("use_sync", [False]) \| @pytest.mark.parametrize("dynamic", [False]) \| @pytest.mark.parametrize("use_compile", [False]) \| @pytest.mark.parametrize("attn_backend", ["sdpa", "flash_attn"]) |
 | diffusion/attention/test_flash_attn.py::test_padding_equivalence | @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU") |
 | diffusion/attention/test_flash_attn.py::test_fa_vs_sdpa | @pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU") |
@@ -270,6 +285,7 @@
 | distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_large_tensor_500mb | (无) |
 | distributed/omni_connectors/test_mooncake_transfer_engine_rdma.py::test_rapid_alloc_free_cycle | (无) |
 | distributed/omni_connectors/test_omni_connector_configs.py::test_load_qwen_yaml_configs | @pytest.mark.skipif(len(config_files) == 0, reason="No config files found or directory missing") \| @pytest.mark.parametrize("yaml_file", config_files, ids=lambda p: p.name) |
+| engine/test_async_omni_engine_abort.py::test_abort | @pytest.mark.core_model \| @pytest.mark.omni \| @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1) \| @pytest.mark.asyncio |
 | entrypoints/openai_api/test_image_server.py::test_parse_size_valid | (无) |
 | entrypoints/openai_api/test_image_server.py::test_parse_size_invalid | (无) |
 | entrypoints/openai_api/test_image_server.py::test_parse_size_negative | (无) |
