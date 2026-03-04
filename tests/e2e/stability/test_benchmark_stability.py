@@ -60,7 +60,7 @@ def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str
         test_name = config["test_name"]
         model = config["server_params"]["model"]
         stage_config_name = config["server_params"]["stage_config_name"]
-        stage_config_path = str(STAGE_CONFIGS_DIR / stage_config_name)  # stability 使用本目录 stage_configs
+        stage_config_path = str(STAGE_CONFIGS_DIR / stage_config_name)
         delete = config["server_params"].get("delete", None)
         update = config["server_params"].get("update", None)
         stage_config_path = modify_stage(stage_config_path, update, delete)
