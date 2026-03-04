@@ -244,12 +244,12 @@ def get_hunyuan_image_3_pre_process_func(
 
         return _joint_image_info_to_payload(
             JointImageInfo(
-            vae_image_info=vae_info,
-            vision_image_info=vit_info,
-            vision_encoder_kwargs={
-                "spatial_shapes": spatial_shapes,
-                "pixel_attention_mask": pixel_attention_mask,
-            },
+                vae_image_info=vae_info,
+                vision_image_info=vit_info,
+                vision_encoder_kwargs={
+                    "spatial_shapes": spatial_shapes,
+                    "pixel_attention_mask": pixel_attention_mask,
+                },
             )
         )
 
@@ -263,9 +263,7 @@ def get_hunyuan_image_3_pre_process_func(
 
             multi_modal_data = prompt.get("multi_modal_data") or {}
             raw_images = multi_modal_data.get("image")
-            has_images = raw_images is not None and (
-                not isinstance(raw_images, list) or len(raw_images) > 0
-            )
+            has_images = raw_images is not None and (not isinstance(raw_images, list) or len(raw_images) > 0)
             if has_images:
                 image_list = raw_images if isinstance(raw_images, list) else [raw_images]
                 cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
@@ -750,9 +748,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
                 assert isinstance(batch_cond_image_info, list) and len(batch_cond_image_info) == batch_size, (
                     "`batch_cond_image_info` should be a list with the same batch size as `prompt`."
                 )
-                batch_cond_image_info = [
-                    cond if isinstance(cond, list) else [cond] for cond in batch_cond_image_info
-                ]
+                batch_cond_image_info = [cond if isinstance(cond, list) else [cond] for cond in batch_cond_image_info]
 
         #   -- 2.3 seed
         generator = kwargs.get("generator", None)
@@ -1229,7 +1225,9 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
                 batch_cond_image_info.append([_joint_image_info_from_payload(item) for item in prompt_cond_infos])
             has_cond_image = [len(cond_infos) > 0 for cond_infos in batch_cond_image_info]
             if any(has_cond_image) and not all(has_cond_image):
-                raise ValueError("When batching Hunyuan image editing requests, every prompt must include input image(s).")
+                raise ValueError(
+                    "When batching Hunyuan image editing requests, every prompt must include input image(s)."
+                )
             if not any(has_cond_image):
                 batch_cond_image_info = None
 
