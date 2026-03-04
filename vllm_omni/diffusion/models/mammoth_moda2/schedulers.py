@@ -112,7 +112,8 @@ class FlowMatchEulerDiscreteScheduler:
     ) -> FlowMatchEulerDiscreteSchedulerOutput | tuple[torch.FloatTensor]:
         if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
             raise ValueError(
-                "不支持传入整数 timestep（例如 enumerate 的 index）；请传入 `scheduler.timesteps` 中的值。",
+                "Integer timesteps (e.g. a loop index from enumerate) are not supported; "
+                "pass a value from `scheduler.timesteps` instead.",
             )
 
         if self.step_index is None:
