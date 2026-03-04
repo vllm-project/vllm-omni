@@ -93,19 +93,70 @@ def _merge_batch_results(batch_results: list[dict[str, Any]], total_duration_sec
     if not batch_results:
         return {"completed": 0, "failed": 0, "duration": total_duration_sec}
 
-    merged = {
-        "completed": sum(r.get("completed", 0) for r in batch_results),
-        "failed": sum(r.get("failed", 0) for r in batch_results),
+    completed = sum(r.get("completed", 0) for r in batch_results)
+    failed = sum(r.get("failed", 0) for r in batch_results)
+    total_input_tokens = sum(r.get("total_input_tokens", 0) for r in batch_results)
+    total_output_tokens = sum(r.get("total_output_tokens", 0) for r in batch_results)
+    total_audio_duration_s = sum(r.get("total_audio_duration_s", 0.0) for r in batch_results)
+    total_audio_frames = sum(r.get("total_audio_frames", 0) for r in batch_results)
+
+    dur = float(total_duration_sec) or 0.0
+    request_throughput = completed / dur if dur > 0 else 0.0
+    output_throughput = total_output_tokens / dur if dur > 0 else 0.0
+    total_token_throughput = (total_input_tokens + total_output_tokens) / dur if dur > 0 else 0.0
+    audio_throughput = total_audio_duration_s / dur if dur > 0 else 0.0
+
+    merged: dict[str, Any] = {
+        "completed": completed,
+        "failed": failed,
         "duration": total_duration_sec,
         "errors": [],
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "request_throughput": request_throughput,
+        "output_throughput": output_throughput,
+        "total_token_throughput": total_token_throughput,
+        "total_audio_duration_s": total_audio_duration_s,
+        "total_audio_frames": total_audio_frames,
+        "audio_throughput": audio_throughput,
     }
     for r in batch_results:
         merged["errors"].extend(r.get("errors") or [])
-    # 保留首轮其它字段便于查看（可选）
-    for key in ("request_throughput", "output_throughput", "total_input_tokens", "total_output_tokens"):
-        if key in batch_results[0]:
-            merged[key] = batch_results[0].get(key)
     return merged
+
+
+def _print_merged_report(result: dict[str, Any]) -> None:
+    """以与单轮 benchmark 相同风格打印汇总结果。"""
+    fmt = "{:<40} {:<10}"
+
+    completed = result.get("completed", 0)
+    failed = result.get("failed", 0)
+    duration = float(result.get("duration", 0.0) or 0.0)
+    total_input_tokens = result.get("total_input_tokens", 0)
+    total_output_tokens = result.get("total_output_tokens", 0)
+    request_throughput = result.get("request_throughput", 0.0)
+    output_throughput = result.get("output_throughput", 0.0)
+    total_token_throughput = result.get("total_token_throughput", 0.0)
+    total_audio_duration_s = result.get("total_audio_duration_s", 0.0)
+    total_audio_frames = result.get("total_audio_frames", 0)
+    audio_throughput = result.get("audio_throughput", 0.0)
+
+    print("\n ============ Serving Benchmark Result (Merged) ===========")
+    print(fmt.format("Successful requests:", completed))
+    print(fmt.format("Failed requests:", failed))
+    print(fmt.format("Benchmark duration (s):", f"{duration:.2f}"))
+
+    print(" ================== Text Result (Merged) ==================")
+    print(fmt.format("Total input tokens:", total_input_tokens))
+    print(fmt.format("Total generated tokens:", total_output_tokens))
+    print(fmt.format("Output token throughput (tok/s):", f"{output_throughput:.2f}"))
+    print(fmt.format("Total Token throughput (tok/s):", f"{total_token_throughput:.2f}"))
+
+    print(" ================== Audio Result (Merged) =================")
+    print(fmt.format("Total audio duration generated(s):", f"{total_audio_duration_s:.2f}"))
+    print(fmt.format("Total audio frames generated:", total_audio_frames))
+    print(fmt.format("Audio throughput(audio duration/s):", f"{audio_throughput:.2f}"))
+    print(" ==========================================================\n")
 
 
 def run_stability_benchmark(
@@ -162,6 +213,8 @@ def run_stability_benchmark(
 
     total_duration = time.perf_counter() - start_time
     merged = _merge_batch_results(batch_results, total_duration)
+
+    _print_merged_report(merged)
 
     if result_filename and result_dir:
         result_path = Path(result_dir) / result_filename
