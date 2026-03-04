@@ -110,13 +110,15 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
     parser.add_argument(
-        "--log-stats",
-        action="store_true",
-        help="Enable vLLM-Omni statistics logging.",
         "--vae-patch-parallel-size",
         type=int,
         default=1,
         help="Number of GPUs used for VAE patch/tile parallelism (decode).",
+    )
+    parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        help="Enable vLLM-Omni statistics logging.",
     )
     return parser.parse_args()
 
