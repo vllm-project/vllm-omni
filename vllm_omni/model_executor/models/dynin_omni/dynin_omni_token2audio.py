@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import tempfile
+from collections.abc import Iterable
+from typing import Any
+
+import torch
+import torch.nn as nn
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
+
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+from .dynin_omni_common import (
+    DETOK_AUDIO,
+    first_value,
+    get_runtime_info,
+    resolve_hidden_size,
+    resolve_dynin_infer_sources,
+    to_token_1d,
+)
+
+logger = init_logger(__name__)
+
+
+class DyninOmniToken2Audio(nn.Module):
+    """Stage-3: token detokenization to speech (or pass-through)."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        del prefix
+        super().__init__()
+        self.vllm_config = vllm_config
+        self.have_multimodal_outputs = True
+        self.requires_raw_input_tokens = True
+        self.hidden_size = resolve_hidden_size(vllm_config=vllm_config)
+        self._vq_audio = None
+        self._vq_audio_path: str | None = None
+        self._vq_audio_local_files_only: bool | None = None
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        del positions, intermediate_tensors, inputs_embeds
+        if input_ids is None:
+            raise ValueError("token2audio stage requires input_ids")
+
+        runtime_info = get_runtime_info(kwargs.get("runtime_additional_information"))
+        detok_id = int(first_value(runtime_info.get("detok_id"), 0))
+        tokens = to_token_1d(input_ids)
+
+        if detok_id != DETOK_AUDIO:
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "token_ids": tokens,
+                    "detok_id": torch.tensor([detok_id], dtype=torch.long, device=tokens.device),
+                },
+            )
+
+        audio, sample_rate = self._decode_audio_tokens(tokens, runtime_info=runtime_info)
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={
+                "speech": audio,
+                "audio": audio,
+                "sr": torch.tensor([sample_rate], dtype=torch.int, device=audio.device),
+                "detok_id": torch.tensor([detok_id], dtype=torch.long, device=audio.device),
+            },
+        )
+
+    def _decode_audio_tokens(self, tokens: torch.Tensor, runtime_info: dict[str, Any]) -> tuple[torch.Tensor, int]:
+        # Follow DYNIN validation path:
+        #   token list -> "<|speech_x|>" string -> vq_model_audio.decode(...).
+        vq_audio = self._ensure_vq_audio(runtime_info=runtime_info, ref_device=tokens.device)
+
+        audio_codebook_size = int(first_value(runtime_info.get("audio_codebook_size"), 4096))
+        audio_vocab_offset = first_value(
+            runtime_info.get("audio_vocab_offset"),
+            first_value(runtime_info.get("t2s_vocab_start"), None),
+        )
+
+        token_ids = tokens.to(torch.long)
+        if audio_vocab_offset is not None:
+            off = int(audio_vocab_offset)
+            token_ids = torch.where(token_ids >= off, token_ids - off, token_ids)
+        token_ids = token_ids[(token_ids >= 0) & (token_ids < audio_codebook_size)]
+        if token_ids.numel() == 0:
+            raise RuntimeError("Audio detokenizer got no valid audio token ids.")
+
+        speech_unit_str = " ".join(map(str, token_ids.detach().cpu().tolist()))
+        speech_unit_for_decode = "".join(f"<|speech_{unit}|>" for unit in speech_unit_str.split(" ") if unit != "")
+
+        condition = first_value(
+            runtime_info.get("condition"),
+            first_value(runtime_info.get("t2s_condition"), None),
+        )
+        output_wav_file = first_value(runtime_info.get("output_wav_file"), None)
+        created_tmp = False
+        if output_wav_file is None:
+            fd, tmp_wav = tempfile.mkstemp(prefix="dynin_t2s_", suffix=".wav")
+            try:
+                import os
+
+                os.close(fd)
+            except Exception:
+                pass
+            output_wav_file = tmp_wav
+            created_tmp = True
+
+        audio_array = vq_audio.decode(speech_unit_for_decode, condition=condition, output_wav_file=output_wav_file)
+        if created_tmp:
+            try:
+                import os
+
+                os.remove(output_wav_file)
+            except Exception:
+                pass
+        if not isinstance(audio_array, torch.Tensor):
+            audio_array = torch.as_tensor(audio_array, dtype=torch.float32, device=tokens.device)
+        else:
+            audio_array = audio_array.to(device=tokens.device, dtype=torch.float32)
+
+        if audio_array.ndim > 1:
+            audio_array = audio_array.reshape(-1)
+        audio_array = audio_array.contiguous()
+
+        sample_rate = int(first_value(runtime_info.get("sr"), first_value(runtime_info.get("sample_rate"), 24000)))
+        try:
+            cfg = getattr(vq_audio, "u2s_config", None)
+            cfg_sr = getattr(cfg, "sampling_rate", None)
+            if cfg_sr is None:
+                cfg_sr = getattr(getattr(cfg, "data", None), "sampling_rate", None)
+            if cfg_sr is not None:
+                sample_rate = int(cfg_sr)
+        except Exception:
+            pass
+        return audio_array, sample_rate
+
+    def _ensure_vq_audio(self, runtime_info: dict[str, Any], ref_device: torch.device) -> Any:
+        sources = resolve_dynin_infer_sources(vllm_config=self.vllm_config, runtime_info=runtime_info)
+        model_path = str(sources.vq_audio_source)
+        local_files_only = bool(sources.vq_audio_local_files_only)
+        if (
+            self._vq_audio is None
+            or self._vq_audio_path != model_path
+            or self._vq_audio_local_files_only != local_files_only
+        ):
+            logger.info(
+                "Loading DYNIN audio detokenizer from %s (local_files_only=%s)",
+                model_path,
+                local_files_only,
+            )
+            try:
+                from .models.speech.modeling_emova_speech_tokenizer import EMOVASpeechTokenizer
+
+                try:
+                    self._vq_audio = EMOVASpeechTokenizer.from_pretrained(
+                        model_path,
+                        local_files_only=local_files_only,
+                        low_cpu_mem_usage=False,
+                    )
+                except TypeError:
+                    try:
+                        self._vq_audio = EMOVASpeechTokenizer.from_pretrained(
+                            model_path,
+                            local_files_only=local_files_only,
+                        )
+                    except TypeError:
+                        self._vq_audio = EMOVASpeechTokenizer.from_pretrained(model_path)
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to load EMOVASpeechTokenizer from local DYNIN submodel implementation "
+                    f"for model path '{model_path}'."
+                ) from e
+            self._vq_audio.eval()
+            self._vq_audio.requires_grad_(False)
+            self._vq_audio_path = model_path
+            self._vq_audio_local_files_only = local_files_only
+        if hasattr(self._vq_audio, "to"):
+            self._vq_audio = self._vq_audio.to(ref_device)
+        return self._vq_audio
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        del batch_size, dtype, device
+        return IntermediateTensors({})
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Any = None,
+        is_multimodal: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del multimodal_embeddings, is_multimodal, kwargs
+        hidden_size = self.hidden_size
+        if input_ids.ndim == 0:
+            return torch.zeros(
+                (1, hidden_size),
+                dtype=torch.bfloat16,
+                device=input_ids.device,
+            )
+        if input_ids.ndim == 1:
+            return torch.zeros(
+                (input_ids.shape[0], hidden_size),
+                dtype=torch.bfloat16,
+                device=input_ids.device,
+            )
+        if input_ids.ndim == 2:
+            return torch.zeros(
+                (input_ids.shape[0], input_ids.shape[1], hidden_size),
+                dtype=torch.bfloat16,
+                device=input_ids.device,
+            )
+        raise ValueError(f"Unsupported input_ids rank for Dynin token2audio: {input_ids.ndim}")
+
+    def embed_multimodal(self, **kwargs: Any) -> Any:
+        del kwargs
+        return None
+
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> set[str]:
+        loaded_params: set[str] = set()
+        for name, _ in weights:
+            loaded_params.add(name)
+        return loaded_params
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor | OmniOutput,
+        sampling_metadata: Any = None,
+    ) -> torch.Tensor | None:
+        del hidden_states, sampling_metadata
+        return None
