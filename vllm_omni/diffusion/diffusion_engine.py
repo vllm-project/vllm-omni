@@ -102,6 +102,7 @@ class DiffusionEngine:
         if not isinstance(outputs, list):
             outputs = [outputs] if outputs is not None else []
 
+
         metrics = {
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),

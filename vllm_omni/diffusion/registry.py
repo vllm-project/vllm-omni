@@ -289,6 +289,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
+    "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
 }
 
 

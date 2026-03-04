@@ -730,6 +730,9 @@ class LightProjector(nn.Module):
 
         self.layers = modules
 
+    def forward(self, x):
+        return self.layers(x)
+
 
 class HunYuanRotary2DEmbedder:
     r"""
