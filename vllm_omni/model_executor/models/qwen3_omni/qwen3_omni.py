@@ -857,7 +857,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_prefill_embed = info_dict.get("thinker_embeddings", None)
         thinker_decode_embed_list = info_dict.get("thinker_decode_embeddings_list", None)
         start_index = info_dict.get("num_processed_tokens", 0) - thinker_prefill_embed.shape[0]
-        if start_index >= +len(thinker_decode_embed_list):
+        if start_index >= len(thinker_decode_embed_list):
             if info_dict.get("finished_flag"):
                 return self.tts_pad_embed.to(device)
             update_dict["finished_flag"] = True
