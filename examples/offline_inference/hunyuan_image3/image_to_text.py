@@ -32,13 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image",
         type=str,
-        default="./image.png",
+        required=True,
         help="Path to input image file (PNG, JPG, etc.).",
     )
     parser.add_argument(
         "--prompt",
         type=str,
-        default="<|startoftext|>You are an assistant that understands images and outputs text.<img>Identify the animal in this image and describe this animal's characteristics in the image.",
+        required=True,
         help="Pretrain template prompt: <|startoftext|>{system}<img>{question}",
     )
     return parser.parse_args()
