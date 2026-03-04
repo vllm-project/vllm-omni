@@ -134,11 +134,11 @@ def thinker2talker_async_chunk(
         output_token_ids = _ensure_list(output_token_ids)
 
         talker_additional_info = {
-            "thinker_embeddings": pooling_output.get("0").detach().cpu(),
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
-
-        if not output_token_ids:
+        if output_token_ids:
+            talker_additional_info["thinker_decode_embeddings_list"] = [pooling_output.get("0").detach().cpu()]
+        else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
             talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
     return talker_additional_info
