@@ -349,13 +349,13 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", language="InvalidLang")
         assert "Invalid language" in speech_server._validate_tts_request(req)
 
-        # When no speakers loaded, any voice is accepted (unconstrained)
+        # CustomVoice on model with no speakers -> rejected
         req = OpenAICreateSpeechRequest(input="Hello", voice="Invalid")
-        assert speech_server._validate_tts_request(req) is None
+        assert "does not support CustomVoice" in speech_server._validate_tts_request(req)
 
-        # Valid request
-        req = OpenAICreateSpeechRequest(input="Hello", voice="Vivian")
-        assert speech_server._validate_tts_request(req) is None
+        # CustomVoice without voice on model with no speakers -> also rejected
+        req = OpenAICreateSpeechRequest(input="Hello")
+        assert "does not support CustomVoice" in speech_server._validate_tts_request(req)
 
     def test_validate_tts_request_task_types(self, speech_server):
         """Test task-specific validation."""
@@ -367,9 +367,43 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", task_type="VoiceDesign")
         assert "instructions" in speech_server._validate_tts_request(req)
 
-        # ref_text only for Base
+        # ref_text without task_type auto-infers Base, then fails on missing ref_audio
         req = OpenAICreateSpeechRequest(input="Hello", ref_text="text")
-        assert "Base task" in speech_server._validate_tts_request(req)
+        assert "ref_audio" in speech_server._validate_tts_request(req)
+
+    def test_validate_tts_request_auto_infer_base(self, speech_server):
+        """Test auto-inference of Base task when ref_audio/ref_text is provided."""
+        # ref_audio without task_type -> infers Base, requires non-empty ref_text
+        req = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        result = speech_server._validate_tts_request(req)
+        assert "ref_text" in result
+        assert req.task_type == "Base"
+
+        # ref_text without task_type -> infers Base, requires ref_audio
+        req = OpenAICreateSpeechRequest(input="Hello", ref_text="some text")
+        result = speech_server._validate_tts_request(req)
+        assert "ref_audio" in result
+        assert req.task_type == "Base"
+
+    def test_validate_tts_request_base_empty_ref_text(self, speech_server):
+        """Empty ref_text on Base task returns 400 instead of crashing engine."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello", task_type="Base", ref_audio="data:audio/wav;base64,abc", ref_text=""
+        )
+        result = speech_server._validate_tts_request(req)
+        assert "non-empty 'ref_text'" in result
+
+        # x_vector_only_mode bypasses ref_text requirement
+        req = OpenAICreateSpeechRequest(
+            input="Hello", task_type="Base", ref_audio="data:audio/wav;base64,abc", ref_text="", x_vector_only_mode=True
+        )
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_validate_tts_request_customvoice_no_speakers(self, speech_server):
+        """CustomVoice on a model with no speakers returns 400 instead of crashing engine."""
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
+        result = speech_server._validate_tts_request(req)
+        assert "does not support CustomVoice" in result
 
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
