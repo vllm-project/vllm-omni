@@ -509,6 +509,8 @@ class LongCatImageTransformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
+    _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,

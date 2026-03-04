@@ -544,6 +544,8 @@ class GlmImageTransformer2DModel(CachedTransformer):
             `od_config.tf_model_config`.
     """
 
+    _repeated_blocks = ["GlmImageTransformerBlock"]
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
