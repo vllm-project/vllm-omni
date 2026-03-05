@@ -49,7 +49,7 @@ steps:
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
-      - python tools/nightly/buildkite_testcase_statistics.py
+      - python tools/nightly/buildkite_testcase_statistics.py -o tests/buildkite_testcase_statistics.html
       - buildkite-agent artifact upload "tests/*.html"
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
@@ -57,7 +57,6 @@ steps:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
-          shm-size: "8gb"
           propagate-environment: true
           shm-size: "8gb"
           environment:
@@ -117,7 +116,7 @@ steps:
       - buildkite-agent artifact download "tests/*.json" . --step nightly-performance
       - buildkite-agent artifact download "tests/*.html" . --step nightly-testcase-statistics
       - python tools/nightly/generate_nightly_perf_excel.py
-      - python tools/nightly/send_nightly_email.py --report-file "reports/*.xlsx, reports/*.html"
+      - python tools/nightly/send_nightly_email.py --report-file "tests/*.xlsx, tests/*.html"
       - buildkite-agent artifact upload "tests/*.xlsx"
     agents:
       queue: "cpu_queue_premerge"
