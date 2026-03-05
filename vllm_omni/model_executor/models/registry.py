@@ -52,6 +52,11 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    "CosyVoice3Model": (
+        "cosyvoice3",
+        "cosyvoice3",
+        "CosyVoice3Model",
+    ),
     "MammothModa2Qwen2ForCausalLM": (
         "mammoth_moda2",
         "mammoth_moda2",
