@@ -146,6 +146,7 @@ def thinker2talker_async_chunk(
             talker_additional_info["thinker_output_token_ids"] = output_token_ids
         else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
+            talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
             talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
     return talker_additional_info
 
