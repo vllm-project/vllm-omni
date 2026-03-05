@@ -855,7 +855,13 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
             )
         return base_server.create_error_response(message="The model does not support Speech API")
     try:
-        return await handler.create_speech(request, raw_request)
+        result = await handler.create_speech(request, raw_request)
+        if isinstance(result, ErrorResponse):
+            return JSONResponse(
+                content=result.model_dump(),
+                status_code=result.error.code if result.error else 400,
+            )
+        return result
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
