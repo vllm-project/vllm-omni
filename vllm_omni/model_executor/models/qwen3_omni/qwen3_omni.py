@@ -591,7 +591,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         else:
             # decode
             if not info_dict.get("decode_flag", False):
-                info_dict["num_processed_tokens"] = len(info_dict.get("thinker_input_ids", [])) + 1
+                info_dict["num_processed_tokens"] = 0
                 update_dict["decode_flag"] = True
 
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
@@ -661,7 +661,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         start_index = info_dict.get("num_processed_tokens", 0)
         end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill
-        thinker_sequence_embeds = info_dict.get("thinker_embeddings").to(
+        thinker_sequence_embeds = info_dict.get("thinker_prefill_embeddings").to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )  # Tensor [P,H]
         thinker_hidden_states = info_dict.get("thinker_hidden_states").to(
@@ -691,7 +691,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         if thinker_sequence_embeds is None or thinker_hidden_states is None:
             raise ValueError(
                 "additional_information_by_req_id must include "
-                "'thinker_embeddings' and 'thinker_hidden_states' for talker prefill."
+                "'thinker_prefill_embeddings' and 'thinker_hidden_states' for talker prefill."
             )
 
         # Normalize to tensors
@@ -854,16 +854,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
-        thinker_prefill_embed = info_dict.get("thinker_embeddings", None)
-        thinker_decode_embed_list = info_dict.get("thinker_decode_embeddings_list", None)
-        start_index = info_dict.get("num_processed_tokens", 0) - thinker_prefill_embed.shape[0]
-        if start_index >= len(thinker_decode_embed_list):
+        thinker_decode_embed = info_dict.get("thinker_decode_embeddings", None)
+        start_index = info_dict.get("num_processed_tokens", 0)
+        thinker_output_token_ids = info_dict.get("thinker_output_token_ids", [])
+        if start_index >= len(thinker_output_token_ids):
             if info_dict.get("finished_flag"):
                 return self.tts_pad_embed.to(device)
             update_dict["finished_flag"] = True
             return self.tts_eos_embed.to(device)
 
-        thinker_embed = thinker_decode_embed_list[start_index].to(device)
+        thinker_embed = thinker_decode_embed.to(device)
         return self.talker.text_projection(thinker_embed).to(device)
 
     def talker_preprocess_decode(
