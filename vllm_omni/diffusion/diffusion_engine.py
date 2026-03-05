@@ -110,7 +110,7 @@ class DiffusionEngine:
         metrics = {
             "preprocess_time_ms": preprocess_time * 1000,
             "diffusion_engine_exec_time_ms": (time.time() - diffusion_engine_start_time) * 1000,
-            "executor_time_ms": exec_total_time * 1000,
+            "diffusion_engine_total_time_ms": exec_total_time * 1000,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
         }
