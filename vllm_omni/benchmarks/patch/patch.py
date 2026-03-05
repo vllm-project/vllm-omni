@@ -338,15 +338,6 @@ async def benchmark(
     except KeyError:
         raise ValueError(f"Unknown backend: {endpoint_type}") from None
 
-    # 长稳用例：超过此时长（秒）后不再发起新请求，已发出的请求会等其完成
-    max_duration_sec: float | None = None
-    try:
-        _s = os.environ.get("VLLM_BENCH_MAX_DURATION_SEC", "")
-        if _s:
-            max_duration_sec = float(_s)
-    except ValueError:
-        pass
-
     # Reuses connections across requests to reduce TLS handshake overhead.
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
     connector = aiohttp.TCPConnector(
@@ -498,8 +489,6 @@ async def benchmark(
         ramp_up_start_rps,
         ramp_up_end_rps,
     ):
-        if max_duration_sec is not None and (time.perf_counter() - benchmark_start_time) >= max_duration_sec:
-            break
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
             if current_int_rps > last_int_rps:
