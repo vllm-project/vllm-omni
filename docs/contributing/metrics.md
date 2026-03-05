@@ -199,7 +199,7 @@ For each edge:
 
 - preprocess_time_ms: Time spent on input preprocessing
 - diffusion_engine_exec_time_ms: Pure model execution time
-- postprocess_time_ms: Time spent on output postprocessing 
+- postprocess_time_ms: Time spent on output postprocessing
 - diffusion_engine_total_time_ms: Total time spent in the diffusion engine
 
 so `diffusion_engine_total_time_ms` = `diffusion_engine_exec_time_ms` + `preprocess_time_ms` + `postprocess_time_ms`
