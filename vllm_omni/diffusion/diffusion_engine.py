@@ -119,7 +119,7 @@ class DiffusionEngine:
             metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
         # Handle single request or multiple requests
-        metrics["postprocess_time_ms"] = postprocess_time * 1000,
+        metrics["postprocess_time_ms"] = postprocess_time * 1000
         metrics["num_inference_steps"] = int(request.sampling_params.num_inference_steps)
 
         if len(request.prompts) == 1:
