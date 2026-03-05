@@ -74,6 +74,7 @@ The following table shows which models are currently supported by each accelerat
 | Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel | HSDP | VAE-Patch-Parallel |
 |-------|------------------|:--------:|:---------:|:----------:|:--------------:|:------------:|:----:|:----:|
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **LTX-2** | `Lightricks/LTX-2` | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 ### Quantization
 

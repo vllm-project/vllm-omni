@@ -194,6 +194,13 @@ class OmniServeCommand(CLISubcommand):
             help="Number of GPUs to use for diffusion model inference.",
         )
         omni_config_group.add_argument(
+            "--model-class-name",
+            dest="model_class_name",
+            type=str,
+            default=None,
+            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",

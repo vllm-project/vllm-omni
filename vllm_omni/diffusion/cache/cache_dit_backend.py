@@ -414,6 +414,60 @@ def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], No
     return refresh_cache_context
 
 
+def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for LTX2 pipelines (audio-video transformer blocks)."""
+    transformer = pipeline.transformer
+
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator_config = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    blocks = transformer.transformer_blocks
+
+    logger.info(
+        f"Enabling cache-dit on LTX2 transformer: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
+    )
+
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=transformer,
+            blocks=blocks,
+            # LTX2 blocks return (hidden_states, audio_hidden_states)
+            forward_pattern=ForwardPattern.Pattern_0,
+            # Treat audio_hidden_states as encoder_hidden_states in Pattern_0
+            check_forward_pattern=False,
+        ),
+        cache_config=db_cache_config,
+        calibrator_config=calibrator_config,
+    )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_inference_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_inference_steps,
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
 def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for regular single-transformer DiT models.
 
@@ -862,6 +916,8 @@ CUSTOM_DIT_ENABLERS.update(
         "LongCatImagePipeline": enable_cache_for_longcat_image,
         "LongCatImageEditPipeline": enable_cache_for_longcat_image,
         "StableDiffusion3Pipeline": enable_cache_for_sd3,
+        "LTX2Pipeline": enable_cache_for_ltx2,
+        "LTX2ImageToVideoPipeline": enable_cache_for_ltx2,
         "BagelPipeline": enable_cache_for_bagel,
     }
 )
