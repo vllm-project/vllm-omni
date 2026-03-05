@@ -59,6 +59,11 @@ def _dynin_placeholder_str(modality: str, i: int) -> str | None:
 
 
 class DyninOmniProcessingInfo(BaseProcessingInfo):
+    def get_data_parser(self) -> MultiModalDataParser:
+        return DyninOmniMultiModalDataParser(
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         # Keep limits conservative until DYNIN has modality-specific prompt
         # expansion and embedding lengths wired for online serving.
@@ -146,9 +151,6 @@ class DyninOmniMultiModalDataParser(MultiModalDataParser):
 
 
 class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingInfo]):
-    def _get_data_parser(self) -> MultiModalDataParser:
-        return DyninOmniMultiModalDataParser()
-
     @staticmethod
     def _find_subsequence(
         haystack: list[int],
@@ -309,7 +311,7 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
     def apply(
         self,
         prompt: str | list[int],
-        mm_data: MultiModalDataDict,
+        mm_data: MultiModalDataDict | MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
         tokenization_kwargs: Mapping[str, object] | None = None,
         *,
@@ -318,7 +320,12 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
         if tokenization_kwargs is None:
             tokenization_kwargs = {}
 
-        mm_items = self._to_mm_items(mm_data)
+        # vLLM >= 0.16 removed BaseMultiModalProcessor._to_mm_items.
+        # Normalize here using processing info for compatibility.
+        if isinstance(mm_data, MultiModalDataItems):
+            mm_items = mm_data
+        else:
+            mm_items = self.info.parse_mm_data(mm_data)
         mm_hashes = self._hash_mm_items(
             mm_items,
             hf_processor_mm_kwargs,

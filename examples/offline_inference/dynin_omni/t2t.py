@@ -248,8 +248,8 @@ if __name__ == "__main__":
 
 """
 example commands:
-p /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/t2t.py\
-    --model snu-aidas/Dynin-Omni_vllm\
+python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/t2t.py\
+    --model snu-aidas/Dynin-Omni\
     --dynin-config-path /home/kdg6245/vllm-omni/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml\
     --question "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
 """

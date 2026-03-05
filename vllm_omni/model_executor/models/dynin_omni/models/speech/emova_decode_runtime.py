@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import sys
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,7 @@ from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 logger = logging.getLogger(__name__)
 
 _ASSET_ROOT = Path(__file__).resolve().parent
+_S2U_VENDOR_ROOT = (_ASSET_ROOT / "s2u_vendor").resolve()
 
 
 class HParams:
@@ -2163,20 +2165,67 @@ def synthesis(unit_sequence, style_embedding, hps, net_g, output_wav_file: str =
     return audio
 
 
-def _candidate_emova_tokenizer_roots() -> list[Path]:
-    roots: list[Path] = []
-    env_root = os.environ.get("EMOVA_TOKENIZER_ROOT", "").strip()
-    if env_root:
-        roots.append(Path(env_root).expanduser().resolve())
-    roots.append(
-        (
-            Path(__file__).resolve().parents[3]
-            / "omada_omni"
-            / "tokenizers"
-            / "EMOVA_speech_tokenizer"
-        ).resolve()
+def _import_s2u_runtime():
+    root_str = str(_S2U_VENDOR_ROOT)
+    if not _S2U_VENDOR_ROOT.exists():
+        raise ModuleNotFoundError(
+            f"DYNIN internal S2U vendor root does not exist: {_S2U_VENDOR_ROOT}"
+        )
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+
+    from my_extract_unit_for_speech.extract_unit_construct_wav_unit_text import (
+        batch_extract_unit,
+        get_S2U_ckpt_config_path as _imported_get_S2U_ckpt_config_path,
+        sample_extract_unit,
     )
-    return roots
+    from nemo.collections.asr.models.spec2vec.vq_ctc_finetune import (
+        VQCTCFinetuneModel as _ImportedVQCTCFinetuneModel,
+    )
+    from omegaconf import OmegaConf
+
+    def _imported_load_config(config=None):
+        if config is None:
+            raise ValueError("config path is required for S2U load_config")
+        cfg_module = import_module(config.replace("/", "."))
+        cfg = OmegaConf.structured(cfg_module.cfg)
+        OmegaConf.set_struct(cfg, True)
+        return cfg
+
+    def _imported_s2u_extract_unit_demo(model, wav_path, model_name, reduced=True):
+        if model_name != "SPIRAL-FSQ-CTC":
+            raise ValueError(f"Unsupported S2U model_name: {model_name}")
+        wav_file_list = [wav_path]
+        (
+            extracted_wav_file_list,
+            skipped_wav_file_list,
+            unreduced_unit_sequence_list,
+            reduced_unit_sequence_list,
+        ) = batch_extract_unit(wav_file_list, model, max_chunk=960000)
+        target_unit_sequence_list = (
+            reduced_unit_sequence_list if reduced else unreduced_unit_sequence_list
+        )
+        if extracted_wav_file_list:
+            target_unit_sequence = target_unit_sequence_list[0]
+        else:
+            wav_file = skipped_wav_file_list[0]
+            unreduced_unit_sequence, reduced_unit_sequence = sample_extract_unit(
+                wav_file, model
+            )
+            target_unit_sequence = (
+                reduced_unit_sequence if reduced else unreduced_unit_sequence
+            )
+
+        return "".join(
+            [f"<|speech_{each}|>" for each in target_unit_sequence.split(" ")]
+        )
+
+    return (
+        _ImportedVQCTCFinetuneModel,
+        _imported_get_S2U_ckpt_config_path,
+        _imported_load_config,
+        _imported_s2u_extract_unit_demo,
+    )
 
 
 def _load_external_s2u_runtime():
@@ -2187,30 +2236,11 @@ def _load_external_s2u_runtime():
     except Exception:
         pass
 
-    last_error: Exception | None = None
-    for root in _candidate_emova_tokenizer_roots():
-        try:
-            if not root.exists():
-                continue
-            root_str = str(root)
-            if root_str not in sys.path:
-                sys.path.insert(0, root_str)
-            from emova_speech_tokenizer.speech_utils import (
-                VQCTCFinetuneModel as _ImportedVQCTCFinetuneModel,
-                get_S2U_ckpt_config_path as _imported_get_S2U_ckpt_config_path,
-                load_config as _imported_load_config,
-                s2u_extract_unit_demo as _imported_s2u_extract_unit_demo,
-            )
-            return (
-                _ImportedVQCTCFinetuneModel,
-                _imported_get_S2U_ckpt_config_path,
-                _imported_load_config,
-                _imported_s2u_extract_unit_demo,
-                None,
-            )
-        except Exception as e:
-            last_error = e
-    return None, None, None, None, last_error
+    try:
+        imported = _import_s2u_runtime()
+        return imported[0], imported[1], imported[2], imported[3], None
+    except Exception as e:
+        return None, None, None, None, e
 
 
 (
@@ -2220,13 +2250,21 @@ def _load_external_s2u_runtime():
     _imported_s2u_extract_unit_demo,
     S2U_IMPORT_ERROR,
 ) = _load_external_s2u_runtime()
+S2U_RUNTIME_AVAILABLE = (
+    _IMPORTED_VQCTCFinetuneModel is not None
+    and _imported_get_S2U_ckpt_config_path is not None
+    and _imported_load_config is not None
+    and _imported_s2u_extract_unit_demo is not None
+)
 
 
 def _raise_s2u_unavailable(api_name: str) -> None:
     msg = (
         f"{api_name} is unavailable because EMOVA S2U runtime dependencies are missing. "
         "Install dependencies from "
-        "vllm_omni/model_executor/models/omada_omni/tokenizers/init_tokenizers.sh"
+        "vllm_omni/model_executor/models/dynin_omni/models/configs/speech/install_emova_deps.sh"
+        " and keep the internal S2U vendor runtime under "
+        f"{_S2U_VENDOR_ROOT}."
     )
     if S2U_IMPORT_ERROR is not None:
         msg += f". Root cause: {S2U_IMPORT_ERROR!r}"

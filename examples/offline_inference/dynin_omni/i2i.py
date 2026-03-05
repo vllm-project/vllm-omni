@@ -595,7 +595,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
         help="Set HF_HUB_DISABLE_XET=1 to avoid CAS/xet download path.",
     )
     parser.add_argument(
-        "--dtype", type=str, default=None,
+        "--dtype", type=str, default="auto",
         help="Optional vLLM dtype override (e.g., float16, bfloat16, float32, auto).",
     )
     return parser.parse_args()
@@ -784,7 +784,7 @@ if __name__ == "__main__":
 """
 example usage:
 python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/i2i.py \
-  --model snu-aidas/Dynin-Omni_vllm \
+  --model snu-aidas/Dynin-Omni \
   --dynin-config-path /home/kdg6245/vllm-omni/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
   --edit-json /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/text/i2i_edits.json \
   --origin-img-root /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/image \

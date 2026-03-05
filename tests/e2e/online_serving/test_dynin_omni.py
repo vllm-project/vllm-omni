@@ -19,9 +19,9 @@ from tests.utils import hardware_test
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-#models = ["snu-aidas/Dynin-Omni_vllm"]
-models = ["/tmp/dynin_localized_models/snu-aidas_Dynin-Omni_vllm"]
-stage_configs = [str(Path(__file__).parent / "stage_configs" / "dynin_omni_ci.yaml")]
+#models = ["snu-aidas/Dynin-Omni"]
+models = ["/tmp/dynin_localized_models/snu-aidas_Dynin-Omni"]
+stage_configs = [str(Path(__file__).resolve().parents[1] / "stage_configs" / "dynin_omni_ci.yaml")]
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]

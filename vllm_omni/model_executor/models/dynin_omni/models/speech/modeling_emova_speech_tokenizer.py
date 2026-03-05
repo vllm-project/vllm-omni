@@ -22,6 +22,7 @@ from transformers.modeling_utils import PreTrainedModel
 
 try:
     from .emova_decode_runtime import (
+        S2U_RUNTIME_AVAILABLE,
         S2U_IMPORT_ERROR,
         SynthesizerTrn,
         VQCTCFinetuneModel,
@@ -53,11 +54,7 @@ class EMOVASpeechTokenizer(PreTrainedModel):
         self.s2u_config = None
         self.encoder = None
 
-        if (
-            get_S2U_ckpt_config_path is not None
-            and load_config is not None
-            and VQCTCFinetuneModel is not None
-        ):
+        if S2U_RUNTIME_AVAILABLE:
             _, s2u_config_path = get_S2U_ckpt_config_path(config.s2u_unit_type)
             s2u_cfg = load_config(config=s2u_config_path)
             s2u_cfg.model.pretrain_chkpt_path = None
@@ -93,7 +90,7 @@ class EMOVASpeechTokenizer(PreTrainedModel):
             msg = (
                 "EMOVASpeechTokenizer encode path is unavailable. "
                 "Install EMOVA tokenizer runtime dependencies first "
-                "(see vllm_omni/model_executor/models/omada_omni/tokenizers/init_tokenizers.sh)."
+                "(see vllm_omni/model_executor/models/dynin_omni/models/configs/speech/install_emova_deps.sh)."
             )
             if _S2U_IMPORT_ERROR is not None:
                 msg += f" Root cause: {_S2U_IMPORT_ERROR!r}"

@@ -21,7 +21,7 @@ from transformers import AutoTokenizer
 
 from tests.utils import hardware_test
 
-from .conftest import OmniRunner
+from tests.conftest import OmniRunner
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -30,8 +30,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DYNIN_CONFIG_PATH = _REPO_ROOT / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"
 _DEFAULT_STAGE_CONFIG_PATH = Path(__file__).parent / "stage_configs" / "dynin_omni_ci.yaml"
 
-#models = ["snu-aidas/Dynin-Omni_vllm"]
-models = ["/tmp/dynin_localized_models/snu-aidas_Dynin-Omni_vllm"]
+#models = ["snu-aidas/Dynin-Omni"]
+models = ["/tmp/dynin_localized_models/snu-aidas_Dynin-Omni"]
 stage_configs = [str(_DEFAULT_STAGE_CONFIG_PATH)]
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
@@ -277,7 +277,7 @@ def _numel(value: Any) -> int:
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("test_config", test_params)
-def test_dynin_mmu_to_text(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
+def test_dynin_mmu_to_text(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
     os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
@@ -287,7 +287,7 @@ def test_dynin_mmu_to_text(omni_runner: type[OmniRunner], test_config: tuple[str
         dynin_config_path=DYNIN_CONFIG_PATH,
     )
 
-    with omni_runner(
+    with OmniRunner(
         model,
         seed=42,
         stage_configs_path=stage_config_path,
@@ -304,7 +304,7 @@ def test_dynin_mmu_to_text(omni_runner: type[OmniRunner], test_config: tuple[str
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("test_config", test_params)
-def test_dynin_image_to_text(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
+def test_dynin_image_to_text(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
     os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
@@ -315,7 +315,7 @@ def test_dynin_image_to_text(omni_runner: type[OmniRunner], test_config: tuple[s
         image=_generate_synthetic_image(),
     )
 
-    with omni_runner(
+    with OmniRunner(
         model,
         seed=42,
         stage_configs_path=stage_config_path,
@@ -332,7 +332,7 @@ def test_dynin_image_to_text(omni_runner: type[OmniRunner], test_config: tuple[s
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("test_config", test_params)
-def test_dynin_speech_to_text(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
+def test_dynin_speech_to_text(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
     os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
@@ -343,7 +343,7 @@ def test_dynin_speech_to_text(omni_runner: type[OmniRunner], test_config: tuple[
         audio=_generate_synthetic_audio(),
     )
 
-    with omni_runner(
+    with OmniRunner(
         model,
         seed=42,
         stage_configs_path=stage_config_path,
@@ -360,12 +360,12 @@ def test_dynin_speech_to_text(omni_runner: type[OmniRunner], test_config: tuple[
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("test_config", test_params)
-def test_dynin_t2s_decode_to_audio(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
+def test_dynin_t2s_decode_to_audio(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
     os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
     prompt = _build_t2s_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
 
-    with omni_runner(
+    with OmniRunner(
         model,
         seed=42,
         stage_configs_path=stage_config_path,
@@ -383,12 +383,12 @@ def test_dynin_t2s_decode_to_audio(omni_runner: type[OmniRunner], test_config: t
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("test_config", test_params)
-def test_dynin_t2i_decode_to_image(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
+def test_dynin_t2i_decode_to_image(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
     os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
     prompt = _build_t2i_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
 
-    with omni_runner(
+    with OmniRunner(
         model,
         seed=42,
         stage_configs_path=stage_config_path,

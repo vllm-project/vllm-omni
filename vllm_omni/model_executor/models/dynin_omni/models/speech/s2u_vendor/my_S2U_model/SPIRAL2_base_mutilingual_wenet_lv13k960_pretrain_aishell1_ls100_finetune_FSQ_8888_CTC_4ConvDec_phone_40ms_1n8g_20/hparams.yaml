@@ -1,0 +1,1643 @@
+train_ds:
+  batch_size: 14
+  drop_last: false
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  manifest_dir: /home/ma-user/work/taodehua/data/multi_lingual_AISHELL1_LibriSpeech
+  data_dir: /home/ma-user/work/taodehua/data/multi_lingual_AISHELL1_LibriSpeech
+  manifest_filepath: phone_sequence_aishell1_train.json,phone_sequence_librispeech_train-clean-100.json
+  sample_rate: 16000
+  labels:
+  - en_AA0
+  - en_AA1
+  - en_AA2
+  - en_AE0
+  - en_AE1
+  - en_AE2
+  - en_AH0
+  - en_AH1
+  - en_AH2
+  - en_AO0
+  - en_AO1
+  - en_AO2
+  - en_AW0
+  - en_AW1
+  - en_AW2
+  - en_AY0
+  - en_AY1
+  - en_AY2
+  - en_B
+  - en_CH
+  - en_D
+  - en_DH
+  - en_EH0
+  - en_EH1
+  - en_EH2
+  - en_ER0
+  - en_ER1
+  - en_ER2
+  - en_EY0
+  - en_EY1
+  - en_EY2
+  - en_F
+  - en_G
+  - en_HH
+  - en_IH0
+  - en_IH1
+  - en_IH2
+  - en_IY0
+  - en_IY1
+  - en_IY2
+  - en_JH
+  - en_K
+  - en_L
+  - en_M
+  - en_N
+  - en_NG
+  - en_OW0
+  - en_OW1
+  - en_OW2
+  - en_OY0
+  - en_OY1
+  - en_OY2
+  - en_P
+  - en_R
+  - en_S
+  - en_SH
+  - en_T
+  - en_TH
+  - en_UH0
+  - en_UH1
+  - en_UH2
+  - en_UW0
+  - en_UW1
+  - en_UW2
+  - en_V
+  - en_W
+  - en_Y
+  - en_Z
+  - en_ZH
+  - CN_a1
+  - CN_a2
+  - CN_a3
+  - CN_a4
+  - CN_a5
+  - CN_ai1
+  - CN_ai2
+  - CN_ai3
+  - CN_ai4
+  - CN_an1
+  - CN_an2
+  - CN_an3
+  - CN_an4
+  - CN_ang1
+  - CN_ang2
+  - CN_ang3
+  - CN_ang4
+  - CN_ao1
+  - CN_ao2
+  - CN_ao3
+  - CN_ao4
+  - CN_b
+  - CN_c
+  - CN_ch
+  - CN_d
+  - CN_e1
+  - CN_e2
+  - CN_e3
+  - CN_e4
+  - CN_e5
+  - CN_ei1
+  - CN_ei2
+  - CN_ei3
+  - CN_ei4
+  - CN_en1
+  - CN_en2
+  - CN_en3
+  - CN_en4
+  - CN_en5
+  - CN_eng1
+  - CN_eng2
+  - CN_eng3
+  - CN_eng4
+  - CN_f
+  - CN_g
+  - CN_h
+  - CN_i1
+  - CN_i2
+  - CN_i3
+  - CN_i4
+  - CN_ia1
+  - CN_ia2
+  - CN_ia3
+  - CN_ia4
+  - CN_ian1
+  - CN_ian2
+  - CN_ian3
+  - CN_ian4
+  - CN_iang1
+  - CN_iang2
+  - CN_iang3
+  - CN_iang4
+  - CN_iao1
+  - CN_iao2
+  - CN_iao3
+  - CN_iao4
+  - CN_ie1
+  - CN_ie2
+  - CN_ie3
+  - CN_ie4
+  - CN_ii1
+  - CN_ii2
+  - CN_ii3
+  - CN_ii4
+  - CN_ii5
+  - CN_iii1
+  - CN_iii2
+  - CN_iii3
+  - CN_iii4
+  - CN_in1
+  - CN_in2
+  - CN_in3
+  - CN_in4
+  - CN_ing1
+  - CN_ing2
+  - CN_ing3
+  - CN_ing4
+  - CN_iong1
+  - CN_iong2
+  - CN_iong3
+  - CN_iong4
+  - CN_iou1
+  - CN_iou2
+  - CN_iou3
+  - CN_iou4
+  - CN_j
+  - CN_k
+  - CN_l
+  - CN_m
+  - CN_n
+  - CN_o1
+  - CN_o2
+  - CN_o3
+  - CN_o4
+  - CN_ong1
+  - CN_ong2
+  - CN_ong3
+  - CN_ong4
+  - CN_ou1
+  - CN_ou2
+  - CN_ou3
+  - CN_ou4
+  - CN_p
+  - CN_q
+  - CN_r
+  - CN_rr
+  - CN_s
+  - CN_sh
+  - CN_t
+  - CN_u1
+  - CN_u2
+  - CN_u3
+  - CN_u4
+  - CN_ua1
+  - CN_ua2
+  - CN_ua3
+  - CN_ua4
+  - CN_uai1
+  - CN_uai2
+  - CN_uai3
+  - CN_uai4
+  - CN_uan1
+  - CN_uan2
+  - CN_uan3
+  - CN_uan4
+  - CN_uang1
+  - CN_uang2
+  - CN_uang3
+  - CN_uang4
+  - CN_ui1
+  - CN_ui2
+  - CN_ui3
+  - CN_ui4
+  - CN_un1
+  - CN_un2
+  - CN_un3
+  - CN_un4
+  - CN_uo1
+  - CN_uo2
+  - CN_uo3
+  - CN_uo4
+  - CN_uo5
+  - CN_v1
+  - CN_v2
+  - CN_v3
+  - CN_v4
+  - CN_van1
+  - CN_van2
+  - CN_van3
+  - CN_van4
+  - CN_ve1
+  - CN_ve2
+  - CN_ve3
+  - CN_ve4
+  - CN_vn1
+  - CN_vn2
+  - CN_vn3
+  - CN_vn4
+  - CN_x
+  - CN_z
+  - CN_zh
+  trim_silence: false
+  int_values: false
+  augmentor: null
+  max_duration: 24.0
+  min_duration: null
+  max_utts: 0
+  dup_factor: 1
+  blank_index: -1
+  unk_index: -1
+  normalize: false
+  trim: true
+  load_audio: true
+  parser: en
+  parser_add_end_space: false
+  add_misc: false
+  subword_sampling_nbest_size: null
+  subword_sampling_alpha: null
+validation_ds:
+  batch_size: 14
+  drop_last: false
+  shuffle: false
+  num_workers: 4
+  pin_memory: true
+  manifest_dir: /home/ma-user/work/taodehua/data/multi_lingual_AISHELL1_LibriSpeech
+  data_dir: /home/ma-user/work/taodehua/data/multi_lingual_AISHELL1_LibriSpeech
+  manifest_filepath: phone_sequence_aishell1_dev.json,phone_sequence_librispeech_dev-other.json
+  sample_rate: 16000
+  labels:
+  - en_AA0
+  - en_AA1
+  - en_AA2
+  - en_AE0
+  - en_AE1
+  - en_AE2
+  - en_AH0
+  - en_AH1
+  - en_AH2
+  - en_AO0
+  - en_AO1
+  - en_AO2
+  - en_AW0
+  - en_AW1
+  - en_AW2
+  - en_AY0
+  - en_AY1
+  - en_AY2
+  - en_B
+  - en_CH
+  - en_D
+  - en_DH
+  - en_EH0
+  - en_EH1
+  - en_EH2
+  - en_ER0
+  - en_ER1
+  - en_ER2
+  - en_EY0
+  - en_EY1
+  - en_EY2
+  - en_F
+  - en_G
+  - en_HH
+  - en_IH0
+  - en_IH1
+  - en_IH2
+  - en_IY0
+  - en_IY1
+  - en_IY2
+  - en_JH
+  - en_K
+  - en_L
+  - en_M
+  - en_N
+  - en_NG
+  - en_OW0
+  - en_OW1
+  - en_OW2
+  - en_OY0
+  - en_OY1
+  - en_OY2
+  - en_P
+  - en_R
+  - en_S
+  - en_SH
+  - en_T
+  - en_TH
+  - en_UH0
+  - en_UH1
+  - en_UH2
+  - en_UW0
+  - en_UW1
+  - en_UW2
+  - en_V
+  - en_W
+  - en_Y
+  - en_Z
+  - en_ZH
+  - CN_a1
+  - CN_a2
+  - CN_a3
+  - CN_a4
+  - CN_a5
+  - CN_ai1
+  - CN_ai2
+  - CN_ai3
+  - CN_ai4
+  - CN_an1
+  - CN_an2
+  - CN_an3
+  - CN_an4
+  - CN_ang1
+  - CN_ang2
+  - CN_ang3
+  - CN_ang4
+  - CN_ao1
+  - CN_ao2
+  - CN_ao3
+  - CN_ao4
+  - CN_b
+  - CN_c
+  - CN_ch
+  - CN_d
+  - CN_e1
+  - CN_e2
+  - CN_e3
+  - CN_e4
+  - CN_e5
+  - CN_ei1
+  - CN_ei2
+  - CN_ei3
+  - CN_ei4
+  - CN_en1
+  - CN_en2
+  - CN_en3
+  - CN_en4
+  - CN_en5
+  - CN_eng1
+  - CN_eng2
+  - CN_eng3
+  - CN_eng4
+  - CN_f
+  - CN_g
+  - CN_h
+  - CN_i1
+  - CN_i2
+  - CN_i3
+  - CN_i4
+  - CN_ia1
+  - CN_ia2
+  - CN_ia3
+  - CN_ia4
+  - CN_ian1
+  - CN_ian2
+  - CN_ian3
+  - CN_ian4
+  - CN_iang1
+  - CN_iang2
+  - CN_iang3
+  - CN_iang4
+  - CN_iao1
+  - CN_iao2
+  - CN_iao3
+  - CN_iao4
+  - CN_ie1
+  - CN_ie2
+  - CN_ie3
+  - CN_ie4
+  - CN_ii1
+  - CN_ii2
+  - CN_ii3
+  - CN_ii4
+  - CN_ii5
+  - CN_iii1
+  - CN_iii2
+  - CN_iii3
+  - CN_iii4
+  - CN_in1
+  - CN_in2
+  - CN_in3
+  - CN_in4
+  - CN_ing1
+  - CN_ing2
+  - CN_ing3
+  - CN_ing4
+  - CN_iong1
+  - CN_iong2
+  - CN_iong3
+  - CN_iong4
+  - CN_iou1
+  - CN_iou2
+  - CN_iou3
+  - CN_iou4
+  - CN_j
+  - CN_k
+  - CN_l
+  - CN_m
+  - CN_n
+  - CN_o1
+  - CN_o2
+  - CN_o3
+  - CN_o4
+  - CN_ong1
+  - CN_ong2
+  - CN_ong3
+  - CN_ong4
+  - CN_ou1
+  - CN_ou2
+  - CN_ou3
+  - CN_ou4
+  - CN_p
+  - CN_q
+  - CN_r
+  - CN_rr
+  - CN_s
+  - CN_sh
+  - CN_t
+  - CN_u1
+  - CN_u2
+  - CN_u3
+  - CN_u4
+  - CN_ua1
+  - CN_ua2
+  - CN_ua3
+  - CN_ua4
+  - CN_uai1
+  - CN_uai2
+  - CN_uai3
+  - CN_uai4
+  - CN_uan1
+  - CN_uan2
+  - CN_uan3
+  - CN_uan4
+  - CN_uang1
+  - CN_uang2
+  - CN_uang3
+  - CN_uang4
+  - CN_ui1
+  - CN_ui2
+  - CN_ui3
+  - CN_ui4
+  - CN_un1
+  - CN_un2
+  - CN_un3
+  - CN_un4
+  - CN_uo1
+  - CN_uo2
+  - CN_uo3
+  - CN_uo4
+  - CN_uo5
+  - CN_v1
+  - CN_v2
+  - CN_v3
+  - CN_v4
+  - CN_van1
+  - CN_van2
+  - CN_van3
+  - CN_van4
+  - CN_ve1
+  - CN_ve2
+  - CN_ve3
+  - CN_ve4
+  - CN_vn1
+  - CN_vn2
+  - CN_vn3
+  - CN_vn4
+  - CN_x
+  - CN_z
+  - CN_zh
+  trim_silence: false
+  int_values: false
+  augmentor: null
+  max_duration: null
+  min_duration: null
+  max_utts: 0
+  dup_factor: 1
+  blank_index: -1
+  unk_index: -1
+  normalize: false
+  trim: true
+  load_audio: true
+  parser: en
+  parser_add_end_space: false
+  add_misc: false
+  subword_sampling_nbest_size: null
+  subword_sampling_alpha: null
+test_ds:
+  batch_size: 14
+  drop_last: false
+  shuffle: false
+  num_workers: 4
+  pin_memory: true
+  manifest_dir: /home/ma-user/work/taodehua/data/multi_lingual_AISHELL1_LibriSpeech
+  data_dir: /home/ma-user/work/taodehua/data/multi_lingual_AISHELL1_LibriSpeech
+  manifest_filepath: phone_sequence_aishell1_test.json,phone_sequence_librispeech_test-clean.json
+  sample_rate: 16000
+  labels:
+  - en_AA0
+  - en_AA1
+  - en_AA2
+  - en_AE0
+  - en_AE1
+  - en_AE2
+  - en_AH0
+  - en_AH1
+  - en_AH2
+  - en_AO0
+  - en_AO1
+  - en_AO2
+  - en_AW0
+  - en_AW1
+  - en_AW2
+  - en_AY0
+  - en_AY1
+  - en_AY2
+  - en_B
+  - en_CH
+  - en_D
+  - en_DH
+  - en_EH0
+  - en_EH1
+  - en_EH2
+  - en_ER0
+  - en_ER1
+  - en_ER2
+  - en_EY0
+  - en_EY1
+  - en_EY2
+  - en_F
+  - en_G
+  - en_HH
+  - en_IH0
+  - en_IH1
+  - en_IH2
+  - en_IY0
+  - en_IY1
+  - en_IY2
+  - en_JH
+  - en_K
+  - en_L
+  - en_M
+  - en_N
+  - en_NG
+  - en_OW0
+  - en_OW1
+  - en_OW2
+  - en_OY0
+  - en_OY1
+  - en_OY2
+  - en_P
+  - en_R
+  - en_S
+  - en_SH
+  - en_T
+  - en_TH
+  - en_UH0
+  - en_UH1
+  - en_UH2
+  - en_UW0
+  - en_UW1
+  - en_UW2
+  - en_V
+  - en_W
+  - en_Y
+  - en_Z
+  - en_ZH
+  - CN_a1
+  - CN_a2
+  - CN_a3
+  - CN_a4
+  - CN_a5
+  - CN_ai1
+  - CN_ai2
+  - CN_ai3
+  - CN_ai4
+  - CN_an1
+  - CN_an2
+  - CN_an3
+  - CN_an4
+  - CN_ang1
+  - CN_ang2
+  - CN_ang3
+  - CN_ang4
+  - CN_ao1
+  - CN_ao2
+  - CN_ao3
+  - CN_ao4
+  - CN_b
+  - CN_c
+  - CN_ch
+  - CN_d
+  - CN_e1
+  - CN_e2
+  - CN_e3
+  - CN_e4
+  - CN_e5
+  - CN_ei1
+  - CN_ei2
+  - CN_ei3
+  - CN_ei4
+  - CN_en1
+  - CN_en2
+  - CN_en3
+  - CN_en4
+  - CN_en5
+  - CN_eng1
+  - CN_eng2
+  - CN_eng3
+  - CN_eng4
+  - CN_f
+  - CN_g
+  - CN_h
+  - CN_i1
+  - CN_i2
+  - CN_i3
+  - CN_i4
+  - CN_ia1
+  - CN_ia2
+  - CN_ia3
+  - CN_ia4
+  - CN_ian1
+  - CN_ian2
+  - CN_ian3
+  - CN_ian4
+  - CN_iang1
+  - CN_iang2
+  - CN_iang3
+  - CN_iang4
+  - CN_iao1
+  - CN_iao2
+  - CN_iao3
+  - CN_iao4
+  - CN_ie1
+  - CN_ie2
+  - CN_ie3
+  - CN_ie4
+  - CN_ii1
+  - CN_ii2
+  - CN_ii3
+  - CN_ii4
+  - CN_ii5
+  - CN_iii1
+  - CN_iii2
+  - CN_iii3
+  - CN_iii4
+  - CN_in1
+  - CN_in2
+  - CN_in3
+  - CN_in4
+  - CN_ing1
+  - CN_ing2
+  - CN_ing3
+  - CN_ing4
+  - CN_iong1
+  - CN_iong2
+  - CN_iong3
+  - CN_iong4
+  - CN_iou1
+  - CN_iou2
+  - CN_iou3
+  - CN_iou4
+  - CN_j
+  - CN_k
+  - CN_l
+  - CN_m
+  - CN_n
+  - CN_o1
+  - CN_o2
+  - CN_o3
+  - CN_o4
+  - CN_ong1
+  - CN_ong2
+  - CN_ong3
+  - CN_ong4
+  - CN_ou1
+  - CN_ou2
+  - CN_ou3
+  - CN_ou4
+  - CN_p
+  - CN_q
+  - CN_r
+  - CN_rr
+  - CN_s
+  - CN_sh
+  - CN_t
+  - CN_u1
+  - CN_u2
+  - CN_u3
+  - CN_u4
+  - CN_ua1
+  - CN_ua2
+  - CN_ua3
+  - CN_ua4
+  - CN_uai1
+  - CN_uai2
+  - CN_uai3
+  - CN_uai4
+  - CN_uan1
+  - CN_uan2
+  - CN_uan3
+  - CN_uan4
+  - CN_uang1
+  - CN_uang2
+  - CN_uang3
+  - CN_uang4
+  - CN_ui1
+  - CN_ui2
+  - CN_ui3
+  - CN_ui4
+  - CN_un1
+  - CN_un2
+  - CN_un3
+  - CN_un4
+  - CN_uo1
+  - CN_uo2
+  - CN_uo3
+  - CN_uo4
+  - CN_uo5
+  - CN_v1
+  - CN_v2
+  - CN_v3
+  - CN_v4
+  - CN_van1
+  - CN_van2
+  - CN_van3
+  - CN_van4
+  - CN_ve1
+  - CN_ve2
+  - CN_ve3
+  - CN_ve4
+  - CN_vn1
+  - CN_vn2
+  - CN_vn3
+  - CN_vn4
+  - CN_x
+  - CN_z
+  - CN_zh
+  trim_silence: false
+  int_values: false
+  augmentor: null
+  max_duration: null
+  min_duration: null
+  max_utts: 0
+  dup_factor: 1
+  blank_index: -1
+  unk_index: -1
+  normalize: false
+  trim: true
+  load_audio: true
+  parser: en
+  parser_add_end_space: false
+  add_misc: false
+  subword_sampling_nbest_size: null
+  subword_sampling_alpha: null
+optim:
+  name: adamw
+  lr: 3.0e-05
+  sched:
+    hold_steps: null
+    hold_ratio: 0.4
+    warmup_steps: null
+    warmup_ratio: 0.1
+    warmup_power: null
+    name: PolynomialHoldDecayAnnealing
+    min_lr: 1.5e-06
+    last_epoch: -1
+    max_steps: 80000
+    power: 1.0
+    cycle: false
+  betas:
+  - 0.9
+  - 0.98
+  eps: 1.0e-06
+  weight_decay: 0.01
+  amsgrad: false
+pretrain_chkpt_path: /home/ma-user/work/taodehua/pretrained_models/SPIRAL_BASE_pretrain_multi_lingual_wenetspeech_13k960_40ms_init80_from_13k960_v2/st2vec-1.6M.ckpt
+encoder_type: st
+encoder:
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: 16000
+    window_size: 0.02
+    window_stride: 0.01
+    n_window_size: null
+    n_window_stride: null
+    window: hann
+    normalize: per_feature
+    n_fft: null
+    preemph: 0.97
+    features: 128
+    lowfreq: 0
+    highfreq: null
+    log: true
+    log_zero_guard_type: add
+    log_zero_guard_value: 5.960464477539063e-08
+    dither: 1.0e-05
+    dither_train_only: true
+    pad_to: 16
+    frame_splicing: 1
+    stft_exact_pad: false
+    stft_conv: false
+    pad_value: 0
+    mag_power: 2.0
+    normalize_time_domain: true
+  feature_encoder:
+    _target_: nemo.collections.asr.parts.spec2vec.FeatureEncoder
+    feat_in: 128
+    use_conv_mask: true
+    conv2d_block: null
+    conv_transformer_blocks:
+    - conv_layers:
+      - filters: 384
+        kernel_size:
+        - 5
+        stride:
+        - 2
+        norm_type: ln
+        gn_groups: null
+        act_func: relu
+        dilation:
+        - 1
+        dropout: 0.1
+        padding: same
+        bias: true
+        residual: false
+      - filters: 512
+        kernel_size:
+        - 5
+        stride:
+        - 2
+        norm_type: ln
+        gn_groups: null
+        act_func: relu
+        dilation:
+        - 1
+        dropout: 0.1
+        padding: same
+        bias: true
+        residual: false
+      - filters: 512
+        kernel_size:
+        - 1
+        stride:
+        - 1
+        norm_type: ln
+        gn_groups: null
+        act_func: null
+        dilation:
+        - 1
+        dropout: 0.0
+        padding: same
+        bias: true
+        residual: false
+      transformer_block:
+        use_pytorch_transformer: false
+        dropout: 0.1
+        conv:
+          conv_pos: 128
+          conv_pos_groups: 16
+          layer_drop: 0.0
+        encoder:
+          encoder_layers: 2
+          encoder_layerdrop: 0.0
+          embedding_dim: 512
+          ffn_embedding_dim: 2048
+          num_attention_heads: 8
+          dropout: 0.1
+          attention_dropout: 0.1
+          activation_dropout: 0.1
+          activation_fn: gelu
+          layer_norm_first: true
+    - conv_layers:
+      - filters: 1536
+        kernel_size:
+        - 5
+        stride:
+        - 1
+        norm_type: ln
+        gn_groups: null
+        act_func: relu
+        dilation:
+        - 1
+        dropout: 0.1
+        padding: same
+        bias: true
+        residual: false
+      - filters: 768
+        kernel_size:
+        - 1
+        stride:
+        - 1
+        norm_type: ln
+        gn_groups: null
+        act_func: null
+        dilation:
+        - 1
+        dropout: 0.0
+        padding: same
+        bias: true
+        residual: false
+      transformer_block:
+        use_pytorch_transformer: false
+        dropout: 0.1
+        conv:
+          conv_pos: 128
+          conv_pos_groups: 16
+          layer_drop: 0.0
+        encoder:
+          encoder_layers: 10
+          encoder_layerdrop: 0.1
+          embedding_dim: 768
+          ffn_embedding_dim: 3072
+          num_attention_heads: 12
+          dropout: 0.1
+          attention_dropout: 0.1
+          activation_dropout: 0.1
+          activation_fn: gelu
+          layer_norm_first: true
+    use_tf_pad: true
+    ln_eps: 1.0e-05
+  pretrained_encoder_path: null
+  freeze_feature_encoder: false
+  freeze_student: false
+  noise_mix_ratio: null
+  masking:
+    mask_prob: 0.0
+    mask_type: static
+    mask_emb_type: gaussian
+    mask_other: 0
+    mask_length: 20
+    no_mask_overlap: false
+    mask_min_space: 1
+    mask_channel_prob: 0.0
+    mask_channel_type: static
+    mask_channel_other: 0
+    mask_channel_length: 20
+    no_mask_channel_overlap: false
+    mask_channel_min_space: 1
+    mask_shrink_to_batch_min: false
+    mask_channel_shrink_to_batch_min: false
+  shifting: null
+  target_shifting:
+    dist: uniform
+    shift_prob: 1.0
+    max_ratio: 0.5
+    unit: 4
+    max: 16
+    min: 0
+    mean: null
+    std: null
+    truncate: false
+  target_masking: null
+  target_compute_perturb: true
+  target_momentum: 0.99
+  target_momentum_final: 0.999
+  target_momentum_steps: 2000000
+  target_momentum_type: cosine
+  projector:
+    input_dim: null
+    output_dim: 256
+    use_conv_mask: true
+    use_tf_pad: true
+    ln_eps: 1.0e-05
+    conv_layers: null
+    transformer: null
+  predictor:
+    input_dim: null
+    output_dim: 256
+    use_conv_mask: true
+    use_tf_pad: true
+    ln_eps: 1.0e-05
+    conv_layers:
+    - filters: 256
+      kernel_size:
+      - 5
+      stride:
+      - 1
+      norm_type: bn
+      gn_groups: null
+      act_func: relu
+      dilation:
+      - 1
+      dropout: 0.0
+      padding: same
+      bias: null
+      residual: false
+    - filters: 256
+      kernel_size:
+      - 5
+      stride:
+      - 1
+      norm_type: bn
+      gn_groups: null
+      act_func: relu
+      dilation:
+      - 1
+      dropout: 0.0
+      padding: same
+      bias: null
+      residual: false
+    transformer: null
+  quantizer: null
+  n_negatives: 100
+  cross_sample_negatives: 0
+  codebook_negatives: 0
+  negatives_from_everywhere: false
+  negatives_from_noisy_features: false
+  pitch_estimation_task: null
+  pitch_loss_weight: 0.0
+  reconstruction_task: null
+  reconstruction_loss_weight: 0.0
+  reconstruction_quant_ppl_loss_weight: 0.0
+decoder:
+  _target_: nemo.collections.asr.modules.ConvASRDecoder
+  feat_in: 4
+  num_classes: 0
+  proj_upsampling: null
+  conv_layers:
+  - filters: 512
+    kernel_size:
+    - 5
+    stride:
+    - 1
+    norm_type: null
+    gn_groups: null
+    act_func: relu
+    dilation:
+    - 1
+    dropout: 0.1
+    padding: same
+    bias: null
+    residual: false
+  - filters: 512
+    kernel_size:
+    - 5
+    stride:
+    - 1
+    norm_type: null
+    gn_groups: null
+    act_func: relu
+    dilation:
+    - 1
+    dropout: 0.1
+    padding: same
+    bias: null
+    residual: false
+  - filters: 512
+    kernel_size:
+    - 5
+    stride:
+    - 1
+    norm_type: null
+    gn_groups: null
+    act_func: relu
+    dilation:
+    - 1
+    dropout: 0.1
+    padding: same
+    bias: null
+    residual: false
+  - filters: 512
+    kernel_size:
+    - 5
+    stride:
+    - 1
+    norm_type: null
+    gn_groups: null
+    act_func: relu
+    dilation:
+    - 1
+    dropout: 0.1
+    padding: same
+    bias: null
+    residual: false
+  projector: null
+  use_conv_mask: true
+  use_tf_pad: true
+  ln_eps: 1.0e-05
+  blank_pos: after_vocab_last
+  init_mode: xavier_uniform
+  vocabulary:
+  - en_AA0
+  - en_AA1
+  - en_AA2
+  - en_AE0
+  - en_AE1
+  - en_AE2
+  - en_AH0
+  - en_AH1
+  - en_AH2
+  - en_AO0
+  - en_AO1
+  - en_AO2
+  - en_AW0
+  - en_AW1
+  - en_AW2
+  - en_AY0
+  - en_AY1
+  - en_AY2
+  - en_B
+  - en_CH
+  - en_D
+  - en_DH
+  - en_EH0
+  - en_EH1
+  - en_EH2
+  - en_ER0
+  - en_ER1
+  - en_ER2
+  - en_EY0
+  - en_EY1
+  - en_EY2
+  - en_F
+  - en_G
+  - en_HH
+  - en_IH0
+  - en_IH1
+  - en_IH2
+  - en_IY0
+  - en_IY1
+  - en_IY2
+  - en_JH
+  - en_K
+  - en_L
+  - en_M
+  - en_N
+  - en_NG
+  - en_OW0
+  - en_OW1
+  - en_OW2
+  - en_OY0
+  - en_OY1
+  - en_OY2
+  - en_P
+  - en_R
+  - en_S
+  - en_SH
+  - en_T
+  - en_TH
+  - en_UH0
+  - en_UH1
+  - en_UH2
+  - en_UW0
+  - en_UW1
+  - en_UW2
+  - en_V
+  - en_W
+  - en_Y
+  - en_Z
+  - en_ZH
+  - CN_a1
+  - CN_a2
+  - CN_a3
+  - CN_a4
+  - CN_a5
+  - CN_ai1
+  - CN_ai2
+  - CN_ai3
+  - CN_ai4
+  - CN_an1
+  - CN_an2
+  - CN_an3
+  - CN_an4
+  - CN_ang1
+  - CN_ang2
+  - CN_ang3
+  - CN_ang4
+  - CN_ao1
+  - CN_ao2
+  - CN_ao3
+  - CN_ao4
+  - CN_b
+  - CN_c
+  - CN_ch
+  - CN_d
+  - CN_e1
+  - CN_e2
+  - CN_e3
+  - CN_e4
+  - CN_e5
+  - CN_ei1
+  - CN_ei2
+  - CN_ei3
+  - CN_ei4
+  - CN_en1
+  - CN_en2
+  - CN_en3
+  - CN_en4
+  - CN_en5
+  - CN_eng1
+  - CN_eng2
+  - CN_eng3
+  - CN_eng4
+  - CN_f
+  - CN_g
+  - CN_h
+  - CN_i1
+  - CN_i2
+  - CN_i3
+  - CN_i4
+  - CN_ia1
+  - CN_ia2
+  - CN_ia3
+  - CN_ia4
+  - CN_ian1
+  - CN_ian2
+  - CN_ian3
+  - CN_ian4
+  - CN_iang1
+  - CN_iang2
+  - CN_iang3
+  - CN_iang4
+  - CN_iao1
+  - CN_iao2
+  - CN_iao3
+  - CN_iao4
+  - CN_ie1
+  - CN_ie2
+  - CN_ie3
+  - CN_ie4
+  - CN_ii1
+  - CN_ii2
+  - CN_ii3
+  - CN_ii4
+  - CN_ii5
+  - CN_iii1
+  - CN_iii2
+  - CN_iii3
+  - CN_iii4
+  - CN_in1
+  - CN_in2
+  - CN_in3
+  - CN_in4
+  - CN_ing1
+  - CN_ing2
+  - CN_ing3
+  - CN_ing4
+  - CN_iong1
+  - CN_iong2
+  - CN_iong3
+  - CN_iong4
+  - CN_iou1
+  - CN_iou2
+  - CN_iou3
+  - CN_iou4
+  - CN_j
+  - CN_k
+  - CN_l
+  - CN_m
+  - CN_n
+  - CN_o1
+  - CN_o2
+  - CN_o3
+  - CN_o4
+  - CN_ong1
+  - CN_ong2
+  - CN_ong3
+  - CN_ong4
+  - CN_ou1
+  - CN_ou2
+  - CN_ou3
+  - CN_ou4
+  - CN_p
+  - CN_q
+  - CN_r
+  - CN_rr
+  - CN_s
+  - CN_sh
+  - CN_t
+  - CN_u1
+  - CN_u2
+  - CN_u3
+  - CN_u4
+  - CN_ua1
+  - CN_ua2
+  - CN_ua3
+  - CN_ua4
+  - CN_uai1
+  - CN_uai2
+  - CN_uai3
+  - CN_uai4
+  - CN_uan1
+  - CN_uan2
+  - CN_uan3
+  - CN_uan4
+  - CN_uang1
+  - CN_uang2
+  - CN_uang3
+  - CN_uang4
+  - CN_ui1
+  - CN_ui2
+  - CN_ui3
+  - CN_ui4
+  - CN_un1
+  - CN_un2
+  - CN_un3
+  - CN_un4
+  - CN_uo1
+  - CN_uo2
+  - CN_uo3
+  - CN_uo4
+  - CN_uo5
+  - CN_v1
+  - CN_v2
+  - CN_v3
+  - CN_v4
+  - CN_van1
+  - CN_van2
+  - CN_van3
+  - CN_van4
+  - CN_ve1
+  - CN_ve2
+  - CN_ve3
+  - CN_ve4
+  - CN_vn1
+  - CN_vn2
+  - CN_vn3
+  - CN_vn4
+  - CN_x
+  - CN_z
+  - CN_zh
+labels:
+- en_AA0
+- en_AA1
+- en_AA2
+- en_AE0
+- en_AE1
+- en_AE2
+- en_AH0
+- en_AH1
+- en_AH2
+- en_AO0
+- en_AO1
+- en_AO2
+- en_AW0
+- en_AW1
+- en_AW2
+- en_AY0
+- en_AY1
+- en_AY2
+- en_B
+- en_CH
+- en_D
+- en_DH
+- en_EH0
+- en_EH1
+- en_EH2
+- en_ER0
+- en_ER1
+- en_ER2
+- en_EY0
+- en_EY1
+- en_EY2
+- en_F
+- en_G
+- en_HH
+- en_IH0
+- en_IH1
+- en_IH2
+- en_IY0
+- en_IY1
+- en_IY2
+- en_JH
+- en_K
+- en_L
+- en_M
+- en_N
+- en_NG
+- en_OW0
+- en_OW1
+- en_OW2
+- en_OY0
+- en_OY1
+- en_OY2
+- en_P
+- en_R
+- en_S
+- en_SH
+- en_T
+- en_TH
+- en_UH0
+- en_UH1
+- en_UH2
+- en_UW0
+- en_UW1
+- en_UW2
+- en_V
+- en_W
+- en_Y
+- en_Z
+- en_ZH
+- CN_a1
+- CN_a2
+- CN_a3
+- CN_a4
+- CN_a5
+- CN_ai1
+- CN_ai2
+- CN_ai3
+- CN_ai4
+- CN_an1
+- CN_an2
+- CN_an3
+- CN_an4
+- CN_ang1
+- CN_ang2
+- CN_ang3
+- CN_ang4
+- CN_ao1
+- CN_ao2
+- CN_ao3
+- CN_ao4
+- CN_b
+- CN_c
+- CN_ch
+- CN_d
+- CN_e1
+- CN_e2
+- CN_e3
+- CN_e4
+- CN_e5
+- CN_ei1
+- CN_ei2
+- CN_ei3
+- CN_ei4
+- CN_en1
+- CN_en2
+- CN_en3
+- CN_en4
+- CN_en5
+- CN_eng1
+- CN_eng2
+- CN_eng3
+- CN_eng4
+- CN_f
+- CN_g
+- CN_h
+- CN_i1
+- CN_i2
+- CN_i3
+- CN_i4
+- CN_ia1
+- CN_ia2
+- CN_ia3
+- CN_ia4
+- CN_ian1
+- CN_ian2
+- CN_ian3
+- CN_ian4
+- CN_iang1
+- CN_iang2
+- CN_iang3
+- CN_iang4
+- CN_iao1
+- CN_iao2
+- CN_iao3
+- CN_iao4
+- CN_ie1
+- CN_ie2
+- CN_ie3
+- CN_ie4
+- CN_ii1
+- CN_ii2
+- CN_ii3
+- CN_ii4
+- CN_ii5
+- CN_iii1
+- CN_iii2
+- CN_iii3
+- CN_iii4
+- CN_in1
+- CN_in2
+- CN_in3
+- CN_in4
+- CN_ing1
+- CN_ing2
+- CN_ing3
+- CN_ing4
+- CN_iong1
+- CN_iong2
+- CN_iong3
+- CN_iong4
+- CN_iou1
+- CN_iou2
+- CN_iou3
+- CN_iou4
+- CN_j
+- CN_k
+- CN_l
+- CN_m
+- CN_n
+- CN_o1
+- CN_o2
+- CN_o3
+- CN_o4
+- CN_ong1
+- CN_ong2
+- CN_ong3
+- CN_ong4
+- CN_ou1
+- CN_ou2
+- CN_ou3
+- CN_ou4
+- CN_p
+- CN_q
+- CN_r
+- CN_rr
+- CN_s
+- CN_sh
+- CN_t
+- CN_u1
+- CN_u2
+- CN_u3
+- CN_u4
+- CN_ua1
+- CN_ua2
+- CN_ua3
+- CN_ua4
+- CN_uai1
+- CN_uai2
+- CN_uai3
+- CN_uai4
+- CN_uan1
+- CN_uan2
+- CN_uan3
+- CN_uan4
+- CN_uang1
+- CN_uang2
+- CN_uang3
+- CN_uang4
+- CN_ui1
+- CN_ui2
+- CN_ui3
+- CN_ui4
+- CN_un1
+- CN_un2
+- CN_un3
+- CN_un4
+- CN_uo1
+- CN_uo2
+- CN_uo3
+- CN_uo4
+- CN_uo5
+- CN_v1
+- CN_v2
+- CN_v3
+- CN_v4
+- CN_van1
+- CN_van2
+- CN_van3
+- CN_van4
+- CN_ve1
+- CN_ve2
+- CN_ve3
+- CN_ve4
+- CN_vn1
+- CN_vn2
+- CN_vn3
+- CN_vn4
+- CN_x
+- CN_z
+- CN_zh
+tokenizer: null
+add_end_space: false
+lang: en
+freeze_finetune_updates: 0
+noise_perturb: null
+expected_gpu_num: 8
+label_type: phone
+quantizer:
+  quantize_targets: true
+  quantize_input: false
+  same_quantizer: false
+  targets_bottleneck_dim: null
+  targets_bottleneck_act_fn: null
+  targets_bottleneck_dropout: 0.0
+  latent_vars: 320
+  latent_groups: 2
+  latent_dim: 0
+  latent_temp:
+  - 2
+  - 0.5
+  - 0.999995
+  levels:
+  - 8
+  - 8
+  - 8
+  - 8
+  l2_norm: false
+  batch_norm: false
+quant_ppl_loss_weight: 1.0
+use_teacher_encoder: false
+target: nemo.collections.asr.models.spec2vec.vq_ctc_finetune.VQCTCFinetuneModel

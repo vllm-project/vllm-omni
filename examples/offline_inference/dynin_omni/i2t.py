@@ -830,7 +830,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         type=str,
-        default=None,
+        default="auto",
         help="Optional vLLM dtype override (e.g., float16, bfloat16, float32, auto).",
     )
     return parser.parse_args()
@@ -1034,7 +1034,7 @@ if __name__ == "__main__":
 """
 example usage:
 python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/i2t.py \
-  --model snu-aidas/Dynin-Omni_vllm \
+  --model snu-aidas/Dynin-Omni \
   --dynin-config-path /home/kdg6245/vllm-omni/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
   --image-path /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/image \
   --output-dir /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/results/i2t_from_vllm

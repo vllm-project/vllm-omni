@@ -129,6 +129,11 @@ _OMNI_MODELS = {
         "hunyuan_image3",
         "HunyuanImage3ForConditionalGeneration",
     ),
+    "DyninOmniForConditionalGeneration": (
+        "dynin_omni",
+        "dynin_omni",
+        "DyninOmniForConditionalGeneration",
+    ),
 }
 
 
