@@ -27,7 +27,6 @@
 | `RESOURCE_MONITOR_INTERVAL` / `GPU_MONITOR_INTERVAL` | 采样间隔（秒） | 5 |
 | `RESOURCE_MONITOR_LOG_INTERVAL` / `GPU_MONITOR_LOG_INTERVAL` | 日志中 `[GPU]` 行打印间隔（秒） | 15 |
 | `GPU_MONITOR_DEVICES` | 监控的 GPU ID，如 `0,1` 或 `all` | all |
-| `SKIP_DEPS_CHECK` | 非空则跳过 nvidia-smi 等依赖检查 | 未设置 |
 
 ---
 
