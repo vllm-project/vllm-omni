@@ -84,8 +84,6 @@ def xpu_omni_platform_plugin() -> str | None:
     is_xpu = False
     logger.debug("Checking if XPU OmniPlatform is available.")
     try:
-        # installed IPEX if the machine has XPUs.
-        import intel_extension_for_pytorch  # noqa: F401
         import torch
 
         if supports_xccl():

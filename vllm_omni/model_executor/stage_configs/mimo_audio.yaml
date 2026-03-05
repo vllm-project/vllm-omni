@@ -1,0 +1,67 @@
+# stage config for running mimo-audio with architecture of OmniLLM.
+
+# The following config has been verified on 1x H20-96G GPU.
+async_chunk: false
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true           # Run this stage in a separate process
+      devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
+      max_batch_size: 1
+    engine_args:
+      dtype: bfloat16
+      model_stage: fused_thinker_talker
+      model_arch: MiMoAudioForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.3
+      enforce_eager: true    # need to discuss
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: latent   # change the param name,such as pooling_output
+      max_model_len: 8192
+      max_num_batched_tokens: 8192
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 18192
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      process: true            # Run this stage in a separate process
+      devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
+      max_batch_size: 1
+    engine_args:
+      model_stage: code2wav
+      model_arch: MiMoAudioForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.2
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      max_model_len: 18192
+      max_num_batched_tokens: 18192
+      async_scheduling: false
+    engine_input_source: [ 0 ]
+    is_comprehension: false
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 18192
+      seed: 42
+      detokenize: false

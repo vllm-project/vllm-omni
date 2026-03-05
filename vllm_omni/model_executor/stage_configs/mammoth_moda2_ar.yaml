@@ -1,0 +1,24 @@
+# Stage config for running MammothModa2 with single AR stage (understanding / summarization).
+# Stage 0: AR (multimodal understanding + text generation)
+#
+# Use this config for image/video understanding tasks where only text output is needed.
+# For text-to-image generation (AR → DiT), use mammoth_moda2.yaml instead.
+
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: "0"
+      max_batch_size: 16
+    engine_args:
+      model_stage: ar
+      model_arch: MammothModa2ForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      max_model_len: 8192
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: text
+      enable_prefix_caching: false
+    final_output: true
+    final_output_type: text

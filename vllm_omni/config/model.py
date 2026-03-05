@@ -58,6 +58,7 @@ class OmniModelConfig(ModelConfig):
         }
     )
     omni_kv_config: dict | None = None
+    codec_frame_rate_hz: float | None = None
 
     @property
     def registry(self):
@@ -127,6 +128,21 @@ class OmniModelConfig(ModelConfig):
             skip_mm_profiling=skip_mm_profiling,
             video_pruning_rate=video_pruning_rate,
         )
+
+        # Qwen3-TTS: infer codec frame rate from the model config for online serving.
+        if self.codec_frame_rate_hz is None and self.model_arch == "Qwen3TTSTalkerForConditionalGenerationARVLLM":
+            talker_cfg = getattr(self.hf_config, "talker_config", None)
+            if isinstance(talker_cfg, dict):
+                pos_per_sec = talker_cfg.get("position_id_per_seconds")
+            else:
+                pos_per_sec = getattr(talker_cfg, "position_id_per_seconds", None)
+            if pos_per_sec is not None:
+                try:
+                    fps = float(pos_per_sec)
+                except Exception:
+                    fps = None
+                if fps is not None and fps > 0:
+                    self.codec_frame_rate_hz = fps
 
         # Override hf_text_config with omni-specific logic for multi-stage models
         # (e.g., thinker_config, talker_config)

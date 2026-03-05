@@ -17,7 +17,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
@@ -354,8 +353,7 @@ class GlmImageAttention(nn.Module):
             nn.Dropout(0.0),
         )
 
-        # RoPE and attention
-        self.rope = RotaryEmbedding(is_neox_style=False)
+        # Attention
         self.attn = Attention(
             num_heads=num_heads,
             head_size=head_dim,
@@ -379,7 +377,6 @@ class GlmImageAttention(nn.Module):
             hidden_states: Image hidden states [B, img_seq_len, D]
             encoder_hidden_states: Text hidden states [B, text_seq_len, D]
             image_rotary_emb: Tuple of (cos, sin) for RoPE
-            attention_mask: Optional attention mask for text tokens
             kv_cache: Optional layer KV cache for image editing
             kv_cache_mode: Cache mode (WRITE, READ, SKIP)
 
@@ -407,16 +404,12 @@ class GlmImageAttention(nn.Module):
 
         # Apply RoPE only to image tokens (not text tokens)
         if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            cos = cos.to(query.dtype)
-            sin = sin.to(query.dtype)
             # Only apply RoPE to image part (after text_seq_length)
             query_img = query[:, text_seq_length:, :, :]
             key_img = key[:, text_seq_length:, :, :]
             from diffusers.models.embeddings import apply_rotary_emb
 
             query_img = apply_rotary_emb(query_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
-            # key_img = self.rope(key_img, cos, sin)
             key_img = apply_rotary_emb(key_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
             query = torch.cat([query[:, :text_seq_length, :, :], query_img], dim=1)
             key = torch.cat([key[:, :text_seq_length, :, :], key_img], dim=1)
@@ -551,9 +544,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
             `od_config.tf_model_config`.
     """
 
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-    }
+    _repeated_blocks = ["GlmImageTransformerBlock"]
 
     def __init__(
         self,
@@ -724,6 +715,8 @@ class GlmImageTransformer2DModel(CachedTransformer):
             (".to_qkv", ".to_k", "k"),
             (".to_qkv", ".to_v", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 

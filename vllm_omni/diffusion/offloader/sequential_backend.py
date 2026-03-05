@@ -76,9 +76,11 @@ class SequentialOffloadHook(ModelHook):
         current_omni_platform.synchronize()
 
         logger.debug(
-            "Swapped: %s -> CPU, %s -> GPU",
+            "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",
             [t.__class__.__name__ for t in self.offload_targets],
             module.__class__.__name__,
+            f"{self.device.type}:{self.device.index}",
+            current_omni_platform.get_free_memory() / 1024 / 1024 / 1024,
         )
 
         return args, kwargs
