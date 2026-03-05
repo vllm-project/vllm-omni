@@ -22,8 +22,9 @@
 #
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 数据根目录：优先通用名，兼容旧 GPU 名
-DATA_ROOT="${RESOURCE_MONITOR_DATA_ROOT:-${GPU_MONITOR_DATA_ROOT:-$SCRIPT_DIR/gpu_monitor_data}}"
+# 数据根目录：放在 stability 目录下（SCRIPT_DIR 的上一级），便于与 stage_configs/tests 同级
+STABILITY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DATA_ROOT="${RESOURCE_MONITOR_DATA_ROOT:-${GPU_MONITOR_DATA_ROOT:-$STABILITY_DIR/gpu_monitor_data}}"
 SUBCMD="${1:-}"
 
 # 解析可选参数 --backend|-b，结果存入 BACKEND，剩余位置参数存入 REST_ARGS 数组
@@ -257,17 +258,17 @@ cmd_run() {
 
 run_backend_gpu() {
     local CMD=("$@")
-    export RESOURCE_MONITOR_DATA_ROOT="${RESOURCE_MONITOR_DATA_ROOT:-${GPU_MONITOR_DATA_ROOT:-$SCRIPT_DIR/gpu_monitor_data}}"
-    export GPU_MONITOR_DATA_ROOT="${GPU_MONITOR_DATA_ROOT:-$SCRIPT_DIR/gpu_monitor_data}"
+    export RESOURCE_MONITOR_DATA_ROOT="${RESOURCE_MONITOR_DATA_ROOT:-${GPU_MONITOR_DATA_ROOT:-$STABILITY_DIR/gpu_monitor_data}}"
+    export GPU_MONITOR_DATA_ROOT="${GPU_MONITOR_DATA_ROOT:-$STABILITY_DIR/gpu_monitor_data}"
     export SKIP_DEPS_CHECK="${SKIP_DEPS_CHECK:-1}"
     export RESOURCE_MONITOR_INTERVAL="${RESOURCE_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}"
-    export GPU_MONITOR_INTERVAL="${RESOURCE_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}"
+    export GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}"
     export GPU_MONITOR_DEVICES="${GPU_MONITOR_DEVICES:-all}"
     export RESOURCE_MONITOR_LOG_INTERVAL="${RESOURCE_MONITOR_LOG_INTERVAL:-${GPU_MONITOR_LOG_INTERVAL:-15}}"
     export GPU_MONITOR_LOG_INTERVAL="${RESOURCE_MONITOR_LOG_INTERVAL:-${GPU_MONITOR_LOG_INTERVAL:-15}}"
 
     local REPO_ROOT
-    REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
     local MONITOR_PID="" LOG_REPORTER_PID=""
     local TEST_EXIT_CODE=0
 

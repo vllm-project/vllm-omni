@@ -11,16 +11,18 @@ get_benchmark_params_for_server、create_benchmark_indices、omni_server fixture
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tests.conftest import OmniServer, modify_stage_config
+from tests.perf.scripts.run_benchmark import run_benchmark
 
-STABILITY_DIR = Path(__file__).resolve().parent
+STABILITY_DIR = Path(__file__).resolve().parent.parent
 STAGE_CONFIGS_DIR = STABILITY_DIR / "stage_configs"
-CONFIG_FILE_PATH = str(STABILITY_DIR / "stability_test.json")
+CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "stability_test.json")
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
@@ -119,6 +121,147 @@ def create_benchmark_indices():
 
 benchmark_indices = create_benchmark_indices()
 
+NUM_PROMPTS_PER_BATCH = 20
+
+
+def _build_base_args(params: dict[str, Any], host: str, port: int) -> list[str]:
+    exclude = {"request_rate", "max_concurrency", "num_prompts", "baseline", "duration_sec"}
+    args = ["--host", host, "--port", str(port)]
+    for key, value in params.items():
+        if key in exclude or value is None:
+            continue
+        arg_name = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool) and value:
+            args.append(arg_name)
+        elif isinstance(value, dict):
+            args.extend([arg_name, json.dumps(value, ensure_ascii=False, separators=(",", ":"))])
+        elif not isinstance(value, bool):
+            args.extend([arg_name, str(value)])
+    return args
+
+
+def _run_one_benchmark_batch(
+    host: str,
+    port: int,
+    params: dict[str, Any],
+    num_prompts: int,
+    request_rate: float | None,
+    max_concurrency: int | None,
+    result_dir: str,
+    batch_index: int,
+) -> dict[str, Any]:
+    base = _build_base_args(params, host, port)
+    if request_rate is not None:
+        args = base + ["--request-rate", str(request_rate), "--num-prompts", str(num_prompts)]
+        flow = request_rate
+    else:
+        args = base + [
+            "--max-concurrency", str(max_concurrency),
+            "--num-prompts", str(num_prompts),
+            "--request-rate", "inf",
+        ]
+        flow = max_concurrency
+
+    dataset_name = params.get("dataset_name", "random")
+    old_benchmark_dir = os.environ.get("BENCHMARK_DIR")
+    try:
+        os.environ["BENCHMARK_DIR"] = result_dir
+        result = run_benchmark(
+            args=args,
+            test_name="stability",
+            flow=flow,
+            dataset_name=dataset_name,
+            num_prompt=num_prompts,
+        )
+        return result
+    except (FileNotFoundError, OSError):
+        return {"completed": 0, "failed": 0, "duration": 0.0}
+    finally:
+        if old_benchmark_dir is not None:
+            os.environ["BENCHMARK_DIR"] = old_benchmark_dir
+        elif "BENCHMARK_DIR" in os.environ:
+            os.environ.pop("BENCHMARK_DIR")
+
+
+def _merge_batch_results(batch_results: list[dict[str, Any]], total_duration_sec: float) -> dict[str, Any]:
+    if not batch_results:
+        return {"completed": 0, "failed": 0, "duration": total_duration_sec, "errors": []}
+
+    completed = sum(r.get("completed", 0) for r in batch_results)
+    failed = sum(r.get("failed", 0) for r in batch_results)
+    merged: dict[str, Any] = {
+        "completed": completed,
+        "failed": failed,
+        "duration": total_duration_sec,
+        "errors": [],
+    }
+    for r in batch_results:
+        merged["errors"].extend(r.get("errors") or [])
+    return merged
+
+
+def _print_merged_report(result: dict[str, Any]) -> None:
+    """总汇总：仅打印成功请求数、失败请求数、总时间。"""
+    fmt = "{:<40} {:<10}"
+    fmt_float = "{:<40} {:<10.2f}"
+    completed = result.get("completed", 0)
+    failed = result.get("failed", 0)
+    duration = float(result.get("duration", 0.0) or 0.0)
+    print("\n============ Stability Benchmark Summary ============")
+    print(fmt.format("Successful requests:", completed))
+    print(fmt.format("Failed requests:", failed))
+    print(fmt_float.format("Total duration (s):", duration))
+    print("==================================================\n")
+
+
+def run_stability_benchmark(
+    host: str,
+    port: int,
+    duration_sec: int | float,
+    params: dict[str, Any],
+    *,
+    request_rate: float | None = None,
+    max_concurrency: int | None = None,
+    result_filename: str | None = None,
+    result_dir: str = "./",
+    num_prompts_per_batch: int = NUM_PROMPTS_PER_BATCH,
+) -> dict[str, Any]:
+    if (request_rate is None) == (max_concurrency is None):
+        raise ValueError("必须且仅能指定 request_rate 或 max_concurrency 之一")
+
+    start_time = time.perf_counter()
+    batch_results: list[dict[str, Any]] = []
+    batch_index = 0
+
+    while True:
+        if (time.perf_counter() - start_time) >= duration_sec:
+            break
+        result = _run_one_benchmark_batch(
+            host=host,
+            port=port,
+            params=params,
+            num_prompts=num_prompts_per_batch,
+            request_rate=request_rate,
+            max_concurrency=max_concurrency,
+            result_dir=result_dir,
+            batch_index=batch_index,
+        )
+        batch_results.append(result)
+        batch_index += 1
+        if (time.perf_counter() - start_time) >= duration_sec:
+            break
+
+    total_duration = time.perf_counter() - start_time
+    merged = _merge_batch_results(batch_results, total_duration)
+    _print_merged_report(merged)
+
+    if result_filename and result_dir:
+        result_path = Path(result_dir) / result_filename
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2, ensure_ascii=False)
+
+    return merged
+
 
 @pytest.fixture(scope="module")
 def omni_server(request):
@@ -167,8 +310,6 @@ def stability_benchmark_params(request, omni_server):
 @pytest.mark.parametrize("stability_benchmark_params", benchmark_indices, indirect=True)
 def test_benchmark_stability(omni_server, stability_benchmark_params):
     """在指定时长内按 request-rate 或 max-concurrency 跑 benchmark，断言无失败请求。"""
-    from tests.e2e.stability.run_benchmark_duration import run_stability_benchmark
-
     test_name = stability_benchmark_params["test_name"]
     params = stability_benchmark_params["params"]
     duration_sec = int(os.environ.get("STABILITY_BENCHMARK_DURATION_SEC", params.get("duration_sec", 300)))
