@@ -194,13 +194,13 @@ def format_input(
             for _ in cleaned_txt
         ]
 
-        for i, (el, images) in enumerate(zip(messages, images)):
+        for i, (el, batch_images) in enumerate(zip(messages, images)):
             # optionally add the images per batch element.
-            if images is not None:
+            if batch_images is not None:
                 el.append(
                     {
                         "role": "user",
-                        "content": [{"type": "image", "image": image_obj} for image_obj in images],
+                        "content": [{"type": "image", "image": image_obj} for image_obj in batch_images],
                     }
                 )
             # add the text.
