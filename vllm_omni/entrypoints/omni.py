@@ -1027,6 +1027,16 @@ class Omni(OmniBase):
 
                 made_progress = True
                 req_id = result.get("request_id")
+
+                # Discard stale results from a previous generate() call.
+                # This can happen when the prior run exits early (e.g. on
+                # error) while companion results are still queued.
+                if req_id not in request_id_to_prompt and not cfg.is_companion(req_id):
+                    logger.warning(
+                        f"[{self._name}] Skipping stale result for unknown request {req_id}",
+                    )
+                    continue
+
                 if "error" in result:
                     logger.error(
                         f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
@@ -1039,6 +1049,14 @@ class Omni(OmniBase):
                                 f"[{self._name}] Parent {parent_id} aborted due to "
                                 f"companion failure ({completed_requests}/{total_requests})",
                             )
+                    else:
+                        completed_requests += 1
+                        if pbar:
+                            pbar.update(1)
+                        logger.error(
+                            f"[{self._name}] Request {req_id} failed at stage {stage_id} "
+                            f"({completed_requests}/{total_requests})",
+                        )
                     continue
 
                 if result.get("type") == "stage_ready":
