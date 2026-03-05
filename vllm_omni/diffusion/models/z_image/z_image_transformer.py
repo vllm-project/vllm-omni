@@ -579,10 +579,6 @@ class ZImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-        "w13": ["w1", "w3"],
-    }
 
     # Sequence Parallelism for Z-Image (following diffusers' _cp_plan pattern)
     # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,
@@ -985,6 +981,8 @@ class ZImageTransformer2DModel(CachedTransformer):
             (".w13", ".w1", 0),
             (".w13", ".w3", 1),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 

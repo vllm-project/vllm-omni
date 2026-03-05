@@ -111,6 +111,16 @@ _DIFFUSION_MODELS = {
         "pipeline_omnigen2",
         "OmniGen2Pipeline",
     ),
+    "HeliosPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
+    "HeliosPyramidPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
 }
 
 
@@ -275,6 +285,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
+    "HeliosPipeline": "get_helios_post_process_func",
+    "HeliosPyramidPipeline": "get_helios_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -289,6 +301,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
+    "HeliosPipeline": "get_helios_pre_process_func",
+    "HeliosPyramidPipeline": "get_helios_pre_process_func",
 }
 
 
