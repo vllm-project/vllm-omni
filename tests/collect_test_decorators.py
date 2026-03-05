@@ -87,39 +87,49 @@ def collect_decorators_and_tests(file_path: Path) -> list[tuple[str, list[str]]]
 
 
 def main():
-    rows = []
+    # rows: (file, func_name, decorators_md, decorators_csv)
+    rows: list[tuple[str, str, str, str]] = []
     for py in sorted(TESTS_ROOT.rglob("*.py")):
         rel = py.relative_to(TESTS_ROOT)
         if should_skip(rel):
             continue
         try:
             for func_name, decorators in collect_decorators_and_tests(py):
-                case_id = f"{rel.as_posix()}::{func_name}"
+                file_str = rel.as_posix()
                 # Markdown 用竖线分隔，CSV 用分号分隔
                 decorator_str_md = " | ".join(decorators) if decorators else "(无)"
                 decorator_str_csv = "; ".join(decorators) if decorators else "(无)"
-                rows.append((case_id, decorator_str_md, decorator_str_csv))
+                rows.append((file_str, func_name, decorator_str_md, decorator_str_csv))
         except Exception as e:
-            rows.append((str(rel), f"(解析错误: {e})", ""))
+            file_str = rel.as_posix()
+            rows.append((file_str, "<解析错误>", f"(解析错误: {e})", ""))
+
+    # 按文件名、函数名排序，方便查看和“合并”相同文件
+    rows.sort(key=lambda x: (x[0], x[1]))
 
     # 输出 CSV，便于 Excel 打开
     out_csv = TESTS_ROOT / "test_decorators_report.csv"
     with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["用例 (文件::函数名)", "修饰器 (同一单元格用 ; 分隔)"])
-        for case_id, _, dec_csv in rows:
-            w.writerow([case_id, dec_csv])
+        w.writerow(["文件", "函数名", "修饰器 (同一单元格用 ; 分隔)"])
+        for file_str, func_name, _, dec_csv in rows:
+            w.writerow([file_str, func_name, dec_csv])
 
     # 同时输出 Markdown 表格到文件
     out_md = TESTS_ROOT / "test_decorators_report.md"
     with open(out_md, "w", encoding="utf-8") as f:
         f.write("# tests 用例与修饰器统计（已排除 e2e、examples、perf）\n\n")
-        f.write("| 用例 (文件::函数名) | 修饰器 |\n")
-        f.write("| --- | --- |\n")
-        for case_id, dec_str, _ in rows:
+        f.write("| 文件 | 函数名 | 修饰器 |\n")
+        f.write("| --- | --- | --- |\n")
+
+        last_file: str | None = None
+        for file_str, func_name, dec_str, _ in rows:
+            # 同一个文件的多行，只在第一行显示文件名，后续行留空，达到“合并”视觉效果
+            file_cell = file_str if file_str != last_file else ""
+            last_file = file_str
             # Markdown 表格内 | 转义为 \| 或放在代码块里避免破坏列
             dec_esc = dec_str.replace("|", "\\|").replace("\n", " ")
-            f.write(f"| {case_id} | {dec_esc} |\n")
+            f.write(f"| {file_cell} | {func_name} | {dec_esc} |\n")
 
     print(f"共 {len(rows)} 个用例，已写入:")
     print(f"  - {out_csv}")
