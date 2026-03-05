@@ -81,7 +81,6 @@ With `--log-stats` enabled, the server will output detailed metrics logs after e
 | num_inference_steps             |     50.000 |
 | postprocess_time_ms             |     67.685 |
 | preprocess_time_ms              |     60.106 |
-| preprocessing_time_ms           |     60.106 |
 | resolution                      |    640.000 |
 | stage_gen_time_ms               | 16,363.714 |
 
