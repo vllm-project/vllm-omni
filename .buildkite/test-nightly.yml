@@ -1,5 +1,5 @@
 steps:
-  - label: "Omni Model Test with H100"
+  - label: ":full_moon: Omni Model Test with H100"
     timeout_in_minutes: 90
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
@@ -41,13 +41,16 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: "Omni Model Test"
+  - label: ":full_moon: Omni Model Test&Test Case Statistics"
     timeout_in_minutes: 60
+    key: nightly-testcase-statistics
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
+      - python tools/nightly/buildkite_testcase_statistics.py
+      - buildkite-agent artifact upload "tests/*.html"
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
@@ -56,18 +59,22 @@ steps:
           always-pull: true
           shm-size: "8gb"
           propagate-environment: true
+          shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Omni Model Perf Test"
-    timeout_in_minutes: 120
+  - label: ":full_moon: Omni Model Perf Test with H100"
+    key: nightly-performance
+    timeout_in_minutes: 180
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - export BENCHMARK_DIR=tests
       - pytest -s -v tests/perf/scripts/run_benchmark.py
+      - buildkite-agent artifact upload "tests/*.json"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -96,3 +103,21 @@ steps:
                 hostPath:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
+
+  - label: ":email: Nightly Collection & Email"
+    key: nightly-perf-distribution
+    depends_on:
+    - nightly-performance
+    - nightly-testcase-statistics
+    if: build.env("NIGHTLY") == "1"
+    commands:
+      - pip install openpyxl
+      - export DEFAULT_INPUT_DIR=tests
+      - export DEFAULT_OUTPUT_DIR=tests
+      - buildkite-agent artifact download "tests/*.json" . --step nightly-performance
+      - buildkite-agent artifact download "tests/*.html" . --step nightly-performance
+      - python tools/nightly/generate_nightly_perf_excel.py
+      - python tools/nightly/send_nightly_email.py --report-file "reports/*.xlsx, reports/*.html"
+      - buildkite-agent artifact upload "tests/*.xlsx"
+    agents:
+      queue: "cpu_queue_premerge"
