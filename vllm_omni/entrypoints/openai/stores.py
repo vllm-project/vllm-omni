@@ -1,9 +1,9 @@
 import asyncio
-from typing import Any, TypeVar, Generic
-from collections.abc import Callable
-from pydantic import BaseModel
-from vllm_omni.entrypoints.openai.protocol.videos import VideoResponse
+from typing import Any, Generic, TypeVar
 
+from pydantic import BaseModel
+
+from vllm_omni.entrypoints.openai.protocol.videos import VideoResponse
 
 T = TypeVar("T", bound=BaseModel)
 U = TypeVar("U")

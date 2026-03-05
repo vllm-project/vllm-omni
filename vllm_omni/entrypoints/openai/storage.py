@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from tempfile import NamedTemporaryFile
 
 
-class StorageBaseManger(ABC):
+class StorageBaseManager(ABC):
     @abstractmethod
     async def save(self, *args, **kwargs) -> str:
         pass
@@ -14,7 +14,7 @@ class StorageBaseManger(ABC):
         pass
 
 
-class LocalStorageManager(StorageBaseManger):
+class LocalStorageManager(StorageBaseManager):
     def __init__(self, storage_path: str | None = None):
         if storage_path is None:
             storage_path = os.getenv("VLLM_OMNI_STORAGE_PATH", "/tmp/storage")

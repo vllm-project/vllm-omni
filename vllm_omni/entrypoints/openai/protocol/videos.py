@@ -8,15 +8,38 @@ mirrors the OpenAI Images API shape, with vllm-omni extensions for diffusion
 video models (e.g., Wan2.2).
 """
 
-from enum import Enum
-from typing import Any, Literal
+import mimetypes
 import time
-from pydantic import BaseModel, Field, field_validator, model_validator
-from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 import uuid
+from enum import Enum
+from functools import lru_cache
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+from vllm_omni.entrypoints.openai.image_api_utils import parse_size
+
+
+class VideoGenerationStatus(str, Enum):
+    QUEUED = "queued"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
 
 DEFAULT_FPS = 24
-GENERATION_STATUS = Literal["queued", "in_progress", "complete", "failed", "deleted"]
+
+
+@lru_cache
+def file_extension(media_type: str):
+    media_type = str(media_type).split(";", 1)[0].strip().lower()
+    ext = mimetypes.guess_extension(media_type, strict=False)
+
+    if ext is None:
+        raise ValueError(f"No recognized file extension for media_type {media_type}")
+
+    # Keep naming stable for unknown/unsupported MIME types.
+    return ext.lstrip(".")
 
 
 class VideoResponseFormat(str, Enum):
@@ -49,7 +72,6 @@ class VideoGenerationRequest(BaseModel):
         default=None,
         description="Model to use (optional, uses server's configured model if omitted)",
     )
-    n: int = Field(default=1, ge=1, le=4, description="Number of videos to generate")
     seconds: int | str | None = Field(
         default=None,
         description="Clip duration in seconds (OpenAI-compatible, e.g., 4, 8, 12)",
@@ -194,29 +216,59 @@ class VideoGenerationResponse(BaseModel):
 
 
 class VideoResponse(BaseModel):
-    model: str
-    id: str = Field(default_factory=lambda: f"video_gen_{uuid.uuid4().hex}")
-    object: str = "video"
-    status: GENERATION_STATUS = "queued"
-    media_type: Literal["video/mp4"] = "video/mp4"
-    size: str = ""
-    created_at: int = Field(default_factory=lambda: int(time.time()))
-    completed_at: int | None = None
-    expires_at: int | None = None
-    error: dict[str, Any | None] | None = None
-    file_paths: list[str] = Field(
-        default_factory=list,
-        description="Saved output file paths.",
+    """Stored metadata for an async video generation job."""
+
+    # OpenAI standard fields
+    model: str = Field(..., description="Model name used for video generation.")
+    id: str = Field(
+        default_factory=lambda: f"video_gen_{uuid.uuid4().hex}", description="Unique id for a video request"
     )
-    peak_memory_mb: float | None = None
-    inference_time_s: float | None = None
+    object: str = Field(default="video", description="Object type identifier.")
+    status: VideoGenerationStatus = Field(
+        default=VideoGenerationStatus.QUEUED, description="Current lifecycle status of the video job."
+    )
+    size: str = Field(default="", description="Requested output size in WIDTHxHEIGHT format.")
+    progress: int = Field(default=0, description="Best-effort progress indicator from 0 to 100.")
+    seconds: str = Field(default="4", description="Requested clip length in seconds.")
+    quality: str = Field(default="default", description="Requested quality level for generation.")
+    created_at: int = Field(
+        default_factory=lambda: int(time.time()),
+        description="Unix timestamp when the job was created.",
+    )
+    remixed_from_video_id: str | None = Field(
+        default=None,
+        description="Optional source video id for remix/edit flows.",
+    )
+
+    # vLLM specific fields
+    media_type: Literal["video/mp4"] = Field(default="video/mp4", description="MIME type of the generated artifact.")
+    completed_at: int | None = Field(default=None, description="Unix timestamp when generation completed.")
+    expires_at: int | None = Field(default=None, description="Unix timestamp when this record is considered expired.")
+    error: dict[str, Any | None] | None = Field(
+        default=None,
+        description="Structured error payload when generation fails.",
+    )
+    file_path: str | None = Field(
+        default=None,
+        description="Absolute path of the saved output video files for this job.",
+    )
+    inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
 
     @property
     def file_extension(self) -> str:
-        ext_map = {"video/mp4": "mp4"}
-        return ext_map[self.media_type]
+        return file_extension(self.media_type)
+
+
+class VideoDeleteResponse(BaseModel):
+    id: str = Field(description="Identifier of the deleted video.")
+    deleted: bool = Field(description="Indicates that the video resource was deleted.")
+    object: Literal["object.deleted"] = Field(
+        default="object.deleted", description="The object type that signals the deletion response."
+    )
 
 
 class VideoListResponse(BaseModel):
-    data: list[VideoResponse]
-    object: str = "list"
+    """Paginated-style wrapper for listing stored video jobs."""
+
+    data: list[VideoResponse] = Field(..., description="Array of video job records.")
+    object: Literal["list"] = Field(default="list", description="Object type identifier for list responses.")

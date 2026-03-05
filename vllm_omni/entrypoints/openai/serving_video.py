@@ -3,13 +3,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
-import uuid
 from http import HTTPStatus
 from typing import Any, cast
-import asyncio
-from weakref import ref
 
 from fastapi import HTTPException
 from PIL import Image
@@ -21,10 +19,10 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoData,
     VideoGenerationRequest,
     VideoGenerationResponse,
+    VideoResponse,
 )
-from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference, encode_video_base64
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
-from vllm_omni.entrypoints.openai.protocol.videos import VideoResponse
+from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference, encode_video_base64
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -113,7 +111,7 @@ class OmniOpenAIServingVideo:
                 detail=str(exc),
             ) from exc
 
-        gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
+        gen_params = OmniDiffusionSamplingParams()
 
         vp = request.resolve_video_params()
         if input_image is not None and vp.width is not None and vp.height is not None:
