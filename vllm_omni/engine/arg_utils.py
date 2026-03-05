@@ -65,6 +65,8 @@ class OmniEngineArgs(EngineArgs):
         stage_connector_spec: Extra configuration for stage connector
         async_chunk: If set to True, perform async chunk
         worker_type: Model Type, e.g., "ar" or "generation"
+        task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
+            If not specified, will be inferred from model path.
     """
 
     stage_id: int = 0
@@ -78,6 +80,7 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     worker_type: str | None = None
+    task_type: str | None = None
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
@@ -199,6 +202,7 @@ class OmniEngineArgs(EngineArgs):
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             stage_connector_config=stage_connector_config,
             omni_kv_config=self.omni_kv_config,
+            task_type=self.task_type,
         )
         omni_config.hf_config.architectures = omni_config.architectures
 
@@ -221,6 +225,8 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
             "audio", "latents"). If None, output type is inferred.
         stage_connector_spec: Extra configuration for stage connector
         worker_type: Model Type, e.g., "ar" or "generation"
+        task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
+            If not specified, will be inferred from model path.
     """
 
     stage_id: int = 0
@@ -234,6 +240,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     worker_type: str | None = None
+    task_type: str | None = None
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
@@ -355,6 +362,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             stage_connector_config=stage_connector_config,
             omni_kv_config=self.omni_kv_config,
+            task_type=self.task_type,
         )
         omni_config.hf_config.architectures = omni_config.architectures
 
