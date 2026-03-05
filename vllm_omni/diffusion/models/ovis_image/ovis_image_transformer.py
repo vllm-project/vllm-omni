@@ -98,6 +98,7 @@ class SwiGLU(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, hidden_states):
+        # Weight layout: [hidden_local, gate_local] interleaved within each TP shard
         hidden_states, _ = self.proj(hidden_states)
         hidden_states, gate = hidden_states.chunk(2, dim=-1)
         out = hidden_states * self.activation(gate)
@@ -260,7 +261,7 @@ class OvisImageAttention(nn.Module):
             value,
         )
         hidden_states = hidden_states.flatten(2, 3)
-
+        hidden_states = hidden_states.to(query.dtype)
         if encoder_hidden_states is not None:
             enc_len = encoder_hidden_states.shape[1]
             encoder_hidden_states, hidden_states = (
@@ -507,8 +508,8 @@ class OvisImageTransformer2DModel(nn.Module):
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=self.inner_dim)
 
         self.context_embedder_norm = RMSNorm(joint_attention_dim, eps=1e-6)
-        self.context_embedder = ColumnParallelLinear(joint_attention_dim, self.inner_dim, bias=True, gather_output=True)
-        self.x_embedder = ColumnParallelLinear(in_channels, self.inner_dim, bias=True, gather_output=True)
+        self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim)
+        self.x_embedder = nn.Linear(in_channels, self.inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -532,9 +533,7 @@ class OvisImageTransformer2DModel(nn.Module):
             ]
         )
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = RowParallelLinear(
-            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True, input_is_parallel=False
-        )
+        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
     def forward(
         self,
@@ -568,14 +567,14 @@ class OvisImageTransformer2DModel(nn.Module):
             `tuple` where the first element is the sample tensor.
         """
 
-        hidden_states, _ = self.x_embedder(hidden_states)
+        hidden_states = self.x_embedder(hidden_states)
         timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
 
         timesteps_proj = self.time_proj(timestep)
         temb = self.timestep_embedder(timesteps_proj.to(device=hidden_states.device, dtype=hidden_states.dtype))
 
         encoder_hidden_states = self.context_embedder_norm(encoder_hidden_states)
-        encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
         if txt_ids.ndim == 3:
             logger.warning(
                 "Passing `txt_ids` 3d torch.Tensor is deprecated."
@@ -613,7 +612,7 @@ class OvisImageTransformer2DModel(nn.Module):
             )
 
         hidden_states = self.norm_out(hidden_states, temb)
-        output, _ = self.proj_out(hidden_states)
+        output = self.proj_out(hidden_states)
 
         if not return_dict:
             return (output,)
@@ -635,6 +634,12 @@ class OvisImageTransformer2DModel(nn.Module):
         self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
+
+        # we need to load the buffers for beta and eps (XIELU)
+        for name, buffer in self.named_buffers():
+            if name.endswith(".beta") or name.endswith(".eps"):
+                params_dict[name] = buffer
+
         loaded_params: set[str] = set()
 
         tp_size = get_tensor_model_parallel_world_size()
@@ -695,6 +700,7 @@ class OvisImageTransformer2DModel(nn.Module):
 
             # 4. Standard parameter loading
             if name not in params_dict:
+                logger.warning("Unexpected parameter in checkpoint: %s", name)
                 continue
 
             param = params_dict[name]
