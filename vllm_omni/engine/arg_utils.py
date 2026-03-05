@@ -16,6 +16,7 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -25,6 +26,7 @@ def _register_omni_hf_configs() -> None:
 
     try:
         AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+        AutoConfig.register("cosyvoice3", CosyVoice3Config)
     except ValueError:
         # Already registered elsewhere; ignore.
         return
@@ -74,6 +76,7 @@ class OmniEngineArgs(EngineArgs):
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     async_chunk: bool = False
     omni_kv_config: dict | None = None
+    quantization_config: Any | None = None
     worker_type: str | None = None
 
     def __post_init__(self) -> None:
@@ -230,6 +233,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     async_chunk: bool = False
     omni_kv_config: dict | None = None
+    quantization_config: Any | None = None
     worker_type: str | None = None
 
     def __post_init__(self) -> None:

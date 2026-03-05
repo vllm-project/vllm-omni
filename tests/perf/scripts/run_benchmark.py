@@ -1,9 +1,5 @@
-import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
-
 import json
+import os
 import subprocess
 import threading
 from datetime import datetime
@@ -13,6 +9,9 @@ from typing import Any
 import pytest
 
 from tests.conftest import OmniServer, modify_stage_config
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
@@ -46,7 +45,8 @@ def modify_stage(default_path, updates, deletes):
 
 
 def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
-    unique_params = set()
+    unique_params = []
+    seen = set()
     for config in configs:
         test_name = config["test_name"]
         model = config["server_params"]["model"]
@@ -55,9 +55,13 @@ def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str
         delete = config["server_params"].get("delete", None)
         update = config["server_params"].get("update", None)
         stage_config_path = modify_stage(stage_config_path, update, delete)
-        unique_params.add((test_name, model, stage_config_path))
 
-    return list(unique_params)
+        server_param = (test_name, model, stage_config_path)
+        if server_param not in seen:
+            seen.add(server_param)
+            unique_params.append(server_param)
+
+    return unique_params
 
 
 def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[str, dict]:
@@ -95,6 +99,7 @@ def omni_server(request):
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
         with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+            server.test_name = test_name
             print("OmniServer started successfully")
             yield server
             print("OmniServer stopping...")
@@ -117,6 +122,8 @@ def run_benchmark(args: list, test_name: str, flow, dataset_name: str, num_promp
             "--endpoint",
             "/v1/chat/completions",
             "--save-result",
+            "--result-dir",
+            os.environ.get("BENCHMARK_DIR", "tests"),
             "--result-filename",
             result_filename,
         ]
@@ -131,9 +138,9 @@ def run_benchmark(args: list, test_name: str, flow, dataset_name: str, num_promp
     for line in iter(process.stderr.readline, ""):
         print(line, end=" ")
 
-    if "--result-dir" in args:
-        index = args.index("--result-dir")
-        result_dir = args[index + 1]
+    if "--result-dir" in command:
+        index = command.index("--result-dir")
+        result_dir = command[index + 1]
     else:
         result_dir = "./"
 
@@ -150,10 +157,15 @@ def get_benchmark_params_for_server(test_name: str) -> list:
 
 def create_benchmark_indices():
     indices = []
-    for test_name, config_data in server_to_benchmark_mapping.items():
-        params_list = config_data["benchmark_params"]
-        for idx in range(len(params_list)):
-            indices.append((test_name, idx))
+    seen = set()
+    for config in BENCHMARK_CONFIGS:
+        test_name = config["test_name"]
+        if test_name not in seen:
+            seen.add(test_name)
+            params_list = get_benchmark_params_for_server(test_name)
+            for idx in range(len(params_list)):
+                indices.append((test_name, idx))
+
     return indices
 
 
@@ -164,6 +176,10 @@ benchmark_indices = create_benchmark_indices()
 def benchmark_params(request, omni_server):
     """Benchmark parameters fixture with proper parametrization"""
     test_name, param_index = request.param
+
+    if test_name != omni_server.test_name:
+        pytest.skip(f"Skipping parameter for {test_name} - current server is {omni_server.test_name}")
+
     all_params = get_benchmark_params_for_server(test_name)
 
     if not all_params:
@@ -171,6 +187,14 @@ def benchmark_params(request, omni_server):
 
     if param_index >= len(all_params):
         raise ValueError(f"No benchmark parameters found for index {param_index} in test: {test_name}")
+
+    if all_params[param_index]["dataset_name"] == "random-mm":
+        # TODO: Due to known issues, skip the random-mm dataset.
+        pytest.skip("Skipping parameter for random-mm dataset.")
+
+    current = param_index + 1
+    total = len(all_params)
+    print(f"\n  Running benchmark {current}/{total} for {test_name}")
 
     return {"test_name": test_name, "params": all_params[param_index]}
 

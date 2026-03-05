@@ -1,6 +1,6 @@
 """Thin Omni wrapper: reuse upstream Qwen2.5-Omni thinker (v0.14) with minimal overrides."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -25,13 +25,15 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
     Qwen2_5OmniThinkerProcessingInfo,
     check_interleaved_audio_video,
     merge_interleaved_embeddings,
 )
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin as Qwen2_5OmniConditionalGenerationMixinBase,
+)
+from vllm.model_executor.models.qwen2_5_omni_thinker import (
+    Qwen2_5OmniThinkerMultiModalProcessor as _Qwen2_5OmniThinkerMultiModalProcessorBase,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VisionTransformer,
@@ -45,7 +47,6 @@ from vllm.model_executor.models.qwen2_5_vl import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
-    _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
     split_list_into_ranges,
@@ -54,6 +55,12 @@ from vllm.model_executor.models.vision import get_llm_pos_ids_for_vision
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
+    MultiModalKwargsItems,
+)
+from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.processing.processor import (
+    MultiModalPromptUpdates,
+    PlaceholderFeaturesInfo,
 )
 from vllm.sequence import IntermediateTensors
 
@@ -62,6 +69,69 @@ try:
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
 logger = init_logger(__name__)
+
+
+class Qwen2_5OmniThinkerMultiModalProcessor(
+    _Qwen2_5OmniThinkerMultiModalProcessorBase,
+):
+    """Override to fix use_audio_in_video detection when mm cache returns None."""
+
+    def _maybe_apply_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        prompt_ids: list[int],
+        mm_kwargs: MultiModalKwargsItems,
+        mm_prompt_updates: MultiModalPromptUpdates,
+        is_update_applied: bool,
+    ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
+        mm_item_counts = mm_items.get_all_counts()
+        self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
+        self._validate_mm_updates(mm_prompt_updates, mm_item_counts)
+
+        use_audio_in_video = False
+        if "video" in mm_kwargs:
+            non_none_items = [item for item in mm_kwargs["video"] if item is not None]
+            if non_none_items:
+                for item in non_none_items:
+                    if item.get("use_audio_in_video"):
+                        uaiv_tensor = item["use_audio_in_video"].data
+                        if uaiv_tensor.numel() > 0:
+                            use_audio_in_video = bool(uaiv_tensor.item())
+                            break
+            elif "audio" in mm_prompt_updates:
+                tokenizer = self.info.get_tokenizer()
+                audio_pad_id = tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+                use_audio_in_video = audio_pad_id not in prompt_ids
+
+        if is_update_applied:
+            mm_placeholders = self._find_mm_placeholders(
+                prompt_ids,
+                mm_prompt_updates,
+            )
+            self._validate_mm_placeholders(
+                mm_placeholders,
+                mm_item_counts,
+            )
+        else:
+            if use_audio_in_video and "audio" in mm_prompt_updates:
+                filtered_updates = {k: v for k, v in mm_prompt_updates.items() if k != "audio"}
+                prompt_ids, mm_placeholders = self._apply_prompt_updates(
+                    prompt_ids,
+                    filtered_updates,
+                )
+                mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_prompt_updates)
+            else:
+                prompt_ids, mm_placeholders = self._apply_prompt_updates(
+                    prompt_ids,
+                    mm_prompt_updates,
+                )
+
+            self._validate_mm_placeholders(
+                mm_placeholders,
+                mm_item_counts,
+            )
+
+        return prompt_ids, mm_placeholders
 
 
 class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixinBase):
@@ -518,22 +588,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         is_multimodal: torch.Tensor | None = None,
         handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
-        # This is to satisfy the type checker for each overload
         if multimodal_embeddings is None or is_multimodal is None:
             return super().embed_input_ids(input_ids)
 
-        inputs_embeds = self._embed_text_input_ids(
-            input_ids,
-            self.get_language_model().embed_input_ids,
-            is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
-        )
-
-        if len(multimodal_embeddings) == 0:
-            return inputs_embeds
-
         # Check for audio-in-video: interleaved video and audio tokens
-        # in the multimodal region.
+        # in the multimodal region. Only use the interleaved path when
+        # needed; otherwise fall back to the default parent implementation.
         video_token_id = self.config.video_token_index
         audio_token_id = self.config.audio_token_index
 
@@ -544,6 +604,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         num_audio = is_audio.sum().item()
 
         if check_interleaved_audio_video(is_video, is_audio, num_video, num_audio):
+            inputs_embeds = self._embed_text_input_ids(
+                input_ids,
+                self.get_language_model().embed_input_ids,
+                is_multimodal=is_multimodal,
+                handle_oov_mm_token=handle_oov_mm_token,
+            )
             return merge_interleaved_embeddings(
                 inputs_embeds,
                 multimodal_embeddings,
@@ -554,8 +620,13 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 num_audio,
             )
 
-        # Default: standard merge (no interleaving)
-        return _merge_multimodal_embeddings(inputs_embeds, multimodal_embeddings, is_multimodal)
+        # Default: standard merge (no interleaving), same as parent class
+        return super().embed_input_ids(
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
+        )
 
     def forward(
         self,

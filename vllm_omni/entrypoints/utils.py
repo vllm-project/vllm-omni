@@ -1,8 +1,9 @@
 import os
+import types
 from collections import Counter
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_origin
 
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
@@ -68,6 +69,52 @@ def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     return None
 
 
+def _filter_dict_like_object(obj: dict | Any) -> dict:
+    """Filter dict-like object by removing callables and recursively converting values.
+
+    Converts dict-like objects to regular dicts while filtering out callable values
+    that are incompatible with OmegaConf. Recursively processes values through
+    _convert_dataclasses_to_dict for nested object conversion.
+
+    Args:
+        obj: Dict or dict-like object to filter
+
+    Returns:
+        Regular dict with callables filtered out and values recursively converted
+
+    Raises:
+        TypeError: If obj doesn't support .items() method
+        ValueError: If dict conversion fails unexpectedly
+    """
+
+    def _is_callable_value(value: Any) -> bool:
+        if callable(value):
+            return True
+        return isinstance(
+            value,
+            (
+                types.FunctionType,
+                types.MethodType,
+                types.BuiltinFunctionType,
+                types.BuiltinMethodType,
+            ),
+        )
+
+    result = {}
+    filtered_keys = []
+    for k, v in obj.items():
+        if _is_callable_value(v):
+            filtered_keys.append(str(k))
+        else:
+            result[k] = _convert_dataclasses_to_dict(v)
+    if filtered_keys:
+        logger.warning(
+            f"Filtered out {len(filtered_keys)} callable object(s) from base_engine_args "
+            f"that are not compatible with OmegaConf: {filtered_keys}. "
+        )
+    return result
+
+
 def _convert_dataclasses_to_dict(obj: Any) -> Any:
     """Recursively convert non-serializable objects to OmegaConf-compatible types.
 
@@ -75,6 +122,7 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     - Dataclass objects with Literal type annotations (e.g., StructuredOutputsConfig)
     - Counter objects (from collections or vllm.utils)
     - Set objects
+    - Callable objects (functions, methods, etc.)
     - Other non-primitive types
     """
     # IMPORTANT: Check Counter BEFORE dict, since Counter is a subclass of dict
@@ -99,17 +147,21 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
         result = asdict(obj)
         # Recursively process the result to convert any Counter objects
         return _convert_dataclasses_to_dict(result)
-    # Handle dictionaries (recurse into values)
+    # Handle dictionaries (recurse into values) and filter out callables(cause error in OmegaConf.create)
     # Note: This must come AFTER Counter check since Counter is a dict subclass
     if isinstance(obj, dict):
-        return {k: _convert_dataclasses_to_dict(v) for k, v in obj.items()}
+        return _filter_dict_like_object(obj)
+    # Handle callable objects (functions, methods, etc.) - skip them
+    # Note: This comes after dict/list checks to avoid misclassifying dict-like objects
+    if callable(obj):
+        return None
     # Handle lists and tuples (recurse into items)
     if isinstance(obj, (list, tuple)):
-        return type(obj)(_convert_dataclasses_to_dict(item) for item in obj)
+        return type(obj)(_convert_dataclasses_to_dict(item) for item in obj if not callable(item))
     # Try to convert any dict-like object (has keys/values methods) to dict
     if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, (str, bytes)):
         try:
-            return {k: _convert_dataclasses_to_dict(v) for k, v in obj.items()}
+            return _filter_dict_like_object(obj)
         except (TypeError, ValueError, AttributeError):
             # If conversion fails, return as-is
             return obj
@@ -236,6 +288,40 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     return stage_args
 
 
+def load_and_resolve_stage_configs(
+    model: str,
+    stage_configs_path: str | None,
+    kwargs: dict | None,
+    default_stage_cfg_factory: Any = None,
+) -> tuple[str, list]:
+    """Load stage configurations from model or YAML file with fallback to defaults.
+
+    Args:
+        model: Model name or path
+        stage_configs_path: Optional path to YAML file containing stage configurations
+        kwargs: Engine arguments to merge with stage configs
+        default_stage_cfg_factory: Optional callable that takes no args and returns
+            default stage config list when no configs are found
+
+    Returns:
+        Tuple of (config_path, stage_configs)
+    """
+    if stage_configs_path is None:
+        config_path = resolve_model_config_path(model)
+        stage_configs = load_stage_configs_from_model(model, base_engine_args=kwargs)
+        if not stage_configs:
+            if default_stage_cfg_factory is not None:
+                default_stage_cfg = default_stage_cfg_factory()
+                stage_configs = OmegaConf.create(default_stage_cfg)
+            else:
+                stage_configs = []
+    else:
+        config_path = stage_configs_path
+        stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
+
+    return config_path, stage_configs
+
+
 def get_final_stage_id_for_e2e(
     output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
 ) -> int:
@@ -280,6 +366,117 @@ def get_final_stage_id_for_e2e(
         final_stage_id_for_e2e = last_stage_id
 
     return final_stage_id_for_e2e
+
+
+def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
+    """Filter kwargs to only include fields defined in the dataclass.
+
+    Args:
+        cls: Dataclass type
+        kwargs: Keyword arguments to filter
+
+    Returns:
+        Filtered keyword arguments containing only valid dataclass fields
+    """
+    if not is_dataclass(cls):
+        raise ValueError(f"{cls} is not a dataclass")
+    if not isinstance(kwargs, dict):
+        raise ValueError("kwargs must be a dictionary")
+
+    def _filter_value(value: Any, annotation: Any) -> Any:
+        """Recursively filter nested dict/list values based on dataclass annotations."""
+        if annotation is None:
+            return value
+
+        origin = get_origin(annotation)
+        if origin is None:
+            if isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
+                return filter_dataclass_kwargs(annotation, value)
+            return value
+
+        if origin in (list, tuple, set):
+            args = get_args(annotation)
+            inner = args[0] if args else None
+            if isinstance(value, (list, tuple, set)):
+                return type(value)(_filter_value(v, inner) for v in value)
+            return value
+
+        if origin is dict:
+            args = get_args(annotation)
+            val_type = args[1] if len(args) > 1 else None
+            if isinstance(value, dict):
+                return {k: _filter_value(v, val_type) for k, v in value.items()}
+            return value
+
+        if origin is types.UnionType or origin is getattr(types, "UnionType", None):
+            for arg in get_args(annotation):
+                if isinstance(arg, type) and is_dataclass(arg) and isinstance(value, dict):
+                    return filter_dataclass_kwargs(arg, value)
+                # Try container-style filtering for union members
+                filtered = _filter_value(value, arg)
+                if filtered is not value:
+                    return filtered
+            return value
+
+        return value
+
+    valid_fields = {f.name: f for f in fields(cls) if f.init}
+    filtered_kwargs = {}
+    for k, v in kwargs.items():
+        if k not in valid_fields:
+            continue
+        field = valid_fields[k]
+        filtered_kwargs[k] = _filter_value(v, field.type)
+
+    return filtered_kwargs
+
+
+# TODO(wuhang): Remove after PR #1115.
+def build_base_engine_args(source: Any) -> dict[str, Any] | None:
+    """Build base engine args with tokenizer and parallel configuration.
+
+    Automatically detects whether source is a dict-like object or namespace object.
+
+    Args:
+        source: Source object (args namespace or kwargs dict) containing configuration.
+
+    Returns:
+        Dictionary containing tokenizer and parallel configuration overrides,
+        or None if no configuration is present.
+    """
+    # Auto-detect source type: dict-like objects have 'get' method
+    is_dict_like = hasattr(source, "get") and callable(getattr(source, "get"))
+
+    # Extract tokenizer
+    if is_dict_like:
+        tokenizer = source.get("tokenizer", None)
+    else:
+        tokenizer = getattr(source, "tokenizer", None)
+
+    base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
+
+    # Extract parallel configuration
+    parallel_keys = [
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "data_parallel_size_local",
+        "data_parallel_backend",
+        "distributed_executor_backend",
+    ]
+
+    if is_dict_like:
+        parallel_overrides = {k: source[k] for k in parallel_keys if k in source and source[k] is not None}
+    else:
+        parallel_overrides = {
+            k: getattr(source, k) for k in parallel_keys if hasattr(source, k) and getattr(source, k) is not None
+        }
+
+    if parallel_overrides:
+        base_engine_args = base_engine_args or {}
+        base_engine_args.update(parallel_overrides)
+
+    return base_engine_args
 
 
 # The following code detects if the process is running in a container and if

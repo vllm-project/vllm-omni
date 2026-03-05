@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import glob
 import inspect
 import logging
 import math
-import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -22,7 +20,6 @@ from diffusers.utils.outputs import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from PIL import Image
-from safetensors.torch import load_file
 from torch import nn
 from torchvision import transforms
 from transformers import PretrainedConfig, Siglip2ImageProcessorFast
@@ -64,6 +61,7 @@ from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = logging.getLogger(__name__)
@@ -354,14 +352,6 @@ def build_batch_2d_rope(
         return stacked_cos, stacked_sin, all_pos_list
 
     return stacked_cos, stacked_sin
-
-
-def get_full_state_dict(model_path):
-    files = glob.glob(os.path.join(model_path, "*.safetensors"))
-    full_sd = {}
-    for f in files:
-        full_sd.update(load_file(f))
-    return full_sd
 
 
 def rotate_half(x):
@@ -1588,20 +1578,6 @@ class HunyuanFusedMoE(SharedFusedMoE):
         self._init_hook_handle.remove()
 
     def forward(self, hidden_states, router_logits):
-        from vllm.model_executor.layers.fused_moe.layer import get_forward_context
-
-        ctx = get_forward_context()
-        if not ctx.remaining_moe_layers:
-            import re
-
-            moe_names = [name for name in ctx.no_compile_layers.keys() if ".mlp.experts" in name]
-
-            def get_layer_num(name):
-                match = re.search(r"layers\.(\d+)\.mlp", name)
-                return int(match.group(1)) if match else -1
-
-            moe_names.sort(key=get_layer_num, reverse=True)
-            ctx.remaining_moe_layers.extend(moe_names)
         return super().forward(hidden_states, router_logits)
 
 
@@ -1751,12 +1727,12 @@ class HunyuanImage3Model(nn.Module):
         lora_config = None
         self.num_redundant_experts = 0
         self.config = config
+        self.device = get_local_device()
         self.quant_config = quant_config
         self.padding_idx = config.pad_token_id
         lora_vocab = (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1)) if lora_config else 0
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
-        self.wte = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         if get_pp_group().is_first_rank or (config.tie_word_embeddings and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
@@ -2059,7 +2035,7 @@ class HunyuanImage3Model(nn.Module):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -2444,7 +2420,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     **model_kwargs,
                 )
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                     model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
                     pred = model_output["diffusion_prediction"]
                 pred = pred.to(dtype=torch.float32)
@@ -2491,7 +2467,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         if hasattr(self.vae, "ffactor_temporal"):
             latents = latents.unsqueeze(2)
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
             image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
         if hasattr(self.vae, "ffactor_temporal"):

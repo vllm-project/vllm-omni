@@ -128,13 +128,10 @@ class SiglipNaViTWrapper(nn.Module):
         else:
             self.vision_model = vision_model
 
-        # Configure weights for linear equivalent of patch embedding
-        self.patch_embed_weight = self.vision_model.embeddings.patch_embedding.weight
-        self.patch_embed_bias = self.vision_model.embeddings.patch_embedding.bias
-
     def forward(self, packed_pixel_values, packed_flattened_position_ids, cu_seqlens, max_seqlen):
-        w = self.patch_embed_weight.view(self.patch_embed_weight.shape[0], -1)
-        x = F.linear(packed_pixel_values, w, self.patch_embed_bias)
+        patch_embed = self.vision_model.embeddings.patch_embedding
+        w = patch_embed.weight.view(patch_embed.weight.shape[0], -1)
+        x = F.linear(packed_pixel_values, w, patch_embed.bias)
         pos = self.vision_model.embeddings.position_embedding(packed_flattened_position_ids)
         x = x + pos
         hidden_states = x.unsqueeze(0)
@@ -205,6 +202,9 @@ class BagelPipeline(nn.Module):
         )
         vit_config_path = os.path.join(model_path, "vit_config.json")
         vit_conf = SiglipVisionConfig.from_json_file(vit_config_path)
+        if vit_conf.num_hidden_layers == 27:
+            vit_conf.num_hidden_layers = 26
+        vit_conf.vision_use_head = False
         self.vit_model = SiglipVisionModel(vit_conf)
         self.image_processor = SiglipImageProcessor.from_pretrained(model_path, local_files_only=True)
 
@@ -327,16 +327,40 @@ class BagelPipeline(nn.Module):
             gen_context["past_key_values"] = injected_kv
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
-            gen_context["ropes"] = [seq_len]
+            if req.sampling_params.kv_metadata and "ropes" in req.sampling_params.kv_metadata:
+                gen_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
+            else:
+                gen_context["ropes"] = [seq_len]
 
-            # Disable CFG: single KV cache cannot support 3-branch CFG
-            logger.warning("CFG is disabled when using injected KV Cache")
-            gen_params = BagelGenParams(
-                num_timesteps=gen_params.num_timesteps,
-                timestep_shift=gen_params.timestep_shift,
-                cfg_text_scale=1.0,
-                cfg_img_scale=1.0,
-            )
+            cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None)
+            if cfg_text_kv is not None:
+                logger.info("CFG enabled with multi-KV: using injected cfg_text KV Cache")
+                cfg_text_seq_len = cfg_text_kv.key_cache[0].shape[0]
+                cfg_text_context["past_key_values"] = cfg_text_kv
+                cfg_text_context["kv_lens"] = [cfg_text_seq_len]
+                cfg_text_metadata = getattr(req.sampling_params, "cfg_text_kv_metadata", None)
+                if cfg_text_metadata and "ropes" in cfg_text_metadata:
+                    cfg_text_context["ropes"] = cfg_text_metadata["ropes"]
+                else:
+                    cfg_text_context["ropes"] = [cfg_text_seq_len]
+
+                cfg_img_kv = getattr(req.sampling_params, "cfg_img_past_key_values", None) or injected_kv
+                cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
+                cfg_img_context["past_key_values"] = cfg_img_kv
+                cfg_img_context["kv_lens"] = [cfg_img_seq_len]
+                cfg_img_metadata = getattr(req.sampling_params, "cfg_img_kv_metadata", None)
+                if cfg_img_metadata and "ropes" in cfg_img_metadata:
+                    cfg_img_context["ropes"] = cfg_img_metadata["ropes"]
+                else:
+                    cfg_img_context["ropes"] = [cfg_img_seq_len]
+            else:
+                logger.warning("CFG is disabled: only single KV cache available")
+                gen_params = BagelGenParams(
+                    num_timesteps=gen_params.num_timesteps,
+                    timestep_shift=gen_params.timestep_shift,
+                    cfg_text_scale=1.0,
+                    cfg_img_scale=1.0,
+                )
 
         else:
             image_input = (

@@ -13,9 +13,10 @@ nav:
     - examples/README.md
     - Offline Inference:
       - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
+      - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
-      - LoRA Inference(Diffusion): user_guide/examples/offline_inference/lora_inference.md
+      - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Qwen3-TTS: user_guide/examples/offline_inference/qwen3_tts.md
@@ -24,12 +25,15 @@ nav:
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
+      - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
-      - LoRA Inference(Diffusion): user_guide/examples/online_serving/lora_inference.md
+      - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
+      - Online serving Example of vLLM-Omni for MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
       - Qwen3-TTS: user_guide/examples/online_serving/qwen3_tts.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
+      - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
   - General:
     - usage/*
   - Configuration:
@@ -40,30 +44,29 @@ nav:
   - Features:
     - Sleep Mode: features/sleep_mode.md
     - Diffusion Features:
-      - Overview: user_guide/diffusion_acceleration.md
+      - Acceleration Overview: user_guide/diffusion_acceleration.md
       - TeaCache: user_guide/diffusion/teacache.md
       - Cache-DiT: user_guide/diffusion/cache_dit_acceleration.md
       - Quantization:
         - Overview: user_guide/diffusion/quantization/overview.md
         - FP8: user_guide/diffusion/quantization/fp8.md
+        - GGUF: user_guide/diffusion/quantization/gguf.md
       - Parallelism Acceleration: user_guide/diffusion/parallelism_acceleration.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
+      - LoRA: user_guide/diffusion/lora.md
+      - Hybrid Sharded Data Parallel: design/feature/hsdp.md
+      - Custom Pipeline: features/custom_pipeline.md
     - ComfyUI: features/comfyui.md
 - Developer Guide:
   - General:
     - contributing/README.md
+    - pr_reviewer.md
     - glob: contributing/*
       flatten_single_child_sections: true
   - Model Implementation:
     - contributing/model/README.md
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_diffusion_model.md
-    - Advanced Features:
-      - contributing/features/cfg_parallel.md
-      - contributing/features/sequence_parallel.md
-      - contributing/features/tensor_parallel.md
-      - contributing/features/cache_dit.md
-      - contributing/features/teacache.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md
@@ -72,6 +75,12 @@ nav:
       - design/feature/disaggregated_inference.md
       - design/feature/ray_based_execution.md
       - design/feature/omni_connectors/
+      - design/feature/cfg_parallel.md
+      - design/feature/sequence_parallel.md
+      - design/feature/tensor_parallel.md
+      - design/feature/cache_dit.md
+      - design/feature/teacache.md
+      - design/feature/async_chunk_design.md
     - Module Design:
       - design/module/ar_module.md
       - design/module/dit_module.md

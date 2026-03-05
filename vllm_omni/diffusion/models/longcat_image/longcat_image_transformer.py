@@ -509,25 +509,23 @@ class LongCatImageTransformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
-    }
+    _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
 
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
-        patch_size: int = 1,
-        in_channels: int = 64,
-        num_layers: int = 19,
-        num_single_layers: int = 38,
-        attention_head_dim: int = 128,
-        num_attention_heads: int = 24,
-        joint_attention_dim: int = 3584,
-        pooled_projection_dim: int = 3584,
-        axes_dims_rope: list[int] = [16, 56, 56],
     ):
         super().__init__()
+        model_config = od_config.tf_model_config
+        patch_size = model_config.patch_size
+        in_channels = model_config.in_channels
+        num_layers = model_config.num_layers
+        num_single_layers = model_config.num_single_layers
+        attention_head_dim = model_config.attention_head_dim
+        num_attention_heads = model_config.num_attention_heads
+        joint_attention_dim = model_config.joint_attention_dim
+        pooled_projection_dim = model_config.pooled_projection_dim
+        axes_dims_rope = getattr(model_config, "axes_dims_rope", [16, 56, 56])
         self.out_channels = in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.pooled_projection_dim = pooled_projection_dim
@@ -713,6 +711,8 @@ class LongCatImageTransformer2DModel(nn.Module):
             (".add_kv_proj", ".add_k_proj", "k"),
             (".add_kv_proj", ".add_v_proj", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 

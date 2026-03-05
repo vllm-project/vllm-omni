@@ -71,6 +71,7 @@ class OmniCachedRequestData(CachedRequestData):
     """
 
     prompt_token_ids: dict[str, list[int]]
+    additional_information: dict[str, dict | None]
 
 
 @dataclass

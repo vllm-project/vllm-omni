@@ -11,8 +11,7 @@ def _bagel_payload_preprocessor(payload: dict) -> dict:
                     content["text"] = "<|im_start|>" + content["text"] + "<|im_end|>"
     except (KeyError, TypeError):
         raise RuntimeError("Internal Error: malformatted BAGEL payload")
-    extra_body = payload.pop("extra_body", {})
-    return {**payload, **extra_body}
+    return payload
 
 
 def _qwen25_payload_preprocessor(payload: dict) -> dict:
@@ -37,7 +36,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
         ],
         "modes": [
             {
-                "mode": ModelMode.COMPREHENSION,
+                "mode": ModelMode.UNDERSTANDING,
                 "input_modalities": [Modality.TEXT, Modality.IMAGE],
             }
         ],
@@ -48,7 +47,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
         "payload_preprocessor": _qwen25_payload_preprocessor,
         "modes": [
             {
-                "mode": ModelMode.COMPREHENSION,
+                "mode": ModelMode.UNDERSTANDING,
                 "input_modalities": [
                     Modality.TEXT,
                     Modality.IMAGE,
@@ -62,7 +61,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
         "stages": ["autoregression", "autoregression", "autoregression"],
         "modes": [
             {
-                "mode": ModelMode.COMPREHENSION,
+                "mode": ModelMode.UNDERSTANDING,
                 "input_modalities": [
                     Modality.TEXT,
                     Modality.IMAGE,

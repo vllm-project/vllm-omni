@@ -8,6 +8,7 @@ import torch
 from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,7 +42,7 @@ def test_stable_audio_model(model_name: str):
         sampling_params_list=OmniDiffusionSamplingParams(
             num_inference_steps=4,  # Minimal steps for speed
             guidance_scale=7.0,
-            generator=torch.Generator("cuda").manual_seed(42),
+            generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
             num_outputs_per_prompt=1,
             extra_args={
                 "audio_start_in_s": audio_start_in_s,
