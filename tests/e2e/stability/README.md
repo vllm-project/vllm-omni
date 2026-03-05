@@ -1,6 +1,6 @@
 # Stability 资源监控在 CI 中的使用（GPU / 预留 CPU·NPU）
 
-长稳结束后 CI 环境会被清理，网页和 CSV 都会丢失。通过**在清理前打包并上传为 CI 产物**，流水线结束后仍可下载查看。
+长稳结束后 CI 环境会被清理，网页和 CSV 会丢失。脚本在清理前**仅打包并生成 report.html**，不上传到 CI artifact；本地或 CI 运行结束后在输出目录中直接打开 `report.html` 查看。
 
 **脚本与数据目录**：`tests/e2e/stability/`（`scripts/resource_monitor.sh`、`scripts/generate_report.py`、`scripts/test_benchmark_stability.py` 等）。脚本名为资源监控统一入口，当前仅实现 GPU；通过 `--backend gpu|cpu|npu` 预留 CPU/NPU 扩展。
 
@@ -28,9 +28,7 @@ bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e
 
 ## 如何查看？
 
-使用 **静态报告 `report.html`**。`scripts/resource_monitor.sh finalize` 会从 CSV 调用 `scripts/generate_report.py` 生成单文件 HTML（图表、统计、异常表均内嵌），**无需任何服务器**。把打包目录上传为 CI artifact，流水线结束后**下载 artifact，在本地用浏览器打开其中的 `report.html`** 即可查看完整显存曲线与统计，不依赖当时的环境与网址。
-
-CI 中只做「监控 → 收尾打包 → 上传 artifact」；查看时从流水线下载 artifact，本地打开 `report.html` 即可。
+使用 **静态报告 `report.html`**。`scripts/resource_monitor.sh finalize` 会从 CSV 调用 `scripts/generate_report.py` 生成单文件 HTML（图表、统计、异常表均内嵌），**无需任何服务器**。脚本仅生成 HTML 与打包目录，**不上传到 CI artifact**；运行结束后在输出目录（如 `gpu_monitor_data/gpu_monitor_bundle_<run_id>/`）用浏览器打开 `report.html` 即可查看完整显存曲线与统计。
 
 ## 单脚本子命令
 
@@ -40,13 +38,13 @@ CI 中只做「监控 → 收尾打包 → 上传 artifact」；查看时从流�
 |--------|------|
 | `scripts/resource_monitor.sh start [--backend gpu\|cpu\|npu] [gpu_ids] [interval]` | 后台采集（当前仅 gpu：显存） |
 | `scripts/resource_monitor.sh finalize [--backend gpu\|cpu\|npu] [run_id]` | 打包当前 run，生成 report.html，输出 `GPU_MONITOR_BUNDLE_DIR=` / `RESOURCE_MONITOR_BUNDLE_DIR=` |
-| `scripts/resource_monitor.sh run [--backend gpu\|cpu\|npu] -- <command>` | 一步完成：start → 执行命令 → finalize（CI 中自动上传 artifact） |
+| `scripts/resource_monitor.sh run [--backend gpu\|cpu\|npu] -- <command>` | 一步完成：start → 执行命令 → finalize（仅生成 report.html，不上传） |
 
 ## 本地与 CI 统一：一步完成
 
 同一条命令在**本地**和 **CI** 都能用，无需分步。
 
-- **CI**：不设环境变量，直接执行。会启动监控、跑测试、收尾打包并上传 artifact；实时看日志里的 `[GPU]` 行，结束后在 Artifacts 下载 `report.html`。
+- **CI**：不设环境变量，直接执行。会启动监控、跑测试、收尾打包并生成 report.html（不上传 artifact）；实时看日志里的 `[GPU]` 行，结束后在日志中打印的 bundle 目录里打开 `report.html`。
 - **本地**：同上。
 
 示例（仓库根目录）：
@@ -73,9 +71,7 @@ bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e
 1. **启动监控**：后台运行 `./resource_monitor.sh start`（在 `tests/e2e/stability/scripts` 目录下），整个长稳期间持续写 CSV。
 2. **跑长稳**：执行你的长稳用例（如 `test_qwen_edit.sh`）。
 3. **收尾**：长稳结束后、环境清理前，执行 `./resource_monitor.sh finalize`（在 scripts 目录下），生成报告并打包。
-4. **归档**：把 `resource_monitor.sh finalize` 输出的目录上传为 CI artifact。
-
-之后在流水线页面下载该 artifact，即可得到 `gpu_metrics.csv` 和 `report.html`（含图表与异常标记），无需再访问当时的环境。
+4. **查看**：`resource_monitor.sh finalize` 输出的目录内已有 `gpu_metrics.csv` 和 `report.html`（含图表与异常标记），在本地或 CI 工作目录中直接打开 `report.html` 即可，不上传 CI artifact。
 
 ## 步骤说明
 
@@ -104,31 +100,25 @@ eval "$BUNDLE_LINE"
 echo "归档目录: $GPU_MONITOR_BUNDLE_DIR"
 ```
 
-### 4. 上传为 CI 产物
+### 4. 查看报告（仅生成 HTML，不上传）
 
-**GitHub Actions** 示例：
+**GitHub Actions** 示例（仅 finalize 生成报告，不上传 artifact）：
 
 ```yaml
-- name: Finalize GPU monitor and upload
+- name: Finalize GPU monitor (generate report only)
   if: always()
   run: |
     cd tests/e2e/stability/scripts
     BUNDLE_LINE=$(./resource_monitor.sh finalize 2>/dev/null | grep '^GPU_MONITOR_BUNDLE_DIR=') || true
     if [[ -n "$BUNDLE_LINE" ]]; then
       eval "$BUNDLE_LINE"
-      echo "GPU_MONITOR_BUNDLE_DIR=$GPU_MONITOR_BUNDLE_DIR" >> $GITHUB_ENV
+      echo "Report: $GPU_MONITOR_BUNDLE_DIR/report.html"
     fi
-- name: Upload GPU monitor bundle
-  if: env.GPU_MONITOR_BUNDLE_DIR != ''
-  uses: actions/upload-artifact@v4
-  with:
-    name: gpu-monitor-${{ github.run_id }}
-    path: ${{ env.GPU_MONITOR_BUNDLE_DIR }}
 ```
 
 **Buildkite（推荐用 resource_monitor.sh run 一条龙）**
 
-用单脚本一次完成「启动监控 + 跑测试 + 收尾 + 上传 artifact」：
+用单脚本一次完成「启动监控 + 跑测试 + 收尾生成 report.html」（不上传 artifact）：
 
 ```yaml
 commands:
@@ -137,7 +127,7 @@ commands:
 
 - **用到的脚本**：`tests/e2e/stability/scripts/resource_monitor.sh`（子命令 run 内部会 start、finalize，并调 `scripts/generate_report.py`）。
 - **运行中「实时」看什么**：CI 没有单独的可访问网页。请打开 **Buildkite 该次构建的 Job 页面**，在**日志区域**里会每隔约 15 秒出现一行 `[GPU] ...`，即当前最新一次采样的显存数据。
-- **结束后在哪里下载**：同一 Job 页面的 **Artifacts** 中可下载 `gpu_metrics.csv`、`report.html`、`README.txt`。本地用浏览器打开 `report.html` 即可。
+- **结束后在哪里看报告**：日志会打印 bundle 目录路径（如 `Line chart: open in browser: .../report.html`）。脚本仅生成 HTML 与 CSV，不上传 Artifacts；若需保留报告，需自行从工作目录归档或下载。
 
 ## 产物内容
 
@@ -145,4 +135,4 @@ commands:
 - `report.html`：单文件报告，含统计表、时序图、简单异常标记，浏览器打开即可。
 - `README.txt`：简要说明。
 
-长稳结束后在流水线里下载该 artifact，本地打开 `report.html` 即可查看，不依赖当时的环境与网址。
+脚本仅生成 `report.html` 与 CSV，不上传 CI artifact；运行结束后在输出目录中打开 `report.html` 即可查看。

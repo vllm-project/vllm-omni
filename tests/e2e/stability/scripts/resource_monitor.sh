@@ -7,7 +7,7 @@
 #
 # start   - 后台采集（当前仅 gpu：nvidia-smi 写 CSV）
 # finalize - 打包当前 run（CSV + report.html），输出 BUNDLE_DIR
-# run     - 启动监控 → 执行命令 → finalize；CI 中可上传 artifact
+# run     - 启动监控 → 执行命令 → finalize（仅生成 report.html，不上传）
 #
 # 参数入口（预留多后端）:
 #   --backend, -b   gpu | cpu | npu  默认 gpu，当前仅 gpu 已实现
@@ -200,8 +200,7 @@ finalize_backend_gpu() {
     cat > "$BUNDLE_DIR/README.txt" << EOF
 Stability resource monitor (gpu) bundle - ${RUN_ID}
 - gpu_metrics.csv: raw samples
-- report.html: report with charts (open in browser)
-Upload this dir as a CI artifact to view after the run.
+- report.html: report with charts (open in browser to view)
 EOF
 
     local BUNDLE_ABS
@@ -287,12 +286,6 @@ run_backend_gpu() {
                 if [[ -d "${GPU_MONITOR_BUNDLE_DIR:-}" ]]; then
                     echo "--- Resource monitor bundle dir: $GPU_MONITOR_BUNDLE_DIR ---"
                     echo "--- Line chart: open in browser: $GPU_MONITOR_BUNDLE_DIR/report.html ---"
-                    if command -v buildkite-agent &>/dev/null; then
-                        echo "--- Uploading resource monitor artifacts ---"
-                        for f in "$GPU_MONITOR_BUNDLE_DIR"/*; do
-                            [[ -e "$f" ]] && buildkite-agent artifact upload "$f"
-                        done
-                    fi
                 fi
             fi
         fi
@@ -337,7 +330,7 @@ case "$SUBCMD" in
         echo "Usage: $0 { start [--backend gpu|cpu|npu] [gpu_ids] [interval] | finalize [--backend gpu|cpu|npu] [run_id] | run [--backend gpu|cpu|npu] -- <command> }" >&2
         echo "  start   - background monitor (currently only backend=gpu)" >&2
         echo "  finalize - bundle current run, print GPU_MONITOR_BUNDLE_DIR= / RESOURCE_MONITOR_BUNDLE_DIR=" >&2
-        echo "  run     - start + command + finalize (+ CI upload)" >&2
+        echo "  run     - start + command + finalize (generate report.html only)" >&2
         echo "  --backend gpu|cpu|npu  (default: gpu; cpu/npu reserved for future use)" >&2
         exit 1
         ;;
