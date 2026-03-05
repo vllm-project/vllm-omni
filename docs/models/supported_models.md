@@ -35,6 +35,8 @@ th {
 |`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
 |`LongCatImageEditPipeline` | LongCat-Image-Edit | `meituan-longcat/LongCat-Image-Edit` |
 |`StableDiffusion3Pipeline` | Stable-Diffusion-3 | `stabilityai/stable-diffusion-3.5-medium` |
+|`CosyVoice3Model` | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` |
+|`MammothModa2ForConditionalGeneration` | MammothModa2-Preview | `bytedance-research/MammothModa2-Preview` |
 |`Flux2KleinPipeline` | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B`, `black-forest-labs/FLUX.2-klein-9B` |
 |`FluxPipeline` | FLUX.1-dev | `black-forest-labs/FLUX.1-dev` |
 |`OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` |
