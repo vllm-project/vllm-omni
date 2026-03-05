@@ -11,7 +11,9 @@
 
 - **`tests/stability_test.json`**：长稳用例配置（与 `tests/perf/tests/test.json` 格式一致），每个 `benchmark_params` 需包含 `duration_sec`，以及 `request_rate` 或 `max_concurrency` 之一。
 - **`stage_configs/`**：本目录下的 stage 配置（如 `qwen3_omni.yaml`），长稳用例只读取此目录，不依赖 `tests/perf`。
-- **`scripts/test_benchmark_stability.py`**：pytest 用例，内含长稳 benchmark 逻辑（在指定时长内按 request-rate 或 max-concurrency 调用 `vllm bench serve --omni`）；先起 OmniServer，再跑 benchmark，断言无失败请求。时长优先取环境变量 `STABILITY_BENCHMARK_DURATION_SEC`，否则用配置中的 `duration_sec`（默认 300 秒）。
+- **`scripts/test_benchmark_stability.py`**：pytest 用例，内含长稳 benchmark 逻辑（在指定时长内按 request-rate 或 max-concurrency 调用 `vllm bench serve --omni`）；先起 OmniServer，再跑 benchmark，断言无失败请求。以下参数可通过环境变量覆盖，无需改源码：
+  - `STABILITY_BENCHMARK_DURATION_SEC`：运行时长（秒），覆盖 JSON 中的 `duration_sec`，默认 300
+  - `STABILITY_BENCHMARK_NUM_PROMPTS_PER_BATCH`：每批请求数，默认 20
 
 **示例：**
 
