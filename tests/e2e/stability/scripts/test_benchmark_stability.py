@@ -6,12 +6,10 @@
 get_benchmark_params_for_server、create_benchmark_indices、omni_server fixture 与 perf 相同，
 仅 run_benchmark（此处为 run_stability_benchmark 带时长）和测试用例不同。不修改 tests/perf。
 
-可通过环境变量覆盖以下参数（无需改源码）：
-- STABILITY_BENCHMARK_DURATION_SEC: 运行时长（秒），覆盖 JSON 中的 duration_sec，默认 300
-- STABILITY_BENCHMARK_NUM_PROMPTS_PER_BATCH: 每批请求数，默认 20
+所有与用例强相关的参数（如 duration_sec、request_rate/max_concurrency、num_prompts_per_batch 等）
+均在 tests/e2e/stability/tests/stability_test.json 中配置，不再通过环境变量覆盖。
 """
 import json
-import os
 import threading
 import time
 from pathlib import Path
@@ -25,15 +23,7 @@ from tests.perf.scripts.run_benchmark import run_benchmark
 STABILITY_DIR = Path(__file__).resolve().parent.parent
 STAGE_CONFIGS_DIR = STABILITY_DIR / "stage_configs"
 CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "stability_test.json")
-
-
-def _env_int(key: str, default: int) -> int:
-    """从环境变量读取整数，无效或未设置时返回 default。"""
-    try:
-        s = os.environ.get(key, "")
-        return int(s) if s else default
-    except ValueError:
-        return default
+DEFAULT_NUM_PROMPTS_PER_BATCH = 20
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
@@ -132,11 +122,16 @@ def create_benchmark_indices():
 
 benchmark_indices = create_benchmark_indices()
 
-NUM_PROMPTS_PER_BATCH = _env_int("STABILITY_BENCHMARK_NUM_PROMPTS_PER_BATCH", 20)
-
 
 def _build_base_args(params: dict[str, Any], host: str, port: int) -> list[str]:
-    exclude = {"request_rate", "max_concurrency", "num_prompts", "baseline", "duration_sec"}
+    exclude = {
+        "request_rate",
+        "max_concurrency",
+        "num_prompts",
+        "baseline",
+        "duration_sec",
+        "num_prompts_per_batch",
+    }
     args = ["--host", host, "--port", str(port)]
     for key, value in params.items():
         if key in exclude or value is None:
@@ -235,7 +230,7 @@ def run_stability_benchmark(
     max_concurrency: int | None = None,
     result_filename: str | None = None,
     result_dir: str = "./",
-    num_prompts_per_batch: int = NUM_PROMPTS_PER_BATCH,
+    num_prompts_per_batch: int = DEFAULT_NUM_PROMPTS_PER_BATCH,
 ) -> dict[str, Any]:
     if (request_rate is None) == (max_concurrency is None):
         raise ValueError("必须且仅能指定 request_rate 或 max_concurrency 之一")
@@ -323,14 +318,15 @@ def test_benchmark_stability(omni_server, stability_benchmark_params):
     """在指定时长内按 request-rate 或 max-concurrency 跑 benchmark，断言无失败请求。"""
     test_name = stability_benchmark_params["test_name"]
     params = stability_benchmark_params["params"]
-    duration_sec = _env_int("STABILITY_BENCHMARK_DURATION_SEC", params.get("duration_sec", 300))
+    duration_sec = params.get("duration_sec", 300)
+    num_prompts_per_batch = params.get("num_prompts_per_batch", DEFAULT_NUM_PROMPTS_PER_BATCH)
     request_rate = params.get("request_rate")
     max_concurrency = params.get("max_concurrency")
 
     bench_params = {
         k: v
         for k, v in params.items()
-        if k not in ("duration_sec", "request_rate", "max_concurrency")
+        if k not in ("duration_sec", "request_rate", "max_concurrency", "num_prompts_per_batch")
     }
 
     result = run_stability_benchmark(
@@ -341,6 +337,7 @@ def test_benchmark_stability(omni_server, stability_benchmark_params):
         request_rate=request_rate,
         max_concurrency=max_concurrency,
         result_dir=str(STABILITY_DIR),
+        num_prompts_per_batch=num_prompts_per_batch,
     )
 
     assert result.get("failed", 0) == 0, f"存在失败请求: {result.get('errors', [])}"

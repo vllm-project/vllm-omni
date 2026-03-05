@@ -1,85 +1,89 @@
-# Stability 资源监控在 CI 中的使用（GPU / 预留 CPU·NPU）
+# 资源监控脚本使用说明（GPU / 预留 CPU·NPU）
 
-长稳结束后 CI 环境会被清理，网页和 CSV 会丢失。脚本在清理前**仅打包并生成 report.html**，不上传到 CI artifact；本地或 CI 运行结束后在输出目录中直接打开 `report.html` 查看。
+本目录下的 **`scripts/resource_monitor.sh`** 是资源监控的统一入口：在跑任意命令（如长稳测试、单测等）的同时采集 GPU 显存等指标，结束后打包并生成单文件 HTML 报告，便于在 CI 或本地查看。脚本**仅生成 report.html 与 CSV**，不上传 CI artifact；运行结束后在输出目录中打开 `report.html` 即可。
 
-**脚本与数据目录**：`tests/e2e/stability/`（`scripts/resource_monitor.sh`、`scripts/generate_report.py`、`scripts/test_benchmark_stability.py` 等）。脚本名为资源监控统一入口，当前仅实现 GPU；通过 `--backend gpu|cpu|npu` 预留 CPU/NPU 扩展。
+当前仅实现 **GPU** 后端；通过 `--backend gpu|cpu|npu` 预留 CPU/NPU 扩展。
 
-### 长稳 Benchmark 用例
+---
 
-与 **perf** 一致使用 `vllm bench serve --omni`，支持 **`--request-rate`**（请求速率）或 **`--max-concurrency`**（并发数）发请求；长稳额外增加**指定时长**：超过 `duration_sec` 后脚本不再发送新的请求，等待现有请求结束。
+## 子命令
 
-- **`tests/stability_test.json`**：长稳用例配置（与 `tests/perf/tests/test.json` 格式一致），每个 `benchmark_params` 需包含 `duration_sec`，以及 `request_rate` 或 `max_concurrency` 之一。
-- **`stage_configs/`**：本目录下的 stage 配置（如 `qwen3_omni.yaml`），长稳用例只读取此目录，不依赖 `tests/perf`。
-- **`scripts/test_benchmark_stability.py`**：pytest 用例，内含长稳 benchmark 逻辑（在指定时长内按 request-rate 或 max-concurrency 调用 `vllm bench serve --omni`）；先起 OmniServer，再跑 benchmark，断言无失败请求。以下参数可通过环境变量覆盖，无需改源码：
-  - `STABILITY_BENCHMARK_DURATION_SEC`：运行时长（秒），覆盖 JSON 中的 `duration_sec`，默认 300
-  - `STABILITY_BENCHMARK_NUM_PROMPTS_PER_BATCH`：每批请求数，默认 20
+所有功能通过一个脚本完成，在仓库根目录执行：
 
-**环境变量与可选参数一览**
+| 子命令 | 说明 |
+|--------|------|
+| `scripts/resource_monitor.sh start [--backend gpu\|cpu\|npu] [gpu_ids] [interval]` | 后台采集（当前仅 gpu：nvidia-smi 写 CSV） |
+| `scripts/resource_monitor.sh finalize [--backend gpu\|cpu\|npu] [run_id]` | 打包当前 run，生成 report.html，输出 `GPU_MONITOR_BUNDLE_DIR=` / `RESOURCE_MONITOR_BUNDLE_DIR=` |
+| `scripts/resource_monitor.sh run [--backend gpu\|cpu\|npu] -- <command>` | 一步完成：start → 执行你指定的命令 → finalize |
 
-| 作用对象 | 环境变量 / 参数 | 说明 | 默认值 |
-|----------|-----------------|------|--------|
-| 长稳用例 | `STABILITY_BENCHMARK_DURATION_SEC` | 运行时长（秒） | 300 |
-| 长稳用例 | `STABILITY_BENCHMARK_NUM_PROMPTS_PER_BATCH` | 每批请求数 | 20 |
-| 资源监控 | `RESOURCE_MONITOR_DATA_ROOT` / `GPU_MONITOR_DATA_ROOT` | 监控数据根目录 | `tests/e2e/stability/gpu_monitor_data` |
-| 资源监控 | `RESOURCE_MONITOR_INTERVAL` / `GPU_MONITOR_INTERVAL` | 采样间隔（秒） | 5 |
-| 资源监控 | `RESOURCE_MONITOR_LOG_INTERVAL` / `GPU_MONITOR_LOG_INTERVAL` | 日志中 `[GPU]` 行打印间隔（秒） | 15 |
-| 资源监控 | `GPU_MONITOR_DEVICES` | 监控的 GPU ID，如 `0,1` 或 `all` | all |
-| 资源监控 | `SKIP_DEPS_CHECK` | 非空则跳过 nvidia-smi 等依赖检查 | 未设置 |
-| 资源监控脚本 | `--backend gpu\|cpu\|npu` / `-b` | 子命令 start/finalize/run 的后端 | gpu |
+---
 
-**示例：**
+## 环境变量（仅监控脚本）
+
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `RESOURCE_MONITOR_BACKEND` | 后端：gpu\|cpu\|npu（当前仅 gpu 实现） | gpu |
+| `RESOURCE_MONITOR_DATA_ROOT` / `GPU_MONITOR_DATA_ROOT` | 监控数据根目录 | `tests/e2e/stability/gpu_monitor_data` |
+| `RESOURCE_MONITOR_INTERVAL` / `GPU_MONITOR_INTERVAL` | 采样间隔（秒） | 5 |
+| `RESOURCE_MONITOR_LOG_INTERVAL` / `GPU_MONITOR_LOG_INTERVAL` | 日志中 `[GPU]` 行打印间隔（秒） | 15 |
+| `GPU_MONITOR_DEVICES` | 监控的 GPU ID，如 `0,1` 或 `all` | all |
+| `SKIP_DEPS_CHECK` | 非空则跳过 nvidia-smi 等依赖检查 | 未设置 |
+
+---
+
+## 推荐用法：`run` 一条龙
+
+在 **finally** 或 **after script** 里执行（确保被测命令失败也会收尾）：
 
 ```bash
+# 监控 + 执行任意命令，结束后自动打包并生成 report.html
+bash tests/e2e/stability/scripts/resource_monitor.sh run -- <你的命令>
+```
 
-# 配合资源监控：长稳 10 分钟 + 采样 10s、日志每 30s、仅 GPU 0,1
-export STABILITY_BENCHMARK_DURATION_SEC=600
+示例（仓库根目录）：
+
+```bash
+# 示例：跑某条 pytest
+bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py -k test_xxx
+
+# 自定义采样间隔、只监控 GPU 0,1、日志每 30s 打一行
 export GPU_MONITOR_INTERVAL=10
-export GPU_MONITOR_LOG_INTERVAL=30
 export GPU_MONITOR_DEVICES=0,1
-bash tests/e2e/stability/scripts/resource_monitor.sh run --backend gpu -- pytest -s -v tests/e2e/stability/scripts/test_benchmark_stability.py
-
-# 自定义数据目录、跳过依赖检查
-export RESOURCE_MONITOR_DATA_ROOT=/tmp/my_monitor_data
-export SKIP_DEPS_CHECK=1
-bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v -k "test_benchmark" tests/e2e/stability/scripts/test_benchmark_stability.py
+export GPU_MONITOR_LOG_INTERVAL=30
+bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py
 ```
 
-## 如何查看？
+运行中可在日志里看每隔若干秒出现的 `[GPU] ...`；结束后日志会打印 bundle 路径，如：`Line chart: open in browser: .../report.html`。
 
-运行结束后在输出目录（如 `gpu_monitor_data/gpu_monitor_bundle_<run_id>/`）用浏览器打开 `report.html` 即可查看完整显存曲线与统计。
+---
 
-## 目录分布
+## 分步用法：start → 你的命令 → finalize
 
-```
-tests/e2e/stability/
-├── README.md
-├── scripts/
-│   ├── __init__.py
-│   ├── resource_monitor.sh
-│   ├── generate_report.py
-│   └── test_benchmark_stability.py
-├── tests/
-│   └── stability_test.json
-├── stage_configs/
-│   └── qwen3_omni.yaml
-└── gpu_monitor_data/          # 运行时生成，默认数据根目录
-    ├── run_<run_id>/          # 单次运行的 CSV
-    │   └── gpu_metrics.csv
-    └── gpu_monitor_bundle_<run_id>/   # finalize 打包目录
-        ├── gpu_metrics.csv
-        ├── report.html
-        └── README.txt
+若需要先起监控、再手动执行长时间任务，可分步调用：
+
+```bash
+# 1. 启动监控（在 scripts 目录下或指定 DATA_ROOT）
+cd tests/e2e/stability/scripts
+./resource_monitor.sh start all 5 &
+MONITOR_PID=$!
+
+# 2. 执行你的长稳/测试命令（任意）
+# ...
+
+# 3. 收尾（必须放在环境清理前，建议放在 finally / after script）
+BUNDLE_LINE=$(./resource_monitor.sh finalize 2>/dev/null | grep '^GPU_MONITOR_BUNDLE_DIR=')
+eval "$BUNDLE_LINE"
+echo "报告目录: $GPU_MONITOR_BUNDLE_DIR"
 ```
 
-### 文件与目录说明
+---
 
-| 路径 | 作用 |
-|------|------|
-| `README.md` | 本说明文档：资源监控与长稳 benchmark 的使用方式、环境变量、目录与流程。 |
-| `scripts/__init__.py` | Python 包标识，便于 `scripts` 作为模块被引用。 |
-| `scripts/resource_monitor.sh` | 资源监控统一入口。子命令：`start`（后台采集）、`finalize`（打包并生成 report.html）、`run`（start → 执行命令 → finalize）。支持 `--backend gpu\|cpu\|npu`，当前仅 gpu 已实现。 |
-| `scripts/generate_report.py` | 由 `resource_monitor.sh finalize` 调用，读取监控 CSV，生成单文件 HTML 报告（统计表、时序图、简单异常标记）。 |
-| `scripts/test_benchmark_stability.py` | 长稳 benchmark 的 pytest 用例：先起 OmniServer，再在指定时长内按 `request_rate` 或 `max_concurrency` 跑 `vllm bench serve --omni`，断言无失败请求。 |
-| `tests/stability_test.json` | 长稳用例配置（与 perf 的 test.json 格式一致），定义 server_params、benchmark_params（含 `duration_sec`、`request_rate` 或 `max_concurrency`）。 |
-| `stage_configs/qwen3_omni.yaml` | Stage 配置示例，长稳用例只读取本目录下的 yaml，不依赖 `tests/perf`。 |
-| `gpu_monitor_data/` | 默认监控数据根目录（可由 `RESOURCE_MONITOR_DATA_ROOT` / `GPU_MONITOR_DATA_ROOT` 覆盖）。内含每次运行的 CSV 与 finalize 生成的 bundle（`gpu_metrics.csv`、`report.html`、`README.txt`）。 |
+## 目录与产物（仅监控相关）
+
+- **脚本**：`tests/e2e/stability/scripts/resource_monitor.sh`（入口）、`scripts/generate_report.py`（由 finalize 调用，生成 HTML）。
+- **数据目录**：默认 `tests/e2e/stability/gpu_monitor_data/`（可由 `RESOURCE_MONITOR_DATA_ROOT` 覆盖）。  
+  - 每次运行会生成 `run_<run_id>/gpu_metrics.csv`；  
+  - `finalize` 后得到 `gpu_monitor_bundle_<run_id>/`，内含 `gpu_metrics.csv`、`report.html`、`README.txt`。
+- **查看报告**：在 bundle 目录下用浏览器打开 `report.html`，即可查看显存曲线与统计。
+
+脚本仅生成 `report.html` 与 CSV，不上传 CI artifact；若需保留报告，请自行从工作目录归档或下载。
