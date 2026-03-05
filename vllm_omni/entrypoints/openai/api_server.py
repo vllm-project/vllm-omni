@@ -1751,6 +1751,9 @@ async def _run_video_generation_job(
         if not response.data:
             raise RuntimeError("Video generation completed but returned no outputs.")
 
+        if (video_count := len(response.data)) > 1:
+            logger.warning("Video request %s generated %s outputs but we only expected one.", video_id, video_count)
+
         file_name = f"{video_id}.{job.file_extension}"
         output_path = await decode_and_save_video_output(response.data[0], file_name)
         logger.info("Video request %s persisted %s output file.", video_id, output_path)

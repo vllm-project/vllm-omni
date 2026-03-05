@@ -8,6 +8,7 @@ import asyncio
 import io
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -32,8 +33,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class MockVideoResult:
-    def __init__(self, videos):
+    def __init__(self, videos, audios=None, sample_rate=None):
         self.multimodal_output = {"video": videos}
+        if audios is not None:
+            self.multimodal_output["audio"] = audios
+        if sample_rate is not None:
+            self.multimodal_output["audio_sample_rate"] = sample_rate
 
 
 class FakeAsyncOmni:
@@ -154,6 +159,34 @@ def test_i2v_video_generation_form(test_client, mocker: MockerFixture):
     assert input_image.size == (48, 32)
 
 
+def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client, mocker: MockerFixture):
+    image_bytes = _make_test_image_bytes((48, 32))
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A bear playing with yarn.",
+            "width": "96",
+            "height": "64",
+        },
+        files={"input_reference": ("input.png", image_bytes, "image/png")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    prompt = engine.captured_prompt
+    input_image = prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (96, 64)
+
+
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
     fps_values = []
 
@@ -235,6 +268,45 @@ def test_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.true_cfg_scale == 4.0
     assert captured.boundary_ratio == 0.7
     assert captured.extra_args["flow_shift"] == 0.25
+
+
+def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFixture):
+    audio_sample_rates = []
+
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None):
+        del video, fps, audio
+        audio_sample_rates.append(audio_sample_rate)
+        return "Zg=="
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            vocoder=SimpleNamespace(
+                config=SimpleNamespace(output_sampling_rate=16000),
+            ),
+        ),
+    )
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        yield MockVideoResult([object()], audios=[object()])
+
+    engine.generate = _generate
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        side_effect=_fake_encode,
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "video with audio"},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert audio_sample_rates == [16000]
 
 
 def test_missing_handler_returns_503():
