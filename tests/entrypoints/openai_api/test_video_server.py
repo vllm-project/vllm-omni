@@ -420,6 +420,7 @@ def test_video_request_validation():
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", seconds="abc")
 
+
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
