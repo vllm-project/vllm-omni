@@ -78,7 +78,7 @@ class DiffusionEngine:
 
         exec_start_time = time.time()
         output = self.add_req_and_wait_for_response(request)
-        exec_total_time = time.time() - exec_start_time
+        diffusion_engine_total_time_ms = time.time() - exec_start_time
 
         if output.error:
             raise Exception(f"{output.error}")
@@ -108,18 +108,18 @@ class DiffusionEngine:
             outputs = [outputs] if outputs is not None else []
 
         metrics = {
-            "preprocess_time_ms": round(preprocess_time * 1000, 2),
-            "diffusion_engine_exec_time_ms": round((time.time() - diffusion_engine_start_time) * 1000, 2),
-            "executor_time_ms": round(exec_total_time * 1000, 2),
+            "preprocess_time_ms": preprocess_time * 1000,
+            "diffusion_engine_exec_time_ms": (time.time() - diffusion_engine_start_time) * 1000,
+            "executor_time_ms": exec_total_time * 1000,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
         }
 
         if self.pre_process_func is not None:
-            metrics["preprocessing_time_ms"] = round(preprocess_time * 1000, 2)
+            metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
         # Handle single request or multiple requests
-        metrics["postprocess_time_ms"] = round(postprocess_time * 1000, 2)
+        metrics["postprocess_time_ms"] = postprocess_time * 1000,
         metrics["num_inference_steps"] = int(request.sampling_params.num_inference_steps)
 
         if len(request.prompts) == 1:
