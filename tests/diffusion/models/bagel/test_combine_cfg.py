@@ -7,6 +7,8 @@ import torch
 
 from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestCombineCfg:
     """Tests for the _combine_cfg static method."""
