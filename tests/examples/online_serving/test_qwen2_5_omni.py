@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import convert_audio_file_to_text, cosine_similarity_text
+from tests.conftest import OmniServerParams, convert_audio_file_to_text, cosine_similarity_text
 from tests.utils import hardware_test
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
@@ -22,7 +22,11 @@ stage_configs = [str(Path(__file__).parent.parent.parent / "e2e" / "stage_config
 
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving" / "qwen2_5_omni")
 # Create parameter combinations for model and stage config
-test_params = [(8091, model, stage_config) for model in models for stage_config in stage_configs]
+test_params = [
+    OmniServerParams(model=model, port=8091, stage_config_path=stage_config)
+    for model in models
+    for stage_config in stage_configs
+]
 
 
 def run_cmd(command):
