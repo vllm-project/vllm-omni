@@ -78,7 +78,7 @@ class DiffusionEngine:
 
         exec_start_time = time.time()
         output = self.add_req_and_wait_for_response(request)
-        diffusion_engine_total_time_ms = time.time() - exec_start_time
+        exec_total_time = time.time() - exec_start_time
 
         if output.error:
             raise Exception(f"{output.error}")
