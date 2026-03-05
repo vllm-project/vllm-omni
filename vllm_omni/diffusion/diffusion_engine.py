@@ -316,8 +316,6 @@ class DiffusionEngine:
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         num_inference_steps = 1
-        # NOTE: Use a typical high resolution to better exercise allocator
-        # behavior for 1024+ workloads.
         height = 1024
         width = 1024
         if supports_image_input(self.od_config.model_class_name):
