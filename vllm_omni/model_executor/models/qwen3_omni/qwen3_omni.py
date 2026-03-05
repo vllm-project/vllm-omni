@@ -676,6 +676,13 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_sequence_embeds = info_dict.get("thinker_prefill_embeddings").to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )  # Tensor [P,H]
+        if info_dict.get("thinker_decode_embeddings", None) is not None:
+            thinker_decode_embeds = info_dict.get("thinker_decode_embeddings").to(
+                device=self._module_device(self.talker), dtype=torch.bfloat16
+            )  # Tensor [D,H]
+            thinker_sequence_embeds = torch.cat([thinker_sequence_embeds, thinker_decode_embeds], dim=0)
+            update_dict["thinker_prefill_embeddings"] = thinker_sequence_embeds
+            update_dict["thinker_decode_embeddings"] = None
         thinker_hidden_states = info_dict.get("thinker_hidden_states").to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )  # Tensor [K,H]
