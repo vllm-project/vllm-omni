@@ -18,7 +18,6 @@
 #   RESOURCE_MONITOR_INTERVAL      采样间隔(秒)（兼容 GPU_MONITOR_INTERVAL）
 #   RESOURCE_MONITOR_LOG_INTERVAL  日志打印间隔(秒)（兼容 GPU_MONITOR_LOG_INTERVAL）
 #   GPU_MONITOR_DEVICES            [仅 GPU 后端] 设备 ID，如 0,1 或 all
-#   SKIP_DEPS_CHECK               跳过依赖检查
 #
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,13 +72,6 @@ cmd_start() {
 start_backend_gpu() {
     local GPU_IDS_RAW="${1:-${GPU_MONITOR_DEVICES:-all}}"
     local INTERVAL="${2:-${RESOURCE_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}}"
-
-    if [[ -z "${SKIP_DEPS_CHECK:-}" ]]; then
-        if ! command -v nvidia-smi &>/dev/null; then
-            echo "Error: nvidia-smi not found. Run this script on a Linux machine with NVIDIA drivers."
-            exit 1
-        fi
-    fi
 
     [[ "$INTERVAL" =~ ^[0-9]+$ ]] && [[ "$INTERVAL" -ge 1 ]] || {
         echo "Error: interval must be a positive integer (seconds)"
@@ -259,7 +251,6 @@ run_backend_gpu() {
     local CMD=("$@")
     export RESOURCE_MONITOR_DATA_ROOT="${RESOURCE_MONITOR_DATA_ROOT:-${GPU_MONITOR_DATA_ROOT:-$STABILITY_DIR/gpu_monitor_data}}"
     export GPU_MONITOR_DATA_ROOT="${GPU_MONITOR_DATA_ROOT:-$STABILITY_DIR/gpu_monitor_data}"
-    export SKIP_DEPS_CHECK="${SKIP_DEPS_CHECK:-1}"
     export RESOURCE_MONITOR_INTERVAL="${RESOURCE_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}"
     export GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}"
     export GPU_MONITOR_DEVICES="${GPU_MONITOR_DEVICES:-all}"
