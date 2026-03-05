@@ -132,17 +132,43 @@ class DiffusionLoRAManager:
     def _compute_packed_modules_mapping(self) -> dict[str, list[str]]:
         """Collect packed->sublayer mappings from the diffusion model.
 
-        vLLM models declare `packed_modules_mapping` on the model class. For
-        diffusion pipelines, we attach the same mapping on the transformer
-        module(s) that implement packed (fused) projections, so LoRA loading can
-        accept checkpoints trained against the logical sub-projections.
+        Diffusion models often use packed (fused) projections like `to_qkv` or
+        `w13`, while LoRA checkpoints are typically saved against the logical
+        sub-projections (e.g. `to_q`/`to_k`/`to_v`, `w1`/`w3`). Many diffusion
+        model implementations already define these relationships in
+        `load_weights()` via `stacked_params_mapping`. To avoid duplicating the
+        mapping in multiple places, we derive packed→sublayer mappings from the
+        model's `stacked_params_mapping`.
         """
+
+        def _derive_from_stacked_params_mapping(stacked: object) -> dict[str, list[str]]:
+            if not isinstance(stacked, (list, tuple)):
+                return {}
+            derived: dict[str, list[str]] = {}
+            for item in stacked:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                packed_suffix, sub_suffix = item[0], item[1]
+                if not isinstance(packed_suffix, str) or not packed_suffix:
+                    continue
+                if not isinstance(sub_suffix, str) or not sub_suffix:
+                    continue
+                # The mapping strings are usually suffix patterns (e.g. ".to_qkv"),
+                # but some models scope them under submodules (e.g. ".attn1.to_qkv").
+                # For LoRA we only care about the leaf module names.
+                packed_name = packed_suffix.strip(".").split(".")[-1]
+                sub_name = sub_suffix.strip(".").split(".")[-1]
+                existing = derived.get(packed_name)
+                if existing is None:
+                    derived[packed_name] = [sub_name]
+                elif sub_name not in existing:
+                    existing.append(sub_name)
+            return derived
+
         mapping: dict[str, list[str]] = {}
         for module in self.pipeline.modules():
-            packed = getattr(module, "packed_modules_mapping", None)
-            if not isinstance(packed, dict):
-                continue
-            for packed_name, sub_names in packed.items():
+            derived = _derive_from_stacked_params_mapping(getattr(module, "stacked_params_mapping", None))
+            for packed_name, sub_names in derived.items():
                 if not isinstance(packed_name, str) or not packed_name:
                     continue
                 if not isinstance(sub_names, (list, tuple)) or not all(isinstance(s, str) for s in sub_names):
@@ -156,7 +182,7 @@ class DiffusionLoRAManager:
                     mapping[packed_name] = sub_names_list
                 elif existing != sub_names_list:
                     logger.warning(
-                        "Conflicting packed_modules_mapping for %s: %s vs %s; using %s",
+                        "Conflicting packed module mapping for %s: %s vs %s; using %s",
                         packed_name,
                         existing,
                         sub_names_list,
@@ -171,7 +197,7 @@ class DiffusionLoRAManager:
             return None
         if len(sub_suffixes) != n_slices:
             logger.warning(
-                "packed_modules_mapping[%s] has %d slices but layer expects %d; skipping sublayer lookup",
+                "Packed module mapping[%s] has %d slices but layer expects %d; skipping sublayer lookup",
                 packed_module_suffix,
                 len(sub_suffixes),
                 n_slices,

@@ -68,6 +68,21 @@ class DiffusionModelRunner:
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
+    def _compile_transformer(self, attr_name: str) -> None:
+        """Compile a transformer attribute on the pipeline with torch.compile."""
+        model = getattr(self.pipeline, attr_name, None)
+        if model is None:
+            return
+        try:
+            setattr(self.pipeline, attr_name, regionally_compile(model, dynamic=True))
+            logger.info("Model runner: %s compiled with torch.compile.", attr_name)
+        except Exception as e:
+            logger.warning(
+                "Model runner: torch.compile for %s failed: %s. Using eager mode.",
+                attr_name,
+                e,
+            )
+
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
@@ -131,14 +146,8 @@ class DiffusionModelRunner:
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                try:
-                    self.pipeline.transformer = regionally_compile(
-                        self.pipeline.transformer,
-                        dynamic=True,
-                    )
-                    logger.info("Model runner: Model compiled with torch.compile.")
-                except Exception as e:
-                    logger.warning(f"Model runner: torch.compile failed with error: {e}. Using eager mode.")
+                self._compile_transformer("transformer")
+                self._compile_transformer("transformer_2")
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",

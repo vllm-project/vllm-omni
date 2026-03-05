@@ -7,7 +7,6 @@ from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
@@ -19,6 +18,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
+from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 if TYPE_CHECKING:
@@ -910,8 +910,18 @@ class OmniGPUModelRunner(GPUModelRunner):
         """Gather per-request model_intermediate_buffer in batch order."""
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
+            req_state = self.requests.get(req_id)
+            # MammothModa2 AR grid constraint: the model must emit a special
+            # end-of-line (EOL) token at the end of each image row.  To determine
+            # whether the current decoding step falls on a row boundary, the
+            # constraint logic (see MammothModa2ARForConditionalGeneration.
+            # _apply_t2i_token_constraints) computes:
+            #   column_id = generated_len % (ar_width + 1)
+            # and forces the EOL token when column_id == ar_width.
+            generated_len = len(req_state.output_token_ids) if req_state is not None else 0
             info = self.model_intermediate_buffer.get(req_id, {})
             if info:
+                info["generated_len"] = generated_len
                 per_req_runtime_info.append(info)
                 if "thinker_reply_part_per_request" in info:
                     q = info["thinker_reply_part_per_request"]
@@ -1155,12 +1165,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Prefill: overlay prompt_embeds and collect additional_information
             self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
 
+        # Keep per-request additional_information in sync for both new and
+        # cached requests. This is required for stages without preprocess
+        # (e.g., code2wav) so runtime_additional_information can be refreshed
+        # from scheduler cached infos on every step.
+        if hasattr(self.model, "has_preprocess") or hasattr(self.model, "enable_update_additional_information"):
+            if self.vllm_config.model_config.async_chunk:
+                self._update_additional_information(scheduler_output)
+
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
-            if self.vllm_config.model_config.async_chunk:
-                self._update_additional_information(scheduler_output)
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
