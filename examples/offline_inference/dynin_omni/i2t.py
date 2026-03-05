@@ -925,7 +925,7 @@ def main() -> None:
         cli_vq_path=args.vq_model_image_path.strip() or None,
         cli_local_files_only=args.vq_model_image_local_files_only,
         dynin_config_path=dynin_config_path,
-        default_model_local_files_only=effective_model_local_files_only,
+        default_model_local_files_only=False,
     )
     print(
         f"[i2t] Loading image tokenizer from: {vq_source} "
