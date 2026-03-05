@@ -82,7 +82,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```
     If you only want to run L3 test case, you can use:
     ```bash
-    pytest -s -v tests/e2e/ --ignore-glob='*expansion.py' -m "advanced_model" --run-level=advanced_model
+    pytest -s -v e2e/ --ignore-glob='*expansion.py' -m "advanced_model" --run-level=advanced_model
     ```
     If you only want to run a specific test case, you can use:
     ```bash
