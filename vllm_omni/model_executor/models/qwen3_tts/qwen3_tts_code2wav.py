@@ -73,7 +73,7 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         tok = Qwen3TTSTokenizer.from_pretrained(
             speech_tokenizer_dir,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
             load_feature_extractor=False,
         )
 
