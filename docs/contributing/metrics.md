@@ -69,7 +69,7 @@ With `--log-stats` enabled, the server will output detailed metrics logs after e
 | rx_decode_time_ms   | 111.865     | 31.706     |
 | in_flight_time_ms   | 2.015       | 2.819      |
 
-### DiffusionStats 
+### DiffusionStats
 
 | Field                           |      Value |
 |---------------------------------|------------|
@@ -92,7 +92,7 @@ With `--log-stats` enabled, the server will output detailed metrics logs after e
 - **Stage table**: per-stage batch and timing details.
 
 - **Transfer table**: data transfer and timing for each edge.
-  
+
 - **DiffusionStats**:preprocessing time, model execution time, postprocessing time, generated images, resolution, and inference steps.
 
 
@@ -197,8 +197,8 @@ For each edge:
 
 **diffusion_engine_total_time_ms**
 
-- preprocess_time_ms: Time spent on input preprocessing 
-- diffusion_engine_exec_time_ms: Pure model execution time 
+- preprocess_time_ms: Time spent on input preprocessing
+- diffusion_engine_exec_time_ms: Pure model execution time
 - postprocess_time_ms: Time spent on output postprocessing 
 - diffusion_engine_total_time_ms: Total time spent in the diffusion engine
 
