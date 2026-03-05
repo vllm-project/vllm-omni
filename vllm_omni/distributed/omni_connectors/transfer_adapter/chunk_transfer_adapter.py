@@ -185,7 +185,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.request_payload[req_id] = payload_data
             return payload_data
         origin_payload = self.request_payload[req_id]
-        override_keys = payload_data.get("override_keys", [])
+        override_keys = payload_data.pop("override_keys", [])
         for key, value in payload_data.items():
             if key == "finished":
                 continue
