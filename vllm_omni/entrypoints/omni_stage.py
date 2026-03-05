@@ -70,7 +70,43 @@ def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int =
     If process-scoped memory tracking is available (NVML works), stages can
     safely initialize concurrently — each measures only its own GPU memory.
     Otherwise, fall back to file-based locks to serialize initialization.
+
+    A global file lock is always acquired first to serialize get_open_port()
+    calls across all stages, preventing EADDRINUSE TOCTOU races.
     """
+    # Global lock to serialize engine initialization across all stages.
+    # This prevents TOCTOU races where concurrent get_open_port() calls
+    # in different stages (using different devices) return the same port.
+    _GLOBAL_INIT_LOCK_PATH = "/tmp/vllm_omni_engine_init.lock"
+    global_lock_fd = os.open(_GLOBAL_INIT_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        logger.info("Waiting for global engine init lock (%s)...", _GLOBAL_INIT_LOCK_PATH)
+        fcntl.flock(global_lock_fd, fcntl.LOCK_EX)
+        logger.info("Acquired global engine init lock")
+    except OSError as e:
+        logger.warning("Failed to acquire global init lock: %s, proceeding anyway", e)
+        try:
+            os.close(global_lock_fd)
+        except OSError:
+            pass
+        global_lock_fd = -1
+
+    try:
+        with _sequential_init_lock_inner(engine_args, stage_init_timeout):
+            yield
+    finally:
+        if global_lock_fd >= 0:
+            try:
+                fcntl.flock(global_lock_fd, fcntl.LOCK_UN)
+                os.close(global_lock_fd)
+                logger.info("Released global engine init lock")
+            except OSError:
+                pass
+
+
+@contextmanager
+def _sequential_init_lock_inner(engine_args: dict[str, Any], stage_init_timeout: int = 300):
+    """Inner logic for sequential init locks (per-device granularity)."""
     from vllm_omni.worker.gpu_memory_utils import is_process_scoped_memory_available
 
     nvml_available = is_process_scoped_memory_available()
