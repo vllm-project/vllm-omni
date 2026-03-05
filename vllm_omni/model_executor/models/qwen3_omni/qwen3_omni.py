@@ -896,15 +896,21 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_decode_embed = info_dict.get("thinker_decode_embeddings", None)
         start_index = info_dict.get("num_processed_tokens", 0)
         thinker_output_token_ids = info_dict.get("thinker_output_token_ids", [])
-        if start_index >= len(thinker_output_token_ids):
+        if start_index >= len(thinker_output_token_ids) - 1:
             if info_dict.get("finished_flag"):
                 return self.tts_pad_embed.to(device)
             update_dict["finished_flag"] = True
             return self.tts_eos_embed.to(device)
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
-            thinker_embed = cached_thinker_decode_embeds[start_index].to(device)
+            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
+            thinker_embed = cached_thinker_decode_embeds[start_index]
+            if thinker_decode_embed is not None:
+                thinker_decode_embed = thinker_decode_embed.to(device)
+                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
+                update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
         else:
             thinker_embed = thinker_decode_embed.to(device)
+        update_dict["thinker_decode_embeddings"] = None
         return self.talker.text_projection(thinker_embed).to(device)
 
     def talker_preprocess_decode(
