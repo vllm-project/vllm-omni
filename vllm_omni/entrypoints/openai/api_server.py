@@ -1713,11 +1713,9 @@ def _parse_form_json(value: str | None) -> Any:
 
 
 def video_response_from_request(model_name: str, req: VideoGenerationRequest) -> VideoResponse:
-    return VideoResponse(
-        model=model_name,
-        status=VideoGenerationStatus.QUEUED,
-        size=req.size or "",
-    )
+    resp = VideoResponse(model=model_name, status=VideoGenerationStatus.QUEUED, size=req.size or "")
+    resp.seconds = str(req.seconds or resp.seconds)
+    return resp
 
 
 async def decode_and_save_video_output(output: Any, file_name: str) -> str:
@@ -1762,6 +1760,7 @@ async def _run_video_generation_job(
             video_id,
             {
                 "status": VideoGenerationStatus.COMPLETED,
+                "progress": 100,
                 "file_path": output_path,
                 "media_type": "video/mp4",
                 "completed_at": int(time.time()),
