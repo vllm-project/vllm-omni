@@ -5,49 +5,15 @@ vLLM-Omni provides an official Docker image for deployment. These images are bui
 For a local test environment, you can follow the steps below to create a container:
 ## Installing Dependencies
 ### vLLM & vLLM-Omni
-vLLM-Omni is built based on vLLM. Please install it using the command below.
-
-=== "GPU (NVIDIA)"
-
-    ```bash
-    uv pip install vllm=={version number} --torch-backend=auto
-    uv pip install vllm-omni
-    ```
-
-=== "ROCM (AMD)"
-
-    ```bash
-    uv pip install vllm=={version number} --extra-index-url https://wheels.vllm.ai/rocm/{version number}
-    git clone https://github.com/vllm-project/vllm-omni.git
-    cd vllm-omni
-    VLLM_OMNI_TARGET_DEVICE=rocm uv pip install -e .
-    # OR
-    uv pip install -e . --no-build-isolation
-    ```
-
-=== "NPU (Ascend)"
-
-    ```bash
-    cd /vllm-workspace
-    git clone -b {version number} https://github.com/vllm-project/vllm-omni.git
-
-    export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    cd vllm-omni
-    VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
-    # OR pip install -v -e . --no-build-isolation
-    ```
+vLLM-Omni is built based on vLLM. You can follow [install guide](../../getting_started/installation/README.md) to build your local environment.
 
 ### Test Case Dependencies
 When running test cases, you may need to install the following dependencies:
 
-    ```bash
-    pip install \
-    pytest>=7.0.0 \
-    pytest-asyncio>=0.21.0 \
-    pytest-cov>=4.0.0
-
-    apt-get install -y ffmpeg
-    ```
+```bash
+uv pip install ".[dev]"
+apt-get install -y ffmpeg
+```
 
 ## Running Tests
 Our test scripts use the pytest framework. First, please use `git clone https://github.com/vllm-project/vllm-omni.git` to download the vllm-omni source code. Then, in the root directory of vllm-omni, you can run the following commands in your local test environment to execute the corresponding test cases.
@@ -58,6 +24,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     cd tests
     pytest -s -v -m "core_model and cpu"
     ```
+    The latest test command is available in the "Simple Unit Test" step of this [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
 
 === "L2 level"
 
@@ -73,6 +40,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```bash
     pytest -s -v -m "core_model and distributed_cuda and L4"  --run-level=core_model
     ```
+    The latest test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
 
 === "L3 level & L4 level"
 
@@ -96,6 +64,10 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```bash
     pytest -s -v perf/scripts/run_benchmark.py
     ```
+
+    The latest L3 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-merge.yml).
+
+    The latest L4 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml).
 
 You can find more information about markers in the documentation: [marker doc](./tests_markers.md)
 
