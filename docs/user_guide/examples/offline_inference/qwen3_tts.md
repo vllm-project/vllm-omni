@@ -98,7 +98,8 @@ Add `--streaming` to stream audio chunks progressively via `AsyncOmni` (requires
 python end2end.py --query-type CustomVoice --streaming --output-dir /tmp/out_stream
 ```
 
-Each 25-frame Code2Wav chunk is logged as it arrives. The final WAV file is written once generation
+Each Code2Wav chunk is logged as it arrives (default 25 frames; configurable via `codec_chunk_frames`
+and `initial_codec_chunk_frames` in the stage config). The final WAV file is written once generation
 completes. This demonstrates that audio data is available progressively rather than only at the end.
 
 > **Note:** Streaming uses `AsyncOmni` internally. The non-streaming path (`Omni`) is unchanged.
