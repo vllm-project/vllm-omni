@@ -51,6 +51,13 @@ def parse_args():
     parser.add_argument(
         "--negative-prompt", type=str, default=None, help="Negative prompt for CFG (default: empty prompt)"
     )
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
+    )
 
     args = parser.parse_args()
     return args
@@ -82,12 +89,14 @@ def main():
     from PIL import Image
 
     if args.modality == "img2img":
-        from PIL import Image
-
         from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 
-        print("[Info] Running in img2img mode (Stage 1 only)")
-        client = OmniDiffusion(model=model_name)
+        print(f"[Info] Running in {args.modality} mode (Stage 1 only, cfg_parallel_size={args.cfg_parallel_size})")
+
+        client = OmniDiffusion(
+            model=model_name,
+            parallel_config={"cfg_parallel_size": args.cfg_parallel_size},
+        )
 
         if args.image_path:
             if os.path.exists(args.image_path):

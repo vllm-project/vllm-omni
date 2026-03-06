@@ -7,6 +7,7 @@ tasks, then runs Omni generation and saves output wav files.
 import asyncio
 import logging
 import os
+import time
 from typing import Any, NamedTuple
 
 import soundfile as sf
@@ -337,13 +338,27 @@ async def main_streaming(args):
 
     for i, prompt in enumerate(inputs):
         request_id = str(i)
+        t_start = time.perf_counter()
+        t_prev = t_start
+        chunk_idx = 0
         async for stage_output in omni.generate(prompt, request_id=request_id):
             mm = stage_output.request_output.outputs[0].multimodal_output
             if not stage_output.finished:
+                t_now = time.perf_counter()
                 audio = mm.get("audio")
                 n = len(audio) if isinstance(audio, list) else (0 if audio is None else 1)
-                logger.info(f"Request {request_id}: received chunk {n}")
+                dt_ms = (t_now - t_prev) * 1000
+                ttfa_ms = (t_now - t_start) * 1000
+                if chunk_idx == 0:
+                    logger.info(f"Request {request_id}: chunk {chunk_idx} samples={n} TTFA={ttfa_ms:.1f}ms")
+                else:
+                    logger.info(f"Request {request_id}: chunk {chunk_idx} samples={n} inter_chunk={dt_ms:.1f}ms")
+                t_prev = t_now
+                chunk_idx += 1
             else:
+                t_end = time.perf_counter()
+                total_ms = (t_end - t_start) * 1000
+                logger.info(f"Request {request_id}: done total={total_ms:.1f}ms chunks={chunk_idx}")
                 _save_wav(output_dir, request_id, mm)
 
 

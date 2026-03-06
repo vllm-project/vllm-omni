@@ -418,7 +418,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             mm = getattr(ro, "multimodal_output", None) if ro else None
         if not mm:
             return None, None
-        key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
+        key = "audio" if "audio" in mm else None
         return mm, key
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -467,6 +467,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["max_new_tokens"] = [request.max_new_tokens]
         else:
             params["max_new_tokens"] = [2048]
+
+        if request.initial_codec_chunk_frames is not None:
+            params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
 
         # VoiceDesign requires non_streaming_mode (match offline script behaviour).
         # CustomVoice and Base rely on the model default (True and False respectively).

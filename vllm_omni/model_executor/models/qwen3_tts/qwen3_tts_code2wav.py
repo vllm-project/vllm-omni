@@ -4,7 +4,6 @@ import os
 from collections.abc import Iterable
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 from transformers.utils.hub import cached_file
@@ -21,7 +20,8 @@ logger = init_logger(__name__)
 
 class Qwen3TTSCode2Wav(nn.Module):
     """Stage-1 code2wav model for Qwen3-TTS (GenerationModelRunner).
-    Consumes frame-aligned codec tokens from input_ids and decodes waveform via SpeechTokenizer."""
+    Consumes frame-aligned codec tokens from input_ids and decodes waveform
+    via the SpeechTokenizer decoder directly (bypassing HF wrapper overhead)."""
 
     input_modalities = "audio"
 
@@ -34,13 +34,13 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.has_preprocess = False
         self.has_postprocess = False
         self.enable_update_additional_information = True
-        # Generation-only stage (no logits / sampling).
         self.requires_raw_input_tokens = True
 
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
+        self._decoder: nn.Module | None = None
         self._num_quantizers: int | None = None
-        self._decode_upsample_rate: int | None = None
         self._output_sample_rate: int | None = None
+        self._total_upsample: int | None = None
         self._logged_codec_stats = False
 
     @staticmethod
@@ -52,18 +52,15 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return buf.device
             return torch.device("cpu")
 
-    def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
-        if self._speech_tokenizer is not None:
-            return self._speech_tokenizer
+    def _ensure_speech_tokenizer_loaded(self) -> None:
+        if self._decoder is not None:
+            return
 
-        # Locate speech_tokenizer dir from HF cache (or local path).
         cfg_path = cached_file(self.model_path, "speech_tokenizer/config.json")
         if cfg_path is None:
             raise ValueError(f"{self.model_path}/speech_tokenizer/config.json not found")
         speech_tokenizer_dir = os.path.dirname(cfg_path)
 
-        # Stage-1 only needs decode; skip HF feature extractor to avoid heavy optional deps.
-        # Still require preprocessor_config.json (use cached_file so online runs can fetch it).
         prep_cfg = cached_file(self.model_path, "speech_tokenizer/preprocessor_config.json")
         if prep_cfg is None:
             raise ValueError(
@@ -73,16 +70,14 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         tok = Qwen3TTSTokenizer.from_pretrained(
             speech_tokenizer_dir,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
             load_feature_extractor=False,
         )
 
-        # Align device with vLLM worker, then read back from module.
         if tok.model is not None:
             tok.model.to(device=self.vllm_config.device_config.device)
             tok.device = self._module_device(tok.model)
 
-        # Derive codec group count and rates from tokenizer config.
         dec_cfg = getattr(tok.model.config, "decoder_config", None)
         num_q = getattr(dec_cfg, "num_quantizers", None) if dec_cfg is not None else None
         if num_q is None:
@@ -103,11 +98,39 @@ class Qwen3TTSCode2Wav(nn.Module):
         except Exception as e:
             raise ValueError(f"Failed to get output sample rate: {e}") from e
 
+        decoder = tok.model.decoder
+        decoder.eval()
+
         self._speech_tokenizer = tok
+        self._decoder = decoder
         self._num_quantizers = num_q
-        self._decode_upsample_rate = upsample
         self._output_sample_rate = out_sr
-        return tok
+        self._total_upsample = int(decoder.total_upsample)
+
+        if hasattr(decoder, "enable_cudagraph"):
+            device = self._module_device(decoder)
+            if device.type == "cuda":
+                try:
+                    capture_sizes = None
+                    model_cfg = getattr(self.vllm_config, "model_config", None)
+                    connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+                    extra_cfg = (
+                        connector_cfg.get("extra", connector_cfg)
+                        if isinstance(connector_cfg, dict)
+                        else getattr(connector_cfg, "extra", None)
+                    )
+                    if isinstance(extra_cfg, dict):
+                        chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
+                        left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+                        if chunk_frames > 0 and left_frames >= 0:
+                            from .cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+
+                            steady_window = left_frames + chunk_frames
+                            capture_sizes = sorted({*CUDAGraphDecoderWrapper.DEFAULT_CAPTURE_SIZES, steady_window})
+                    decoder.enable_cudagraph(capture_sizes=capture_sizes, device=device)
+                    logger.info("Code2Wav decoder CUDA Graph enabled")
+                except Exception:
+                    logger.warning("Failed to enable CUDA Graph for Code2Wav decoder", exc_info=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -155,17 +178,19 @@ class Qwen3TTSCode2Wav(nn.Module):
         input_ids layout per request: [codec_context_frames, *flat_codes]
         where flat_codes is codebook-major [q*F].
 
-        When batched, uses forward context ubatch_slices to split the
-        concatenated input_ids and decode via a single batched forward pass.
+        Bypasses the HF Qwen3TTSTokenizer.decode() wrapper and calls the
+        decoder.chunked_decode() directly to avoid GPU->CPU->GPU round-trips.
+        Length management is done here instead of relying on HF's padding=-1
+        sentinel logic.
         """
         self._ensure_speech_tokenizer_loaded()
+        assert self._decoder is not None
         assert self._num_quantizers is not None
-        assert self._decode_upsample_rate is not None
-        assert self._output_sample_rate is not None
+        assert self._total_upsample is not None
 
-        tok = self._speech_tokenizer
+        decoder = self._decoder
         q = int(self._num_quantizers)
-        upsample = int(self._decode_upsample_rate)
+        upsample = int(self._total_upsample)
         sr_val = int(self._output_sample_rate)
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
@@ -179,13 +204,9 @@ class Qwen3TTSCode2Wav(nn.Module):
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
-        # Parse each request: extract left_context_size, validate, reshape codes.
-        # input_ids layout per request: [*flat_codes]
-        # where flat_codes is codebook-major [q*F].
-        parsed = []  # (left_context_size, actual_frames)
-        valid_codes = []
-        valid_indices = []
-        # Get left_context_size from runtime_additional_information (passed via kwargs)
+        parsed: list[tuple[int, int]] = []
+        valid_codes_qf: list[torch.Tensor] = []
+        valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
         if runtime_additional_information is not None:
             for i, info in enumerate(runtime_additional_information):
@@ -193,8 +214,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                     break
                 if "left_context_size" in info:
                     left_context_size[i] = info["left_context_size"]
-        else:
-            logger.debug("No additional_information provided to code2wav stage.")
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
                 parsed.append((0, 0))
@@ -202,7 +221,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             ctx_frames = left_context_size[i]
             flat = req_ids
             n = flat.numel()
-            # Warmup / dummy_run: not divisible by num_quantizers.
             if n == 0 or n % q != 0:
                 if n > 0:
                     logger.warning(
@@ -214,14 +232,14 @@ class Qwen3TTSCode2Wav(nn.Module):
                 parsed.append((0, 0))
                 continue
             frames = n // q
-            # Reshape codebook-major flat [q*F] -> [q, F] -> [F, q] for SpeechTokenizer.
-            codes_fq = flat.reshape(q, frames).transpose(0, 1).contiguous()
+            # [q*F] -> [Q, F] for direct decoder call (decoder expects [B, Q, F])
+            codes_qf = flat.reshape(q, frames)
             parsed.append((ctx_frames, frames))
-            valid_codes.append({"audio_codes": codes_fq})
+            valid_codes_qf.append(codes_qf)
             valid_indices.append(i)
 
         num_req = len(request_ids_list)
-        if not valid_codes:
+        if not valid_codes_qf:
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -233,50 +251,55 @@ class Qwen3TTSCode2Wav(nn.Module):
         if not self._logged_codec_stats:
             self._logged_codec_stats = True
             try:
-                c = valid_codes[0]["audio_codes"]
+                c = valid_codes_qf[0]
                 logger.info(
-                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] head=%s batch=%d",
-                    c.shape[0],
+                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] batch=%d",
+                    c.shape[1],
                     q,
                     int(torch.unique(c).numel()),
                     int(c.min().item()),
                     int(c.max().item()),
-                    c[: min(2, c.shape[0]), : min(8, q)].cpu().tolist(),
-                    len(valid_codes),
+                    len(valid_codes_qf),
                 )
             except Exception:
                 pass
 
-        # Batched decode: single forward pass through SpeechTokenizer.
-        wavs, _ = tok.decode(valid_codes)
-        if len(wavs) != len(valid_codes):
-            raise RuntimeError(f"Code2Wav returned {len(wavs)} waveforms for {len(valid_codes)} requests")
+        # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
+        # For single request: no padding needed, fast path.
+        # For multiple requests: decode each individually to avoid padding overhead.
+        wav_tensors: list[torch.Tensor] = []
+        if len(valid_codes_qf) == 1:
+            codes_bqf = valid_codes_qf[0].unsqueeze(0)  # [1, Q, F]
+            wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
+            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        else:
+            for codes_qf in valid_codes_qf:
+                codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
+                wav = decoder.chunked_decode(codes_bqf)
+                wav_tensors.append(wav.squeeze(0).squeeze(0))
 
-        # Build per-request outputs, trimming padding and left-context.
-        audios = [empty] * num_req
+        audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
-            audio_np = wavs[j].astype(np.float32, copy=False)
-            # Trim decoder padding (output may be longer due to batch padding).
+            wav = wav_tensors[j]
             expected_len = actual_frames * upsample
-            if audio_np.shape[0] > expected_len:
-                audio_np = audio_np[:expected_len]
-            # Trim left-context waveform samples (streaming sliding window).
+            if wav.shape[0] > expected_len:
+                wav = wav[:expected_len]
             if ctx_frames > 0:
                 cut = ctx_frames * upsample
-                if cut < audio_np.shape[0]:
-                    audio_np = audio_np[cut:]
+                if cut < wav.shape[0]:
+                    wav = wav[cut:]
                 else:
                     logger.warning(
                         "Context trim %d >= decoded length %d; returning empty audio.",
                         cut,
-                        audio_np.shape[0],
+                        wav.shape[0],
                     )
                     continue
-            if audio_np.shape[0] > 0:
-                audios[idx] = torch.from_numpy(audio_np).to(dtype=torch.float32).reshape(-1)
+            if wav.shape[0] > 0:
+                audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 
         return OmniOutput(
             text_hidden_states=None,

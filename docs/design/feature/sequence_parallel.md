@@ -240,7 +240,8 @@ class TransformerWithRoPE(nn.Module):
 
 ## Approach 2: Intrusive Modification (For Complex Cases)
 
-For models with dynamic sharding logic that cannot be expressed via `_sp_plan`, manually insert shard/gather calls.
+For models with dynamic sharding logic that cannot be expressed via `_sp_plan`, manually insert shard/gather calls. Importantly, when taking this approach, be careful to ensure that you correctly manage the `_sp_shard_depth`; if the sequence parallel shard depth is 0, Ulysses will not be used.
+
 
 **When to use:**
 - Dynamic/conditional sharding logic
@@ -252,15 +253,18 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 
 def forward(self, hidden_states, ...):
     if self.parallel_config.sequence_parallel_size > 1:
+        # <Increment the _sp_shard_depth on the fwd context>
         hidden_states = sp_shard(hidden_states, dim=1)
 
     # ... computation ...
 
     if self.parallel_config.sequence_parallel_size > 1:
         output = sp_gather(output, dim=1)
+        # <Decrement the _sp_shard_depth on the fwd context>
 
     return output
 ```
+Note that currently, `sp_shard` / `sp_gather` do *not* automatically manage the `_sp_shard_depth`; you need to be careful to manage it yourself.
 
 ---
 

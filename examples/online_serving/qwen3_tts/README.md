@@ -250,6 +250,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | `language`       | string | "Auto"        | Language (see supported languages below)                                     |
 | `instructions`   | string | ""            | Voice style/emotion instructions                                             |
 | `max_new_tokens` | int    | 2048          | Maximum tokens to generate                                                   |
+| `initial_codec_chunk_frames` | int | null | Initial chunk size for reduced TTFA (overrides stage config)                 |
 | `stream`         | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
@@ -265,7 +266,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 ## Streaming
 
 Set `stream=true` with `response_format="pcm"` to receive raw PCM audio chunks as they are decoded
-(one chunk per 25-frame Code2Wav window):
+(one chunk per Code2Wav window, default 25 frames; configurable in the stage config):
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
