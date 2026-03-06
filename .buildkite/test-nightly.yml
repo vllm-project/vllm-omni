@@ -62,6 +62,27 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - label: ":full_moon: Qwen3-TTS Non-Async-Chunk E2E Test"
+    timeout_in_minutes: 30
+    depends_on: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1"
+    commands:
+      - |
+        export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        pytest -s -v tests/e2e/online_serving/test_qwen3_tts.py::TestQwen3TTSNoAsyncChunk
+    agents:
+      queue: "gpu_4_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: ":full_moon: Omni Model Perf Test with H100"
     key: nightly-performance
     timeout_in_minutes: 180
