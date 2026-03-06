@@ -10,6 +10,7 @@ get_benchmark_params_for_server、create_benchmark_indices、omni_server fixture
 均在 tests/e2e/stability/tests/stability_test.json 中配置，不再通过环境变量覆盖。
 """
 import json
+import os
 import threading
 import time
 from pathlib import Path

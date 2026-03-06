@@ -1,6 +1,6 @@
 # 资源监控脚本使用说明（GPU / 预留 CPU·NPU）
 
-本目录下的 **`scripts/resource_monitor.sh`** 是资源监控的统一入口：在跑任意命令（如长稳测试、单测等）的同时采集 GPU 显存等指标，结束后打包并生成单文件 HTML 报告，便于在 CI 或本地查看。脚本**仅生成 report.html 与 CSV**，不上传 CI artifact；运行结束后在输出目录中打开 `report.html` 即可。
+本目录下的 **`scripts/resource_monitor.sh`** 是资源监控的统一入口：在跑任意命令（如长稳测试、单测等）的同时采集 GPU 显存等指标，结束后打包并生成单文件 HTML 报告。脚本**生成 report.html 与 CSV**；运行结束后在输出目录中打开 `report.html` 即可。
 
 当前仅实现 **GPU** 后端；后端由子命令的 `--backend gpu|cpu|npu` 指定（默认 gpu），预留 CPU/NPU 扩展。
 
@@ -87,4 +87,4 @@ echo "报告目录: $GPU_MONITOR_BUNDLE_DIR"
   - `finalize` 后得到 `gpu_monitor_bundle_<run_id>/`，内含 `gpu_metrics.csv`、`report.html`、`README.txt`。
 - **查看报告**：在 bundle 目录下用浏览器打开 `report.html`，即可查看显存曲线与统计。
 
-脚本仅生成 `report.html` 与 CSV，不上传 CI artifact；若需保留报告，请自行从工作目录归档或下载。
+脚本仅生成 `report.html` 与 CSV；若需保留报告，请自行从工作目录归档或下载。
