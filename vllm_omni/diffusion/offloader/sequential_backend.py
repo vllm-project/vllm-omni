@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from itertools import chain
+
 import torch
 from torch import nn
 from vllm.logger import init_logger
@@ -12,6 +14,37 @@ from .base import OffloadBackend, OffloadConfig
 from .module_collector import ModuleDiscovery
 
 logger = init_logger(__name__)
+
+
+class PinnedWeightsStore:
+    """Pre-allocated pinned CPU buffers for a module's parameters and buffers.
+
+    Allocates page-locked CPU tensors once so that GPU-to-CPU offloading can
+    copy directly into pinned memory (single DMA) instead of the default
+    module.to("cpu") path which creates pageable tensors followed by an
+    expensive per-parameter pin_memory() call.
+
+    Note: This class relies on CUDA/ROCm ``pin_memory`` and is only
+    instantiated when ``is_cuda_alike()`` is True.  To support NPU/XPU,
+    a platform-level pinned-memory abstraction would be needed.
+    """
+
+    def __init__(self, module: nn.Module):
+        self._store: dict[str, torch.Tensor] = {}
+        for name, tensor in chain(module.named_parameters(), module.named_buffers()):
+            self._store[name] = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+
+    def offload_from_gpu(self, module: nn.Module) -> None:
+        """Copy GPU tensors into pre-pinned buffers and point params at them."""
+        for name, tensor in chain(module.named_parameters(), module.named_buffers()):
+            buf = self._store.get(name)
+            if buf is not None:
+                buf.copy_(tensor.data)
+                tensor.data = buf
+
+    def release(self) -> None:
+        """Free all pre-pinned CPU buffers."""
+        self._store.clear()
 
 
 class SequentialOffloadHook(ModelHook):
@@ -29,11 +62,13 @@ class SequentialOffloadHook(ModelHook):
         offload_targets: list[nn.Module],
         device: torch.device,
         pin_memory: bool = True,
+        pinned_stores: dict[int, PinnedWeightsStore] | None = None,
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
         self.device = device
         self.pin_memory = pin_memory
+        self._pinned_stores: dict[int, PinnedWeightsStore] = pinned_stores or {}
 
     @staticmethod
     def _move_params(module: nn.Module, device: torch.device) -> None:
@@ -63,13 +98,19 @@ class SequentialOffloadHook(ModelHook):
         if param.device.type == "cpu":
             return
 
-        self._move_params(module, torch.device("cpu"))
-        current_omni_platform.empty_cache()
+        store = self._pinned_stores.get(id(module))
+        if store is not None:
+            store.offload_from_gpu(module)
+        else:
+            self._move_params(module, torch.device("cpu"))
+            if self.pin_memory:
+                for p in module.parameters():
+                    if p.data.device.type == "cpu" and not p.data.is_pinned():
+                        p.data = p.data.pin_memory()
 
-        if self.pin_memory:
-            for p in module.parameters():
-                if p.data.device.type == "cpu" and not p.data.is_pinned():
-                    p.data = p.data.pin_memory()
+        empty_cache = current_omni_platform.empty_cache
+        if empty_cache is not None:
+            empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
         """Move module to GPU."""
@@ -107,6 +148,7 @@ def apply_sequential_offload(
     encoder_modules: list[nn.Module],
     device: torch.device,
     pin_memory: bool = True,
+    pinned_stores: dict[int, PinnedWeightsStore] | None = None,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -119,6 +161,7 @@ def apply_sequential_offload(
         encoder_modules: Encoder modules to register hooks on
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
+        pinned_stores: Pre-allocated pinned CPU buffers keyed by module id
 
     Example:
         >>> apply_sequential_offload(
@@ -128,6 +171,8 @@ def apply_sequential_offload(
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
+    stores = pinned_stores or {}
+
     # Register hooks on DiT modules (offload encoders when DiT runs)
     for dit_mod in dit_modules:
         registry = HookRegistry.get_or_create(dit_mod)
@@ -135,6 +180,7 @@ def apply_sequential_offload(
             offload_targets=encoder_modules,
             device=device,
             pin_memory=pin_memory,
+            pinned_stores=stores,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
         logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
@@ -146,6 +192,7 @@ def apply_sequential_offload(
             offload_targets=dit_modules,
             device=device,
             pin_memory=pin_memory,
+            pinned_stores=stores,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
         logger.debug("Registered offload hook for %s", enc.__class__.__name__)
@@ -177,6 +224,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
         self._offload_modules: list[nn.Module] = []  # Track modules with hooks
+        self._pinned_stores: dict[int, PinnedWeightsStore] = {}
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
@@ -202,12 +250,38 @@ class ModelLevelOffloadBackend(OffloadBackend):
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
 
+        # pin_memory requires a CUDA-compatible runtime (CUDA / ROCm);
+        # disable on platforms where it is unsupported (NPU, XPU, …).
+        pin_memory = self.config.pin_cpu_memory and current_omni_platform.is_cuda_alike()
+        if self.config.pin_cpu_memory and not pin_memory:
+            logger.warning(
+                "pin_cpu_memory is enabled but pinned memory is not supported "
+                "on this platform; falling back to unpinned transfers"
+            )
+
+        if pin_memory:
+            # Pre-pin DiT parameters that start on CPU for fast CPU->GPU transfer
+            for dit_mod in modules.dits:
+                for p in dit_mod.parameters():
+                    if p.data.device.type == "cpu" and not p.data.is_pinned():
+                        p.data = p.data.pin_memory()
+
+            # Pre-allocate pinned CPU buffers for encoders (currently on GPU)
+            # so GPU->CPU offload copies directly into pinned memory
+            for enc in modules.encoders:
+                self._pinned_stores[id(enc)] = PinnedWeightsStore(enc)
+                logger.debug(
+                    "Pre-allocated pinned CPU buffers for %s",
+                    enc.__class__.__name__,
+                )
+
         # Apply sequential offloading hooks
         apply_sequential_offload(
             dit_modules=modules.dits,
             encoder_modules=modules.encoders,
             device=self.device,
-            pin_memory=self.config.pin_cpu_memory,
+            pin_memory=pin_memory,
+            pinned_stores=self._pinned_stores,
         )
 
         # Track modules for cleanup
@@ -227,6 +301,9 @@ class ModelLevelOffloadBackend(OffloadBackend):
 
         remove_sequential_offload(self._offload_modules)
 
+        for store in self._pinned_stores.values():
+            store.release()
+        self._pinned_stores.clear()
         self._offload_modules.clear()
         self.enabled = False
         logger.info("Model-level offloading disabled")
