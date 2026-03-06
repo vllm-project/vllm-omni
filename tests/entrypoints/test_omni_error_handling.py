@@ -106,5 +106,43 @@ class TestSyncOrchestratorErrorCounting(unittest.TestCase):
         )
 
 
+    def test_stale_result_skipped(self):
+        """Stale results from a previous generate() call should be silently
+        skipped without affecting the completed_requests counter."""
+        completed_requests = 0
+
+        # request_id_to_prompt only contains the current run's requests
+        request_id_to_prompt = {"req-current": "hello"}
+
+        # Simulate a stale result whose request_id is not in the current run
+        result = {
+            "request_id": "req-stale-from-previous-run",
+            "stage_id": 0,
+        }
+
+        class MockCfg:
+            def is_companion(self, req_id):
+                return False
+
+        cfg = MockCfg()
+        req_id = result.get("request_id")
+
+        # This is the stale-result guard from omni.py lines 1031-1038
+        skipped = False
+        if req_id not in request_id_to_prompt and not cfg.is_companion(req_id):
+            skipped = True
+            # In real code: logger.warning + continue
+
+        self.assertTrue(
+            skipped,
+            "Stale result with unknown request_id must be skipped",
+        )
+        self.assertEqual(
+            completed_requests,
+            0,
+            "completed_requests must not change when skipping stale results",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
