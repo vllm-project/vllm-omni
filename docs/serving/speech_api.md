@@ -96,6 +96,7 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
+| `initial_codec_chunk_frames` | integer | null | Initial chunk size for reduced TTFA (overrides stage config) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 

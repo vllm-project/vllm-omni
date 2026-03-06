@@ -268,7 +268,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 ## Streaming
 
 Set `stream=true` with `response_format="pcm"` to receive raw PCM audio chunks as they are decoded
-(one chunk per 25-frame Code2Wav window):
+(one chunk per Code2Wav window, default 25 frames; configurable in the stage config):
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \

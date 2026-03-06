@@ -163,6 +163,7 @@ class OmniDiffusionSamplingParams:
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
+    output_type: str | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -187,6 +188,7 @@ class OmniDiffusionSamplingParams:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    audio_latents: torch.Tensor | None = None
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
     image_latent: torch.Tensor | None = None
@@ -200,7 +202,8 @@ class OmniDiffusionSamplingParams:
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None
-    fps: int | None = None
+    fps: int | None = None  # Integer FPS kept for request compatibility and output encoding.
+    frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False
 
@@ -216,6 +219,8 @@ class OmniDiffusionSamplingParams:
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
+    decode_timestep: float | list[float] | None = None
+    decode_noise_scale: float | list[float] | None = None
     eta: float = 0.0
     sigmas: list[float] | None = None
 
@@ -283,6 +288,20 @@ class OmniDiffusionSamplingParams:
         # This class is changed to only represent a single prompt request
         # Only adjust batch size for number of videos per prompt
         return self.num_outputs_per_prompt
+
+    @property
+    def resolved_frame_rate(self) -> float | None:
+        if self.frame_rate is not None:
+            return float(self.frame_rate)
+
+        fps = self.fps
+        if isinstance(fps, list):
+            fps = fps[0] if fps else None
+
+        if fps is None:
+            return None
+
+        return float(fps)
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
