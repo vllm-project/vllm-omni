@@ -280,6 +280,17 @@ def get_docstring_for_node_id(repo_root: Path, node_id: str) -> str:
     return ""
 
 
+def get_test_file_for_node_id(node_id: str) -> str:
+    """Extract test file path from a pytest node id."""
+    if not node_id:
+        return ""
+    if "::" in node_id:
+        return node_id.split("::", 1)[0]
+    if node_id.endswith(".py"):
+        return node_id
+    return "(marker-only / no collection)"
+
+
 def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Path | None = None) -> None:
     """Write stats to HTML with styling and responsive tables."""
     root = repo_root if repo_root is not None else REPO_ROOT
@@ -331,6 +342,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
             <tr>
               <th>Pipeline</th>
               <th>Test Suite</th>
+              <th>Test File</th>
               <th>No.</th>
               <th>Test Name</th>
               <th>Status</th>
@@ -343,28 +355,49 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         badge = pipeline_badges.get(pipeline_name, "")
         badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
         suite_summary = f"{esc(label)} ({count} cases)"
-        suite_rows = []
+        file_sections: list[str] = []
         if not names:
-            suite_rows.append(
+            suite_rows = [
                 f'<tr class="{tr_class(0)}">'
-                f'<td>{badge_span}</td><td>{esc(label)}</td><td class="num">0</td>'
+                f"<td>{badge_span}</td><td>{esc(label)}</td>"
+                f'<td class="files"><em>(marker-only / no collection)</em></td><td class="num">0</td>'
                 f'<td class="name"><em>No collection or only -m/--run-level</em></td>'
                 f'<td class="status"></td><td class="desc"></td></tr>'
+            ]
+            file_sections.append(
+                '<details class="file-details" open>'
+                "<summary>(marker-only / no collection)</summary>"
+                f'<div class="table-wrap"><table><thead>{case_details_thead}</thead>'
+                f"<tbody>{''.join(suite_rows)}</tbody></table></div></details>"
             )
         else:
-            for i, name in enumerate(names, 1):
-                desc = (docstrings[i - 1] if i - 1 < len(docstrings) else "") or ""
+            file_groups: dict[str, list[tuple[str, str, bool]]] = {}
+            for idx, name in enumerate(names):
+                desc = (docstrings[idx] if idx < len(docstrings) else "") or ""
                 if not desc and "::" in name and not name.startswith("["):
                     desc = get_docstring_for_node_id(root, name)
-                desc_html = esc(desc).replace("\n", "<br>") if desc else ""
-                status_html = '<span class="badge skip">Skipped</span>' if name in skipped_ids else "—"
-                suite_rows.append(
-                    f'<tr class="{tr_class(i - 1)}">'
-                    f'<td>{badge_span}</td><td>{esc(label)}</td><td class="num">{i}</td>'
-                    f'<td class="name"><code>{esc(name)}</code></td>'
-                    f'<td class="status">{status_html}</td><td class="desc">{desc_html}</td></tr>'
+                file_key = get_test_file_for_node_id(name)
+                file_groups.setdefault(file_key, []).append((name, desc, name in skipped_ids))
+
+            for file_name in sorted(file_groups.keys()):
+                suite_rows = []
+                for i, (name, desc, is_skipped) in enumerate(file_groups[file_name], 1):
+                    desc_html = esc(desc).replace("\n", "<br>") if desc else ""
+                    status_html = '<span class="badge skip">Skipped</span>' if is_skipped else "—"
+                    suite_rows.append(
+                        f'<tr class="{tr_class(i - 1)}">'
+                        f'<td>{badge_span}</td><td>{esc(label)}</td><td class="files">{esc(file_name)}</td>'
+                        f'<td class="num">{i}</td>'
+                        f'<td class="name"><code>{esc(name)}</code></td>'
+                        f'<td class="status">{status_html}</td><td class="desc">{desc_html}</td></tr>'
+                    )
+                file_sections.append(
+                    f'<details class="file-details" data-test-file="{esc(file_name.lower())}">'
+                    f"<summary>{esc(file_name)} ({len(file_groups[file_name])} cases)</summary>"
+                    f'<div class="table-wrap"><table><thead>{case_details_thead}</thead>'
+                    f"<tbody>{''.join(suite_rows)}</tbody></table></div></details>"
                 )
-        body = "".join(suite_rows)
+        body = "".join(file_sections)
         if pipeline_name not in pipeline_suites:
             pipeline_suites[pipeline_name] = []
         pipeline_suites[pipeline_name].append((label, count, suite_summary, body))
@@ -381,8 +414,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         pipeline_summary = f"{badge_span} ({pipeline_total} cases)"
         inner_html = "".join(
             f'<details class="suite-details"><summary>{suite_summary}</summary>'
-            f'<div class="table-wrap"><table><thead>{case_details_thead}</thead>'
-            f"<tbody>{body}</tbody></table></div></details>"
+            f'<div class="case-files-inner">{body}</div></details>'
             for _, _, suite_summary, body in suites
         )
         detail_sections_html_parts.append(
@@ -398,8 +430,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         pipeline_summary = f"{esc(pipeline_name)} ({pipeline_total} cases)"
         inner_html = "".join(
             f'<details class="suite-details"><summary>{suite_summary}</summary>'
-            f'<div class="table-wrap"><table><thead>{case_details_thead}</thead>'
-            f"<tbody>{body}</tbody></table></div></details>"
+            f'<div class="case-files-inner">{body}</div></details>'
             for _, _, suite_summary, body in suites
         )
         detail_sections_html_parts.append(
@@ -456,6 +487,36 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       padding-bottom: 0.5rem;
       border-bottom: 1px solid var(--border);
       color: var(--accent);
+    }}
+    .filter-bar {{
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 1rem;
+    }}
+    .filter-bar label {{
+      color: var(--muted);
+      font-size: 0.9rem;
+    }}
+    .filter-input {{
+      min-width: 320px;
+      max-width: 520px;
+      width: 100%;
+      padding: 0.7rem 0.9rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      outline: none;
+    }}
+    .filter-input:focus {{
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.18);
+    }}
+    .filter-hint {{
+      color: var(--muted);
+      font-size: 0.82rem;
     }}
     .table-wrap {{ overflow-x: auto; }}
     table {{
@@ -529,9 +590,46 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       content: "▶ "; font-size: 0.7rem; color: var(--muted); margin-right: 0.35rem;
     }}
     .case-details .suite-details[open] summary::before {{ content: "▼ "; }}
+    .case-details .case-files-inner {{ padding-left: 0.5rem; margin-top: 0.35rem; }}
+    .case-details .file-details {{
+      margin-bottom: 0.35rem;
+      margin-left: 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    .case-details .file-details summary {{
+      padding: 0.55rem 0.8rem;
+      cursor: pointer;
+      user-select: none;
+      background: rgba(255,255,255,0.015);
+    }}
+    .case-details .file-details summary::-webkit-details-marker {{ display: none; }}
+    .case-details .file-details summary::before {{
+      content: "▶ ";
+      font-size: 0.7rem;
+      color: var(--muted);
+      margin-right: 0.35rem;
+    }}
+    .case-details .file-details[open] summary::before {{ content: "▼ "; }}
+    .back-to-top {{
+      position: fixed;
+      right: 24px;
+      bottom: 24px;
+      display: inline-block;
+      padding: 0.7rem 0.9rem;
+      border-radius: 999px;
+      background: rgba(88, 166, 255, 0.18);
+      border: 1px solid var(--border);
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.9rem;
+      backdrop-filter: blur(6px);
+    }}
+    .back-to-top:hover {{ background: rgba(88, 166, 255, 0.28); }}
   </style>
 </head>
-<body>
+<body id="top">
   <div class="container">
     <h1>Buildkite Pytest Case Statistics</h1>
     <p class="meta">Test Suites: {len(all_stats)} · Total cases (sum of steps): {total} · </p>
@@ -566,10 +664,49 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
 
     <section class="case-details">
       <h2>Case Details</h2>
-      <p class="meta">Expand by Pipeline, then by Test Suite.</p>
+      <p class="meta">Expand by Pipeline, then by Test Suite, then by Test File.</p>
+      <div class="filter-bar">
+        <label for="test-file-filter">Filter by Test File</label>
+        <input
+          id="test-file-filter"
+          class="filter-input"
+          type="text"
+          placeholder="Type part of a test file path, e.g. tests/e2e/online_serving"
+        />
+        <span class="filter-hint">Filter applies to the Test File fold sections below.</span>
+      </div>
       {detail_sections_html}
     </section>
   </div>
+  <a href="#top" class="back-to-top" aria-label="Back to top">↑ Top</a>
+  <script>
+    (() => {{
+      const input = document.getElementById("test-file-filter");
+      if (!input) return;
+
+      const applyFilter = () => {{
+        const query = input.value.trim().toLowerCase();
+        document.querySelectorAll(".pipeline-details").forEach((pipeline) => {{
+          let pipelineVisible = false;
+          pipeline.querySelectorAll(".suite-details").forEach((suite) => {{
+            let suiteVisible = false;
+            suite.querySelectorAll(".file-details").forEach((fileDetail) => {{
+              const fileName = (fileDetail.dataset.testFile || fileDetail.textContent || "").toLowerCase();
+              const matched = !query || fileName.includes(query);
+              fileDetail.style.display = matched ? "" : "none";
+              if (matched) suiteVisible = true;
+            }});
+            suite.style.display = suiteVisible ? "" : "none";
+            if (suiteVisible) pipelineVisible = true;
+          }});
+          pipeline.style.display = pipelineVisible ? "" : "none";
+        }});
+      }};
+
+      input.addEventListener("input", applyFilter);
+      applyFilter();
+    }})();
+  </script>
 </body>
 </html>
 """
