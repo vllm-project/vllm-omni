@@ -418,7 +418,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             mm = getattr(ro, "multimodal_output", None) if ro else None
         if not mm:
             return None, None
-        key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
+        key = "audio" if "audio" in mm else None
         return mm, key
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
