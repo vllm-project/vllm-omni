@@ -23,6 +23,29 @@ Or use the startup script:
 bash run_server.sh
 ```
 
+### Start with Parallelism Acceleration
+
+Enable Tensor Parallelism and VAE Patch Parallelism for faster inference:
+
+```bash
+# With Tensor Parallelism (requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --tensor-parallel-size 2
+
+# With Tensor Parallelism and VAE Patch Parallelism (requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --tensor-parallel-size 2 --vae-patch-parallel-size 2 --vae-use-tiling
+
+# With Sequence Parallelism (Ulysses-SP, requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
+
+# With Ring-Attention (requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
+
+# Combined: Ulysses + Ring (requires >= 4 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
+```
+
+For more details on parallelism acceleration, see the [Parallelism Acceleration Guide](../../diffusion/parallelism_acceleration.md).
+
 ## API Calls
 
 ### Method 1: Using curl
