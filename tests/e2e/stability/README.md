@@ -37,20 +37,21 @@
 
 ```bash
 # 监控 + 执行任意命令，结束后自动打包并生成 report.html
-bash tests/e2e/stability/scripts/resource_monitor.sh run -- <你的命令>
+# 不指定 --backend 时默认 gpu；使用其他后端时加上 --backend cpu 或 --backend npu
+bash tests/e2e/stability/scripts/resource_monitor.sh run [--backend gpu|cpu|npu] -- <你的命令>
 ```
 
 示例（仓库根目录）：
 
 ```bash
-# 示例：跑某条 pytest
+# 示例：跑某条 pytest（默认 gpu 后端，可不写 --backend）
 bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py -k test_xxx
 
-# 自定义采样间隔、只监控 GPU 0,1、日志每 30s 打一行
+# 显式指定 gpu 后端、自定义采样间隔与 GPU 0,1、日志每 30s 打一行
 export RESOURCE_MONITOR_INTERVAL=10
 export GPU_MONITOR_DEVICES=0,1
 export RESOURCE_MONITOR_LOG_INTERVAL=30
-bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py
+bash tests/e2e/stability/scripts/resource_monitor.sh run --backend gpu -- pytest -s -v tests/e2e/online_serving/test_foo.py
 ```
 
 运行中可在日志里看每隔若干秒出现的 `[GPU] ...`；结束后日志会打印 bundle 路径，如：`Line chart: open in browser: .../report.html`。
@@ -62,16 +63,16 @@ bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e
 若需要先起监控、再手动执行长时间任务，可分步调用：
 
 ```bash
-# 1. 启动监控（在 scripts 目录下或指定 DATA_ROOT）
+# 1. 启动监控（在 scripts 目录下或指定 DATA_ROOT；不写 --backend 时默认 gpu）
 cd tests/e2e/stability/scripts
-./resource_monitor.sh start all 5 &
+./resource_monitor.sh start [--backend gpu] all 5 &
 MONITOR_PID=$!
 
 # 2. 执行你的长稳/测试命令（任意）
 # ...
 
-# 3. 收尾（必须放在环境清理前，建议放在 finally / after script）
-BUNDLE_LINE=$(./resource_monitor.sh finalize 2>/dev/null | grep '^GPU_MONITOR_BUNDLE_DIR=')
+# 3. 收尾（必须放在环境清理前，建议放在 finally / after script；backend 需与 start 一致）
+BUNDLE_LINE=$(./resource_monitor.sh finalize [--backend gpu] 2>/dev/null | grep '^GPU_MONITOR_BUNDLE_DIR=')
 eval "$BUNDLE_LINE"
 echo "报告目录: $GPU_MONITOR_BUNDLE_DIR"
 ```
