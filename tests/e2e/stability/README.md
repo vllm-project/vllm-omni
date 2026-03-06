@@ -1,90 +1,90 @@
-# 资源监控脚本使用说明（GPU / 预留 CPU·NPU）
+# Resource Monitor Script Guide (GPU / Reserved CPU·NPU)
 
-本目录下的 **`scripts/resource_monitor.sh`** 是资源监控的统一入口：在跑任意命令（如长稳测试、单测等）的同时采集 GPU 显存等指标，结束后打包并生成单文件 HTML 报告。脚本**生成 report.html 与 CSV**；运行结束后在输出目录中打开 `report.html` 即可。
+The **`scripts/resource_monitor.sh`** script in this directory is the unified entry point for resource monitoring: it collects GPU memory and related metrics while running any command (such as long-running stability tests or unit tests), then bundles the results and generates a single-file HTML report when the command finishes. The script generates **`report.html` and CSV** files; open `report.html` in the output directory after the run completes.
 
-当前仅实现 **GPU** 后端；后端由子命令的 `--backend gpu|cpu|npu` 指定（默认 gpu），预留 CPU/NPU 扩展。
+Currently only the **GPU** backend is implemented. The backend is selected with the subcommand option `--backend gpu|cpu|npu` (`gpu` by default), with CPU/NPU reserved for future extension.
 
 ---
 
-## 子命令
+## Subcommands
 
-所有功能通过一个脚本完成，在仓库根目录执行：
+All functionality is provided by a single script and should be run from the repository root:
 
-| 子命令 | 说明 |
+| Subcommand | Description |
 |--------|------|
-| `scripts/resource_monitor.sh start [--backend gpu\|cpu\|npu] [gpu_ids] [interval]` | 后台采集（当前仅 gpu：nvidia-smi 写 CSV） |
-| `scripts/resource_monitor.sh finalize [--backend gpu\|cpu\|npu] [run_id]` | 打包当前 run，生成 report.html，输出 `GPU_MONITOR_BUNDLE_DIR=` / `RESOURCE_MONITOR_BUNDLE_DIR=` |
-| `scripts/resource_monitor.sh run [--backend gpu\|cpu\|npu] -- <command>` | 一步完成：start → 执行你指定的命令 → finalize |
+| `scripts/resource_monitor.sh start [--backend gpu\|cpu\|npu] [gpu_ids] [interval]` | Collect data in the background (currently only `gpu`: `nvidia-smi` writes CSV) |
+| `scripts/resource_monitor.sh finalize [--backend gpu\|cpu\|npu] [run_id]` | Bundle the current run, generate `report.html`, and print `GPU_MONITOR_BUNDLE_DIR=` / `RESOURCE_MONITOR_BUNDLE_DIR=` |
+| `scripts/resource_monitor.sh run [--backend gpu\|cpu\|npu] -- <command>` | Complete everything in one step: `start` -> run your command -> `finalize` |
 
-`--backend` 为可选项，不传时默认使用 **gpu** 后端。
+`--backend` is optional. If omitted, the **gpu** backend is used by default.
 
 ---
 
-## 环境变量（仅监控脚本）
+## Environment Variables (monitoring script only)
 
-| 环境变量 | 说明 | 默认值 |
+| Environment Variable | Description | Default |
 |----------|------|--------|
-| `RESOURCE_MONITOR_DATA_ROOT` | 监控数据根目录 | `tests/e2e/stability/gpu_monitor_data` |
-| `RESOURCE_MONITOR_INTERVAL` | 采样间隔（秒） | 5 |
-| `RESOURCE_MONITOR_LOG_INTERVAL` | 日志打印间隔（秒） | 15 |
-| `GPU_MONITOR_DEVICES` | [GPU 后端] 监控的 GPU 设备 ID，如 `0,1` 或 `all` | all |
+| `RESOURCE_MONITOR_DATA_ROOT` | Root directory for monitoring data | `tests/e2e/stability/gpu_monitor_data` |
+| `RESOURCE_MONITOR_INTERVAL` | Sampling interval (seconds) | 5 |
+| `RESOURCE_MONITOR_LOG_INTERVAL` | Log print interval (seconds) | 15 |
+| `GPU_MONITOR_DEVICES` | [GPU backend] GPU device IDs to monitor, such as `0,1` or `all` | all |
 
 ---
 
-## 推荐用法：`run` 一条龙
+## Recommended Usage: one-step `run`
 
-在 **finally** 或 **after script** 里执行（确保被测命令失败也会收尾）：
+Run this in **finally** or **after script** blocks so cleanup still happens even if the tested command fails:
 
 ```bash
-# 监控 + 执行任意命令，结束后自动打包并生成 report.html
-# 不指定 --backend 时默认 gpu；使用其他后端时加上 --backend cpu 或 --backend npu
-bash tests/e2e/stability/scripts/resource_monitor.sh run [--backend gpu|cpu|npu] -- <你的命令>
+# Monitor + run any command, then automatically bundle results and generate report.html
+# If --backend is omitted, gpu is used by default; use --backend cpu or --backend npu for other backends
+bash tests/e2e/stability/scripts/resource_monitor.sh run [--backend gpu|cpu|npu] -- <your-command>
 ```
 
-示例（仓库根目录）：
+Examples (from the repository root):
 
 ```bash
-# 示例：跑某条 pytest（默认 gpu 后端，可不写 --backend）
+# Example: run a pytest case (gpu backend by default, so --backend can be omitted)
 bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py -k test_xxx
 
-# 显式指定 gpu 后端、自定义采样间隔与 GPU 0,1、日志每 30s 打一行
+# Explicitly select the gpu backend, customize the sampling interval and GPUs 0,1, and print one log line every 30s
 export RESOURCE_MONITOR_INTERVAL=10
 export GPU_MONITOR_DEVICES=0,1
 export RESOURCE_MONITOR_LOG_INTERVAL=30
 bash tests/e2e/stability/scripts/resource_monitor.sh run --backend gpu -- pytest -s -v tests/e2e/online_serving/test_foo.py
 ```
 
-运行中可在日志里看每隔若干秒出现的 `[GPU] ...`；结束后日志会打印 bundle 路径，如：`Line chart: open in browser: .../report.html`。
+During execution, the log will show `[GPU] ...` every few seconds. When the run ends, the log prints the bundle path, for example: `Line chart: open in browser: .../report.html`.
 
 ---
 
-## 分步用法：start → 你的命令 → finalize
+## Step-by-step Usage: `start` -> your command -> `finalize`
 
-若需要先起监控、再手动执行长时间任务，可分步调用：
+If you need to start monitoring first and then manually run a long task, you can call the steps separately:
 
 ```bash
-# 1. 启动监控（在 scripts 目录下或指定 DATA_ROOT；不写 --backend 时默认 gpu）
+# 1. Start monitoring (run from the `scripts` directory or set `DATA_ROOT`; gpu is the default if `--backend` is omitted)
 cd tests/e2e/stability/scripts
 ./resource_monitor.sh start [--backend gpu] all 5 &
 MONITOR_PID=$!
 
-# 2. 执行你的长稳/测试命令（任意）
+# 2. Run your long-running/stability test command (any command)
 # ...
 
-# 3. 收尾（必须放在环境清理前，建议放在 finally / after script；backend 需与 start 一致）
+# 3. Finalize (must run before environment cleanup; putting it in `finally` / `after script` is recommended; the backend must match `start`)
 BUNDLE_LINE=$(./resource_monitor.sh finalize [--backend gpu] 2>/dev/null | grep '^GPU_MONITOR_BUNDLE_DIR=')
 eval "$BUNDLE_LINE"
-echo "报告目录: $GPU_MONITOR_BUNDLE_DIR"
+echo "Report directory: $GPU_MONITOR_BUNDLE_DIR"
 ```
 
 ---
 
-## 目录与产物（仅监控相关）
+## Directories and Outputs (monitoring only)
 
-- **脚本**：`tests/e2e/stability/scripts/resource_monitor.sh`（入口）、`scripts/generate_report.py`（由 finalize 调用，生成 HTML）。
-- **数据目录**：默认 `tests/e2e/stability/gpu_monitor_data/`（可由 `RESOURCE_MONITOR_DATA_ROOT` 覆盖）。  
-  - 每次运行会生成 `run_<run_id>/gpu_metrics.csv`；  
-  - `finalize` 后得到 `gpu_monitor_bundle_<run_id>/`，内含 `gpu_metrics.csv`、`report.html`、`README.txt`。
-- **查看报告**：在 bundle 目录下用浏览器打开 `report.html`，即可查看显存曲线与统计。
+- **Scripts**: `tests/e2e/stability/scripts/resource_monitor.sh` (entry point) and `scripts/generate_report.py` (called by `finalize` to generate HTML).
+- **Data directory**: `tests/e2e/stability/gpu_monitor_data/` by default (can be overridden with `RESOURCE_MONITOR_DATA_ROOT`).  
+  - Each run generates `run_<run_id>/gpu_metrics.csv`.  
+  - After `finalize`, you get `gpu_monitor_bundle_<run_id>/` containing `gpu_metrics.csv`, `report.html`, and `README.txt`.
+- **View the report**: open `report.html` in the bundle directory with a browser to inspect memory usage curves and statistics.
 
-脚本仅生成 `report.html` 与 CSV；若需保留报告，请自行从工作目录归档或下载。
+The script only generates `report.html` and CSV files. If you need to keep the report, archive or download it from the working directory yourself.

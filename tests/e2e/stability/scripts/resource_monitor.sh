@@ -1,31 +1,33 @@
 #!/bin/bash
 #
-# Stability 资源监控脚本（统一入口，后续可扩展 CPU/NPU）
-# 当前仅实现 GPU 监控；--backend 预留 cpu/npu 参数，便于后期补充。
+# Stability resource monitor script (single entry point, extendable to CPU/NPU later)
+# Only GPU monitoring is implemented for now; --backend reserves cpu/npu for future expansion.
 #
-# 子命令: start | finalize | run -- <command>
+# Subcommands: start | finalize | run -- <command>
 #
-# start   - 后台采集（当前仅 gpu：nvidia-smi 写 CSV）
-# finalize - 打包当前 run（CSV + report.html），输出 BUNDLE_DIR
-# run     - 启动监控 → 执行命令 → finalize（仅生成 report.html，不上传）
+# start    - collect data in the background (currently only gpu: `nvidia-smi` writes CSV)
+# finalize - bundle the current run (CSV + report.html) and print BUNDLE_DIR
+# run      - start monitoring -> execute command -> finalize (generate report.html only, no upload)
 #
-# 参数入口（预留多后端）:
-#   --backend, -b   gpu | cpu | npu  默认 gpu，当前仅 gpu 已实现
+# Argument entry point (reserved for multiple backends):
+#   --backend, -b   gpu | cpu | npu  default: gpu; only gpu is implemented right now
 #
-# 环境变量:
-#   RESOURCE_MONITOR_DATA_ROOT     数据根目录（兼容 GPU_MONITOR_DATA_ROOT）
-#   RESOURCE_MONITOR_INTERVAL      采样间隔(秒)（兼容 GPU_MONITOR_INTERVAL）
-#   RESOURCE_MONITOR_LOG_INTERVAL  日志打印间隔(秒)（兼容 GPU_MONITOR_LOG_INTERVAL）
-#   GPU_MONITOR_DEVICES           [GPU 后端] 监控的 GPU 设备 ID，如 0,1 或 all
+# Environment variables:
+#   RESOURCE_MONITOR_DATA_ROOT     data root directory (compatible with GPU_MONITOR_DATA_ROOT)
+#   RESOURCE_MONITOR_INTERVAL      sampling interval in seconds (compatible with GPU_MONITOR_INTERVAL)
+#   RESOURCE_MONITOR_LOG_INTERVAL  log print interval in seconds (compatible with GPU_MONITOR_LOG_INTERVAL)
+#   GPU_MONITOR_DEVICES            [GPU backend] GPU device IDs to monitor, e.g. 0,1 or all
 #
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 数据根目录：放在 stability 目录下（SCRIPT_DIR 的上一级），便于与 stage_configs/tests 同级
+# Data root directory: placed under the stability directory (the parent of SCRIPT_DIR)
+# so it stays alongside stage_configs/tests.
 STABILITY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DATA_ROOT="${RESOURCE_MONITOR_DATA_ROOT:-${GPU_MONITOR_DATA_ROOT:-$STABILITY_DIR/gpu_monitor_data}}"
 SUBCMD="${1:-}"
 
-# 解析可选参数 --backend|-b，结果存入 BACKEND，剩余位置参数存入 REST_ARGS 数组
+# Parse optional --backend|-b arguments, store the result in BACKEND,
+# and keep the remaining positional arguments in the REST_ARGS array.
 parse_backend_and_rest() {
     BACKEND="gpu"
     REST_ARGS=()

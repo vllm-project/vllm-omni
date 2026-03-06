@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-从 moniter.sh 产出的 CSV 生成 GPU 显存监控报告（HTML，含图表与简单异常标记）。
-用于长稳结束后在 CI 中生成可归档的报告，环境清理后仍可查看。
+Generate a GPU memory monitoring report (HTML with charts and simple anomaly markers)
+from the CSV produced by `resource_monitor.sh`.
+
+This is used to generate an archivable report in CI after a long-running stability
+test so that the report remains available even after environment cleanup.
 """
 from __future__ import annotations
 
@@ -18,14 +21,15 @@ logger = init_logger(__name__)
 
 
 def load_csv(csv_path: str) -> list[dict]:
-    """从 GPU 监控 CSV 加载并解析行。
+    """Load and parse rows from a GPU monitoring CSV file.
 
     Args:
-        csv_path: CSV 文件路径。
+        csv_path: Path to the CSV file.
 
     Returns:
-        解析后的行列表，每行为包含 timestamp_epoch、gpu_index、memory_* 等键的 dict。
-        无效行会被跳过并记录日志。
+        A list of parsed row dicts. Each row contains keys such as
+        `timestamp_epoch`, `gpu_index`, and `memory_*`.
+        Invalid rows are skipped and logged.
     """
     rows = []
     with open(csv_path, newline="", encoding="utf-8") as f:
@@ -44,13 +48,14 @@ def load_csv(csv_path: str) -> list[dict]:
 
 
 def compute_stats(rows: list[dict]) -> dict:
-    """按 GPU 计算显存利用率的最小、最大、平均、P50、P95 及采样数。
+    """Compute per-GPU min/max/avg/P50/P95 memory utilization and sample counts.
 
     Args:
-        rows: load_csv 返回的行列表。
+        rows: Rows returned by `load_csv`.
 
     Returns:
-        以 gpu_index 为键的统计 dict，值为 min/max/avg/p50/p95/samples。
+        A stats dict keyed by `gpu_index`, with values containing
+        `min`/`max`/`avg`/`p50`/`p95`/`samples`.
     """
     by_gpu = defaultdict(list)
     for r in rows:
@@ -73,7 +78,7 @@ def compute_stats(rows: list[dict]) -> dict:
 
 
 def find_anomalies(rows: list[dict], high_pct: int = 95, low_pct: int = 5) -> list[dict]:
-    """简单异常：显存利用率超过 high_pct 或低于 low_pct 的采样点。"""
+    """Find simple anomalies where memory utilization exceeds `high_pct` or drops below `low_pct`."""
     anomalies = []
     for r in rows:
         pct = r["memory_util_pct"]
@@ -85,7 +90,7 @@ def find_anomalies(rows: list[dict], high_pct: int = 95, low_pct: int = 5) -> li
 
 
 def build_series_by_gpu(rows: list[dict]) -> tuple[list[float], dict[int, list[float]]]:
-    """按时间顺序去重得到时间戳列表，以及每个 GPU 的利用率序列。"""
+    """Deduplicate timestamps in time order and build a utilization series for each GPU."""
     times = []
     by_ts_gpu = defaultdict(dict)
     for r in rows:
@@ -110,18 +115,18 @@ def render_html(
     anomalies: list[dict],
     out_path: str,
 ) -> None:
-    """生成单文件 HTML 报告（统计表、时序图、异常表），写入 out_path。
+    """Generate a single-file HTML report and write it to `out_path`.
 
     Args:
-        run_id: 运行标识，用于标题。
-        csv_path: 数据来源 CSV 路径（仅用于展示文件名）。
-        rows: 原始数据行。
-        stats: compute_stats 返回的统计。
-        anomalies: find_anomalies 返回的异常列表。
-        out_path: 输出 HTML 路径；父目录不存在时会创建。
+        run_id: Run identifier used in the title.
+        csv_path: Source CSV path, used only for displaying the file name.
+        rows: Raw data rows.
+        stats: Statistics returned by `compute_stats`.
+        anomalies: Anomaly list returned by `find_anomalies`.
+        out_path: Output HTML path; parent directories are created if needed.
     """
     times, gpu_series = build_series_by_gpu(rows)
-    # X 轴时间：例如 02-27 11:38:07（本地时区），便于长稳时阅读
+    # X-axis time, e.g. 02-27 11:38:07 (local timezone), which is easier to read for long stability runs.
     labels_js = [
         f'"{datetime.fromtimestamp(t).strftime("%m-%d %H:%M:%S")}"'
         for t in times
@@ -255,10 +260,10 @@ def render_html(
 
 
 def main() -> int:
-    """入口：从命令行读取 CSV 路径与可选输出路径，生成 report.html。
+    """Entry point: read the CSV path and optional output path from the command line and generate `report.html`.
 
     Returns:
-        0 成功，1 参数或数据错误。
+        0 on success, 1 on invalid arguments or invalid data.
     """
     if len(sys.argv) < 2:
         logger.error("Usage: generate_report.py <gpu_metrics.csv> [output.html]")

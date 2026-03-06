@@ -1,6 +1,8 @@
 """
-Stability 目录专用 conftest：当在此目录下执行 pytest 时，自动在 session 开始时启动资源监控、
-session 结束时结束并打包（finalize），无需再手写 bash resource_monitor.sh run -- pytest ...
+Stability-specific conftest: when pytest is executed under this directory,
+resource monitoring starts automatically at session start and is finalized
+and bundled at session end, so there is no need to wrap pytest with
+`bash resource_monitor.sh run -- pytest ...` manually.
 """
 import subprocess
 import sys
@@ -14,7 +16,7 @@ REPO_ROOT = STABILITY_DIR.parent.parent.parent
 
 
 def _start_resource_monitor():
-    """后台启动 resource_monitor.sh start，返回 Popen 或 None（未启动时）。"""
+    """Start `resource_monitor.sh start` in the background and return `Popen` or `None`."""
     if not RESOURCE_MONITOR_SCRIPT.is_file():
         return None
     try:
@@ -25,7 +27,7 @@ def _start_resource_monitor():
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        # 短暂等待，确认 start 未立即失败
+        # Wait briefly to make sure `start` does not fail immediately.
         try:
             proc.wait(timeout=2)
             if proc.returncode != 0:
@@ -38,7 +40,7 @@ def _start_resource_monitor():
 
 
 def _finalize_resource_monitor():
-    """执行 resource_monitor.sh finalize，打包当前 run 并生成 report。"""
+    """Run `resource_monitor.sh finalize` to bundle the current run and generate the report."""
     if not RESOURCE_MONITOR_SCRIPT.is_file():
         return
     try:
@@ -55,7 +57,7 @@ def _finalize_resource_monitor():
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_sessionstart(session: pytest.Session) -> None:
-    """Session 开始时自动启动资源监控（仅当运行本目录下用例且脚本存在、bash 可用时）。"""
+    """Auto-start resource monitoring at session start when the script and bash are available."""
     proc = _start_resource_monitor()
     if proc is not None:
         session._resource_monitor_process = proc  # type: ignore[attr-defined]
@@ -69,7 +71,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """Session 结束时结束监控进程并执行 finalize，生成 report.html 等。"""
+    """Stop monitoring at session end and run finalize to generate `report.html` and related outputs."""
     proc = getattr(session, "_resource_monitor_process", None)
     if proc is not None and proc.poll() is None:
         proc.terminate()

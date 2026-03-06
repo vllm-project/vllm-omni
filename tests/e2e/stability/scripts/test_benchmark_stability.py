@@ -1,13 +1,19 @@
 """
-长稳用例：先起 OmniServer，再在指定时长内按 request-rate 或 max-concurrency 跑 benchmark，
-超过时长后不再发新请求，断言无失败请求。
+Stability test cases: start OmniServer first, then run benchmark traffic with either
+`request-rate` or `max-concurrency` for a fixed duration. No new requests are sent
+after the duration is reached, and the test asserts that there are no failed requests.
 
-与 perf 逻辑一致：load_configs、modify_stage、create_unique_server_params、create_test_parameter_mapping、
-get_benchmark_params_for_server、create_benchmark_indices、omni_server fixture 与 perf 相同，
-仅 run_benchmark（此处为 run_stability_benchmark 带时长）和测试用例不同。不修改 tests/perf。
+The overall flow matches the perf logic: `load_configs`, `modify_stage`,
+`create_unique_server_params`, `create_test_parameter_mapping`,
+`get_benchmark_params_for_server`, `create_benchmark_indices`, and the
+`omni_server` fixture are aligned with perf. Only the benchmark execution
+(`run_stability_benchmark`, which is duration-based here) and the test cases differ.
+`tests/perf` is not modified.
 
-所有与用例强相关的参数（如 duration_sec、request_rate/max_concurrency、num_prompts_per_batch 等）
-均在 tests/e2e/stability/tests/stability_test.json 中配置，不再通过环境变量覆盖。
+All test-specific parameters, such as `duration_sec`, `request_rate` /
+`max_concurrency`, and `num_prompts_per_batch`, are configured in
+`tests/e2e/stability/tests/stability_test.json` and are no longer overridden
+through environment variables.
 """
 import json
 import os
@@ -208,7 +214,7 @@ def _merge_batch_results(batch_results: list[dict[str, Any]], total_duration_sec
 
 
 def _print_merged_report(result: dict[str, Any]) -> None:
-    """总汇总：仅打印成功请求数、失败请求数、总时间。"""
+    """Print the final summary: successful requests, failed requests, and total duration only."""
     fmt = "{:<40} {:<10}"
     fmt_float = "{:<40} {:<10.2f}"
     completed = result.get("completed", 0)
@@ -234,7 +240,7 @@ def run_stability_benchmark(
     num_prompts_per_batch: int = DEFAULT_NUM_PROMPTS_PER_BATCH,
 ) -> dict[str, Any]:
     if (request_rate is None) == (max_concurrency is None):
-        raise ValueError("必须且仅能指定 request_rate 或 max_concurrency 之一")
+        raise ValueError("Exactly one of request_rate or max_concurrency must be specified")
 
     start_time = time.perf_counter()
     batch_results: list[dict[str, Any]] = []
@@ -316,7 +322,7 @@ def stability_benchmark_params(request, omni_server):
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("stability_benchmark_params", benchmark_indices, indirect=True)
 def test_benchmark_stability(omni_server, stability_benchmark_params):
-    """在指定时长内按 request-rate 或 max-concurrency 跑 benchmark，断言无失败请求。"""
+    """Run the benchmark for a fixed duration using request-rate or max-concurrency and assert zero failed requests."""
     test_name = stability_benchmark_params["test_name"]
     params = stability_benchmark_params["params"]
     duration_sec = params.get("duration_sec", 300)
@@ -341,5 +347,5 @@ def test_benchmark_stability(omni_server, stability_benchmark_params):
         num_prompts_per_batch=num_prompts_per_batch,
     )
 
-    assert result.get("failed", 0) == 0, f"存在失败请求: {result.get('errors', [])}"
-    assert result.get("completed", 0) > 0, "未完成任何请求"
+    assert result.get("failed", 0) == 0, f"Failed requests detected: {result.get('errors', [])}"
+    assert result.get("completed", 0) > 0, "No requests completed"
