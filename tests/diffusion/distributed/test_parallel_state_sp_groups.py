@@ -15,7 +15,7 @@ pytestmark = [
     pytest.mark.diffusion,
     pytest.mark.parallel,
     pytest.mark.core_model,
-    pytest.mark.cpu,
+    pytest.mark.cpu
 ]
 
 
