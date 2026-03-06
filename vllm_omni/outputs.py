@@ -248,7 +248,6 @@ class OmniRequestOutput:
             f"images={images_repr}",
             f"prompt={self.prompt!r}",
             f"latents={self.latents}",
-            f"metrics={self.metrics}",
             f"multimodal_output={self._multimodal_output}",
         ]
 

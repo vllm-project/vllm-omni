@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
     parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        help="Enable vLLM-Omni statistics logging.",
+    )
+    parser.add_argument(
         "--ulysses-degree",
         type=int,
         default=1,
@@ -299,6 +304,7 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
+        "log_stats": args.log_stats,
         **lora_args,
         **quant_kwargs,
     }
