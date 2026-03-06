@@ -13,11 +13,10 @@
 #   --backend, -b   gpu | cpu | npu  默认 gpu，当前仅 gpu 已实现
 #
 # 环境变量:
-#   RESOURCE_MONITOR_BACKEND       默认后端 (gpu|cpu|npu)
 #   RESOURCE_MONITOR_DATA_ROOT     数据根目录（兼容 GPU_MONITOR_DATA_ROOT）
 #   RESOURCE_MONITOR_INTERVAL      采样间隔(秒)（兼容 GPU_MONITOR_INTERVAL）
 #   RESOURCE_MONITOR_LOG_INTERVAL  日志打印间隔(秒)（兼容 GPU_MONITOR_LOG_INTERVAL）
-#   GPU_MONITOR_DEVICES            [仅 GPU 后端] 设备 ID，如 0,1 或 all
+#   GPU_MONITOR_DEVICES           [GPU 后端] 监控的 GPU 设备 ID，如 0,1 或 all
 #
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +27,7 @@ SUBCMD="${1:-}"
 
 # 解析可选参数 --backend|-b，结果存入 BACKEND，剩余位置参数存入 REST_ARGS 数组
 parse_backend_and_rest() {
-    BACKEND="${RESOURCE_MONITOR_BACKEND:-gpu}"
+    BACKEND="gpu"
     REST_ARGS=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -205,7 +204,7 @@ EOF
 # ---------- subcommand: run ----------
 cmd_run() {
     shift
-    local BACKEND="${RESOURCE_MONITOR_BACKEND:-gpu}"
+    local BACKEND="gpu"
     local CMD=()
     while [[ $# -gt 0 ]]; do
         case "$1" in

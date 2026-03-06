@@ -2,7 +2,7 @@
 
 本目录下的 **`scripts/resource_monitor.sh`** 是资源监控的统一入口：在跑任意命令（如长稳测试、单测等）的同时采集 GPU 显存等指标，结束后打包并生成单文件 HTML 报告，便于在 CI 或本地查看。脚本**仅生成 report.html 与 CSV**，不上传 CI artifact；运行结束后在输出目录中打开 `report.html` 即可。
 
-当前仅实现 **GPU** 后端；通过 `--backend gpu|cpu|npu` 预留 CPU/NPU 扩展。
+当前仅实现 **GPU** 后端；后端由子命令的 `--backend gpu|cpu|npu` 指定（默认 gpu），预留 CPU/NPU 扩展。
 
 ---
 
@@ -16,17 +16,18 @@
 | `scripts/resource_monitor.sh finalize [--backend gpu\|cpu\|npu] [run_id]` | 打包当前 run，生成 report.html，输出 `GPU_MONITOR_BUNDLE_DIR=` / `RESOURCE_MONITOR_BUNDLE_DIR=` |
 | `scripts/resource_monitor.sh run [--backend gpu\|cpu\|npu] -- <command>` | 一步完成：start → 执行你指定的命令 → finalize |
 
+`--backend` 为可选项，不传时默认使用 **gpu** 后端。
+
 ---
 
 ## 环境变量（仅监控脚本）
 
 | 环境变量 | 说明 | 默认值 |
 |----------|------|--------|
-| `RESOURCE_MONITOR_BACKEND` | 后端：gpu\|cpu\|npu（当前仅 gpu 实现） | gpu |
-| `RESOURCE_MONITOR_DATA_ROOT` / `GPU_MONITOR_DATA_ROOT` | 监控数据根目录 | `tests/e2e/stability/gpu_monitor_data` |
-| `RESOURCE_MONITOR_INTERVAL` / `GPU_MONITOR_INTERVAL` | 采样间隔（秒） | 5 |
-| `RESOURCE_MONITOR_LOG_INTERVAL` / `GPU_MONITOR_LOG_INTERVAL` | 日志中 `[GPU]` 行打印间隔（秒） | 15 |
-| `GPU_MONITOR_DEVICES` | 监控的 GPU ID，如 `0,1` 或 `all` | all |
+| `RESOURCE_MONITOR_DATA_ROOT` | 监控数据根目录 | `tests/e2e/stability/gpu_monitor_data` |
+| `RESOURCE_MONITOR_INTERVAL` | 采样间隔（秒） | 5 |
+| `RESOURCE_MONITOR_LOG_INTERVAL` | 日志打印间隔（秒） | 15 |
+| `GPU_MONITOR_DEVICES` | [GPU 后端] 监控的 GPU 设备 ID，如 `0,1` 或 `all` | all |
 
 ---
 
@@ -46,9 +47,9 @@ bash tests/e2e/stability/scripts/resource_monitor.sh run -- <你的命令>
 bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py -k test_xxx
 
 # 自定义采样间隔、只监控 GPU 0,1、日志每 30s 打一行
-export GPU_MONITOR_INTERVAL=10
+export RESOURCE_MONITOR_INTERVAL=10
 export GPU_MONITOR_DEVICES=0,1
-export GPU_MONITOR_LOG_INTERVAL=30
+export RESOURCE_MONITOR_LOG_INTERVAL=30
 bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py
 ```
 
