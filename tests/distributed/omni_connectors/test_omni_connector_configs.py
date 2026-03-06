@@ -8,6 +8,8 @@ import pytest
 # Use the new import path for initialization utilities
 from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def get_config_files():
     """Helper to find config files."""

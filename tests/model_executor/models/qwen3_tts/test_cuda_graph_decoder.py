@@ -20,7 +20,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+]
 
 DEVICE = torch.device("cuda:0")
 NUM_QUANTIZERS = 8

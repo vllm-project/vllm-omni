@@ -11,7 +11,7 @@ import torch.nn as nn
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
+pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu, pytest.mark.core_model]
 
 
 class TestHSDPInferenceConfig:

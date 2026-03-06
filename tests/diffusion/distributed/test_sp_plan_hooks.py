@@ -47,6 +47,8 @@ requires_distributed = pytest.mark.skipif(
 pytestmark = [
     pytest.mark.diffusion,
     pytest.mark.parallel,
+    pytest.mark.core_model,
+    pytest.mark.cpu,
 ]
 
 # =============================================================================
