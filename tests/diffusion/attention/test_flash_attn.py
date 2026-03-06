@@ -19,8 +19,6 @@ from vllm_omni.platforms import current_omni_platform
 
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
     """
