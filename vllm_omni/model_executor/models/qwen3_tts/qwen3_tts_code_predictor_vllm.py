@@ -376,16 +376,17 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     def _maybe_init_kv_cache(self, device: torch.device) -> None:
         if self._kv_cache is not None:
             return
-        max_seq_len = int(getattr(self.config, "num_code_groups", 16) or 16)
-        # Upper bound on batch size: vLLM scheduler max_num_seqs (fallback 8).
-        max_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 8) or 8)
-        max_batch = max(1, max_batch)
-        self._kv_cache = _LocalPredictorKVCache(
-            vllm_config=self._vllm_config,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch,
-            device=device,
-        )
+        with set_current_vllm_config(self._vllm_config):
+            max_seq_len = int(getattr(self.config, "num_code_groups", 16) or 16)
+            # Upper bound on batch size: vLLM scheduler max_num_seqs (fallback 8).
+            max_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 8) or 8)
+            max_batch = max(1, max_batch)
+            self._kv_cache = _LocalPredictorKVCache(
+                vllm_config=self._vllm_config,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch,
+                device=device,
+            )
 
     @torch.inference_mode()
     def reset_cache(self) -> None:
@@ -402,7 +403,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         bsz = int(inputs_embeds.shape[0])
         qlen = 2
         # Flatten to token-major.
-        hs = inputs_embeds.to(dtype=torch.bfloat16).reshape(bsz * qlen, -1)
+        model_dtype = next(self.model.parameters()).dtype
+        hs = inputs_embeds.to(dtype=model_dtype).reshape(bsz * qlen, -1)
         hs = self.small_to_mtp_projection(hs)
 
         query_lens = torch.full((bsz,), qlen, dtype=torch.int32)
@@ -503,11 +505,15 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         for step in range(1, num_groups):
             # Sample or argmax from logits.
             if do_sample and temperature > 0:
-                scaled = logits / temperature
+                scaled = logits.float() / temperature
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(top_k, dim=-1)
                     scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                 probs = torch.softmax(scaled, dim=-1)
+                # Guard against NaN/Inf from lower-precision dtypes.
+                probs = probs.clamp(min=0.0)
+                row_sums = probs.sum(dim=-1, keepdim=True)
+                probs = torch.where(row_sums > 0, probs / row_sums, torch.ones_like(probs) / probs.shape[-1])
                 next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
             else:
                 next_ids = logits.argmax(dim=-1, keepdim=True)  # [B, 1]

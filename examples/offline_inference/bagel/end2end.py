@@ -49,7 +49,14 @@ def parse_args():
     parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
     parser.add_argument("--cfg-img-scale", type=float, default=1.5, help="Image CFG scale (default: 1.5)")
     parser.add_argument(
-        "--negative-prompt", type=str, default=None, help="Negative prompt (not yet supported, reserved for future)"
+        "--negative-prompt", type=str, default=None, help="Negative prompt for CFG (default: empty prompt)"
+    )
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
     )
 
     args = parser.parse_args()
@@ -82,12 +89,14 @@ def main():
     from PIL import Image
 
     if args.modality == "img2img":
-        from PIL import Image
-
         from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 
-        print("[Info] Running in img2img mode (Stage 1 only)")
-        client = OmniDiffusion(model=model_name)
+        print(f"[Info] Running in {args.modality} mode (Stage 1 only, cfg_parallel_size={args.cfg_parallel_size})")
+
+        client = OmniDiffusion(
+            model=model_name,
+            parallel_config={"cfg_parallel_size": args.cfg_parallel_size},
+        )
 
         if args.image_path:
             if os.path.exists(args.image_path):
@@ -162,6 +171,8 @@ def main():
                 # text2img
                 final_prompt_text = f"<|im_start|>{p}<|im_end|>"
                 prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
+                if args.negative_prompt is not None:
+                    prompt_dict["negative_prompt"] = args.negative_prompt
                 formatted_prompts.append(prompt_dict)
 
         params_list = omni.default_sampling_params_list
@@ -170,10 +181,13 @@ def main():
             if len(params_list) > 1:
                 diffusion_params = params_list[1]
                 diffusion_params.num_inference_steps = args.steps  # type: ignore
-                diffusion_params.extra_args = {  # type: ignore
+                extra = {
                     "cfg_text_scale": args.cfg_text_scale,
                     "cfg_img_scale": args.cfg_img_scale,
                 }
+                if args.negative_prompt is not None:
+                    extra["negative_prompt"] = args.negative_prompt
+                diffusion_params.extra_args = extra  # type: ignore
 
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 

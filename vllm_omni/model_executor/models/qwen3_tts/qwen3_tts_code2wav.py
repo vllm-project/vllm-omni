@@ -33,6 +33,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
+        self.enable_update_additional_information = True
         # Generation-only stage (no logits / sampling).
         self.requires_raw_input_tokens = True
 
@@ -72,7 +73,7 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         tok = Qwen3TTSTokenizer.from_pretrained(
             speech_tokenizer_dir,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
             load_feature_extractor=False,
         )
 
@@ -146,6 +147,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         positions: torch.Tensor | None = None,
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         """Decode codec codes into audio waveform.
@@ -177,18 +179,28 @@ class Qwen3TTSCode2Wav(nn.Module):
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
-        # Parse each request: extract ctx_frames, validate, reshape codes.
-        # input_ids layout per request: [codec_context_frames, *flat_codes]
+        # Parse each request: extract left_context_size, validate, reshape codes.
+        # input_ids layout per request: [*flat_codes]
         # where flat_codes is codebook-major [q*F].
-        parsed = []  # (ctx_frames, actual_frames)
+        parsed = []  # (left_context_size, actual_frames)
         valid_codes = []
         valid_indices = []
+        # Get left_context_size from runtime_additional_information (passed via kwargs)
+        left_context_size = [0] * len(request_ids_list)
+        if runtime_additional_information is not None:
+            for i, info in enumerate(runtime_additional_information):
+                if i >= len(left_context_size):
+                    break
+                if "left_context_size" in info:
+                    left_context_size[i] = info["left_context_size"]
+        else:
+            logger.debug("No additional_information provided to code2wav stage.")
         for i, req_ids in enumerate(request_ids_list):
-            if req_ids.numel() < 2:
+            if req_ids.numel() < 1:
                 parsed.append((0, 0))
                 continue
-            ctx_frames = int(req_ids[0].item())
-            flat = req_ids[1:]
+            ctx_frames = left_context_size[i]
+            flat = req_ids
             n = flat.numel()
             # Warmup / dummy_run: not divisible by num_quantizers.
             if n == 0 or n % q != 0:

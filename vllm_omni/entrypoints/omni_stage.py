@@ -47,6 +47,7 @@ from vllm_omni.entrypoints.stage_utils import (
     _resolve_model_tokenizer_paths,
     _to_dict,
     is_profiler_task,
+    load_func_from_config,
     maybe_dump_to_shm,
     set_stage_devices,
 )
@@ -284,6 +285,7 @@ class OmniStage:
         else:
             self.custom_process_input_func = None
 
+        self.prompt_expand_func = load_func_from_config(getattr(stage_config, "prompt_expand_func", None))
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
         self.tts_args = _to_dict(getattr(stage_config, "tts_args", {}))
@@ -464,6 +466,7 @@ class OmniStage:
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
             "engine_input_source": self.engine_input_source,
+            "cfg_kv_collect_func": getattr(self.stage_config, "cfg_kv_collect_func", None),
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
         }
@@ -616,7 +619,11 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
+        self,
+        stage_list: list[Any],
+        prompt: OmniTokensPrompt | TextPrompt = None,
+        *,
+        source_outputs_override: Any = None,
     ) -> list[OmniTokensPrompt | TextPrompt]:
         """Process engine inputs for this stage from upstream stage outputs.
 
@@ -627,6 +634,8 @@ class OmniStage:
         Args:
             stage_list: List of all stages in the pipeline
             prompt: Optional original prompt (for multimodal data preservation)
+            source_outputs_override: Use these outputs instead of reading from
+                the source stage's ``engine_outputs`` (for deferred CFG requests).
 
         Returns:
             List of processed engine inputs ready for this stage
@@ -639,7 +648,11 @@ class OmniStage:
             if len(self.engine_input_source) == 0:
                 raise ValueError("engine_input_source is empty")
             source_stage_id = self.engine_input_source[0]
-            source_outputs = stage_list[source_stage_id].engine_outputs
+            source_outputs = (
+                source_outputs_override
+                if source_outputs_override is not None
+                else stage_list[source_stage_id].engine_outputs
+            )
             if not isinstance(prompt, list):
                 prompt = [prompt]
             multi_modal_data = {
@@ -661,6 +674,18 @@ class OmniStage:
 
         else:
             engine_input_source = self.engine_input_source
+            if source_outputs_override is not None and engine_input_source:
+                # Temporarily swap engine_outputs so custom_process_input_func
+                # (which reads stage_list directly) sees the correct data.
+                _source_id = engine_input_source[0]
+                _orig_outputs = stage_list[_source_id].engine_outputs
+                stage_list[_source_id].engine_outputs = source_outputs_override
+                try:
+                    return self.custom_process_input_func(
+                        stage_list, engine_input_source, prompt, self.requires_multimodal_data
+                    )
+                finally:
+                    stage_list[_source_id].engine_outputs = _orig_outputs
             return self.custom_process_input_func(
                 stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )
@@ -705,6 +730,8 @@ def _stage_worker(
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
+
+    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
@@ -765,6 +792,7 @@ def _stage_worker(
                 model=model,
                 stage_id=stage_id,
                 engine_input_source=stage_payload.get("engine_input_source", []),
+                cfg_kv_collect_func=cfg_kv_collect_func,
                 **engine_args,
             )
         else:
@@ -1113,6 +1141,7 @@ async def _stage_worker_async(
     final_output = stage_payload.get("final_output", False)
     final_output_type = stage_payload.get("final_output_type", None)
 
+    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
     # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
     model = _resolve_model_tokenizer_paths(model, engine_args)
 
@@ -1191,10 +1220,13 @@ async def _stage_worker_async(
             od_config["omni_kv_config"]["engine_input_source"] = stage_payload.get("engine_input_source", [])
 
             logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
+            _diffusion_kwargs = {k: v for k, v in engine_args.items() if k not in {"od_config", "model"}}
+            if cfg_kv_collect_func is not None:
+                _diffusion_kwargs["cfg_kv_collect_func"] = cfg_kv_collect_func
             stage_engine = AsyncOmniDiffusion(
                 model=model,
                 od_config=od_config,
-                **{k: v for k, v in engine_args.items() if k not in {"od_config", "model"}},
+                **_diffusion_kwargs,
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
         else:

@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=720, help="Video height.")
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
     parser.add_argument("--num-frames", type=int, default=81, help="Number of frames (Wan default is 81).")
+    parser.add_argument(
+        "--frame-rate",
+        type=float,
+        default=None,
+        help="Optional generation frame rate (used by models like LTX2). Defaults to --fps.",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=40, help="Sampling steps.")
     parser.add_argument(
         "--boundary-ratio",
@@ -109,12 +115,25 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=24000,
+        help="Sample rate for audio output when saved (default: 24000 for LTX2).",
+    )
+    parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    frame_rate = args.frame_rate if args.frame_rate is not None else float(args.fps)
 
     # Wan2.2 cache-dit tuning (from cache-dit examples and cache_alignment).
     cache_config = None
@@ -134,13 +153,13 @@ def main():
             "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
-    # Configure parallel settings (only SP is supported for Wan)
-    # Note: cfg_parallel and tensor_parallel are not implemented for Wan models
+    # Configure parallel settings
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
     )
 
     # Check if profiling is requested via environment variable
@@ -153,12 +172,12 @@ def main():
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
-        cache_backend=args.cache_backend,
-        cache_config=cache_config,
         enable_cache_dit_summary=args.enable_cache_dit_summary,
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
     )
 
     if profiler_enabled:
@@ -172,7 +191,9 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
     print(
-        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}"
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
+        f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
+        f" vae_patch_parallel_size={args.vae_patch_parallel_size}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
@@ -191,6 +212,7 @@ def main():
             guidance_scale_2=args.guidance_scale_high,
             num_inference_steps=args.num_inference_steps,
             num_frames=args.num_frames,
+            frame_rate=frame_rate,
         ),
     )
     generation_end = time.perf_counter()
@@ -199,30 +221,55 @@ def main():
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
-    # Extract video frames from OmniRequestOutput
-    if isinstance(frames, list) and len(frames) > 0:
-        first_item = frames[0]
+    audio = None
+    if isinstance(frames, list):
+        frames = frames[0] if frames else None
 
-        # Check if it's an OmniRequestOutput
-        if hasattr(first_item, "final_output_type"):
-            if first_item.final_output_type != "image":
-                raise ValueError(
-                    f"Unexpected output type '{first_item.final_output_type}', expected 'image' for video generation."
-                )
-
-            # Pipeline mode: extract from nested request_output
-            if hasattr(first_item, "is_pipeline_output") and first_item.is_pipeline_output:
-                if isinstance(first_item.request_output, list) and len(first_item.request_output) > 0:
-                    inner_output = first_item.request_output[0]
-                    if isinstance(inner_output, OmniRequestOutput) and hasattr(inner_output, "images"):
-                        frames = inner_output.images[0] if inner_output.images else None
-                        if frames is None:
-                            raise ValueError("No video frames found in output.")
-            # Diffusion mode: use direct images field
-            elif hasattr(first_item, "images") and first_item.images:
-                frames = first_item.images
+    if isinstance(frames, OmniRequestOutput):
+        if frames.final_output_type != "image":
+            raise ValueError(
+                f"Unexpected output type '{frames.final_output_type}', expected 'image' for video generation."
+            )
+        if frames.multimodal_output and "audio" in frames.multimodal_output:
+            audio = frames.multimodal_output["audio"]
+        if frames.is_pipeline_output and frames.request_output is not None:
+            inner_output = frames.request_output
+            if isinstance(inner_output, list):
+                inner_output = inner_output[0] if inner_output else None
+            if isinstance(inner_output, OmniRequestOutput):
+                if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
+                    audio = inner_output.multimodal_output["audio"]
+                frames = inner_output
+        if isinstance(frames, OmniRequestOutput):
+            if frames.images:
+                if len(frames.images) == 1 and isinstance(frames.images[0], tuple) and len(frames.images[0]) == 2:
+                    frames, audio = frames.images[0]
+                elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
+                    audio = frames.images[0].get("audio")
+                    frames = frames.images[0].get("frames") or frames.images[0].get("video")
+                else:
+                    frames = frames.images
             else:
                 raise ValueError("No video frames found in OmniRequestOutput.")
+
+    if isinstance(frames, list) and frames:
+        first_item = frames[0]
+        if isinstance(first_item, tuple) and len(first_item) == 2:
+            frames, audio = first_item
+        elif isinstance(first_item, dict):
+            audio = first_item.get("audio")
+            frames = first_item.get("frames") or first_item.get("video")
+        elif isinstance(first_item, list):
+            frames = first_item
+
+    if isinstance(frames, tuple) and len(frames) == 2:
+        frames, audio = frames
+    elif isinstance(frames, dict):
+        audio = frames.get("audio")
+        frames = frames.get("frames") or frames.get("video")
+
+    if frames is None:
+        raise ValueError("No video frames found in output.")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,32 +278,127 @@ def main():
     except ImportError:
         raise ImportError("diffusers is required for export_to_video.")
 
-    # frames may be np.ndarray (preferred) or torch.Tensor
+    def _normalize_frame(frame):
+        if isinstance(frame, torch.Tensor):
+            frame_tensor = frame.detach().cpu()
+            if frame_tensor.dim() == 4 and frame_tensor.shape[0] == 1:
+                frame_tensor = frame_tensor[0]
+            if frame_tensor.dim() == 3 and frame_tensor.shape[0] in (3, 4):
+                frame_tensor = frame_tensor.permute(1, 2, 0)
+            if frame_tensor.is_floating_point():
+                frame_tensor = frame_tensor.clamp(-1, 1) * 0.5 + 0.5
+            return frame_tensor.float().numpy()
+        if isinstance(frame, np.ndarray):
+            frame_array = frame
+            if frame_array.ndim == 4 and frame_array.shape[0] == 1:
+                frame_array = frame_array[0]
+            if np.issubdtype(frame_array.dtype, np.integer):
+                frame_array = frame_array.astype(np.float32) / 255.0
+            return frame_array
+        try:
+            from PIL import Image
+        except ImportError:
+            Image = None
+        if Image is not None and isinstance(frame, Image.Image):
+            return np.asarray(frame).astype(np.float32) / 255.0
+        return frame
+
+    def _ensure_frame_list(video_array):
+        if isinstance(video_array, list):
+            if len(video_array) == 0:
+                return video_array
+            first_item = video_array[0]
+            if isinstance(first_item, np.ndarray):
+                if first_item.ndim == 5:
+                    return list(first_item[0])
+                if first_item.ndim == 4:
+                    if len(video_array) == 1:
+                        return list(first_item)
+                    return list(first_item)
+                if first_item.ndim == 3:
+                    return video_array
+            return video_array
+        if isinstance(video_array, np.ndarray):
+            if video_array.ndim == 5:
+                return list(video_array[0])
+            if video_array.ndim == 4:
+                return list(video_array)
+            if video_array.ndim == 3:
+                return [video_array]
+        return video_array
+
+    # frames may be np.ndarray, torch.Tensor, or list of tensors/arrays/images
     # export_to_video expects a list of frames with values in [0, 1]
     if isinstance(frames, torch.Tensor):
         video_tensor = frames.detach().cpu()
         if video_tensor.dim() == 5:
-            # [B, C, F, H, W] or [B, F, H, W, C]
             if video_tensor.shape[1] in (3, 4):
                 video_tensor = video_tensor[0].permute(1, 2, 3, 0)
             else:
                 video_tensor = video_tensor[0]
         elif video_tensor.dim() == 4 and video_tensor.shape[0] in (3, 4):
             video_tensor = video_tensor.permute(1, 2, 3, 0)
-        # If float, assume [-1,1] and normalize to [0,1]
         if video_tensor.is_floating_point():
             video_tensor = video_tensor.clamp(-1, 1) * 0.5 + 0.5
         video_array = video_tensor.float().numpy()
+    elif isinstance(frames, np.ndarray):
+        video_array = frames
+        if video_array.ndim == 5:
+            video_array = video_array[0]
+        if np.issubdtype(video_array.dtype, np.integer):
+            video_array = video_array.astype(np.float32) / 255.0
+    elif isinstance(frames, list):
+        if len(frames) == 0:
+            raise ValueError("No video frames found in output.")
+        video_array = [_normalize_frame(frame) for frame in frames]
     else:
         video_array = frames
-        if hasattr(video_array, "shape") and video_array.ndim == 5:
-            video_array = video_array[0]
 
-    # Convert 4D array (frames, H, W, C) to list of frames for export_to_video
-    if isinstance(video_array, np.ndarray) and video_array.ndim == 4:
-        video_array = list(video_array)
+    video_array = _ensure_frame_list(video_array)
 
-    export_to_video(video_array, str(output_path), fps=args.fps)
+    use_ltx2_export = False
+    if args.model and "ltx" in str(args.model).lower():
+        use_ltx2_export = True
+    if audio is not None:
+        use_ltx2_export = True
+
+    if use_ltx2_export:
+        try:
+            from diffusers.pipelines.ltx2.export_utils import encode_video
+        except ImportError:
+            raise ImportError("diffusers is required for LTX2 encode_video.")
+
+        if isinstance(video_array, list):
+            frames_np = np.stack(video_array, axis=0)
+        elif isinstance(video_array, np.ndarray):
+            frames_np = video_array
+        else:
+            frames_np = np.asarray(video_array)
+
+        frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
+        video_tensor = torch.from_numpy(frames_u8)
+
+        audio_out = None
+        if audio is not None:
+            if isinstance(audio, list):
+                audio = audio[0] if audio else None
+            if isinstance(audio, np.ndarray):
+                audio = torch.from_numpy(audio)
+            if isinstance(audio, torch.Tensor):
+                audio_out = audio
+                if audio_out.dim() > 1:
+                    audio_out = audio_out[0]
+                audio_out = audio_out.float().cpu()
+
+        encode_video(
+            video_tensor,
+            fps=args.fps,
+            audio=audio_out,
+            audio_sample_rate=args.audio_sample_rate if audio_out is not None else None,
+            output_path=str(output_path),
+        )
+    else:
+        export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
 
     if profiler_enabled:

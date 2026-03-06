@@ -77,7 +77,9 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
-        assert self.cfg_parallel_size in [1, 2], f"CFG parallel size must be 1 or 2, but got {self.cfg_parallel_size}"
+        assert self.cfg_parallel_size in [1, 2, 3], (
+            f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
+        )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
@@ -379,6 +381,10 @@ class OmniDiffusionConfig:
     # Compilation
     enforce_eager: bool = False
 
+    # Parallel weight loading (for faster diffusion model startup)
+    enable_multithread_weight_load: bool = True
+    num_weight_load_threads: int = 4
+
     # Enable sleep mode
     enable_sleep_mode: bool = False
 
@@ -441,6 +447,9 @@ class OmniDiffusionConfig:
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
+
+    # Model-specific function for collecting CFG KV caches (set at runtime)
+    cfg_kv_collect_func: Any | None = None
 
     # Quantization settings
     # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)

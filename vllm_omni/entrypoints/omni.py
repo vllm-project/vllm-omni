@@ -13,6 +13,7 @@ from typing import Any, Literal, overload
 
 import huggingface_hub
 import msgspec.msgpack
+import torch
 import zmq
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
@@ -34,6 +35,7 @@ from vllm_omni.distributed.ray_utils.utils import (
     get_ray_queue_class,
     try_close_ray,
 )
+from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -216,8 +218,11 @@ class OmniBase:
         # We temporally create a default config for diffusion stage.
         # In the future, we should merge the default config with the user-provided config.
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
-        if "dtype" in kwargs:
-            kwargs["dtype"] = str(kwargs["dtype"])
+        if "dtype" in kwargs and not isinstance(kwargs["dtype"], str):
+            if not isinstance(kwargs["dtype"], torch.dtype):
+                raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(kwargs['dtype']).__name__}")
+            kwargs["dtype"] = str(kwargs["dtype"]).removeprefix("torch.")
+
         cache_backend = kwargs.get("cache_backend", "none")
         cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
         # TODO: hack, calculate devices based on parallel config.
@@ -935,6 +940,13 @@ class Omni(OmniBase):
         _req_start_ts: dict[str, float] = {}
         _wall_start_ts: float = time.time()
 
+        # CFG companion tracking (prompt expansion + lifecycle management)
+        cfg = CfgCompanionTracker(
+            prompt_expand_func=getattr(self.stage_list[0], "prompt_expand_func", None),
+            stage0_sampling_params=sampling_params_list[0],
+        )
+        expanded_companions = cfg.expand_prompts(request_id_to_prompt)
+
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
         final_stage_id_to_prompt: dict[str, int] = {}
         for rid, prompt in request_id_to_prompt.items():
@@ -976,6 +988,18 @@ class Omni(OmniBase):
             _req_start_ts[req_id] = time.time()
             logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
 
+        # Submit CFG companion requests to stage-0
+        if cfg.is_active:
+            for companion_id, companion_prompt in expanded_companions:
+                task = {
+                    "request_id": companion_id,
+                    "engine_inputs": companion_prompt,
+                    "sampling_params": cfg.stage0_sampling_params,
+                }
+                self.stage_list[0].submit(task)
+                _req_start_ts[companion_id] = time.time()
+                logger.debug(f"[{self._name}] Enqueued CFG companion {companion_id} to stage-0")
+
         pbar = None
         if use_tqdm:
             tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
@@ -987,7 +1011,7 @@ class Omni(OmniBase):
             )
         # For each stage, forward results to next stage; collect finals at the end
         # We pipeline by continually polling output queues in stage order
-        remaining_by_stage: list[int] = [len(request_prompts)] + [0] * (num_stages - 1)
+        remaining_by_stage: list[int] = [len(request_prompts) + cfg.num_companions] + [0] * (num_stages - 1)
         completed_requests = 0
         total_requests = len(request_prompts)
 
@@ -1007,12 +1031,44 @@ class Omni(OmniBase):
                     logger.error(
                         f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                     )
+                    if cfg.is_companion(req_id) and stage_id == 0:
+                        parent_id, parent_aborted = cfg.on_companion_error(req_id)
+                        if parent_aborted:
+                            completed_requests += 1
+                            logger.error(
+                                f"[{self._name}] Parent {parent_id} aborted due to "
+                                f"companion failure ({completed_requests}/{total_requests})",
+                            )
                     continue
 
                 if result.get("type") == "stage_ready":
                     # Only happens when stage is initialized slower than expected,
                     # so we wait for a short time and try again
                     time.sleep(0.05)
+                    continue
+
+                # CFG: companion requests only run through Stage-0
+                if cfg.is_companion(req_id) and stage_id == 0:
+                    ready_parent = cfg.on_companion_completed(req_id)
+                    if ready_parent is not None:
+                        success = cfg.forward_parent_with_cfg(
+                            ready_parent,
+                            cfg.pop_pending_parent(ready_parent),
+                            self.stage_list,
+                            self.connectors,
+                            sampling_params_list,
+                            request_id_to_prompt,
+                            final_stage_id_to_prompt,
+                            metrics,
+                            remaining_by_stage,
+                        )
+                        if not success:
+                            cfg.consume_parent_failure(ready_parent)
+                            completed_requests += 1
+                            logger.error(
+                                f"[{self._name}] Parent {ready_parent} dropped due to CFG forwarding failure "
+                                f"({completed_requests}/{total_requests})",
+                            )
                     continue
 
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
@@ -1104,6 +1160,40 @@ class Omni(OmniBase):
 
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
+                    # CFG: if this parent has companions, defer forwarding
+                    if cfg.has_companions(req_id) and stage_id == 0:
+                        if cfg.is_parent_failed(req_id):
+                            cfg.consume_parent_failure(req_id)
+                            completed_requests += 1
+                            logger.error(
+                                f"[{self._name}] Parent {req_id} skipped CFG forwarding due to "
+                                f"companion failure ({completed_requests}/{total_requests})",
+                            )
+                            continue
+
+                        if cfg.all_companions_done(req_id):
+                            success = cfg.forward_parent_with_cfg(
+                                req_id,
+                                {"engine_outputs": engine_outputs, "stage_id": stage_id},
+                                self.stage_list,
+                                self.connectors,
+                                sampling_params_list,
+                                request_id_to_prompt,
+                                final_stage_id_to_prompt,
+                                metrics,
+                                remaining_by_stage,
+                            )
+                            if not success:
+                                cfg.consume_parent_failure(req_id)
+                                completed_requests += 1
+                                logger.error(
+                                    f"[{self._name}] Parent {req_id} dropped due to CFG forwarding failure "
+                                    f"({completed_requests}/{total_requests})",
+                                )
+                        else:
+                            cfg.defer_parent(req_id, engine_outputs, stage_id)
+                        continue
+
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     try:
                         # Derive inputs for the next stage, record preprocess time
@@ -1112,9 +1202,10 @@ class Omni(OmniBase):
                                 self.stage_list, [request_id_to_prompt[req_id]]
                             )
                     except Exception as e:
+                        completed_requests += 1
                         logger.exception(
                             f"[{self._name}] Process engine inputs error for req {req_id}"
-                            f" at stage {next_stage_id}: {e}",
+                            f" at stage {next_stage_id}: {e} ({completed_requests}/{total_requests})",
                         )
                         continue
                     sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
@@ -1141,6 +1232,7 @@ class Omni(OmniBase):
                             f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
                             "Configure a connector for this edge or inspect connector logs for details."
                         )
+
                     logger.debug(
                         f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
                     )
@@ -1154,6 +1246,12 @@ class Omni(OmniBase):
                     logger.debug(
                         f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
                     )
+            for timed_out_id in cfg.check_timeouts():
+                completed_requests += 1
+                logger.error(
+                    f"[{self._name}] Parent {timed_out_id} timed out; counting as failed "
+                    f"({completed_requests}/{total_requests})",
+                )
 
             if not made_progress:
                 time.sleep(0.005)

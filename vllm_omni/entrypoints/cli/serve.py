@@ -114,6 +114,14 @@ class OmniServeCommand(CLISubcommand):
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
         omni_config_group.add_argument(
+            "--task-type",
+            type=str,
+            default=None,
+            choices=["CustomVoice", "VoiceDesign", "Base"],
+            help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
+            "If not specified, will be inferred from model path.",
+        )
+        omni_config_group.add_argument(
             "--stage-configs-path",
             type=str,
             default=None,
@@ -194,6 +202,13 @@ class OmniServeCommand(CLISubcommand):
             help="Number of GPUs to use for diffusion model inference.",
         )
         omni_config_group.add_argument(
+            "--model-class-name",
+            dest="model_class_name",
+            type=str,
+            default=None,
+            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",
@@ -270,6 +285,21 @@ class OmniServeCommand(CLISubcommand):
             "--vae-use-tiling",
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
+        )
+
+        # Parallel weight loading (faster diffusion startup)
+        omni_config_group.add_argument(
+            "--disable-multithread-weight-load",
+            action="store_false",
+            dest="enable_multithread_weight_load",
+            default=True,
+            help="Disable multi-threaded safetensors loading (default: enabled with 4 threads).",
+        )
+        omni_config_group.add_argument(
+            "--num-weight-load-threads",
+            type=int,
+            default=4,
+            help="Number of threads for parallel weight loading (default: 4).",
         )
 
         # diffusion model offload parameters

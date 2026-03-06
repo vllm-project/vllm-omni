@@ -62,6 +62,7 @@ The available `ignored_layers` names depend on the model architecture (e.g., `to
 |-------|-----------|---------------|------------------|
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | All layers | None |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Skip sensitive layers | `img_mlp` |
+| Flux | `black-forest-labs/FLUX.1-dev` | All layers | None |
 
 ## Combining with Other Features
 

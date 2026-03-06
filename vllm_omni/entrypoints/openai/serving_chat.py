@@ -13,7 +13,6 @@ import torch
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
-from vllm.renderers.protocol import BaseRenderer
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
@@ -67,7 +66,7 @@ from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
-from vllm.renderers import merge_kwargs
+from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike

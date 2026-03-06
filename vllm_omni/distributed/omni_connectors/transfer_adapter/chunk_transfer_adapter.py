@@ -155,6 +155,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("code_predictor_codes", [])
                 request.prompt_token_ids = new_ids
+                # Pass additional fields (like left_context_size) to the request
+                # Only pass chunk context metadata in additional_information
+                request.additional_information = {}
+                if "left_context_size" in payload_data:
+                    request.additional_information["left_context_size"] = payload_data["left_context_size"]
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
@@ -180,9 +185,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.request_payload[req_id] = payload_data
             return payload_data
         origin_payload = self.request_payload[req_id]
+        override_keys = payload_data.pop("override_keys", [])
         for key, value in payload_data.items():
             if key == "finished":
                 continue
+            elif key in override_keys:
+                payload_data[key] = value
             elif isinstance(value, torch.Tensor) and key in origin_payload:
                 payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
             elif isinstance(value, list) and key in origin_payload:

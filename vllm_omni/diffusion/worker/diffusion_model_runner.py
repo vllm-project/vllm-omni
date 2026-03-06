@@ -68,6 +68,21 @@ class DiffusionModelRunner:
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
+    def _compile_transformer(self, attr_name: str) -> None:
+        """Compile a transformer attribute on the pipeline with torch.compile."""
+        model = getattr(self.pipeline, attr_name, None)
+        if model is None:
+            return
+        try:
+            setattr(self.pipeline, attr_name, regionally_compile(model, dynamic=True))
+            logger.info("Model runner: %s compiled with torch.compile.", attr_name)
+        except Exception as e:
+            logger.warning(
+                "Model runner: torch.compile for %s failed: %s. Using eager mode.",
+                attr_name,
+                e,
+            )
+
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
@@ -102,7 +117,7 @@ class DiffusionModelRunner:
 
         # Load model within forward context
         load_config = LoadConfig()
-        model_loader = DiffusersPipelineLoader(load_config)
+        model_loader = DiffusersPipelineLoader(load_config, od_config=self.od_config)
         time_before_load = time.perf_counter()
 
         with get_memory_context():
@@ -131,14 +146,8 @@ class DiffusionModelRunner:
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                try:
-                    self.pipeline.transformer = regionally_compile(
-                        self.pipeline.transformer,
-                        dynamic=True,
-                    )
-                    logger.info("Model runner: Model compiled with torch.compile.")
-                except Exception as e:
-                    logger.warning(f"Model runner: torch.compile failed with error: {e}. Using eager mode.")
+                self._compile_transformer("transformer")
+                self._compile_transformer("transformer_2")
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
@@ -191,7 +200,11 @@ class DiffusionModelRunner:
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
             # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
+            self.kv_transfer_manager.receive_multi_kv_cache(
+                req,
+                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                target_device=getattr(self.pipeline, "device", None),
+            )
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:

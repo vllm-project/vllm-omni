@@ -35,6 +35,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
@@ -128,7 +129,7 @@ def get_wan22_ti2v_pre_process_func(
     return pre_process_func
 
 
-class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
+class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin):
     """
     Wan2.2 Text-Image-to-Video (TI2V) Pipeline.
 
@@ -380,60 +381,63 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             attention_kwargs = {}
 
         # Denoising loop
-        for t in timesteps:
-            self._current_timestep = t
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for t in timesteps:
+                self._current_timestep = t
 
-            # Prepare latent input
-            if latent_condition is not None:
-                # I2V mode: blend condition with latents using mask
-                latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
-                latent_model_input = latent_model_input.to(dtype)
+                # Prepare latent input
+                if latent_condition is not None:
+                    # I2V mode: blend condition with latents using mask
+                    latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
+                    latent_model_input = latent_model_input.to(dtype)
 
-                # Expand timesteps for each patch (TI2V style)
-                temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
-                timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-            else:
-                # T2V mode: use latents directly
-                latent_model_input = latents.to(dtype)
+                    # Expand timesteps for each patch (TI2V style)
+                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
+                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                else:
+                    # T2V mode: use latents directly
+                    latent_model_input = latents.to(dtype)
 
-                # Expand timesteps for TI2V model architecture
-                mask = torch.ones(1, 1, num_latent_frames, latent_height, latent_width, device=device)
-                temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
-                timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                    # Expand timesteps for TI2V model architecture
+                    mask = torch.ones(1, 1, num_latent_frames, latent_height, latent_width, device=device)
+                    temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
+                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
-            do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
-            # Prepare kwargs for positive and negative predictions
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep,
-                "encoder_hidden_states": prompt_embeds,
-                "attention_kwargs": attention_kwargs,
-                "return_dict": False,
-                "current_model": self.transformer,
-            }
-            if do_true_cfg:
-                negative_kwargs = {
+                do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+                # Prepare kwargs for positive and negative predictions
+                positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
-                    "encoder_hidden_states": negative_prompt_embeds,
+                    "encoder_hidden_states": prompt_embeds,
                     "attention_kwargs": attention_kwargs,
                     "return_dict": False,
                     "current_model": self.transformer,
                 }
-            else:
-                negative_kwargs = None
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "attention_kwargs": attention_kwargs,
+                        "return_dict": False,
+                        "current_model": self.transformer,
+                    }
+                else:
+                    negative_kwargs = None
 
-            # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_true_cfg,
-                true_cfg_scale=guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=False,
-            )
+                # Predict noise with automatic CFG parallel handling
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
 
-            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                pbar.update()
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.

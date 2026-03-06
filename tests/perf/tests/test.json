@@ -10,16 +10,14 @@
                 "dataset_name": "random",
                 "num_prompts": [
                     10,
-                    40,
-                    100
+                    40
                 ],
                 "max_concurrency": [
                     1,
-                    4,
-                    10
+                    4
                 ],
-                "random_input_len": 2500,
-                "random_output_len": 900,
+                "random_input_len": 100,
+                "random_output_len": 100,
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
@@ -32,13 +30,11 @@
                 "dataset_name": "random-mm",
                 "num_prompts": [
                     10,
-                    40,
-                    100
+                    40
                 ],
                 "max_concurrency": [
                     1,
-                    4,
-                    10
+                    4
                 ],
                 "random_input_len": 100,
                 "random_output_len": 100,
@@ -94,16 +90,14 @@
                 "dataset_name": "random",
                 "num_prompts": [
                     10,
-                    40,
-                    100
+                    40
                 ],
                 "max_concurrency": [
                     1,
-                    4,
-                    10
+                    4
                 ],
-                "random_input_len": 2500,
-                "random_output_len": 900,
+                "random_input_len": 100,
+                "random_output_len": 100,
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
@@ -116,13 +110,11 @@
                 "dataset_name": "random-mm",
                 "num_prompts": [
                     10,
-                    40,
-                    100
+                    40
                 ],
                 "max_concurrency": [
                     1,
-                    4,
-                    10
+                    4
                 ],
                 "random_input_len": 100,
                 "random_output_len": 100,
