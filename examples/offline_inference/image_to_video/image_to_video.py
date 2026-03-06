@@ -284,6 +284,9 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         log_stats=args.log_stats,
+        model_class_name=model_class_name,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
     )
 
     if profiler_enabled:
