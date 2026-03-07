@@ -16,6 +16,7 @@ eggs/
 .eggs/
 lib/
 lib64/
+parts/
 sdist/
 var/
 wheels/
@@ -217,6 +218,7 @@ ehthumbs.db
 Thumbs.db
 
 # Data files
+data/
 datasets/
 *.csv
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
