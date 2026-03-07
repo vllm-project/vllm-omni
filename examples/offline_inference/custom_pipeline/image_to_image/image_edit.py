@@ -99,7 +99,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae_use_slicing", action="store_true")
     parser.add_argument("--vae_use_tiling", action="store_true")
     parser.add_argument("--enable-cpu-offload", action="store_true")
-    parser.add_argument("--log-stats", "--log_stats", dest="log_stats", action="store_true", default=False)
 
     return parser.parse_args()
 
@@ -156,7 +155,6 @@ async def main():
         cache_config=cache_config,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
-        log_stats=args.log_stats,
         enable_cpu_offload=args.enable_cpu_offload,
         diffusion_load_format="dummy",
         custom_pipeline_args={"pipeline_class": "custom_pipeline.CustomPipeline"},

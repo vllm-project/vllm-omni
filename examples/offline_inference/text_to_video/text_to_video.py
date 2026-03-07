@@ -127,11 +127,6 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
-    parser.add_argument(
-        "--log-stats",
-        action="store_true",
-        help="Enable vLLM-Omni statistics logging.",
-    )
     return parser.parse_args()
 
 
@@ -181,7 +176,6 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
-        log_stats=args.log_stats,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
     )
