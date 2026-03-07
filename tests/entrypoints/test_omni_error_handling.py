@@ -105,7 +105,6 @@ class TestSyncOrchestratorErrorCounting(unittest.TestCase):
             "Companion error without parent abort should not increment (parent is still processing)",
         )
 
-
     def test_stale_result_skipped(self):
         """Stale results from a previous generate() call should be silently
         skipped without affecting the completed_requests counter."""
