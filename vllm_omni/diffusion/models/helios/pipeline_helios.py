@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -174,8 +174,17 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         ]
 
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        # Helios checkpoints store embed_tokens under ``shared.weight`` only,
+        # but the published config sets ``tie_word_embeddings=False``.  When
+        # transformers sees ``tie=False`` it creates a separate
+        # ``encoder.embed_tokens.weight`` that is never loaded from the
+        # checkpoint, leaving it as all-zeros.  This silently destroys prompt
+        # encoding and produces grey/meaningless video output.  Force tying so
+        # that ``embed_tokens`` shares ``shared.weight`` as intended.
+        text_enc_cfg = AutoConfig.from_pretrained(model, subfolder="text_encoder", local_files_only=local_files_only)
+        text_enc_cfg.tie_word_embeddings = True
         self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
         self.vae = AutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
