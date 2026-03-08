@@ -1045,6 +1045,8 @@ class Omni(OmniBase):
                         parent_id, parent_aborted = cfg.on_companion_error(req_id)
                         if parent_aborted:
                             completed_requests += 1
+                            if pbar:
+                                pbar.update(1)
                             logger.error(
                                 f"[{self._name}] Parent {parent_id} aborted due to "
                                 f"companion failure ({completed_requests}/{total_requests})",
@@ -1083,6 +1085,8 @@ class Omni(OmniBase):
                         if not success:
                             cfg.consume_parent_failure(ready_parent)
                             completed_requests += 1
+                            if pbar:
+                                pbar.update(1)
                             logger.error(
                                 f"[{self._name}] Parent {ready_parent} dropped due to CFG forwarding failure "
                                 f"({completed_requests}/{total_requests})",
@@ -1183,6 +1187,8 @@ class Omni(OmniBase):
                         if cfg.is_parent_failed(req_id):
                             cfg.consume_parent_failure(req_id)
                             completed_requests += 1
+                            if pbar:
+                                pbar.update(1)
                             logger.error(
                                 f"[{self._name}] Parent {req_id} skipped CFG forwarding due to "
                                 f"companion failure ({completed_requests}/{total_requests})",
@@ -1204,6 +1210,8 @@ class Omni(OmniBase):
                             if not success:
                                 cfg.consume_parent_failure(req_id)
                                 completed_requests += 1
+                                if pbar:
+                                    pbar.update(1)
                                 logger.error(
                                     f"[{self._name}] Parent {req_id} dropped due to CFG forwarding failure "
                                     f"({completed_requests}/{total_requests})",
@@ -1221,6 +1229,8 @@ class Omni(OmniBase):
                             )
                     except Exception as e:
                         completed_requests += 1
+                        if pbar:
+                            pbar.update(1)
                         logger.exception(
                             f"[{self._name}] Process engine inputs error for req {req_id}"
                             f" at stage {next_stage_id}: {e} ({completed_requests}/{total_requests})",
@@ -1266,6 +1276,8 @@ class Omni(OmniBase):
                     )
             for timed_out_id in cfg.check_timeouts():
                 completed_requests += 1
+                if pbar:
+                    pbar.update(1)
                 logger.error(
                     f"[{self._name}] Parent {timed_out_id} timed out; counting as failed "
                     f"({completed_requests}/{total_requests})",
