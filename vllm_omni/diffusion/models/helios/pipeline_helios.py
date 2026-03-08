@@ -604,6 +604,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                     use_zero_init=use_zero_init,
                     zero_steps=zero_steps,
                     device=device,
+                    generator=generator,
                 )
 
             if keep_first_frame and (
@@ -752,6 +753,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         use_zero_init: bool = True,
         zero_steps: int = 1,
         device: torch.device | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
     ) -> torch.Tensor:
         """Pyramid multi-stage denoising for one chunk."""
         batch_size, num_channel, num_frames_lat, height, width = latents.shape
@@ -804,7 +806,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
-                noise = self.sample_block_noise(batch_size, num_channel, latents.shape[2], height, width, patch_size, device=device)
+                noise = self.sample_block_noise(batch_size, num_channel, latents.shape[2], height, width, patch_size, device=device, generator=generator)
                 noise = noise.to(device=device, dtype=transformer_dtype)
                 latents = alpha * latents + beta * noise
 
@@ -873,11 +875,12 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
         return latents
 
-    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2), device="cuda"):
+    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2), device="cuda", generator=None):
         # NOTE: A generator must be provided to ensure correct and reproducible results.
         # Creating a default generator here is a fallback only — without a fixed seed,
         # the output will be non-deterministic and may produce incorrect results in CP context.
-        generator = torch.Generator(device=device)
+        if generator is None:
+            generator = torch.Generator(device=device)
 
         gamma = self.scheduler.config.gamma
         _, ph, pw = patch_size
