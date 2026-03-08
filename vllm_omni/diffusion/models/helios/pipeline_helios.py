@@ -806,7 +806,9 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
-                noise = self.sample_block_noise(batch_size, num_channel, latents.shape[2], height, width, patch_size, generator=generator)
+                noise = self.sample_block_noise(
+                    batch_size, num_channel, latents.shape[2], height, width, patch_size, generator=generator
+                )
                 noise = noise.to(device=device, dtype=transformer_dtype)
                 latents = alpha * latents + beta * noise
 
@@ -888,7 +890,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
         z = torch.randn(block_number, block_size, generator=generator)
         noise = z @ L.T
-    
+
         noise = noise.view(batch_size, channel, num_frames, height // ph, width // pw, ph, pw)
         noise = noise.permute(0, 1, 2, 3, 5, 4, 6).reshape(batch_size, channel, num_frames, height, width)
 
