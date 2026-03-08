@@ -806,7 +806,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
-                noise = self.sample_block_noise(batch_size, num_channel, latents.shape[2], height, width, patch_size, device=device, generator=generator)
+                noise = self.sample_block_noise(batch_size, num_channel, latents.shape[2], height, width, patch_size, generator=generator)
                 noise = noise.to(device=device, dtype=transformer_dtype)
                 latents = alpha * latents + beta * noise
 
@@ -875,13 +875,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
         return latents
 
-    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2), device="cuda", generator=None):
-        # NOTE: A generator must be provided to ensure correct and reproducible results.
-        # Creating a default generator here is a fallback only — without a fixed seed,
-        # the output will be non-deterministic and may produce incorrect results in CP context.
-        if generator is None:
-            generator = torch.Generator(device=device)
-
+    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2), generator=None):
         gamma = self.scheduler.config.gamma
         _, ph, pw = patch_size
         block_size = ph * pw
