@@ -12,10 +12,9 @@ Easy, fast, and cheap omni-modality model serving for everyone
 | <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1qv4qMW1rKAqDREMXiUDLIgqqHQe7TDPj/edit?usp=sharing&ouid=110473603432222024453&rtpof=true&sd=true"><b>Slides</b></a> |
 </p>
 
-
 ---
 
-*Latest News* 🔥
+_Latest News_ 🔥
 
 - [2026/02] We released [0.14.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.14.0) - This is the first **stable release** of vLLM-Omni that expands Omni’s diffusion / image-video generation and audio / TTS stack, improves distributed execution and memory efficiency, and broadens platform/backend coverage (GPU/ROCm/NPU/XPU). It also brings meaningful upgrades to serving APIs, profiling & benchmarking, and overall stability. Please check our latest [paper](https://arxiv.org/abs/2602.02204) for architecture design and performance results.
 - [2026/01] We released [0.12.0rc1](https://github.com/vllm-project/vllm-omni/releases/tag/v0.12.0rc1) - a major RC milestone focused on maturing the diffusion stack, strengthening OpenAI-compatible serving, expanding omni-model coverage, and improving stability across platforms (GPU/NPU/ROCm).
@@ -67,7 +66,14 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 ## Contributing
 
 We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM-Omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
+There are many ways to get involved:
+
+- **Documentation** — Improve guides, fix typos, or clarify examples in `docs/`.
+- **Bug reports** — Use our [bug report templates](files/BUG_REPORT_TEMPLATES.md) to file a well-structured issue. Thorough reproduction steps dramatically speed up the fix.
+- **Bug fixes & features** — Browse open issues or open a proposal issue before writing large changes. For changes over 500 LOC, an RFC issue is required.
+- **Translations** — Open an issue to propose a new language translation. Community validation is required before work begins.
+
+Please check out the [CONTRIBUTING.md](CONTRIBUTING.md) for a quick-start guide, or the full [Contributing Documentation](https://vllm-omni.readthedocs.io/en/latest/contributing/) for detailed guidelines.
 
 ## Citation
 
@@ -83,6 +89,7 @@ If you use vLLM-Omni for your research, please cite our [paper](https://arxiv.or
 ```
 
 ## Join the Community
+
 Feel free to ask questions, provide feedbacks and discuss with fellow users of vLLM-Omni in `#sig-omni` slack channel at [slack.vllm.ai](https://slack.vllm.ai) or vLLM user forum at [discuss.vllm.ai](https://discuss.vllm.ai).
 
 ## Star History
