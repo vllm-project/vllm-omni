@@ -881,8 +881,113 @@ async def list_voices(raw_request: Request):
     if handler is None:
         return base(raw_request).create_error_response(message="The model does not support Speech API")
 
+    # Get all speakers (both model built-in and uploaded)
     speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
-    return JSONResponse(content={"voices": speakers})
+
+    # Get uploaded speakers details
+    uploaded_speakers = []
+    if hasattr(handler, "uploaded_speakers"):
+        for voice_name, info in handler.uploaded_speakers.items():
+            uploaded_speakers.append(
+                {
+                    "name": info.get("name", voice_name),
+                    "consent": info.get("consent", ""),
+                    "created_at": info.get("created_at", 0),
+                    "file_size": info.get("file_size", 0),
+                    "mime_type": info.get("mime_type", ""),
+                }
+            )
+
+    return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
+
+
+@router.post(
+    "/v1/audio/voices",
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def upload_voice(
+    raw_request: Request,
+    audio_sample: UploadFile = File(...),
+    consent: str = Form(...),
+    name: str = Form(...),
+):
+    """Upload a new voice sample for voice cloning.
+
+    Uploads an audio file that can be used as a reference for voice cloning
+    in Base task TTS requests. The voice can then be referenced by name
+    in subsequent TTS requests.
+
+    Args:
+        audio_sample: Audio file (max 10MB)
+        consent: Consent recording ID
+        name: Name for the new voice
+        raw_request: Raw FastAPI request
+
+    Returns:
+        JSON response with voice information
+    """
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+
+    try:
+        # Upload the voice
+        result = await handler.upload_voice(audio_sample, consent, name)
+
+        return JSONResponse(content={"success": True, "voice": result})
+
+    except ValueError as e:
+        return base(raw_request).create_error_response(message=str(e))
+    except Exception as e:
+        logger.exception(f"Failed to upload voice: {e}")
+        return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
+
+
+@router.delete(
+    "/v1/audio/voices/{name}",
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def delete_voice(name: str, raw_request: Request):
+    """Delete an uploaded voice.
+
+    Deletes the voice sample and associated metadata. Also removes any
+    cached voice clone prompts for this voice.
+
+    Args:
+        name: Name of the voice to delete
+        raw_request: Raw FastAPI request
+
+    Returns:
+        JSON response indicating success or failure
+    """
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+
+    try:
+        # Delete the voice
+        success = await handler.delete_voice(name)
+        if not success:
+            return JSONResponse(
+                content={"success": False, "error": f"Voice '{name}' not found"},
+                status_code=HTTPStatus.NOT_FOUND.value,
+            )
+
+        return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
+
+    except ValueError as e:
+        return base(raw_request).create_error_response(message=str(e))
+    except Exception as e:
+        logger.exception(f"Failed to delete voice '{name}': {e}")
+        return base(raw_request).create_error_response(message=f"Failed to delete voice: {str(e)}")
 
 
 # Health and Model endpoints for diffusion mode

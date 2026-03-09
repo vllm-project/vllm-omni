@@ -144,6 +144,7 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        custom_output=output.custom_output or {},
                         multimodal_output=mm_output,
                     ),
                 ]
@@ -197,6 +198,7 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
+                            custom_output=output.custom_output or {},
                             multimodal_output=mm_output,
                         ),
                     )

@@ -618,6 +618,10 @@ class DiffusionOutput:
 
     post_process_func: Callable[..., Any] | None = None
 
+    # Extra custom output data (e.g. latent trajectories, prompt embeds)
+    # passed through to OmniRequestOutput.custom_output
+    custom_output: dict[str, Any] = field(default_factory=dict)
+
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
 
