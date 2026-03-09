@@ -40,8 +40,15 @@ _R = TypeVar("_R")
 logger = init_logger(__name__)
 
 
-def _weak_close_cleanup_async(stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None):
+def _weak_close_cleanup_async(
+    stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None, inline_engine=None
+):
     """Weak reference cleanup function for AsyncOmni instances."""
+    if inline_engine is not None:
+        try:
+            inline_engine.close()
+        except Exception as e:
+            logger.warning("Failed to close inline diffusion engine: %s", e)
     if stage_list:
         for q in stage_in_queues:
             try:
@@ -130,6 +137,7 @@ class AsyncOmni(OmniBase):
             self._ray_pg,
             self.output_handler,
             self._zmq_ctx,
+            getattr(self, "_inline_engine", None),
         )
 
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -330,6 +338,11 @@ class AsyncOmni(OmniBase):
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
 
+        if self._inline_diffusion:
+            async for output in self._generate_inline(prompt, request_id, sampling_params_list, output_modalities):
+                yield output
+            return
+
         logger.debug(f"[{self._name}] generate() called")
         try:
             # Start output handler on the first call to generate()
@@ -419,6 +432,97 @@ class AsyncOmni(OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
             logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
+            raise
+
+    async def _generate_inline(
+        self,
+        prompt: OmniPromptType,
+        request_id: str,
+        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
+        output_modalities: list[str] | None = None,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Generate using inline diffusion engine (no stage worker subprocess).
+
+        Eliminates Hop3 IPC overhead by running OmniDiffusion directly in the
+        orchestrator process.  The blocking generate() call is offloaded to a
+        thread executor so the asyncio event loop remains responsive.
+        """
+        _wall_start_ts = time.time()
+
+        if sampling_params_list is None:
+            sampling_params_list = self.default_sampling_params_list
+        sp0 = sampling_params_list[0]
+
+        stage = self.stage_list[0]
+        final_stage_id_for_e2e = 0
+
+        metrics = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=self.log_stats,
+            wall_start_ts=_wall_start_ts,
+            final_stage_id_for_e2e=final_stage_id_for_e2e,
+        )
+        metrics.stage_first_ts[0] = time.time()
+
+        logger.info(
+            "[%s] Inline diffusion generate for request %s",
+            self._name,
+            request_id,
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(
+                None,
+                self._inline_engine.generate,
+                prompt,
+                sp0,
+                [request_id],
+            )
+
+            for result in results:
+                images = getattr(result, "images", None) or []
+                finished = getattr(result, "finished", True)
+
+                output_to_yield = OmniRequestOutput(
+                    stage_id=0,
+                    final_output_type=stage.final_output_type,
+                    request_output=result,
+                    images=images,
+                    finished=finished,
+                )
+
+                metrics.stage_last_ts[0] = time.time()
+                yield output_to_yield
+
+            try:
+                metrics.on_finalize_request(
+                    final_stage_id_for_e2e,
+                    request_id,
+                    _wall_start_ts,
+                )
+                metrics.build_and_log_summary()
+            except Exception as e:
+                logger.exception(
+                    "[%s] Failed to finalize inline metrics: %s",
+                    self._name,
+                    e,
+                )
+
+        except (asyncio.CancelledError, GeneratorExit):
+            logger.info(
+                "[%s] Inline request %s cancelled.",
+                self._name,
+                request_id,
+            )
+            raise
+        except Exception as e:
+            logger.exception(
+                "[%s] Inline diffusion failed for request %s: %s",
+                self._name,
+                request_id,
+                e,
+            )
             raise
 
     async def _process_async_results(
@@ -569,6 +673,7 @@ class AsyncOmni(OmniBase):
             raise RuntimeError(result)
 
         engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+
         if isinstance(engine_outputs, list):
             engine_outputs = engine_outputs[0]
 
@@ -690,7 +795,8 @@ class AsyncOmni(OmniBase):
 
     @property
     def is_running(self) -> bool:
-        # Is None before the loop is started.
+        if self._inline_diffusion:
+            return self._inline_engine is not None
         return len(self._stage_in_queues) > 0
 
     @property
@@ -714,6 +820,10 @@ class AsyncOmni(OmniBase):
         return EngineDeadError()
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
+        if self._inline_diffusion:
+            if self._inline_engine is not None:
+                self._inline_engine.engine.abort(request_id)
+            return None
         abort_task = {"type": OmniStageTaskType.ABORT, "request_id": request_id}
         for stage in self.stage_list:
             stage.submit(abort_task)

@@ -1119,7 +1119,6 @@ def _stage_worker(
                 gen_outputs.extend(results)
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-            logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
 
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
@@ -1159,6 +1158,10 @@ def _stage_worker(
                     _metrics.stage_stats = None
                 try:
                     use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
+                except Exception:
+                    use_shm, payload = False, r_outputs
+
+                try:
                     if use_shm:
                         out_q.put(
                             {
@@ -1186,10 +1189,6 @@ def _stage_worker(
                             "metrics": _metrics,
                         }
                     )
-                logger.debug(
-                    "Enqueued result for request %s to downstream",
-                    rid,
-                )
         except Exception as e:
             logger.exception("Failed on batch %s: %s", batch_request_ids, e)
             _tb = traceback.format_exc()
