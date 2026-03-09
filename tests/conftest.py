@@ -91,8 +91,22 @@ def _run_pre_test_cleanup(enable_force=False):
         try:
             from tests.utils import wait_for_gpu_memory_to_clear
 
+            # 支持环境变量 VLLM_TEST_GPU_DEVICES 指定卡号，如 "0,1,2"；不传则默认全部卡
+            env_devices = os.getenv("VLLM_TEST_GPU_DEVICES", "").strip()
+            if env_devices:
+                devices = [
+                    int(x.strip())
+                    for x in env_devices.split(",")
+                    if x.strip().isdigit()
+                ]
+                devices = [d for d in devices if 0 <= d < num_gpus]
+                if not devices:
+                    devices = list(range(num_gpus))
+            else:
+                devices = list(range(num_gpus))
+
             wait_for_gpu_memory_to_clear(
-                devices=list(range(num_gpus)),
+                devices=devices,
                 threshold_ratio=0.05,
             )
         except Exception as e:
