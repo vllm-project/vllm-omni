@@ -16,7 +16,6 @@ import base64
 import io
 import urllib.request
 from collections.abc import Iterable
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -35,6 +34,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .configuration_qwen3_tts import Qwen3TTSConfig
 from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 from .processing_qwen3_tts import Qwen3TTSProcessor
+from .voice_cache_manager import VoiceCacheManager, VoiceClonePromptItem
 
 logger = init_logger(__name__)
 
@@ -57,21 +57,6 @@ AudioLike = (
 )
 
 MaybeList = Any | list[Any]
-
-
-@dataclass
-class VoiceClonePromptItem:
-    """
-    Container for one sample's voice-clone prompt information that can be fed to the model.
-
-    Fields are aligned with `Qwen3TTSForConditionalGeneration.generate(..., voice_clone_prompt=...)`.
-    """
-
-    ref_code: torch.Tensor | None  # (T, Q) or (T,) depending on tokenizer 25Hz/12Hz
-    ref_spk_embedding: torch.Tensor  # (D,)
-    x_vector_only_mode: bool
-    icl_mode: bool
-    ref_text: str | None = None
 
 
 class Qwen3TTSModelForGeneration(nn.Module):
@@ -372,6 +357,12 @@ class Qwen3TTSModel:
         self.model = model
         self.processor = processor
         self.generate_defaults = generate_defaults or {}
+
+        # Initialize voice cache manager.
+        # Note: this creates its own MetadataManager for the same metadata.json
+        # used by serving_speech.py. Sharing is not possible across model/serving
+        # layers, but file locking in MetadataManager ensures correctness.
+        self.voice_cache_manager = VoiceCacheManager()
 
         self.device = getattr(model, "device", None)
         if self.device is None:
@@ -791,6 +782,7 @@ class Qwen3TTSModel:
         self,
         text: str | list[str],
         language: str | list[str] = None,
+        speaker: str | None = None,  # New parameter: speaker name
         ref_audio: AudioLike | list[AudioLike] | None = None,
         ref_text: str | list[str | None] | None = None,
         x_vector_only_mode: bool | list[bool] = False,
@@ -865,7 +857,27 @@ class Qwen3TTSModel:
 
         self._validate_languages(languages)
 
-        if voice_clone_prompt is None:
+        # Cache logic: if speaker parameter is provided, try to load from cache
+        cache_loaded = False
+        cache_speaker = None
+        cache_audio_path = None
+
+        if speaker:
+            # Use VoiceCacheManager to load cached voice prompt, passing device parameter
+            cached_items = self.voice_cache_manager.load_cached_voice_prompt(speaker, device=str(self.device))
+            if cached_items is not None:
+                voice_clone_prompt = cached_items
+                cache_loaded = True
+
+            # If no cache, check if cache needs to be generated
+            if not cache_loaded:
+                audio_file_path = self.voice_cache_manager.get_speaker_audio_path(speaker)
+                if audio_file_path:
+                    logger.info(f"Will generate cache for speaker: {speaker} (first use)")
+                    cache_speaker = speaker
+                    cache_audio_path = audio_file_path
+
+        if voice_clone_prompt is None and not cache_loaded:
             if ref_audio is None:
                 # For profile run
                 sample_rate = int(self.model.speaker_encoder_sample_rate)
@@ -879,6 +891,28 @@ class Qwen3TTSModel:
             prompt_items = self.create_voice_clone_prompt(
                 ref_audio=ref_audio, ref_text=ref_text, x_vector_only_mode=x_vector_only_mode
             )
+
+            # If cache needs to be generated, save cache file
+            if cache_speaker and cache_audio_path:
+                try:
+                    # Use VoiceCacheManager to save cache
+                    success = self.voice_cache_manager.save_voice_cache(cache_speaker, cache_audio_path, prompt_items)
+                    if success:
+                        logger.info(f"Cache generated and saved for speaker: {cache_speaker}")
+                    else:
+                        logger.error(f"Failed to save cache for speaker: {cache_speaker}")
+                except Exception as e:
+                    logger.error(f"Failed to save cache for speaker {cache_speaker}: {e}")
+
+            if len(prompt_items) == 1 and len(texts) > 1:
+                prompt_items = prompt_items * len(texts)
+            if len(prompt_items) != len(texts):
+                raise ValueError(f"Batch size mismatch: prompt={len(prompt_items)}, text={len(texts)}")
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+            ref_texts_for_ids = [it.ref_text for it in prompt_items]
+        elif cache_loaded and isinstance(voice_clone_prompt, list):
+            # Use cached VoiceClonePromptItem
+            prompt_items = voice_clone_prompt
             if len(prompt_items) == 1 and len(texts) > 1:
                 prompt_items = prompt_items * len(texts)
             if len(prompt_items) != len(texts):
