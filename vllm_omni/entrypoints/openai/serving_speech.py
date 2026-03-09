@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from transformers.utils.hub import cached_file
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
@@ -120,7 +121,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         try:
             model_path = self.engine_client.model_config.model
             st_config_path = os.path.join(model_path, "speech_tokenizer", "config.json")
-            if os.path.exists(st_config_path):
+            if not os.path.exists(st_config_path):
+                st_config_path = cached_file(model_path, "speech_tokenizer/config.json")
+            if st_config_path is not None and os.path.exists(st_config_path):
                 with open(st_config_path) as f:
                     st_config = json.load(f)
                 output_sr = st_config.get("output_sample_rate")
