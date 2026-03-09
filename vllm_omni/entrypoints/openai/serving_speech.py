@@ -14,6 +14,7 @@ import numpy as np
 import soundfile as sf
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
+from prometheus_client import REGISTRY, Counter, Histogram
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
@@ -26,6 +27,52 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics for TTS requests
+# ---------------------------------------------------------------------------
+# These use the same metric names as upstream vLLM so they appear on the
+# existing /metrics endpoint.  If the upstream engine has already registered
+# a metric with the same name (e.g. when TTS shares a process with an LLM
+# engine), we reuse the existing collector instead of creating a duplicate.
+# ---------------------------------------------------------------------------
+
+
+def _get_or_create_counter(name: str, documentation: str, labelnames: tuple[str, ...]) -> Counter:
+    """Return an existing Counter from the default registry, or create one."""
+    for collector in list(REGISTRY._names_to_collectors.values()):
+        if getattr(collector, "_name", None) == name and isinstance(collector, Counter):
+            return collector
+    return Counter(name, documentation, labelnames=labelnames, registry=REGISTRY)
+
+
+def _get_or_create_histogram(name: str, documentation: str, buckets: list, labelnames: tuple[str, ...]) -> Histogram:
+    """Return an existing Histogram from the default registry, or create one."""
+    for collector in list(REGISTRY._names_to_collectors.values()):
+        if getattr(collector, "_name", None) == name and isinstance(collector, Histogram):
+            return collector
+    return Histogram(name, documentation, buckets=buckets, labelnames=labelnames, registry=REGISTRY)
+
+
+_TOKEN_BUCKETS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+
+_tts_request_success = _get_or_create_counter(
+    "vllm:request_success",
+    "Count of successfully processed requests.",
+    labelnames=("finish_reason",),
+)
+_tts_prompt_tokens = _get_or_create_histogram(
+    "vllm:request_prompt_tokens",
+    "Number of prefill tokens processed.",
+    buckets=_TOKEN_BUCKETS,
+    labelnames=(),
+)
+_tts_generation_tokens = _get_or_create_histogram(
+    "vllm:request_generation_tokens",
+    "Number of generation tokens processed.",
+    buckets=_TOKEN_BUCKETS,
+    labelnames=(),
+)
 
 _REF_AUDIO_TIMEOUT_S = 15
 _REF_AUDIO_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
@@ -244,10 +291,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.voice is not None:
             request.voice = request.voice.lower()
 
-        # Validate input is not empty
-        if not request.input or not request.input.strip():
-            return "Input text cannot be empty"
-
         # Validate language
         if request.language is not None and request.language not in _TTS_LANGUAGES:
             return f"Invalid language '{request.language}'. Supported: {', '.join(sorted(_TTS_LANGUAGES))}"
@@ -399,10 +442,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         base64_encode=False,
                     )
                     yield self.create_audio(audio_obj).audio_data
+            # Streaming completed successfully
+            _tts_request_success.labels(finish_reason="stop").inc()
         except asyncio.CancelledError:
+            _tts_request_success.labels(finish_reason="abort").inc()
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
         except Exception as e:
+            _tts_request_success.labels(finish_reason="abort").inc()
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
 
     @staticmethod
@@ -512,11 +559,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         request_id = f"speech-{random_uuid()}"
 
+        # Empty input → return empty (silent) audio without hitting the engine.
+        if not request.input or not request.input.strip():
+            empty_audio = np.zeros(0, dtype=np.float32)
+            if request.stream:
+                return StreamingResponse(iter([b""]), media_type="audio/pcm")
+            audio_obj = CreateAudio(
+                audio_tensor=empty_audio,
+                sample_rate=24000,
+                response_format=request.response_format or "wav",
+                speed=request.speed or 1.0,
+                stream_format=request.stream_format,
+                base64_encode=False,
+            )
+            audio_response = self.create_audio(audio_obj)
+            _tts_request_success.labels(finish_reason="stop").inc()
+            _tts_prompt_tokens.observe(0)
+            _tts_generation_tokens.observe(0)
+            return Response(content=audio_response.audio_data, media_type=audio_response.media_type)
+
         try:
             if self._is_tts:
                 # Validate TTS parameters
                 validation_error = self._validate_tts_request(request)
                 if validation_error:
+                    _tts_request_success.labels(finish_reason="abort").inc()
                     return self.create_error_response(validation_error)
 
                 tts_params = self._build_tts_params(request)
@@ -548,6 +615,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
             if request.stream:
+                # Streaming metrics are recorded in _generate_pcm_chunks
                 return StreamingResponse(
                     self._generate_pcm_chunks(generator, request_id),
                     media_type="audio/pcm",
@@ -559,10 +627,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 final_output = res
 
             if final_output is None:
+                _tts_request_success.labels(finish_reason="abort").inc()
                 return self.create_error_response("No output generated from the model.")
 
             audio_output, audio_key = self._extract_audio_output(final_output)
             if audio_key is None:
+                _tts_request_success.labels(finish_reason="abort").inc()
                 return self.create_error_response("TTS model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
@@ -589,12 +659,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 base64_encode=False,
             )
             audio_response = self.create_audio(audio_obj)
+
+            # Record prompt token count (placeholder length ≈ model prompt tokens)
+            _tts_prompt_tokens.observe(ph_len)
+
+            # Record generation token count from pipeline metrics if available
+            metrics = getattr(final_output, "metrics", None) or {}
+            gen_tokens = metrics.get("num_tokens_out")
+            if gen_tokens is not None:
+                _tts_generation_tokens.observe(gen_tokens)
+
+            _tts_request_success.labels(finish_reason="stop").inc()
             return Response(content=audio_response.audio_data, media_type=audio_response.media_type)
 
         except asyncio.CancelledError:
+            _tts_request_success.labels(finish_reason="abort").inc()
             return self.create_error_response("Client disconnected")
         except ValueError as e:
+            _tts_request_success.labels(finish_reason="abort").inc()
             return self.create_error_response(e)
         except Exception as e:
+            _tts_request_success.labels(finish_reason="abort").inc()
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")

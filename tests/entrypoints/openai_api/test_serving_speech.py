@@ -341,10 +341,6 @@ class TestTTSMethods:
 
     def test_validate_tts_request_basic(self, speech_server):
         """Test basic validation cases."""
-        # Empty input
-        req = OpenAICreateSpeechRequest(input="")
-        assert speech_server._validate_tts_request(req) == "Input text cannot be empty"
-
         # Invalid language
         req = OpenAICreateSpeechRequest(input="Hello", language="InvalidLang")
         assert "Invalid language" in speech_server._validate_tts_request(req)
