@@ -22,8 +22,8 @@ MULTI_EDIT_PROMPT = (
     "Transform the second image of colorful geometric shapes into a Vincent van Gogh style painting. "
     "Then juxtapose the two transformed images into a single artwork for visual contrast."
 )
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4", "rocm": "MI325", "npu": "A2"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "L4", "rocm": "MI325", "npu": "A2"}, num_cards=2, parallel=True)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2, parallel=True)
 
 
 # This test file targets two models, so I write a helper function.
