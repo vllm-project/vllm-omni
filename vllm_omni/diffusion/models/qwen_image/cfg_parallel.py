@@ -15,11 +15,12 @@ import torch
 
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 
 logger = logging.getLogger(__name__)
 
 
-class QwenImageCFGParallelMixin(CFGParallelMixin):
+class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
     """
     Base Mixin class for Qwen Image pipelines providing shared CFG methods.
     """
@@ -69,58 +70,61 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
         self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
 
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
-            self._current_timestep = t
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+                self._current_timestep = t
 
-            # Broadcast timestep to match batch size
-            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+                # Broadcast timestep to match batch size
+                timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
-            # Concatenate image latents with noise latents if available (for editing pipelines)
-            latent_model_input = latents
-            if image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1)
+                # Concatenate image latents with noise latents if available (for editing pipelines)
+                latent_model_input = latents
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents, image_latents], dim=1)
 
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep / 1000,
-                "guidance": guidance,
-                "encoder_hidden_states_mask": prompt_embeds_mask,
-                "encoder_hidden_states": prompt_embeds,
-                "img_shapes": img_shapes,
-                "txt_seq_lens": txt_seq_lens,
-                **additional_transformer_kwargs,
-            }
-            if do_true_cfg:
-                negative_kwargs = {
+                positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep / 1000,
                     "guidance": guidance,
-                    "encoder_hidden_states_mask": negative_prompt_embeds_mask,
-                    "encoder_hidden_states": negative_prompt_embeds,
+                    "encoder_hidden_states_mask": prompt_embeds_mask,
+                    "encoder_hidden_states": prompt_embeds,
                     "img_shapes": img_shapes,
-                    "txt_seq_lens": negative_txt_seq_lens,
+                    "txt_seq_lens": txt_seq_lens,
                     **additional_transformer_kwargs,
                 }
-            else:
-                negative_kwargs = None
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep / 1000,
+                        "guidance": guidance,
+                        "encoder_hidden_states_mask": negative_prompt_embeds_mask,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "img_shapes": img_shapes,
+                        "txt_seq_lens": negative_txt_seq_lens,
+                        **additional_transformer_kwargs,
+                    }
+                else:
+                    negative_kwargs = None
 
-            # For editing pipelines, we need to slice the output to remove condition latents
-            output_slice = latents.size(1) if image_latents is not None else None
+                # For editing pipelines, we need to slice the output to remove condition latents
+                output_slice = latents.size(1) if image_latents is not None else None
 
-            # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg,
-                true_cfg_scale,
-                positive_kwargs,
-                negative_kwargs,
-                cfg_normalize,
-                output_slice,
-            )
+                # Predict noise with automatic CFG parallel handling
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg,
+                    true_cfg_scale,
+                    positive_kwargs,
+                    negative_kwargs,
+                    cfg_normalize,
+                    output_slice,
+                )
 
-            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                pbar.update()
 
         return latents
 

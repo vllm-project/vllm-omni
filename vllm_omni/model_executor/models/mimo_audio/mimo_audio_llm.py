@@ -556,12 +556,14 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             config.hidden_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
         self.hidden_states_downcast = ColumnParallelLinear(
             config.hidden_size,
             self.local_config.hidden_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
 
         self.lm_head = ColumnParallelLinear(
@@ -569,6 +571,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             config.vocab_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
 
         # Re-encode the sum of multi-layer RVQ embeddings to obtain true Audio Code Embeddings

@@ -58,7 +58,8 @@ class OmniDiffusion:
                 od_config.model,
             )
             if config_dict is not None:
-                od_config.model_class_name = config_dict.get("_class_name", None)
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
 
                 tf_config_dict = get_hf_file_to_dict(
@@ -91,7 +92,8 @@ class OmniDiffusion:
             if pipeline_class is None:
                 raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")
 
-            od_config.model_class_name = pipeline_class
+            if od_config.model_class_name is None:
+                od_config.model_class_name = pipeline_class
             od_config.tf_model_config = TransformerConfig()
             od_config.update_multimodal_support()
 
