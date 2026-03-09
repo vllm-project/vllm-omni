@@ -9,15 +9,15 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  # L2 Test
-  - label: "Upload Ready Pipeline"
-    depends_on: image-build
-    key: upload-ready-pipeline
-    if: build.branch != "main"
-    commands:
-      - buildkite-agent pipeline upload .buildkite/test-ready.yml
-    agents:
-      queue: "cpu_queue_premerge"
+  # # L2 Test
+  # - label: "Upload Ready Pipeline"
+  #   depends_on: image-build
+  #   key: upload-ready-pipeline
+  #   if: build.branch != "main"
+  #   commands:
+  #     - buildkite-agent pipeline upload .buildkite/test-ready.yml
+  #   agents:
+  #     queue: "cpu_queue_premerge"
 
   # L3 Test
   - label: "Upload Merge Pipeline"
@@ -33,7 +33,7 @@ steps:
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1"
+    #if: build.env("NIGHTLY") == "1"
     commands:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:
