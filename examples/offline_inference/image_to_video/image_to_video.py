@@ -22,7 +22,7 @@ Usage:
     python image_to_video.py --model /path/to/LTX-2 \
         --model-class-name LTX2ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --num-frames 121 --num_inference_steps 40 --guidance_scale 4.0 \
+        --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 """
 
