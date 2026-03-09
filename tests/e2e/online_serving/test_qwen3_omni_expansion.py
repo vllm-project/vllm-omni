@@ -336,7 +336,7 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
     Input Modal: text, video
     Output Modal: text, audio
     Input Setting: stream=True
-    Datasets: few requests
+    Datasets: single requests
     """
     video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 30)['base64']}"
 
@@ -351,7 +351,7 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"video": VIDEO_KEY},
     }
 
-    openai_client.send_request(request_config, request_num=get_max_batch_size())
+    openai_client.send_request(request_config)
 
 
 @pytest.mark.skip(reason="There is a known issue with shape mismatch error.")

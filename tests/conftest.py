@@ -713,7 +713,6 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
     model = whisper.load_model("small", device=device)
     try:
         text = model.transcribe(
@@ -723,6 +722,10 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
             condition_on_previous_text=False,
         )["text"]
     finally:
+        # Sync GPU so in-flight ops finish before we free the model; otherwise
+        # freed memory may not show up until those ops complete.
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.synchronize()
         del model
         gc.collect()
         if torch is not None and torch.cuda.is_available():
