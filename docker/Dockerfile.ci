@@ -1,9 +1,8 @@
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.16.0
+ARG VLLM_BASE_TAG=v0.17.0
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
-
 COPY . .
 
 # Install system dependencies

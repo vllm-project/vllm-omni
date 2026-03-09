@@ -1,6 +1,6 @@
 import time
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -9,26 +9,14 @@ from vllm.inputs import ProcessorInputs, PromptType
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
-
-try:
-    from vllm.multimodal.processing import set_request_id
-except ImportError:  # vllm without set_request_id (older releases)
-    from contextlib import contextmanager
-
-    @contextmanager
-    def set_request_id(_request_id: str):
-        yield
-
-
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.multimodal.utils import argsort_mm_positions
-from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
-from vllm.renderers.inputs import DictPrompt, TokPrompt
+from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.utils.torch_utils import set_default_torch_num_threads
+from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.engine import (
@@ -41,6 +29,35 @@ from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.lora.request import LoRARequest
 
 logger = init_logger(__name__)
+
+_OMNI_EXTRA_KEYS = (
+    "additional_information",
+    "prompt_embeds",
+    "negative_prompt",
+    "negative_prompt_embeds",
+)
+
+
+def reinject_omni_fields(
+    results: list[ProcessorInputs],
+    original_prompts: list[dict],
+) -> None:
+    """Re-inject omni-specific fields that the upstream renderer discards.
+
+    The upstream renderer's ``process_for_engine`` creates new dicts that only
+    copy standard vLLM fields (prompt_token_ids, multi_modal_data, …).
+    Omni-specific fields such as ``additional_information`` and
+    ``prompt_embeds`` are silently dropped.  This helper copies them back from
+    the *original* parsed prompts into the renderer outputs so they survive
+    into ``OmniInputProcessor.process_inputs()``.
+    """
+    for result, orig in zip(results, original_prompts):
+        if not isinstance(orig, dict):
+            continue
+        for key in _OMNI_EXTRA_KEYS:
+            val = orig.get(key)
+            if val is not None and key not in result:
+                result[key] = val
 
 
 class OmniInputProcessor(InputProcessor):
@@ -88,28 +105,29 @@ class OmniInputProcessor(InputProcessor):
     def __init__(
         self,
         vllm_config: VllmConfig,
+        renderer: BaseRenderer | None = None,
+        *,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
-        super().__init__(vllm_config, mm_registry)
+        super().__init__(vllm_config, renderer=renderer, mm_registry=mm_registry)
         self.input_preprocessor = OmniInputPreprocessor(
-            self.model_config,
-            vllm_config.observability_config,
-            mm_registry,
-            mm_processor_cache=self.mm_processor_cache,
+            vllm_config=vllm_config,
+            renderer=self.renderer,
+            mm_registry=mm_registry,
         )
 
     def process_inputs(
         self,
         request_id: str,
-        prompt: PromptType | DictPrompt | TokPrompt,
+        prompt: PromptType | ProcessorInputs,
         params: SamplingParams | PoolingParams,
+        supported_tasks: tuple[SupportedTask, ...] = ("generate",),
         arrival_time: float | None = None,
         lora_request: LoRARequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
-        supported_tasks: tuple[SupportedTask, ...] | None = None,
         resumable: bool = False,
     ) -> OmniEngineCoreRequest:
         """Process input prompt into an engine core request.
@@ -123,6 +141,7 @@ class OmniInputProcessor(InputProcessor):
             request_id: Unique identifier for this request
             prompt: Input prompt (text, token IDs, embeddings, or multimodal)
             params: Sampling or pooling parameters for generation
+            supported_tasks: Tuple of supported tasks for validation
             arrival_time: Optional arrival timestamp (defaults to current time)
             lora_request: Optional LoRA adapter request
             tokenization_kwargs: Optional additional tokenization arguments
@@ -130,19 +149,17 @@ class OmniInputProcessor(InputProcessor):
             priority: Request priority (higher values processed first)
             data_parallel_rank: Optional data parallel rank for distributed
                 inference
+            resumable: Whether the request supports streaming input
 
         Returns:
-            Tuple of (prompt_string, OmniEngineCoreRequest) where:
-                - prompt_string: The original prompt as a string, or None if
-                  using embeddings
-                - OmniEngineCoreRequest: Processed request ready for the engine
+            OmniEngineCoreRequest ready for the engine
 
         Raises:
             ValueError: If data_parallel_rank is out of range or prompt_embeds
                 has incorrect shape
         """
-        self._validate_lora(lora_request)
         self._validate_params(params, supported_tasks)
+        self._validate_lora(lora_request)
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size
@@ -151,50 +168,23 @@ class OmniInputProcessor(InputProcessor):
         if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):
             raise ValueError(f"data_parallel_rank {data_parallel_rank} is out of range [0, {num_ranks}).")
 
-        if arrival_time is None:
-            arrival_time = time.time()
-
-        # Optionally generate multimodal hash overrides to avoid hashing
-        # multimodal data items by their content as their identifiers.
-
-        # NOTE: when users explicitly turn off BOTH prefix caching and input
-        # processing caching, no multimodal features or embeddings will be
-        # reused across requests, therefore identifying multimodal data items
-        # by their content is no longer necessary, and we create uuids with
-        # request id-modality-index as multimodal hash overrides.
-        if (
-            self.model_config.multimodal_config
-            and self.model_config.multimodal_config.mm_processor_cache_gb == 0
-            and not self.cache_config.enable_prefix_caching
-        ):
-            mm_uuids = self._maybe_build_mm_uuids(request_id, prompt)
+        # Short-circuit for prompts already processed by the renderer
+        # (they carry a "type" key).  Raw prompts must still go through the
+        # omni preprocessor which preserves additional_information, etc.
+        if isinstance(prompt, dict) and "type" in prompt:
+            if arrival_time is None:
+                arrival_time = prompt.get("arrival_time", time.time())
+            processed_inputs: ProcessorInputs = prompt  # type: ignore[assignment]
         else:
-            # Otherwise, use user-provided uuids as multimodal hash overrides
-            # if provided.
-            self._validate_mm_uuids(prompt)
-            if isinstance(prompt, dict):
-                mm_uuids = cast(MultiModalUUIDDict | None, prompt.get("multi_modal_uuids"))
-            else:
-                mm_uuids = None
+            if arrival_time is None:
+                arrival_time = time.time()
 
-        # Process inputs, which includes:
-        # 1. Tokenize text prompt, with LoRA request if one exists.
-        # 2. For multimodal models with a merged preprocessor, preprocess
-        #   multimodal data and expand prompt token ids accordingly.
-        with set_request_id(request_id), set_default_torch_num_threads():
-            processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
+            processed_inputs = self.input_preprocessor.preprocess(
                 prompt,
                 tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
             )
 
-        current_platform.validate_request(
-            prompt=prompt,
-            params=params,
-            processed_inputs=processed_inputs,
-        )
-
-        eos_token_id = self.input_preprocessor.get_eos_token_id()
+        self._platform_validate_request(processed_inputs, params)
 
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
         self._validate_model_inputs(encoder_inputs, decoder_inputs)
@@ -216,7 +206,10 @@ class OmniInputProcessor(InputProcessor):
             if sampling_params.max_tokens is None:
                 seq_len = length_from_prompt_token_ids_or_embeds(prompt_token_ids, prompt_embeds)
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
-            sampling_params.update_from_generation_config(self.generation_config_fields, eos_token_id)
+            sampling_params.update_from_generation_config(
+                self.generation_config_fields,
+                self.renderer.get_eos_token_id(),
+            )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
         else:
@@ -229,6 +222,13 @@ class OmniInputProcessor(InputProcessor):
             decoder_mm_inputs = decoder_inputs["mm_kwargs"]
             decoder_mm_positions = decoder_inputs["mm_placeholders"]
             decoder_mm_hashes = decoder_inputs["mm_hashes"]
+
+            if not all(isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)):
+                raise ValueError(
+                    f"mm_hashes must contain only strings, got: {decoder_mm_hashes}. "
+                    "This is likely due to an incorrect custom implementation of "
+                    "MultiModalProcessor.apply method."
+                )
 
             # Merge and flatten multimodal placeholders, hashes and inputs
             # from dictionaries to lists, and sort them by each item's position
@@ -281,7 +281,6 @@ class OmniInputProcessor(InputProcessor):
             mm_features=mm_features,
             sampling_params=sampling_params,
             pooling_params=pooling_params,
-            eos_token_id=eos_token_id,
             arrival_time=arrival_time,
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),

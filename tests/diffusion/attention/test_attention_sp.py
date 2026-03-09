@@ -414,7 +414,8 @@ def ulysses_attention_on_test_model(
             # Generate and save full input data with fixed seed
             # Reinitialize RNG to ensure reproducibility
             torch.manual_seed(42)
-            current_omni_platform.seed_everything(42)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(42)
             full_hidden_states = torch.randn(
                 (batch_size, seq_len, hidden_size),
                 dtype=dtype,

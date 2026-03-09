@@ -28,7 +28,7 @@ def get_stage_config(name: str = "qwen3_tts.yaml"):
     return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def omni_server():
     """Start vLLM-Omni server with CustomVoice model."""
     stage_config_path = get_stage_config()
@@ -225,7 +225,7 @@ class TestQwen3TTSAPIEndpoints:
         assert len(data["data"]) > 0
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def omni_server_no_async_chunk():
     """Start vLLM-Omni server with non-async-chunk config."""
     stage_config_path = get_stage_config("qwen3_tts_no_async_chunk.yaml")
