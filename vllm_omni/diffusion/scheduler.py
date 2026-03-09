@@ -8,6 +8,7 @@ from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -59,12 +60,18 @@ class Scheduler:
 
                 # Broadcast RPC request to all workers
                 self.mq.enqueue(rpc_request)
-                # Wait for result from Rank 0 (or whoever sends it)
 
+                # Wait for result from Rank 0 (or whoever sends it)
                 if self.result_mq is None:
                     raise RuntimeError("Result queue not initialized")
 
                 output = self.result_mq.dequeue()
+
+                try:
+                    unpack_diffusion_output_shm(output)
+                except Exception as e:
+                    logger.warning("SHM unpack failed (data may already be inline): %s", e)
+
                 # {"status": "error", "error": str(e)}
                 if isinstance(output, dict) and output.get("status") == "error":
                     raise RuntimeError("worker error")

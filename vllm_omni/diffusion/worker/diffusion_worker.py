@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -376,6 +377,10 @@ class WorkerProc:
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
+            try:
+                pack_diffusion_output_shm(output)
+            except Exception as e:
+                logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
             self.result_mq.enqueue(output)
 
     def recv_message(self):

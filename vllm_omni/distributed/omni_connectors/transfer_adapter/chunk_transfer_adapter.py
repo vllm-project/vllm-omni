@@ -39,7 +39,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
-        self.model_mode = getattr(model_config, "worker_type", "ar")
+        self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
         self.custom_process_next_stage_input_func = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
