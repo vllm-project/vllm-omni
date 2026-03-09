@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep import (
     NextStepConfig,
     NextStepModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -130,7 +131,7 @@ def get_nextstep11_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class NextStep11Pipeline(nn.Module):
+class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
     """
     NextStep-1.1 Pipeline for text-to-image generation.
 
@@ -232,6 +233,7 @@ class NextStep11Pipeline(nn.Module):
                 allow_patterns_overrides=["model-*.safetensors", "model.safetensors"],
             )
         ]
+        self.setup_diffusion_pipeline_profiler()
 
     @property
     def device(self):

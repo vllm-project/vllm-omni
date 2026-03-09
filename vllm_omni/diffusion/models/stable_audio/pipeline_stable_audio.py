@@ -29,6 +29,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
@@ -59,7 +60,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput):
+class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -149,6 +150,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+        self.setup_diffusion_pipeline_profiler()
 
     @property
     def guidance_scale(self):

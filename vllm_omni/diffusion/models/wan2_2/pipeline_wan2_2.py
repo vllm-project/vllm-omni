@@ -24,6 +24,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -187,7 +188,7 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,
@@ -308,6 +309,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         self._guidance_scale_2 = None
         self._num_timesteps = None
         self._current_timestep = None
+
+        self.setup_diffusion_pipeline_profiler()
 
     @property
     def guidance_scale(self):

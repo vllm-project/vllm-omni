@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageKVCache,
     GlmImageTransformer2DModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -237,7 +238,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class GlmImagePipeline(nn.Module):
+class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     """
     GLM-Image Pipeline for text-to-image and image-to-image generation.
 
@@ -320,6 +321,7 @@ class GlmImagePipeline(nn.Module):
 
         # Get transformer config for patch size
         self._patch_size = getattr(self.transformer, "patch_size", 2)
+        self.setup_diffusion_pipeline_profiler()
 
     # ==================== Input Validation ====================
 

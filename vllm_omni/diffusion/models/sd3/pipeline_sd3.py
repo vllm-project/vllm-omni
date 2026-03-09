@@ -22,6 +22,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -127,7 +128,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
+class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,
@@ -187,6 +188,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
         self.default_sample_size = 128
         self.patch_size = 2
         self.output_type = self.od_config.output_type
+        self.setup_diffusion_pipeline_profiler()
 
     def check_inputs(
         self,

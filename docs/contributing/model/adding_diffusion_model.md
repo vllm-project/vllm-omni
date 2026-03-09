@@ -796,6 +796,93 @@ class WanTransformer3DModel(nn.Module):
 
 ---
 
+### Diffusion Timing (Performance Profiling)
+When adapting a new diffusion model, it is often useful to analyze the latency of key components such as text encoding, diffusion denoising, and VAE decoding.
+vLLM-Omni provides a timing utility via `DiffusionPipelineProfilerMixin` to help developers quickly identify performance bottlenecks.
+
+This tool automatically measures the execution time of selected pipeline modules and prints the results in the logs.
+
+**Enabling Diffusion Timing**
+
+Diffusion timing is controlled by environment variables.
+
+Enable timing by setting:
+```
+export ENABLE_DIFFUSION_PIPELINE_PROFILER=1
+```
+You can optionally specify which modules to profile:
+```
+export DIFFUSION_PIPELINE_PROFILER_TARGETS="vae.encode,vae.decode,diffuse,text_encoder.forward"
+```
+If not specified, the default targets are used:
+```
+["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
+```
+**Adding DiffusionPipelineProfilerMixin to a Pipeline**
+To enable timing support in your pipeline, inherit from DiffusionPipelineProfilerMixin.
+```python
+from vllm_omni.diffusion.utils.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+
+class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
+    # Optional: Specify custom timing targets
+    _diffusion_timing_targets = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
+
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
+        # initialize pipeline components
+        ...
+
+        # initialize timing profiler
+        self.setup_diffusion_pipeline_profiler()
+```
+The mixin dynamically wraps selected methods and records their execution time during inference.
+
+**Pipeline Design for Timing**
+The current diffusion timing utility is function-based, meaning it measures the execution time of individual methods.
+
+When implementing a new pipeline, avoid putting all logic inside a single function (e.g., forward). Instead, structure the pipeline in a modular way by separating key stages into independent methods, such as the diffusion loop.
+
+For example:
+```
+def forward(self, req: OmniDiffusionRequest):
+    prompt_embeds = self.encode_prompt(req)
+    latents = self.diffuse(prompt_embeds, req)
+    images = self.vae.decode(latents)
+    return DiffusionOutput(output=images)
+```
+This allows the timing utility to measure each stage (e.g., encode_prompt, diffuse, vae.decode) separately and helps identify performance bottlenecks more easily.
+
+
+**Default Profiled Modules**
+
+By default, the following pipeline modules are timed:
+```
+vae.encode
+vae.decode
+diffuse
+text_encoder.forward
+tokenizer.forward
+```
+
+**Example Output**
+
+When enabled, timing logs appear like this:
+```
+[DiffusionTiming] text_encoder.forward took 0.018s
+[DiffusionTiming] diffuse took 2.412s
+[DiffusionTiming] vae.decode took 0.063s
+```
+These measurements help identify bottlenecks during model adaptation and optimization
+
+
+
 ## Troubleshooting
 
 

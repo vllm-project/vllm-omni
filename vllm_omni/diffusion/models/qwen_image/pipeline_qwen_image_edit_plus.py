@@ -38,6 +38,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.inputs.data import OmniTextPrompt
@@ -166,7 +167,9 @@ def get_qwen_image_edit_plus_post_process_func(
     return post_process_func
 
 
-class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin):
+class QwenImageEditPlusPipeline(
+    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin
+):
     def __init__(
         self,
         *,
@@ -224,6 +227,7 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParall
         )
         self.prompt_template_encode_start_idx = 64
         self.default_sample_size = 128
+        self.setup_diffusion_pipeline_profiler()
 
     def check_inputs(
         self,
