@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -63,6 +64,7 @@ class DiffusionWorker:
         local_rank: int,
         rank: int,
         od_config: OmniDiffusionConfig,
+        skip_load_model: bool = False,
     ):
         self.local_rank = local_rank
         self.rank = rank
@@ -79,8 +81,9 @@ class DiffusionWorker:
             od_config=self.od_config,
             device=self.device,
         )
-        self.load_model(load_format=self.od_config.diffusion_load_format)
-        self.init_lora_manager()
+        if not skip_load_model:
+            self.load_model(load_format=self.od_config.diffusion_load_format)
+            self.init_lora_manager()
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
@@ -123,6 +126,7 @@ class DiffusionWorker:
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
+                hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
             )
             init_workspace_manager(self.device)
 
@@ -373,6 +377,10 @@ class WorkerProc:
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
+            try:
+                pack_diffusion_output_shm(output)
+            except Exception as e:
+                logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
             self.result_mq.enqueue(output)
 
     def recv_message(self):
@@ -524,10 +532,15 @@ class WorkerWrapperBase:
         worker_class = self._prepare_worker_class()
 
         # Create the actual worker instance
+        # When custom_pipeline_args is provided, skip initial model loading
+        # since re_init_pipeline will handle it. This avoids allocating memory
+        # through CuMemAllocator twice, which causes assertion failures in
+        # sleep mode.
         self.worker = worker_class(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
+            skip_load_model=(self.custom_pipeline_args is not None),
         )
 
         # Re-initialize pipeline with custom pipeline if provided

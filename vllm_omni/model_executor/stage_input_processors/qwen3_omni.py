@@ -105,7 +105,7 @@ def thinker2talker_async_chunk(
         all_token_ids = _ensure_list(all_token_ids)
         prompt_token_ids = _ensure_list(prompt_token_ids)
         talker_additional_info = {
-            "thinker_embeddings": pooling_output.get("0").detach().cpu(),
+            "thinker_prefill_embeddings": pooling_output.get("0").detach().cpu(),
             "thinker_hidden_states": pooling_output.get("24").detach().cpu(),
             "thinker_sequences": all_token_ids,
             "thinker_input_ids": prompt_token_ids,
@@ -121,8 +121,12 @@ def thinker2talker_async_chunk(
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
-            talker_additional_info["thinker_embeddings"] = torch.cat(
-                (save_payload.get("thinker_embeddings"), talker_additional_info.get("thinker_embeddings")), dim=0
+            talker_additional_info["thinker_prefill_embeddings"] = torch.cat(
+                (
+                    save_payload.get("thinker_prefill_embeddings"),
+                    talker_additional_info.get("thinker_prefill_embeddings"),
+                ),
+                dim=0,
             )
             talker_additional_info["thinker_hidden_states"] = torch.cat(
                 (save_payload.get("thinker_hidden_states"), talker_additional_info.get("thinker_hidden_states")),
@@ -134,12 +138,15 @@ def thinker2talker_async_chunk(
         output_token_ids = _ensure_list(output_token_ids)
 
         talker_additional_info = {
-            "thinker_embeddings": pooling_output.get("0").detach().cpu(),
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
-
-        if not output_token_ids:
+        if output_token_ids:
+            talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
+            talker_additional_info["thinker_decode_embeddings"] = pooling_output.get("0").detach().cpu()
+            talker_additional_info["thinker_output_token_ids"] = output_token_ids
+        else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
+            talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
             talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
     return talker_additional_info
 
@@ -177,7 +184,7 @@ def thinker2talker(
         output = thinker_output.outputs[0]
 
         info = {
-            "thinker_embeddings": output.multimodal_output["0"].detach().to(device=device, dtype=torch.float),
+            "thinker_prefill_embeddings": output.multimodal_output["0"].detach().to(device=device, dtype=torch.float),
             "thinker_hidden_states": output.multimodal_output["24"].detach().to(device=device, dtype=torch.float),
             "thinker_sequences": (
                 thinker_output.prompt_token_ids + output.token_ids

@@ -13,11 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
-import copy
 import io
 import urllib.request
 from collections.abc import Iterable
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -36,6 +34,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .configuration_qwen3_tts import Qwen3TTSConfig
 from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 from .processing_qwen3_tts import Qwen3TTSProcessor
+from .voice_cache_manager import VoiceCacheManager, VoiceClonePromptItem
 
 logger = init_logger(__name__)
 
@@ -60,21 +59,6 @@ AudioLike = (
 MaybeList = Any | list[Any]
 
 
-@dataclass
-class VoiceClonePromptItem:
-    """
-    Container for one sample's voice-clone prompt information that can be fed to the model.
-
-    Fields are aligned with `Qwen3TTSForConditionalGeneration.generate(..., voice_clone_prompt=...)`.
-    """
-
-    ref_code: torch.Tensor | None  # (T, Q) or (T,) depending on tokenizer 25Hz/12Hz
-    ref_spk_embedding: torch.Tensor  # (D,)
-    x_vector_only_mode: bool
-    icl_mode: bool
-    ref_text: str | None = None
-
-
 class Qwen3TTSModelForGeneration(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -94,7 +78,9 @@ class Qwen3TTSModelForGeneration(nn.Module):
             torch_dtype=torch.bfloat16,
             **attn_kwargs,
         )
-        self.task_type = _normalize_task_type(model_path.split("-")[-1].split("/")[0])
+        self.task_type = getattr(vllm_config.model_config, "task_type", None) or _normalize_task_type(
+            model_path.split("-")[-1].split("/")[0]
+        )
         # Mark that this model produces multimodal outputs
         self.have_multimodal_outputs = True
 
@@ -128,6 +114,13 @@ class Qwen3TTSModelForGeneration(nn.Module):
         except Exception:
             logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)
 
+    @staticmethod
+    def extract_val(d, key, default):
+        val = d.get(key, default)
+        if isinstance(val, list):
+            return val[0] if len(val) > 0 else default
+        return val
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -137,7 +130,7 @@ class Qwen3TTSModelForGeneration(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         """
-        Forward pass for TTS generation model.
+        Forward pass for TTS generation model (Patched for batched inference).
 
         Args:
             input_ids: Input token IDs (required for TTS generation)
@@ -149,46 +142,62 @@ class Qwen3TTSModelForGeneration(nn.Module):
         Returns:
             OmniOutput: Contains multimodal outputs with audio tensors
         """
+        runtime_info_list = kwargs.get("runtime_additional_information", [{}])
+        if not isinstance(runtime_info_list, list):
+            runtime_info_list = [runtime_info_list]
 
-        # Extract additional parameters from kwargs that the generation methods expect
+        # Initialize lists to accumulate batched inputs
+        texts = []
+        task_types = []
+        speakers = []
+        languages = []
+        instructs = []
+        merged_kwargs = {}
 
-        runtime_additional_information = kwargs.get("model_intermediate_buffer")
-        if runtime_additional_information is None:
-            runtime_additional_information = kwargs.get("runtime_additional_information", [{}])
-        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
-            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
-        if isinstance(runtime_additional_information, list) and len(runtime_additional_information) > 0:
-            runtime_additional_information = runtime_additional_information[0]
-        runtime_additional_information = copy.deepcopy(runtime_additional_information)
-        text = runtime_additional_information.pop("text", [""])[0]
-        # Extract task_type from kwargs, default to self.task_type
-        task_type = _normalize_task_type(runtime_additional_information.pop("task_type", [self.task_type])[0])
-        speaker = runtime_additional_information.pop("speaker", ["uncle_fu"])[0]
-        language = runtime_additional_information.pop("language", ["Auto"])[0]
-        instruct = runtime_additional_information.pop("instruct", [""])[0]
-        for key, value in runtime_additional_information.items():
-            if isinstance(value, list) and len(value) > 0:
-                runtime_additional_information[key] = value[0]
+        # Keys that the underlying model natively supports as lists for batched inference
+        batched_keys = {"ref_audio", "ref_text", "x_vector_only_mode", "voice_clone_prompt"}
 
-        # During profile/warmup runs, text is empty and no real inputs exist.
-        # Cap generation steps so the full pipeline executes (preserving
-        # KV-cache profiling behaviour) but exits quickly even if the model
-        # cannot converge from degenerate dummy inputs.
-        if not text:
+        for req_info in runtime_info_list:
+            texts.append(self.extract_val(req_info, "text", ""))
+            task_types.append(self.extract_val(req_info, "task_type", self.task_type))
+            speakers.append(self.extract_val(req_info, "speaker", "uncle_fu"))
+            languages.append(self.extract_val(req_info, "language", "Auto"))
+            instructs.append(self.extract_val(req_info, "instruct", ""))
+
+            for k, v in req_info.items():
+                if k not in ["text", "task_type", "speaker", "language", "instruct"]:
+                    # Extract single value from list if wrapped
+                    val = v[0] if isinstance(v, list) and len(v) > 0 else v
+
+                    if k in batched_keys:
+                        # Accumulate as list for batched generation
+                        if k not in merged_kwargs:
+                            merged_kwargs[k] = []
+                        merged_kwargs[k].append(val)
+                    else:
+                        # For scalar params (e.g. max_new_tokens), take from the first request
+                        if k not in merged_kwargs:
+                            merged_kwargs[k] = val
+
+        # During profile/warmup runs, texts are empty.
+        if all(not t for t in texts):
             logger.info("Profile run detected (empty text). Capping max_new_tokens to 2.")
-            runtime_additional_information["max_new_tokens"] = 2
+            merged_kwargs["max_new_tokens"] = 2
 
-        # Call the appropriate generation method based on task_type
+        # Assume uniform task type across the batch
+        if len(set(task_types)) > 1:
+            raise ValueError(f"Mixed task types not supported: {set(task_types)}")
+        task_type = task_types[0]
+
+        # Call the appropriate generation method based on task_type, passing lists
         if task_type == "CustomVoice":
             result = self.model.generate_custom_voice(
-                text, speaker=speaker, language=language, instruct=instruct, **runtime_additional_information
+                texts, speaker=speakers, language=languages, instruct=instructs, **merged_kwargs
             )
         elif task_type == "VoiceDesign":
-            result = self.model.generate_voice_design(
-                text, instruct=instruct, language=language, **runtime_additional_information
-            )
+            result = self.model.generate_voice_design(texts, instruct=instructs, language=languages, **merged_kwargs)
         elif task_type == "Base":
-            result = self.model.generate_voice_clone(text, language=language, **runtime_additional_information)
+            result = self.model.generate_voice_clone(texts, language=languages, **merged_kwargs)
         else:
             raise ValueError(f"Invalid task type: {task_type}")
 
@@ -207,17 +216,20 @@ class Qwen3TTSModelForGeneration(nn.Module):
         # Handle tuple format: (audio_tensors, sample_rate)
         if isinstance(model_outputs, tuple) and len(model_outputs) == 2:
             audio_tensors, sr = model_outputs
-            # audio_tensors is a list of numpy arrays, convert first one to tensor if needed
+            # audio_tensors is a list of numpy arrays, convert ALL to tensors
             if isinstance(audio_tensors, list) and len(audio_tensors) > 0:
-                # Convert numpy array to tensor if needed
-                audio_tensor = audio_tensors[0]
-                if isinstance(audio_tensor, np.ndarray):
-                    audio_tensor = torch.from_numpy(audio_tensor).float()
-                elif not isinstance(audio_tensor, torch.Tensor):
-                    audio_tensor = torch.tensor(audio_tensor, dtype=torch.float32)
+                audio_tensor_list = []
+                for audio_tensor in audio_tensors:
+                    if isinstance(audio_tensor, np.ndarray):
+                        audio_tensor_list.append(torch.from_numpy(audio_tensor).float())
+                    elif not isinstance(audio_tensor, torch.Tensor):
+                        audio_tensor_list.append(torch.tensor(audio_tensor, dtype=torch.float32))
+                    else:
+                        audio_tensor_list.append(audio_tensor)
+
                 return OmniOutput(
                     text_hidden_states=None,
-                    multimodal_outputs={"model_outputs": audio_tensor, "sr": torch.tensor(sr, dtype=torch.int)},
+                    multimodal_outputs={"model_outputs": audio_tensor_list, "sr": torch.tensor(sr, dtype=torch.int)},
                 )
 
         # If it's already a tensor, wrap it
@@ -345,6 +357,12 @@ class Qwen3TTSModel:
         self.model = model
         self.processor = processor
         self.generate_defaults = generate_defaults or {}
+
+        # Initialize voice cache manager.
+        # Note: this creates its own MetadataManager for the same metadata.json
+        # used by serving_speech.py. Sharing is not possible across model/serving
+        # layers, but file locking in MetadataManager ensures correctness.
+        self.voice_cache_manager = VoiceCacheManager()
 
         self.device = getattr(model, "device", None)
         if self.device is None:
@@ -764,6 +782,7 @@ class Qwen3TTSModel:
         self,
         text: str | list[str],
         language: str | list[str] = None,
+        speaker: str | None = None,  # New parameter: speaker name
         ref_audio: AudioLike | list[AudioLike] | None = None,
         ref_text: str | list[str | None] | None = None,
         x_vector_only_mode: bool | list[bool] = False,
@@ -838,7 +857,27 @@ class Qwen3TTSModel:
 
         self._validate_languages(languages)
 
-        if voice_clone_prompt is None:
+        # Cache logic: if speaker parameter is provided, try to load from cache
+        cache_loaded = False
+        cache_speaker = None
+        cache_audio_path = None
+
+        if speaker:
+            # Use VoiceCacheManager to load cached voice prompt, passing device parameter
+            cached_items = self.voice_cache_manager.load_cached_voice_prompt(speaker, device=str(self.device))
+            if cached_items is not None:
+                voice_clone_prompt = cached_items
+                cache_loaded = True
+
+            # If no cache, check if cache needs to be generated
+            if not cache_loaded:
+                audio_file_path = self.voice_cache_manager.get_speaker_audio_path(speaker)
+                if audio_file_path:
+                    logger.info(f"Will generate cache for speaker: {speaker} (first use)")
+                    cache_speaker = speaker
+                    cache_audio_path = audio_file_path
+
+        if voice_clone_prompt is None and not cache_loaded:
             if ref_audio is None:
                 # For profile run
                 sample_rate = int(self.model.speaker_encoder_sample_rate)
@@ -852,6 +891,28 @@ class Qwen3TTSModel:
             prompt_items = self.create_voice_clone_prompt(
                 ref_audio=ref_audio, ref_text=ref_text, x_vector_only_mode=x_vector_only_mode
             )
+
+            # If cache needs to be generated, save cache file
+            if cache_speaker and cache_audio_path:
+                try:
+                    # Use VoiceCacheManager to save cache
+                    success = self.voice_cache_manager.save_voice_cache(cache_speaker, cache_audio_path, prompt_items)
+                    if success:
+                        logger.info(f"Cache generated and saved for speaker: {cache_speaker}")
+                    else:
+                        logger.error(f"Failed to save cache for speaker: {cache_speaker}")
+                except Exception as e:
+                    logger.error(f"Failed to save cache for speaker {cache_speaker}: {e}")
+
+            if len(prompt_items) == 1 and len(texts) > 1:
+                prompt_items = prompt_items * len(texts)
+            if len(prompt_items) != len(texts):
+                raise ValueError(f"Batch size mismatch: prompt={len(prompt_items)}, text={len(texts)}")
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+            ref_texts_for_ids = [it.ref_text for it in prompt_items]
+        elif cache_loaded and isinstance(voice_clone_prompt, list):
+            # Use cached VoiceClonePromptItem
+            prompt_items = voice_clone_prompt
             if len(prompt_items) == 1 and len(texts) > 1:
                 prompt_items = prompt_items * len(texts)
             if len(prompt_items) != len(texts):
