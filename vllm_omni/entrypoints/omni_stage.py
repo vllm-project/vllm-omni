@@ -76,20 +76,16 @@ def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int =
     """
     from vllm_omni.worker.gpu_memory_utils import is_process_scoped_memory_available
 
-    nvml_available = is_process_scoped_memory_available()
-    pid_host = detect_pid_host()
-
-    if nvml_available and pid_host:
-        logger.info(
+    if is_process_scoped_memory_available() and detect_pid_host():
+        logger.debug(
             "NVML process-scoped memory available and PID host is available — concurrent init is safe, skipping locks"
         )
         yield
         return
     else:
-        logger.info(
-            "Using sequential init locks (nvml_available=%s, pid_host=%s)",
-            nvml_available,
-            pid_host,
+        logger.debug(
+            "NVML unavailable or PID host is not available (usually inside a container, "
+            "--pid=host is not set in docker run command) — using sequential init locks"
         )
 
     from vllm_omni.platforms import current_omni_platform
@@ -1356,7 +1352,7 @@ async def _stage_worker_async(
                 usage_context=usage_context,
                 engine_args=omni_engine_args,
                 disable_log_stats=bool(
-                    engine_args.get("disable_log_stats", True) or getattr(omni_engine_args, "disable_log_stats", True)
+                    engine_args.get("disable_log_stats", False) or getattr(omni_engine_args, "disable_log_stats", False)
                 ),
             )
     if hasattr(stage_engine, "log_stats") and stage_engine.log_stats:

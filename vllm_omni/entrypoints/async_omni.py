@@ -432,7 +432,10 @@ class AsyncOmni(OmniBase):
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         all_stages_finished = {stage_id: False for stage_id in range(final_stage_id_for_e2e + 1)}
         submit_flag = True
+        _loop_iter = 0
+        _last_progress_ts = time.time()
         while not all(all_stages_finished.values()):
+            _loop_iter += 1
             for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
                 if all_stages_finished[stage_id]:
                     continue
@@ -441,6 +444,7 @@ class AsyncOmni(OmniBase):
                 except asyncio.QueueEmpty:
                     await asyncio.sleep(0.001)
                     continue
+                _last_progress_ts = time.time()
                 engine_outputs, finished, output_to_yield = self._process_single_result(
                     result,
                     stage,
@@ -449,11 +453,20 @@ class AsyncOmni(OmniBase):
                 )
                 if submit_flag and stage_id == 0:
                     submit_flag = False
-                    prompt_token_ids = engine_outputs.prompt_token_ids
+                    prompt_token_ids = getattr(engine_outputs, "prompt_token_ids", None)
+                    if prompt_token_ids is None:
+                        prompt_token_ids = []
                     engine_input = copy.deepcopy(prompt)
-                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    try:
+                        next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    except Exception:
+                        raise
                     engine_input["prompt_token_ids"] = [0] * next_prompt_len
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
+                    for _mm_key in ("mm_kwargs", "mm_hashes", "mm_placeholders", "multi_modal_uuids"):
+                        engine_input.pop(_mm_key, None)
+                    if engine_input.get("type") == "multimodal":
+                        engine_input["type"] = "token"
                     for i in range(1, len(self.stage_list)):
                         task = {
                             "request_id": request_id,
@@ -706,6 +719,16 @@ class AsyncOmni(OmniBase):
             stage.submit(abort_task)
         return None
 
+    async def get_supported_tasks(self) -> set[str]:
+        tasks: set[str] = set()
+        has_comprehension = any(stage.is_comprehension for stage in self.stage_list)
+        if has_comprehension:
+            tasks.add("generate")
+        for stage in self.stage_list:
+            if getattr(stage, "final_output_type", None) == "audio":
+                tasks.add("speech")
+        return tasks if tasks else {"generate"}
+
     async def get_vllm_config(self) -> VllmConfig:
         for stage in self.stage_list:
             if stage.is_comprehension:
@@ -744,6 +767,8 @@ class AsyncOmni(OmniBase):
         OMNI: Required by upstream OpenAIServingModels.__init__ which
         accesses engine_client.renderer.
         """
+        if self.input_processor is None:
+            return None
         return self.input_processor.renderer
 
     async def do_log_stats(self) -> None:
