@@ -1,3 +1,4 @@
+import inspect
 import uuid
 import warnings
 from queue import Empty, Queue
@@ -1194,3 +1195,72 @@ def test_close_sends_shutdown_signal(monkeypatch: pytest.MonkeyPatch, mocker: Mo
 
     # Verify stop_stage_worker was called (process should be set)
     assert omni.stage_list[0]._proc is not None
+
+
+# ---------------------------------------------------------------------------
+# Signature compatibility tests — catch upstream API drift early
+# ---------------------------------------------------------------------------
+
+_INHERITANCE_PAIRS: list[tuple[str, str, str, str]] = [
+    (
+        "vllm.entrypoints.llm",
+        "LLM",
+        "vllm_omni.entrypoints.omni_llm",
+        "OmniLLM",
+    ),
+]
+
+
+def _import_class(module_path: str, class_name: str):
+    mod = __import__(module_path, fromlist=[class_name])
+    return getattr(mod, class_name)
+
+
+@pytest.mark.parametrize(
+    "up_mod,up_cls,omni_mod,omni_cls",
+    _INHERITANCE_PAIRS,
+    ids=[f"{pair[3]}({pair[1]})" for pair in _INHERITANCE_PAIRS],
+)
+def test_overridden_method_signatures_compatible(up_mod: str, up_cls: str, omni_mod: str, omni_cls: str):
+    """All params accepted by a base-class method must also be accepted by
+    the overriding method in the vllm-omni subclass.  This prevents
+    TypeError at runtime when upstream callers pass new arguments."""
+    BaseCls = _import_class(up_mod, up_cls)
+    OmniCls = _import_class(omni_mod, omni_cls)
+
+    failures: list[str] = []
+    for name in dir(OmniCls):
+        if name.startswith("__") and name != "__init__":
+            continue
+        omni_method = getattr(OmniCls, name, None)
+        base_method = getattr(BaseCls, name, None)
+        if not (callable(omni_method) and callable(base_method)):
+            continue
+        if omni_method is base_method:
+            continue
+        try:
+            base_sig = inspect.signature(base_method)
+            omni_sig = inspect.signature(omni_method)
+        except (ValueError, TypeError):
+            continue
+
+        omni_has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in omni_sig.parameters.values())
+
+        base_params = base_sig.parameters
+        omni_params = set(omni_sig.parameters.keys())
+
+        missing = []
+        for pname, param in base_params.items():
+            if pname in omni_params:
+                continue
+            if omni_has_var_keyword and param.kind in (
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                continue
+            missing.append(pname)
+
+        if missing:
+            failures.append(f"{omni_cls}.{name}() missing params {sorted(missing)}; base={base_sig}, omni={omni_sig}")
+
+    assert not failures, f"Signature mismatches found ({len(failures)}):\n" + "\n".join(f"  - {f}" for f in failures)

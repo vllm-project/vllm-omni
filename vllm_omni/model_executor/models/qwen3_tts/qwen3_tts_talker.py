@@ -831,7 +831,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     def _is_url(self, s: str) -> bool:
         try:
             u = urlparse(s)
-            return u.scheme in ("http", "https") and bool(u.netloc)
+            if u.scheme in ("http", "https"):
+                return bool(u.netloc)
+            return u.scheme == "file"
         except Exception:
             return False
 
@@ -841,12 +843,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return base64.b64decode(b64)
 
     def _load_audio_to_np(self, x: str) -> tuple[np.ndarray, int]:
-        """Load audio from local path or base64 data URI (no network I/O)."""
+        """Load audio from local path, URL, or base64 data URI.
+
+        Uses upstream vLLM's MediaConnector for http(s) URLs and ``file:``
+        URIs, with unrestricted local access (offline inference is trusted).
+        """
         import librosa
 
         if self._is_url(x):
-            raise ValueError("ref_audio URLs must be resolved by the serving layer before reaching the model worker.")
-        if self._is_probably_base64(x):
+            from vllm.multimodal.media import MediaConnector
+
+            connector = MediaConnector(allowed_local_media_path="/")
+            audio, sr = connector.fetch_audio(x)
+        elif self._is_probably_base64(x):
             wav_bytes = self._decode_base64_to_wav_bytes(x)
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)

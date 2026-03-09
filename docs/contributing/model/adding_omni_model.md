@@ -460,7 +460,7 @@ def forward(self, ...):
 These keys are then accessible in your stage transition function:
 ```python
 # In stage_input_processors/qwen3_omni.py
-thinker_embeddings = output.multimodal_output["0"]  # Access by key
+thinker_prefill_embeddings = output.multimodal_output["0"]  # Access by key
 thinker_hidden_states = output.multimodal_output["24"]
 ```
 
@@ -513,11 +513,11 @@ def thinker2talker(
     for thinker_output in thinker_outputs:
         output = thinker_output.outputs[0]
         # Extract thinker embeddings and hidden states
-        thinker_embeddings = output.multimodal_output["0"].float().clone().detach().cuda()
+        thinker_prefill_embeddings = output.multimodal_output["0"].float().clone().detach().cuda()
         thinker_hidden_states = output.multimodal_output["24"].float().clone().detach().cuda()
 
         info = {
-            "thinker_embeddings": thinker_embeddings,
+            "thinker_prefill_embeddings": thinker_prefill_embeddings,
             "thinker_hidden_states": thinker_hidden_states,
             "thinker_sequences": thinker_output.prompt_token_ids + output.token_ids,
             "thinker_input_ids": thinker_output.prompt_token_ids,

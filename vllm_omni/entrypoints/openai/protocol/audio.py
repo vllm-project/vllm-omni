@@ -55,6 +55,11 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    initial_codec_chunk_frames: int | None = Field(
+        default=None,
+        ge=0,
+        description="Initial chunk size for reduced TTFA. Overrides stage config for this request.",
+    )
 
     @field_validator("stream_format")
     @classmethod

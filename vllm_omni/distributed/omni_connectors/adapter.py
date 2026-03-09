@@ -35,12 +35,26 @@ def try_send_via_connector(
     try:
         t0 = time.time()
 
+        # Strip non-serializable multimodal feature fields from original_prompt
+        # before including it in metadata.  After stage-0 runs, the TokPrompt
+        # returned by render_chat_async may carry processed multimodal features
+        # (mm_kwargs, mm_placeholders, mm_hashes) that contain MultiModalKwargsItems
+        # objects, which are not supported by OmniMsgpackEncoder.  The receiving
+        # side (try_recv_via_connector) only extracts "engine_inputs" from the
+        # payload and never uses "original_prompt", so stripping these fields
+        # only affects debug metadata and is safe.
+        _MM_FEATURE_KEYS = frozenset({"mm_kwargs", "mm_placeholders", "mm_hashes"})
+        if isinstance(original_prompt, dict) and any(k in original_prompt for k in _MM_FEATURE_KEYS):
+            safe_prompt = {k: v for k, v in original_prompt.items() if k not in _MM_FEATURE_KEYS}
+        else:
+            safe_prompt = original_prompt
+
         # Prepare data for connector
         payload_data = {
             "engine_inputs": next_inputs,
             "sampling_params": sampling_params,
             "metadata": {
-                "original_prompt": original_prompt,
+                "original_prompt": safe_prompt,
                 "stage_transition": f"{stage_id}->{next_stage_id}",
                 "timestamp": time.time(),
             },
