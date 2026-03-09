@@ -184,6 +184,59 @@ sudo apt install ffmpeg
 
 ## API Reference
 
+### Voices Endpoint
+
+#### GET /v1/audio/voices
+
+List all available voices/speakers from the loaded model, including both built-in model voices and uploaded custom voices.
+
+**Response Example:**
+```json
+{
+  "voices": ["vivian", "ryan", "custom_voice_1"],
+  "uploaded_voices": [
+    {
+      "name": "custom_voice_1",
+      "consent": "user_consent_id",
+      "created_at": 1738660000,
+      "file_size": 1024000,
+      "mime_type": "audio/wav"
+    }
+  ]
+}
+```
+
+#### POST /v1/audio/voices
+
+Upload a new voice sample for voice cloning in Base task TTS requests.
+
+**Form Parameters:**
+- `audio_sample` (required): Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4)
+- `consent` (required): Consent recording ID
+- `name` (required): Name for the new voice
+
+**Response Example:**
+```json
+{
+  "success": true,
+  "voice": {
+    "name": "custom_voice_1",
+    "consent": "user_consent_id",
+    "created_at": 1738660000,
+    "mime_type": "audio/wav",
+    "file_size": 1024000
+  }
+}
+```
+
+**Usage Example:**
+```bash
+curl -X POST http://localhost:8000/v1/audio/voices \
+  -F "audio_sample=@/path/to/voice_sample.wav" \
+  -F "consent=user_consent_id" \
+  -F "name=custom_voice_1"
+```
+
 ### Endpoint
 
 ```
@@ -192,20 +245,6 @@ Content-Type: application/json
 ```
 
 This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/docs/api-reference/audio/createSpeech) format with additional Qwen3-TTS parameters.
-
-### Voices Endpoint
-
-```
-GET /v1/audio/voices
-```
-
-Lists available voices for the loaded model:
-
-```json
-{
-    "voices": ["aiden", "dylan", "eric", "one_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"]
-}
-```
 
 ### Request Body
 
@@ -250,6 +289,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | `language`       | string | "Auto"        | Language (see supported languages below)                                     |
 | `instructions`   | string | ""            | Voice style/emotion instructions                                             |
 | `max_new_tokens` | int    | 2048          | Maximum tokens to generate                                                   |
+| `initial_codec_chunk_frames` | int | null | Initial chunk size for reduced TTFA (overrides stage config)                 |
 | `stream`         | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
@@ -265,7 +305,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 ## Streaming
 
 Set `stream=true` with `response_format="pcm"` to receive raw PCM audio chunks as they are decoded
-(one chunk per 25-frame Code2Wav window):
+(one chunk per Code2Wav window, default 25 frames; configurable in the stage config):
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \

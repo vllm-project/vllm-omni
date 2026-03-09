@@ -63,6 +63,7 @@ class DiffusionWorker:
         local_rank: int,
         rank: int,
         od_config: OmniDiffusionConfig,
+        skip_load_model: bool = False,
     ):
         self.local_rank = local_rank
         self.rank = rank
@@ -79,8 +80,9 @@ class DiffusionWorker:
             od_config=self.od_config,
             device=self.device,
         )
-        self.load_model(load_format=self.od_config.diffusion_load_format)
-        self.init_lora_manager()
+        if not skip_load_model:
+            self.load_model(load_format=self.od_config.diffusion_load_format)
+            self.init_lora_manager()
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
@@ -524,10 +526,15 @@ class WorkerWrapperBase:
         worker_class = self._prepare_worker_class()
 
         # Create the actual worker instance
+        # When custom_pipeline_args is provided, skip initial model loading
+        # since re_init_pipeline will handle it. This avoids allocating memory
+        # through CuMemAllocator twice, which causes assertion failures in
+        # sleep mode.
         self.worker = worker_class(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
+            skip_load_model=(self.custom_pipeline_args is not None),
         )
 
         # Re-initialize pipeline with custom pipeline if provided

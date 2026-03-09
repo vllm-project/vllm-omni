@@ -36,6 +36,7 @@ class OmniStageTaskType(enum.Enum):
     SHUTDOWN = "shutdown"
     PROFILER_START = "profiler_start"
     PROFILER_STOP = "profiler_stop"
+    COLLECTIVE_RPC = "collective_rpc"
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
