@@ -9,7 +9,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.renderers import renderer_from_config
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
@@ -106,21 +106,17 @@ class AsyncOmniLLM(AsyncLLM):
                 "enabling logging without default stat loggers"
             )
 
-        if self.model_config.skip_tokenizer_init:
-            tokenizer = None
-        else:
-            # Tokenizer (+ ensure liveness if running in another process).
-            tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
-
         # InputProcessor (converts Inputs --> EngineCoreRequests).
         self.input_processor = OmniInputProcessor(
             vllm_config=vllm_config,
             mm_registry=mm_registry,
         )
 
+        self.renderer = renderer_from_config(self.vllm_config)
+
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
         self.output_processor = MultimodalOutputProcessor(
-            tokenizer=tokenizer,
+            tokenizer=self.renderer.tokenizer,
             log_stats=self.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
