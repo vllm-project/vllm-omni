@@ -28,6 +28,7 @@ from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
+    resolve_model_type,
 )
 
 logger = init_logger(__name__)
@@ -84,12 +85,13 @@ class OmniLLM(LLM):
         self.worker_backend = kwargs.get("worker_backend", "multi_process")
         self.ray_address = kwargs.get("ray_address", None)
         self.batch_timeout = batch_timeout
+        self.model_type = resolve_model_type(model)
         self.log_stats: bool = bool(log_stats)
 
         # Load stage configurations
         if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model)
+            self.config_path = resolve_model_config_path(self.model_type)
+            self.stage_configs = load_stage_configs_from_model(config_path=self.config_path)
         else:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
