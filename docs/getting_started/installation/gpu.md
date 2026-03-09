@@ -30,7 +30,7 @@ vLLM-Omni is a Python library that supports the following GPU variants. The libr
 
 ### Pre-built wheels
 
-Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1, 0.12.0rc1, 0.14.0rc1, 0.14.0. For the latest version, please [build from source](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/gpu/#build-wheel-from-source).
+Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1, 0.12.0rc1, 0.14.0rc1, 0.14.0, 0.16.0. For the latest version, please [build from source](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/gpu/#build-wheel-from-source).
 
 === "NVIDIA CUDA"
 

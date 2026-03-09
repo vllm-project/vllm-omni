@@ -43,9 +43,12 @@ from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
 from transformers.models.whisper import WhisperFeatureExtractor
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import (
@@ -70,7 +73,9 @@ from vllm.model_executor.models.qwen2_audio import Qwen2AudioProcessingInfo
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeModel as _Qwen3MoeLLMModel
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
-    Qwen3Omni_VisionTransformer,
+    Qwen3Omni_VisionTransformer as _Qwen3Omni_VisionTransformer,
+)
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
     _get_feat_extract_output_lengths,
 )
@@ -103,6 +108,90 @@ except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
 logger = init_logger(__name__)
+
+
+class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
+    """Subclass that fixes Qwen2_5_VisionAttention.forward() compatibility.
+
+    The upstream Qwen3_VisionBlock.forward() does not pass the
+    ``sequence_lengths`` argument required by the updated
+    Qwen2_5_VisionAttention.forward() signature.  This subclass overrides
+    ``forward()`` to compute ``sequence_lengths`` via MMEncoderAttention
+    (following the pattern in qwen3_vl.py) and calls block internals
+    directly so the argument is forwarded correctly.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thw,
+    ) -> torch.Tensor:
+        hidden_states = x.to(device=self.device, dtype=self.dtype)
+        hidden_states = self.patch_embed(hidden_states)
+
+        if self.apply_vit_abs_pos_embed:
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+            hidden_states = hidden_states + pos_embeds
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw)
+
+        if isinstance(grid_thw, torch.Tensor):
+            grid_thw_np = grid_thw.cpu().numpy().astype(np.int32)
+        else:
+            grid_thw_np = np.array(grid_thw, dtype=np.int32)
+
+        cu_seqlens = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(axis=0, dtype=np.int32)
+        cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+
+        sequence_lengths = MMEncoderAttention.maybe_compute_sequence_lengths(self.attn_backend, cu_seqlens)
+        if sequence_lengths is not None:
+            sequence_lengths = torch.from_numpy(sequence_lengths).to(self.device, non_blocking=True)
+        max_seqlen = torch.tensor(
+            MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
+            self.attn_backend,
+            cu_seqlens,
+            self.hidden_size,
+            self.tp_size,
+        )
+        cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
+
+        hidden_states = hidden_states.unsqueeze(1)
+
+        hidden_states_list = []
+        deepstack_visual_indexes = self.deepstack_visual_indexes
+
+        for layer_num, blk in enumerate(self.blocks):
+            hidden_states = hidden_states + blk.attn(
+                blk.norm1(hidden_states),
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
+            )
+            hidden_states = hidden_states + blk.mlp(blk.norm2(hidden_states))
+
+            if deepstack_visual_indexes is not None and layer_num in deepstack_visual_indexes:
+                hidden_states_list.append(hidden_states)
+
+        hidden_states = self.merger(hidden_states)
+
+        if deepstack_visual_indexes is not None:
+            processed_hidden_states_list = [hidden_states]
+            for idx, x_ds in enumerate(hidden_states_list):
+                x_ds = self.merger_list[idx](x_ds)
+                processed_hidden_states_list.append(x_ds)
+            hidden_states = torch.cat(processed_hidden_states_list, dim=1)
+
+        return hidden_states
+
 
 # Speech input languages supported by Qwen3-Omni
 # From: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct
@@ -228,6 +317,38 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None, "image": None, "video": None}
 
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int] | None = None,
+    ) -> Mapping[str, int] | None:
+        mm_counts = mm_counts or {}
+        requested_modalities = {m for m, c in mm_counts.items() if c > 0}
+        mm_max_tokens: dict[str, int] = {}
+
+        if requested_modalities & {"image", "video"}:
+            vl_tokens = Qwen2_5_VLProcessingInfo.get_mm_max_tokens_per_item(
+                self,
+                seq_len=seq_len,
+                mm_counts=mm_counts,
+            )
+            mm_max_tokens.update({m: vl_tokens[m] for m in ["image", "video"] if m in requested_modalities})
+
+        if "audio" in requested_modalities:
+            audio_tokens = Qwen2AudioProcessingInfo.get_mm_max_tokens_per_item(
+                self,
+                seq_len=seq_len,
+                mm_counts=mm_counts,
+            )
+            if audio_tokens is None:
+                feature_extractor = self.get_feature_extractor()
+                max_audio_samples = feature_extractor.chunk_length * feature_extractor.sampling_rate
+                max_audio_tokens = int(_get_feat_extract_output_lengths(torch.tensor([max_audio_samples])).item())
+                audio_tokens = {"audio": max_audio_tokens}
+            mm_max_tokens["audio"] = audio_tokens["audio"]
+
+        return mm_max_tokens
+
 
 Qwen3OmniMoeThinkerDummyInputsBuilder = Qwen2_5OmniThinkerDummyInputsBuilder
 
@@ -253,7 +374,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             return x
 
         # NOTE: WhisperFeatureExtractor cannot handle empty list of audios
-        feature_extractor = self.info.get_feature_extractor()
+        feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
         hop_length = feature_extractor.hop_length
         if audios:
             # NOTE: Qwen3-Omni processor accept "audio"
@@ -653,8 +774,7 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
             feature_lens=audio_feature_lengths,
             aftercnn_lens=audio_output_lengths,
         )
-        # OMNI: audio_tower.forward() returns hidden_states tensor directly
-        audio_features = audio_outputs
+        audio_features = audio_outputs if isinstance(audio_outputs, torch.Tensor) else audio_outputs.last_hidden_state
         return audio_features.split(audio_output_lengths.tolist())
 
 
@@ -936,14 +1056,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 num_audio,
             )
 
-        # Default: standard merge (no interleaving)
-        inputs_embeds = _merge_multimodal_embeddings(
-            inputs_embeds=inputs_embeds,
+        # Default: standard merge (no interleaving), same as parent class.
+        # multimodal_embeddings may have been updated above (deepstack
+        # main-scale). Use super() to stay consistent with the parent
+        # implementation and avoid issues seen in Qwen2.5-Omni (#34506).
+        return super().embed_input_ids(
+            input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
         )
-
-        return inputs_embeds
 
     def forward(
         self,

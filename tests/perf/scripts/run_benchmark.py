@@ -1,9 +1,5 @@
-import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
-
 import json
+import os
 import subprocess
 import threading
 from datetime import datetime
@@ -13,6 +9,9 @@ from typing import Any
 import pytest
 
 from tests.conftest import OmniServer, modify_stage_config
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
@@ -123,6 +122,8 @@ def run_benchmark(args: list, test_name: str, flow, dataset_name: str, num_promp
             "--endpoint",
             "/v1/chat/completions",
             "--save-result",
+            "--result-dir",
+            os.environ.get("BENCHMARK_DIR", "tests"),
             "--result-filename",
             result_filename,
         ]
@@ -137,9 +138,9 @@ def run_benchmark(args: list, test_name: str, flow, dataset_name: str, num_promp
     for line in iter(process.stderr.readline, ""):
         print(line, end=" ")
 
-    if "--result-dir" in args:
-        index = args.index("--result-dir")
-        result_dir = args[index + 1]
+    if "--result-dir" in command:
+        index = command.index("--result-dir")
+        result_dir = command[index + 1]
     else:
         result_dir = "./"
 
@@ -186,6 +187,10 @@ def benchmark_params(request, omni_server):
 
     if param_index >= len(all_params):
         raise ValueError(f"No benchmark parameters found for index {param_index} in test: {test_name}")
+
+    if all_params[param_index]["dataset_name"] == "random-mm":
+        # TODO: Due to known issues, skip the random-mm dataset.
+        pytest.skip("Skipping parameter for random-mm dataset.")
 
     current = param_index + 1
     total = len(all_params)

@@ -36,12 +36,12 @@ from transformers.models.glm_image.configuration_glm_image import (
     GlmImageVQVAEConfig,
 )
 from transformers.models.glm_image.processing_glm_image import GlmImageProcessor
-from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, MultiModalConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )

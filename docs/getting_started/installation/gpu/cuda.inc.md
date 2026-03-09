@@ -40,7 +40,7 @@ If you do not need to modify source code of vLLM, you can directly install the s
 uv pip install vllm==0.16.0 --torch-backend=auto
 ```
 
-The release 0.14.0 of vLLM is based on PyTorch 2.9.0 which requires CUDA 12.9 environment.
+The release 0.16.0 of vLLM is based on PyTorch 2.9.0 which requires CUDA 12.9 environment.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
@@ -91,7 +91,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.14.0 \
+    vllm/vllm-omni:v0.16.0 \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
 ```
 

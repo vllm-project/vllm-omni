@@ -48,6 +48,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
+            # Currently, we always use SHM.
             if True:
                 # Use Shared Memory
                 lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
@@ -86,7 +87,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             return obj, int(shm_handle.get("size", 0))
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
-            return None, 0
+            return None
         finally:
             # If data has been received, delete lock_file.
             if obj and os.path.exists(lock_file):
@@ -105,7 +106,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 metadata = metadata.get(get_key)
 
             if not isinstance(metadata, dict):
-                return None, 0
+                return None
 
             if "inline_bytes" in metadata:
                 try:
@@ -113,24 +114,24 @@ class SharedMemoryConnector(OmniConnectorBase):
                     return obj, int(metadata.get("size", 0))
                 except Exception as e:
                     logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
-                    return None, 0
+                    return None
 
             if "shm" in metadata:
                 shm_handle = metadata["shm"]
                 lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
                 return self._get_data_with_lock(lock_file, shm_handle)
 
-            return None, 0
+            return None
         shm = None
         try:
             shm = shm_pkg.SharedMemory(name=get_key)
             if shm is None or shm.size == 0:
-                return None, 0
+                return None
             lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
             shm_handle = {"name": get_key, "size": shm.size}
             return self._get_data_with_lock(lock_file, shm_handle)
         except Exception:
-            return None, 0
+            return None
         finally:
             if shm:
                 shm.close()

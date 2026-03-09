@@ -509,25 +509,23 @@ class LongCatImageTransformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
-    }
+    _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
 
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
-        patch_size: int = 1,
-        in_channels: int = 64,
-        num_layers: int = 19,
-        num_single_layers: int = 38,
-        attention_head_dim: int = 128,
-        num_attention_heads: int = 24,
-        joint_attention_dim: int = 3584,
-        pooled_projection_dim: int = 3584,
-        axes_dims_rope: list[int] = [16, 56, 56],
     ):
         super().__init__()
+        model_config = od_config.tf_model_config
+        patch_size = model_config.patch_size
+        in_channels = model_config.in_channels
+        num_layers = model_config.num_layers
+        num_single_layers = model_config.num_single_layers
+        attention_head_dim = model_config.attention_head_dim
+        num_attention_heads = model_config.num_attention_heads
+        joint_attention_dim = model_config.joint_attention_dim
+        pooled_projection_dim = model_config.pooled_projection_dim
+        axes_dims_rope = getattr(model_config, "axes_dims_rope", [16, 56, 56])
         self.out_channels = in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.pooled_projection_dim = pooled_projection_dim
@@ -582,19 +580,28 @@ class LongCatImageTransformer2DModel(nn.Module):
         guidance: torch.Tensor = None,
         return_dict: bool = True,
     ) -> torch.FloatTensor | Transformer2DModelOutput:
+        fwd_context = get_forward_context()
         # Before: hidden_states shape = (B, img_seq_len, in_channels)
         # After:  hidden_states shape = (B, img_seq_len // SP, in_channels)
         sp_size = self.parallel_config.sequence_parallel_size
         # Store SP size in forward context for sub-modules to access
-        get_forward_context().sequence_parallel_size = sp_size
-        if sp_size > 1:
+        if sp_size is not None and sp_size > 1:
             sp_world_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
             original_shape = hidden_states.shape
             hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
             # LongCat uses dual-stream (text + image) with joint attention
             # Text embeddings should be replicated across SP ranks for correctness
-            get_forward_context().split_text_embed_in_sp = False
+            fwd_context.sequence_parallel_size = sp_size
+            fwd_context.split_text_embed_in_sp = False
+
+            # Mark SP as active so attention layers; we need this to ensure we use
+            # Ulysses instead of NoParallelAttention since we don't set an sp plan
+            # for this model.
+            # TODO: would be nice to refactor this to use sp_plan if possible to
+            # tracking this directly, even though we only have one level.
+            fwd_context._sp_shard_depth = 1
+
             # Debug log (only first forward)
             if not hasattr(self, "_sp_forward_logged"):
                 self._sp_forward_logged = True
@@ -603,6 +610,7 @@ class LongCatImageTransformer2DModel(nn.Module):
                     f"rank={sp_rank}, original_shape={original_shape}, chunked_shape={hidden_states.shape}"
                 )
         else:
+            fwd_context._sp_shard_depth = 0
             if not hasattr(self, "_sp_forward_logged"):
                 self._sp_forward_logged = True
                 logger.info(f"[LongCat Transformer] SP disabled: sp_size={sp_size}")
@@ -623,7 +631,7 @@ class LongCatImageTransformer2DModel(nn.Module):
             image_rotary_emb = self.pos_embed(ids)
 
         # SP: Chunk RoPE embeddings along sequence dimension
-        if self.parallel_config.sequence_parallel_size > 1:
+        if sp_size is not None and sp_size > 1:
             sp_world_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
             freqs_cos, freqs_sin = image_rotary_emb
@@ -655,46 +663,30 @@ class LongCatImageTransformer2DModel(nn.Module):
                 torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
             )
 
-        for index_block, block in enumerate(self.transformer_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_checkpoint[index_block]:
-                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    image_rotary_emb,
-                )
-            else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                )
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+            )
 
-        for index_block, block in enumerate(self.single_transformer_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_single_checkpoint[index_block]:
-                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    image_rotary_emb,
-                )
-            else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                )
+        for block in self.single_transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+            )
 
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
         # SP: All-gather output to reconstruct full sequence
-        if self.parallel_config.sequence_parallel_size > 1:
+        if sp_size is not None and sp_size > 1:
             output = get_sp_group().all_gather(output, dim=1)
+            # Mark SP as inactive after gathering
+            get_forward_context()._sp_shard_depth = 0
 
         if not return_dict:
             return (output,)
@@ -713,6 +705,8 @@ class LongCatImageTransformer2DModel(nn.Module):
             (".add_kv_proj", ".add_k_proj", "k"),
             (".add_kv_proj", ".add_v_proj", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 

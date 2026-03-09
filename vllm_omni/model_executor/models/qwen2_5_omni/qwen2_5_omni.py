@@ -628,7 +628,7 @@ class Qwen2_5OmniForConditionalGeneration(
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 
     def _get_embed_text_spk_token(self, voice_type: str):
-        if voice_type not in self.embed_text_spk_tokens:
+        if not hasattr(self, "embed_text_spk_tokens") or voice_type not in self.embed_text_spk_tokens:
             return self.embed_text_bos_token
         return self.embed_text_spk_tokens[voice_type]
 

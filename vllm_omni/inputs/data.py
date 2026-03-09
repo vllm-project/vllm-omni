@@ -1,7 +1,7 @@
 import copy
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypedDict
 
 from vllm.inputs import PromptType
 from vllm.sampling_params import SamplingParams
@@ -103,13 +103,34 @@ class OmniEmbedsPrompt(EmbedsPrompt):
     additional_information: NotRequired[dict[str, Any]]
 
 
+class OmniCustomPrompt(TypedDict, total=False):
+    """Custom prompt type for diffusion pipelines with pre-tokenized inputs.
+
+    Allows users to pass pre-tokenized prompt IDs, attention masks, and extra
+    arguments directly, bypassing the tokenization stage in the pipeline.
+
+    Attributes:
+        prompt_ids: Pre-tokenized prompt token IDs (single or batched)
+        negative_prompt_ids: Pre-tokenized negative prompt token IDs
+        prompt_mask: Attention mask tensor for the prompt
+        negative_prompt_mask: Attention mask tensor for the negative prompt
+        extra_args: Additional pipeline-specific arguments
+    """
+
+    prompt_ids: list[int] | list[list[int]]
+    negative_prompt_ids: list[int] | list[list[int]]
+    prompt_mask: torch.Tensor
+    negative_prompt_mask: torch.Tensor
+    extra_args: dict[str, Any]
+
+
 # Must ensure that all additional prompt types are inherited from vLLM prompt types
 # Because TypedDict doesn't support isinstance and are dict. Cannot distinguish them in runtime.
 # Inheritance ensure that there are only additional fields but not removing fields--safe to route to LLM.generate()
 OmniSingletonPrompt: TypeAlias = str | list[int] | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
 """Omni singleton prompt type extending vLLM's SingletonPrompt."""
 
-OmniPromptType: TypeAlias = PromptType | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
+OmniPromptType: TypeAlias = PromptType | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt | OmniCustomPrompt
 
 
 def token_inputs_omni(
@@ -163,6 +184,7 @@ class OmniDiffusionSamplingParams:
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
+    output_type: str | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -187,6 +209,7 @@ class OmniDiffusionSamplingParams:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    audio_latents: torch.Tensor | None = None
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
     image_latent: torch.Tensor | None = None
@@ -200,7 +223,8 @@ class OmniDiffusionSamplingParams:
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None
-    fps: int | None = None
+    fps: int | None = None  # Integer FPS kept for request compatibility and output encoding.
+    frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False
 
@@ -216,6 +240,8 @@ class OmniDiffusionSamplingParams:
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
+    decode_timestep: float | list[float] | None = None
+    decode_noise_scale: float | list[float] | None = None
     eta: float = 0.0
     sigmas: list[float] | None = None
 
@@ -228,6 +254,13 @@ class OmniDiffusionSamplingParams:
     past_key_values: Any | None = None  # Injected KV Cache
     kv_metadata: dict[str, Any] | None = None  # Metadata for KV Cache (e.g., kv_lens, ropes)
     need_kv_receive: bool = True  # Flag to indicate if this request expects KV transfer
+
+    # [Omni] Multi-KV for CFG: populated by model-specific cfg_kv_collect_func
+    cfg_text_past_key_values: Any | None = None
+    cfg_img_past_key_values: Any | None = None
+    cfg_text_kv_metadata: dict[str, Any] | None = None
+    cfg_img_kv_metadata: dict[str, Any] | None = None
+    cfg_kv_request_ids: dict[str, str] | None = None
 
     # Component modules
     modules: dict[str, Any] = field(default_factory=dict)
@@ -276,6 +309,20 @@ class OmniDiffusionSamplingParams:
         # This class is changed to only represent a single prompt request
         # Only adjust batch size for number of videos per prompt
         return self.num_outputs_per_prompt
+
+    @property
+    def resolved_frame_rate(self) -> float | None:
+        if self.frame_rate is not None:
+            return float(self.frame_rate)
+
+        fps = self.fps
+        if isinstance(fps, list):
+            fps = fps[0] if fps else None
+
+        if fps is None:
+            return None
+
+        return float(fps)
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)

@@ -332,7 +332,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
-
         # Used by OmniGPUModelRunner for the GPU-side MTP fast-path.
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in
@@ -441,7 +440,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return model_outputs
 
         hidden = model_outputs
-        info_dicts = kwargs.get("runtime_additional_information") or []
+        info_dicts = kwargs.get("model_intermediate_buffer")
+        if info_dicts is None:
+            info_dicts = kwargs.get("runtime_additional_information") or []
+        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         audio_codes_list: list[torch.Tensor] = []
         ref_code_len_list: list[torch.Tensor] = []
         codec_streaming_list: list[torch.Tensor] = []
@@ -635,12 +638,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
     def _get_tokenizer(self):
         if self._tokenizer is None:
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path,
-                trust_remote_code=True,
-                fix_mistral_regex=True,
-                use_fast=True,
-            )
+            import transformers
+
+            kwargs = dict(trust_remote_code=True, use_fast=True)
+            if transformers.__version__ < "5":
+                kwargs["fix_mistral_regex"] = True
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_path, **kwargs)
             self._tokenizer.padding_side = "left"
         return self._tokenizer
 
@@ -828,7 +831,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     def _is_url(self, s: str) -> bool:
         try:
             u = urlparse(s)
-            return u.scheme in ("http", "https") and bool(u.netloc)
+            if u.scheme in ("http", "https"):
+                return bool(u.netloc)
+            return u.scheme == "file"
         except Exception:
             return False
 
@@ -838,12 +843,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return base64.b64decode(b64)
 
     def _load_audio_to_np(self, x: str) -> tuple[np.ndarray, int]:
-        """Load audio from local path or base64 data URI (no network I/O)."""
+        """Load audio from local path, URL, or base64 data URI.
+
+        Uses upstream vLLM's MediaConnector for http(s) URLs and ``file:``
+        URIs, with unrestricted local access (offline inference is trusted).
+        """
         import librosa
 
         if self._is_url(x):
-            raise ValueError("ref_audio URLs must be resolved by the serving layer before reaching the model worker.")
-        if self._is_probably_base64(x):
+            from vllm.multimodal.media import MediaConnector
+
+            connector = MediaConnector(allowed_local_media_path="/")
+            audio, sr = connector.fetch_audio(x)
+        elif self._is_probably_base64(x):
             wav_bytes = self._decode_base64_to_wav_bytes(x)
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)

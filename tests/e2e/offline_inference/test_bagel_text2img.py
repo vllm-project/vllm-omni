@@ -37,16 +37,16 @@ from vllm_omni.entrypoints.omni import Omni
 # "Generated with seed=52, num_inference_steps=15,
 # prompt='A futuristic city skyline at twilight, cyberpunk style'"
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (68, 107, 134)},
-    {"position": (400, 50), "rgb": (95, 139, 166)},
-    {"position": (700, 100), "rgb": (99, 122, 151)},
-    {"position": (150, 400), "rgb": (111, 125, 153)},
-    {"position": (512, 512), "rgb": (97, 107, 131)},
-    {"position": (700, 400), "rgb": (48, 64, 98)},
-    {"position": (100, 700), "rgb": (79, 63, 84)},
-    {"position": (400, 700), "rgb": (40, 58, 79)},
-    {"position": (700, 700), "rgb": (60, 75, 103)},
-    {"position": (256, 256), "rgb": (97, 128, 156)},
+    {"position": (100, 100), "rgb": (49, 96, 134)},
+    {"position": (400, 50), "rgb": (63, 127, 167)},
+    {"position": (700, 100), "rgb": (70, 101, 141)},
+    {"position": (150, 400), "rgb": (115, 90, 150)},
+    {"position": (512, 512), "rgb": (98, 86, 119)},
+    {"position": (700, 400), "rgb": (29, 42, 91)},
+    {"position": (100, 700), "rgb": (47, 50, 88)},
+    {"position": (400, 700), "rgb": (36, 52, 91)},
+    {"position": (700, 700), "rgb": (45, 58, 99)},
+    {"position": (256, 256), "rgb": (62, 94, 135)},
 ]
 
 # Maximum allowed difference per color channel
@@ -80,6 +80,10 @@ def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_st
     params_list[0].max_tokens = max_tokens  # type: ignore
     if len(params_list) > 1:
         params_list[1].num_inference_steps = num_inference_steps  # type: ignore
+        params_list[1].extra_args = {  # type: ignore
+            "cfg_text_scale": 4.0,
+            "cfg_img_scale": 1.5,
+        }
     return params_list
 
 

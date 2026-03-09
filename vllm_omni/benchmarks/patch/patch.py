@@ -16,7 +16,6 @@ from typing import Literal
 import aiohttp
 from pydub import AudioSegment
 from tqdm.asyncio import tqdm
-from transformers import PreTrainedTokenizerBase
 from vllm.benchmarks import datasets
 from vllm.benchmarks.datasets import SampleRequest
 from vllm.benchmarks.lib.endpoint_request_func import (
@@ -31,6 +30,7 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     _validate_api_url,
 )
 from vllm.logger import init_logger
+from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
@@ -134,6 +134,8 @@ async def async_request_openai_chat_omni_completions(
 
                     messages = handler.add_chunk(chunk_bytes)
                     for message in messages:
+                        if type(message) is bytes:
+                            message = message.decode("utf-8")
                         # NOTE: SSE comments (often used as pings) start with
                         # a colon. These are not JSON data payload and should
                         # be skipped.
@@ -311,7 +313,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     model_name: str,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: TokenizerLike | None,
     input_requests: list[SampleRequest],
     logprobs: int | None,
     request_rate: float,
@@ -576,6 +578,7 @@ async def benchmark(
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            "rtfx": metrics.rtfx,
         }
     else:
         result = {

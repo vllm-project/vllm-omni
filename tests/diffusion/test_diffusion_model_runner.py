@@ -56,7 +56,10 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         enable_cache_dit_summary=enable_cache_dit_summary,
         parallel_config=SimpleNamespace(use_hsdp=False),
     )
-    runner.kv_transfer_manager = SimpleNamespace(receive_kv_cache=lambda req, target_device: None)
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_kv_cache=lambda req, target_device=None: None,
+        receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
+    )
     return runner
 
 
@@ -105,8 +108,8 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
 def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     class _DummyLoader:
-        def __init__(self, load_config):
-            del load_config
+        def __init__(self, load_config, od_config=None):
+            del load_config, od_config
 
         def load_model(self, **kwargs):
             del kwargs

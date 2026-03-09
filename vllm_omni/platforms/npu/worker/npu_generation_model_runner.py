@@ -86,7 +86,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             #  -------------------------------------- Omni-new -------------------------------------------------
-            if self.model_config.async_chunk:
+            if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
             #  -------------------------------------- Omni-new -------------------------------------------------
             with self.synchronize_input_prep():
