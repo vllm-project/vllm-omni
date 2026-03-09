@@ -1,8 +1,8 @@
 """
 Stability-specific conftest: when pytest is executed under this directory,
-resource monitoring starts automatically at session start and is finalized
-and bundled at session end, so there is no need to wrap pytest with
-`bash resource_monitor.sh run -- pytest ...` manually.
+resource monitoring is started before each test and finalized after each test,
+so each stability test case gets its own HTML report (one report per case).
+No need to wrap pytest with `bash resource_monitor.sh run -- pytest ...`.
 """
 import os
 import subprocess
@@ -30,13 +30,18 @@ def _start_resource_monitor():
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        # Wait briefly to make sure `start` does not fail immediately.
         try:
             proc.wait(timeout=2)
             if proc.returncode != 0:
-                stderr = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
+                stderr = (
+                    proc.stderr.read().decode("utf-8", errors="ignore")
+                    if proc.stderr
+                    else ""
+                )
                 if stderr.strip():
-                    sys.stderr.write(f"[Stability] Resource monitor failed to start: {stderr.strip()}\n")
+                    sys.stderr.write(
+                        f"[Stability] Resource monitor failed to start: {stderr.strip()}\n"
+                    )
                 return None
         except subprocess.TimeoutExpired:
             pass
@@ -46,7 +51,9 @@ def _start_resource_monitor():
 
 
 def _get_monitor_data_root() -> Path:
-    data_root = os.environ.get("RESOURCE_MONITOR_DATA_ROOT") or os.environ.get("GPU_MONITOR_DATA_ROOT")
+    data_root = os.environ.get("RESOURCE_MONITOR_DATA_ROOT") or os.environ.get(
+        "GPU_MONITOR_DATA_ROOT"
+    )
     if data_root:
         return Path(data_root)
     return STABILITY_DIR / "gpu_monitor_data"
@@ -68,7 +75,7 @@ def _wait_for_run_dir(timeout_sec: int = 10) -> Path | None:
 
 
 def _report_latest_gpu_samples(stop_event: threading.Event) -> None:
-    """Periodically print the latest sampled GPU line, similar to `run` mode."""
+    """Periodically print the latest sampled GPU line."""
     log_interval = int(
         os.environ.get("RESOURCE_MONITOR_LOG_INTERVAL")
         or os.environ.get("GPU_MONITOR_LOG_INTERVAL")
@@ -97,29 +104,46 @@ def _report_latest_gpu_samples(stop_event: threading.Event) -> None:
             sys.stderr.write(f"[GPU] {latest}\n")
 
 
-def _finalize_resource_monitor():
-    """Run `resource_monitor.sh finalize` to bundle the current run and generate the report."""
+def _finalize_resource_monitor() -> str | None:
+    """
+    Run `resource_monitor.sh finalize` for the current run and generate the report.
+    Returns the bundle dir path (for this test case's report) if successful, else None.
+    """
     if not RESOURCE_MONITOR_SCRIPT.is_file():
-        return
+        return None
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["bash", str(RESOURCE_MONITOR_SCRIPT), "finalize", "--backend", "gpu"],
             cwd=str(REPO_ROOT),
-            capture_output=False,
+            capture_output=True,
+            text=True,
             timeout=60,
             check=False,
         )
+        if result.returncode != 0:
+            return None
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("GPU_MONITOR_BUNDLE_DIR=") or line.startswith(
+                "RESOURCE_MONITOR_BUNDLE_DIR="
+            ):
+                _, _, value = line.partition("=")
+                return value.strip() if value else None
+        return None
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        pass
+        return None
 
 
-@pytest.hookimpl(tryfirst=True)
-def pytest_sessionstart(session: pytest.Session) -> None:
-    """Auto-start resource monitoring at session start when the script and bash are available."""
+@pytest.fixture(autouse=True)
+def stability_resource_monitor_per_test(request: pytest.FixtureRequest):
+    """
+    For each test under this directory: start GPU monitor before the test,
+    then finalize after the test so this case gets its own report.html.
+    """
     proc = _start_resource_monitor()
+    stop_event = threading.Event()
+    reporter: threading.Thread | None = None
+
     if proc is not None:
-        session._resource_monitor_process = proc  # type: ignore[attr-defined]
-        stop_event = threading.Event()
         reporter = threading.Thread(
             target=_report_latest_gpu_samples,
             args=(stop_event,),
@@ -127,44 +151,38 @@ def pytest_sessionstart(session: pytest.Session) -> None:
             daemon=True,
         )
         reporter.start()
-        session._resource_monitor_stop_event = stop_event  # type: ignore[attr-defined]
-        session._resource_monitor_reporter = reporter  # type: ignore[attr-defined]
         run_dir = _wait_for_run_dir(timeout_sec=5)
-        bundle_root = _get_monitor_data_root()
-        sys.stderr.write(
-            "[Stability] Resource monitor (gpu) auto-started for this session. "
-            "Bundle will be generated at session end.\n"
-        )
+        node_name = request.node.name
         if run_dir is not None:
-            sys.stderr.write(f"[Stability] Resource monitor run dir: {run_dir}\n")
+            sys.stderr.write(
+                f"[Stability] Resource monitor started for test: {node_name} | run dir: {run_dir}\n"
+            )
         else:
             sys.stderr.write(
-                f"[Stability] Resource monitor data root: {bundle_root} "
-                "(run dir not ready yet)\n"
+                f"[Stability] Resource monitor started for test: {node_name} (run dir not ready yet)\n"
             )
-    else:
-        session._resource_monitor_process = None  # type: ignore[attr-defined]
-        session._resource_monitor_stop_event = None  # type: ignore[attr-defined]
-        session._resource_monitor_reporter = None  # type: ignore[attr-defined]
 
+    yield
 
-@pytest.hookimpl(trylast=True)
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """Stop monitoring at session end and run finalize to generate `report.html` and related outputs."""
-    stop_event = getattr(session, "_resource_monitor_stop_event", None)
-    if stop_event is not None:
+    # Teardown: stop reporter, stop monitor, finalize → one HTML per test
+    if proc is not None:
         stop_event.set()
-    reporter = getattr(session, "_resource_monitor_reporter", None)
-    if reporter is not None and reporter.is_alive():
-        reporter.join(timeout=2)
-    proc = getattr(session, "_resource_monitor_process", None)
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-    if getattr(session, "_resource_monitor_process", None) is not None:
-        sys.stderr.write("[Stability] Finalizing resource monitor (gpu)...\n")
-        _finalize_resource_monitor()
+        if reporter is not None and reporter.is_alive():
+            reporter.join(timeout=2)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        bundle_dir = _finalize_resource_monitor()
+        node_name = request.node.name
+        if bundle_dir:
+            sys.stderr.write(
+                f"[Stability] Report for test «{node_name}»: {bundle_dir}/report.html\n"
+            )
+        else:
+            sys.stderr.write(
+                f"[Stability] Finalize skipped or failed for test «{node_name}»\n"
+            )
