@@ -104,7 +104,7 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ref_audio` | string | null | Reference audio (URL or base64 data URL) |
+| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 

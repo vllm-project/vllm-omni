@@ -1,21 +1,15 @@
 import asyncio
-import base64
-import io
-import ipaddress
 import json
 import math
 import os
-import socket
 from typing import Any
-from urllib.parse import urlparse
-from urllib.request import urlopen
 
 import numpy as np
-import soundfile as sf
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
+from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
@@ -26,19 +20,6 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
-
-_REF_AUDIO_TIMEOUT_S = 15
-_REF_AUDIO_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
-_REF_AUDIO_BLOCKED_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
 
 # TTS Configuration (currently supports Qwen3-TTS)
 _TTS_MODEL_STAGES: set[str] = {"qwen3_tts"}
@@ -268,8 +249,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_audio is None:
                 return "Base task requires 'ref_audio' for voice cloning"
             # Validate ref_audio format
-            if not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
-                return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
+            if not (
+                request.ref_audio.startswith(("http://", "https://"))
+                or request.ref_audio.startswith("data:")
+                or request.ref_audio.startswith("file://")
+            ):
+                return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
             # In-context voice cloning (default) requires non-empty ref_text.
             # x_vector_only_mode skips in-context and only uses speaker embedding.
             if not request.x_vector_only_mode:
@@ -303,44 +288,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    @staticmethod
-    async def _resolve_ref_audio(ref_audio_str: str) -> tuple[list[float], int]:
-        """Resolve ref_audio URL/base64 to (wav_samples, sample_rate)."""
-        parsed = urlparse(ref_audio_str)
+    async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
+        """Resolve ref_audio to (wav_samples, sample_rate).
 
-        def _check_ssrf(url: str) -> None:
-            host = urlparse(url).hostname
-            if not host:
-                raise ValueError("ref_audio URL must include a hostname")
-            for info in socket.getaddrinfo(host, None):
-                ip_str = str(info[4][0]).split("%", 1)[0]
-                addr = ipaddress.ip_address(ip_str)
-                if any(addr in net for net in _REF_AUDIO_BLOCKED_NETWORKS):
-                    raise ValueError(f"ref_audio URL resolves to blocked address: {addr}")
-
-        def _fetch_sync() -> tuple[np.ndarray, int]:
-            if parsed.scheme in ("http", "https"):
-                _check_ssrf(ref_audio_str)
-                with urlopen(ref_audio_str, timeout=_REF_AUDIO_TIMEOUT_S) as resp:
-                    data = resp.read(_REF_AUDIO_MAX_BYTES + 1)
-                    if len(data) > _REF_AUDIO_MAX_BYTES:
-                        raise ValueError(f"ref_audio URL exceeds {_REF_AUDIO_MAX_BYTES} bytes")
-                buf = io.BytesIO(data)
-            elif ref_audio_str.startswith("data:"):
-                b64 = ref_audio_str
-                if "," in b64:
-                    b64 = b64.split(",", 1)[1]
-                buf = io.BytesIO(base64.b64decode(b64))
-            else:
-                raise ValueError("ref_audio must be an http(s) URL or data: base64 URI")
-            audio, sr = sf.read(buf, dtype="float32", always_2d=False)
-            if isinstance(audio, np.ndarray) and audio.ndim > 1:
-                audio = np.mean(audio, axis=-1)
-            return np.asarray(audio, dtype=np.float32), int(sr)
-
-        loop = asyncio.get_running_loop()
-        wav_np, sr = await loop.run_in_executor(None, _fetch_sync)
-        return wav_np.tolist(), sr
+        Delegates to upstream vLLM's MediaConnector which handles http(s)
+        URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
+        gated by ``--allowed-local-media-path``).
+        """
+        model_config = self.model_config
+        connector = MediaConnector(
+            allowed_local_media_path=model_config.allowed_local_media_path,
+            allowed_media_domains=model_config.allowed_media_domains,
+        )
+        wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
+        wav_np = np.asarray(wav_np, dtype=np.float32)
+        if wav_np.ndim > 1:
+            wav_np = np.mean(wav_np, axis=-1)
+        return wav_np.tolist(), int(sr)
 
     async def _generate_pcm_chunks(self, generator, request_id: str):
         """Generate PCM audio chunks for streaming response.
