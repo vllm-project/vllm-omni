@@ -9,7 +9,7 @@ import uuid
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Literal, overload
+from typing import Any, Literal, TypeVar, overload
 
 import huggingface_hub
 import msgspec.msgpack
@@ -46,11 +46,14 @@ from vllm_omni.entrypoints.utils import (
 )
 from vllm_omni.entrypoints.zmq_utils import ZmqQueue
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.metrics import OrchestratorAggregator, StageRequestStats
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.outputs import OmniRequestOutput
+
+_R = TypeVar("_R")
 
 logger = init_logger(__name__)
 
@@ -176,6 +179,13 @@ class OmniBase:
         self._handshake_endpoints: dict[int, tuple[str, str]] = {}
         self._handshake_seen: set[int] = set()  # Track which stage IDs have completed ZMQ handshake
         self._single_stage_id: int | None = None  # Optional: deploy only a specific stage ID
+
+        # Sleep mode tracking
+        self._is_sleeping: bool = False
+
+        # RPC results storage: {stage_id: {rpc_id: result}}
+        # Used by collective_rpc to retrieve results collected from the output queue
+        self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
 
         # Initialize stages - each stage will create appropriate instance based on stage_type
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
@@ -362,6 +372,8 @@ class OmniBase:
         self._start_stages(model)
         # Wait for all stages to report readiness before seeding
         self._wait_for_stages_ready(timeout=init_timeout)
+        # Set up RPC result checkers so that collective_rpc works
+        self._setup_rpc_result_checkers()
 
     def _is_async_chunk_enable(self, stage_args: list) -> bool:
         """get async chunk flag"""
@@ -516,6 +528,117 @@ class OmniBase:
             return False
         profiler = getattr(profiler_config, "profiler", None)
         return profiler is not None
+
+    def _setup_rpc_result_checkers(self) -> None:
+        """Set up RPC result checkers for all stages.
+
+        Each checker reads from the shared ``_rpc_results`` dict so that
+        ``OmniStage.collective_rpc`` can retrieve results that were
+        collected by the orchestrator (or, in the sync path, by the
+        stage-level checker that drains the output queue).
+
+        Uses a weak reference to ``self`` to avoid a circular reference
+        (OmniBase → stage_list → OmniStage → closure → OmniBase) that
+        would prevent the instance from being freed by reference counting.
+        """
+        weak_self = weakref.ref(self)
+        for stage in self.stage_list:
+            sid = stage.stage_id
+
+            def make_rpc_checker(stage_id: int):
+                def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
+                    _self = weak_self()
+                    if _self is None:
+                        return None
+                    # First check the shared dict
+                    if stage_id in _self._rpc_results and rpc_id in _self._rpc_results[stage_id]:
+                        return _self._rpc_results[stage_id].pop(rpc_id)
+                    # In the sync path there is no background output handler,
+                    # so drain the output queue ourselves and stash any
+                    # non-RPC results back.
+                    out_q = _self._stage_out_queues[stage_id] if stage_id < len(_self._stage_out_queues) else None
+                    if out_q is not None:
+                        import queue as _queue
+
+                        try:
+                            while True:
+                                item = out_q.get_nowait()
+                                if isinstance(item, dict) and item.get("type") == "collective_rpc_result":
+                                    item_rpc_id = item.get("rpc_id")
+                                    if item_rpc_id == rpc_id:
+                                        return item
+                                    # Stash for another caller
+                                    if stage_id not in _self._rpc_results:
+                                        _self._rpc_results[stage_id] = {}
+                                    _self._rpc_results[stage_id][item_rpc_id] = item
+                                else:
+                                    # Non-RPC item — put it back
+                                    out_q.put(item)
+                                    break
+                        except _queue.Empty:
+                            pass
+                    return None
+
+                return rpc_checker
+
+            stage._rpc_result_checker = make_rpc_checker(sid)
+
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        """Execute an RPC call on all stage workers.
+
+        Args:
+            method: Name of the worker method to execute, or a callable.
+            timeout: Maximum time in seconds to wait for execution.
+            args: Positional arguments to pass to the worker method.
+            kwargs: Keyword arguments to pass to the worker method.
+
+        Returns:
+            A list containing the results from each stage.
+        """
+        results: list[_R] = []
+        for stage in self.stage_list:
+            results.append(
+                stage.collective_rpc(
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
+                )
+            )
+        return results
+
+    def sleep(self, level: int = 1) -> None:
+        """Put the engine to sleep to free up resources.
+
+        Args:
+            level: Sleep level (1 = light sleep, higher = deeper sleep).
+        """
+        self._is_sleeping = True
+        self.collective_rpc(method="sleep", args=(level,))
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake the engine up from sleep.
+
+        Args:
+            tags: Optional list of tags to selectively wake components.
+        """
+        self._is_sleeping = False
+        self.collective_rpc(method="wake_up", args=(tags,))
+
+    def is_sleeping(self) -> bool:
+        """Check whether the engine is sleeping."""
+        return getattr(self, "_is_sleeping", False)
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        """Load a new LoRA adapter into the engine for future requests."""
+        result = self.collective_rpc(method="add_lora", args=(lora_request,))
+        return result[0][0]
 
     def start_profile(self, stages: list[int] | None = None) -> None:
         """Start profiling for specified stages.
@@ -1135,15 +1258,6 @@ class Omni(OmniBase):
                         final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
                         request_output=engine_outputs,
                     )
-                    try:
-                        if stage.final_output_type == "text" or metrics.log_stats:
-                            output_to_yield.metrics = metrics.build_output_metrics(stage_id, req_id)
-                    except Exception as e:
-                        # Make metrics contract explicit on failure.
-                        output_to_yield.metrics = {}
-                        logger.exception(
-                            f"[{self._name}] Failed to attach output metrics for req {req_id} at stage {stage_id}: {e}",
-                        )
 
                     # Record audio generated frames (only when finished)
                     try:

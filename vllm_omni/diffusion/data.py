@@ -111,11 +111,12 @@ class DiffusionParallelConfig:
         # 1. Standalone: when other parallelism is all 1, HSDP determines world_size
         # 2. Combined: HSDP overlays on top of other parallelism
         if self.use_hsdp:
-            if self.tensor_parallel_size > 1:
+            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
                 raise ValueError(
-                    "HSDP (use_hsdp=True) cannot be used with Tensor Parallelism "
-                    f"(tensor_parallel_size={self.tensor_parallel_size}). "
-                    "Set tensor_parallel_size=1 when using HSDP."
+                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
+                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
+                    f"data_parallel_size={self.data_parallel_size}). "
+                    "Set tensor_parallel_size=1 and data_parallel_size=1 when using HSDP."
                 )
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
@@ -617,6 +618,10 @@ class DiffusionOutput:
     error: str | None = None
 
     post_process_func: Callable[..., Any] | None = None
+
+    # Extra custom output data (e.g. latent trajectories, prompt embeds)
+    # passed through to OmniRequestOutput.custom_output
+    custom_output: dict[str, Any] = field(default_factory=dict)
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None

@@ -320,11 +320,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
-    parser.add_argument(
-        "--log-stats",
-        action="store_true",
-        help="Enable vLLM-Omni statistics logging.",
-    )
     return parser.parse_args()
 
 
@@ -388,7 +383,6 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
-        log_stats=args.log_stats,
     )
     print("Pipeline loaded")
 

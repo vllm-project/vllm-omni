@@ -22,6 +22,7 @@ stage_args:
     max_num_batched_tokens: 32768
     max_model_len: 32768
     enable_prefix_caching: false
+    mm_processor_cache_gb: 0
     hf_config_name: thinker_config
     tensor_parallel_size: 1
     load_format: dummy

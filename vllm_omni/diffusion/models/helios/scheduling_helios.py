@@ -78,7 +78,7 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
         num_train_timesteps = self.config.num_train_timesteps
         shift = self.config.shift
 
-        alphas = np.linspace(1, 1 / num_train_timesteps, num_train_timesteps + 1)
+        alphas = np.linspace(1, 1 / num_train_timesteps, num_train_timesteps + 1, dtype=np.float32)
         sigmas = 1.0 - alphas
         sigmas = np.flip(shift * sigmas / (1 + (shift - 1) * sigmas))[:-1].copy()
         sigmas = torch.from_numpy(sigmas)
@@ -133,11 +133,11 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             timestep_ratio = self.timestep_ratios[i_s]
             timestep_max = min(self.timesteps[int(timestep_ratio[0] * training_steps)], 999)
             timestep_min = self.timesteps[min(int(timestep_ratio[1] * training_steps), training_steps - 1)]
-            timesteps = np.linspace(timestep_max, timestep_min, training_steps + 1)
+            timesteps = np.linspace(timestep_max, timestep_min, training_steps + 1, dtype=np.float32)
             self.timesteps_per_stage[i_s] = (
                 timesteps[:-1] if isinstance(timesteps, torch.Tensor) else torch.from_numpy(timesteps[:-1])
             )
-            stage_sigmas = np.linspace(0.999, 0, training_steps + 1)
+            stage_sigmas = np.linspace(0.999, 0, training_steps + 1, dtype=np.float32)
             self.sigmas_per_stage[i_s] = torch.from_numpy(stage_sigmas[:-1])
 
     @property
@@ -188,10 +188,11 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
                 stage_timesteps[0].item(),
                 stage_timesteps[-1].item(),
                 num_inference_steps,
+                dtype=np.float32,
             )
 
             stage_sigmas = self.sigmas_per_stage[stage_index]
-            ratios = np.linspace(stage_sigmas[0].item(), stage_sigmas[-1].item(), num_inference_steps)
+            ratios = np.linspace(stage_sigmas[0].item(), stage_sigmas[-1].item(), num_inference_steps, dtype=np.float32)
             sigmas = torch.from_numpy(ratios)
 
         self.timesteps = torch.from_numpy(timesteps).to(device=device)

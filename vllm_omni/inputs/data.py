@@ -1,7 +1,7 @@
 import copy
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypedDict
 
 from vllm.inputs import PromptType
 from vllm.sampling_params import SamplingParams
@@ -103,13 +103,34 @@ class OmniEmbedsPrompt(EmbedsPrompt):
     additional_information: NotRequired[dict[str, Any]]
 
 
+class OmniCustomPrompt(TypedDict, total=False):
+    """Custom prompt type for diffusion pipelines with pre-tokenized inputs.
+
+    Allows users to pass pre-tokenized prompt IDs, attention masks, and extra
+    arguments directly, bypassing the tokenization stage in the pipeline.
+
+    Attributes:
+        prompt_ids: Pre-tokenized prompt token IDs (single or batched)
+        negative_prompt_ids: Pre-tokenized negative prompt token IDs
+        prompt_mask: Attention mask tensor for the prompt
+        negative_prompt_mask: Attention mask tensor for the negative prompt
+        extra_args: Additional pipeline-specific arguments
+    """
+
+    prompt_ids: list[int] | list[list[int]]
+    negative_prompt_ids: list[int] | list[list[int]]
+    prompt_mask: torch.Tensor
+    negative_prompt_mask: torch.Tensor
+    extra_args: dict[str, Any]
+
+
 # Must ensure that all additional prompt types are inherited from vLLM prompt types
 # Because TypedDict doesn't support isinstance and are dict. Cannot distinguish them in runtime.
 # Inheritance ensure that there are only additional fields but not removing fields--safe to route to LLM.generate()
 OmniSingletonPrompt: TypeAlias = str | list[int] | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
 """Omni singleton prompt type extending vLLM's SingletonPrompt."""
 
-OmniPromptType: TypeAlias = PromptType | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
+OmniPromptType: TypeAlias = PromptType | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt | OmniCustomPrompt
 
 
 def token_inputs_omni(
