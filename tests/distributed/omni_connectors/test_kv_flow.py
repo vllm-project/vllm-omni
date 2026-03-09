@@ -6,6 +6,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVCacheConfig,
     OmniKVTransferManager,
 )
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import normalize_layer_kv
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.cache]
@@ -192,8 +193,7 @@ def test_normalize_layer_kv_rejects_invalid_inputs(kv_config, common_constants, 
     else:
         layer_kv = (torch.randn(2, block_size, num_heads, head_dim), "not-a-tensor")
 
-    manager = OmniKVTransferManager(kv_config)
-    normalized = manager._normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=0)
+    normalized = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=0)
     assert normalized is None
 
 
