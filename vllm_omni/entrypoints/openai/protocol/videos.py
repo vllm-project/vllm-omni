@@ -13,9 +13,9 @@ import time
 import uuid
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 
@@ -27,6 +27,8 @@ class VideoGenerationStatus(str, Enum):
     FAILED = "failed"
 
 
+SizeStr = Annotated[str, StringConstraints(pattern=r"^\d+x\d+$")]
+SecondStr = Annotated[str, StringConstraints(pattern=r"^[1-9]\d*$")]
 DEFAULT_FPS = 24
 
 
@@ -42,13 +44,6 @@ def file_extension(media_type: str):
     return ext.lstrip(".")
 
 
-class VideoResponseFormat(str, Enum):
-    """Video response format."""
-
-    B64_JSON = "b64_json"
-    URL = "url"  # Not implemented in PoC
-
-
 class VideoParams(BaseModel):
     """Optional block for video-specific parameters."""
 
@@ -56,6 +51,26 @@ class VideoParams(BaseModel):
     height: int | None = Field(default=None, ge=1, description="Video height in pixels")
     num_frames: int | None = Field(default=None, ge=1, description="Number of frames")
     fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
+
+    @property
+    def size(self) -> str | None:
+        if self.width and self.height:
+            return f"{self.width}x{self.height}"
+        else:
+            return None
+
+
+class FileImageReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_id: str
+
+
+class UrlImageReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    image_url: str
+
+
+ImageReference = UrlImageReference | FileImageReference
 
 
 class VideoGenerationRequest(BaseModel):
@@ -65,35 +80,31 @@ class VideoGenerationRequest(BaseModel):
     Follows the OpenAI Images API conventions with extensions for video.
     """
 
-    prompt: str = Field(..., description="Text description of the desired video(s)")
-
     # OpenAI standard fields
     model: str | None = Field(
         default=None,
         description="Model to use (optional, uses server's configured model if omitted)",
     )
-    seconds: int | str | None = Field(
+    prompt: str = Field(..., description="Text description of the desired video(s)")
+    seconds: SecondStr | None = Field(
         default=None,
         description="Clip duration in seconds (OpenAI-compatible, e.g., 4, 8, 12)",
     )
-    size: str | None = Field(
+    size: SizeStr | None = Field(
         default=None,
         description="Video dimensions in WIDTHxHEIGHT format (e.g., '1280x720')",
     )
-    response_format: VideoResponseFormat = Field(
-        default=VideoResponseFormat.B64_JSON, description="Format of the returned video"
+
+    image_reference: ImageReference | None = Field(
+        default=None,
+        description="Optional JSON-safe image reference that guides generation. Provide either image_url or file_id.",
     )
-    user: str | None = Field(default=None, description="User identifier for tracking")
-    stream: bool | None = Field(default=False, description="Whether to stream outputs (not yet supported)")
 
     # Video params block for extensibility
     video_params: VideoParams | None = Field(default=None, description="Optional video-specific parameters")
 
-    # Image-to-video input (OpenAI-style name)
-    input_reference: str | None = Field(
-        default=None,
-        description="Image input for I2V; provided via multipart form-data as a file upload.",
-    )
+    # User specific tracking field
+    user: str | None = Field(default=None, description="User identifier for tracking")
 
     # Video-specific fields (top-level for OpenAI-style compatibility)
     width: int | None = Field(default=None, ge=1, description="Video width in pixels")
@@ -150,35 +161,6 @@ class VideoGenerationRequest(BaseModel):
         ),
     )
 
-    @field_validator("size")
-    @classmethod
-    def validate_size(cls, v):
-        if v is None:
-            return None
-        if not isinstance(v, str) or "x" not in v:
-            raise ValueError("size must be in format 'WIDTHxHEIGHT' (e.g., '1280x720')")
-        return v
-
-    @field_validator("response_format")
-    @classmethod
-    def validate_response_format(cls, v):
-        if v is not None and v != VideoResponseFormat.B64_JSON:
-            raise ValueError(f"Only 'b64_json' response format is supported, got: {v}")
-        return v
-
-    @field_validator("seconds")
-    @classmethod
-    def validate_seconds(cls, v):
-        if v is None:
-            return None
-        if isinstance(v, str):
-            if not v.isdigit():
-                raise ValueError("seconds must be an integer or numeric string")
-            return int(v)
-        if isinstance(v, int):
-            return v
-        raise ValueError("seconds must be an integer or numeric string")
-
     def resolve_video_params(self) -> VideoParams:
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
 
@@ -215,42 +197,51 @@ class VideoGenerationResponse(BaseModel):
     data: list[VideoData] = Field(..., description="Array of generated videos")
 
 
+class VideoError(BaseModel):
+    code: str = Field(..., description="A machine-readable error code that was returned.")
+    message: str = Field(..., description="A human-readable description of the error that was returned.")
+
+
 class VideoResponse(BaseModel):
     """Stored metadata for an async video generation job."""
 
     # OpenAI standard fields
     model: str = Field(..., description="Model name used for video generation.")
+    prompt: str = Field(..., description="The prompt that was used to generate the video.")
     id: str = Field(
         default_factory=lambda: f"video_gen_{uuid.uuid4().hex}", description="Unique id for a video request"
     )
-    object: str = Field(default="video", description="Object type identifier.")
+    object: Literal["video"] = Field(default="video", description="Object type identifier.")
     status: VideoGenerationStatus = Field(
         default=VideoGenerationStatus.QUEUED, description="Current lifecycle status of the video job."
     )
-    size: str = Field(default="", description="Requested output size in WIDTHxHEIGHT format.")
+    size: SizeStr | None = Field(default=None, description="Requested output size in WIDTHxHEIGHT format.")
     progress: int = Field(default=0, description="Best-effort progress indicator from 0 to 100.")
-    seconds: str = Field(default="4", description="Requested clip length in seconds.")
+    seconds: SecondStr = Field(default="4", description="Requested clip length in seconds.")
     quality: str = Field(default="default", description="Requested quality level for generation.")
+    completed_at: int | None = Field(
+        default=None, description="Unix timestamp (seconds) for when the job completed, if finished."
+    )
     created_at: int = Field(
         default_factory=lambda: int(time.time()),
-        description="Unix timestamp when the job was created.",
+        description="Unix timestamp (seconds) for when the job was created.",
     )
     remixed_from_video_id: str | None = Field(
         default=None,
         description="Optional source video id for remix/edit flows.",
     )
+    error: VideoError | None = Field(
+        default=None,
+        description="Error payload that explains why generation failed, if applicable.",
+    )
 
     # vLLM specific fields
     media_type: Literal["video/mp4"] = Field(default="video/mp4", description="MIME type of the generated artifact.")
-    completed_at: int | None = Field(default=None, description="Unix timestamp when generation completed.")
+
     expires_at: int | None = Field(default=None, description="Unix timestamp when this record is considered expired.")
-    error: dict[str, Any | None] | None = Field(
+    file_name: str | None = Field(
         default=None,
-        description="Structured error payload when generation fails.",
-    )
-    file_path: str | None = Field(
-        default=None,
-        description="Absolute path of the saved output video files for this job.",
+        description="Filename of the saved output video files for this job.",
     )
     inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
 
@@ -262,13 +253,16 @@ class VideoResponse(BaseModel):
 class VideoDeleteResponse(BaseModel):
     id: str = Field(description="Identifier of the deleted video.")
     deleted: bool = Field(description="Indicates that the video resource was deleted.")
-    object: Literal["object.deleted"] = Field(
-        default="object.deleted", description="The object type that signals the deletion response."
+    object: Literal["video.deleted"] = Field(
+        default="video.deleted", description="The object type that signals the deletion response."
     )
 
 
 class VideoListResponse(BaseModel):
     """Paginated-style wrapper for listing stored video jobs."""
 
+    first_id: str | None = Field(..., description="The ID of the first item in the list.")
+    last_id: str | None = Field(..., description="The ID of the last item in the list.")
+    has_more: bool = Field(..., description="Whether there are more items available.")
     data: list[VideoResponse] = Field(..., description="Array of video job records.")
     object: Literal["list"] = Field(default="list", description="Object type identifier for list responses.")

@@ -9,6 +9,29 @@ T = TypeVar("T", bound=BaseModel)
 U = TypeVar("U")
 
 
+class TaskRegistry:
+    def __init__(self) -> None:
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> asyncio.Task[None] | None:
+        async with self._lock:
+            return self._tasks.get(key)
+
+    async def pop(self, key: str) -> asyncio.Task[None] | None:
+        async with self._lock:
+            return self._tasks.pop(key, None)
+
+    async def upsert(self, key: str, task: asyncio.Task[None]) -> None:
+        def _cleanup(_: asyncio.Task[None]) -> None:
+            asyncio.create_task(self.pop(key))
+
+        task.add_done_callback(_cleanup)
+
+        async with self._lock:
+            self._tasks[key] = task
+
+
 class AsyncDictStore(Generic[T]):
     """A small async-safe in-memory key-value store for dict items.
 
@@ -48,3 +71,4 @@ class AsyncDictStore(Generic[T]):
 
 
 VIDEO_STORE: AsyncDictStore[VideoResponse] = AsyncDictStore()
+VIDEO_TASKS: TaskRegistry = TaskRegistry()

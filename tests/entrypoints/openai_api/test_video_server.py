@@ -5,8 +5,10 @@ Unit tests for OpenAI-compatible video generation endpoints.
 """
 
 import asyncio
+import base64
 import io
 import os
+import threading
 import time
 from types import SimpleNamespace
 
@@ -23,11 +25,10 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoResponse,
-    VideoResponseFormat,
 )
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
-from vllm_omni.entrypoints.openai.stores import AsyncDictStore
+from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -55,14 +56,36 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
+class BlockingVideoHandler:
+    def __init__(self):
+        self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+        self.stage_configs = None
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def set_stage_configs_if_missing(self, stage_configs):
+        if self.stage_configs is None:
+            self.stage_configs = stage_configs
+
+    async def generate_videos(self, request, reference_id, *, reference_image=None):
+        self.started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
 @pytest.fixture(autouse=True)
 def isolated_video_backends(tmp_path, monkeypatch):
     """Use isolated in-memory metadata and local storage for each test."""
     store: AsyncDictStore[VideoResponse] = AsyncDictStore()
+    tasks = TaskRegistry()
     storage = LocalStorageManager(storage_path=str(tmp_path / "storage"))
     monkeypatch.setattr(api_server, "VIDEO_STORE", store)
+    monkeypatch.setattr(api_server, "VIDEO_TASKS", tasks)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
-    return store, storage
+    return store, tasks, storage
 
 
 @pytest.fixture
@@ -84,6 +107,12 @@ def _make_test_image_bytes(size=(64, 64)) -> bytes:
     return buf.getvalue()
 
 
+def _make_test_image_data_url(size=(64, 64)) -> str:
+    image_bytes = _make_test_image_bytes(size)
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+
 def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
     deadline = time.time() + timeout_s
     last_payload = None
@@ -95,6 +124,15 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
             return last_payload
         time.sleep(0.02)
     raise AssertionError(f"Timed out waiting for status={status}. Last payload: {last_payload}")
+
+
+def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(interval_s)
+    raise AssertionError("Timed out waiting for condition")
 
 
 def test_t2v_video_generation_form(test_client, mocker: MockerFixture):
@@ -185,6 +223,30 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     input_image = prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (96, 64)
+
+
+def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A fox running through snow.",
+            "image_reference": f"{'image_url': {_make_test_image_data_url((40, 24))}}",
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    prompt = engine.captured_prompt
+    input_image = prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (40, 24)
 
 
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
@@ -347,16 +409,21 @@ def test_invalid_size_parse_returns_500(test_client):
     assert response.status_code == 200
     video_id = response.json()["id"]
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
-    assert failed["error"]["type"] == "ValueError"
+    assert failed["error"]["code"] == "ValueError"
     assert "invalid size format" in failed["error"]["message"].lower()
 
 
-def test_invalid_response_format_raises_validation_error(test_client):
-    with pytest.raises(ValidationError):
-        test_client.post(
-            "/v1/videos",
-            data={"prompt": "bad format", "response_format": "url"},
-        )
+def test_rejects_input_reference_and_image_reference_together(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "bad refs",
+            "image_reference": '{"image_url": "https://example.com/cat.png"}',
+        },
+        files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 400
+    assert "either input_reference or image_reference" in response.json()["detail"].lower()
 
 
 def test_invalid_seconds_returns_422(test_client):
@@ -402,23 +469,36 @@ def test_invalid_lora_returns_400(test_client):
     assert response.status_code == 200
     video_id = response.json()["id"]
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
-    assert failed["error"]["type"] == "HTTPException"
+    assert failed["error"]["code"] == "HTTPException"
     assert "lora object" in failed["error"]["message"].lower()
+
+
+def test_unsupported_image_reference_file_id_fails_job(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "unsupported ref",
+            "image_reference": '{"file_id": "file-123"}',
+        },
+    )
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
+    assert failed["error"]["code"] == "HTTPException"
+    assert "file_id is not supported" in failed["error"]["message"].lower()
 
 
 def test_video_request_validation():
     req = VideoGenerationRequest(prompt="test")
     assert req.prompt == "test"
-    assert req.response_format == VideoResponseFormat.B64_JSON
-
-    with pytest.raises(ValueError):
-        VideoGenerationRequest(prompt="test", response_format="url")
-
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", size="invalid")
 
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", seconds="abc")
+
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", image_reference={"file_id": "file-1", "image_url": "https://example.com"})
 
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
@@ -440,18 +520,54 @@ def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerF
 
     asc_resp = test_client.get("/v1/videos", params={"order": "asc"})
     assert asc_resp.status_code == 200
-    asc_ids = [item["id"] for item in asc_resp.json()["data"]]
+    asc_body = asc_resp.json()
+    asc_ids = [item["id"] for item in asc_body["data"]]
     assert asc_ids == [ids[0], ids[1], ids[2]]
+    assert asc_body["object"] == "list"
+    assert asc_body["first_id"] == ids[0]
+    assert asc_body["last_id"] == ids[2]
+    assert asc_body["has_more"] is False
 
     desc_resp = test_client.get("/v1/videos", params={"order": "desc", "limit": 2})
     assert desc_resp.status_code == 200
-    desc_ids = [item["id"] for item in desc_resp.json()["data"]]
+    desc_body = desc_resp.json()
+    desc_ids = [item["id"] for item in desc_body["data"]]
     assert desc_ids == [ids[2], ids[1]]
+    assert desc_body["object"] == "list"
+    assert desc_body["first_id"] == ids[2]
+    assert desc_body["last_id"] == ids[1]
+    assert desc_body["has_more"] is True
 
     after_resp = test_client.get("/v1/videos", params={"order": "asc", "after": ids[0]})
     assert after_resp.status_code == 200
-    after_ids = [item["id"] for item in after_resp.json()["data"]]
+    after_body = after_resp.json()
+    after_ids = [item["id"] for item in after_body["data"]]
     assert after_ids == [ids[1], ids[2]]
+    assert after_body["object"] == "list"
+    assert after_body["first_id"] == ids[1]
+    assert after_body["last_id"] == ids[2]
+    assert after_body["has_more"] is False
+
+    zero_limit_resp = test_client.get("/v1/videos", params={"order": "asc", "limit": 0})
+    assert zero_limit_resp.status_code == 200
+    zero_limit_body = zero_limit_resp.json()
+    assert zero_limit_body["data"] == []
+    assert zero_limit_body["object"] == "list"
+    assert zero_limit_body["first_id"] is None
+    assert zero_limit_body["last_id"] is None
+    assert zero_limit_body["has_more"] is True
+
+    zero_limit_after_resp = test_client.get(
+        "/v1/videos",
+        params={"order": "asc", "after": ids[2], "limit": 0},
+    )
+    assert zero_limit_after_resp.status_code == 200
+    zero_limit_after_body = zero_limit_after_resp.json()
+    assert zero_limit_after_body["data"] == []
+    assert zero_limit_after_body["object"] == "list"
+    assert zero_limit_after_body["first_id"] is None
+    assert zero_limit_after_body["last_id"] is None
+    assert zero_limit_after_body["has_more"] is False
 
 
 def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: MockerFixture):
@@ -464,16 +580,41 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
     video_id = create_resp.json()["id"]
 
     final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
-    file_path = final["file_path"]
-    assert file_path is not None
+    file_name = final["file_name"]
+    assert file_name is not None
+    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, file_name)
     assert os.path.exists(file_path)
 
     delete_resp = test_client.delete(f"/v1/videos/{video_id}")
     assert delete_resp.status_code == 200
     assert delete_resp.json()["id"] == video_id
     assert delete_resp.json()["deleted"] is True
-    assert delete_resp.json()["object"] == "object.deleted"
+    assert delete_resp.json()["object"] == "video.deleted"
     assert not os.path.exists(file_path)
+
+
+def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
+    handler = BlockingVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Cancel this video"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+
+    assert handler.started.wait(timeout=2.0)
+
+    delete_resp = test_client.delete(f"/v1/videos/{video_id}")
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["id"] == video_id
+    assert delete_resp.json()["deleted"] is True
+    assert delete_resp.json()["object"] == "video.deleted"
+
+    assert handler.cancelled.wait(timeout=2.0)
+    _wait_until(lambda: asyncio.run(api_server.VIDEO_TASKS.get(video_id)) is None)
+    assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
+
+    retrieve_resp = test_client.get(f"/v1/videos/{video_id}")
+    assert retrieve_resp.status_code == 404
 
 
 def test_video_response_file_extension_is_robust():

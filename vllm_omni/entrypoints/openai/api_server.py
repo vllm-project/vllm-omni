@@ -95,7 +95,9 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationResponse,
 )
 from vllm_omni.entrypoints.openai.protocol.videos import (
+    SecondStr,
     VideoDeleteResponse,
+    VideoError,
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoListResponse,
@@ -103,9 +105,10 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
-from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
+from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
+from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -1713,7 +1716,12 @@ def _parse_form_json(value: str | None) -> Any:
 
 
 def video_response_from_request(model_name: str, req: VideoGenerationRequest) -> VideoResponse:
-    resp = VideoResponse(model=model_name, status=VideoGenerationStatus.QUEUED, size=req.size or "")
+    resp = VideoResponse(
+        model=model_name,
+        status=VideoGenerationStatus.QUEUED,
+        size=req.size,
+        prompt=req.prompt,
+    )
     resp.seconds = str(req.seconds or resp.seconds)
     return resp
 
@@ -1730,6 +1738,14 @@ async def decode_and_save_video_output(output: Any, file_name: str) -> str:
     return await STORAGE_MANAGER.save(video_bytes, file_name)
 
 
+def _cleanup_video(video_id: str, output_path: str | None):
+    try:
+        if output_path is not None:
+            os.remove(output_path)
+    except OSError:
+        logger.warning("Failed to cleanup partial video file '%s' for id=%s", output_path, video_id)
+
+
 async def _run_video_generation_job(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
@@ -1741,11 +1757,14 @@ async def _run_video_generation_job(
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
         return
 
-    started_at = time.perf_counter()
+    image_data = await decode_input_reference(request.image_reference, input_reference_bytes)
+    reference_image = ReferenceImage(data=image_data) if image_data is not None else image_data
+
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+    started_at = time.perf_counter()
     output_path = None
     try:
-        response = await handler.generate_videos(request, video_id, input_reference_bytes=input_reference_bytes)
+        response = await handler.generate_videos(request, video_id, reference_image=reference_image)
         if not response.data:
             raise RuntimeError("Video generation completed but returned no outputs.")
 
@@ -1761,31 +1780,29 @@ async def _run_video_generation_job(
             {
                 "status": VideoGenerationStatus.COMPLETED,
                 "progress": 100,
-                "file_path": output_path,
-                "media_type": "video/mp4",
+                "file_name": file_name,
                 "completed_at": int(time.time()),
                 "inference_time_s": time.perf_counter() - started_at,
             },
         )
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
-        try:
-            if output_path is not None:
-                os.remove(output_path)
-        except OSError:
-            logger.warning("Failed to cleanup partial video file '%s' for id=%s", output_path, video_id)
+
+        _cleanup_video(video_id, output_path)
+        # TODO: It would be better to have a finite collection of errors to return rather than the exception name
         await VIDEO_STORE.update_fields(
             video_id,
             {
                 "status": VideoGenerationStatus.FAILED,
                 "completed_at": int(time.time()),
-                "error": {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                },
+                "error": VideoError(code=type(exc).__name__, message=str(exc)),
                 "inference_time_s": time.perf_counter() - started_at,
             },
         )
+    except asyncio.CancelledError:
+        _cleanup_video(video_id, output_path)
+        await VIDEO_STORE.pop(video_id)
+        raise
 
 
 @router.post(
@@ -1801,10 +1818,10 @@ async def create_video(
     raw_request: Request,
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
+    image_reference: str | None = Form(default=None),
     model: str | None = Form(default=None),
-    seconds: int | None = Form(default=None),
+    seconds: SecondStr | None = Form(default=None),
     size: str | None = Form(default=None),
-    response_format: str | None = Form(default=None),
     user: str | None = Form(default=None),
     width: int | None = Form(default=None),
     height: int | None = Form(default=None),
@@ -1822,15 +1839,20 @@ async def create_video(
 ) -> VideoResponse:
     """OpenAI-style video create endpoint (multipart form-data)."""
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
+    parsed_image_reference = _parse_form_json(image_reference)
+    if parsed_image_reference is not None and input_reference_bytes is not None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Provide either input_reference or image_reference, not both.",
+        )
 
     request_data: dict[str, Any] = {
         "prompt": prompt,
         "model": model,
         "seconds": seconds,
         "size": size,
+        "image_reference": parsed_image_reference,
         "user": user,
-        "response_format": response_format,
-        "input_reference": None,
         "width": width,
         "height": height,
         "num_frames": num_frames,
@@ -1875,16 +1897,17 @@ async def create_video(
             detail=f"Video generation failed: {str(e)}",
         )
     ref = video_response_from_request(effective_model_name, request)
-
     await VIDEO_STORE.upsert(ref.id, ref)
-    asyncio.create_task(_run_video_generation_job(handler, request, ref.id, input_reference_bytes))
+
+    task = asyncio.create_task(_run_video_generation_job(handler, request, ref.id, input_reference_bytes))
+    await VIDEO_TASKS.upsert(ref.id, task)
     return ref
 
 
 @router.get("/v1/videos", response_model=VideoListResponse)
 async def list_videos(
     after: str | None = None,
-    limit: int | None = Query(None, ge=1, le=100),
+    limit: int | None = Query(None, ge=0, le=100),
     order: Annotated[Literal["asc", "desc"], Query()] = "desc",
 ):
     jobs = await VIDEO_STORE.list_values()
@@ -1894,10 +1917,17 @@ async def list_videos(
         idx = next((i for i, job in enumerate(jobs) if job.id == after), None)
         jobs = [] if idx is None else jobs[idx + 1 :]
 
+    has_more = False
     if limit is not None:
+        has_more = len(jobs) > limit
         jobs = jobs[:limit]
 
-    return VideoListResponse(data=jobs)
+    first_id, last_id = None, None
+    if len(jobs) > 0:
+        first_id = jobs[0].id
+        last_id = jobs[-1].id
+
+    return VideoListResponse(data=jobs, has_more=has_more, first_id=first_id, last_id=last_id)
 
 
 @router.get("/v1/videos/{video_id}")
@@ -1910,17 +1940,29 @@ async def retrieve_video(video_id: str) -> VideoResponse:
 
 @router.delete("/v1/videos/{video_id}")
 async def delete_video(video_id: str) -> VideoDeleteResponse:
-    job = await VIDEO_STORE.pop(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    # TODO: Handle interrupting running tasks.
     if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS):
-        raise HTTPException(status_code=409, detail="Video generation still in progress. Cannot delete.")
-    if job.file_path is None:
+        task = await VIDEO_TASKS.get(video_id)
+        if task is not None:
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
+            except asyncio.CancelledError:
+                pass
+
+            await VIDEO_STORE.pop(video_id)
+            return VideoDeleteResponse(id=job.id, deleted=True)
+
+    if job.file_name is None:
         raise HTTPException(status_code=409, detail="Video output not yet available. Please try again later.")
 
-    await STORAGE_MANAGER.delete(job.file_path)
+    await STORAGE_MANAGER.delete(job.file_name)
+    await VIDEO_STORE.pop(video_id)
     return VideoDeleteResponse(id=job.id, deleted=True)
 
 
@@ -1930,10 +1972,11 @@ async def download_video(video_id: str) -> FileResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    if not job.file_path:
+    if not job.file_name:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
-    if not os.path.exists(job.file_path):
+    full_path = STORAGE_MANAGER.get_full_file_path(job.file_name)
+    if not os.path.exists(full_path):
         raise HTTPException(status_code=404, detail="Generated video file not found on disk")
 
-    return FileResponse(path=job.file_path, media_type=job.media_type, filename=os.path.basename(job.file_path))
+    return FileResponse(path=full_path, media_type=job.media_type, filename=job.file_name)

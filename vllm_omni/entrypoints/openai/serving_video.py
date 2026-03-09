@@ -3,14 +3,13 @@
 
 from __future__ import annotations
 
-import asyncio
-import os
 import time
 from http import HTTPStatus
 from typing import Any, cast
 
 from fastapi import HTTPException
 from PIL import Image
+from pydantic import BaseModel
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
@@ -19,32 +18,19 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoData,
     VideoGenerationRequest,
     VideoGenerationResponse,
-    VideoResponse,
 )
-from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
-from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference, encode_video_base64
+from vllm_omni.entrypoints.openai.video_api_utils import encode_video_base64
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 
-DEFAULT_TTL = 60**2 * 24 * 7
-DEFAULT_STORAGE_PATH = "/tmp/storage/videos"
 
+class ReferenceImage(BaseModel):
+    """Reference class for tracking additional metadata if needed"""
 
-class OmniOpenAIVideoResponseStore:
-    def __init__(self, storage_path: str = DEFAULT_STORAGE_PATH, ttl: int = DEFAULT_TTL):
-        self.storage_path = storage_path
-        self.ttl = ttl
-
-        self.lock = asyncio.Lock()
-        self.store = VIDEO_STORE
-
-        os.makedirs(self.storage_path, exist_ok=True)
-
-    async def add(self, video: VideoResponse):
-        pass
+    data: Image.Image
 
 
 class OmniOpenAIServingVideo:
@@ -90,29 +76,15 @@ class OmniOpenAIServingVideo:
         request: VideoGenerationRequest,
         reference_id: str,
         *,
-        input_reference_bytes: bytes | None = None,
+        reference_image: ReferenceImage | None = None,
     ) -> VideoGenerationResponse:
-        if request.stream:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="Streaming video generation is not supported yet.",
-            )
-
-        prompt: OmniTextPrompt = {"prompt": request.prompt}
+        prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        input_image = None
-        try:
-            input_image = decode_input_reference(request.input_reference, input_reference_bytes)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail=str(exc),
-            ) from exc
-
         gen_params = OmniDiffusionSamplingParams()
 
+        input_image = None if reference_image is None else reference_image.data
         vp = request.resolve_video_params()
         if input_image is not None and vp.width is not None and vp.height is not None:
             target_size = (vp.width, vp.height)

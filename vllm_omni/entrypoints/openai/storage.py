@@ -25,7 +25,7 @@ class LocalStorageManager(StorageBaseManager):
         self._io_semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     def _save_sync(self, data: bytes, file_name: str) -> str:
-        filename = os.path.join(self.storage_path, f"{file_name}")
+        filename = self.get_full_file_path(file_name)
         tmp_name: str | None = None
         try:
             with NamedTemporaryFile("wb", dir=self.storage_path, delete=False) as f:
@@ -49,7 +49,7 @@ class LocalStorageManager(StorageBaseManager):
 
     def _delete_sync(self, file_name: str) -> bool:
         try:
-            os.remove(os.path.join(self.storage_path, file_name))
+            os.remove(self.get_full_file_path(file_name))
         except FileNotFoundError:
             return False
         return True
@@ -57,6 +57,9 @@ class LocalStorageManager(StorageBaseManager):
     async def delete(self, file_name: str) -> bool:
         async with self._io_semaphore:
             return await asyncio.to_thread(self._delete_sync, file_name)
+
+    def get_full_file_path(self, file_name: str) -> str:
+        return os.path.join(self.storage_path, file_name)
 
 
 # Should implement TTL management on local file storage

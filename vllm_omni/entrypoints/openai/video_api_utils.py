@@ -12,17 +12,23 @@ import tempfile
 from io import BytesIO
 from typing import Any
 
+import httpx
 import numpy as np
 import torch
 from PIL import Image
 
+from vllm_omni.entrypoints.openai.protocol.videos import (
+    FileImageReference,
+    ImageReference,
+    UrlImageReference,
+)
 
-def decode_input_reference(input_reference: str | None, input_reference_bytes: bytes | None) -> Image.Image | None:
-    """Decode image input from multipart bytes or base64/data URL."""
-    if input_reference and input_reference_bytes:
-        raise ValueError("Provide input_reference either as file upload or base64, not both.")
-    if input_reference_bytes:
-        return Image.open(BytesIO(input_reference_bytes)).convert("RGB")
+
+def _decode_image_bytes(image_bytes: bytes) -> Image.Image:
+    return Image.open(BytesIO(image_bytes)).convert("RGB")
+
+
+def _decode_base64_image(input_reference: str) -> Image.Image:
     if input_reference:
         if input_reference.startswith("data:image"):
             _, b64_data = input_reference.split(",", 1)
@@ -32,7 +38,41 @@ def decode_input_reference(input_reference: str | None, input_reference_bytes: b
             image_bytes = base64.b64decode(b64_data)
         except Exception as exc:  # pragma: no cover - malformed base64
             raise ValueError("Invalid base64 input_reference.") from exc
-        return Image.open(BytesIO(image_bytes)).convert("RGB")
+        return _decode_image_bytes(image_bytes)
+    raise ValueError("Empty image reference provided.")
+
+
+async def decode_image_url(image_url: str) -> Image.Image:
+    if image_url.startswith("data:image"):
+        return _decode_base64_image(image_url)
+    if image_url.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(image_url)
+                response.raise_for_status()
+            except Exception as exc:
+                raise ValueError(f"Failed to download image_reference.image_url: {exc}") from exc
+        return _decode_image_bytes(response.content)
+    raise ValueError("image_reference.image_url must be an http(s) URL or data URL.")
+
+
+async def decode_input_reference(
+    image_reference: ImageReference | None,
+    input_reference_bytes: bytes | None,
+) -> Image.Image | None:
+    """Decode image input from multipart bytes, base64/data URL, or image_reference."""
+
+    if input_reference_bytes is not None and image_reference is not None:
+        raise ValueError("Provide only one of input_reference_bytes, or image_reference.")
+
+    if isinstance(input_reference_bytes, bytes):
+        return _decode_image_bytes(input_reference_bytes)
+
+    if isinstance(image_reference, UrlImageReference):
+        return await decode_image_url(image_reference.image_url)
+    elif isinstance(image_reference, FileImageReference):
+        raise ValueError("image_reference.file_id is not supported yet.")
+
     return None
 
 
