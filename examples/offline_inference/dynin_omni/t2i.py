@@ -679,10 +679,10 @@ if __name__ == "__main__":
 
 """
 example usage:
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/t2i.py \
+python <REPO_ROOT>/examples/offline_inference/dynin_omni/t2i.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path /home/kdg6245/vllm-omni/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
-  --metadata-path /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/text/t2i_metadata.jsonl \
-  --output-dir /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/results/t2i_from_vllm \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --metadata-path <REPO_ROOT>/examples/offline_inference/dynin_omni/data/text/t2i_metadata.jsonl \
+  --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/t2i_from_vllm \
   --max-prompts 4
 """

@@ -1097,10 +1097,10 @@ if __name__ == "__main__":
 
 """
 example usage:
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/v2t.py \
+python <REPO_ROOT>/examples/offline_inference/dynin_omni/v2t.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path /home/kdg6245/vllm-omni/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
-  --video-path /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/video/baseball.mp4 \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --video-path <REPO_ROOT>/examples/offline_inference/dynin_omni/data/video/baseball.mp4 \
   --question "Describe this video in detail." \
-  --output-dir /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/results/v2t_from_vllm
+  --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/v2t_from_vllm
 """

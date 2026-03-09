@@ -817,22 +817,22 @@ if __name__ == "__main__":
 
 """
 example usage:
-p /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/t2s.py \
+p <REPO_ROOT>/examples/offline_inference/dynin_omni/t2s.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path /home/kdg6245/vllm-omni/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
   --text "Hello, this is a text to speech test." \
-  --output-dir /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/results/t2s_from_vllm
+  --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/t2s_from_vllm
 """
 
 
 
 """
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/t2s.py \
+python <REPO_ROOT>/examples/offline_inference/dynin_omni/t2s.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path /home/kdg6245/vllm-omni/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
-  --metadata-path /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/text/t2i_metadata.jsonl \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --metadata-path <REPO_ROOT>/examples/offline_inference/dynin_omni/data/text/t2i_metadata.jsonl \
   --max-prompts 4 \
-  --output-dir /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/results/t2s_from_vllm
+  --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/t2s_from_vllm
 """
 
 

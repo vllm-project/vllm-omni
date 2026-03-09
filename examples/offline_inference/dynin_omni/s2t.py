@@ -1033,9 +1033,9 @@ if __name__ == "__main__":
 
 """
 example usage:
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/s2t.py \
+python <REPO_ROOT>/examples/offline_inference/dynin_omni/s2t.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path /home/kdg6245/vllm-omni/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
-  --audio-path /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/results/t2s_from_vllm/cli-00000.wav \
-  --output-dir /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/results/s2t_from_vllm
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --audio-path <REPO_ROOT>/examples/offline_inference/dynin_omni/results/t2s_from_vllm/cli-00000.wav \
+  --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/s2t_from_vllm
 """
