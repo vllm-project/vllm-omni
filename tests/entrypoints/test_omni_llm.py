@@ -1,3 +1,4 @@
+import inspect
 import uuid
 import warnings
 from queue import Empty, Queue
@@ -576,7 +577,7 @@ def test_initialize_stage_configs_called_when_none(
     """Test that stage configs are auto-loaded when stage_configs_path is None."""
 
     def _fake_loader(
-        model: str,
+        config_path: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -653,7 +654,7 @@ def test_generate_raises_on_length_mismatch(monkeypatch: pytest.MonkeyPatch, moc
     """Test that generate raises ValueError when sampling_params_list length doesn't match."""
 
     def _fake_loader(
-        model: str,
+        config_path: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -710,7 +711,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch: pytest.MonkeyPatch, mo
     stage_cfg1["processed_input"] = ["processed-for-stage-1"]
 
     def _fake_loader(
-        model: str,
+        config_path: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -818,7 +819,7 @@ def test_generate_no_final_output_returns_empty(
     stage_cfg1["final_output"] = False
 
     def _fake_loader(
-        model: str,
+        config_path: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -910,7 +911,7 @@ def test_generate_sampling_params_none_use_default(
     stage_cfg1["final_output"] = False
 
     def _fake_loader(
-        model: str,
+        config_path: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -987,7 +988,7 @@ def test_wait_for_stages_ready_timeout(monkeypatch: pytest.MonkeyPatch, mocker: 
     """Test that _wait_for_stages_ready handles timeout correctly."""
 
     def _fake_loader(
-        model: str,
+        config_path: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -1051,7 +1052,7 @@ def test_generate_handles_error_messages(monkeypatch: pytest.MonkeyPatch, mocker
     """Test that generate handles error messages from stages correctly."""
 
     def _fake_loader(
-        model: str,
+        config_path: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -1134,7 +1135,7 @@ def test_close_sends_shutdown_signal(monkeypatch: pytest.MonkeyPatch, mocker: Mo
     """Test that close() sends shutdown signal to all input queues."""
 
     def _fake_loader(
-        model: str,
+        config_path: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -1194,3 +1195,72 @@ def test_close_sends_shutdown_signal(monkeypatch: pytest.MonkeyPatch, mocker: Mo
 
     # Verify stop_stage_worker was called (process should be set)
     assert omni.stage_list[0]._proc is not None
+
+
+# ---------------------------------------------------------------------------
+# Signature compatibility tests — catch upstream API drift early
+# ---------------------------------------------------------------------------
+
+_INHERITANCE_PAIRS: list[tuple[str, str, str, str]] = [
+    (
+        "vllm.entrypoints.llm",
+        "LLM",
+        "vllm_omni.entrypoints.omni_llm",
+        "OmniLLM",
+    ),
+]
+
+
+def _import_class(module_path: str, class_name: str):
+    mod = __import__(module_path, fromlist=[class_name])
+    return getattr(mod, class_name)
+
+
+@pytest.mark.parametrize(
+    "up_mod,up_cls,omni_mod,omni_cls",
+    _INHERITANCE_PAIRS,
+    ids=[f"{pair[3]}({pair[1]})" for pair in _INHERITANCE_PAIRS],
+)
+def test_overridden_method_signatures_compatible(up_mod: str, up_cls: str, omni_mod: str, omni_cls: str):
+    """All params accepted by a base-class method must also be accepted by
+    the overriding method in the vllm-omni subclass.  This prevents
+    TypeError at runtime when upstream callers pass new arguments."""
+    BaseCls = _import_class(up_mod, up_cls)
+    OmniCls = _import_class(omni_mod, omni_cls)
+
+    failures: list[str] = []
+    for name in dir(OmniCls):
+        if name.startswith("__") and name != "__init__":
+            continue
+        omni_method = getattr(OmniCls, name, None)
+        base_method = getattr(BaseCls, name, None)
+        if not (callable(omni_method) and callable(base_method)):
+            continue
+        if omni_method is base_method:
+            continue
+        try:
+            base_sig = inspect.signature(base_method)
+            omni_sig = inspect.signature(omni_method)
+        except (ValueError, TypeError):
+            continue
+
+        omni_has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in omni_sig.parameters.values())
+
+        base_params = base_sig.parameters
+        omni_params = set(omni_sig.parameters.keys())
+
+        missing = []
+        for pname, param in base_params.items():
+            if pname in omni_params:
+                continue
+            if omni_has_var_keyword and param.kind in (
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                continue
+            missing.append(pname)
+
+        if missing:
+            failures.append(f"{omni_cls}.{name}() missing params {sorted(missing)}; base={base_sig}, omni={omni_sig}")
+
+    assert not failures, f"Signature mismatches found ({len(failures)}):\n" + "\n".join(f"  - {f}" for f in failures)

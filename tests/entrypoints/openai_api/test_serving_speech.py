@@ -1,11 +1,15 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import logging
+import os
 from inspect import Signature, signature
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.params import File, Form
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
@@ -206,9 +210,51 @@ def test_app(mocker: MockerFixture):
     # Add list_voices endpoint
     async def list_voices():
         speakers = sorted(speech_server.supported_speakers) if speech_server.supported_speakers else []
-        return {"voices": speakers}
+        uploaded_voices = []
+        if hasattr(speech_server, "uploaded_speakers"):
+            for voice_name, info in speech_server.uploaded_speakers.items():
+                uploaded_voices.append(
+                    {
+                        "name": info.get("name", voice_name),
+                        "consent": info.get("consent", ""),
+                        "created_at": info.get("created_at", 0),
+                        "file_size": info.get("file_size", 0),
+                        "mime_type": info.get("mime_type", ""),
+                    }
+                )
+        return {"voices": speakers, "uploaded_voices": uploaded_voices}
 
     app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
+
+    # Add upload_voice endpoint
+    async def upload_voice(audio_sample: UploadFile = File(...), consent: str = Form(...), name: str = Form(...)):
+        try:
+            result = await speech_server.upload_voice(audio_sample, consent, name)
+            return {"success": True, "voice": result}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.exception(f"Failed to upload voice: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to upload voice: {str(e)}")
+
+    app.add_api_route("/v1/audio/voices", upload_voice, methods=["POST"])
+
+    # Add delete_voice endpoint
+    async def delete_voice(name: str):
+        try:
+            success = await speech_server.delete_voice(name)
+            if not success:
+                raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
+            return {"success": True, "message": f"Voice '{name}' deleted successfully"}
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.exception(f"Failed to delete voice '{name}': {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete voice: {str(e)}")
+
+    app.add_api_route("/v1/audio/voices/{name}", delete_voice, methods=["DELETE"])
 
     return app
 
@@ -284,6 +330,149 @@ class TestSpeechAPI:
         assert response.status_code == 200
         assert "voices" in response.json()
 
+    def test_upload_voice_success(self, client, tmp_path):
+        """Test successful voice upload."""
+        # Create a mock audio file
+        audio_content = b"fake audio content" * 1000  # ~17KB
+        files = {
+            "audio_sample": ("test.wav", audio_content, "audio/wav"),
+        }
+        data = {
+            "consent": "user_consent_123",
+            "name": "test_voice",
+        }
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["success"] is True
+        assert "voice" in result
+        voice_info = result["voice"]
+        assert voice_info["name"] == "test_voice"
+        assert voice_info["consent"] == "user_consent_123"
+        assert "created_at" in voice_info
+        assert voice_info["mime_type"] == "audio/wav"
+        assert voice_info["file_size"] == len(audio_content)
+        response = client.delete("/v1/audio/voices/test_voice")
+
+    def test_upload_voice_file_too_large(self, client):
+        """Test voice upload with file exceeding size limit."""
+        # Create a file larger than 10MB
+        audio_content = b"x" * (11 * 1024 * 1024)  # 11MB
+        files = {
+            "audio_sample": ("test.wav", audio_content, "audio/wav"),
+        }
+        data = {
+            "consent": "user_consent_123",
+            "name": "test_voice",
+        }
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 400
+        result = response.json()
+        assert "detail" in result
+        assert "10MB" in result["detail"]
+
+    def test_upload_voice_invalid_mime_type(self, client):
+        """Test voice upload with invalid MIME type."""
+        audio_content = b"fake audio content"
+        files = {
+            "audio_sample": ("test.txt", audio_content, "text/plain"),
+        }
+        data = {
+            "consent": "user_consent_123",
+            "name": "test_voice",
+        }
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 400
+        result = response.json()
+        assert "detail" in result
+        assert "MIME type" in result["detail"]
+
+    def test_upload_voice_name_collision(self, client):
+        """Test voice upload with duplicate name."""
+        # First upload
+        audio_content = b"fake audio content"
+        files = {
+            "audio_sample": ("test.wav", audio_content, "audio/wav"),
+        }
+        data = {
+            "consent": "user_consent_123",
+            "name": "test_voice",
+        }
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+
+        # Second upload with same name
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 400
+        result = response.json()
+        assert "detail" in result
+        assert "already exists" in result["detail"]
+        response = client.delete("/v1/audio/voices/test_voice")
+
+    def test_upload_voice_missing_parameters(self, client):
+        """Test voice upload with missing required parameters."""
+        audio_content = b"fake audio content"
+        files = {
+            "audio_sample": ("test.wav", audio_content, "audio/wav"),
+        }
+
+        # Missing consent
+        data = {"name": "test_voice5"}
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 422  # Validation error
+
+        # Missing name
+        data = {"consent": "user_consent_123"}
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 422  # Validation error
+
+        # Missing file
+        data = {
+            "consent": "user_consent_123",
+            "name": "test_voice6",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 422  # Validation error
+
+    def test_delete_voice_success(self, client):
+        """Test successful voice deletion."""
+        # First upload a voice
+        audio_content = b"fake audio content"
+        files = {
+            "audio_sample": ("test.wav", audio_content, "audio/wav"),
+        }
+        data = {
+            "consent": "user_consent_123",
+            "name": "test_voice7",
+        }
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+
+        # Then delete it
+        response = client.delete("/v1/audio/voices/test_voice7")
+        assert response.status_code == 200
+        result = response.json()
+        assert result["success"] is True
+        assert "deleted successfully" in result["message"]
+
+        # Verify it's gone by trying to delete again
+        response = client.delete("/v1/audio/voices/test_voice7")
+        assert response.status_code == 404
+        result = response.json()
+        assert "not found" in result["detail"]
+
+    def test_delete_voice_not_found(self, client):
+        """Test deleting a non-existent voice."""
+        response = client.delete("/v1/audio/voices/nonexistent")
+        assert response.status_code == 404
+        result = response.json()
+        assert "not found" in result["detail"]
+
 
 class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
@@ -349,13 +538,13 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", language="InvalidLang")
         assert "Invalid language" in speech_server._validate_tts_request(req)
 
-        # When no speakers loaded, any voice is accepted (unconstrained)
+        # CustomVoice on model with no speakers -> rejected
         req = OpenAICreateSpeechRequest(input="Hello", voice="Invalid")
-        assert speech_server._validate_tts_request(req) is None
+        assert "does not support CustomVoice" in speech_server._validate_tts_request(req)
 
-        # Valid request
-        req = OpenAICreateSpeechRequest(input="Hello", voice="Vivian")
-        assert speech_server._validate_tts_request(req) is None
+        # CustomVoice without voice on model with no speakers -> also rejected
+        req = OpenAICreateSpeechRequest(input="Hello")
+        assert "does not support CustomVoice" in speech_server._validate_tts_request(req)
 
     def test_validate_tts_request_task_types(self, speech_server):
         """Test task-specific validation."""
@@ -367,9 +556,43 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", task_type="VoiceDesign")
         assert "instructions" in speech_server._validate_tts_request(req)
 
-        # ref_text only for Base
+        # ref_text without task_type auto-infers Base, then fails on missing ref_audio
         req = OpenAICreateSpeechRequest(input="Hello", ref_text="text")
-        assert "Base task" in speech_server._validate_tts_request(req)
+        assert "ref_audio" in speech_server._validate_tts_request(req)
+
+    def test_validate_tts_request_auto_infer_base(self, speech_server):
+        """Test auto-inference of Base task when ref_audio/ref_text is provided."""
+        # ref_audio without task_type -> infers Base, requires non-empty ref_text
+        req = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        result = speech_server._validate_tts_request(req)
+        assert "ref_text" in result
+        assert req.task_type == "Base"
+
+        # ref_text without task_type -> infers Base, requires ref_audio
+        req = OpenAICreateSpeechRequest(input="Hello", ref_text="some text")
+        result = speech_server._validate_tts_request(req)
+        assert "ref_audio" in result
+        assert req.task_type == "Base"
+
+    def test_validate_tts_request_base_empty_ref_text(self, speech_server):
+        """Empty ref_text on Base task returns 400 instead of crashing engine."""
+        req = OpenAICreateSpeechRequest(
+            input="Hello", task_type="Base", ref_audio="data:audio/wav;base64,abc", ref_text=""
+        )
+        result = speech_server._validate_tts_request(req)
+        assert "non-empty 'ref_text'" in result
+
+        # x_vector_only_mode bypasses ref_text requirement
+        req = OpenAICreateSpeechRequest(
+            input="Hello", task_type="Base", ref_audio="data:audio/wav;base64,abc", ref_text="", x_vector_only_mode=True
+        )
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_validate_tts_request_customvoice_no_speakers(self, speech_server):
+        """CustomVoice on a model with no speakers returns 400 instead of crashing engine."""
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
+        result = speech_server._validate_tts_request(req)
+        assert "does not support CustomVoice" in result
 
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
@@ -403,6 +626,121 @@ class TestTTSMethods:
 
         # Verify speakers are normalized to lowercase
         assert server.supported_speakers == {"ryan", "vivian", "aiden"}
+
+    def test_build_tts_params_with_uploaded_voice(self, speech_server):
+        """Test _build_tts_params auto-sets ref_audio for uploaded voices."""
+        # Mock an uploaded speaker
+        speech_server.uploaded_speakers = {
+            "custom_voice": {
+                "name": "custom_voice",
+                "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
+                "mime_type": "audio/wav",
+            }
+        }
+        speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
+
+        # Mock _get_uploaded_audio_data to return base64 data
+        with patch.object(speech_server, "_get_uploaded_audio_data") as mock_get_audio:
+            mock_get_audio.return_value = "data:audio/wav;base64,ZmFrZWF1ZGlv"
+
+            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice", task_type="Base")
+
+            params = speech_server._build_tts_params(req)
+
+            # Verify ref_audio was auto-set
+            assert "ref_audio" in params
+            assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
+            assert "x_vector_only_mode" in params
+            assert params["x_vector_only_mode"] == [True]
+            mock_get_audio.assert_called_once_with("custom_voice")
+
+    def test_build_tts_params_without_uploaded_voice(self, speech_server):
+        """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""
+        # No uploaded speakers
+        speech_server.uploaded_speakers = {}
+        speech_server.supported_speakers = {"ryan", "vivian"}
+
+        req = OpenAICreateSpeechRequest(input="Hello", voice="ryan", task_type="Base")
+
+        params = speech_server._build_tts_params(req)
+
+        # Verify ref_audio was NOT auto-set
+        assert "ref_audio" not in params
+        assert "x_vector_only_mode" not in params
+
+    def test_build_tts_params_with_explicit_ref_audio(self, speech_server):
+        """Test _build_tts_params uses explicit ref_audio even for uploaded voices."""
+        # Mock an uploaded speaker
+        speech_server.uploaded_speakers = {
+            "custom_voice": {
+                "name": "custom_voice",
+                "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
+                "mime_type": "audio/wav",
+            }
+        }
+        speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello", voice="custom_voice", task_type="Base", ref_audio="data:audio/wav;base64,ZXhwbGljaXQ="
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        # _build_tts_params should NOT auto-set ref_audio when explicit ref_audio
+        # is provided (request.ref_audio is not None skips the auto-set branch).
+        # The explicit ref_audio is resolved later in create_speech() via
+        # _resolve_ref_audio(), not in _build_tts_params().
+        assert "ref_audio" not in params
+        # x_vector_only_mode should not be set when explicit ref_audio is provided
+        assert "x_vector_only_mode" not in params
+
+    def test_get_uploaded_audio_data(self, speech_server):
+        """Test _get_uploaded_audio_data function."""
+        # Mock file operations
+        with (
+            patch("builtins.open", create=True) as mock_open,
+            patch("base64.b64encode") as mock_b64encode,
+            patch("pathlib.Path.exists") as mock_exists,
+        ):
+            mock_exists.return_value = True
+            mock_b64encode.return_value = b"ZmFrZWF1ZGlv"
+
+            # Setup mock file
+            mock_file = MagicMock()
+            mock_file.read.return_value = b"fakeaudio"
+            mock_open.return_value.__enter__.return_value = mock_file
+
+            # Setup uploaded speaker
+            speech_server.uploaded_speakers = {
+                "test_voice": {"name": "test_voice", "file_path": "/tmp/test.wav", "mime_type": "audio/wav"}
+            }
+            result = speech_server._get_uploaded_audio_data("test_voice")
+
+            assert result == "data:audio/wav;base64,ZmFrZWF1ZGlv"
+            mock_open.assert_called_once_with(Path("/tmp/test.wav"), "rb")
+            mock_b64encode.assert_called_once_with(b"fakeaudio")
+
+    def test_get_uploaded_audio_data_missing_file(self, speech_server):
+        """Test _get_uploaded_audio_data when file is missing."""
+        with patch("pathlib.Path.exists") as mock_exists:
+            mock_exists.return_value = False
+
+            # Setup uploaded speaker
+            speech_server.uploaded_speakers = {
+                "test_voice": {"name": "test_voice", "file_path": "/tmp/test.wav", "mime_type": "audio/wav"}
+            }
+
+            result = speech_server._get_uploaded_audio_data("test_voice")
+
+            assert result is None
+
+    def test_get_uploaded_audio_data_voice_not_found(self, speech_server):
+        """Test _get_uploaded_audio_data when voice is not in uploaded_speakers."""
+        speech_server.uploaded_speakers = {}
+
+        result = speech_server._get_uploaded_audio_data("nonexistent")
+
+        assert result is None
 
     def test_max_instructions_length_default(self, speech_server):
         """Test default max instructions length (500) when no config provided."""
@@ -508,6 +846,70 @@ class TestTTSMethods:
         error = server._validate_tts_request(req)
         assert error is not None
         assert "max 10 characters" in error
+
+
+class TestFileValidationFunctions:
+    """Unit tests for file validation helper functions."""
+
+    def test_sanitize_filename(self):
+        """Test _sanitize_filename function."""
+        from vllm_omni.entrypoints.openai.serving_speech import _sanitize_filename
+
+        # Test normal filenames
+        assert _sanitize_filename("test.wav") == "test.wav"
+        assert _sanitize_filename("test-file.mp3") == "test-file.mp3"
+        assert _sanitize_filename("test_file.flac") == "test_file.flac"
+
+        # Test path traversal attempts
+        assert _sanitize_filename("../../../etc/passwd") == "passwd"
+        assert _sanitize_filename("/absolute/path/file.wav") == "file.wav"
+
+        # Test special characters
+        assert _sanitize_filename("file with spaces.wav") == "file_with_spaces.wav"
+        assert _sanitize_filename("file&with&special&chars.wav") == "file_with_special_chars.wav"
+        assert _sanitize_filename("file@with#special$chars%.wav") == "file_with_special_chars_.wav"
+
+        # Test empty filename
+        assert _sanitize_filename("") == "file"
+
+        # Test very long filename
+        long_name = "a" * 300
+        sanitized = _sanitize_filename(long_name)
+        assert len(sanitized) == 255
+        assert sanitized.startswith("a")
+
+    def test_validate_path_within_directory(self, tmp_path):
+        """Test _validate_path_within_directory function."""
+        from vllm_omni.entrypoints.openai.serving_speech import _validate_path_within_directory
+
+        # Create test directory structure
+        base_dir = tmp_path / "uploads"
+        base_dir.mkdir()
+
+        # Valid paths within directory
+        valid_file = base_dir / "test.wav"
+        valid_subdir_file = base_dir / "subdir" / "test.wav"
+        valid_subdir_file.parent.mkdir()
+
+        assert _validate_path_within_directory(valid_file, base_dir) is True
+        assert _validate_path_within_directory(valid_subdir_file, base_dir) is True
+
+        # Invalid paths outside directory
+        outside_file = tmp_path / "outside.wav"
+        assert _validate_path_within_directory(outside_file, base_dir) is False
+
+        # Test with symlink (should fail)
+        if hasattr(os, "symlink"):
+            link_target = tmp_path / "target.wav"
+            link_target.touch()
+            symlink = base_dir / "link.wav"
+            os.symlink(link_target, symlink)
+            # Symlinks to outside should be rejected
+            assert _validate_path_within_directory(symlink, base_dir) is False
+
+        # Test with non-existent file (should still validate path)
+        non_existent = base_dir / "nonexistent.wav"
+        assert _validate_path_within_directory(non_existent, base_dir) is True
 
 
 class TestStreamingProtocolValidation:

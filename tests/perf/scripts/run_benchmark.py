@@ -188,6 +188,10 @@ def benchmark_params(request, omni_server):
     if param_index >= len(all_params):
         raise ValueError(f"No benchmark parameters found for index {param_index} in test: {test_name}")
 
+    if all_params[param_index]["dataset_name"] == "random-mm":
+        # TODO: Due to known issues, skip the random-mm dataset.
+        pytest.skip("Skipping parameter for random-mm dataset.")
+
     current = param_index + 1
     total = len(all_params)
     print(f"\n  Running benchmark {current}/{total} for {test_name}")

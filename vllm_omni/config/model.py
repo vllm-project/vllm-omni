@@ -34,6 +34,8 @@ class OmniModelConfig(ModelConfig):
             "audio", "latents"). If None, output type is inferred.
         stage_connector_config: Stage connector configuration dictionary.
             Contains "name" (connector name), "extra" (extra connector config).
+        task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
+            If not specified, will be inferred from model path.
 
     Example:
         >>> config = OmniModelConfig(
@@ -59,6 +61,7 @@ class OmniModelConfig(ModelConfig):
     )
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
+    task_type: str | None = None
 
     @property
     def registry(self):
@@ -98,6 +101,7 @@ class OmniModelConfig(ModelConfig):
     def __post_init__(
         self,
         # Multimodal config init vars
+        language_model_only: bool,
         limit_mm_per_prompt: dict[str, int | dict[str, int]] | None,
         enable_mm_embeds: bool | None,
         media_io_kwargs: dict[str, dict[str, Any]] | None,
@@ -114,6 +118,7 @@ class OmniModelConfig(ModelConfig):
     ) -> None:
         # Call parent's __post_init__ to handle all standard ModelConfig initialization
         super().__post_init__(
+            language_model_only=language_model_only,
             limit_mm_per_prompt=limit_mm_per_prompt,
             enable_mm_embeds=enable_mm_embeds,
             media_io_kwargs=media_io_kwargs,

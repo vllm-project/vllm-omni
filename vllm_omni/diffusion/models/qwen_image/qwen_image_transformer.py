@@ -1082,6 +1082,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
             (".add_kv_proj", ".add_k_proj", "k"),
             (".add_kv_proj", ".add_v_proj", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 

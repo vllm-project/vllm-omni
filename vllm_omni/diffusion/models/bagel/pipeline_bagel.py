@@ -332,6 +332,9 @@ class BagelPipeline(nn.Module):
             else:
                 gen_context["ropes"] = [seq_len]
 
+            if req.sampling_params.kv_metadata and "image_shape" in req.sampling_params.kv_metadata:
+                image_shape = tuple(req.sampling_params.kv_metadata["image_shape"])
+
             cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None)
             if cfg_text_kv is not None:
                 logger.info("CFG enabled with multi-KV: using injected cfg_text KV Cache")

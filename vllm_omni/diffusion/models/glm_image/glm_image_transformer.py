@@ -544,9 +544,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
             `od_config.tf_model_config`.
     """
 
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-    }
+    _repeated_blocks = ["GlmImageTransformerBlock"]
 
     def __init__(
         self,
@@ -717,6 +715,8 @@ class GlmImageTransformer2DModel(CachedTransformer):
             (".to_qkv", ".to_k", "k"),
             (".to_qkv", ".to_v", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 

@@ -178,9 +178,6 @@ def main(args: argparse.Namespace) -> None:
     print("=" * 60)
 
     # Validate arguments
-    if not args.model_path:
-        raise ValueError("--model-path is required")
-
     if not args.prompt:
         raise ValueError("--prompt is required")
 
@@ -365,7 +362,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path",
         type=str,
-        required=True,
+        default="zai-org/GLM-Image",
         help="Path to GLM-Image model directory or HuggingFace model ID",
     )
     parser.add_argument(
