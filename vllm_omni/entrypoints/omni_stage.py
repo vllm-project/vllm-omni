@@ -15,10 +15,11 @@ import queue
 import sys
 import time
 import traceback
-from collections.abc import Sequence
+import uuid
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import fields
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from vllm import PromptType, RequestOutput
 from vllm.inputs import TextPrompt
@@ -60,6 +61,8 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, O
 from vllm_omni.metrics import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
 
+_R = TypeVar("_R")
+
 logger = init_logger(__name__)
 
 
@@ -73,20 +76,16 @@ def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int =
     """
     from vllm_omni.worker.gpu_memory_utils import is_process_scoped_memory_available
 
-    nvml_available = is_process_scoped_memory_available()
-    pid_host = detect_pid_host()
-
-    if nvml_available and pid_host:
-        logger.info(
+    if is_process_scoped_memory_available() and detect_pid_host():
+        logger.debug(
             "NVML process-scoped memory available and PID host is available — concurrent init is safe, skipping locks"
         )
         yield
         return
     else:
-        logger.info(
-            "Using sequential init locks (nvml_available=%s, pid_host=%s)",
-            nvml_available,
-            pid_host,
+        logger.debug(
+            "NVML unavailable or PID host is not available (usually inside a container, "
+            "--pid=host is not set in docker run command) — using sequential init locks"
         )
 
     from vllm_omni.platforms import current_omni_platform
@@ -306,6 +305,10 @@ class OmniStage:
         self._proc: mp.Process | None = None
         self._shm_threshold_bytes: int = 65536
         self._stage_init_timeout: int = stage_init_timeout
+        # Callback used by the orchestrator's output handler to stash
+        # collective_rpc results so that ``collective_rpc`` can retrieve
+        # them without competing for the output queue.
+        self._rpc_result_checker: Callable[[str], dict | None] | None = None
 
     def set_engine(self, engine: LLMEngine) -> None:
         """Set the LLM engine for this stage.
@@ -409,6 +412,71 @@ class OmniStage:
         except queue.Empty:
             logger.error(f"[Stage-{self.stage_id}] Timeout waiting for profiler results.")
             return {}
+
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        """Execute an RPC call on all workers via the stage engine.
+
+        Args:
+            method: Name of the worker method to execute, or a callable that
+                is serialized and sent to all workers to execute.
+
+                If the method is a callable, it should accept an additional
+                ``self`` argument, in addition to the arguments passed in
+                ``args`` and ``kwargs``.  The ``self`` argument will be the
+                worker object.
+            timeout: Maximum time in seconds to wait for execution.  Raises a
+                :class:`TimeoutError` on timeout.  ``None`` means wait
+                indefinitely.
+            args: Positional arguments to pass to the worker method.
+            kwargs: Keyword arguments to pass to the worker method.
+
+        Returns:
+            A list containing the results from each worker.
+
+        Note:
+            It is recommended to use this API to only pass control messages,
+            and set up data-plane communication to pass data.
+        """
+        assert self._in_q is not None and self._out_q is not None, "Queues must be attached before collective_rpc"
+
+        # Submit collective_rpc task to worker
+        rpc_id = str(uuid.uuid4())
+        self._in_q.put(
+            {
+                "type": OmniStageTaskType.COLLECTIVE_RPC,
+                "rpc_id": rpc_id,
+                "method": method,
+                "timeout": timeout,
+                "args": args,
+                "kwargs": kwargs,
+            }
+        )
+
+        start_time = time.time()
+        while True:
+            if timeout is not None and (time.time() - start_time) > timeout:
+                raise TimeoutError(f"collective_rpc timed out after {timeout} seconds")
+
+            # Check if result was already collected by the orchestrator's
+            # output handler (stored in a shared dict).
+            result = None
+            if self._rpc_result_checker is not None:
+                result = self._rpc_result_checker(rpc_id)
+
+            if result is not None:
+                if result.get("type") == "collective_rpc_result":
+                    if result.get("rpc_id") == rpc_id:
+                        if "error" in result:
+                            raise RuntimeError(f"collective_rpc failed: {result['error']}")
+                        return result["result"]
+
+            time.sleep(0.001)  # Small sleep to avoid busy waiting
 
     def init_stage_worker(
         self,
@@ -542,14 +610,24 @@ class OmniStage:
             try:
                 self._in_q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
-                logger.warning("Failed to send shutdown to in_q: %s", e)
+                # Queue may already be closed by the weak-ref cleanup
+                # (e.g. ZmqQueue socket closed) — this is expected.
+                logger.debug("Failed to send shutdown to in_q: %s", e)
             close_fn = getattr(self._in_q, "close", None)
             if callable(close_fn):
-                close_fn()
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._in_q = None
         if self._out_q is not None:
             close_fn = getattr(self._out_q, "close", None)
             if callable(close_fn):
-                close_fn()
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._out_q = None
 
         if hasattr(self, "_ray_actor") and self._ray_actor:
             kill_ray_actor(self._ray_actor)
@@ -878,6 +956,40 @@ def _stage_worker(
                 out_q.put({"type": "profiler_result", "data": profiler_data})
             continue
 
+        # Handle collective_rpc commands
+        if task_type == OmniStageTaskType.COLLECTIVE_RPC:
+            rpc_id = task.get("rpc_id")
+            rpc_method = task.get("method")
+            rpc_timeout = task.get("timeout")
+            rpc_args = task.get("args", ())
+            rpc_kwargs = task.get("kwargs") or {}
+            try:
+                rpc_result = stage_engine.collective_rpc(
+                    method=rpc_method,
+                    timeout=rpc_timeout,
+                    args=rpc_args,
+                    kwargs=rpc_kwargs,
+                )
+                out_q.put(
+                    {
+                        "type": "collective_rpc_result",
+                        "rpc_id": rpc_id,
+                        "stage_id": stage_id,
+                        "result": rpc_result,
+                    }
+                )
+            except Exception as e:
+                logger.exception("[Stage-%s] collective_rpc failed: %s", stage_id, e)
+                out_q.put(
+                    {
+                        "type": "collective_rpc_result",
+                        "rpc_id": rpc_id,
+                        "stage_id": stage_id,
+                        "error": str(e),
+                    }
+                )
+            continue
+
         batch_tasks: list[dict[str, Any]] = [task]
         tasks_failed_to_add_to_batch: list[dict[str, Any]] = []
         start_time = _time.time()
@@ -1007,7 +1119,6 @@ def _stage_worker(
                 gen_outputs.extend(results)
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-            logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
 
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
@@ -1047,6 +1158,10 @@ def _stage_worker(
                     _metrics.stage_stats = None
                 try:
                     use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
+                except Exception:
+                    use_shm, payload = False, r_outputs
+
+                try:
                     if use_shm:
                         out_q.put(
                             {
@@ -1074,10 +1189,6 @@ def _stage_worker(
                             "metrics": _metrics,
                         }
                     )
-                logger.debug(
-                    "Enqueued result for request %s to downstream",
-                    rid,
-                )
         except Exception as e:
             logger.exception("Failed on batch %s: %s", batch_request_ids, e)
             _tb = traceback.format_exc()
@@ -1240,7 +1351,7 @@ async def _stage_worker_async(
                 usage_context=usage_context,
                 engine_args=omni_engine_args,
                 disable_log_stats=bool(
-                    engine_args.get("disable_log_stats", True) or getattr(omni_engine_args, "disable_log_stats", True)
+                    engine_args.get("disable_log_stats", False) or getattr(omni_engine_args, "disable_log_stats", False)
                 ),
             )
     if hasattr(stage_engine, "log_stats") and stage_engine.log_stats:
@@ -1406,6 +1517,54 @@ async def _stage_worker_async(
                 # Send result back to orchestrator for STOP command
                 if task_type == OmniStageTaskType.PROFILER_STOP:
                     out_q.put({"type": "profiler_result", "data": profiler_data})
+            elif task_type == OmniStageTaskType.COLLECTIVE_RPC:
+                rpc_id = task.get("rpc_id")
+                rpc_method = task.get("method")
+                rpc_timeout = task.get("timeout")
+                rpc_args = task.get("args", ())
+                rpc_kwargs = task.get("kwargs") or {}
+                try:
+                    if stage_type == "diffusion":
+                        # DiffusionEngine.collective_rpc is synchronous
+                        loop = asyncio.get_event_loop()
+                        rpc_result = await loop.run_in_executor(
+                            None,
+                            lambda: stage_engine.engine.collective_rpc(
+                                method=rpc_method,
+                                timeout=rpc_timeout,
+                                args=rpc_args,
+                                kwargs=rpc_kwargs,
+                            ),
+                        )
+                    else:
+                        rpc_result = await cast(AsyncLLM, stage_engine).collective_rpc(
+                            method=rpc_method,
+                            timeout=rpc_timeout,
+                            args=rpc_args,
+                            kwargs=rpc_kwargs,
+                        )
+                    out_q.put(
+                        {
+                            "type": "collective_rpc_result",
+                            "rpc_id": rpc_id,
+                            "stage_id": stage_id,
+                            "result": rpc_result,
+                        }
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "[Stage-%s] collective_rpc failed: %s",
+                        stage_id,
+                        e,
+                    )
+                    out_q.put(
+                        {
+                            "type": "collective_rpc_result",
+                            "rpc_id": rpc_id,
+                            "stage_id": stage_id,
+                            "error": str(e),
+                        }
+                    )
             else:
                 asyncio.create_task(generation_single_request(task))
 
@@ -1559,10 +1718,16 @@ def output_strip(r_output: RequestOutput | OmniRequestOutput, final_output: bool
     if mm_output is not None:
         r_output.multimodal_output = {}
 
+    custom_out = getattr(r_output, "_custom_output", None)
+    if custom_out is not None:
+        r_output._custom_output = {}
+
     outputs = getattr(r_output, "outputs", None)
     if outputs is not None:
         for out in outputs:
             if getattr(out, "multimodal_output", None):
                 out.multimodal_output = {}
+            if getattr(out, "_custom_output", None):
+                out._custom_output = {}
 
     return r_output

@@ -6,15 +6,14 @@ stage_args:
     prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
     runtime:
       devices: "0"
-      # 2 = 1 user prompt + 1 CFG companion (text-unconditional).
-      # For multi-prompt batches this should scale as batch_size × 2.
-      max_batch_size: 2
+      # 3 = 1 user prompt + 2 CFG companions (text-unconditional + image-unconditional).
+      max_batch_size: 3
     engine_args:
       model_stage: thinker
-      model_arch: BagelForConditionalGeneration
+      model_arch: OmniBagelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.35
+      gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: text
@@ -46,7 +45,7 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      gpu_memory_utilization: 0.55
+      gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: image

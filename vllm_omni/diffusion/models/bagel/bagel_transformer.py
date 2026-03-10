@@ -32,6 +32,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 
@@ -1330,7 +1335,6 @@ class Bagel(nn.Module):
         cfg_img_past_key_values: NaiveCache | None = None,
         cfg_img_key_values_lens: torch.IntTensor | None = None,
         cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
-        cfg_type: str = "parallel",
     ):
         x_t = packed_init_noises
 
@@ -1339,9 +1343,45 @@ class Bagel(nn.Module):
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
-        # ── Pre-compute batched CFG state (merged caches + indices) ──
         use_cfg_text = cfg_text_scale > 1.0
         use_cfg_img = cfg_img_scale > 1.0
+
+        # ── Detect CFG parallel mode ──
+        cfg_parallel_ready = use_cfg_text and get_classifier_free_guidance_world_size() > 1
+
+        if cfg_parallel_ready:
+            return self._generate_image_parallel(
+                x_t=x_t,
+                timesteps=timesteps,
+                dts=dts,
+                packed_text_ids=packed_text_ids,
+                packed_text_indexes=packed_text_indexes,
+                packed_vae_position_ids=packed_vae_position_ids,
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                packed_seqlens=packed_seqlens,
+                packed_position_ids=packed_position_ids,
+                packed_indexes=packed_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                cfg_renorm_min=cfg_renorm_min,
+                cfg_renorm_type=cfg_renorm_type,
+                cfg_interval=cfg_interval,
+                cfg_text_scale=cfg_text_scale,
+                cfg_text_packed_query_indexes=cfg_text_packed_query_indexes,
+                cfg_text_packed_position_ids=cfg_text_packed_position_ids,
+                cfg_text_past_key_values=cfg_text_past_key_values,
+                cfg_text_key_values_lens=cfg_text_key_values_lens,
+                cfg_text_packed_key_value_indexes=cfg_text_packed_key_value_indexes,
+                cfg_img_scale=cfg_img_scale,
+                cfg_img_packed_query_indexes=cfg_img_packed_query_indexes,
+                cfg_img_packed_position_ids=cfg_img_packed_position_ids,
+                cfg_img_past_key_values=cfg_img_past_key_values,
+                cfg_img_key_values_lens=cfg_img_key_values_lens,
+                cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
+            )
+
+        # ── Batched CFG mode (cfg_parallel_size=1) ──
         cfg_batched = None
 
         if use_cfg_text:
@@ -1429,6 +1469,252 @@ class Bagel(nn.Module):
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
+
+    def _generate_image_parallel(
+        self,
+        x_t: torch.Tensor,
+        timesteps: torch.Tensor,
+        dts: torch.Tensor,
+        packed_text_ids: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+        packed_vae_position_ids: torch.LongTensor,
+        packed_vae_token_indexes: torch.LongTensor,
+        packed_seqlens: torch.IntTensor,
+        packed_position_ids: torch.LongTensor,
+        packed_indexes: torch.LongTensor,
+        past_key_values: NaiveCache,
+        key_values_lens: torch.IntTensor,
+        packed_key_value_indexes: torch.LongTensor,
+        cfg_renorm_min: float,
+        cfg_renorm_type: str,
+        cfg_interval: tuple[float, float],
+        cfg_text_scale: float,
+        cfg_text_packed_query_indexes: torch.LongTensor | None,
+        cfg_text_packed_position_ids: torch.LongTensor | None,
+        cfg_text_past_key_values: NaiveCache | None,
+        cfg_text_key_values_lens: torch.IntTensor | None,
+        cfg_text_packed_key_value_indexes: torch.LongTensor | None,
+        cfg_img_scale: float,
+        cfg_img_packed_query_indexes: torch.LongTensor | None,
+        cfg_img_packed_position_ids: torch.LongTensor | None,
+        cfg_img_past_key_values: NaiveCache | None,
+        cfg_img_key_values_lens: torch.IntTensor | None,
+        cfg_img_packed_key_value_indexes: torch.LongTensor | None,
+    ):
+        """CFG parallel denoising loop: each rank computes one CFG branch.
+
+        Rank 0: gen branch (full conditioning)
+        Rank 1: text_cfg branch (unconditional text)
+        Rank 2: img_cfg branch (no image condition), only when cfg_img_scale > 1.0
+        """
+        cfg_group = get_cfg_group()
+        cfg_rank = get_classifier_free_guidance_rank()
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        use_cfg_img = cfg_img_scale > 1.0
+
+        # Validate cfg_parallel_size vs cfg_img_scale consistency
+        if cfg_world_size == 3 and not use_cfg_img:
+            raise ValueError(
+                f"cfg_parallel_size=3 requires cfg_img_scale > 1.0, "
+                f"but got cfg_img_scale={cfg_img_scale}. "
+                f"Use cfg_parallel_size=2 for text-only CFG parallel(text2img), or set cfg_img_scale > 1.0."
+            )
+        if cfg_world_size == 2 and use_cfg_img:
+            raise ValueError(
+                f"Image CFG (cfg_img_scale={cfg_img_scale}) requires cfg_parallel_size=3, "
+                f"but got cfg_parallel_size=2. "
+                f"Use cfg_parallel_size=3 to enable image CFG in parallel mode."
+            )
+
+        # Ensure all ranks start with the same x_t (initial noise may differ
+        # across ranks when no per-request seed is set).
+        x_t = x_t.contiguous()
+        cfg_group.broadcast(x_t, src=0)
+
+        # Select this rank's branch inputs
+        if cfg_rank == 0:
+            # Gen branch: use main inputs directly
+            branch_position_ids = packed_position_ids
+            branch_indexes = packed_indexes
+            branch_past_key_values = past_key_values
+            branch_key_values_lens = key_values_lens
+            branch_key_value_indexes = packed_key_value_indexes
+        elif cfg_rank == 1:
+            # Text CFG branch
+            branch_position_ids = cfg_text_packed_position_ids
+            branch_indexes = cfg_text_packed_query_indexes
+            branch_past_key_values = cfg_text_past_key_values
+            branch_key_values_lens = cfg_text_key_values_lens
+            branch_key_value_indexes = cfg_text_packed_key_value_indexes
+        elif cfg_rank == 2:
+            # Image CFG branch
+            branch_position_ids = cfg_img_packed_position_ids
+            branch_indexes = cfg_img_packed_query_indexes
+            branch_past_key_values = cfg_img_past_key_values
+            branch_key_values_lens = cfg_img_key_values_lens
+            branch_key_value_indexes = cfg_img_packed_key_value_indexes
+        else:
+            raise RuntimeError(f"Unexpected cfg_rank={cfg_rank} for Bagel 3-branch CFG parallel")
+
+        for i, t in enumerate(timesteps):
+            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+            use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
+
+            if use_cfg_this_step:
+                # CFG interval: each rank computes its own branch
+                local_v_t = self._forward_flow_single_branch(
+                    x_t=x_t,
+                    timestep=timestep,
+                    packed_vae_token_indexes=packed_vae_token_indexes,
+                    packed_vae_position_ids=packed_vae_position_ids,
+                    packed_text_ids=packed_text_ids,
+                    packed_text_indexes=packed_text_indexes,
+                    packed_indexes=branch_indexes,
+                    packed_position_ids=branch_position_ids,
+                    packed_seqlens=packed_seqlens,
+                    key_values_lens=branch_key_values_lens,
+                    past_key_values=branch_past_key_values,
+                    packed_key_value_indexes=branch_key_value_indexes,
+                )
+
+                gathered = cfg_group.all_gather(local_v_t, separate_tensors=True)
+                v_t = self._combine_cfg(
+                    gathered[0],
+                    gathered[1],
+                    gathered[2] if (use_cfg_img and len(gathered) > 2) else None,
+                    cfg_text_scale,
+                    cfg_img_scale,
+                    cfg_renorm_type,
+                    cfg_renorm_min,
+                )
+            else:
+                # Outside CFG interval: all ranks compute with gen inputs, no comm
+                v_t = self._forward_flow_single_branch(
+                    x_t=x_t,
+                    timestep=timestep,
+                    packed_vae_token_indexes=packed_vae_token_indexes,
+                    packed_vae_position_ids=packed_vae_position_ids,
+                    packed_text_ids=packed_text_ids,
+                    packed_text_indexes=packed_text_indexes,
+                    packed_indexes=packed_indexes,
+                    packed_position_ids=packed_position_ids,
+                    packed_seqlens=packed_seqlens,
+                    key_values_lens=key_values_lens,
+                    past_key_values=past_key_values,
+                    packed_key_value_indexes=packed_key_value_indexes,
+                )
+
+            x_t = x_t - v_t.to(x_t.device) * dts[i]
+
+        unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+        return unpacked_latent
+
+    @staticmethod
+    def _combine_cfg(
+        v_t: torch.Tensor,
+        cfg_text_v_t: torch.Tensor,
+        cfg_img_v_t: torch.Tensor | None,
+        cfg_text_scale: float,
+        cfg_img_scale: float,
+        cfg_renorm_type: str,
+        cfg_renorm_min: float,
+    ) -> torch.Tensor:
+        """Combine 3-branch CFG predictions with renormalization.
+
+        Args:
+            v_t: velocity from gen branch (full conditioning)
+            cfg_text_v_t: velocity from text_cfg branch (unconditional text)
+            cfg_img_v_t: velocity from img_cfg branch (no image), or None
+            cfg_text_scale: text guidance scale
+            cfg_img_scale: image guidance scale
+            cfg_renorm_type: "text_channel", "global", or "channel"
+            cfg_renorm_min: minimum renormalization scale
+        """
+        if cfg_renorm_type == "text_channel":
+            v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+            norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
+            norm_v_t_text_ = torch.norm(v_t_text_, dim=-1, keepdim=True)
+            scale = (norm_v_t / (norm_v_t_text_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+            v_t_text = v_t_text_ * scale
+            if cfg_img_scale > 1.0 and cfg_img_v_t is not None:
+                v_t = cfg_img_v_t + cfg_img_scale * (v_t_text - cfg_img_v_t)
+            else:
+                v_t = v_t_text
+        else:
+            v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+
+            if cfg_img_scale > 1.0 and cfg_img_v_t is not None:
+                v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
+            else:
+                v_t_ = v_t_text_
+
+            # NOTE norm is computed over all dimensions, thus currently only supports batch_size = 1 with navit
+            if cfg_renorm_type == "global":
+                norm_v_t = torch.norm(v_t)
+                norm_v_t_ = torch.norm(v_t_)
+            elif cfg_renorm_type == "channel":
+                norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
+                norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
+            else:
+                raise NotImplementedError(f"{cfg_renorm_type} is not supported")
+            scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+            v_t = v_t_ * scale
+
+        return v_t
+
+    def _forward_flow_single_branch(
+        self,
+        x_t: torch.Tensor,
+        timestep: torch.LongTensor,
+        packed_vae_token_indexes: torch.LongTensor,
+        packed_vae_position_ids: torch.LongTensor,
+        packed_text_ids: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+        packed_indexes: torch.LongTensor,
+        packed_position_ids: torch.LongTensor,
+        packed_seqlens: torch.IntTensor,
+        key_values_lens: torch.IntTensor,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Run a single-branch forward pass (no CFG batching).
+
+        Used by CFG parallel mode where each rank computes one branch.
+        Returns the velocity v_t for the given branch.
+        """
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        assert timestep.unique().shape[0] == 1
+        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+        packed_timestep_embeds = self.time_embedder(timestep)
+        x_t_emb = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        if x_t_emb.dtype != packed_sequence.dtype:
+            x_t_emb = x_t_emb.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = x_t_emb
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs["mode"] = "gen"
+            extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
+            extra_inputs["packed_text_indexes"] = packed_text_indexes
+
+        output = self.language_model.forward(
+            packed_query_sequence=packed_sequence,
+            query_lens=packed_seqlens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            **extra_inputs,
+        )
+        v_t = self.llm2vae(output.packed_query_sequence)
+        v_t = v_t[packed_vae_token_indexes]
+        return v_t
 
     def _forward_flow(
         self,
@@ -1535,34 +1821,14 @@ class Bagel(nn.Module):
 
         # ── CFG combination ──
         if use_cfg:
-            if cfg_renorm_type == "text_channel":
-                v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
-                norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
-                norm_v_t_text_ = torch.norm(v_t_text_, dim=-1, keepdim=True)
-                scale = (norm_v_t / (norm_v_t_text_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-                v_t_text = v_t_text_ * scale
-                if cfg_img_scale > 1.0:
-                    v_t = cfg_img_v_t + cfg_img_scale * (v_t_text - cfg_img_v_t)
-                else:
-                    v_t = v_t_text
-            else:
-                v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
-
-                if cfg_img_scale > 1.0:
-                    v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
-                else:
-                    v_t_ = v_t_text_
-
-                # NOTE norm is computed over all dimensions, thus currently only supports batch_size = 1 with navit
-                if cfg_renorm_type == "global":
-                    norm_v_t = torch.norm(v_t)
-                    norm_v_t_ = torch.norm(v_t_)
-                elif cfg_renorm_type == "channel":
-                    norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
-                    norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
-                else:
-                    raise NotImplementedError(f"{cfg_renorm_type} is not supported")
-                scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-                v_t = v_t_ * scale
+            v_t = self._combine_cfg(
+                v_t,
+                cfg_text_v_t,
+                cfg_img_v_t,
+                cfg_text_scale,
+                cfg_img_scale,
+                cfg_renorm_type,
+                cfg_renorm_min,
+            )
 
         return v_t
