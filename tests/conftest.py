@@ -89,7 +89,7 @@ def _run_pre_test_cleanup(enable_force=False):
             try:
                 from tests.utils import wait_for_gpu_memory_to_clear
 
-                # Use env VLLM_TEST_GPU_DEVICES to specify GPU indices (e.g. "0,1,2"), if unset, use all GPUs
+                # Use env VLLM_TEST_GPU_DEVICES to specify GPU indices (e.g. "0,1,2"), if unset, use all GPU
                 env_devices = os.getenv("VLLM_TEST_GPU_DEVICES", "").strip()
                 if env_devices:
                     devices = [int(x.strip()) for x in env_devices.split(",") if x.strip().isdigit()]
