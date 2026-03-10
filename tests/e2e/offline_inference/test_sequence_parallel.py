@@ -146,9 +146,6 @@ def _run_inference(
 # - warmup: whether to run warmup for this SP config
 # - is_perf_test: whether this is a performance test (show speedup metrics)
 SP_CONFIGS_L2 = [
-    # Ulysses-2 - performance test
-    (2, 1, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),
-    (1, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ring-2 - performance test
     # Hybrid - correctness only
     (2, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, False, False),
 ]
