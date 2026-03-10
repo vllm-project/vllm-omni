@@ -100,8 +100,7 @@ def _wait_for_video_status(server: OmniServer, video_id: str, expected_status: s
         time.sleep(VIDEO_POLL_INTERVAL_S)
 
     raise AssertionError(
-        f"Timed out waiting for video job {video_id} to reach status={expected_status}. "
-        f"Last payload: {last_payload}"
+        f"Timed out waiting for video job {video_id} to reach status={expected_status}. Last payload: {last_payload}"
     )
 
 
