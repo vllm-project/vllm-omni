@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from http import HTTPStatus
 from typing import Any, cast
 
 from fastapi import HTTPException
 from PIL import Image
-from pydantic import BaseModel
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
@@ -27,7 +27,8 @@ from vllm_omni.lora.utils import stable_lora_int_id
 logger = init_logger(__name__)
 
 
-class ReferenceImage(BaseModel):
+@dataclass
+class ReferenceImage:
     """Reference class for tracking additional metadata if needed"""
 
     data: Image.Image

@@ -855,6 +855,20 @@ _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
 @with_cancellation
 @load_aware_call
 async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request):
+    """Generate speech audio from text using the loaded TTS model.
+
+    Args:
+        request: Speech synthesis request in OpenAI-compatible format.
+        raw_request: Raw FastAPI request for accessing app state.
+
+    Returns:
+        The generated audio response, or an OpenAI-style error payload when
+        the request cannot be fulfilled.
+
+    Raises:
+        HTTPException: If the server does not support speech generation or the
+        synthesis request fails unexpectedly.
+    """
     handler = Omnispeech(raw_request)
     if handler is None:
         base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
@@ -886,7 +900,16 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
     },
 )
 async def list_voices(raw_request: Request):
-    """List available TTS voices/speakers from the loaded model."""
+    """List available TTS voices exposed by the loaded speech model.
+
+    Args:
+        raw_request: Raw FastAPI request for accessing app state.
+
+    Returns:
+        A JSON payload containing the sorted set of supported speaker names, or
+        an OpenAI-style error response when the current server configuration
+        does not support the Speech API.
+    """
     handler = Omnispeech(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(message="The model does not support Speech API")
@@ -1837,7 +1860,44 @@ async def create_video(
     negative_prompt: str | None = Form(default=None),
     lora: str | None = Form(default=None),
 ) -> VideoResponse:
-    """OpenAI-style video create endpoint (multipart form-data)."""
+    """Create an asynchronous video generation job.
+
+    This OpenAI-style endpoint accepts multipart form-data, validates the
+    request payload, persists a queued job record, and starts generation in the
+    background. The response contains metadata for polling job status rather
+    than the generated video bytes.
+
+    Args:
+        raw_request: Raw FastAPI request for accessing app state.
+        prompt: Text prompt describing the requested video.
+        input_reference: Optional uploaded reference image file.
+        image_reference: Optional JSON-encoded reference image descriptor.
+        model: Optional model name supplied by the client.
+        seconds: Optional target duration string accepted by the video API.
+        size: Optional output size string such as ``1280x720``.
+        user: Optional user identifier forwarded in the stored request.
+        width: Optional explicit output width override.
+        height: Optional explicit output height override.
+        num_frames: Optional explicit frame count override.
+        fps: Optional explicit frame rate override.
+        num_inference_steps: Optional inference step override.
+        guidance_scale: Optional primary guidance scale override.
+        guidance_scale_2: Optional secondary guidance scale override.
+        boundary_ratio: Optional boundary ratio override.
+        flow_shift: Optional flow shift override.
+        true_cfg_scale: Optional true CFG scale override.
+        seed: Optional random seed override.
+        negative_prompt: Optional negative prompt.
+        lora: Optional JSON-encoded per-request LoRA configuration.
+
+    Returns:
+        A queued ``VideoResponse`` that includes the generated job identifier
+        and initial metadata for later retrieval.
+
+    Raises:
+        HTTPException: If the request is invalid, the video handler is
+        unavailable, or job initialization fails.
+    """
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
     parsed_image_reference = _parse_form_json(image_reference)
     if parsed_image_reference is not None and input_reference_bytes is not None:
@@ -1910,6 +1970,17 @@ async def list_videos(
     limit: int | None = Query(None, ge=0, le=100),
     order: Annotated[Literal["asc", "desc"], Query()] = "desc",
 ):
+    """List stored video generation jobs.
+
+    Args:
+        after: Optional cursor indicating the last seen video ID.
+        limit: Optional maximum number of jobs to return.
+        order: Sort order for the returned jobs by creation time.
+
+    Returns:
+        A ``VideoListResponse`` containing paginated job metadata and cursor
+        information.
+    """
     jobs = await VIDEO_STORE.list_values()
     jobs.sort(key=lambda j: j.created_at, reverse=order == "desc")
 
@@ -1932,6 +2003,17 @@ async def list_videos(
 
 @router.get("/v1/videos/{video_id}")
 async def retrieve_video(video_id: str) -> VideoResponse:
+    """Retrieve metadata for a previously created video job.
+
+    Args:
+        video_id: Identifier returned by ``POST /v1/videos``.
+
+    Returns:
+        The stored ``VideoResponse`` for the requested job.
+
+    Raises:
+        HTTPException: If the video job does not exist.
+    """
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -1940,6 +2022,21 @@ async def retrieve_video(video_id: str) -> VideoResponse:
 
 @router.delete("/v1/videos/{video_id}")
 async def delete_video(video_id: str) -> VideoDeleteResponse:
+    """Delete a stored video job and any generated output.
+
+    If the job is still queued or running, this endpoint first attempts to
+    cancel the in-flight generation task before removing the stored metadata.
+
+    Args:
+        video_id: Identifier of the video job to delete.
+
+    Returns:
+        A ``VideoDeleteResponse`` confirming the job was removed.
+
+    Raises:
+        HTTPException: If the video job does not exist, cancellation is still
+        in progress, or output is not yet ready for a completed job.
+    """
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -1968,6 +2065,19 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
 
 @router.get("/v1/videos/{video_id}/content")
 async def download_video(video_id: str) -> FileResponse:
+    """Download the generated file for a completed video job.
+
+    Args:
+        video_id: Identifier of the video job whose output should be returned.
+
+    Returns:
+        A ``FileResponse`` streaming the generated video file from local
+        storage.
+
+    Raises:
+        HTTPException: If the job does not exist, is still in progress, or the
+        generated file is missing from disk.
+    """
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Video not found")
