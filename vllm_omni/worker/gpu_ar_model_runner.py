@@ -98,9 +98,25 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        if not getattr(self, "_warmup_state_cleared", False):
+            self._warmup_state_cleared = True
+            if hasattr(self.model, "_clear_warmup_state"):
+                self.model._clear_warmup_state()
+
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
+        finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
+        if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
+            for req_id, data in finished_reqs.items():
+                try:
+                    model_meta = self.model.get_kv_transfer_metadata(req_id)
+                    if model_meta:
+                        existing = data.get("custom_metadata") or {}
+                        existing.update(model_meta)
+                        data["custom_metadata"] = existing
+                except Exception as e:
+                    logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
         self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=getattr(scheduler_output, "finished_requests_needing_kv_transfer", {}),
+            finished_reqs=finished_reqs,
             kv_caches=self.kv_caches,
             block_size=self.cache_config.block_size,
             cache_dtype=str(self.cache_config.cache_dtype),
@@ -289,6 +305,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+
+            # [Omni] Map pending ropes metadata to req_ids.
+            if hasattr(self.model, "flush_pending_metadata"):
+                self.model.flush_pending_metadata(list(req_ids))
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

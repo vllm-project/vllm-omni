@@ -14,6 +14,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 RUN apt clean && apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
     curl \
+    espeak-ng \
     ffmpeg \
     git \
     libsndfile1 \
