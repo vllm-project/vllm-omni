@@ -7,6 +7,7 @@ Unit tests for OpenAI-compatible video generation endpoints.
 import asyncio
 import base64
 import io
+import json
 import os
 import threading
 import time
@@ -234,7 +235,7 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
         "/v1/videos",
         data={
             "prompt": "A fox running through snow.",
-            "image_reference": f"{'image_url': {_make_test_image_data_url((40, 24))}}",
+            "image_reference": {json.dumps({"image_url": _make_test_image_data_url((40, 24))})},
         },
     )
 
@@ -401,16 +402,16 @@ def test_invalid_size_format_raises_validation_error(test_client):
         )
 
 
-def test_invalid_size_parse_returns_500(test_client):
+def test_invalid_size_parse_returns_422(test_client):
     response = test_client.post(
         "/v1/videos",
         data={"prompt": "bad size", "size": "640x"},
     )
-    assert response.status_code == 200
-    video_id = response.json()["id"]
-    failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
-    assert failed["error"]["code"] == "ValueError"
-    assert "invalid size format" in failed["error"]["message"].lower()
+    assert response.status_code == 422
+    body = response.json()
+    assert body["detail"][0]["loc"] == ["body", "size"]
+    assert body["detail"][0]["type"] == "string_pattern_mismatch"
+    assert body["detail"][0]["input"] == "640x"
 
 
 def test_rejects_input_reference_and_image_reference_together(test_client):
@@ -625,7 +626,7 @@ def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
 
 
 def test_video_response_file_extension_is_robust():
-    response = VideoResponse(model="test-model")
+    response = VideoResponse(model="test-model", prompt="Make something beautiful")
     assert response.file_extension == "mp4"
 
     with_params = VideoResponse.model_construct(

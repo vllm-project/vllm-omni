@@ -97,6 +97,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
+    SizeStr,
     VideoDeleteResponse,
     VideoError,
     VideoGenerationRequest,
@@ -1842,7 +1843,7 @@ async def create_video(
     image_reference: str | None = Form(default=None),
     model: str | None = Form(default=None),
     seconds: SecondStr | None = Form(default=None),
-    size: str | None = Form(default=None),
+    size: SizeStr | None = Form(default=None),
     user: str | None = Form(default=None),
     width: int | None = Form(default=None),
     height: int | None = Form(default=None),
