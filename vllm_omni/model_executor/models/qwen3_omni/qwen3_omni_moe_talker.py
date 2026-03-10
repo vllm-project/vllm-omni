@@ -19,7 +19,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerDummyInputsBuilder,
 )
-from vllm.model_executor.models.qwen3_omni_moe_thinker import Qwen3Omni_VisionTransformer
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -33,6 +32,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mt
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMForCausalLM,
+    Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeConditionalGenerationMixin,
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,

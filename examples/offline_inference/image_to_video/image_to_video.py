@@ -22,7 +22,7 @@ Usage:
     python image_to_video.py --model /path/to/LTX-2 \
         --model-class-name LTX2ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --num-frames 121 --num_inference_steps 40 --guidance_scale 4.0 \
+        --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 """
 
@@ -176,11 +176,6 @@ def parse_args() -> argparse.Namespace:
             "Default 1 means pure sharding (no replication). "
         ),
     )
-    parser.add_argument(
-        "--log-stats",
-        action="store_true",
-        help="Enable vLLM-Omni statistics logging.",
-    )
     return parser.parse_args()
 
 
@@ -283,7 +278,6 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
-        log_stats=args.log_stats,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,

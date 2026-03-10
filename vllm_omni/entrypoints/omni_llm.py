@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import cloudpickle
@@ -8,9 +8,11 @@ from tqdm import tqdm
 # External library imports (vLLM)
 from vllm.config import CompilationConfig, StructuredOutputsConfig, is_init_field
 from vllm.entrypoints.llm import LLM
+from vllm.inputs import ProcessorInputs, PromptType
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
+from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
@@ -19,13 +21,14 @@ from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connec
 
 # Internal imports (our code)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.input_processor import OmniInputProcessor
+from vllm_omni.engine.input_processor import OmniInputProcessor, reinject_omni_fields
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.utils import (
     filter_dataclass_kwargs,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
+    resolve_model_type,
 )
 
 logger = init_logger(__name__)
@@ -82,12 +85,13 @@ class OmniLLM(LLM):
         self.worker_backend = kwargs.get("worker_backend", "multi_process")
         self.ray_address = kwargs.get("ray_address", None)
         self.batch_timeout = batch_timeout
+        self.model_type = resolve_model_type(model)
         self.log_stats: bool = bool(log_stats)
 
         # Load stage configurations
         if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model)
+            self.config_path = resolve_model_config_path(self.model_type)
+            self.stage_configs = load_stage_configs_from_model(config_path=self.config_path)
         else:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
@@ -174,11 +178,49 @@ class OmniLLM(LLM):
 
         self.supported_tasks = supported_tasks
 
+        # Keep parity with vLLM's LLM initialization fields so inherited
+        # generate/chat preprocessing paths work as expected.
+        self.renderer = self.llm_engine.renderer
         # Load the Input/Output processor plugin if any
         io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
         self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
         self.model_config = self.llm_engine.model_config
         self.input_processor = self.llm_engine.input_processor
+
+        # Parity with upstream LLM for pooling/classify entrypoints
+        chat_template = kwargs.get("chat_template", None)
+        from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
+        from vllm.entrypoints.pooling.io_processor_factories import init_pooling_io_processors
+
+        self.chat_template = load_chat_template(chat_template)
+        self.chat_template_config = ChatTemplateConfig(chat_template=self.chat_template)
+        self.init_pooling_io_processors = init_pooling_io_processors(
+            supported_tasks=supported_tasks,
+            model_config=self.model_config,
+            renderer=self.renderer,
+            chat_template_config=self.chat_template_config,
+        )
+
+    # ------------------------------------------------------------------
+    # Override upstream _preprocess_cmpl so that omni-specific fields
+    # (additional_information, prompt_embeds, …) survive the renderer's
+    # process_for_engine step which only copies standard vLLM keys.
+    # ------------------------------------------------------------------
+
+    def _preprocess_cmpl(
+        self,
+        prompts: Sequence[PromptType],
+        tokenization_kwargs: dict[str, Any] | None = None,
+    ) -> Sequence[ProcessorInputs]:
+        renderer = self.renderer
+        model_config = self.model_config
+
+        parsed_prompts = [parse_model_prompt(model_config, prompt) for prompt in prompts]
+        tok_params = renderer.default_cmpl_tok_params.with_kwargs(**(tokenization_kwargs or {}))
+        results = renderer.render_cmpl(parsed_prompts, tok_params)
+
+        reinject_omni_fields(results, parsed_prompts)
+        return results
 
     def close(self) -> None:
         """Close resources.
@@ -197,7 +239,9 @@ class OmniLLM(LLM):
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
 
-    def _run_engine(self, *, use_tqdm: bool | Callable[..., tqdm] = True) -> list[RequestOutput | PoolingRequestOutput]:
+    def _run_engine(
+        self, output_type=None, *, use_tqdm: bool | Callable[..., tqdm] = True
+    ) -> list[RequestOutput | PoolingRequestOutput]:
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()

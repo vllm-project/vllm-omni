@@ -219,6 +219,7 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--ring",
+            "--ring-degree",
             dest="ring_degree",
             type=int,
             default=None,
@@ -334,6 +335,14 @@ class OmniServeCommand(CLISubcommand):
             choices=[1, 2],
             help="Number of devices for CFG parallel computation for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
+        )
+        omni_config_group.add_argument(
+            "--vae-patch-parallel-size",
+            type=int,
+            default=1,
+            help="VAE Patch Parallelism degree for diffusion models. "
+            "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
+            "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
 
         # Default sampling parameters

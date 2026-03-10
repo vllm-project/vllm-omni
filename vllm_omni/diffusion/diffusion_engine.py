@@ -67,18 +67,19 @@ class DiffusionEngine:
             raise e
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
-        diffusion_engine_start_time = time.time()
+        diffusion_engine_start_time = time.perf_counter()
+
         # Apply pre-processing if available
         preprocess_time = 0.0
         if self.pre_process_func is not None:
-            preprocess_start_time = time.time()
+            preprocess_start_time = time.perf_counter()
             request = self.pre_process_func(request)
-            preprocess_time = time.time() - preprocess_start_time
+            preprocess_time = time.perf_counter() - preprocess_start_time
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
-        exec_start_time = time.time()
+        exec_start_time = time.perf_counter()
         output = self.add_req_and_wait_for_response(request)
-        exec_total_time = time.time() - exec_start_time
+        exec_total_time = time.perf_counter() - exec_start_time
 
         if output.error:
             raise Exception(f"{output.error}")
@@ -97,14 +98,24 @@ class DiffusionEngine:
                 for i, prompt in enumerate(request.prompts)
             ]
 
-        postprocess_start_time = time.time()
+        postprocess_start_time = time.perf_counter()
         outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
         audio_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
             outputs = outputs.get("video", outputs)
-        postprocess_time = time.time() - postprocess_start_time
+        postprocess_time = time.perf_counter() - postprocess_start_time
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+
+        step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
+        logger.info(
+            "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
+            "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
+            preprocess_time * 1000,
+            exec_total_time * 1000,
+            postprocess_time * 1000,
+            step_total_ms,
+        )
 
         # Convert to OmniRequestOutput format
         # Ensure outputs is a list
@@ -113,19 +124,16 @@ class DiffusionEngine:
 
         metrics = {
             "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": (time.time() - diffusion_engine_start_time) * 1000,
+            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
             "diffusion_engine_total_time_ms": exec_total_time * 1000,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
+            "postprocess_time_ms": postprocess_time * 1000,
         }
-
         if self.pre_process_func is not None:
             metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
         # Handle single request or multiple requests
-        metrics["postprocess_time_ms"] = postprocess_time * 1000
-        metrics["num_inference_steps"] = int(request.sampling_params.num_inference_steps)
-
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
             prompt = request.prompts[0]
@@ -155,6 +163,7 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        custom_output=output.custom_output or {},
                         multimodal_output=mm_output,
                     ),
                 ]
@@ -208,11 +217,12 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
+                            custom_output=output.custom_output or {},
                             multimodal_output=mm_output,
                         ),
                     )
 
-        return results
+            return results
 
     @staticmethod
     def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
