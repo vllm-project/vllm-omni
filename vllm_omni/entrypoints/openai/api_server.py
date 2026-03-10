@@ -183,25 +183,12 @@ class _DiffusionServingModels:
         def __getattr__(self, name):
             return None
 
-    class _Unsupported:
-        def __init__(self, name: str):
-            self.name = name
-
-        def __call__(self, *args, **kwargs):
-            raise NotImplementedError(f"{self.name} is not supported in diffusion mode")
-
-        def __getattr__(self, attr):
-            raise NotImplementedError(f"{self.name}.{attr} is not supported in diffusion mode")
-
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
         self._base_model_paths = base_model_paths
         self.model_config = self._NullModelConfig()
-
-    def __getattr__(self, name):
-        """Return a sentinel that raises NotImplementedError if called or
-        accessed, so any use of unsupported OpenAIServingModels features in
-        diffusion mode fails loudly with a descriptive message."""
-        return self._Unsupported(name)
+        self.renderer = None
+        self.input_processor = None
+        self.io_processor = None
 
     async def show_available_models(self) -> ModelList:
         return ModelList(
