@@ -15,7 +15,7 @@ model:
     vq_model_name: ${model.vq_model_image.repo_id}
   vq_model_audio:
     type: "emova"
-    repo_id: "Emova-ollm/emova_speech_tokenizer_hf"
+    repo_id: "snu-aidas/emova_speech_tokenizer_vllm"
     vq_model_name: ${model.vq_model_audio.repo_id}
   dynin_omni:
     repo_id: "snu-aidas/dynin-omni_vllm"

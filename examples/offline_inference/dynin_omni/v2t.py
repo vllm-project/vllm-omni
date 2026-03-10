@@ -18,7 +18,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-
 DEFAULT_V2T_QUESTIONS = [
     "Please describe this video in detail.",
     "What is happening in this video?",
@@ -138,10 +137,7 @@ def resolve_tokenizer_source_with_local_priority(
         )
         return str(configured_tokenizer_path)
 
-    print(
-        "[v2t] Local tokenizer markers were not found; "
-        f"falling back to model dir anyway: {model_dir}"
-    )
+    print(f"[v2t] Local tokenizer markers were not found; falling back to model dir anyway: {model_dir}")
     return str(model_dir)
 
 
@@ -193,12 +189,9 @@ def resolve_video_path_from_row(*, row: dict[str, Any], base_dir: Path) -> Path:
 
     if missing_paths:
         first = missing_paths[0]
-        raise FileNotFoundError(
-            f"video file not found: {first} (checked {len(missing_paths)} candidate path(s))"
-        )
+        raise FileNotFoundError(f"video file not found: {first} (checked {len(missing_paths)} candidate path(s))")
     raise ValueError(
-        "metadata row has no usable video source. "
-        "Expected one of: video_path/video_file/path/file/video.path"
+        "metadata row has no usable video source. Expected one of: video_path/video_file/path/file/video.path"
     )
 
 
@@ -453,6 +446,7 @@ def load_uni_prompting(
     local_files_only: bool,
 ) -> Any:
     from transformers import AutoTokenizer
+
     from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import (
         UniversalPrompting,
     )
@@ -528,7 +522,7 @@ def _load_video_frames(video_path: Path) -> list[Image.Image]:
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            raise IOError(f"Could not open video file: {video_path}")
+            raise OSError(f"Could not open video file: {video_path}")
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -569,9 +563,7 @@ def load_video_token_ids(
     if total_frames == 0:
         raise ValueError(f"Video has no decodable frames: {video_path}")
     if total_frames < num_frames:
-        raise ValueError(
-            f"Video {video_path} has {total_frames} frame(s), required >= {num_frames}."
-        )
+        raise ValueError(f"Video {video_path} has {total_frames} frame(s), required >= {num_frames}.")
 
     if sample_method not in {"uniform", "uniform_sequential"}:
         raise ValueError(f"Sampling method {sample_method} not supported.")
@@ -588,8 +580,7 @@ def load_video_token_ids(
 
 def build_v2t_chat_prompt(question: str) -> str:
     return (
-        "<|start_header_id|>user<|end_header_id|>\n"
-        f"{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+        f"<|start_header_id|>user<|end_header_id|>\n{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
     )
 
 
@@ -755,9 +746,7 @@ def validate_generation_args(
     if steps <= 0:
         raise ValueError("--v2t-steps must be > 0.")
     if max_new_tokens % block_length != 0:
-        raise ValueError(
-            f"v2t requires max_new_tokens % block_length == 0, got {max_new_tokens} % {block_length}"
-        )
+        raise ValueError(f"v2t requires max_new_tokens % block_length == 0, got {max_new_tokens} % {block_length}")
     num_blocks = max_new_tokens // block_length
     if num_blocks <= 0:
         raise ValueError("Invalid number of generation blocks.")
@@ -916,9 +905,7 @@ def main() -> None:
         block_length=v2t_block_length,
     )
 
-    cond_dropout_prob, tokenizer_path, model_local_files_only = resolve_prompting_defaults(
-        dynin_config_path
-    )
+    cond_dropout_prob, tokenizer_path, model_local_files_only = resolve_prompting_defaults(dynin_config_path)
 
     os.environ["DYNIN_CONFIG_PATH"] = dynin_config_path
     if args.disable_hf_xet:
@@ -971,9 +958,7 @@ def main() -> None:
         model_dir=model_dir,
         configured_tokenizer_path=tokenizer_path,
     )
-    effective_model_local_files_only = bool(
-        model_local_files_only or Path(tokenizer_source).expanduser().is_dir()
-    )
+    effective_model_local_files_only = bool(model_local_files_only or Path(tokenizer_source).expanduser().is_dir())
     if effective_model_local_files_only and not model_local_files_only:
         print("[v2t] Enabling local_files_only because tokenizer source is local.")
 
@@ -992,10 +977,7 @@ def main() -> None:
         dynin_config_path=dynin_config_path,
         default_model_local_files_only=effective_model_local_files_only,
     )
-    print(
-        f"[v2t] Loading image tokenizer from: {vq_source} "
-        f"(local_files_only={vq_local_only})"
-    )
+    print(f"[v2t] Loading image tokenizer from: {vq_source} (local_files_only={vq_local_only})")
     vq_model = load_vq_encoder(vq_source, device=device, local_files_only=vq_local_only)
 
     image_token_offset = len(uni_prompting.text_tokenizer)
@@ -1003,6 +985,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     from vllm import SamplingParams
+
     from vllm_omni.entrypoints.omni import Omni
 
     omni = Omni(model=str(model_dir), stage_configs_path=args.stage_config_path, dtype=args.dtype)

@@ -17,10 +17,10 @@ import numpy as np
 import torch
 from PIL import Image
 
-
 # ---------------------------------------------------------------------------
 # Bootstrap & environment
 # ---------------------------------------------------------------------------
+
 
 def bootstrap_repo_path() -> Path:
     repo_root = Path(__file__).resolve().parents[3]
@@ -34,6 +34,7 @@ def ensure_safe_import_for_vllm() -> None:
     os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
     try:
         import torchvision  # noqa: F401
+
         return
     except Exception:
         pass
@@ -88,6 +89,7 @@ def ensure_local_model_dir(model: str, cache_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Config resolution helpers
 # ---------------------------------------------------------------------------
+
 
 def resolve_prompting_defaults(dynin_config_path: str) -> tuple[str, float, str | None, bool]:
     """Resolve noise_type, cond_dropout_prob, tokenizer_path, local_files_only from DYNIN config."""
@@ -152,6 +154,7 @@ def resolve_i2i_runtime_defaults(
     cfg_select = lambda _path: None
     try:
         from omegaconf import OmegaConf
+
         dynin_cfg = OmegaConf.load(dynin_config_path)
         cfg_select = lambda _path: OmegaConf.select(dynin_cfg, _path)
     except Exception:
@@ -159,10 +162,16 @@ def resolve_i2i_runtime_defaults(
 
     base_resolution = _pick_int(None, cfg_select, ("dataset.params.resolution",), 336)
     resolved_src_res = _pick_int(
-        source_resolution, cfg_select, ("dataset.params.i2i_source_resolution",), base_resolution,
+        source_resolution,
+        cfg_select,
+        ("dataset.params.i2i_source_resolution",),
+        base_resolution,
     )
     resolved_tgt_res = _pick_int(
-        target_resolution, cfg_select, ("dataset.params.i2i_target_resolution",), base_resolution,
+        target_resolution,
+        cfg_select,
+        ("dataset.params.i2i_target_resolution",),
+        base_resolution,
     )
     num_vq_tokens = (resolved_tgt_res // 16) ** 2
 
@@ -171,6 +180,7 @@ def resolve_i2i_runtime_defaults(
     if dynin_cfg is not None:
         try:
             from omegaconf import OmegaConf
+
             explicit_schedule = OmegaConf.select(dynin_cfg, "mask_schedule.schedule")
             if explicit_schedule is not None:
                 resolved_noise_schedule_name = str(explicit_schedule)
@@ -189,22 +199,40 @@ def resolve_i2i_runtime_defaults(
 
     return {
         "prompt_max_text_len": _pick_int(
-            prompt_max_text_len, cfg_select, ("dataset.preprocessing.max_seq_length",), 128,
+            prompt_max_text_len,
+            cfg_select,
+            ("dataset.preprocessing.max_seq_length",),
+            128,
         ),
         "mask_token_id": _pick_int(
-            mask_token_id, cfg_select, ("model.omada.mask_token_id",), 126336,
+            mask_token_id,
+            cfg_select,
+            ("model.omada.mask_token_id",),
+            126336,
         ),
         "codebook_size": _pick_int(
-            codebook_size, cfg_select, ("model.omada.codebook_size",), 8192,
+            codebook_size,
+            cfg_select,
+            ("model.omada.codebook_size",),
+            8192,
         ),
         "timesteps": _pick_int(
-            timesteps, cfg_select, ("training.generation_timesteps",), 18,
+            timesteps,
+            cfg_select,
+            ("training.generation_timesteps",),
+            18,
         ),
         "guidance_scale": _pick_float(
-            guidance_scale, cfg_select, ("training.guidance_scale",), 0.0,
+            guidance_scale,
+            cfg_select,
+            ("training.guidance_scale",),
+            0.0,
         ),
         "temperature": _pick_float(
-            temperature, cfg_select, ("training.generation_temperature",), 1.0,
+            temperature,
+            cfg_select,
+            ("training.generation_temperature",),
+            1.0,
         ),
         "source_resolution": resolved_src_res,
         "target_resolution": resolved_tgt_res,
@@ -218,6 +246,7 @@ def resolve_i2i_runtime_defaults(
 # VQ encoder
 # ---------------------------------------------------------------------------
 
+
 def resolve_vq_model_path(
     *,
     cli_vq_path: str | None,
@@ -229,6 +258,7 @@ def resolve_vq_model_path(
 
     try:
         from omegaconf import OmegaConf
+
         cfg = OmegaConf.load(dynin_config_path)
         repo_id = OmegaConf.select(cfg, "model.vq_model_image.repo_id")
         if repo_id is not None:
@@ -269,6 +299,7 @@ def preprocess_source_image(image: Image.Image, resolution: int) -> torch.Tensor
 # Prompt construction
 # ---------------------------------------------------------------------------
 
+
 def load_uni_prompting(
     *,
     tokenizer_source: str,
@@ -278,6 +309,7 @@ def load_uni_prompting(
 ) -> Any:
     """Initialise UniversalPrompting with the DYNIN tokenizer."""
     from transformers import AutoTokenizer
+
     from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import UniversalPrompting
 
     load_kwargs = {
@@ -295,8 +327,15 @@ def load_uni_prompting(
         tokenizer,
         max_text_len=int(max_text_len),
         special_tokens=(
-            "<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>",
-            "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>",
+            "<|soi|>",
+            "<|eoi|>",
+            "<|sov|>",
+            "<|eov|>",
+            "<|t2i|>",
+            "<|mmu|>",
+            "<|t2v|>",
+            "<|v2v|>",
+            "<|lvg|>",
         ),
         ignore_id=-100,
         cond_dropout_prob=float(cond_dropout_prob),
@@ -323,7 +362,10 @@ def build_i2i_model_inputs(
     """
     device = input_image_tokens.device
     output_placeholder = torch.full(
-        (1, num_vq_tokens), fill_value=mask_token_id, dtype=torch.long, device=device,
+        (1, num_vq_tokens),
+        fill_value=mask_token_id,
+        dtype=torch.long,
+        device=device,
     )
 
     src_tokens = input_image_tokens
@@ -332,10 +374,14 @@ def build_i2i_model_inputs(
 
     if use_train_i2i_prompt:
         labels_placeholder = torch.full(
-            (1, num_vq_tokens), fill_value=-100, dtype=torch.long, device=device,
+            (1, num_vq_tokens),
+            fill_value=-100,
+            dtype=torch.long,
+            device=device,
         )
         input_ids, attention_mask, _ = uni_prompting(
-            ([str(prompt_text)], src_tokens, output_placeholder, labels_placeholder), "i2i",
+            ([str(prompt_text)], src_tokens, output_placeholder, labels_placeholder),
+            "i2i",
         )
         attention_mask = attention_mask.long()
 
@@ -343,18 +389,21 @@ def build_i2i_model_inputs(
         uncond_attention_mask = None
         if float(guidance_scale) > 0:
             uncond_input_ids, uncond_attention_mask, _ = uni_prompting(
-                ([""], src_tokens, output_placeholder, labels_placeholder), "i2i",
+                ([""], src_tokens, output_placeholder, labels_placeholder),
+                "i2i",
             )
             uncond_attention_mask = uncond_attention_mask.long()
     else:
         input_ids, attention_mask = uni_prompting(
-            ([str(prompt_text)], src_tokens, output_placeholder), "i2i_gen",
+            ([str(prompt_text)], src_tokens, output_placeholder),
+            "i2i_gen",
         )
         uncond_input_ids = None
         uncond_attention_mask = None
         if float(guidance_scale) > 0:
             uncond_input_ids, uncond_attention_mask = uni_prompting(
-                ([""], src_tokens, output_placeholder), "i2i_gen",
+                ([""], src_tokens, output_placeholder),
+                "i2i_gen",
             )
 
     def _to_1d_list(tensor: torch.Tensor | None) -> list[int] | None:
@@ -442,6 +491,7 @@ def build_i2i_prompt(
 # Image tensor extraction & conversion (reused from t2i.py)
 # ---------------------------------------------------------------------------
 
+
 def extract_image_tensor(outputs: list[Any]) -> torch.Tensor | None:
     """Walk Omni stage outputs and return the first image tensor found."""
     for omni_out in outputs:
@@ -486,9 +536,10 @@ def tensor_to_pil_image(image: torch.Tensor) -> Image.Image:
 # Metadata parsing
 # ---------------------------------------------------------------------------
 
+
 def parse_i2i_metadata(metadata_path: str) -> list[tuple[str, dict[str, str]]]:
     """Parse i2i edits JSON. Returns sorted (key, {id, prompt}) pairs."""
-    with open(metadata_path, "r", encoding="utf-8") as f:
+    with open(metadata_path, encoding="utf-8") as f:
         edit_infos = json.load(f)
 
     def _sort_key(item: tuple[str, Any]) -> int | str:
@@ -504,98 +555,135 @@ def parse_i2i_metadata(metadata_path: str) -> list[tuple[str, dict[str, str]]]:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def parse_args(repo_root: Path) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DYNIN image-to-image editing using vllm_omni.")
     parser.add_argument("--model", required=True, help="HF repo id or local model dir.")
     parser.add_argument(
-        "--stage-config-path", type=str,
+        "--stage-config-path",
+        type=str,
         default=str(repo_root / "vllm_omni/model_executor/stage_configs/dynin_omni.yaml"),
         help="Path to stage config yaml.",
     )
     parser.add_argument(
-        "--dynin-config-path", type=str,
+        "--dynin-config-path",
+        type=str,
         default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"),
         help="Path to DYNIN config yaml.",
     )
     parser.add_argument(
-        "--edit-json", type=str,
+        "--edit-json",
+        type=str,
         default=str(repo_root / "examples/offline_inference/dynin_omni/data/text/i2i_edits.json"),
         help="JSON file with i2i edit entries ({key: {id, prompt}}).",
     )
     parser.add_argument(
-        "--origin-img-root", type=str,
+        "--origin-img-root",
+        type=str,
         default=str(repo_root / "examples/offline_inference/dynin_omni/data/image"),
         help="Root folder for source images.",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="/tmp/dynin_i2i_outputs",
+        "--output-dir",
+        type=str,
+        default="/tmp/dynin_i2i_outputs",
         help="Output directory to save edited images.",
     )
     parser.add_argument(
-        "--model-cache-dir", type=str, default="/tmp/dynin_localized_models",
+        "--model-cache-dir",
+        type=str,
+        default="/tmp/dynin_localized_models",
         help="Cache dir used when --model is HF repo id.",
     )
     parser.add_argument(
-        "--max-prompts", type=int, default=0,
+        "--max-prompts",
+        type=int,
+        default=0,
         help="0 means all entries from metadata.",
     )
     parser.add_argument(
-        "--source-resolution", type=int, default=None,
+        "--source-resolution",
+        type=int,
+        default=None,
         help="Source image resolution. Default: dataset.params.i2i_source_resolution from config.",
     )
     parser.add_argument(
-        "--target-resolution", type=int, default=None,
+        "--target-resolution",
+        type=int,
+        default=None,
         help="Target image resolution. Default: dataset.params.i2i_target_resolution from config.",
     )
     parser.add_argument(
-        "--prompt-max-text-len", type=int, default=None,
+        "--prompt-max-text-len",
+        type=int,
+        default=None,
         help="UniversalPrompting max_text_len. Default: from config.",
     )
     parser.add_argument(
-        "--mask-token-id", type=int, default=None,
+        "--mask-token-id",
+        type=int,
+        default=None,
         help="Mask token id. Default: model.omada.mask_token_id (or 126336).",
     )
     parser.add_argument(
-        "--codebook-size", type=int, default=None,
+        "--codebook-size",
+        type=int,
+        default=None,
         help="Image codebook size. Default: model.omada.codebook_size from config.",
     )
     parser.add_argument(
-        "--timesteps", type=int, default=128,
+        "--timesteps",
+        type=int,
+        default=128,
         help="Generation timesteps. Default: training.generation_timesteps from config.",
     )
     parser.add_argument(
-        "--guidance-scale", type=float, default=3.5,
+        "--guidance-scale",
+        type=float,
+        default=3.5,
         help="CFG guidance scale. Default: training.guidance_scale from config.",
     )
     parser.add_argument(
-        "--temperature", type=float, default=None,
+        "--temperature",
+        type=float,
+        default=None,
         help="Generation temperature. Default: training.generation_temperature from config.",
     )
     parser.add_argument(
-        "--use-train-i2i-prompt", action="store_true",
+        "--use-train-i2i-prompt",
+        action="store_true",
         help="Use training i2i prompt template (<|i2i|> ...). This is the default.",
     )
     parser.add_argument(
-        "--no-use-train-i2i-prompt", dest="use_train_i2i_prompt", action="store_false",
+        "--no-use-train-i2i-prompt",
+        dest="use_train_i2i_prompt",
+        action="store_false",
         help="Use i2i_gen prompt template (<|t2i|> ...).",
     )
     parser.set_defaults(use_train_i2i_prompt=True)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--max-tokens-per-stage", type=int, default=1)
     parser.add_argument(
-        "--vq-model-image-path", type=str, default="",
+        "--vq-model-image-path",
+        type=str,
+        default="",
         help="Local directory path for MAGVITv2 weights.",
     )
     parser.add_argument(
         "--vq-model-image-local-files-only",
-        action=argparse.BooleanOptionalAction, default=None,
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
     parser.add_argument(
-        "--disable-hf-xet", action=argparse.BooleanOptionalAction, default=True,
+        "--disable-hf-xet",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Set HF_HUB_DISABLE_XET=1 to avoid CAS/xet download path.",
     )
     parser.add_argument(
-        "--dtype", type=str, default="auto",
+        "--dtype",
+        type=str,
+        default="auto",
         help="Optional vLLM dtype override (e.g., float16, bfloat16, float32, auto).",
     )
     return parser.parse_args()
@@ -604,6 +692,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     repo_root = bootstrap_repo_path()
@@ -677,6 +766,7 @@ def main():
 
     # -- vllm_omni engine ---------------------------------------------------
     from vllm import SamplingParams
+
     from vllm_omni.entrypoints.omni import Omni
 
     omni = Omni(model=str(model_dir), stage_configs_path=args.stage_config_path, dtype=args.dtype)
@@ -760,12 +850,14 @@ def main():
             image = tensor_to_pil_image(image_tensor)
             image.save(out_path)
 
-            result_rows.append({
-                "id": key,
-                "source": item["id"],
-                "prompt": prompt_text,
-                "image_path": str(out_path),
-            })
+            result_rows.append(
+                {
+                    "id": key,
+                    "source": item["id"],
+                    "prompt": prompt_text,
+                    "image_path": str(out_path),
+                }
+            )
             print(f"[{idx + 1}/{len(items)}] saved: {out_path}")
     finally:
         omni.close()

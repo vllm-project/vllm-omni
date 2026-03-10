@@ -18,7 +18,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-
 DEFAULT_I2T_QUESTIONS = [
     "Please describe this image in detail.",
     "What is shown in this image?",
@@ -137,10 +136,7 @@ def resolve_tokenizer_source_with_local_priority(
         )
         return str(configured_tokenizer_path)
 
-    print(
-        "[i2t] Local tokenizer markers were not found; "
-        f"falling back to model dir anyway: {model_dir}"
-    )
+    print(f"[i2t] Local tokenizer markers were not found; falling back to model dir anyway: {model_dir}")
     return str(model_dir)
 
 
@@ -192,12 +188,9 @@ def resolve_image_path_from_row(*, row: dict[str, Any], base_dir: Path) -> Path:
 
     if missing_paths:
         first = missing_paths[0]
-        raise FileNotFoundError(
-            f"image file not found: {first} (checked {len(missing_paths)} candidate path(s))"
-        )
+        raise FileNotFoundError(f"image file not found: {first} (checked {len(missing_paths)} candidate path(s))")
     raise ValueError(
-        "metadata row has no usable image source. "
-        "Expected one of: image_path/image_file/path/file/image.path"
+        "metadata row has no usable image source. Expected one of: image_path/image_file/path/file/image.path"
     )
 
 
@@ -257,14 +250,10 @@ def collect_cli_image_paths(image_paths: list[str], *, base_dir: Path) -> list[P
 
         if resolved_path.is_dir():
             image_files = sorted(
-                p.resolve()
-                for p in resolved_path.iterdir()
-                if p.is_file() and p.suffix.lower() in allowed_extensions
+                p.resolve() for p in resolved_path.iterdir() if p.is_file() and p.suffix.lower() in allowed_extensions
             )
             if not image_files:
-                raise ValueError(
-                    f"no .jpg or .png files found in directory: {resolved_path}"
-                )
+                raise ValueError(f"no .jpg or .png files found in directory: {resolved_path}")
             expanded_paths.extend(image_files)
             continue
 
@@ -495,6 +484,7 @@ def load_uni_prompting(
     local_files_only: bool,
 ) -> Any:
     from transformers import AutoTokenizer
+
     from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import (
         UniversalPrompting,
     )
@@ -565,8 +555,7 @@ def preprocess_image(image: Image.Image, resolution: int) -> torch.Tensor:
 
 def build_i2t_chat_prompt(question: str) -> str:
     return (
-        "<|start_header_id|>user<|end_header_id|>\n"
-        f"{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+        f"<|start_header_id|>user<|end_header_id|>\n{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
     )
 
 
@@ -732,9 +721,7 @@ def validate_generation_args(
     if steps <= 0:
         raise ValueError("--i2t-steps must be > 0.")
     if max_new_tokens % block_length != 0:
-        raise ValueError(
-            f"i2t requires max_new_tokens % block_length == 0, got {max_new_tokens} % {block_length}"
-        )
+        raise ValueError(f"i2t requires max_new_tokens % block_length == 0, got {max_new_tokens} % {block_length}")
     num_blocks = max_new_tokens // block_length
     if num_blocks <= 0:
         raise ValueError("Invalid number of generation blocks.")
@@ -871,9 +858,7 @@ def main() -> None:
         block_length=i2t_block_length,
     )
 
-    cond_dropout_prob, tokenizer_path, model_local_files_only = resolve_prompting_defaults(
-        dynin_config_path
-    )
+    cond_dropout_prob, tokenizer_path, model_local_files_only = resolve_prompting_defaults(dynin_config_path)
 
     os.environ["DYNIN_CONFIG_PATH"] = dynin_config_path
     if args.disable_hf_xet:
@@ -906,9 +891,7 @@ def main() -> None:
         model_dir=model_dir,
         configured_tokenizer_path=tokenizer_path,
     )
-    effective_model_local_files_only = bool(
-        model_local_files_only or Path(tokenizer_source).expanduser().is_dir()
-    )
+    effective_model_local_files_only = bool(model_local_files_only or Path(tokenizer_source).expanduser().is_dir())
     if effective_model_local_files_only and not model_local_files_only:
         print("[i2t] Enabling local_files_only because tokenizer source is local.")
 
@@ -927,10 +910,7 @@ def main() -> None:
         dynin_config_path=dynin_config_path,
         default_model_local_files_only=False,
     )
-    print(
-        f"[i2t] Loading image tokenizer from: {vq_source} "
-        f"(local_files_only={vq_local_only})"
-    )
+    print(f"[i2t] Loading image tokenizer from: {vq_source} (local_files_only={vq_local_only})")
     vq_model = load_vq_encoder(vq_source, device=device, local_files_only=vq_local_only)
 
     image_token_offset = len(uni_prompting.text_tokenizer)
@@ -938,6 +918,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     from vllm import SamplingParams
+
     from vllm_omni.entrypoints.omni import Omni
 
     omni = Omni(model=str(model_dir), stage_configs_path=args.stage_config_path, dtype=args.dtype)
@@ -1008,16 +989,16 @@ def main() -> None:
                     row_out["gt_text"] = gt_text
                 result_rows.append(row_out)
                 print(
-                        f"[{idx + 1}/{len(records)}] {sample_id} | "
-                        f"res={image_resolution} | "
-                        f"tokens={i2t_max_new_tokens} | "
-                        f"steps={i2t_steps} | "
-                        f"blk={i2t_block_length} | "
-                        f"T={i2t_temperature} | "
-                        f"cfg={i2t_cfg_scale} | "
-                        f"Q: {question} | "
-                        f"A: {decoded_text_norm}"
-                    )
+                    f"[{idx + 1}/{len(records)}] {sample_id} | "
+                    f"res={image_resolution} | "
+                    f"tokens={i2t_max_new_tokens} | "
+                    f"steps={i2t_steps} | "
+                    f"blk={i2t_block_length} | "
+                    f"T={i2t_temperature} | "
+                    f"cfg={i2t_cfg_scale} | "
+                    f"Q: {question} | "
+                    f"A: {decoded_text_norm}"
+                )
     finally:
         omni.close()
 

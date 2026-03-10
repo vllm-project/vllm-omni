@@ -25,6 +25,7 @@ def ensure_safe_import_for_vllm() -> None:
     os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
     try:
         import torchvision  # noqa: F401
+
         return
     except Exception:
         pass
@@ -134,7 +135,9 @@ def extract_text(outputs: list[Any], tokenizer: Any) -> str:
     return ""
 
 
-def build_prompt(tokenizer: Any, question: str, dynin_config_path: str, max_new_tokens: int, steps: int, block_length: int) -> dict[str, Any]:
+def build_prompt(
+    tokenizer: Any, question: str, dynin_config_path: str, max_new_tokens: int, steps: int, block_length: int
+) -> dict[str, Any]:
     # Match mmu_generate.py style: build a chat prompt then tokenize to ids.
     messages = [{"role": "user", "content": question}]
     if getattr(tokenizer, "chat_template", None):
@@ -210,6 +213,7 @@ def main() -> None:
 
     from transformers import AutoTokenizer
     from vllm import SamplingParams
+
     from vllm_omni.entrypoints.omni import Omni
 
     try:

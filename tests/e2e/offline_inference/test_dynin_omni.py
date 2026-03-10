@@ -19,18 +19,19 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
-from tests.utils import hardware_test
-
 from tests.conftest import OmniRunner
+from tests.utils import hardware_test
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_DYNIN_CONFIG_PATH = _REPO_ROOT / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"
+_DEFAULT_DYNIN_CONFIG_PATH = (
+    _REPO_ROOT / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"
+)
 _DEFAULT_STAGE_CONFIG_PATH = Path(__file__).parent / "stage_configs" / "dynin_omni_ci.yaml"
 
-#models = ["snu-aidas/Dynin-Omni"]
+# models = ["snu-aidas/Dynin-Omni"]
 models = ["/tmp/dynin_localized_models/snu-aidas_Dynin-Omni"]
 stage_configs = [str(_DEFAULT_STAGE_CONFIG_PATH)]
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
@@ -41,6 +42,7 @@ pytestmark = [
     pytest.mark.core_model,
     pytest.mark.omni,
 ]
+
 
 # prompting util
 def _build_mmu_prompt(tokenizer: Any, question: str, dynin_config_path: str) -> dict[str, Any]:
@@ -109,6 +111,7 @@ def _generate_synthetic_audio(duration_s: int = 5, sample_rate: int = 48_000) ->
     waveform = 0.1 * np.sin(2.0 * np.pi * 440.0 * t)
     return waveform.astype(np.float32), sample_rate
 
+
 # prompting util
 def _build_t2s_decode_prompt(dynin_config_path: str) -> dict[str, Any]:
     # Bypass stage-0 generation and directly validate token->audio decode path.
@@ -124,6 +127,7 @@ def _build_t2s_decode_prompt(dynin_config_path: str) -> dict[str, Any]:
         },
         "modalities": ["audio"],
     }
+
 
 # prompting util
 def _build_t2i_decode_prompt(dynin_config_path: str) -> dict[str, Any]:
@@ -154,7 +158,9 @@ def _is_finished_request_output(request_output: Any) -> bool:
 
 
 def _find_stage_output(outputs: list[Any], output_type: str) -> Any | None:
-    matched = [stage_output for stage_output in outputs if getattr(stage_output, "final_output_type", None) == output_type]
+    matched = [
+        stage_output for stage_output in outputs if getattr(stage_output, "final_output_type", None) == output_type
+    ]
     if not matched:
         return None
 

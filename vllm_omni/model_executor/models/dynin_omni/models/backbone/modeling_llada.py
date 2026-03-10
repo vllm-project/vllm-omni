@@ -4,22 +4,13 @@ import logging
 import math
 import sys
 from abc import abstractmethod
-from collections import defaultdict
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import fields
 from functools import partial
 from typing import (
-    Callable,
-    Dict,
-    Iterable,
-    List,
     NamedTuple,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
     cast,
 )
-from dataclasses import fields
-from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.backends.cuda
@@ -27,25 +18,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import einsum
 from transformers import PreTrainedModel
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto import AutoModel
-from transformers.cache_utils import Cache
 
 from .configuration_llada import (
-    LLaDAConfig,
-    StrEnum,
-    InitFnType,
+    ActivationCheckpointingStrategy,
     ActivationType,
     BlockType,
+    InitFnType,
     LayerNormType,
+    LLaDAConfig,
     ModelConfig,
-    ActivationCheckpointingStrategy,
+    StrEnum,
 )
 
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
 elif sys.version_info.minor == 8:
-    from typing import MutableMapping
+    from collections.abc import MutableMapping
 else:
     raise SystemExit("This script supports Python 3.8 or higher")
 
@@ -79,11 +70,11 @@ class ModuleType(StrEnum):
 
 def init_weights(
     config: ModelConfig,
-    module: Union[nn.Linear, nn.Embedding],
-    d: Optional[int] = None,
-    layer_id: Optional[int] = None,
+    module: nn.Linear | nn.Embedding,
+    d: int | None = None,
+    layer_id: int | None = None,
     std_factor: float = 1.0,
-    type_of_module: Optional[ModuleType] = None,
+    type_of_module: ModuleType | None = None,
 ) -> None:
     """
     Initialize weights of a linear or embedding module.
@@ -210,8 +201,8 @@ class LayerNormBase(nn.Module):
         self,
         config: ModelConfig,
         *,
-        size: Optional[int] = None,
-        elementwise_affine: Optional[bool] = True,
+        size: int | None = None,
+        elementwise_affine: bool | None = True,
         eps: float = 1e-05,
     ):
         super().__init__()
@@ -236,7 +227,7 @@ class LayerNormBase(nn.Module):
         raise NotImplementedError
 
     @classmethod
-    def build(cls, config: ModelConfig, size: Optional[int] = None, **kwargs) -> LayerNormBase:
+    def build(cls, config: ModelConfig, size: int | None = None, **kwargs) -> LayerNormBase:
         if config.layer_norm_type == LayerNormType.default:
             return LayerNorm(config, size=size, low_precision=False, **kwargs)
         elif config.layer_norm_type == LayerNormType.low_precision:
@@ -248,7 +239,7 @@ class LayerNormBase(nn.Module):
         else:
             raise NotImplementedError(f"Unknown LayerNorm type: '{config.layer_norm_type}'")
 
-    def _cast_if_autocast_enabled(self, tensor: torch.Tensor, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    def _cast_if_autocast_enabled(self, tensor: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
         # NOTE: `is_autocast_enabled()` only checks for CUDA autocast, so we use the separate function
         # `is_autocast_cpu_enabled()` for CPU autocast.
         # See https://github.com/pytorch/pytorch/issues/110966.
@@ -274,9 +265,9 @@ class LayerNorm(LayerNormBase):
     def __init__(
         self,
         config: ModelConfig,
-        size: Optional[int] = None,
+        size: int | None = None,
         low_precision: bool = False,
-        elementwise_affine: Optional[bool] = None,
+        elementwise_affine: bool | None = None,
         eps: float = 1e-05,
     ):
         super().__init__(config, size=size, elementwise_affine=elementwise_affine, eps=eps)
@@ -286,9 +277,7 @@ class LayerNorm(LayerNormBase):
         if self.low_precision:
             module_device = x.device
             downcast_x = self._cast_if_autocast_enabled(x)
-            downcast_weight = (
-                self._cast_if_autocast_enabled(self.weight) if self.weight is not None else self.weight
-            )
+            downcast_weight = self._cast_if_autocast_enabled(self.weight) if self.weight is not None else self.weight
             downcast_bias = self._cast_if_autocast_enabled(self.bias) if self.bias is not None else self.bias
             with torch.autocast(enabled=False, device_type=module_device.type):
                 return F.layer_norm(
@@ -306,8 +295,8 @@ class RMSLayerNorm(LayerNormBase):
     def __init__(
         self,
         config: ModelConfig,
-        size: Optional[int] = None,
-        elementwise_affine: Optional[bool] = None,
+        size: int | None = None,
+        elementwise_affine: bool | None = None,
         eps: float = 1e-5,
     ):
         super().__init__(config, size=size, elementwise_affine=elementwise_affine, eps=config.rms_norm_eps)
@@ -337,8 +326,8 @@ class GemmaRMSLayerNorm(LayerNormBase):
     def __init__(
         self,
         config: ModelConfig,
-        size: Optional[int] = None,
-        elementwise_affine: Optional[bool] = None,
+        size: int | None = None,
+        elementwise_affine: bool | None = None,
         eps: float = 1e-5,
     ):
         super().__init__(config, size=size, elementwise_affine=elementwise_affine, eps=config.rms_norm_eps)
@@ -373,7 +362,7 @@ class RotaryEmbedding(nn.Module):
         self.rope_theta = config.rope_theta
         self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
 
-    def get_rotary_embedding(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_rotary_embedding(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             (pos_sin := self.__cache.get("rope_pos_sin")) is not None
             and (pos_cos := self.__cache.get("rope_pos_cos")) is not None
@@ -408,7 +397,7 @@ class RotaryEmbedding(nn.Module):
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
         else:
@@ -467,10 +456,12 @@ class ReLU(nn.ReLU):
     def output_multiplier(self) -> float:
         return 1.0
 
+
 class SiLU(nn.SiLU):
     @property
     def output_multiplier(self) -> float:
         return 1.0
+
 
 class SwiGLU(Activation):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -539,8 +530,8 @@ class LLaDABlock(nn.Module):
         self.dropout = Dropout(config.residual_dropout)
 
         # Layer norms.
-        self.k_norm: Optional[LayerNormBase] = None
-        self.q_norm: Optional[LayerNormBase] = None
+        self.k_norm: LayerNormBase | None = None
+        self.q_norm: LayerNormBase | None = None
         if config.attention_layer_norm:
             self.k_norm = LayerNormBase.build(
                 config,
@@ -554,9 +545,7 @@ class LLaDABlock(nn.Module):
         assert (self.act.output_multiplier * self.hidden_size) % 1 == 0
 
         # Attention output projection.
-        self.attn_out = nn.Linear(
-            config.d_model, config.d_model, bias=config.include_bias, device=config.init_device
-        )
+        self.attn_out = nn.Linear(config.d_model, config.d_model, bias=config.include_bias, device=config.init_device)
 
         # Feed-forward output projection.
         self.ff_out = nn.Linear(
@@ -600,7 +589,7 @@ class LLaDABlock(nn.Module):
             type_of_module=ModuleType.out_module,
         )
 
-    def set_activation_checkpointing(self, strategy: Optional[ActivationCheckpointingStrategy]):
+    def set_activation_checkpointing(self, strategy: ActivationCheckpointingStrategy | None):
         if strategy == ActivationCheckpointingStrategy.fine_grained:
             self._activation_checkpoint_fn = activation_checkpoint_function(self.config)
         else:
@@ -626,7 +615,7 @@ class LLaDABlock(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
     ) -> torch.Tensor:
@@ -664,10 +653,10 @@ class LLaDABlock(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attention_bias: Optional[torch.Tensor] = None,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_bias: torch.Tensor | None = None,
+        layer_past: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
 
@@ -702,9 +691,7 @@ class LLaDABlock(nn.Module):
             # run in if AMP is enabled, and this can be a problem if some tokens are masked out due to padding
             # as down-casting the attention bias to the autocast precision will result in -infs, which will
             # cause the SDP attn function to produce NaNs.
-            attention_bias = self._cast_attn_bias(
-                attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
-            )
+            attention_bias = self._cast_attn_bias(attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype)
 
         # Get the attention scores.
         # shape: (B, nh, T, hs)
@@ -727,10 +714,10 @@ class LLaDABlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_bias: Optional[torch.FloatTensor] = None,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_bias: torch.FloatTensor | None = None,
+        layer_past: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         raise NotImplementedError
 
     @classmethod
@@ -762,12 +749,13 @@ class LLaDASequentialBlock(LLaDABlock):
             config.effective_n_kv_heads * head_dim,
         )
         self.att_proj = nn.Linear(
-            config.d_model, sum(self.fused_dims), bias=config.include_bias | config.include_qkv_bias, device=config.init_device
+            config.d_model,
+            sum(self.fused_dims),
+            bias=config.include_bias | config.include_qkv_bias,
+            device=config.init_device,
         )
         # Feed-forward input projection.
-        self.ff_proj = nn.Linear(
-            config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device
-        )
+        self.ff_proj = nn.Linear(config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device)
 
     def reset_parameters(self):
         super().reset_parameters()
@@ -784,10 +772,10 @@ class LLaDASequentialBlock(LLaDABlock):
     def forward(
         self,
         x: torch.Tensor,
-        attention_bias: Optional[torch.Tensor] = None,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_bias: torch.Tensor | None = None,
+        layer_past: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         # Get query, key, value projections.
         # shape:
         #  - for regular attn q, k, v: (batch_size, seq_len, d_model)
@@ -796,9 +784,7 @@ class LLaDASequentialBlock(LLaDABlock):
         #  - for group query attn q: (batch_size, seq_len, d_model)
         #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
         if self._activation_checkpoint_fn is not None:
-            q, k, v = self.att_proj(self._activation_checkpoint_fn(self.attn_norm, x)).split(
-                self.fused_dims, dim=-1
-            )
+            q, k, v = self.att_proj(self._activation_checkpoint_fn(self.attn_norm, x)).split(self.fused_dims, dim=-1)
         else:
             q, k, v = self.att_proj(self.attn_norm(x)).split(self.fused_dims, dim=-1)
 
@@ -854,23 +840,28 @@ class LLaDALlamaBlock(LLaDABlock):
         k_proj_out_dim = config.effective_n_kv_heads * head_dim
         v_proj_out_dim = config.effective_n_kv_heads * head_dim
         self.q_proj = nn.Linear(
-            config.d_model, q_proj_out_dim, bias=config.include_bias | config.include_qkv_bias, device=config.init_device
+            config.d_model,
+            q_proj_out_dim,
+            bias=config.include_bias | config.include_qkv_bias,
+            device=config.init_device,
         )
         self.k_proj = nn.Linear(
-            config.d_model, k_proj_out_dim, bias=config.include_bias | config.include_qkv_bias, device=config.init_device
+            config.d_model,
+            k_proj_out_dim,
+            bias=config.include_bias | config.include_qkv_bias,
+            device=config.init_device,
         )
         self.v_proj = nn.Linear(
-            config.d_model, v_proj_out_dim, bias=config.include_bias | config.include_qkv_bias, device=config.init_device
+            config.d_model,
+            v_proj_out_dim,
+            bias=config.include_bias | config.include_qkv_bias,
+            device=config.init_device,
         )
 
         # Feed-forward input projection.
-        self.ff_proj = nn.Linear(
-            config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device
-        )
+        self.ff_proj = nn.Linear(config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device)
         # new add
-        self.up_proj = nn.Linear(
-            config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device
-        )
+        self.up_proj = nn.Linear(config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device)
 
     def reset_parameters(self):
         super().reset_parameters()
@@ -886,10 +877,10 @@ class LLaDALlamaBlock(LLaDABlock):
     def forward(
         self,
         x: torch.Tensor,
-        attention_bias: Optional[torch.Tensor] = None,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_bias: torch.Tensor | None = None,
+        layer_past: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         # Get query, key, value projections.
         # shape:
         #  - for regular attn q, k, v: (batch_size, seq_len, d_model)
@@ -921,12 +912,12 @@ class LLaDALlamaBlock(LLaDABlock):
             x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
         else:
             x = self.ff_norm(x)
-        x, x_up = self.ff_proj(x), self.up_proj(x) # new add
+        x, x_up = self.ff_proj(x), self.up_proj(x)  # new add
         if self._activation_checkpoint_fn is not None:
             x = self._activation_checkpoint_fn(self.act, x)  # type: ignore
         else:
             x = self.act(x)
-        x = x * x_up # new add
+        x = x * x_up  # new add
         x = self.ff_out(x)
         x = self.dropout(x)
         x = og_x + x
@@ -941,12 +932,12 @@ class LLaDAOutput(NamedTuple):
     for the next token *before* normalization via (log) softmax.
     """
 
-    attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
+    attn_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None
     """
     Attention keys and values from each block.
     """
 
-    hidden_states: Optional[Tuple[torch.Tensor]]
+    hidden_states: tuple[torch.Tensor] | None
     """
     Hidden states from each block.
     """
@@ -966,21 +957,21 @@ class LLaDAGenerateOutput(NamedTuple):
 
 
 class LLaDABlockGroup(nn.ModuleList):
-    def __init__(self, config: ModelConfig, layer_offset: int, modules: Optional[Iterable[nn.Module]] = None):
+    def __init__(self, config: ModelConfig, layer_offset: int, modules: Iterable[nn.Module] | None = None):
         super().__init__(modules)
         self.config = config
         self.layer_offset = layer_offset
-        self.activation_checkpointing_strategy: Optional[ActivationCheckpointingStrategy] = None
+        self.activation_checkpointing_strategy: ActivationCheckpointingStrategy | None = None
         self._activation_checkpoint_fn = activation_checkpoint_function(self.config)
 
     def forward(
         self,
         x: torch.Tensor,
-        attention_bias: Optional[torch.FloatTensor] = None,
-        layers_past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        attention_bias: torch.FloatTensor | None = None,
+        layers_past: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
-        attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]] | None]:
+        attn_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = [] if use_cache else None
         for block_idx, block in enumerate(self):
             layer_past = None if layers_past is None else layers_past[block_idx]
             block_idx += self.layer_offset
@@ -1015,7 +1006,7 @@ class LLaDABlockGroup(nn.ModuleList):
         for block in self:
             block.reset_parameters()
 
-    def set_activation_checkpointing(self, strategy: Optional[ActivationCheckpointingStrategy]):
+    def set_activation_checkpointing(self, strategy: ActivationCheckpointingStrategy | None):
         self.activation_checkpointing_strategy = strategy
         for block in self:
             block.set_activation_checkpointing(strategy)
@@ -1047,7 +1038,7 @@ class LLaDAModel(nn.Module):
                     "Embedding size is not a multiple of 128! This could hurt throughput performance.", UserWarning
                 )
 
-        self.activation_checkpointing_strategy: Optional[ActivationCheckpointingStrategy] = None
+        self.activation_checkpointing_strategy: ActivationCheckpointingStrategy | None = None
         self._activation_checkpoint_fn: Callable = activation_checkpoint_function(self.config)
 
         if not (
@@ -1061,9 +1052,7 @@ class LLaDAModel(nn.Module):
 
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(
-                    config.embedding_size or config.vocab_size, config.d_model, device=config.init_device
-                ),
+                wte=nn.Embedding(config.embedding_size or config.vocab_size, config.d_model, device=config.init_device),
                 emb_drop=Dropout(config.embedding_dropout),
                 ln_f=LayerNorm.build(config),
             )
@@ -1097,14 +1086,14 @@ class LLaDAModel(nn.Module):
         # When `init_device="meta"` FSDP will call `reset_parameters()` to initialize weights.
         if init_params and self.config.init_device != "meta":
             self.reset_parameters()
-        self.__num_fwd_flops: Optional[int] = None
+        self.__num_fwd_flops: int | None = None
 
         # Warm up cache.
         if self.config.alibi:
             get_causal_attention_bias(self.__cache, config.max_sequence_length, _non_meta_init_device(config))
             self.get_alibi_attention_bias(config.max_sequence_length, _non_meta_init_device(config))
 
-    def set_activation_checkpointing(self, strategy: Optional[ActivationCheckpointingStrategy]):
+    def set_activation_checkpointing(self, strategy: ActivationCheckpointingStrategy | None):
         self.activation_checkpointing_strategy = strategy
         if self.config.block_group_size != 1:
             for block_group in self.transformer.block_groups:
@@ -1149,9 +1138,7 @@ class LLaDAModel(nn.Module):
                 block_group.reset_parameters()
 
     def get_alibi_attention_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        if (alibi_bias := self.__cache.get("alibi_attention_bias")) is not None and alibi_bias.shape[
-            -1
-        ] >= seq_len:
+        if (alibi_bias := self.__cache.get("alibi_attention_bias")) is not None and alibi_bias.shape[-1] >= seq_len:
             if alibi_bias.device != device:
                 alibi_bias = alibi_bias.to(device)
                 self.__cache["alibi_attention_bias"] = alibi_bias
@@ -1164,13 +1151,13 @@ class LLaDAModel(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        input_embeddings: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        attention_bias: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        input_embeddings: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        past_key_values: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
         use_cache: bool = False,
         last_logits_only: bool = False,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1205,7 +1192,7 @@ class LLaDAModel(nn.Module):
         # Add Basic MDM Model config check
         assert not self.config.alibi, "Alibi length extrapolation is not supported for MDM."
         assert self.config.rope, "Rope must be used in Llama-Encoder for MDM."
-        assert (past_key_values is None and not use_cache), "The kvcache is not suppotred for MDM."
+        assert past_key_values is None and not use_cache, "The kvcache is not suppotred for MDM."
 
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
 
@@ -1281,7 +1268,7 @@ class LLaDAModel(nn.Module):
                 # it can produce NaNs.
                 ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
 
-        attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
+        attn_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = [] if use_cache else None
 
         # decoder layers
         all_hidden_states = []
@@ -1332,9 +1319,7 @@ class LLaDAModel(nn.Module):
                         group_idx * self.config.block_group_size : (group_idx + 1) * self.config.block_group_size
                     ]
                 )
-                x, cache = block_group(
-                    x, attention_bias=attention_bias, layers_past=layers_past, use_cache=use_cache
-                )
+                x, cache = block_group(x, attention_bias=attention_bias, layers_past=layers_past, use_cache=use_cache)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.extend(cache)
@@ -1359,7 +1344,11 @@ class LLaDAModel(nn.Module):
         if self.config.scale_logits:
             logits.mul_(1 / math.sqrt(self.config.d_model))
 
-        return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
+        return LLaDAOutput(
+            logits=logits,
+            attn_key_values=attn_key_values,
+            hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
+        )  # type: ignore[arg-type]
 
 
 def create_model_config_from_pretrained_config(config: LLaDAConfig):
@@ -1384,7 +1373,7 @@ class LLaDAModelLM(PreTrainedModel):
     base_model_prefix = "model"
     _no_split_modules = ["LLaDABlock", "LLaDASequentialBlock", "LLaDALlamaBlock"]
 
-    def __init__(self, config: LLaDAConfig, model: Optional[LLaDAModel] = None, init_params: bool = False):
+    def __init__(self, config: LLaDAConfig, model: LLaDAModel | None = None, init_params: bool = False):
         super().__init__(config)
 
         if not model:
@@ -1398,17 +1387,17 @@ class LLaDAModelLM(PreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        attention_bias: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        inputs_embeds: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: Cache | None = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
+    ) -> tuple | CausalLMOutputWithPast:
         if use_cache is None:
             use_cache = self.config.use_cache
 
@@ -1434,6 +1423,7 @@ class LLaDAModelLM(PreTrainedModel):
         loss = None
         if labels is not None:
             import warnings
+
             warnings.warn("Note that for LLaDA, you cannot calculate the loss here.", UserWarning)
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1449,7 +1439,7 @@ class LLaDAModelLM(PreTrainedModel):
         return True
 
     def prepare_inputs_for_generation(
-        self, input_ids: torch.LongTensor, past_key_values: Optional[List[Tuple]] = None, **kwargs
+        self, input_ids: torch.LongTensor, past_key_values: list[tuple] | None = None, **kwargs
     ):
         if past_key_values:
             # This is because we want the model to only process the last generated token.
@@ -1491,6 +1481,7 @@ class LLaDAModelLM(PreTrainedModel):
     def tie_weights(self):
         if self.config.weight_tying:
             self.model.transformer.ff_out = self.model.transformer.wte
+
 
 # Register the model so that it is available for transformer pipelines, auto-loading, etc.
 AutoModel.register(LLaDAConfig, LLaDAModelLM)

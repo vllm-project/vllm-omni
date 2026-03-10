@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -16,12 +18,82 @@ from .dynin_omni_common import (
     DETOK_AUDIO,
     first_value,
     get_runtime_info,
-    resolve_hidden_size,
     resolve_dynin_infer_sources,
+    resolve_hidden_size,
     to_token_1d,
 )
 
 logger = init_logger(__name__)
+
+
+def _looks_like_hf_repo_id(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    if value.count("/") != 1:
+        return False
+    org, name = value.split("/", 1)
+    return bool(org) and bool(name)
+
+
+def _get_hf_token() -> str | None:
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+
+def _ensure_remote_s2u_vendor_root(
+    *,
+    repo_id: str,
+    local_files_only: bool,
+) -> str | None:
+    if local_files_only or not _looks_like_hf_repo_id(repo_id):
+        return None
+
+    existing = os.environ.get("DYNIN_S2U_VENDOR_ROOT")
+    if existing:
+        existing_path = Path(existing).expanduser().resolve()
+        if existing_path.is_dir():
+            return str(existing_path)
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as e:
+        logger.warning("huggingface_hub unavailable; cannot fetch s2u_vendor from %s: %s", repo_id, e)
+        return None
+
+    token = _get_hf_token()
+    last_error: Exception | None = None
+    revisions: list[str | None] = [None]
+
+    for revision in revisions:
+        try:
+            snapshot_dir = snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                allow_patterns=["s2u_vendor/**"],
+                token=token,
+            )
+        except TypeError:
+            try:
+                snapshot_dir = snapshot_download(
+                    repo_id=repo_id,
+                    revision=revision,
+                    allow_patterns=["s2u_vendor/**"],
+                )
+            except Exception as e:
+                last_error = e
+                continue
+        except Exception as e:
+            last_error = e
+            continue
+
+        vendor_root = (Path(snapshot_dir) / "s2u_vendor").resolve()
+        if vendor_root.is_dir():
+            os.environ["DYNIN_S2U_VENDOR_ROOT"] = str(vendor_root)
+            logger.info("Using remote S2U vendor root: %s", vendor_root)
+            return str(vendor_root)
+
+    if last_error is not None:
+        logger.warning("Failed to download remote s2u_vendor from %s: %s", repo_id, last_error)
+    return None
 
 
 class DyninOmniToken2Audio(nn.Module):
@@ -146,6 +218,12 @@ class DyninOmniToken2Audio(nn.Module):
         sources = resolve_dynin_infer_sources(vllm_config=self.vllm_config, runtime_info=runtime_info)
         model_path = str(sources.vq_audio_source)
         local_files_only = bool(sources.vq_audio_local_files_only)
+
+        _ensure_remote_s2u_vendor_root(
+            repo_id=model_path,
+            local_files_only=local_files_only,
+        )
+
         if (
             self._vq_audio is None
             or self._vq_audio_path != model_path
@@ -157,27 +235,42 @@ class DyninOmniToken2Audio(nn.Module):
                 local_files_only,
             )
             try:
-                from .models.speech.modeling_emova_speech_tokenizer import EMOVASpeechTokenizer
-
-                try:
-                    self._vq_audio = EMOVASpeechTokenizer.from_pretrained(
-                        model_path,
-                        local_files_only=local_files_only,
-                        low_cpu_mem_usage=False,
-                    )
-                except TypeError:
-                    try:
-                        self._vq_audio = EMOVASpeechTokenizer.from_pretrained(
-                            model_path,
-                            local_files_only=local_files_only,
-                        )
-                    except TypeError:
-                        self._vq_audio = EMOVASpeechTokenizer.from_pretrained(model_path)
+                from transformers import AutoModel
             except Exception as e:
                 raise RuntimeError(
-                    "Failed to load EMOVASpeechTokenizer from local DYNIN submodel implementation "
+                    "transformers is required to load EMOVASpeechTokenizer remote code from Hugging Face."
+                ) from e
+
+            try:
+                self._vq_audio = AutoModel.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                    local_files_only=local_files_only,
+                    low_cpu_mem_usage=False,
+                )
+            except TypeError:
+                try:
+                    self._vq_audio = AutoModel.from_pretrained(
+                        model_path,
+                        trust_remote_code=True,
+                        local_files_only=local_files_only,
+                    )
+                except TypeError:
+                    self._vq_audio = AutoModel.from_pretrained(
+                        model_path,
+                        trust_remote_code=True,
+                    )
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to load EMOVASpeechTokenizer from Hugging Face remote code "
                     f"for model path '{model_path}'."
                 ) from e
+
+            if not hasattr(self._vq_audio, "decode"):
+                raise RuntimeError(
+                    "Loaded audio tokenizer does not expose decode(). "
+                    "Check HF config.json auto_map/model_type and ensure trust_remote_code=True."
+                )
             self._vq_audio.eval()
             self._vq_audio.requires_grad_(False)
             self._vq_audio_path = model_path

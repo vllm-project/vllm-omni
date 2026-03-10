@@ -330,6 +330,7 @@ def load_uni_prompting_for_t2i(
     local_files_only: bool,
 ) -> Any:
     from transformers import AutoTokenizer
+
     from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import UniversalPrompting
 
     load_kwargs = {
@@ -544,11 +545,11 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
 
 
 def main() -> None:
-    #import torch
-    #torch.backends.cuda.matmul.allow_tf32 = False
-    #torch.backends.cuda.enable_flash_sdp(False)
-    #torch.backends.cuda.enable_mem_efficient_sdp(False)
-    #torch.backends.cuda.enable_math_sdp(True)
+    # import torch
+    # torch.backends.cuda.matmul.allow_tf32 = False
+    # torch.backends.cuda.enable_flash_sdp(False)
+    # torch.backends.cuda.enable_mem_efficient_sdp(False)
+    # torch.backends.cuda.enable_math_sdp(True)
     repo_root = bootstrap_repo_path()
     ensure_safe_import_for_vllm()
     args = parse_args(repo_root)
@@ -599,6 +600,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     from vllm import SamplingParams
+
     from vllm_omni.entrypoints.omni import Omni
 
     omni = Omni(model=str(model_dir), stage_configs_path=args.stage_config_path, dtype=args.dtype)

@@ -19,7 +19,6 @@ from .models.runtime.config_resolver import (
     resolve_vq_repo_source,
 )
 
-
 logger = init_logger(__name__)
 
 
@@ -44,8 +43,8 @@ TASK_TO_DETOK = {
     "ti2ti": DETOK_IMAGE,
 }
 
-DEFAULT_VQ_IMAGE_SOURCE = "showlab/magvitv2"
-DEFAULT_VQ_AUDIO_SOURCE = "Emova-ollm/emova_speech_tokenizer_hf"
+DEFAULT_VQ_IMAGE_SOURCE = "snu-aidas/magvitv2"
+DEFAULT_VQ_AUDIO_SOURCE = "snu-aidas/emova_speech_tokenizer_vllm"
 
 
 @dataclass(frozen=True)
@@ -333,11 +332,7 @@ def resolve_dynin_infer_sources(
     if runtime_local_vq_audio is not None:
         vq_audio_local_files_only = _to_bool(runtime_local_vq_audio, default=vq_audio_local_files_only)
 
-    if (
-        runtime_local_global is None
-        and runtime_local_model is None
-        and local_vllm_model_source is not None
-    ):
+    if runtime_local_global is None and runtime_local_model is None and local_vllm_model_source is not None:
         # In vllm-omni stages, vllm_config.model_config.model is typically already
         # a localized model dir. Prefer it over YAML repo_id for Stage-0 init.
         model_local_files_only = True

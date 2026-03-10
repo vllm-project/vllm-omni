@@ -1,27 +1,24 @@
+import math
 from dataclasses import dataclass, field
-import numpy as np
+
 import torch
 import torch.nn as nn
+
 from .common_modules import *
 from .modeling_utils import ConfigMixin, ModelMixin, register_to_config
-import math
-from typing import List
+
 
 class Updateable:
-    def do_update_step(
-        self, epoch: int, global_step: int, on_load_weights: bool = False
-    ):
+    def do_update_step(self, epoch: int, global_step: int, on_load_weights: bool = False):
         for attr in self.__dir__():
             if attr.startswith("_"):
                 continue
             try:
                 module = getattr(self, attr)
             except:
-                continue  # ignore attributes like property, which can't be retrived using getattr?
+                continue  # ignore attributes like property, which can't be retrieved using getattr?
             if isinstance(module, Updateable):
-                module.do_update_step(
-                    epoch, global_step, on_load_weights=on_load_weights
-                )
+                module.do_update_step(epoch, global_step, on_load_weights=on_load_weights)
         self.update_step(epoch, global_step, on_load_weights=on_load_weights)
 
     def do_update_step_end(self, epoch: int, global_step: int):
@@ -31,7 +28,7 @@ class Updateable:
             try:
                 module = getattr(self, attr)
             except:
-                continue  # ignore attributes like property, which can't be retrived using getattr?
+                continue  # ignore attributes like property, which can't be retrieved using getattr?
             if isinstance(module, Updateable):
                 module.do_update_step_end(epoch, global_step)
         self.update_step_end(epoch, global_step)
@@ -39,7 +36,7 @@ class Updateable:
     def update_step(self, epoch: int, global_step: int, on_load_weights: bool = False):
         # override this method to implement custom update logic
         # if on_load_weights is True, you should be careful doing things related to model evaluations,
-        # as the models and tensors are not guarenteed to be on the same device
+        # as the models and tensors are not guaranteed to be on the same device
         pass
 
     def update_step_end(self, epoch: int, global_step: int):
@@ -50,9 +47,9 @@ class VQGANEncoder(ModelMixin, ConfigMixin):
     @dataclass
     class Config:
         ch: int = 128
-        ch_mult: List[int] = field(default_factory=lambda: [1, 2, 2, 4, 4])
-        num_res_blocks: List[int] = field(default_factory=lambda: [4, 3, 4, 3, 4])
-        attn_resolutions: List[int] = field(default_factory=lambda: [5])
+        ch_mult: list[int] = field(default_factory=lambda: [1, 2, 2, 4, 4])
+        num_res_blocks: list[int] = field(default_factory=lambda: [4, 3, 4, 3, 4])
+        attn_resolutions: list[int] = field(default_factory=lambda: [5])
         dropout: float = 0.0
         in_ch: int = 3
         out_ch: int = 3
@@ -63,9 +60,9 @@ class VQGANEncoder(ModelMixin, ConfigMixin):
     def __init__(
         self,
         ch: int = 128,
-        ch_mult: List[int] = [1, 2, 2, 4, 4],
-        num_res_blocks: List[int] = [4, 3, 4, 3, 4],
-        attn_resolutions: List[int] = [5],
+        ch_mult: list[int] = [1, 2, 2, 4, 4],
+        num_res_blocks: list[int] = [4, 3, 4, 3, 4],
+        attn_resolutions: list[int] = [5],
         dropout: float = 0.0,
         in_ch: int = 3,
         out_ch: int = 3,
@@ -81,9 +78,7 @@ class VQGANEncoder(ModelMixin, ConfigMixin):
         self.resolution = resolution
         self.in_ch = in_ch
         # downsampling
-        self.conv_in = torch.nn.Conv2d(
-            self.in_ch, self.ch, kernel_size=3, stride=1, padding=1
-        )
+        self.conv_in = torch.nn.Conv2d(self.in_ch, self.ch, kernel_size=3, stride=1, padding=1)
 
         curr_res = self.resolution
         in_ch_mult = (1,) + tuple(ch_mult)
@@ -188,10 +183,7 @@ class LFQuantizer(nn.Module):
 
         indices = torch.arange(self.codebook_size)
 
-        binary = (
-            indices.unsqueeze(1)
-            >> torch.arange(codebook_dim - 1, -1, -1, dtype=torch.long)
-        ) & 1
+        binary = (indices.unsqueeze(1) >> torch.arange(codebook_dim - 1, -1, -1, dtype=torch.long)) & 1
 
         embedding = binary.float() * 2 - 1
         self.register_buffer("embedding", embedding)
@@ -200,11 +192,7 @@ class LFQuantizer(nn.Module):
         self.entropy_multiplier = entropy_multiplier
 
     def get_indices(self, z_q):
-        return (
-            (self.power_vals.reshape(1, -1, 1, 1) * (z_q > 0).float())
-            .sum(1, keepdim=True)
-            .long()
-        )
+        return (self.power_vals.reshape(1, -1, 1, 1) * (z_q > 0).float()).sum(1, keepdim=True).long()
 
     def get_codebook_entry(self, indices, shape=None):
         if shape is None:
@@ -259,9 +247,9 @@ class LFQuantizer(nn.Module):
         mean_entropy = CatDist(probs=mean_prob).entropy().mean()
 
         # compute loss for embedding
-        commit_loss = torch.mean(
-            (z_q.detach() - z_flattened) ** 2
-        ) + self.beta * torch.mean((z_q - z_flattened.detach()) ** 2)
+        commit_loss = torch.mean((z_q.detach() - z_flattened) ** 2) + self.beta * torch.mean(
+            (z_q - z_flattened.detach()) ** 2
+        )
 
         # reshape back to match original input shape
         z_q = z_q.view(z.shape)
@@ -279,9 +267,9 @@ class VQGANDecoder(ModelMixin, ConfigMixin):
     def __init__(
         self,
         ch: int = 128,
-        ch_mult: List[int] = [1, 1, 2, 2, 4],
-        num_res_blocks: List[int] = [4, 4, 3, 4, 3],
-        attn_resolutions: List[int] = [5],
+        ch_mult: list[int] = [1, 1, 2, 2, 4],
+        num_res_blocks: list[int] = [4, 4, 3, 4, 3],
+        attn_resolutions: list[int] = [5],
         dropout: float = 0.0,
         in_ch: int = 3,
         out_ch: int = 3,
@@ -306,9 +294,7 @@ class VQGANDecoder(ModelMixin, ConfigMixin):
         self.z_shape = (1, z_channels, curr_res, curr_res)
 
         # z to block_in
-        self.conv_in = torch.nn.Conv2d(
-            z_channels, block_in, kernel_size=3, stride=1, padding=1
-        )
+        self.conv_in = torch.nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
 
         # middle
         self.mid = nn.Module()
@@ -353,9 +339,7 @@ class VQGANDecoder(ModelMixin, ConfigMixin):
             self.up.insert(0, up)  # prepend to get consistent order
 
         self.norm_out = Normalize(block_in)
-        self.conv_out = torch.nn.Conv2d(
-            block_in, out_ch, kernel_size=3, stride=1, padding=1
-        )
+        self.conv_out = torch.nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
         self.post_quant_conv = torch.nn.Conv2d(z_channels, z_channels, 1)
 
     def forward(self, z):
@@ -412,17 +396,15 @@ class MAGVITv2(ModelMixin, ConfigMixin):
     def encode(self, pixel_values, return_loss=False):
         hidden_states = self.encoder(pixel_values)
         quantized_states = self.quantize(hidden_states)["z"]
-        codebook_indices = self.quantize.get_indices(quantized_states).reshape(
-            pixel_values.shape[0], -1
-        )
+        codebook_indices = self.quantize.get_indices(quantized_states).reshape(pixel_values.shape[0], -1)
         output = (quantized_states, codebook_indices)
         return output
 
     def get_code(self, pixel_values):
         hidden_states = self.encoder(pixel_values)
-        codebook_indices = self.quantize.get_indices(
-            self.quantize(hidden_states)["z"]
-        ).reshape(pixel_values.shape[0], -1)
+        codebook_indices = self.quantize.get_indices(self.quantize(hidden_states)["z"]).reshape(
+            pixel_values.shape[0], -1
+        )
 
         return codebook_indices
 

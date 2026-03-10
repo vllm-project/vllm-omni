@@ -16,8 +16,8 @@ from .dynin_omni_common import (
     DETOK_IMAGE,
     first_value,
     get_runtime_info,
-    resolve_hidden_size,
     resolve_dynin_infer_sources,
+    resolve_hidden_size,
     to_token_1d,
 )
 
@@ -28,11 +28,11 @@ from .models import MAGVITv2
 
 class DyninOmniToken2Image(nn.Module):
     """Stage-2: token detokenization to image (or pass-through)."""
-    
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         del prefix
         super().__init__()
-        
+
         self.vllm_config = vllm_config
         self.have_multimodal_outputs = True
         self.requires_raw_input_tokens = True
@@ -118,11 +118,7 @@ class DyninOmniToken2Image(nn.Module):
         sources = resolve_dynin_infer_sources(vllm_config=self.vllm_config, runtime_info=runtime_info)
         model_path = str(sources.vq_image_source)
         local_files_only = bool(sources.vq_image_local_files_only)
-        if (
-            self._vq_model is None
-            or self._vq_model_path != model_path
-            or self._vq_local_files_only != local_files_only
-        ):
+        if self._vq_model is None or self._vq_model_path != model_path or self._vq_local_files_only != local_files_only:
             disable_xet = first_value(
                 runtime_info.get("hf_hub_disable_xet"),
                 first_value(runtime_info.get("disable_hf_xet"), True),

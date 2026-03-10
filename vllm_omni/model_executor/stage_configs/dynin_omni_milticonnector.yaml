@@ -104,11 +104,11 @@ runtime:
       extra:
         shm_threshold_bytes: 65536 # 64KB threshold
     ####
-    
+
   edges:
-    - from: 0                   
+    - from: 0
       to: 1
       window_size: -1
-    - from: 1               
+    - from: 1
       to: 2
       window_size: -1

@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The HuggingFace Inc. team.
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -20,9 +19,10 @@ import json
 import os
 import re
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any
 
 import safetensors
 import torch
@@ -46,10 +46,10 @@ except ImportError:  # Older huggingface_hub without shard helper.
         return _StateDictSplit(state_dict.keys(), filename)
 
 
+from diffusers import __version__
+from diffusers.configuration_utils import ConfigMixin, register_to_config
 from huggingface_hub.utils import validate_hf_hub_args
 from torch import Tensor, nn
-
-from diffusers import __version__
 
 try:
     from diffusers.utils import (
@@ -92,7 +92,7 @@ except ImportError:
                 return candidate
         if os.path.isfile(pretrained_model_name_or_path):
             return pretrained_model_name_or_path
-        raise IOError(f"Model file {weights_name} not found under {base}")
+        raise OSError(f"Model file {weights_name} not found under {base}")
 
     def _get_checkpoint_shard_files(
         pretrained_model_name_or_path,
@@ -102,8 +102,8 @@ except ImportError:
     ):
         index_path = Path(index_file)
         if not index_path.is_file():
-            raise IOError(f"Index file not found: {index_path}")
-        with open(index_path, "r", encoding="utf-8") as f:
+            raise OSError(f"Index file not found: {index_path}")
+        with open(index_path, encoding="utf-8") as f:
             data = json.load(f)
         folder = index_path.parent
         return folder, data
@@ -114,11 +114,6 @@ WEIGHTS_NAME = "pytorch_model.bin"
 SAFETENSORS_WEIGHTS_NAME = "pytorch_model.safetensors"
 HUGGINGFACE_CO_RESOLVE_ENDPOINT = "https://huggingface.co"
 
-from diffusers.utils.hub_utils import (
-    PushToHubMixin,
-    load_or_create_model_card,
-    populate_model_card,
-)
 from diffusers.models.model_loading_utils import (
     _determine_device_map,
     _fetch_index_file,
@@ -126,8 +121,11 @@ from diffusers.models.model_loading_utils import (
     load_model_dict_into_meta,
     load_state_dict,
 )
-
-from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.utils.hub_utils import (
+    PushToHubMixin,
+    load_or_create_model_card,
+    populate_model_card,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -146,10 +144,7 @@ def _load_state_dict_compat(checkpoint_file, **kwargs):
 
 def _fetch_index_file_compat(**kwargs):
     filtered_kwargs = {k: v for k, v in kwargs.items() if k in _FETCH_INDEX_FILE_PARAMS}
-    if (
-        "resume_download" in _FETCH_INDEX_FILE_PARAMS
-        and "resume_download" not in filtered_kwargs
-    ):
+    if "resume_download" in _FETCH_INDEX_FILE_PARAMS and "resume_download" not in filtered_kwargs:
         filtered_kwargs["resume_download"] = False
     return _fetch_index_file(**filtered_kwargs)
 
@@ -180,14 +175,12 @@ if is_accelerate_available():
 
 def get_parameter_device(parameter: torch.nn.Module) -> torch.device:
     try:
-        parameters_and_buffers = itertools.chain(
-            parameter.parameters(), parameter.buffers()
-        )
+        parameters_and_buffers = itertools.chain(parameter.parameters(), parameter.buffers())
         return next(parameters_and_buffers).device
     except StopIteration:
         # For torch.nn.DataParallel compatibility in PyTorch 1.5
 
-        def find_tensor_attributes(module: torch.nn.Module) -> List[Tuple[str, Tensor]]:
+        def find_tensor_attributes(module: torch.nn.Module) -> list[tuple[str, Tensor]]:
             tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
             return tuples
 
@@ -209,7 +202,7 @@ def get_parameter_dtype(parameter: torch.nn.Module) -> torch.dtype:
     except StopIteration:
         # For torch.nn.DataParallel compatibility in PyTorch 1.5
 
-        def find_tensor_attributes(module: torch.nn.Module) -> List[Tuple[str, Tensor]]:
+        def find_tensor_attributes(module: torch.nn.Module) -> list[tuple[str, Tensor]]:
             tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
             return tuples
 
@@ -244,9 +237,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         https://pytorch.org/docs/stable/_modules/torch/nn/modules/module.html#Module
         """
 
-        is_in_config = "_internal_dict" in self.__dict__ and hasattr(
-            self.__dict__["_internal_dict"], name
-        )
+        is_in_config = "_internal_dict" in self.__dict__ and hasattr(self.__dict__["_internal_dict"], name)
         is_attribute = name in self.__dict__
 
         if is_in_config and not is_attribute:
@@ -268,10 +259,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         """
         Whether gradient checkpointing is activated for this model or not.
         """
-        return any(
-            hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing
-            for m in self.modules()
-        )
+        return any(hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing for m in self.modules())
 
     def enable_gradient_checkpointing(self) -> None:
         """
@@ -279,9 +267,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         *checkpoint activations* in other frameworks).
         """
         if not self._supports_gradient_checkpointing:
-            raise ValueError(
-                f"{self.__class__.__name__} does not support gradient checkpointing."
-            )
+            raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
         self.apply(partial(self._set_gradient_checkpointing, value=True))
 
     def disable_gradient_checkpointing(self) -> None:
@@ -322,9 +308,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         """
         self.set_use_npu_flash_attention(False)
 
-    def set_use_memory_efficient_attention_xformers(
-        self, valid: bool, attention_op: Optional[Callable] = None
-    ) -> None:
+    def set_use_memory_efficient_attention_xformers(self, valid: bool, attention_op: Callable | None = None) -> None:
         # Recursively walk through all the children.
         # Any children which exposes the set_use_memory_efficient_attention_xformers method
         # gets the message
@@ -339,9 +323,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             if isinstance(module, torch.nn.Module):
                 fn_recursive_set_mem_eff(module)
 
-    def enable_xformers_memory_efficient_attention(
-        self, attention_op: Optional[Callable] = None
-    ) -> None:
+    def enable_xformers_memory_efficient_attention(self, attention_op: Callable | None = None) -> None:
         r"""
         Enable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/).
 
@@ -385,12 +367,12 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
     def save_pretrained(
         self,
-        save_directory: Union[str, os.PathLike],
+        save_directory: str | os.PathLike,
         is_main_process: bool = True,
-        save_function: Optional[Callable] = None,
+        save_function: Callable | None = None,
         safe_serialization: bool = True,
-        variant: Optional[str] = None,
-        max_shard_size: Union[int, str] = "10GB",
+        variant: str | None = None,
+        max_shard_size: int | str = "10GB",
         push_to_hub: bool = False,
         **kwargs,
     ):
@@ -428,18 +410,14 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 Additional keyword arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
         if os.path.isfile(save_directory):
-            logger.error(
-                f"Provided path ({save_directory}) should be a directory, not a file"
-            )
+            logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
             return
 
         weights_name = SAFETENSORS_WEIGHTS_NAME if safe_serialization else WEIGHTS_NAME
         weights_name = _add_variant(weights_name, variant)
         weight_name_split = weights_name.split(".")
         if len(weight_name_split) in [2, 3]:
-            weights_name_pattern = (
-                weight_name_split[0] + "{suffix}." + ".".join(weight_name_split[1:])
-            )
+            weights_name_pattern = weight_name_split[0] + "{suffix}." + ".".join(weight_name_split[1:])
         else:
             raise ValueError(f"Invalid {weights_name} provided.")
 
@@ -451,9 +429,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             create_pr = kwargs.pop("create_pr", False)
             token = kwargs.pop("token", None)
             repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
-            repo_id = create_repo(
-                repo_id, exist_ok=True, private=private, token=token
-            ).repo_id
+            repo_id = create_repo(repo_id, exist_ok=True, private=private, token=token).repo_id
 
         # Only save the model itself if we are using distributed training
         model_to_save = self
@@ -481,13 +457,9 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 full_filename = os.path.join(save_directory, filename)
                 if not os.path.isfile(full_filename):
                     continue
-                weights_without_ext = weights_name_pattern.replace(".bin", "").replace(
-                    ".safetensors", ""
-                )
+                weights_without_ext = weights_name_pattern.replace(".bin", "").replace(".safetensors", "")
                 weights_without_ext = weights_without_ext.replace("{suffix}", "")
-                filename_without_ext = filename.replace(".bin", "").replace(
-                    ".safetensors", ""
-                )
+                filename_without_ext = filename.replace(".bin", "").replace(".safetensors", "")
                 # make sure that file to be deleted matches format of sharded file, e.g. pytorch_model-00001-of-00005
                 if (
                     filename.startswith(weights_without_ext)
@@ -510,12 +482,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 "metadata": state_dict_split.metadata,
                 "weight_map": state_dict_split.tensor_to_filename,
             }
-            save_index_file = (
-                SAFE_WEIGHTS_INDEX_NAME if safe_serialization else WEIGHTS_INDEX_NAME
-            )
-            save_index_file = os.path.join(
-                save_directory, _add_variant(save_index_file, variant)
-            )
+            save_index_file = SAFE_WEIGHTS_INDEX_NAME if safe_serialization else WEIGHTS_INDEX_NAME
+            save_index_file = os.path.join(save_directory, _add_variant(save_index_file, variant))
             # Save the index as well
             with open(save_index_file, "w", encoding="utf-8") as f:
                 content = json.dumps(index, indent=2, sort_keys=True) + "\n"
@@ -545,9 +513,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
     @classmethod
     @validate_hf_hub_args
-    def from_pretrained(
-        cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs
-    ):
+    def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike | None, **kwargs):
         r"""
         Instantiate a pretrained PyTorch model from a pretrained model configuration.
 
@@ -735,16 +701,12 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             if low_cpu_mem_usage is None:
                 low_cpu_mem_usage = True
             elif not low_cpu_mem_usage:
-                raise ValueError(
-                    "Passing along a `device_map` requires `low_cpu_mem_usage=True`"
-                )
+                raise ValueError("Passing along a `device_map` requires `low_cpu_mem_usage=True`")
 
         if low_cpu_mem_usage:
             if device_map is not None and not is_torch_version(">=", "1.10"):
                 # The max memory utils require PyTorch >= 1.10 to have torch.cuda.mem_get_info.
-                raise ValueError(
-                    "`low_cpu_mem_usage` and `device_map` require PyTorch >= 1.10."
-                )
+                raise ValueError("`low_cpu_mem_usage` and `device_map` require PyTorch >= 1.10.")
 
         # Load config if we don't provide a configuration
         config_path = pretrained_model_name_or_path
@@ -794,9 +756,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             is_sharded = True
 
         if is_sharded and from_flax:
-            raise ValueError(
-                "Loading of sharded checkpoints is not supported when `from_flax=True`."
-            )
+            raise ValueError("Loading of sharded checkpoints is not supported when `from_flax=True`.")
 
         # load model
         model_file = None
@@ -824,18 +784,16 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             model = load_flax_checkpoint_in_pytorch_model(model, model_file)
         else:
             if is_sharded:
-                sharded_ckpt_cached_folder, sharded_metadata = (
-                    _get_checkpoint_shard_files(
-                        pretrained_model_name_or_path,
-                        index_file,
-                        cache_dir=cache_dir,
-                        proxies=proxies,
-                        local_files_only=local_files_only,
-                        token=token,
-                        user_agent=user_agent,
-                        revision=revision,
-                        subfolder=subfolder or "",
-                    )
+                sharded_ckpt_cached_folder, sharded_metadata = _get_checkpoint_shard_files(
+                    pretrained_model_name_or_path,
+                    index_file,
+                    cache_dir=cache_dir,
+                    proxies=proxies,
+                    local_files_only=local_files_only,
+                    token=token,
+                    user_agent=user_agent,
+                    revision=revision,
+                    subfolder=subfolder or "",
                 )
 
             elif use_safetensors and not is_sharded:
@@ -854,10 +812,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                         commit_hash=commit_hash,
                     )
 
-                except IOError as e:
-                    logger.error(
-                        f"An error occurred while trying to fetch {pretrained_model_name_or_path}: {e}"
-                    )
+                except OSError as e:
+                    logger.error(f"An error occurred while trying to fetch {pretrained_model_name_or_path}: {e}")
                     if not allow_pickle:
                         raise
                     logger.warning(
@@ -890,9 +846,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                     state_dict = _load_state_dict_compat(model_file, variant=variant)
                     model._convert_deprecated_attention_blocks(state_dict)
                     # move the params from meta device to cpu
-                    missing_keys = set(model.state_dict().keys()) - set(
-                        state_dict.keys()
-                    )
+                    missing_keys = set(model.state_dict().keys()) - set(state_dict.keys())
                     if len(missing_keys) > 0:
                         raise ValueError(
                             f"Cannot load {cls} from {pretrained_model_name_or_path} because the following keys are"
@@ -911,9 +865,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
                     if cls._keys_to_ignore_on_load_unexpected is not None:
                         for pat in cls._keys_to_ignore_on_load_unexpected:
-                            unexpected_keys = [
-                                k for k in unexpected_keys if re.search(pat, k) is None
-                            ]
+                            unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
 
                     if len(unexpected_keys) > 0:
                         logger.warning(
@@ -924,9 +876,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                     # Load weights and dispatch according to the device_map
                     # by default the device_map is None and the weights are loaded on the CPU
                     force_hook = True
-                    device_map = _determine_device_map(
-                        model, device_map, max_memory, torch_dtype
-                    )
+                    device_map = _determine_device_map(model, device_map, max_memory, torch_dtype)
                     if device_map is None and is_sharded:
                         # we load the parameters on the cpu
                         device_map = {"": "cpu"}
@@ -989,14 +939,12 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 state_dict = _load_state_dict_compat(model_file, variant=variant)
                 model._convert_deprecated_attention_blocks(state_dict)
 
-                model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = (
-                    cls._load_pretrained_model(
-                        model,
-                        state_dict,
-                        model_file,
-                        pretrained_model_name_or_path,
-                        ignore_mismatched_sizes=ignore_mismatched_sizes,
-                    )
+                model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(
+                    model,
+                    state_dict,
+                    model_file,
+                    pretrained_model_name_or_path,
+                    ignore_mismatched_sizes=ignore_mismatched_sizes,
                 )
 
                 loading_info = {
@@ -1028,7 +976,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         model,
         state_dict: OrderedDict,
         resolved_archive_file,
-        pretrained_model_name_or_path: Union[str, os.PathLike],
+        pretrained_model_name_or_path: str | os.PathLike,
         ignore_mismatched_sizes: bool = False,
     ):
         # Retrieve missing & unexpected_keys
@@ -1058,8 +1006,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
                     if (
                         model_key in model_state_dict
-                        and state_dict[checkpoint_key].shape
-                        != model_state_dict[model_key].shape
+                        and state_dict[checkpoint_key].shape != model_state_dict[model_key].shape
                     ):
                         mismatched_keys.append(
                             (
@@ -1084,10 +1031,10 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         if len(error_msgs) > 0:
             error_msg = "\n\t".join(error_msgs)
             if "size mismatch" in error_msg:
-                error_msg += "\n\tYou may consider adding `ignore_mismatched_sizes=True` in the model `from_pretrained` method."
-            raise RuntimeError(
-                f"Error(s) in loading state_dict for {model.__class__.__name__}:\n\t{error_msg}"
-            )
+                error_msg += (
+                    "\n\tYou may consider adding `ignore_mismatched_sizes=True` in the model `from_pretrained` method."
+                )
+            raise RuntimeError(f"Error(s) in loading state_dict for {model.__class__.__name__}:\n\t{error_msg}")
 
         if len(unexpected_keys) > 0:
             logger.warning(
@@ -1101,9 +1048,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 " BertForSequenceClassification model)."
             )
         else:
-            logger.info(
-                f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n"
-            )
+            logger.info(f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n")
         if len(missing_keys) > 0:
             logger.warning(
                 f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
@@ -1136,12 +1081,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
     @classmethod
     def _get_signature_keys(cls, obj):
         parameters = inspect.signature(obj.__init__).parameters
-        required_parameters = {
-            k: v for k, v in parameters.items() if v.default == inspect._empty
-        }
-        optional_parameters = set(
-            {k for k, v in parameters.items() if v.default != inspect._empty}
-        )
+        required_parameters = {k: v for k, v in parameters.items() if v.default == inspect._empty}
+        optional_parameters = set({k for k, v in parameters.items() if v.default != inspect._empty})
         expected_modules = set(required_parameters.keys()) - {"self"}
 
         return expected_modules, optional_parameters
@@ -1172,9 +1113,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                             "class needs to implement the `_no_split_modules` attribute."
                         )
                     else:
-                        _no_split_modules = _no_split_modules | set(
-                            module._no_split_modules
-                        )
+                        _no_split_modules = _no_split_modules | set(module._no_split_modules)
                 modules_to_check += list(module.children())
         return list(_no_split_modules)
 
@@ -1193,9 +1132,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         """
         return get_parameter_dtype(self)
 
-    def num_parameters(
-        self, only_trainable: bool = False, exclude_embeddings: bool = False
-    ) -> int:
+    def num_parameters(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
         """
         Get number of (trainable or non-embedding) parameters in the module.
 
@@ -1227,30 +1164,17 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 if isinstance(module_type, torch.nn.Embedding)
             ]
             non_embedding_parameters = [
-                parameter
-                for name, parameter in self.named_parameters()
-                if name not in embedding_param_names
+                parameter for name, parameter in self.named_parameters() if name not in embedding_param_names
             ]
-            return sum(
-                p.numel()
-                for p in non_embedding_parameters
-                if p.requires_grad or not only_trainable
-            )
+            return sum(p.numel() for p in non_embedding_parameters if p.requires_grad or not only_trainable)
         else:
-            return sum(
-                p.numel()
-                for p in self.parameters()
-                if p.requires_grad or not only_trainable
-            )
+            return sum(p.numel() for p in self.parameters() if p.requires_grad or not only_trainable)
 
     def _convert_deprecated_attention_blocks(self, state_dict: OrderedDict) -> None:
         deprecated_attention_block_paths = []
 
         def recursive_find_attn_block(name, module):
-            if (
-                hasattr(module, "_from_deprecated_attn_block")
-                and module._from_deprecated_attn_block
-            ):
+            if hasattr(module, "_from_deprecated_attn_block") and module._from_deprecated_attn_block:
                 deprecated_attention_block_paths.append(name)
 
             for sub_name, sub_module in module.named_children():
@@ -1268,9 +1192,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
             # query -> to_q
             if f"{path}.query.weight" in state_dict:
-                state_dict[f"{path}.to_q.weight"] = state_dict.pop(
-                    f"{path}.query.weight"
-                )
+                state_dict[f"{path}.to_q.weight"] = state_dict.pop(f"{path}.query.weight")
             if f"{path}.query.bias" in state_dict:
                 state_dict[f"{path}.to_q.bias"] = state_dict.pop(f"{path}.query.bias")
 
@@ -1282,30 +1204,21 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
             # value -> to_v
             if f"{path}.value.weight" in state_dict:
-                state_dict[f"{path}.to_v.weight"] = state_dict.pop(
-                    f"{path}.value.weight"
-                )
+                state_dict[f"{path}.to_v.weight"] = state_dict.pop(f"{path}.value.weight")
             if f"{path}.value.bias" in state_dict:
                 state_dict[f"{path}.to_v.bias"] = state_dict.pop(f"{path}.value.bias")
 
             # proj_attn -> to_out.0
             if f"{path}.proj_attn.weight" in state_dict:
-                state_dict[f"{path}.to_out.0.weight"] = state_dict.pop(
-                    f"{path}.proj_attn.weight"
-                )
+                state_dict[f"{path}.to_out.0.weight"] = state_dict.pop(f"{path}.proj_attn.weight")
             if f"{path}.proj_attn.bias" in state_dict:
-                state_dict[f"{path}.to_out.0.bias"] = state_dict.pop(
-                    f"{path}.proj_attn.bias"
-                )
+                state_dict[f"{path}.to_out.0.bias"] = state_dict.pop(f"{path}.proj_attn.bias")
 
     def _temp_convert_self_to_deprecated_attention_blocks(self) -> None:
         deprecated_attention_block_modules = []
 
         def recursive_find_attn_block(module):
-            if (
-                hasattr(module, "_from_deprecated_attn_block")
-                and module._from_deprecated_attn_block
-            ):
+            if hasattr(module, "_from_deprecated_attn_block") and module._from_deprecated_attn_block:
                 deprecated_attention_block_modules.append(module)
 
             for sub_module in module.children():
@@ -1332,10 +1245,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         deprecated_attention_block_modules = []
 
         def recursive_find_attn_block(module) -> None:
-            if (
-                hasattr(module, "_from_deprecated_attn_block")
-                and module._from_deprecated_attn_block
-            ):
+            if hasattr(module, "_from_deprecated_attn_block") and module._from_deprecated_attn_block:
                 deprecated_attention_block_modules.append(module)
 
             for sub_module in module.children():
@@ -1347,9 +1257,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             module.to_q = module.query
             module.to_k = module.key
             module.to_v = module.value
-            module.to_out = nn.ModuleList(
-                [module.proj_attn, nn.Dropout(module.dropout)]
-            )
+            module.to_out = nn.ModuleList([module.proj_attn, nn.Dropout(module.dropout)])
 
             del module.query
             del module.key
@@ -1365,9 +1273,7 @@ class LegacyModelMixin(ModelMixin):
 
     @classmethod
     @validate_hf_hub_args
-    def from_pretrained(
-        cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs
-    ):
+    def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike | None, **kwargs):
         # To prevent dependency import problem.
         from diffusers.models.model_loading_utils import _fetch_remapped_cls_from_config
 
@@ -1409,6 +1315,4 @@ class LegacyModelMixin(ModelMixin):
         # resolve remapping
         remapped_class = _fetch_remapped_cls_from_config(config, cls)
 
-        return remapped_class.from_pretrained(
-            pretrained_model_name_or_path, **kwargs_copy
-        )
+        return remapped_class.from_pretrained(pretrained_model_name_or_path, **kwargs_copy)

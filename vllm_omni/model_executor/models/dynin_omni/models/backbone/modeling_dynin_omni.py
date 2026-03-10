@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2026 Dynin-Omni Team, AIDAS Lab, Seoul National University
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,50 +16,19 @@ from __future__ import annotations
 
 import logging
 import math
-import sys
 import warnings
-from abc import abstractmethod
-from collections import defaultdict
-from functools import partial
-from typing import (
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    NamedTuple,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    cast,
-)
-from dataclasses import fields
-from typing import List, Optional, Tuple, Union
+
 import numpy as np
 import torch
 import torch.backends.cuda
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import einsum
-from transformers import PreTrainedModel
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.auto import AutoModel, AutoConfig, AutoModelForCausalLM
-from transformers.cache_utils import Cache
 from PIL import Image
-from .configuration_llada import (
-    LLaDAConfig,
-    StrEnum,
-    InitFnType,
-    ActivationType,
-    BlockType,
-    LayerNormType,
-    ModelConfig,
-    ActivationCheckpointingStrategy,
-)
+from transformers import PretrainedConfig
+from transformers.models.auto import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from .modeling_llada import LLaDAModelLM
 from .sampling import cosine_schedule, mask_by_random_topk
-from transformers import PretrainedConfig
 
 try:
     from fastdllm_v1 import mmu_generate_fastdllm_v1 as _mmu_generate_fastdllm_v1
@@ -69,7 +37,10 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 
-def calculate_mmu_style_loss(logits_batch, labels_batch, masked_indices_batch, p_mask, answer_lengths, output_size, device):
+
+def calculate_mmu_style_loss(
+    logits_batch, labels_batch, masked_indices_batch, p_mask, answer_lengths, output_size, device
+):
     if logits_batch.shape[0] == 0:
         return logits_batch.new_zeros(())
 
@@ -78,10 +49,15 @@ def calculate_mmu_style_loss(logits_batch, labels_batch, masked_indices_batch, p
     answer_lengths_flat = answer_lengths.to(device)[masked_indices_batch]
     answer_lengths_flat = torch.clamp(answer_lengths_flat, min=1)
 
-    loss = F.cross_entropy(
-        logits_batch[masked_indices_batch].contiguous().view(-1, output_size),
-        labels_batch[masked_indices_batch].contiguous().view(-1), ignore_index=-100, reduction='none'
-    ) / p_mask_flat
+    loss = (
+        F.cross_entropy(
+            logits_batch[masked_indices_batch].contiguous().view(-1, output_size),
+            labels_batch[masked_indices_batch].contiguous().view(-1),
+            ignore_index=-100,
+            reduction="none",
+        )
+        / p_mask_flat
+    )
 
     loss = torch.sum(loss / answer_lengths_flat) / logits_batch.shape[0]
     return loss
@@ -128,12 +104,7 @@ def calculate_t2s_loss(
     relative_labels[selected_labels == eoa_token_id] = codebook_size
     relative_labels[selected_labels == eos_token_id] = codebook_size + 1
 
-    loss_vec = F.cross_entropy(
-        combined_logits,
-        relative_labels,
-        ignore_index=ignore_index,
-        reduction='none'
-    )
+    loss_vec = F.cross_entropy(combined_logits, relative_labels, ignore_index=ignore_index, reduction="none")
 
     loss_vec = loss_vec / p_mask_flat
     loss_vec = loss_vec / answer_lengths_flat
@@ -141,28 +112,29 @@ def calculate_t2s_loss(
     loss = torch.sum(loss_vec) / logits_batch.shape[0]
     return loss.to(dtype=logits_batch.dtype)
 
+
 def add_gumbel_noise(logits, temperature):
-    '''
+    """
     The Gumbel max is a method for sampling categorical distributions.
     According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
     Thus, we use float64.
-    '''
+    """
     if temperature == 0:
         return logits
     logits = logits.to(torch.float64)
     noise = torch.rand_like(logits, dtype=torch.float64)
-    gumbel_noise = (- torch.log(noise)) ** temperature
+    gumbel_noise = (-torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
 
 def get_num_transfer_tokens(mask_index, steps):
-    '''
+    """
     In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
     Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
     the expected number of tokens transitioned at each step should be consistent.
 
     This function is designed to precompute the number of tokens that need to be transitioned at each step.
-    '''
+    """
     mask_num = mask_index.sum(dim=1, keepdim=True)
 
     base = mask_num // steps
@@ -171,16 +143,17 @@ def get_num_transfer_tokens(mask_index, steps):
     num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
 
     for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, :remainder[i]] += 1
+        num_transfer_tokens[i, : remainder[i]] += 1
 
     return num_transfer_tokens
+
 
 class DyninOmniConfig(PretrainedConfig):
     model_type = "dynin_omni"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        
+
         allowed_keys = [
             "vocab_size",
             "llm_vocab_size",
@@ -224,6 +197,7 @@ class VideoTokenMerger(nn.Module):
 class DyninOmniModelLM(LLaDAModelLM):
     config_class = DyninOmniConfig
     base_model_prefix = "model"
+
     def __init__(self, config: DyninOmniConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.video_token_merger = None
@@ -238,25 +212,25 @@ class DyninOmniModelLM(LLaDAModelLM):
         self.config.vid_merge = True
         self.config.vid_merge_stride = stride
         return merger
-        
+
     @torch.no_grad()
     def t2i_generate(
-            self,
-            input_ids: torch.LongTensor = None,
-            uncond_input_ids: torch.LongTensor = None,
-            attention_mask=None,
-            uncond_attention_mask=None,
-            temperature=1.0,
-            timesteps=18,  # ideal number of steps is 18 in maskgit paper
-            guidance_scale=0,
-            noise_schedule=cosine_schedule,
-            generator: torch.Generator = None,
-            config=None,
-            seq_len=1024,
-            mask_token_id = 126336,
-            resolution = 512,
-            codebook_size = 8192,
-            **kwargs,
+        self,
+        input_ids: torch.LongTensor = None,
+        uncond_input_ids: torch.LongTensor = None,
+        attention_mask=None,
+        uncond_attention_mask=None,
+        temperature=1.0,
+        timesteps=18,  # ideal number of steps is 18 in maskgit paper
+        guidance_scale=0,
+        noise_schedule=cosine_schedule,
+        generator: torch.Generator = None,
+        config=None,
+        seq_len=1024,
+        mask_token_id=126336,
+        resolution=512,
+        codebook_size=8192,
+        **kwargs,
     ):
         """
         Generate 1:1 similar to the original MaskGit repo
@@ -267,17 +241,20 @@ class DyninOmniModelLM(LLaDAModelLM):
         num_vq_tokens = seq_len
         num_new_special_tokens = 0
         uni_prompting = kwargs.get("uni_prompting", None)
-        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1):-1].clone()
-        input_ids_minus_lm_vocab_size = torch.where(input_ids_minus_lm_vocab_size == mask_token_id, mask_token_id, input_ids_minus_lm_vocab_size - len(uni_prompting.text_tokenizer) - num_new_special_tokens)
+        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1) : -1].clone()
+        input_ids_minus_lm_vocab_size = torch.where(
+            input_ids_minus_lm_vocab_size == mask_token_id,
+            mask_token_id,
+            input_ids_minus_lm_vocab_size - len(uni_prompting.text_tokenizer) - num_new_special_tokens,
+        )
 
         # for classifier-free guidance
         if uncond_input_ids is not None:
-            uncond_prefix = uncond_input_ids[:, :resolution + 1]
+            uncond_prefix = uncond_input_ids[:, : resolution + 1]
 
         for step in range(timesteps):
             if uncond_input_ids is not None and guidance_scale > 0:
-                uncond_input_ids = torch.cat(
-                    [uncond_prefix, input_ids[:, resolution + 1:]], dim=1)
+                uncond_input_ids = torch.cat([uncond_prefix, input_ids[:, resolution + 1 :]], dim=1)
                 model_input = torch.cat([input_ids, uncond_input_ids])
                 all_attention_mask = torch.cat([attention_mask, uncond_attention_mask], dim=0)
                 attention_bias = (all_attention_mask[:, :, None] & all_attention_mask[:, None, :]).bool().unsqueeze(1)
@@ -286,16 +263,28 @@ class DyninOmniModelLM(LLaDAModelLM):
                 # logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
                 # it seems that muse has a different cfg setting
                 logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
+                logits = logits[
+                    :,
+                    -(num_vq_tokens + 1) : -1,
+                    len(uni_prompting.text_tokenizer) + num_new_special_tokens : len(uni_prompting.text_tokenizer)
+                    + num_new_special_tokens
+                    + codebook_size,
+                ]
             else:
                 attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
                 logits = self(input_ids, attention_bias=attention_bias).logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
+                logits = logits[
+                    :,
+                    -(num_vq_tokens + 1) : -1,
+                    len(uni_prompting.text_tokenizer) + num_new_special_tokens : len(uni_prompting.text_tokenizer)
+                    + num_new_special_tokens
+                    + codebook_size,
+                ]
 
             # logits: 1, 1024, 8192
             probs = logits.softmax(dim=-1)
             sampled = probs.reshape(-1, logits.size(-1))
-            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1]) # 1, 1024
+            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1])  # 1, 1024
 
             unknown_map = input_ids_minus_lm_vocab_size == mask_token_id
             sampled_ids = torch.where(unknown_map, sampled_ids, input_ids_minus_lm_vocab_size)
@@ -320,34 +309,34 @@ class DyninOmniModelLM(LLaDAModelLM):
             temperature = temperature * (1.0 - ratio)
             masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=generator)
             # Masks tokens with lower confidence.
-            input_ids[:, -(num_vq_tokens + 1):-1] = torch.where(masking, mask_token_id,
-                                                          sampled_ids + len(uni_prompting.text_tokenizer)
-                                                          + num_new_special_tokens)
+            input_ids[:, -(num_vq_tokens + 1) : -1] = torch.where(
+                masking, mask_token_id, sampled_ids + len(uni_prompting.text_tokenizer) + num_new_special_tokens
+            )
             input_ids_minus_lm_vocab_size = torch.where(masking, mask_token_id, sampled_ids)
 
         return sampled_ids
 
     @torch.no_grad()
     def ti2ti_generate(
-            self,
-            input_ids: torch.LongTensor = None,
-            uncond_input_ids: torch.LongTensor = None,
-            attention_mask=None,
-            uncond_attention_mask=None,
-            temperature=1.0,
-            timesteps=18,
-            timesteps_text: int | None = None,
-            timesteps_image: int | None = None,
-            guidance_scale=0,
-            noise_schedule=cosine_schedule,
-            generator: torch.Generator = None,
-            config=None,
-            seq_len=1024,
-            mask_token_id=126336,
-            resolution=512,
-            codebook_size=8192,
-            uni_prompting=None,
-            **kwargs,
+        self,
+        input_ids: torch.LongTensor = None,
+        uncond_input_ids: torch.LongTensor = None,
+        attention_mask=None,
+        uncond_attention_mask=None,
+        temperature=1.0,
+        timesteps=18,
+        timesteps_text: int | None = None,
+        timesteps_image: int | None = None,
+        guidance_scale=0,
+        noise_schedule=cosine_schedule,
+        generator: torch.Generator = None,
+        config=None,
+        seq_len=1024,
+        mask_token_id=126336,
+        resolution=512,
+        codebook_size=8192,
+        uni_prompting=None,
+        **kwargs,
     ):
         """
         TI2TI generation that fills masked text and image tokens; allows separate timesteps.
@@ -382,7 +371,7 @@ class DyninOmniModelLM(LLaDAModelLM):
             attn_uncond = None
         total_len = seq.shape[1]
 
-        def _uniform_transfer_plan(mask_bool: torch.Tensor, steps_count: int) -> Optional[torch.Tensor]:
+        def _uniform_transfer_plan(mask_bool: torch.Tensor, steps_count: int) -> torch.Tensor | None:
             """Evenly divide masked token updates across steps."""
             if steps_count is None or steps_count <= 0:
                 return None
@@ -403,7 +392,7 @@ class DyninOmniModelLM(LLaDAModelLM):
         eoi_id = int(uni_prompting.sptids_dict.get("<|eoi|>", torch.tensor([-1]))[0].item())
         pad_id = int(getattr(uni_prompting, "pad_id", 0))
 
-        def _locate_blocks(sample_seq: torch.Tensor, sample_attn: Optional[torch.Tensor]):
+        def _locate_blocks(sample_seq: torch.Tensor, sample_attn: torch.Tensor | None):
             # Find second (target) soi/eoi pair; fallback to template formula.
             soi_positions = (sample_seq == soi_id).nonzero(as_tuple=True)[0]
             eoi_positions = (sample_seq == eoi_id).nonzero(as_tuple=True)[0]
@@ -449,8 +438,12 @@ class DyninOmniModelLM(LLaDAModelLM):
         max_steps = max(timesteps_image, timesteps_text)
         for step in range(max_steps):
             mask_map = seq == mask_token_id
-            img_mask = mask_map & (text_indices >= img_start) & (text_indices < img_end) if step < timesteps_image else None
-            text_mask = mask_map & (text_indices >= text_start) & (text_indices < text_end) if step < timesteps_text else None
+            img_mask = (
+                mask_map & (text_indices >= img_start) & (text_indices < img_end) if step < timesteps_image else None
+            )
+            text_mask = (
+                mask_map & (text_indices >= text_start) & (text_indices < text_end) if step < timesteps_text else None
+            )
             if not ((img_mask is not None and img_mask.any()) or (text_mask is not None and text_mask.any())):
                 break
 
@@ -466,14 +459,10 @@ class DyninOmniModelLM(LLaDAModelLM):
             if text_mask is not None and text_mask.any():
                 logits_text = logits[..., :text_vocab_size]
                 probs_text = logits_text.softmax(dim=-1)
-                sampled_text = torch.multinomial(
-                    probs_text.view(-1, text_vocab_size),
-                    1,
-                    replacement=False
-                ).view(*logits_text.shape[:2])
-                sampled_probs = torch.gather(
-                    probs_text, dim=-1, index=sampled_text.unsqueeze(-1)
-                ).squeeze(-1)
+                sampled_text = torch.multinomial(probs_text.view(-1, text_vocab_size), 1, replacement=False).view(
+                    *logits_text.shape[:2]
+                )
+                sampled_probs = torch.gather(probs_text, dim=-1, index=sampled_text.unsqueeze(-1)).squeeze(-1)
                 candidate_seq = torch.where(text_mask, sampled_text, seq)
                 confidence = torch.full_like(sampled_probs, float("-inf"))
                 confidence = torch.where(text_mask, sampled_probs, confidence)
@@ -498,11 +487,12 @@ class DyninOmniModelLM(LLaDAModelLM):
             if img_mask is not None and img_mask.any():
                 logits_img = logits[..., image_vocab_start:image_vocab_end]
                 probs_img = logits_img.softmax(dim=-1)
-                sampled_img = torch.multinomial(
-                    probs_img.view(-1, codebook_size),
-                    1,
-                    replacement=False
-                ).view(*logits_img.shape[:2]) + image_vocab_start
+                sampled_img = (
+                    torch.multinomial(probs_img.view(-1, codebook_size), 1, replacement=False).view(
+                        *logits_img.shape[:2]
+                    )
+                    + image_vocab_start
+                )
                 seq = torch.where(img_mask, sampled_img, seq)
 
             if use_guidance:
@@ -523,26 +513,26 @@ class DyninOmniModelLM(LLaDAModelLM):
 
     @torch.no_grad()
     def t2s_generate(
-            self,
-            input_ids: torch.LongTensor = None,
-            uncond_input_ids: torch.LongTensor = None,
-            attention_mask=None,
-            uncond_attention_mask=None,
-            temperature=1.0,
-            timesteps=18,
-            guidance_scale=0,
-            noise_schedule=None,
-            generator: torch.Generator = None,
-            config=None,
-            seq_len=256,
-            mask_token_id=126336,
-            **kwargs,
+        self,
+        input_ids: torch.LongTensor = None,
+        uncond_input_ids: torch.LongTensor = None,
+        attention_mask=None,
+        uncond_attention_mask=None,
+        temperature=1.0,
+        timesteps=18,
+        guidance_scale=0,
+        noise_schedule=None,
+        generator: torch.Generator = None,
+        config=None,
+        seq_len=256,
+        mask_token_id=126336,
+        **kwargs,
     ):
         uni_prompting = kwargs.get("uni_prompting", None)
         if uni_prompting is None:
             raise ValueError("uni_prompting object must be provided in kwargs.")
-        
-        eoa_token_id = uni_prompting.sptids_dict['<|eoa|>'][0].item()
+
+        eoa_token_id = uni_prompting.sptids_dict["<|eoa|>"][0].item()
         eos_token_id = uni_prompting.text_tokenizer.eos_token_id
 
         num_vq_tokens = (input_ids == mask_token_id).sum(dim=-1).max().item()
@@ -551,22 +541,22 @@ class DyninOmniModelLM(LLaDAModelLM):
 
         speech_vocab_start_idx = len(uni_prompting.text_tokenizer) + 8192
         speech_vocab_end_idx = speech_vocab_start_idx + 4096
-        
+
         # VQ Codes: 0 ~ 4095
         # EOA: 4096
         # EOS: 4097
-        vq_code_relative_eoa_id = 4096 
+        vq_code_relative_eoa_id = 4096
         vq_code_relative_eos_id = 4097
 
         input_ids_relative = input_ids[:, -(num_vq_tokens):].clone()
         input_ids_relative = torch.where(
-            input_ids_relative == mask_token_id,
-            mask_token_id,
-            input_ids_relative - speech_vocab_start_idx
+            input_ids_relative == mask_token_id, mask_token_id, input_ids_relative - speech_vocab_start_idx
         )
 
         if uncond_input_ids is not None:
-            start_gen_idx = (uncond_input_ids[0] == uni_prompting.sptids_dict['<|soa|>'][0].item()).nonzero(as_tuple=True)[0][0].item() + 1
+            start_gen_idx = (uncond_input_ids[0] == uni_prompting.sptids_dict["<|soa|>"][0].item()).nonzero(
+                as_tuple=True
+            )[0][0].item() + 1
             uncond_prefix = uncond_input_ids[:, :start_gen_idx]
 
         for step in range(timesteps):
@@ -574,93 +564,94 @@ class DyninOmniModelLM(LLaDAModelLM):
                 uncond_input_ids = torch.cat([uncond_prefix, input_ids[:, start_gen_idx:]], dim=1)
                 model_input = torch.cat([input_ids, uncond_input_ids])
                 all_attention_mask = torch.cat([attention_mask, uncond_attention_mask], dim=0)
-                
+
                 attention_bias = (all_attention_mask[:, :, None] & all_attention_mask[:, None, :]).bool().unsqueeze(1)
                 logits = self(model_input, attention_bias=attention_bias).logits
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
-                
+
                 logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
-                
+
             else:
                 attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
                 logits = self(input_ids, attention_bias=attention_bias).logits
 
             logits_vq = logits[:, -(num_vq_tokens):, speech_vocab_start_idx:speech_vocab_end_idx]
-            logits_eoa = logits[:, -(num_vq_tokens):, eoa_token_id:eoa_token_id+1]
-            logits_eos = logits[:, -(num_vq_tokens):, eos_token_id:eos_token_id+1]
-            
+            logits_eoa = logits[:, -(num_vq_tokens):, eoa_token_id : eoa_token_id + 1]
+            logits_eos = logits[:, -(num_vq_tokens):, eos_token_id : eos_token_id + 1]
+
             combined_logits = torch.cat([logits_vq, logits_eoa, logits_eos], dim=-1)
-            
+
             probs = combined_logits.softmax(dim=-1)
             sampled = probs.reshape(-1, combined_logits.size(-1))
-            
-            sampled_ids_relative = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*combined_logits.shape[:-1])
-            
+
+            sampled_ids_relative = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(
+                *combined_logits.shape[:-1]
+            )
+
             unknown_map = input_ids_relative == mask_token_id
-            
+
             sampled_ids_relative = torch.where(unknown_map, sampled_ids_relative, input_ids_relative)
 
             ratio = 1.0 * (step + 1) / timesteps
             mask_ratio = noise_schedule(torch.tensor(ratio, device=logits.device))
-            
+
             selected_probs = torch.gather(probs, -1, sampled_ids_relative.long()[..., None]).squeeze(-1)
             selected_probs = torch.where(unknown_map, selected_probs, torch.finfo(selected_probs.dtype).max)
 
             mask_len = (num_vq_tokens * mask_ratio).floor().unsqueeze(0).to(logits.device)
             mask_len = torch.max(
-                torch.tensor([1], device=logits.device), 
-                torch.min(unknown_map.sum(dim=-1, keepdim=True) - 1, mask_len)
+                torch.tensor([1], device=logits.device), torch.min(unknown_map.sum(dim=-1, keepdim=True) - 1, mask_len)
             )
-            
+
             temperature = temperature * (1.0 - ratio)
             masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=generator)
 
             input_ids[:, -(num_vq_tokens):] = torch.where(
-                masking, 
+                masking,
                 mask_token_id,
                 torch.where(
-                    sampled_ids_relative == vq_code_relative_eos_id, 
-                    eos_token_id,                                    
+                    sampled_ids_relative == vq_code_relative_eos_id,
+                    eos_token_id,
                     torch.where(
-                        sampled_ids_relative == vq_code_relative_eoa_id, 
-                        eoa_token_id,                                    
-                        sampled_ids_relative + speech_vocab_start_idx    
-                    )
-                )
+                        sampled_ids_relative == vq_code_relative_eoa_id,
+                        eoa_token_id,
+                        sampled_ids_relative + speech_vocab_start_idx,
+                    ),
+                ),
             )
-            
+
             input_ids_relative = torch.where(masking, mask_token_id, sampled_ids_relative)
 
         final_output_ids = []
         for i in range(input_ids_relative.shape[0]):
             seq = input_ids_relative[i]
-            
+
             eoa_indices = (seq >= vq_code_relative_eoa_id).nonzero(as_tuple=True)[0]
-            
+
             if eoa_indices.numel() > 0:
                 first_eoa_idx = eoa_indices[0]
                 seq = seq[:first_eoa_idx]
-            
+
             valid_tokens = seq[seq != mask_token_id]
-            
+
             final_output_ids.append(valid_tokens)
-        
+
         return final_output_ids
 
     @torch.no_grad()
     def t2s_generate_mmu_like(
-            self,
-            input_ids: torch.LongTensor,
-            max_new_tokens: Optional[int] = None,
-            steps: int = 256,
-            block_length: int = 128,
-            temperature: float = 0.0,
-            cfg_scale: float = 0.0,
-            mask_token_id: int = 126336,
-            attention_mask: Optional[torch.LongTensor] = None,
-            uni_prompting=None,
-            codebook_size: Optional[int] = None,
-            audio_codebook_size: int = 4096,
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int | None = None,
+        steps: int = 256,
+        block_length: int = 128,
+        temperature: float = 0.0,
+        cfg_scale: float = 0.0,
+        mask_token_id: int = 126336,
+        attention_mask: torch.LongTensor | None = None,
+        uni_prompting=None,
+        codebook_size: int | None = None,
+        audio_codebook_size: int = 4096,
     ):
         """
         Generate speech tokens with MMU-style block-wise refinement.
@@ -676,7 +667,7 @@ class DyninOmniModelLM(LLaDAModelLM):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
-        mask_positions_full = (input_ids == mask_token_id)
+        mask_positions_full = input_ids == mask_token_id
         if not mask_positions_full.any():
             raise ValueError("No mask tokens detected for T2S generation")
 
@@ -686,7 +677,9 @@ class DyninOmniModelLM(LLaDAModelLM):
 
         mask_counts = mask_positions_full.sum(dim=1)
         if not torch.all(mask_counts == mask_counts[0]):
-            raise ValueError("All batch items must contain the same number of masked speech tokens for MMU-like generation")
+            raise ValueError(
+                "All batch items must contain the same number of masked speech tokens for MMU-like generation"
+            )
 
         if max_new_tokens is None:
             max_new_tokens = speech_region_len
@@ -701,7 +694,7 @@ class DyninOmniModelLM(LLaDAModelLM):
         speech_vocab_start = len(uni_prompting.text_tokenizer) + codebook_base
         speech_vocab_end = speech_vocab_start + audio_codebook_size
 
-        eoa_token_id = uni_prompting.sptids_dict['<|eoa|>'][0].item()
+        eoa_token_id = uni_prompting.sptids_dict["<|eoa|>"][0].item()
         eos_token_id = uni_prompting.text_tokenizer.eos_token_id
         vq_code_relative_eoa_id = audio_codebook_size
         vq_code_relative_eos_id = audio_codebook_size + 1
@@ -741,17 +734,15 @@ class DyninOmniModelLM(LLaDAModelLM):
 
                 logits_block = logits.index_select(1, curr_indices.to(device))
                 logits_vq = logits_block[:, :, speech_vocab_start:speech_vocab_end]
-                logits_eoa = logits_block[:, :, eoa_token_id:eoa_token_id + 1]
-                logits_eos = logits_block[:, :, eos_token_id:eos_token_id + 1]
+                logits_eoa = logits_block[:, :, eoa_token_id : eoa_token_id + 1]
+                logits_eos = logits_block[:, :, eos_token_id : eos_token_id + 1]
 
                 combined_logits = torch.cat([logits_vq, logits_eoa, logits_eos], dim=-1)
                 if temperature > 0.0:
                     combined_logits = combined_logits / max(temperature, 1e-5)
                 probs = F.softmax(combined_logits, dim=-1)
 
-                sampled = torch.multinomial(
-                    probs.view(-1, probs.size(-1)), 1
-                ).view(batch_size, curr_indices.numel())
+                sampled = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(batch_size, curr_indices.numel())
 
                 selected_probs = torch.gather(probs, -1, sampled.unsqueeze(-1)).squeeze(-1)
 
@@ -760,21 +751,13 @@ class DyninOmniModelLM(LLaDAModelLM):
                 sampled_absolute = torch.where(
                     sampled == vq_code_relative_eos_id,
                     eos_tensor,
-                    torch.where(
-                        sampled == vq_code_relative_eoa_id,
-                        eoa_tensor,
-                        sampled + speech_vocab_start
-                    )
+                    torch.where(sampled == vq_code_relative_eoa_id, eoa_tensor, sampled + speech_vocab_start),
                 )
 
                 current_block_vals = work.index_select(1, curr_indices)
                 mask_current = current_block_vals == mask_token_id
 
-                confidence = torch.where(
-                    mask_current,
-                    selected_probs,
-                    torch.full_like(selected_probs, float('-inf'))
-                )
+                confidence = torch.where(mask_current, selected_probs, torch.full_like(selected_probs, float("-inf")))
 
                 finalize = torch.zeros_like(mask_current, dtype=torch.bool)
                 for b in range(batch_size):
@@ -809,19 +792,13 @@ class DyninOmniModelLM(LLaDAModelLM):
                 seq == mask_token_id,
                 mask_tensor,
                 torch.where(
-                    seq == eoa_token_id,
-                    rel_eoa,
-                    torch.where(
-                        seq == eos_token_id,
-                        rel_eos,
-                        seq - speech_vocab_start
-                    )
-                )
+                    seq == eoa_token_id, rel_eoa, torch.where(seq == eos_token_id, rel_eos, seq - speech_vocab_start)
+                ),
             )
 
             eoa_positions = (relative >= vq_code_relative_eoa_id).nonzero(as_tuple=True)[0]
             if eoa_positions.numel() > 0:
-                relative = relative[:eoa_positions[0]]
+                relative = relative[: eoa_positions[0]]
 
             final_outputs.append(relative[relative != mask_token_id])
 
@@ -829,20 +806,20 @@ class DyninOmniModelLM(LLaDAModelLM):
 
     @torch.no_grad()
     def t2s_fixed_generate(
-            self,
-            input_ids: torch.LongTensor = None,
-            uncond_input_ids: torch.LongTensor = None,
-            attention_mask=None,
-            uncond_attention_mask=None,
-            temperature=1.0,
-            timesteps=18,
-            guidance_scale=0,
-            noise_schedule=None,
-            generator: torch.Generator = None,
-            config=None,
-            seq_len=256,
-            mask_token_id=126336,
-            **kwargs,
+        self,
+        input_ids: torch.LongTensor = None,
+        uncond_input_ids: torch.LongTensor = None,
+        attention_mask=None,
+        uncond_attention_mask=None,
+        temperature=1.0,
+        timesteps=18,
+        guidance_scale=0,
+        noise_schedule=None,
+        generator: torch.Generator = None,
+        config=None,
+        seq_len=256,
+        mask_token_id=126336,
+        **kwargs,
     ):
         """
         Generate 1:1 similar to the original MaskGit repo
@@ -855,36 +832,59 @@ class DyninOmniModelLM(LLaDAModelLM):
         num_vq_tokens = seq_len
         num_new_special_tokens = 0
         uni_prompting = kwargs.get("uni_prompting", None)
-        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1):-1].clone()
-        input_ids_minus_lm_vocab_size = torch.where(input_ids_minus_lm_vocab_size == mask_token_id, mask_token_id, input_ids_minus_lm_vocab_size - len(uni_prompting.text_tokenizer) - num_new_special_tokens - 8192)
+        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1) : -1].clone()
+        input_ids_minus_lm_vocab_size = torch.where(
+            input_ids_minus_lm_vocab_size == mask_token_id,
+            mask_token_id,
+            input_ids_minus_lm_vocab_size - len(uni_prompting.text_tokenizer) - num_new_special_tokens - 8192,
+        )
 
         # for classifier-free guidance
         if uncond_input_ids is not None:
-            start_gen_idx = (uncond_input_ids[0] == uni_prompting.sptids_dict['<|soa|>'][0].item()).nonzero(as_tuple=True)[0][0].item() + 1
+            start_gen_idx = (uncond_input_ids[0] == uni_prompting.sptids_dict["<|soa|>"][0].item()).nonzero(
+                as_tuple=True
+            )[0][0].item() + 1
             uncond_prefix = uncond_input_ids[:, :start_gen_idx]
 
         for step in range(timesteps):
             if uncond_input_ids is not None and guidance_scale > 0:
-                uncond_input_ids = torch.cat(
-                    [uncond_prefix, input_ids[:, start_gen_idx:]], dim=1)
+                uncond_input_ids = torch.cat([uncond_prefix, input_ids[:, start_gen_idx:]], dim=1)
                 model_input = torch.cat([input_ids, uncond_input_ids])
                 all_attention_mask = torch.cat([attention_mask, uncond_attention_mask], dim=0)
                 attention_bias = (all_attention_mask[:, :, None] & all_attention_mask[:, None, :]).bool().unsqueeze(1)
-                logits = self(model_input, attention_bias=attention_bias).logits 
+                logits = self(model_input, attention_bias=attention_bias).logits
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
                 # logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
                 # it seems that muse has a different cfg setting
                 logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens + 8192 : len(uni_prompting.text_tokenizer) + num_new_special_tokens + 8192 + 4096]
+                logits = logits[
+                    :,
+                    -(num_vq_tokens + 1) : -1,
+                    len(uni_prompting.text_tokenizer) + num_new_special_tokens + 8192 : len(
+                        uni_prompting.text_tokenizer
+                    )
+                    + num_new_special_tokens
+                    + 8192
+                    + 4096,
+                ]
             else:
                 attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
                 logits = self(input_ids, attention_bias=attention_bias).logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens + 8192 : len(uni_prompting.text_tokenizer) + num_new_special_tokens + 8192 + 4096]
+                logits = logits[
+                    :,
+                    -(num_vq_tokens + 1) : -1,
+                    len(uni_prompting.text_tokenizer) + num_new_special_tokens + 8192 : len(
+                        uni_prompting.text_tokenizer
+                    )
+                    + num_new_special_tokens
+                    + 8192
+                    + 4096,
+                ]
 
             # logits: 1, 1024, 8192
             probs = logits.softmax(dim=-1)
             sampled = probs.reshape(-1, logits.size(-1))
-            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1]) # 1, 1024
+            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1])  # 1, 1024
 
             unknown_map = input_ids_minus_lm_vocab_size == mask_token_id
             sampled_ids = torch.where(unknown_map, sampled_ids, input_ids_minus_lm_vocab_size)
@@ -909,31 +909,31 @@ class DyninOmniModelLM(LLaDAModelLM):
             temperature = temperature * (1.0 - ratio)
             masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=generator)
             # Masks tokens with lower confidence.
-            input_ids[:, -(num_vq_tokens + 1):-1] = torch.where(masking, mask_token_id,
-                                                          sampled_ids + len(uni_prompting.text_tokenizer)
-                                                          + num_new_special_tokens + 8192)
+            input_ids[:, -(num_vq_tokens + 1) : -1] = torch.where(
+                masking, mask_token_id, sampled_ids + len(uni_prompting.text_tokenizer) + num_new_special_tokens + 8192
+            )
             input_ids_minus_lm_vocab_size = torch.where(masking, mask_token_id, sampled_ids)
 
         return sampled_ids
 
     @torch.no_grad()
-    def i2i_generate( 
-            self,
-            input_ids: torch.LongTensor = None,
-            uncond_input_ids: torch.LongTensor = None,
-            attention_mask=None,
-            uncond_attention_mask=None,
-            temperature=1.0,
-            timesteps=64,
-            guidance_scale=0,
-            noise_schedule=cosine_schedule,
-            generator: torch.Generator = None,
-            config=None,
-            seq_len=1024,
-            mask_token_id = 126336,
-            resolution = 336,
-            codebook_size = 8192,
-            **kwargs,
+    def i2i_generate(
+        self,
+        input_ids: torch.LongTensor = None,
+        uncond_input_ids: torch.LongTensor = None,
+        attention_mask=None,
+        uncond_attention_mask=None,
+        temperature=1.0,
+        timesteps=64,
+        guidance_scale=0,
+        noise_schedule=cosine_schedule,
+        generator: torch.Generator = None,
+        config=None,
+        seq_len=1024,
+        mask_token_id=126336,
+        resolution=336,
+        codebook_size=8192,
+        **kwargs,
     ):
         """
         Generate 1:1 similar to the original MaskGit repo
@@ -945,35 +945,50 @@ class DyninOmniModelLM(LLaDAModelLM):
         num_vq_tokens = seq_len
         num_new_special_tokens = 0
         uni_prompting = kwargs.get("uni_prompting", None)
-        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1):-1].clone()
-        input_ids_minus_lm_vocab_size = torch.where(input_ids_minus_lm_vocab_size == mask_token_id, mask_token_id, input_ids_minus_lm_vocab_size - len(uni_prompting.text_tokenizer) - num_new_special_tokens)
+        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1) : -1].clone()
+        input_ids_minus_lm_vocab_size = torch.where(
+            input_ids_minus_lm_vocab_size == mask_token_id,
+            mask_token_id,
+            input_ids_minus_lm_vocab_size - len(uni_prompting.text_tokenizer) - num_new_special_tokens,
+        )
 
         # for classifier-free guidance
         if uncond_input_ids is not None:
-            uncond_prefix = uncond_input_ids[:, :resolution + 1]
+            uncond_prefix = uncond_input_ids[:, : resolution + 1]
 
         for step in range(timesteps):
             if uncond_input_ids is not None and guidance_scale > 0:
-                uncond_input_ids = torch.cat(
-                    [uncond_prefix, input_ids[:, resolution + 1:]], dim=1)
+                uncond_input_ids = torch.cat([uncond_prefix, input_ids[:, resolution + 1 :]], dim=1)
                 model_input = torch.cat([input_ids, uncond_input_ids])
                 all_attention_mask = torch.cat([attention_mask, uncond_attention_mask], dim=0)
                 attention_bias = (all_attention_mask[:, :, None] & all_attention_mask[:, None, :]).bool().unsqueeze(1)
-                logits = self(model_input, attention_bias=attention_bias).logits 
+                logits = self(model_input, attention_bias=attention_bias).logits
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
                 # logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
                 # it seems that muse has a different cfg setting
                 logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
+                logits = logits[
+                    :,
+                    -(num_vq_tokens + 1) : -1,
+                    len(uni_prompting.text_tokenizer) + num_new_special_tokens : len(uni_prompting.text_tokenizer)
+                    + num_new_special_tokens
+                    + codebook_size,
+                ]
             else:
                 attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
                 logits = self(input_ids, attention_bias=attention_bias).logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
+                logits = logits[
+                    :,
+                    -(num_vq_tokens + 1) : -1,
+                    len(uni_prompting.text_tokenizer) + num_new_special_tokens : len(uni_prompting.text_tokenizer)
+                    + num_new_special_tokens
+                    + codebook_size,
+                ]
 
             # logits: 1, 1024, 8192
             probs = logits.softmax(dim=-1)
             sampled = probs.reshape(-1, logits.size(-1))
-            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1]) # 1, 1024
+            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1])  # 1, 1024
 
             unknown_map = input_ids_minus_lm_vocab_size == mask_token_id
             sampled_ids = torch.where(unknown_map, sampled_ids, input_ids_minus_lm_vocab_size)
@@ -998,53 +1013,52 @@ class DyninOmniModelLM(LLaDAModelLM):
             temperature = temperature * (1.0 - ratio)
             masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=generator)
             # Masks tokens with lower confidence.
-            input_ids[:, -(num_vq_tokens + 1):-1] = torch.where(masking, mask_token_id,
-                                                          sampled_ids + len(uni_prompting.text_tokenizer)
-                                                          + num_new_special_tokens)
+            input_ids[:, -(num_vq_tokens + 1) : -1] = torch.where(
+                masking, mask_token_id, sampled_ids + len(uni_prompting.text_tokenizer) + num_new_special_tokens
+            )
             input_ids_minus_lm_vocab_size = torch.where(masking, mask_token_id, sampled_ids)
 
         return sampled_ids
 
-
     def forward_process(
-            self,
-            input_ids,
-            inputs_embeds=None,
-            labels=None,
-            batch_size_t2i=0,
-            batch_size_i2i=0,
-            batch_size_ti2ti=0,
-            batch_size_lm=0,
-            batch_size_mmu=0,
-            batch_size_v2t=0,
-            batch_size_v2s=0,
-            batch_size_s2t=0,
-            batch_size_s2s=0,
-            batch_size_t2s=0,
-            max_seq_length=128,
-            attention_mask=None,
-            p_mask_lm=None,
-            p_mask_mmu=None,
-            p_mask_vid=None,
-            p_mask_v2s=None,
-            p_mask_s2t=None,
-            p_mask_s2s=None,
-            p_mask_t2s=None,
-            answer_lengths_lm=None,
-            answer_lengths_mmu=None,
-            answer_lengths_vid=None,
-            answer_lengths_v2s=None,
-            answer_lengths_s2t=None,
-            answer_lengths_s2s=None,
-            answer_lengths_t2s=None,
-            t2i_masks=None,
-            attention_masks_i2i=None,
-            attention_masks_ti2ti=None,
-            t2s_vocab_start=None,
-            t2s_codebook_size=None,
-            t2s_special_token_ids=None,
-            text_vocab_size_override=None
-            ):
+        self,
+        input_ids,
+        inputs_embeds=None,
+        labels=None,
+        batch_size_t2i=0,
+        batch_size_i2i=0,
+        batch_size_ti2ti=0,
+        batch_size_lm=0,
+        batch_size_mmu=0,
+        batch_size_v2t=0,
+        batch_size_v2s=0,
+        batch_size_s2t=0,
+        batch_size_s2s=0,
+        batch_size_t2s=0,
+        max_seq_length=128,
+        attention_mask=None,
+        p_mask_lm=None,
+        p_mask_mmu=None,
+        p_mask_vid=None,
+        p_mask_v2s=None,
+        p_mask_s2t=None,
+        p_mask_s2s=None,
+        p_mask_t2s=None,
+        answer_lengths_lm=None,
+        answer_lengths_mmu=None,
+        answer_lengths_vid=None,
+        answer_lengths_v2s=None,
+        answer_lengths_s2t=None,
+        answer_lengths_s2s=None,
+        answer_lengths_t2s=None,
+        t2i_masks=None,
+        attention_masks_i2i=None,
+        attention_masks_ti2ti=None,
+        t2s_vocab_start=None,
+        t2s_codebook_size=None,
+        t2s_special_token_ids=None,
+        text_vocab_size_override=None,
+    ):
         # 1. Attention Bias Setup (no changes)
         if attention_mask is not None:
             global_attn_mask = attention_mask.to(input_ids.device)
@@ -1053,7 +1067,9 @@ class DyninOmniModelLM(LLaDAModelLM):
             attention_bias = (global_attn_mask[:, :, None] & global_attn_mask[:, None, :]).unsqueeze(1)
         else:
             global_attn_mask = None
-            attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device)
+            attention_bias = torch.ones(
+                input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device
+            )
         if batch_size_t2i > 0 and t2i_masks is not None:
             t2i_mask = t2i_masks
             if global_attn_mask is not None:
@@ -1085,14 +1101,14 @@ class DyninOmniModelLM(LLaDAModelLM):
         # 2. Model Forward Pass (no changes)
         logits = self(input_ids, inputs_embeds=inputs_embeds, attention_bias=attention_bias).logits
         self.output_size = logits.shape[-1]
-        
+
         # 3. Loss Calculation
         device = input_ids.device
         zero_loss = torch.tensor(0.0, device=device)
-        
+
         # Calculate masked indices for the entire batch
-        masked_indices = (input_ids == self.config.mask_token_id)
-        
+        masked_indices = input_ids == self.config.mask_token_id
+
         text_vocab_size = text_vocab_size_override
         image_vocab_size = getattr(self.config, "codebook_size", 0)
         image_vocab_start = text_vocab_size
@@ -1101,8 +1117,8 @@ class DyninOmniModelLM(LLaDAModelLM):
 
         # T2I Loss
         if batch_size_t2i > 0:
-            logits_t2i = logits[current_idx:current_idx + batch_size_t2i, max_seq_length + 1:]
-            labels_t2i = labels[current_idx:current_idx + batch_size_t2i, max_seq_length + 1:]
+            logits_t2i = logits[current_idx : current_idx + batch_size_t2i, max_seq_length + 1 :]
+            labels_t2i = labels[current_idx : current_idx + batch_size_t2i, max_seq_length + 1 :]
             if image_vocab_size <= 0:
                 warnings.warn("t2i encountered non-positive image vocab size; skipping loss.")
                 loss_t2i = zero_loss
@@ -1129,14 +1145,7 @@ class DyninOmniModelLM(LLaDAModelLM):
                         loss_t2i_check = loss_t2i.to(torch.float32)
                         if (not torch.isfinite(loss_t2i_check)) or (loss_t2i_check < 0) or (loss_t2i_check > 10000):
                             label_vals = labels_t2i[valid_mask]
-                            warn_msg = (
-                                "t2i loss became non-finite. label_min={} label_max={} valid_count={}"
-                                .format(
-                                    label_vals.min().item() if label_vals.numel() > 0 else -1,
-                                    label_vals.max().item() if label_vals.numel() > 0 else -1,
-                                    int(valid_mask.sum().item()),
-                                )
-                            )
+                            warn_msg = f"t2i loss became non-finite. label_min={label_vals.min().item() if label_vals.numel() > 0 else -1} label_max={label_vals.max().item() if label_vals.numel() > 0 else -1} valid_count={int(valid_mask.sum().item())}"
                             logger.warning("[t2i warn] %s", warn_msg)
                             warnings.warn(warn_msg)
                             loss_t2i = zero_loss
@@ -1173,14 +1182,7 @@ class DyninOmniModelLM(LLaDAModelLM):
                         )
                         if (not torch.isfinite(loss_i2i)) or (loss_i2i < 0):
                             label_vals = labels_i2i[image_mask]
-                            warn_msg = (
-                                "i2i loss became non-finite. label_min={} label_max={} valid_count={}"
-                                .format(
-                                    label_vals.min().item() if label_vals.numel() > 0 else -1,
-                                    label_vals.max().item() if label_vals.numel() > 0 else -1,
-                                    int(image_mask.sum().item()),
-                                )
-                            )
+                            warn_msg = f"i2i loss became non-finite. label_min={label_vals.min().item() if label_vals.numel() > 0 else -1} label_max={label_vals.max().item() if label_vals.numel() > 0 else -1} valid_count={int(image_mask.sum().item())}"
                             warnings.warn(warn_msg)
                             loss_i2i = zero_loss
         else:
@@ -1237,7 +1239,7 @@ class DyninOmniModelLM(LLaDAModelLM):
         else:
             loss_ti2ti = zero_loss
         current_idx += batch_size_ti2ti
-        
+
         # LM Loss
         if batch_size_lm > 0:
             start, end = current_idx, current_idx + batch_size_lm
@@ -1255,34 +1257,31 @@ class DyninOmniModelLM(LLaDAModelLM):
                     selected_logits_lm.contiguous().view(-1, effective_vocab_lm),
                     labels_lm[masked_indices_lm].contiguous().view(-1),
                     ignore_index=-100,
-                    reduction='none',
+                    reduction="none",
                 )
-                p_mask_vals = (
-                    p_mask_lm.to(device)[masked_indices_lm]
-                    .clamp(min=1e-4)
-                    .to(per_token_loss.dtype)
-                )
+                p_mask_vals = p_mask_lm.to(device)[masked_indices_lm].clamp(min=1e-4).to(per_token_loss.dtype)
                 per_token_loss = per_token_loss / p_mask_vals
 
                 if answer_lengths_lm is not None:
-                    lengths = (
-                        answer_lengths_lm.to(device)[masked_indices_lm]
-                        .clamp(min=1)
-                        .to(per_token_loss.dtype)
-                    )
+                    lengths = answer_lengths_lm.to(device)[masked_indices_lm].clamp(min=1).to(per_token_loss.dtype)
                     loss_lm = (per_token_loss / lengths).sum() / logits_lm.shape[0]
                 else:
                     loss_lm = per_token_loss.mean()
         else:
             loss_lm = zero_loss
         current_idx += batch_size_lm
-        
+
         # MMU Loss
         if batch_size_mmu > 0:
             start, end = current_idx, current_idx + batch_size_mmu
             loss_mmu = calculate_mmu_style_loss(
-                logits[start:end], labels[start:end], masked_indices[start:end],
-                p_mask_mmu, answer_lengths_mmu, self.output_size, device,
+                logits[start:end],
+                labels[start:end],
+                masked_indices[start:end],
+                p_mask_mmu,
+                answer_lengths_mmu,
+                self.output_size,
+                device,
             )
         else:
             loss_mmu = zero_loss
@@ -1292,8 +1291,13 @@ class DyninOmniModelLM(LLaDAModelLM):
         if batch_size_v2t > 0:
             start, end = current_idx, current_idx + batch_size_v2t
             loss_vid = calculate_mmu_style_loss(
-                logits[start:end], labels[start:end], masked_indices[start:end],
-                p_mask_vid, answer_lengths_vid, self.output_size, device,
+                logits[start:end],
+                labels[start:end],
+                masked_indices[start:end],
+                p_mask_vid,
+                answer_lengths_vid,
+                self.output_size,
+                device,
             )
         else:
             loss_vid = zero_loss
@@ -1302,19 +1306,15 @@ class DyninOmniModelLM(LLaDAModelLM):
         # V2S Loss
         if batch_size_v2s > 0:
             start, end = current_idx, current_idx + batch_size_v2s
-            if (
-                t2s_vocab_start is None
-                or t2s_codebook_size is None
-                or t2s_special_token_ids is None
-            ):
+            if t2s_vocab_start is None or t2s_codebook_size is None or t2s_special_token_ids is None:
                 warnings.warn("v2s missing t2s vocab configuration; skipping loss.")
                 loss_v2s = zero_loss
             elif answer_lengths_v2s is None or not (answer_lengths_v2s > 0).any():
                 warnings.warn("v2s encountered empty answer lengths; skipping loss.")
                 loss_v2s = zero_loss
             else:
-                eoa_id = t2s_special_token_ids.get('eoa')
-                eos_id = t2s_special_token_ids.get('eos')
+                eoa_id = t2s_special_token_ids.get("eoa")
+                eos_id = t2s_special_token_ids.get("eos")
                 loss_v2s = calculate_t2s_loss(
                     logits[start:end],
                     labels[start:end],
@@ -1336,8 +1336,13 @@ class DyninOmniModelLM(LLaDAModelLM):
         if batch_size_s2t > 0:
             start, end = current_idx, current_idx + batch_size_s2t
             loss_s2t = calculate_mmu_style_loss(
-                logits[start:end], labels[start:end], masked_indices[start:end],
-                p_mask_s2t, answer_lengths_s2t, self.output_size, device,
+                logits[start:end],
+                labels[start:end],
+                masked_indices[start:end],
+                p_mask_s2t,
+                answer_lengths_s2t,
+                self.output_size,
+                device,
             )
         else:
             loss_s2t = zero_loss
@@ -1359,8 +1364,8 @@ class DyninOmniModelLM(LLaDAModelLM):
                 warnings.warn("s2s encountered empty answer lengths; skipping loss.")
                 loss_s2s = zero_loss
             else:
-                eoa_id = t2s_special_token_ids.get('eoa')
-                eos_id = t2s_special_token_ids.get('eos')
+                eoa_id = t2s_special_token_ids.get("eoa")
+                eos_id = t2s_special_token_ids.get("eos")
                 loss_s2s = calculate_t2s_loss(
                     logits[start:end],
                     labels[start:end],
@@ -1381,13 +1386,9 @@ class DyninOmniModelLM(LLaDAModelLM):
         # T2S Loss
         if batch_size_t2s > 0:
             start, end = current_idx, current_idx + batch_size_t2s
-            if (
-                t2s_vocab_start is not None
-                and t2s_codebook_size is not None
-                and t2s_special_token_ids is not None
-            ):
-                eoa_id = t2s_special_token_ids.get('eoa')
-                eos_id = t2s_special_token_ids.get('eos')
+            if t2s_vocab_start is not None and t2s_codebook_size is not None and t2s_special_token_ids is not None:
+                eoa_id = t2s_special_token_ids.get("eoa")
+                eos_id = t2s_special_token_ids.get("eos")
             else:
                 eoa_id = eos_id = None
 
@@ -1407,37 +1408,54 @@ class DyninOmniModelLM(LLaDAModelLM):
                 )
             else:
                 loss_t2s = calculate_mmu_style_loss(
-                    logits[start:end], labels[start:end], masked_indices[start:end],
-                    p_mask_t2s, answer_lengths_t2s, self.output_size, device
+                    logits[start:end],
+                    labels[start:end],
+                    masked_indices[start:end],
+                    p_mask_t2s,
+                    answer_lengths_t2s,
+                    self.output_size,
+                    device,
                 )
         else:
             loss_t2s = zero_loss
         current_idx += batch_size_t2s
-        
-        return logits, loss_t2i, loss_i2i, loss_ti2ti, loss_lm, loss_mmu, loss_vid, loss_v2s, loss_s2t, loss_s2s, loss_t2s  
+
+        return (
+            logits,
+            loss_t2i,
+            loss_i2i,
+            loss_ti2ti,
+            loss_lm,
+            loss_mmu,
+            loss_vid,
+            loss_v2s,
+            loss_s2t,
+            loss_s2s,
+            loss_t2s,
+        )
 
     def forward_process_with_r2i(
-            self,
-            input_ids, 
-            labels,
-            t2i_masks=None,
-            max_seq_length=128,
-            batch_size_t2i=0,
-            batch_size_lm=0,
-            batch_size_mmu=0,
-            batch_size_r2i=0,
-            p_mask_lm=None,
-            p_mask_mmu=None,
-            p_mask_r2i=None,
-            answer_lengths=None,
-            answer_lengths_lm=None,
-            answer_lengths_r2i=None,
-            ):
-        # attention bias, True for batch_size, 1, seq_len, seq_len  
+        self,
+        input_ids,
+        labels,
+        t2i_masks=None,
+        max_seq_length=128,
+        batch_size_t2i=0,
+        batch_size_lm=0,
+        batch_size_mmu=0,
+        batch_size_r2i=0,
+        p_mask_lm=None,
+        p_mask_mmu=None,
+        p_mask_r2i=None,
+        answer_lengths=None,
+        answer_lengths_lm=None,
+        answer_lengths_r2i=None,
+    ):
+        # attention bias, True for batch_size, 1, seq_len, seq_len
         attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1])
         attention_bias_t2i = (t2i_masks[:, :, None] & t2i_masks[:, None, :]).bool().unsqueeze(1)
         attention_bias[:batch_size_t2i] = attention_bias_t2i
-        logits = self(input_ids, attention_bias=attention_bias).logits 
+        logits = self(input_ids, attention_bias=attention_bias).logits
         # logits = self(input_ids).logits
         self.output_size = logits.shape[-1]
 
@@ -1446,11 +1464,12 @@ class DyninOmniModelLM(LLaDAModelLM):
         else:
             # t2i loss
             loss_t2i = F.cross_entropy(
-                logits[:batch_size_t2i, max_seq_length + 1:].contiguous().view(-1, self.output_size),
-                labels[:batch_size_t2i, max_seq_length + 1:].contiguous().view(-1), ignore_index=-100,
-                )
-        
-        # llada loss  
+                logits[:batch_size_t2i, max_seq_length + 1 :].contiguous().view(-1, self.output_size),
+                labels[:batch_size_t2i, max_seq_length + 1 :].contiguous().view(-1),
+                ignore_index=-100,
+            )
+
+        # llada loss
         start_lm = batch_size_t2i
         end_lm = start_lm + batch_size_lm
         start_mmu = end_lm
@@ -1458,7 +1477,7 @@ class DyninOmniModelLM(LLaDAModelLM):
         start_r2i = end_mmu
         end_r2i = start_r2i + batch_size_r2i
 
-        masked_indices = input_ids == self.config.mask_token_id 
+        masked_indices = input_ids == self.config.mask_token_id
         masked_indices_lm = masked_indices[start_lm:end_lm]
         masked_indices_mmu = masked_indices[start_mmu:end_mmu]
         masked_indices_r2i = masked_indices[start_r2i:end_r2i]
@@ -1467,102 +1486,111 @@ class DyninOmniModelLM(LLaDAModelLM):
         p_mask_mmu = p_mask_mmu.to(masked_indices_mmu.device)
         p_mask_r2i = p_mask_r2i.to(masked_indices_r2i.device)
 
-        answer_lengths = answer_lengths.to(masked_indices_mmu.device) 
+        answer_lengths = answer_lengths.to(masked_indices_mmu.device)
         answer_lengths_lm = answer_lengths_lm.to(masked_indices_lm.device)
         answer_lengths_r2i = answer_lengths_r2i.to(masked_indices_r2i.device)
 
-        loss_lm = F.cross_entropy(
-            logits[start_lm:end_lm][masked_indices_lm].contiguous().view(-1, self.output_size),
-            labels[start_lm:end_lm][masked_indices_lm].contiguous().view(-1), ignore_index=-100, reduction='none'
-            )/p_mask_lm[masked_indices_lm]
+        loss_lm = (
+            F.cross_entropy(
+                logits[start_lm:end_lm][masked_indices_lm].contiguous().view(-1, self.output_size),
+                labels[start_lm:end_lm][masked_indices_lm].contiguous().view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            / p_mask_lm[masked_indices_lm]
+        )
 
         if answer_lengths_lm is not None:
-            loss_lm = torch.sum(loss_lm / answer_lengths_lm[masked_indices_lm]) / (logits[start_lm:end_lm].shape[0]) 
+            loss_lm = torch.sum(loss_lm / answer_lengths_lm[masked_indices_lm]) / (logits[start_lm:end_lm].shape[0])
         else:
             loss_lm = loss_lm.sum() / (logits[start_lm:end_lm].shape[0] * logits[start_lm:end_lm].shape[1])
 
-        loss_mmu = F.cross_entropy(
-            logits[start_mmu:end_mmu][masked_indices_mmu].contiguous().view(-1, self.output_size),
-            labels[start_mmu:end_mmu][masked_indices_mmu].contiguous().view(-1), ignore_index=-100, reduction='none'
-            )/p_mask_mmu[masked_indices_mmu]
-        loss_mmu = torch.sum(loss_mmu/answer_lengths[masked_indices_mmu]) / (logits[start_mmu:end_mmu].shape[0])
-        
-        loss_r2i = F.cross_entropy(
-            logits[start_r2i:end_r2i][masked_indices_r2i].contiguous().view(-1, self.output_size),
-            labels[start_r2i:end_r2i][masked_indices_r2i].contiguous().view(-1), ignore_index=-100, reduction='none'
-            )/p_mask_r2i[masked_indices_r2i]
-        loss_r2i = torch.sum(loss_r2i/answer_lengths_r2i[masked_indices_r2i]) / (logits[start_r2i:end_r2i].shape[0])
-        
+        loss_mmu = (
+            F.cross_entropy(
+                logits[start_mmu:end_mmu][masked_indices_mmu].contiguous().view(-1, self.output_size),
+                labels[start_mmu:end_mmu][masked_indices_mmu].contiguous().view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            / p_mask_mmu[masked_indices_mmu]
+        )
+        loss_mmu = torch.sum(loss_mmu / answer_lengths[masked_indices_mmu]) / (logits[start_mmu:end_mmu].shape[0])
+
+        loss_r2i = (
+            F.cross_entropy(
+                logits[start_r2i:end_r2i][masked_indices_r2i].contiguous().view(-1, self.output_size),
+                labels[start_r2i:end_r2i][masked_indices_r2i].contiguous().view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            / p_mask_r2i[masked_indices_r2i]
+        )
+        loss_r2i = torch.sum(loss_r2i / answer_lengths_r2i[masked_indices_r2i]) / (logits[start_r2i:end_r2i].shape[0])
+
         return logits, loss_t2i, loss_lm, loss_mmu, loss_r2i
 
-    def forward_t2i(
-            self,
-            input_ids, 
-            labels,
-            batch_size_t2i=0,
-            max_seq_length=128,
-            t2i_masks=None
-            ):
-        # attention bias, True for batch_size, 1, seq_len, seq_len  
+    def forward_t2i(self, input_ids, labels, batch_size_t2i=0, max_seq_length=128, t2i_masks=None):
+        # attention bias, True for batch_size, 1, seq_len, seq_len
         attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1])
         attention_bias_t2i = (t2i_masks[:, :, None] & t2i_masks[:, None, :]).bool().unsqueeze(1)
         attention_bias[:batch_size_t2i] = attention_bias_t2i
-        logits = self(input_ids, attention_bias=attention_bias).logits 
+        logits = self(input_ids, attention_bias=attention_bias).logits
         # logits = self(input_ids).logits
         self.output_size = logits.shape[-1]
 
         loss_t2i = F.cross_entropy(
-            logits[:batch_size_t2i, max_seq_length + 1:].contiguous().view(-1, self.output_size),
-            labels[:batch_size_t2i, max_seq_length + 1:].contiguous().view(-1), ignore_index=-100,
-            )
-        
+            logits[:batch_size_t2i, max_seq_length + 1 :].contiguous().view(-1, self.output_size),
+            labels[:batch_size_t2i, max_seq_length + 1 :].contiguous().view(-1),
+            ignore_index=-100,
+        )
+
         return loss_t2i
-    
+
     # Temp
     def forward_i2i(self, input_ids, attention_mask, labels):
         """
         Forward pass for the I2I task.
         """
-        outputs = self(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
+        outputs = self(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits
 
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-            ignore_index=-100
-        )
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
 
         return logits, loss
 
     # Temp
     def forward_s2t(
-            self,
-            input_ids, 
-            labels,
-            batch_size_s2t=0,
-            max_seq_length=128,
-            p_mask_s2t=None,
-            answer_lengths=None,
-            ):
-        # attention bias, True for batch_size, 1, seq_len, seq_len  
-        attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device)
-        logits = self(input_ids, attention_bias=attention_bias).logits 
+        self,
+        input_ids,
+        labels,
+        batch_size_s2t=0,
+        max_seq_length=128,
+        p_mask_s2t=None,
+        answer_lengths=None,
+    ):
+        # attention bias, True for batch_size, 1, seq_len, seq_len
+        attention_bias = torch.ones(
+            input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device
+        )
+        logits = self(input_ids, attention_bias=attention_bias).logits
         self.output_size = logits.shape[-1]
 
-        masked_indices = input_ids == self.config.mask_token_id 
+        masked_indices = input_ids == self.config.mask_token_id
         masked_indices_s2t = masked_indices[-batch_size_s2t:]
-        p_mask_s2t = p_mask_s2t.to(masked_indices_s2t.device)       
-        answer_lengths = answer_lengths.to(masked_indices_s2t.device) 
+        p_mask_s2t = p_mask_s2t.to(masked_indices_s2t.device)
+        answer_lengths = answer_lengths.to(masked_indices_s2t.device)
 
-        loss_s2t = F.cross_entropy(
-            logits[-batch_size_s2t:][masked_indices_s2t].contiguous().view(-1, self.output_size),
-            labels[-batch_size_s2t:][masked_indices_s2t].contiguous().view(-1), ignore_index=-100, reduction='none'
-            )/p_mask_s2t[masked_indices_s2t]
-        loss_s2t = torch.sum(loss_s2t/answer_lengths[masked_indices_s2t]) / (logits[-batch_size_s2t:].shape[0])
-        
+        loss_s2t = (
+            F.cross_entropy(
+                logits[-batch_size_s2t:][masked_indices_s2t].contiguous().view(-1, self.output_size),
+                labels[-batch_size_s2t:][masked_indices_s2t].contiguous().view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            / p_mask_s2t[masked_indices_s2t]
+        )
+        loss_s2t = torch.sum(loss_s2t / answer_lengths[masked_indices_s2t]) / (logits[-batch_size_s2t:].shape[0])
+
         return logits, loss_s2t
 
     def forward_t2s(
@@ -1587,24 +1615,30 @@ class DyninOmniModelLM(LLaDAModelLM):
         Returns:
             logits, loss_t2s
         """
-        attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device)
+        attention_bias = torch.ones(
+            input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device
+        )
         logits = self(input_ids, attention_bias=attention_bias).logits
         self.output_size = logits.shape[-1]
 
-        masked_indices = input_ids == self.config.mask_token_id 
+        masked_indices = input_ids == self.config.mask_token_id
         masked_indices_t2s = masked_indices[-batch_size_t2s:]
         p_mask_t2s = p_mask_t2s.to(masked_indices_t2s.device)
         answer_lengths = answer_lengths.to(masked_indices_t2s.device)
 
-        loss_t2s = F.cross_entropy(
-            logits[-batch_size_t2s:][masked_indices_t2s].contiguous().view(-1, self.output_size),
-            labels[-batch_size_t2s:][masked_indices_t2s].contiguous().view(-1),
-            ignore_index=-100, reduction='none'
-        ) / p_mask_t2s[masked_indices_t2s]
+        loss_t2s = (
+            F.cross_entropy(
+                logits[-batch_size_t2s:][masked_indices_t2s].contiguous().view(-1, self.output_size),
+                labels[-batch_size_t2s:][masked_indices_t2s].contiguous().view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            / p_mask_t2s[masked_indices_t2s]
+        )
         loss_t2s = torch.sum(loss_t2s / answer_lengths[masked_indices_t2s]) / logits[-batch_size_t2s:].shape[0]
 
         return logits, loss_t2s
-        
+
     def forward_v2t(
         self,
         input_ids,
@@ -1617,24 +1651,29 @@ class DyninOmniModelLM(LLaDAModelLM):
         """
         video-to-text (V2T) diffusion LM training.
         """
-        attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device)
+        attention_bias = torch.ones(
+            input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device
+        )
         logits = self(input_ids, attention_bias=attention_bias).logits
         self.output_size = logits.shape[-1]
-        
+
         masked_indices = input_ids == self.config.mask_token_id
         masked_indices_v2t = masked_indices[:batch_size_v2t]
         p_mask_v2t = p_mask_v2t.to(masked_indices_v2t.device)
         answer_lengths = answer_lengths.to(masked_indices_v2t.device)
-        
-        loss_v2t = F.cross_entropy(
-            logits[:batch_size_v2t][masked_indices_v2t].contiguous().view(-1, self.output_size),
-            labels[:batch_size_v2t][masked_indices_v2t].contiguous().view(-1), 
-            ignore_index=-100, 
-            reduction='none'
-        ) / p_mask_v2t[masked_indices_v2t]
+
+        loss_v2t = (
+            F.cross_entropy(
+                logits[:batch_size_v2t][masked_indices_v2t].contiguous().view(-1, self.output_size),
+                labels[:batch_size_v2t][masked_indices_v2t].contiguous().view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            / p_mask_v2t[masked_indices_v2t]
+        )
         loss_v2t = torch.sum(loss_v2t / answer_lengths[masked_indices_v2t]) / (logits[:batch_size_v2t].shape[0])
         return logits, loss_v2t
-    
+
     def forward_v2t_encoder(
         self,
         input_ids,
@@ -1647,27 +1686,31 @@ class DyninOmniModelLM(LLaDAModelLM):
         """
         video-to-text (V2T) diffusion LM training.
         """
-        attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device)
+        attention_bias = torch.ones(
+            input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device
+        )
         input_embeddings = super().model.transformer.wte(input_ids)
-        
-        
+
         logits = self(input_ids, attention_bias=attention_bias).logits
         self.output_size = logits.shape[-1]
-        
+
         masked_indices = input_ids == self.config.mask_token_id
         masked_indices_v2t = masked_indices[:batch_size_v2t]
         p_mask_v2t = p_mask_v2t.to(masked_indices_v2t.device)
         answer_lengths = answer_lengths.to(masked_indices_v2t.device)
-        
-        loss_v2t = F.cross_entropy(
-            logits[:batch_size_v2t][masked_indices_v2t].contiguous().view(-1, self.output_size),
-            labels[:batch_size_v2t][masked_indices_v2t].contiguous().view(-1), 
-            ignore_index=-100, 
-            reduction='none'
-        ) / p_mask_v2t[masked_indices_v2t]
+
+        loss_v2t = (
+            F.cross_entropy(
+                logits[:batch_size_v2t][masked_indices_v2t].contiguous().view(-1, self.output_size),
+                labels[:batch_size_v2t][masked_indices_v2t].contiguous().view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            / p_mask_v2t[masked_indices_v2t]
+        )
         loss_v2t = torch.sum(loss_v2t / answer_lengths[masked_indices_v2t]) / (logits[:batch_size_v2t].shape[0])
         return logits, loss_v2t
-        
+
     def forward_v2s(
         self,
         input_ids,
@@ -1676,17 +1719,19 @@ class DyninOmniModelLM(LLaDAModelLM):
         max_seq_length: int = 128,
         p_mask_v2s=None,
         answer_lengths=None,
-        t2s_vocab_start: Optional[int] = None,
-        t2s_codebook_size: Optional[int] = None,
-        t2s_special_token_ids: Optional[Dict[str, int]] = None,
+        t2s_vocab_start: int | None = None,
+        t2s_codebook_size: int | None = None,
+        t2s_special_token_ids: dict[str, int] | None = None,
     ):
         """
         # video-to-speech (V2S) diffusion LM training.
         """
-        attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device)
+        attention_bias = torch.ones(
+            input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device
+        )
         logits = self(input_ids, attention_bias=attention_bias).logits
         self.output_size = logits.shape[-1]
-        
+
         masked_indices = input_ids == self.config.mask_token_id
         masked_indices_v2s = masked_indices[:batch_size_v2s]
         if batch_size_v2s == 0:
@@ -1695,13 +1740,9 @@ class DyninOmniModelLM(LLaDAModelLM):
         p_mask_v2s = p_mask_v2s.to(masked_indices_v2s.device)
         answer_lengths = answer_lengths.to(masked_indices_v2s.device)
 
-        if (
-            t2s_vocab_start is not None
-            and t2s_codebook_size is not None
-            and t2s_special_token_ids is not None
-        ):
-            eoa_id = t2s_special_token_ids.get('eoa')
-            eos_id = t2s_special_token_ids.get('eos')
+        if t2s_vocab_start is not None and t2s_codebook_size is not None and t2s_special_token_ids is not None:
+            eoa_id = t2s_special_token_ids.get("eoa")
+            eos_id = t2s_special_token_ids.get("eos")
         else:
             eoa_id = eos_id = None
 
@@ -1721,7 +1762,21 @@ class DyninOmniModelLM(LLaDAModelLM):
         return logits, loss_v2s
 
     @torch.no_grad()
-    def mmu_generate(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128,block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None):
+    def mmu_generate(
+        self,
+        idx=None,
+        input_embeddings=None,
+        max_new_tokens=128,
+        steps=128,
+        block_length=128,
+        temperature=0.0,
+        top_k=None,
+        eot_token=None,
+        cfg_scale=0.0,
+        remasking="low_confidence",
+        mask_id=126336,
+        attention_mask=None,
+    ):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -1740,23 +1795,25 @@ class DyninOmniModelLM(LLaDAModelLM):
         result = []
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
-        x[:, :idx.shape[1]] = idx.clone()
-        prompt_index = (x != mask_id)
-        
-        
+        x[:, : idx.shape[1]] = idx.clone()
+        prompt_index = x != mask_id
+
         assert max_new_tokens % block_length == 0
         num_blocks = max_new_tokens // block_length
 
         assert steps % num_blocks == 0
         steps = steps // num_blocks
-        
+
         # num_transfer_tokens = get_num_transfer_tokens(prompt_index, steps)
         for num_block in range(num_blocks):
-            block_mask_index = (x[:, idx.shape[1] + num_block * block_length: idx.shape[1] + (num_block + 1) * block_length:] == mask_id)
+            block_mask_index = (
+                x[:, idx.shape[1] + num_block * block_length : idx.shape[1] + (num_block + 1) * block_length :]
+                == mask_id
+            )
             num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
             # num_transfer_tokens = get_num_transfer_tokens(prompt_index, steps)
             for i in range(steps):
-                mask_index = (x == mask_id) 
+                mask_index = x == mask_id
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[prompt_index] = mask_id
@@ -1768,17 +1825,16 @@ class DyninOmniModelLM(LLaDAModelLM):
                     logits = self(x, attention_bias=attention_bias).logits
 
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-                if remasking == 'low_confidence':
+                x0 = torch.argmax(logits_with_noise, dim=-1)  # b, l
+                if remasking == "low_confidence":
                     p = F.softmax(logits.to(torch.float64), dim=-1)
-                    x0_p = torch.squeeze(
-                        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
-                elif remasking == 'random':
+                    x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)  # b, l
+                elif remasking == "random":
                     x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                 else:
                     raise NotImplementedError(remasking)
 
-                x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
+                x0_p[:, idx.shape[1] + (num_block + 1) * block_length :] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
@@ -1792,7 +1848,21 @@ class DyninOmniModelLM(LLaDAModelLM):
         return x
 
     @torch.no_grad()
-    def s2t_generate(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128,block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None):
+    def s2t_generate(
+        self,
+        idx=None,
+        input_embeddings=None,
+        max_new_tokens=128,
+        steps=128,
+        block_length=128,
+        temperature=0.0,
+        top_k=None,
+        eot_token=None,
+        cfg_scale=0.0,
+        remasking="low_confidence",
+        mask_id=126336,
+        attention_mask=None,
+    ):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -1811,22 +1881,24 @@ class DyninOmniModelLM(LLaDAModelLM):
         result = []
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
-        x[:, :idx.shape[1]] = idx.clone()
-        prompt_index = (x != mask_id)
-        
-        
+        x[:, : idx.shape[1]] = idx.clone()
+        prompt_index = x != mask_id
+
         assert max_new_tokens % block_length == 0
         num_blocks = max_new_tokens // block_length
 
         assert steps % num_blocks == 0
         steps = steps // num_blocks
-        
+
         for num_block in range(num_blocks):
-            block_mask_index = (x[:, idx.shape[1] + num_block * block_length: idx.shape[1] + (num_block + 1) * block_length:] == mask_id)
+            block_mask_index = (
+                x[:, idx.shape[1] + num_block * block_length : idx.shape[1] + (num_block + 1) * block_length :]
+                == mask_id
+            )
             num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
-            
+
             for i in range(steps):
-                mask_index = (x == mask_id) 
+                mask_index = x == mask_id
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[prompt_index] = mask_id
@@ -1836,19 +1908,18 @@ class DyninOmniModelLM(LLaDAModelLM):
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
                     logits = self(x, attention_bias=attention_bias).logits
-                
+
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-                if remasking == 'low_confidence':
+                x0 = torch.argmax(logits_with_noise, dim=-1)  # b, l
+                if remasking == "low_confidence":
                     p = F.softmax(logits.to(torch.float64), dim=-1)
-                    x0_p = torch.squeeze(
-                        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
-                elif remasking == 'random':
+                    x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)  # b, l
+                elif remasking == "random":
                     x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                 else:
                     raise NotImplementedError(remasking)
 
-                x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
+                x0_p[:, idx.shape[1] + (num_block + 1) * block_length :] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
@@ -1862,7 +1933,21 @@ class DyninOmniModelLM(LLaDAModelLM):
         return x
 
     @torch.no_grad()
-    def mmu_generate_fast(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128,block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None):
+    def mmu_generate_fast(
+        self,
+        idx=None,
+        input_embeddings=None,
+        max_new_tokens=128,
+        steps=128,
+        block_length=128,
+        temperature=0.0,
+        top_k=None,
+        eot_token=None,
+        cfg_scale=0.0,
+        remasking="low_confidence",
+        mask_id=126336,
+        attention_mask=None,
+    ):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -1881,21 +1966,23 @@ class DyninOmniModelLM(LLaDAModelLM):
         result = []
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
-        x[:, :idx.shape[1]] = idx.clone()
-        prompt_index = (x != mask_id)
-        
-        
+        x[:, : idx.shape[1]] = idx.clone()
+        prompt_index = x != mask_id
+
         assert max_new_tokens % block_length == 0
         num_blocks = max_new_tokens // block_length
 
         assert steps % num_blocks == 0
         steps = steps // num_blocks
-        
+
         for num_block in range(num_blocks):
-            block_mask_index = (x[:, idx.shape[1] + num_block * block_length: idx.shape[1] + (num_block + 1) * block_length:] == mask_id)
+            block_mask_index = (
+                x[:, idx.shape[1] + num_block * block_length : idx.shape[1] + (num_block + 1) * block_length :]
+                == mask_id
+            )
             num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
             for i in range(steps):
-                mask_index = (x == mask_id) 
+                mask_index = x == mask_id
                 if cfg_scale > 0.0:
                     un_x = x.clone()
                     un_x[prompt_index] = mask_id
@@ -1905,19 +1992,18 @@ class DyninOmniModelLM(LLaDAModelLM):
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
                     logits = self(x, attention_bias=attention_bias).logits
-                
+
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-                if remasking == 'low_confidence':
+                x0 = torch.argmax(logits_with_noise, dim=-1)  # b, l
+                if remasking == "low_confidence":
                     p = F.softmax(logits.to(torch.float64), dim=-1)
-                    x0_p = torch.squeeze(
-                        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
-                elif remasking == 'random':
+                    x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)  # b, l
+                elif remasking == "random":
                     x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                 else:
                     raise NotImplementedError(remasking)
 
-                x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
+                x0_p[:, idx.shape[1] + (num_block + 1) * block_length :] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
@@ -1959,8 +2045,7 @@ class DyninOmniModelLM(LLaDAModelLM):
         """
         if _mmu_generate_fastdllm_v1 is None:
             raise ImportError(
-                "fastdllm_v1 is not installed. Install it to use "
-                "DyninOmniModelLM.mmu_generate_fastdllm_v1()."
+                "fastdllm_v1 is not installed. Install it to use DyninOmniModelLM.mmu_generate_fastdllm_v1()."
             )
         return _mmu_generate_fastdllm_v1(
             model=self,
@@ -1982,23 +2067,23 @@ class DyninOmniModelLM(LLaDAModelLM):
 
     @torch.no_grad()
     def t2i_generate_decoding_stepwise(
-            self,
-            input_ids: torch.LongTensor = None,
-            uncond_input_ids: torch.LongTensor = None,
-            attention_mask=None,
-            uncond_attention_mask=None,
-            temperature=1.0,
-            timesteps=18,  # ideal number of steps is 18 in maskgit paper
-            guidance_scale=0,
-            noise_schedule=cosine_schedule,
-            generator: torch.Generator = None,
-            config=None,
-            seq_len=1024,
-            mask_token_id = 126336,
-            resolution = 512,
-            codebook_size = 8192,
-            vq_model = None,
-            **kwargs,
+        self,
+        input_ids: torch.LongTensor = None,
+        uncond_input_ids: torch.LongTensor = None,
+        attention_mask=None,
+        uncond_attention_mask=None,
+        temperature=1.0,
+        timesteps=18,  # ideal number of steps is 18 in maskgit paper
+        guidance_scale=0,
+        noise_schedule=cosine_schedule,
+        generator: torch.Generator = None,
+        config=None,
+        seq_len=1024,
+        mask_token_id=126336,
+        resolution=512,
+        codebook_size=8192,
+        vq_model=None,
+        **kwargs,
     ):
         """
         Generate 1:1 similar to the original MaskGit repo
@@ -2010,34 +2095,49 @@ class DyninOmniModelLM(LLaDAModelLM):
         num_vq_tokens = seq_len
         num_new_special_tokens = 0
         uni_prompting = kwargs.get("uni_prompting", None)
-        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1):-1].clone()
-        input_ids_minus_lm_vocab_size = torch.where(input_ids_minus_lm_vocab_size == mask_token_id, mask_token_id, input_ids_minus_lm_vocab_size - len(uni_prompting.text_tokenizer) - num_new_special_tokens)
+        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1) : -1].clone()
+        input_ids_minus_lm_vocab_size = torch.where(
+            input_ids_minus_lm_vocab_size == mask_token_id,
+            mask_token_id,
+            input_ids_minus_lm_vocab_size - len(uni_prompting.text_tokenizer) - num_new_special_tokens,
+        )
 
         # for classifier-free guidance
         if uncond_input_ids is not None:
-            uncond_prefix = uncond_input_ids[:, :resolution + 1]
+            uncond_prefix = uncond_input_ids[:, : resolution + 1]
 
         for step in range(timesteps):
             if uncond_input_ids is not None and guidance_scale > 0:
-                uncond_input_ids = torch.cat(
-                    [uncond_prefix, input_ids[:, resolution + 1:]], dim=1)
+                uncond_input_ids = torch.cat([uncond_prefix, input_ids[:, resolution + 1 :]], dim=1)
                 model_input = torch.cat([input_ids, uncond_input_ids])
                 attention_mask = torch.cat([attention_mask, uncond_attention_mask], dim=0)
                 attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
-                logits = self(model_input, attention_bias=attention_bias).logits 
+                logits = self(model_input, attention_bias=attention_bias).logits
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
                 # it seems that muse has a different cfg setting
                 logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
+                logits = logits[
+                    :,
+                    -(num_vq_tokens + 1) : -1,
+                    len(uni_prompting.text_tokenizer) + num_new_special_tokens : len(uni_prompting.text_tokenizer)
+                    + num_new_special_tokens
+                    + codebook_size,
+                ]
             else:
                 attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
                 logits = self(input_ids, attention_bias=attention_bias).logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
+                logits = logits[
+                    :,
+                    -(num_vq_tokens + 1) : -1,
+                    len(uni_prompting.text_tokenizer) + num_new_special_tokens : len(uni_prompting.text_tokenizer)
+                    + num_new_special_tokens
+                    + codebook_size,
+                ]
 
             # logits: 1, 1024, 8192
             probs = logits.softmax(dim=-1)
             sampled = probs.reshape(-1, logits.size(-1))
-            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1]) # 1, 1024
+            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1])  # 1, 1024
 
             unknown_map = input_ids_minus_lm_vocab_size == mask_token_id
             sampled_ids = torch.where(unknown_map, sampled_ids, input_ids_minus_lm_vocab_size)
@@ -2048,7 +2148,7 @@ class DyninOmniModelLM(LLaDAModelLM):
             images = torch.clamp((current_image + 1.0) / 2.0, min=0.0, max=1.0)
             images *= 255.0
             images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-            pil_images = Image.fromarray(images[0]) 
+            pil_images = Image.fromarray(images[0])
             yield pil_images, f"Step {step + 1}/{timesteps}"
             # determined by mask_ratio * unknown_number_in_the_beginning.
             ratio = 1.0 * (step + 1) / timesteps
@@ -2070,13 +2170,13 @@ class DyninOmniModelLM(LLaDAModelLM):
             temperature = temperature * (1.0 - ratio)
             masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=generator)
             # Masks tokens with lower confidence.
-            input_ids[:, -(num_vq_tokens + 1):-1] = torch.where(masking, mask_token_id,
-                                                          sampled_ids + len(uni_prompting.text_tokenizer)
-                                                          + num_new_special_tokens)
+            input_ids[:, -(num_vq_tokens + 1) : -1] = torch.where(
+                masking, mask_token_id, sampled_ids + len(uni_prompting.text_tokenizer) + num_new_special_tokens
+            )
             input_ids_minus_lm_vocab_size = torch.where(masking, mask_token_id, sampled_ids)
 
         return sampled_ids
-    
+
 
 AutoConfig.register("dynin_omni", DyninOmniConfig)
 AutoModelForCausalLM.register(DyninOmniConfig, DyninOmniModelLM)

@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import os
 import re
+import shutil
 import sys
 import types
 import unicodedata
@@ -17,7 +17,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 
 DEFAULT_S2T_INSTRUCTIONS = [
     "Transcribe the given audio.",
@@ -72,6 +71,297 @@ def ensure_safe_import_for_vllm() -> None:
 
 def sanitize_repo_id(repo_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", repo_id)
+
+
+def looks_like_hf_repo_id(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    if value.count("/") != 1:
+        return False
+    org, name = value.split("/", 1)
+    return bool(org) and bool(name)
+
+
+def _get_hf_token() -> str | None:
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+
+def _resolve_hf_modules_cache_root() -> Path:
+    env_path = os.environ.get("HF_MODULES_CACHE")
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    try:
+        from transformers.utils.hub import HF_MODULES_CACHE
+
+        return Path(HF_MODULES_CACHE).expanduser().resolve()
+    except Exception:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home:
+            return (Path(hf_home).expanduser().resolve() / "modules").resolve()
+    return (Path.home() / ".cache" / "huggingface" / "modules").resolve()
+
+
+def _infer_module_cache_dirs_for_source(source: str) -> list[Path]:
+    root = _resolve_hf_modules_cache_root() / "transformers_modules"
+    candidates: list[Path] = []
+
+    repo_name = source
+    if looks_like_hf_repo_id(source):
+        org, repo = source.split("/", 1)
+        repo_name = repo
+        org_token = org.replace("-", "_hyphen_")
+        repo_token = repo.replace("-", "_hyphen_")
+        org_repo_root = root / org_token / repo_token
+        candidates.append(org_repo_root)
+        if org_repo_root.is_dir():
+            for p in org_repo_root.iterdir():
+                if not p.is_dir():
+                    continue
+                if p.name.startswith("__") or p.name == "runtime_assets":
+                    continue
+                candidates.append(p)
+    else:
+        repo_name = Path(source).name
+
+    candidates.append(root / repo_name)
+
+    unique_dirs: list[Path] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_dirs.append(cand)
+    return unique_dirs
+
+
+def _inject_runtime_assets_into_module_cache(*, source: str, runtime_assets_root: Path) -> None:
+    runtime_assets_root = runtime_assets_root.expanduser().resolve()
+    if not runtime_assets_root.is_dir():
+        return
+
+    for module_dir in _infer_module_cache_dirs_for_source(source):
+        try:
+            module_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+
+        target = module_dir / "runtime_assets"
+        try:
+            if target.is_symlink() and target.resolve() == runtime_assets_root:
+                continue
+        except Exception:
+            pass
+
+        if not target.exists():
+            try:
+                os.symlink(str(runtime_assets_root), str(target), target_is_directory=True)
+                continue
+            except Exception:
+                pass
+
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+        for name in ("u2s_config.json", "condition2style_centroid.txt"):
+            src_file = runtime_assets_root / name
+            dst_file = target / name
+            if src_file.is_file():
+                try:
+                    shutil.copy2(src_file, dst_file)
+                except Exception:
+                    pass
+
+
+def ensure_remote_runtime_assets(
+    *,
+    repo_id: str,
+    local_files_only: bool,
+) -> str | None:
+    """Download remote runtime_assets and export env vars for U2S runtime config."""
+    if local_files_only or not looks_like_hf_repo_id(repo_id):
+        return None
+
+    existing = os.environ.get("DYNIN_RUNTIME_ASSETS_ROOT")
+    if existing:
+        existing_path = Path(existing).expanduser().resolve()
+        if existing_path.is_dir():
+            u2s_cfg = existing_path / "u2s_config.json"
+            if u2s_cfg.is_file():
+                os.environ["DYNIN_U2S_CONFIG_PATH"] = str(u2s_cfg)
+            return str(existing_path)
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as e:
+        print(f"[s2t] Warning: huggingface_hub unavailable; cannot fetch runtime_assets from remote: {e}")
+        return None
+
+    token = _get_hf_token()
+    revisions: list[str | None] = [None]
+    last_error: Exception | None = None
+
+    for revision in revisions:
+        try:
+            snapshot_dir = snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                allow_patterns=["runtime_assets/**"],
+                token=token,
+            )
+        except TypeError:
+            try:
+                snapshot_dir = snapshot_download(
+                    repo_id=repo_id,
+                    revision=revision,
+                    allow_patterns=["runtime_assets/**"],
+                )
+            except Exception as e:
+                last_error = e
+                continue
+        except Exception as e:
+            last_error = e
+            continue
+
+        runtime_assets_root = (Path(snapshot_dir) / "runtime_assets").resolve()
+        if runtime_assets_root.is_dir():
+            os.environ["DYNIN_RUNTIME_ASSETS_ROOT"] = str(runtime_assets_root)
+            u2s_cfg = runtime_assets_root / "u2s_config.json"
+            if u2s_cfg.is_file():
+                os.environ["DYNIN_U2S_CONFIG_PATH"] = str(u2s_cfg)
+            _inject_runtime_assets_into_module_cache(
+                source=repo_id,
+                runtime_assets_root=runtime_assets_root,
+            )
+            print(f"[s2t] Using remote runtime_assets root: {runtime_assets_root}")
+            return str(runtime_assets_root)
+
+    if last_error is not None:
+        print(f"[s2t] Warning: failed to download remote runtime_assets: {last_error}")
+    return None
+
+
+def ensure_remote_s2u_vendor(
+    *,
+    repo_id: str,
+    local_files_only: bool,
+) -> str | None:
+    """Download remote s2u_vendor assets and export DYNIN_S2U_VENDOR_ROOT."""
+    if local_files_only or not looks_like_hf_repo_id(repo_id):
+        return None
+
+    existing = os.environ.get("DYNIN_S2U_VENDOR_ROOT")
+    if existing:
+        existing_path = Path(existing).expanduser().resolve()
+        if existing_path.is_dir():
+            return str(existing_path)
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as e:
+        print(f"[s2t] Warning: huggingface_hub unavailable; cannot fetch s2u_vendor from remote: {e}")
+        return None
+
+    token = _get_hf_token()
+    revisions: list[str | None] = [None]
+    last_error: Exception | None = None
+
+    for revision in revisions:
+        try:
+            snapshot_dir = snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                allow_patterns=["s2u_vendor/**"],
+                token=token,
+            )
+        except TypeError:
+            # Backward compatibility for older huggingface_hub signatures.
+            try:
+                snapshot_dir = snapshot_download(
+                    repo_id=repo_id,
+                    revision=revision,
+                    allow_patterns=["s2u_vendor/**"],
+                )
+            except Exception as e:
+                last_error = e
+                continue
+        except Exception as e:
+            last_error = e
+            continue
+
+        vendor_root = (Path(snapshot_dir) / "s2u_vendor").resolve()
+        if vendor_root.is_dir():
+            os.environ["DYNIN_S2U_VENDOR_ROOT"] = str(vendor_root)
+            print(f"[s2t] Using remote S2U vendor root: {vendor_root}")
+            return str(vendor_root)
+
+    if last_error is not None:
+        print(f"[s2t] Warning: failed to download remote s2u_vendor: {last_error}")
+    return None
+
+
+def ensure_local_vq_audio_repo(
+    *,
+    source: str,
+    local_repo_dir: Path,
+    revision: str | None,
+    local_files_only: bool,
+    force_download: bool,
+) -> Path:
+    """Ensure local EMOVA tokenizer repo exists; download it if needed."""
+    local_repo_dir = local_repo_dir.expanduser().resolve()
+    marker_files = (
+        "config.json",
+        "modeling_emova_speech_tokenizer.py",
+        "emova_decode_runtime.py",
+    )
+    if local_repo_dir.is_dir() and all((local_repo_dir / name).exists() for name in marker_files):
+        return local_repo_dir
+
+    source_path = Path(source).expanduser()
+    if source_path.is_dir():
+        return source_path.resolve()
+
+    if local_files_only:
+        raise FileNotFoundError(
+            f"Local EMOVA tokenizer repo not found at {local_repo_dir}, "
+            "and local_files_only=True prevents snapshot download."
+        )
+
+    if not looks_like_hf_repo_id(source):
+        raise ValueError(
+            "Cannot snapshot_download non-HF source. "
+            f"Expected repo id like 'org/repo', got: {source}"
+        )
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as e:
+        raise RuntimeError(f"huggingface_hub unavailable; cannot download {source}: {e}") from e
+
+    local_repo_dir.mkdir(parents=True, exist_ok=True)
+    token = _get_hf_token()
+    kwargs: dict[str, Any] = {
+        "repo_id": source,
+        "repo_type": "model",
+        "revision": revision,
+        "local_dir": str(local_repo_dir),
+        "token": token,
+        "force_download": bool(force_download),
+    }
+    try:
+        snapshot_dir = snapshot_download(**kwargs)
+    except TypeError:
+        # Backward compatibility for older huggingface_hub signatures.
+        kwargs.pop("token", None)
+        kwargs.pop("force_download", None)
+        snapshot_dir = snapshot_download(**kwargs)
+
+    resolved = Path(snapshot_dir).resolve()
+    print(f"[s2t] Local EMOVA tokenizer repo ready at: {resolved}")
+    return resolved
 
 
 def sanitize_file_stem(value: str, fallback: str) -> str:
@@ -141,10 +431,7 @@ def resolve_tokenizer_source_with_local_priority(
         )
         return str(configured_tokenizer_path)
 
-    print(
-        "[s2t] Local tokenizer markers were not found; "
-        f"falling back to model dir anyway: {model_dir}"
-    )
+    print(f"[s2t] Local tokenizer markers were not found; falling back to model dir anyway: {model_dir}")
     return str(model_dir)
 
 
@@ -229,9 +516,7 @@ def resolve_audio_path_from_row(
 
     if missing_paths:
         first = missing_paths[0]
-        raise FileNotFoundError(
-            f"audio file not found: {first} (checked {len(missing_paths)} candidate path(s))"
-        )
+        raise FileNotFoundError(f"audio file not found: {first} (checked {len(missing_paths)} candidate path(s))")
 
     raise ValueError(
         "metadata row has no usable audio source. "
@@ -441,7 +726,7 @@ def resolve_vq_audio_source(
     dynin_config_path: str,
     default_model_local_files_only: bool,
 ) -> tuple[str, bool]:
-    source = "Emova-ollm/emova_speech_tokenizer_hf"
+    source = "snu-aidas/emova_speech_tokenizer_vllm"
     local_files_only = bool(default_model_local_files_only)
     try:
         from omegaconf import OmegaConf
@@ -475,6 +760,7 @@ def load_uni_prompting_for_s2t(
     local_files_only: bool,
 ) -> Any:
     from transformers import AutoTokenizer
+
     from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import (
         UniversalPrompting,
     )
@@ -525,33 +811,44 @@ def load_vq_model_audio(
     *,
     source: str,
     local_files_only: bool,
+    local_repo_dir: Path,
+    revision: str | None,
+    force_download: bool,
 ) -> Any:
-    from transformers.modeling_utils import PreTrainedModel
-    from vllm_omni.model_executor.models.dynin_omni.models.speech.modeling_emova_speech_tokenizer import (
-        EMOVASpeechTokenizer,
+    local_repo = ensure_local_vq_audio_repo(
+        source=source,
+        local_repo_dir=local_repo_dir,
+        revision=revision,
+        local_files_only=bool(local_files_only),
+        force_download=bool(force_download),
     )
 
-    try:
-        load_state_dict_src = inspect.getsource(EMOVASpeechTokenizer.load_state_dict)
-    except Exception:
-        load_state_dict_src = ""
+    from transformers import AutoModel
 
-    if "pdb.set_trace" in load_state_dict_src:
+    local_s2u_vendor = (local_repo / "s2u_vendor").resolve()
+    if local_s2u_vendor.is_dir():
+        os.environ["DYNIN_S2U_VENDOR_ROOT"] = str(local_s2u_vendor)
+    else:
+        ensure_remote_s2u_vendor(repo_id=source, local_files_only=bool(local_files_only))
 
-        def _safe_load_state_dict(self: Any, state_dict: dict[str, torch.Tensor], strict: bool = True, assign: bool = False):
-            try:
-                return PreTrainedModel.load_state_dict(self, state_dict, strict=strict, assign=assign)
-            except TypeError:
-                return PreTrainedModel.load_state_dict(self, state_dict, strict=strict)
+    local_runtime_assets = (local_repo / "runtime_assets").resolve()
+    if local_runtime_assets.is_dir():
+        os.environ["DYNIN_RUNTIME_ASSETS_ROOT"] = str(local_runtime_assets)
+        local_u2s_cfg = local_runtime_assets / "u2s_config.json"
+        if local_u2s_cfg.is_file():
+            os.environ["DYNIN_U2S_CONFIG_PATH"] = str(local_u2s_cfg)
+        _inject_runtime_assets_into_module_cache(
+            source=source,
+            runtime_assets_root=local_runtime_assets,
+        )
+    else:
+        ensure_remote_runtime_assets(repo_id=source, local_files_only=bool(local_files_only))
 
-        EMOVASpeechTokenizer.load_state_dict = _safe_load_state_dict  # type: ignore[method-assign]
-
-    load_kwargs = {"local_files_only": bool(local_files_only)}
-    try:
-        vq_model_audio = EMOVASpeechTokenizer.from_pretrained(source, **load_kwargs)
-    except TypeError:
-        load_kwargs.pop("local_files_only", None)
-        vq_model_audio = EMOVASpeechTokenizer.from_pretrained(source, **load_kwargs)
+    vq_model_audio = AutoModel.from_pretrained(
+        str(local_repo),
+        trust_remote_code=True,
+        local_files_only=True,
+    )
     vq_model_audio.requires_grad_(False)
     vq_model_audio.eval()
     return vq_model_audio
@@ -727,9 +1024,7 @@ def validate_generation_args(
     if steps <= 0:
         raise ValueError("--s2t-steps must be > 0.")
     if max_new_tokens % block_length != 0:
-        raise ValueError(
-            f"s2t requires max_new_tokens % block_length == 0, got {max_new_tokens} % {block_length}"
-        )
+        raise ValueError(f"s2t requires max_new_tokens % block_length == 0, got {max_new_tokens} % {block_length}")
     num_blocks = max_new_tokens // block_length
     if num_blocks <= 0:
         raise ValueError("Invalid number of generation blocks.")
@@ -818,6 +1113,24 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
         type=str,
         default="",
         help="EMOVA speech tokenizer model path or repo id.",
+    )
+    parser.add_argument(
+        "--vq-model-audio-local-repo",
+        type=str,
+        default="~/hf_models/emova_speech_tokenizer_vllm",
+        help="Local directory for EMOVA tokenizer repo. Download target if missing.",
+    )
+    parser.add_argument(
+        "--vq-model-audio-revision",
+        type=str,
+        default="main",
+        help="Revision used when snapshot-downloading EMOVA tokenizer repo.",
+    )
+    parser.add_argument(
+        "--vq-model-audio-force-download",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Force re-download EMOVA tokenizer repo into --vq-model-audio-local-repo.",
     )
     parser.add_argument(
         "--vq-model-audio-local-files-only",
@@ -915,9 +1228,7 @@ def main() -> None:
         model_dir=model_dir,
         configured_tokenizer_path=tokenizer_path,
     )
-    effective_model_local_files_only = bool(
-        model_local_files_only or Path(tokenizer_source).expanduser().is_dir()
-    )
+    effective_model_local_files_only = bool(model_local_files_only or Path(tokenizer_source).expanduser().is_dir())
     if effective_model_local_files_only and not model_local_files_only:
         print("[s2t] Enabling local_files_only because tokenizer source is local.")
 
@@ -937,13 +1248,13 @@ def main() -> None:
         dynin_config_path=dynin_config_path,
         default_model_local_files_only=False,
     )
-    print(
-        f"[s2t] Loading speech tokenizer from: {vq_audio_source} "
-        f"(local_files_only={vq_audio_local_files_only})"
-    )
+    print(f"[s2t] Loading speech tokenizer from: {vq_audio_source} (local_files_only={vq_audio_local_files_only})")
     vq_model_audio = load_vq_model_audio(
         source=vq_audio_source,
         local_files_only=vq_audio_local_files_only,
+        local_repo_dir=Path(args.vq_model_audio_local_repo),
+        revision=args.vq_model_audio_revision,
+        force_download=bool(args.vq_model_audio_force_download),
     )
 
     speech_token_offset = len(uni_prompting.text_tokenizer) + int(codebook_size)
@@ -951,6 +1262,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     from vllm import SamplingParams
+
     from vllm_omni.entrypoints.omni import Omni
 
     omni = Omni(model=str(model_dir), stage_configs_path=args.stage_config_path, dtype=args.dtype)

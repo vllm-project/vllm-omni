@@ -178,10 +178,7 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
     def _to_prompt_token_ids(prompt: str | list[int], tokenizer: Any | None) -> list[int]:
         if isinstance(prompt, str):
             if tokenizer is None:
-                raise ValueError(
-                    "Tokenizer is required to process string prompts "
-                    "for Dynin multimodal inputs."
-                )
+                raise ValueError("Tokenizer is required to process string prompts for Dynin multimodal inputs.")
             return tokenizer.encode(prompt, add_special_tokens=False)
         return list(prompt)
 
@@ -350,8 +347,7 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
             modality_items = mm_items[modality].get_all()
             if len(modality_items) != item_count:
                 raise RuntimeError(
-                    f"Parsed {len(modality_items)} items but expected {item_count} "
-                    f"for modality={modality!r}"
+                    f"Parsed {len(modality_items)} items but expected {item_count} for modality={modality!r}"
                 )
 
             mm_kwargs_by_modality[modality] = self._build_modality_kwargs(

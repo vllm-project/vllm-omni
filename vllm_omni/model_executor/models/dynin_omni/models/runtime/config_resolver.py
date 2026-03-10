@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
@@ -35,7 +35,7 @@ def _node_get(node: Any, key: str, default: Any = None) -> Any:
         return getattr(node, key, default)
 
 
-def _normalize_optional_text(value: Any) -> Optional[str]:
+def _normalize_optional_text(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
@@ -46,7 +46,7 @@ def _normalize_optional_text(value: Any) -> Optional[str]:
     return text
 
 
-def _first_non_empty(*values: Any) -> Optional[str]:
+def _first_non_empty(*values: Any) -> str | None:
     for value in values:
         text = _normalize_optional_text(value)
         if text is not None:
@@ -64,7 +64,7 @@ def resolve_model_cfg_block(config: Any) -> Any:
     raise ValueError("Config is missing model.dynin_omni/model.mmada block.")
 
 
-def resolve_model_pretrained_source(config: Any, default: Optional[str] = None) -> str:
+def resolve_model_pretrained_source(config: Any, default: str | None = None) -> str:
     model_cfg = resolve_model_cfg_block(config)
     source = _first_non_empty(
         _node_get(model_cfg, "repo_id", None),
@@ -79,7 +79,7 @@ def resolve_model_pretrained_source(config: Any, default: Optional[str] = None) 
     return source
 
 
-def resolve_tokenizer_source(config: Any, default: Optional[str] = None) -> str:
+def resolve_tokenizer_source(config: Any, default: str | None = None) -> str:
     model_cfg = resolve_model_cfg_block(config)
     source = _first_non_empty(
         _node_get(model_cfg, "tokenizer_repo_id", None),
@@ -89,9 +89,7 @@ def resolve_tokenizer_source(config: Any, default: Optional[str] = None) -> str:
         default,
     )
     if source is None:
-        raise ValueError(
-            "Tokenizer source is missing. Set model.dynin_omni.tokenizer_repo_id (or tokenizer_path)."
-        )
+        raise ValueError("Tokenizer source is missing. Set model.dynin_omni.tokenizer_repo_id (or tokenizer_path).")
     return source
 
 
@@ -118,10 +116,7 @@ def resolve_model_type_from_pretrained(
         return str(cfg_json.get("model_type", ""))
 
     if hf_hub_download is None:
-        raise RuntimeError(
-            "huggingface_hub is required to read remote config_vllm.json for "
-            f"'{pretrained_source}'."
-        )
+        raise RuntimeError(f"huggingface_hub is required to read remote config_vllm.json for '{pretrained_source}'.")
 
     try:
         config_path = hf_hub_download(
@@ -136,7 +131,7 @@ def resolve_model_type_from_pretrained(
             "If this is a private repo, run `huggingface-cli login` with an authorized token."
         ) from exc
 
-    with open(config_path, "r", encoding="utf-8") as handle:
+    with open(config_path, encoding="utf-8") as handle:
         cfg_json = json.load(handle)
     return str(cfg_json.get("model_type", ""))
 
@@ -146,35 +141,29 @@ def resolve_vq_cfg_block(config: Any, modality: str = "image") -> Any:
     model_cfg_dict = _as_dict(model_cfg)
     if modality == "image":
         if "vq_model_image" in model_cfg_dict:
-            return getattr(
-                model_cfg, "vq_model_image", model_cfg_dict["vq_model_image"]
-            )
+            return getattr(model_cfg, "vq_model_image", model_cfg_dict["vq_model_image"])
         if "vq_model" in model_cfg_dict:
             return getattr(model_cfg, "vq_model", model_cfg_dict["vq_model"])
         raise ValueError("Config is missing model.vq_model_image/model.vq_model block.")
     if modality == "audio":
         if "vq_model_audio" in model_cfg_dict:
-            return getattr(
-                model_cfg, "vq_model_audio", model_cfg_dict["vq_model_audio"]
-            )
+            return getattr(model_cfg, "vq_model_audio", model_cfg_dict["vq_model_audio"])
         raise ValueError("Config is missing model.vq_model_audio block.")
     raise ValueError(f"Unsupported modality '{modality}'.")
 
 
-def resolve_vq_repo_source(vq_cfg: Any, default: Optional[str] = None) -> str:
+def resolve_vq_repo_source(vq_cfg: Any, default: str | None = None) -> str:
     source = _first_non_empty(
         _node_get(vq_cfg, "repo_id", None),
         _node_get(vq_cfg, "vq_model_name", None),
         default,
     )
     if source is None:
-        raise ValueError(
-            "VQ model source is missing. Set repo_id (or legacy vq_model_name)."
-        )
+        raise ValueError("VQ model source is missing. Set repo_id (or legacy vq_model_name).")
     return source
 
 
-def resolve_hf_cache_root(config: Any, project_root: Optional[str] = None) -> str:
+def resolve_hf_cache_root(config: Any, project_root: str | None = None) -> str:
     dataset_cfg = getattr(config, "dataset", None)
     dataset_params = _as_dict(_node_get(dataset_cfg, "params", {}))
     dataset_hf_cfg = _as_dict(_node_get(dataset_cfg, "hf", {}))
@@ -195,7 +184,7 @@ def resolve_hf_cache_root(config: Any, project_root: Optional[str] = None) -> st
     return str(cache_root.resolve(strict=False))
 
 
-def configure_hf_cache_env(config: Any, project_root: Optional[str] = None) -> str:
+def configure_hf_cache_env(config: Any, project_root: str | None = None) -> str:
     cache_root = resolve_hf_cache_root(config, project_root=project_root)
     cache_root_path = Path(cache_root)
     os.environ["DYNIN_OMNI_HF_CACHE_DIR"] = cache_root
@@ -231,15 +220,9 @@ def _ensure_mapping_node(node: Any, key: str) -> Any:
     return _node_get(node, key, {})
 
 
-def _canonical_t2i_id(entry: dict) -> Optional[str]:
+def _canonical_t2i_id(entry: dict) -> str | None:
     source_id = (
-        str(
-            entry.get("id")
-            or entry.get("name")
-            or entry.get("dataset_id")
-            or entry.get("repo_id")
-            or ""
-        )
+        str(entry.get("id") or entry.get("name") or entry.get("dataset_id") or entry.get("repo_id") or "")
         .strip()
         .lower()
     )
@@ -249,11 +232,7 @@ def _canonical_t2i_id(entry: dict) -> Optional[str]:
         return "text2image2m"
     if "pickapic" in source_id:
         return "pickapic"
-    if (
-        "flux-reason" in source_id
-        or "flux_reason" in source_id
-        or "fluxreason" in source_id
-    ):
+    if "flux-reason" in source_id or "flux_reason" in source_id or "fluxreason" in source_id:
         return "flux_reason"
     if "hq-edit" in source_id or "hq_edit" in source_id or "hqedit" in source_id:
         return "hqedit"
@@ -264,15 +243,9 @@ def _canonical_t2i_id(entry: dict) -> Optional[str]:
     return source_id
 
 
-def _canonical_video_id(entry: dict) -> Optional[str]:
+def _canonical_video_id(entry: dict) -> str | None:
     source_id = (
-        str(
-            entry.get("id")
-            or entry.get("name")
-            or entry.get("dataset_id")
-            or entry.get("repo_id")
-            or ""
-        )
+        str(entry.get("id") or entry.get("name") or entry.get("dataset_id") or entry.get("repo_id") or "")
         .strip()
         .lower()
     )
@@ -356,9 +329,7 @@ def apply_dataset_sources(config: Any) -> None:
             local_only = video_entry.get("local_files_only")
 
             if _node_get(params, "video_caption_dataset", None) is not None:
-                video_caption_cfg = _ensure_mapping_node(
-                    params, "video_caption_dataset"
-                )
+                video_caption_cfg = _ensure_mapping_node(params, "video_caption_dataset")
                 if video_id is not None:
                     _set_node_value(video_caption_cfg, "dataset_name", video_id)
                 if video_path is not None:
@@ -385,15 +356,11 @@ def apply_dataset_sources(config: Any) -> None:
                 video_speech_cfg = _ensure_mapping_node(params, "video_speech_dataset")
                 if video_id == "llavavid":
                     _set_node_value(video_speech_cfg, "use_llavavid", True)
-                    _set_node_value(
-                        video_speech_cfg, "llavavid_dataset_name", "llavavid"
-                    )
+                    _set_node_value(video_speech_cfg, "llavavid_dataset_name", "llavavid")
                     if video_path is not None:
                         _set_node_value(video_speech_cfg, "llavavid_path", video_path)
                     if sample_method is not None:
-                        _set_node_value(
-                            video_speech_cfg, "v2t_sample_method", sample_method
-                        )
+                        _set_node_value(video_speech_cfg, "v2t_sample_method", sample_method)
                     if num_frames is not None:
                         _set_node_value(video_speech_cfg, "num_frames", int(num_frames))
                     if local_only is not None:
@@ -438,8 +405,6 @@ def apply_dataset_sources(config: Any) -> None:
     lm_sources = _to_plain(_node_get(sources, "lm", [])) or []
     if isinstance(lm_sources, list) and lm_sources:
         hf_instruction_lm = _ensure_mapping_node(params, "hf_instruction_lm")
-        normalized_lm_sources = [
-            entry for entry in lm_sources if isinstance(entry, dict)
-        ]
+        normalized_lm_sources = [entry for entry in lm_sources if isinstance(entry, dict)]
         if normalized_lm_sources:
             _set_node_value(hf_instruction_lm, "sources", normalized_lm_sources)

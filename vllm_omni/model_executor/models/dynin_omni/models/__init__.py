@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from .image.modeling_magvitv2 import LFQuantizer, MAGVITv2, VQGANDecoder, VQGANEncoder
 from .backbone.modeling_dynin_omni import DyninOmniConfig, DyninOmniModelLM, VideoTokenMerger
 from .backbone.sampling import get_mask_schedule
+from .image.modeling_magvitv2 import LFQuantizer, MAGVITv2, VQGANDecoder, VQGANEncoder
 
 # Backward compatibility for legacy class names used in prior MMaDA scripts.
 MMadaModelLM = DyninOmniModelLM

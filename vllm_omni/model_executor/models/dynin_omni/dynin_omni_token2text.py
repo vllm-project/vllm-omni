@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
-from contextlib import contextmanager
 from collections.abc import Iterable
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -17,17 +17,16 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
-from .models import DyninOmniModelLM, get_mask_schedule
-
 from .dynin_omni_common import (
     DETOK_TEXT,
     TASK_TO_DETOK,
     first_value,
     get_runtime_info,
-    resolve_hidden_size,
     resolve_dynin_infer_sources,
+    resolve_hidden_size,
     to_token_1d,
 )
+from .models import DyninOmniModelLM, get_mask_schedule
 
 TASK_TO_PROMPTING_TASK = {
     "t2i": "t2i_gen",
@@ -160,8 +159,8 @@ class DyninOmniToken2Text(nn.Module):
             runtime_info=runtime_info,
             kwargs=kwargs,
         )
-        #from remote_pdb import RemotePdb; RemotePdb("127.0.0.1", 4444).set_trace()
-        
+        # from remote_pdb import RemotePdb; RemotePdb("127.0.0.1", 4444).set_trace()
+
         if detok_id != DETOK_TEXT:
             return OmniOutput(
                 text_hidden_states=None,
@@ -218,7 +217,7 @@ class DyninOmniToken2Text(nn.Module):
                 f"DYNIN model does not expose '{fn_name}'. "
                 "Pass additional_information.generated_token_ids or adjust task mapping."
             )
-        #from remote_pdb import RemotePdb; RemotePdb("127.0.0.1", 4444).set_trace()
+        # from remote_pdb import RemotePdb; RemotePdb("127.0.0.1", 4444).set_trace()
         gen_fn = getattr(self.model, fn_name)
         gen_kwargs: dict[str, Any] = {}
         for key in (
@@ -914,7 +913,6 @@ class DyninOmniToken2Text(nn.Module):
         repeats = (hidden_size + base.numel() - 1) // base.numel()
         embedding = base.repeat(repeats)[:hidden_size].to(dtype=torch.bfloat16)
         return embedding.unsqueeze(0).contiguous()
-
 
     def embed_multimodal(self, **kwargs: Any) -> Any:
         # Build deterministic embeddings directly from input modality tensors

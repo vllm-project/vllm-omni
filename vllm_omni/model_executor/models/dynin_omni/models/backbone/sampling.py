@@ -17,9 +17,7 @@ def gumbel_noise(t, generator=None):
 
 
 def gumbel_sample(t, temperature=1.0, dim=-1, generator=None):
-    return (
-        (t / max(temperature, 1e-10)) + gumbel_noise(t, generator=generator)
-    ).argmax(dim=dim)
+    return ((t / max(temperature, 1e-10)) + gumbel_noise(t, generator=generator)).argmax(dim=dim)
 
 
 def top_k(logits, thres=0.9):
@@ -77,7 +75,7 @@ def get_mask_schedule(method, **schedule_kwargs):
     elif method == "sigmoid":
         return partial(sigmoid_schedule, **schedule_kwargs)
     else:
-        raise ValueError("Unknown schedule method: {}".format(method))
+        raise ValueError(f"Unknown schedule method: {method}")
 
 
 def top_k_top_p_filtering(
@@ -116,8 +114,6 @@ def top_k_top_p_filtering(
         sorted_indices_to_remove[..., 0] = 0
 
         # scatter sorted tensors to original indexing
-        indices_to_remove = sorted_indices_to_remove.scatter(
-            1, sorted_indices, sorted_indices_to_remove
-        )
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
         logits[indices_to_remove] = filter_value
     return logits
