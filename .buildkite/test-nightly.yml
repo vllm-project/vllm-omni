@@ -41,28 +41,26 @@ steps:
   #                 path: /mnt/hf-cache
   #                 type: DirectoryOrCreate
 
-  - label: ":full_moon: Omni Model Test&Test Case Statistics"
-    timeout_in_minutes: 60
-    key: nightly-testcase-statistics
-    depends_on: upload-nightly-pipeline
-    #if: build.env("NIGHTLY") == "1"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
-      - python tools/nightly/buildkite_testcase_statistics.py -o tests/buildkite_testcase_statistics.html
-      - buildkite-agent artifact upload "tests/*.html"
-    agents:
-      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          shm-size: "8gb"
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
+  # - label: ":full_moon: Omni Model Test & Test Case Statistics"
+  #   timeout_in_minutes: 60
+  #   key: nightly-testcase-statistics
+  #   depends_on: upload-nightly-pipeline
+  #   #if: build.env("NIGHTLY") == "1"
+  #   commands:
+  #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  #     - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
+  #   agents:
+  #     queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+  #   plugins:
+  #     - docker#v5.2.0:
+  #         image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+  #         always-pull: true
+  #         propagate-environment: true
+  #         shm-size: "8gb"
+  #         environment:
+  #           - "HF_HOME=/fsx/hf_cache"
+  #         volumes:
+  #           - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: ":full_moon: Omni Model Perf Test with H100"
     key: nightly-performance
@@ -74,6 +72,8 @@ steps:
       - export BENCHMARK_DIR=tests
       - pytest -s -v tests/perf/scripts/run_benchmark.py
       - buildkite-agent artifact upload "tests/*.json"
+      - python tools/nightly/buildkite_testcase_statistics.py -o tests/buildkite_testcase_statistics.html
+      - buildkite-agent artifact upload "tests/*.html"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -107,7 +107,7 @@ steps:
     key: nightly-perf-distribution
     depends_on:
     - nightly-performance
-    - nightly-testcase-statistics
+    #- nightly-testcase-statistics
     #if: build.env("NIGHTLY") == "1"
     commands:
       - pip install openpyxl
