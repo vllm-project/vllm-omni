@@ -38,6 +38,8 @@ def run_inference(
     m = Omni(
         model=model_name,
         enable_layerwise_offload=layerwise_offload,
+        # TODO: we might want to add overlapped feature e2e tests
+        # cache_backend="cache_dit",
         boundary_ratio=0.875,
         flow_shift=5.0,
     )

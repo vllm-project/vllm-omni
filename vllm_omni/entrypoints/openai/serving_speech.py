@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from transformers.utils.hub import cached_file
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
@@ -83,6 +84,7 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
+        self.model_name = kwargs.pop("model_name", None)
         super().__init__(*args, **kwargs)
         # Initialize uploaded speakers storage
         speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
@@ -120,7 +122,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         try:
             model_path = self.engine_client.model_config.model
             st_config_path = os.path.join(model_path, "speech_tokenizer", "config.json")
-            if os.path.exists(st_config_path):
+            if not os.path.exists(st_config_path):
+                st_config_path = cached_file(model_path, "speech_tokenizer/config.json")
+            if st_config_path is not None and os.path.exists(st_config_path):
                 with open(st_config_path) as f:
                     st_config = json.load(f)
                 output_sr = st_config.get("output_sample_rate")
@@ -753,6 +757,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
 
         try:
+            sampling_params_list = self.engine_client.default_sampling_params_list
+            default_sr = 24000  # Default sample rate for TTS models
             if self._is_tts:
                 # Validate TTS parameters
                 validation_error = self._validate_tts_request(request)
@@ -777,8 +783,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 tts_params.get("task_type", ["unknown"])[0],
             )
-
-            sampling_params_list = self.engine_client.default_sampling_params_list
 
             generator = self.engine_client.generate(
                 prompt=prompt,
@@ -806,7 +810,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return self.create_error_response("TTS model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            sr_raw = audio_output.get("sr", 24000)
+            sr_raw = audio_output.get("sr", default_sr)
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
