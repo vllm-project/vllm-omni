@@ -447,7 +447,7 @@ def load_uni_prompting(
 ) -> Any:
     from transformers import AutoTokenizer
 
-    from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import (
+    from vllm_omni.model_executor.models.dynin_omni.prompting_utils import (
         UniversalPrompting,
     )
 
@@ -492,7 +492,7 @@ def load_uni_prompting(
 
 
 def load_vq_encoder(vq_path: str, device: torch.device, local_files_only: bool = False) -> Any:
-    from vllm_omni.model_executor.models.dynin_omni.models import MAGVITv2
+    from vllm_omni.model_executor.models.dynin_omni.modeling_magvitv2 import MAGVITv2
 
     vq_model = MAGVITv2.from_pretrained(vq_path, local_files_only=local_files_only).to(device)
     vq_model.requires_grad_(False)
@@ -769,7 +769,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--dynin-config-path",
         type=str,
-        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"),
+        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"),
         help="Path to DYNIN config yaml.",
     )
     parser.add_argument(
@@ -1082,7 +1082,7 @@ if __name__ == "__main__":
 example usage:
 python <REPO_ROOT>/examples/offline_inference/dynin_omni/v2t.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml \
   --video-path <REPO_ROOT>/examples/offline_inference/dynin_omni/data/video/baseball.mp4 \
   --question "Describe this video in detail." \
   --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/v2t_from_vllm

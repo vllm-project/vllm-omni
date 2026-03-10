@@ -180,7 +180,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--dynin-config-path",
         type=str,
-        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"),
+        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"),
         help="Path to DYNIN model config yaml.",
     )
     parser.add_argument(
@@ -254,6 +254,6 @@ if __name__ == "__main__":
 example commands:
 python <REPO_ROOT>/examples/offline_inference/dynin_omni/t2t.py\
     --model snu-aidas/Dynin-Omni\
-    --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml\
+    --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml\
     --question "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
 """

@@ -7,7 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL="${MODEL:-snu-aidas/Dynin-Omni}"
 STAGE_CONFIG_PATH="${STAGE_CONFIG_PATH:-${REPO_ROOT}/vllm_omni/model_executor/stage_configs/dynin_omni.yaml}"
-DYNIN_CONFIG_PATH="${DYNIN_CONFIG_PATH:-${REPO_ROOT}/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml}"
+DYNIN_CONFIG_PATH="${DYNIN_CONFIG_PATH:-${REPO_ROOT}/vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni_demo.yaml}"
 
 usage() {
   cat <<USAGE

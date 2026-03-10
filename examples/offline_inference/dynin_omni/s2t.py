@@ -761,7 +761,7 @@ def load_uni_prompting_for_s2t(
 ) -> Any:
     from transformers import AutoTokenizer
 
-    from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import (
+    from vllm_omni.model_executor.models.dynin_omni.prompting_utils import (
         UniversalPrompting,
     )
 
@@ -1047,7 +1047,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--dynin-config-path",
         type=str,
-        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"),
+        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"),
         help="Path to DYNIN config yaml.",
     )
     parser.add_argument(
@@ -1347,7 +1347,7 @@ if __name__ == "__main__":
 example usage:
 python <REPO_ROOT>/examples/offline_inference/dynin_omni/s2t.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml \
   --audio-path <REPO_ROOT>/examples/offline_inference/dynin_omni/results/t2s_from_vllm/cli-00000.wav \
   --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/s2t_from_vllm
 """

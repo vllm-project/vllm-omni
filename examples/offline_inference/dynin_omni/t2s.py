@@ -538,7 +538,7 @@ def load_uni_prompting_for_t2s(
 ) -> Any:
     from transformers import AutoTokenizer
 
-    from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import UniversalPrompting
+    from vllm_omni.model_executor.models.dynin_omni.prompting_utils import UniversalPrompting
 
     load_kwargs = {
         "padding_side": "left",
@@ -760,7 +760,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--dynin-config-path",
         type=str,
-        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"),
+        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"),
         help="Path to DYNIN config yaml.",
     )
     parser.add_argument(
@@ -1084,7 +1084,7 @@ if __name__ == "__main__":
 example usage:
 p <REPO_ROOT>/examples/offline_inference/dynin_omni/t2s.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml \
   --text "Hello, this is a text to speech test." \
   --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/t2s_from_vllm
 """
@@ -1093,7 +1093,7 @@ p <REPO_ROOT>/examples/offline_inference/dynin_omni/t2s.py \
 """
 python <REPO_ROOT>/examples/offline_inference/dynin_omni/t2s.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml \
   --metadata-path <REPO_ROOT>/examples/offline_inference/dynin_omni/data/text/t2i_metadata.jsonl \
   --max-prompts 4 \
   --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/t2s_from_vllm

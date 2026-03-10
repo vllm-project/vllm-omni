@@ -23,7 +23,7 @@ from .dynin_omni_common import (
 
 logger = init_logger(__name__)
 
-from .models import MAGVITv2
+from .modeling_magvitv2 import MAGVITv2
 
 
 class DyninOmniToken2Image(nn.Module):

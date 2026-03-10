@@ -5,7 +5,7 @@ E2E offline smoke tests for Dynin-Omni.
 
 - model: "snu-aidas/Dynin-Omni"
 - stage config: tests/e2e/offline_inference/stage_configs/dynin_omni_ci.yaml
-- dynin config: vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml
+- dynin config: vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni_demo.yaml
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DYNIN_CONFIG_PATH = (
-    _REPO_ROOT / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"
+    _REPO_ROOT / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni_demo.yaml"
 )
 _DEFAULT_STAGE_CONFIG_PATH = Path(__file__).parent / "stage_configs" / "dynin_omni_ci.yaml"
 

@@ -26,7 +26,8 @@ from .dynin_omni_common import (
     resolve_hidden_size,
     to_token_1d,
 )
-from .models import DyninOmniModelLM, get_mask_schedule
+from .modeling_dynin_omni import DyninOmniModelLM
+from .sampling import get_mask_schedule
 
 TASK_TO_PROMPTING_TASK = {
     "t2i": "t2i_gen",
@@ -466,7 +467,7 @@ class DyninOmniToken2Text(nn.Module):
 
         if self._uni_prompting is None:
             try:
-                from .models.runtime.prompting_utils import UniversalPrompting
+                from .prompting_utils import UniversalPrompting
 
                 init_kwargs: dict[str, Any] = {
                     "use_reserved_token": use_reserved_token,

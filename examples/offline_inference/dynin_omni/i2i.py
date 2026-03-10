@@ -271,7 +271,7 @@ def resolve_vq_model_path(
 
 def load_vq_encoder(vq_path: str, device: torch.device, local_files_only: bool = False) -> Any:
     """Load MAGVITv2 for source image VQ encoding."""
-    from vllm_omni.model_executor.models.dynin_omni.models import MAGVITv2
+    from vllm_omni.model_executor.models.dynin_omni.modeling_magvitv2 import MAGVITv2
 
     vq_model = MAGVITv2.from_pretrained(vq_path, local_files_only=local_files_only).to(device)
     vq_model.requires_grad_(False)
@@ -310,7 +310,7 @@ def load_uni_prompting(
     """Initialise UniversalPrompting with the DYNIN tokenizer."""
     from transformers import AutoTokenizer
 
-    from vllm_omni.model_executor.models.dynin_omni.models.runtime.prompting_utils import UniversalPrompting
+    from vllm_omni.model_executor.models.dynin_omni.prompting_utils import UniversalPrompting
 
     load_kwargs = {
         "padding_side": "left",
@@ -568,7 +568,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--dynin-config-path",
         type=str,
-        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml"),
+        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"),
         help="Path to DYNIN config yaml.",
     )
     parser.add_argument(
@@ -877,7 +877,7 @@ if __name__ == "__main__":
 example usage:
 python <REPO_ROOT>/examples/offline_inference/dynin_omni/i2i.py \
   --model snu-aidas/Dynin-Omni \
-  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/models/configs/dynin_omni_demo.yaml \
+  --dynin-config-path <REPO_ROOT>/vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml \
   --edit-json <REPO_ROOT>/examples/offline_inference/dynin_omni/data/text/i2i_edits.json \
   --origin-img-root <REPO_ROOT>/examples/offline_inference/dynin_omni/data/image \
   --output-dir <REPO_ROOT>/examples/offline_inference/dynin_omni/results/i2i_from_vllm
