@@ -473,7 +473,7 @@ def test_invalid_lora_returns_400(test_client):
     assert "lora object" in failed["error"]["message"].lower()
 
 
-def test_unsupported_image_reference_file_id_fails_job(test_client):
+def test_unsupported_image_reference_file_id_returns_400(test_client):
     response = test_client.post(
         "/v1/videos",
         data={
@@ -481,11 +481,18 @@ def test_unsupported_image_reference_file_id_fails_job(test_client):
             "image_reference": '{"file_id": "file-123"}',
         },
     )
-    assert response.status_code == 200
-    video_id = response.json()["id"]
-    failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
-    assert failed["error"]["code"] == "HTTPException"
-    assert "file_id is not supported" in failed["error"]["message"].lower()
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid image_reference: file_id is not supported yet."
+
+
+def test_invalid_uploaded_input_reference_returns_400(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "bad upload"},
+        files={"input_reference": ("input.png", b"not-an-image", "image/png")},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid input_reference: provided content is not a valid image."
 
 
 def test_video_request_validation():

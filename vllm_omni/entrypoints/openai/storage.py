@@ -58,6 +58,9 @@ class LocalStorageManager(StorageBaseManager):
         async with self._io_semaphore:
             return await asyncio.to_thread(self._delete_sync, file_name)
 
+    def exists(self, file_name: str) -> bool:
+        return os.path.exists(self.get_full_file_path(file_name))
+
     def get_full_file_path(self, file_name: str) -> str:
         return os.path.join(self.storage_path, file_name)
 

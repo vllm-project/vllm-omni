@@ -84,6 +84,7 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
@@ -1773,15 +1774,12 @@ async def _run_video_generation_job(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
     video_id: str,
-    input_reference_bytes: bytes | None,
+    reference_image: ReferenceImage | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
         return
-
-    image_data = await decode_input_reference(request.image_reference, input_reference_bytes)
-    reference_image = ReferenceImage(data=image_data) if image_data is not None else image_data
 
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
@@ -1957,9 +1955,15 @@ async def create_video(
             detail=f"Video generation failed: {str(e)}",
         )
     ref = video_response_from_request(effective_model_name, request)
-    await VIDEO_STORE.upsert(ref.id, ref)
 
-    task = asyncio.create_task(_run_video_generation_job(handler, request, ref.id, input_reference_bytes))
+    try:
+        image_data = await decode_input_reference(request.image_reference, input_reference_bytes)
+    except InvalidInputReferenceError as exc:
+        raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
+
+    reference_image = ReferenceImage(data=image_data) if image_data is not None else image_data
+    await VIDEO_STORE.upsert(ref.id, ref)
+    task = asyncio.create_task(_run_video_generation_job(handler, request, ref.id, reference_image))
     await VIDEO_TASKS.upsert(ref.id, task)
     return ref
 
@@ -2054,6 +2058,15 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
 
             await VIDEO_STORE.pop(video_id)
             return VideoDeleteResponse(id=job.id, deleted=True)
+    elif job.status is VideoGenerationStatus.FAILED:
+        if job.file_name is not None:
+            try:
+                await STORAGE_MANAGER.delete(job.file_name)
+            except Exception:
+                logger.warning("Failed to delete stored artifact for failed video job %s", video_id, exc_info=True)
+
+        await VIDEO_STORE.pop(video_id)
+        return VideoDeleteResponse(id=job.id, deleted=True)
 
     if job.file_name is None:
         raise HTTPException(status_code=409, detail="Video output not yet available. Please try again later.")
