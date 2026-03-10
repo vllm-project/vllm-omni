@@ -96,7 +96,8 @@ python end2end.py --query-type CustomVoice --streaming --output-dir /tmp/out_str
 ```
 
 Each Code2Wav chunk is logged as it arrives (default 25 frames; configurable via `codec_chunk_frames`
-and `initial_codec_chunk_frames` in the stage config). The final WAV file is written once generation
+in the stage config). The initial chunk size is dynamically selected based on server load for reduced
+TTFA, and can be overridden per-request via the `initial_codec_chunk_frames` API field. The final WAV file is written once generation
 completes. This demonstrates that audio data is available progressively rather than only at the end.
 
 > **Note:** Streaming uses `AsyncOmni` internally. The non-streaming path (`Omni`) is unchanged.

@@ -289,7 +289,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | `language`       | string | "Auto"        | Language (see supported languages below)                                     |
 | `instructions`   | string | ""            | Voice style/emotion instructions                                             |
 | `max_new_tokens` | int    | 2048          | Maximum tokens to generate                                                   |
-| `initial_codec_chunk_frames` | int | null | Initial chunk size for reduced TTFA (overrides stage config)                 |
+| `initial_codec_chunk_frames` | int | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `stream`         | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
