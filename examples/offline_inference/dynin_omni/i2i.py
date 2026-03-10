@@ -151,12 +151,18 @@ def resolve_i2i_runtime_defaults(
         return float(default)
 
     dynin_cfg = None
-    cfg_select = lambda _path: None
+
+    def cfg_select(_path: str) -> Any:
+        return None
+
     try:
         from omegaconf import OmegaConf
 
         dynin_cfg = OmegaConf.load(dynin_config_path)
-        cfg_select = lambda _path: OmegaConf.select(dynin_cfg, _path)
+
+        def cfg_select(_path: str) -> Any:
+            return OmegaConf.select(dynin_cfg, _path)
+
     except Exception:
         pass
 
@@ -718,7 +724,6 @@ def main():
     guidance_scale: float = float(runtime["guidance_scale"])
     temperature: float = float(runtime["temperature"])
     src_resolution: int = int(runtime["source_resolution"])
-    tgt_resolution: int = int(runtime["target_resolution"])
     num_vq_tokens: int = int(runtime["num_vq_tokens"])
     noise_schedule_name: str = str(runtime["noise_schedule_name"])
     noise_schedule_params: dict[str, Any] = runtime.get("noise_schedule_params", {})

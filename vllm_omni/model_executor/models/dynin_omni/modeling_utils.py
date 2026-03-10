@@ -47,7 +47,18 @@ except ImportError:  # Older huggingface_hub without shard helper.
 
 
 from diffusers import __version__
-from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.model_loading_utils import (
+    _determine_device_map,
+    _fetch_index_file,
+    _load_state_dict_into_model,
+    load_model_dict_into_meta,
+    load_state_dict,
+)
+from diffusers.utils.hub_utils import (
+    PushToHubMixin,
+    load_or_create_model_card,
+    populate_model_card,
+)
 from huggingface_hub.utils import validate_hf_hub_args
 from torch import Tensor, nn
 
@@ -113,19 +124,6 @@ CONFIG_NAME = "config.json"
 WEIGHTS_NAME = "pytorch_model.bin"
 SAFETENSORS_WEIGHTS_NAME = "pytorch_model.safetensors"
 HUGGINGFACE_CO_RESOLVE_ENDPOINT = "https://huggingface.co"
-
-from diffusers.models.model_loading_utils import (
-    _determine_device_map,
-    _fetch_index_file,
-    _load_state_dict_into_model,
-    load_model_dict_into_meta,
-    load_state_dict,
-)
-from diffusers.utils.hub_utils import (
-    PushToHubMixin,
-    load_or_create_model_card,
-    populate_model_card,
-)
 
 logger = logging.get_logger(__name__)
 
@@ -241,7 +239,11 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         is_attribute = name in self.__dict__
 
         if is_in_config and not is_attribute:
-            deprecation_message = f"Accessing config attribute `{name}` directly via '{type(self).__name__}' object attribute is deprecated. Please access '{name}' over '{type(self).__name__}'s config object instead, e.g. 'unet.config.{name}'."
+            deprecation_message = (
+                f"Accessing config attribute `{name}` directly via '{type(self).__name__}' object attribute is "
+                f"deprecated. Please access '{name}' over '{type(self).__name__}'s config object instead, "
+                f"e.g. 'unet.config.{name}'."
+            )
             deprecate(
                 "direct config name access",
                 "1.0.0",
@@ -490,7 +492,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 f.write(content)
             logger.info(
                 f"The model is bigger than the maximum size per checkpoint ({max_shard_size}) and is going to be "
-                f"split in {len(state_dict_split.filename_to_tensors)} checkpoint shards. You can find where each parameters has been saved in the "
+                f"split in {len(state_dict_split.filename_to_tensors)} checkpoint shards. "
+                "You can find where each parameters has been saved in the "
                 f"index located at {save_index_file}."
             )
         else:
@@ -610,8 +613,10 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         If you get the error message below, you need to finetune the weights for your downstream task:
 
         ```bash
-        Some weights of UNet2DConditionModel were not initialized from the model checkpoint at runwayml/stable-diffusion-v1-5 and are newly initialized because the shapes did not match:
-        - conv_in.weight: found shape torch.Size([320, 4, 3, 3]) in the checkpoint and torch.Size([320, 9, 3, 3]) in the model instantiated
+        Some weights of UNet2DConditionModel were not initialized from the model checkpoint at
+        runwayml/stable-diffusion-v1-5 and are newly initialized because the shapes did not match:
+        - conv_in.weight: found shape torch.Size([320, 4, 3, 3]) in the checkpoint and
+          torch.Size([320, 9, 3, 3]) in the model instantiated
         You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
         ```
         """
@@ -692,7 +697,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         elif isinstance(device_map, int):
             if device_map < 0:
                 raise ValueError(
-                    "You can't pass device_map as a negative int. If you want to put the model on the cpu, pass device_map = 'cpu' "
+                    "You can't pass device_map as a negative int. "
+                    "If you want to put the model on the cpu, pass device_map = 'cpu'."
                 )
             else:
                 device_map = {"": device_map}
@@ -869,7 +875,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
                     if len(unexpected_keys) > 0:
                         logger.warning(
-                            f"Some weights of the model checkpoint were not used when initializing {cls.__name__}: \n {[', '.join(unexpected_keys)]}"
+                            f"Some weights of the model checkpoint were not used when initializing "
+                            f"{cls.__name__}: \n {[', '.join(unexpected_keys)]}"
                         )
 
                 else:  # else let accelerate handle loading and dispatching.
@@ -905,10 +912,12 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
                         if "'Attention' object has no attribute" in str(e):
                             logger.warning(
-                                f"Taking `{str(e)}` while using `accelerate.load_checkpoint_and_dispatch` to mean {pretrained_model_name_or_path}"
-                                " was saved with deprecated attention block weight names. We will load it with the deprecated attention block"
-                                " names and convert them on the fly to the new attention block format. Please re-save the model after this conversion,"
-                                " so we don't have to do the on the fly renaming in the future. If the model is from a hub checkpoint,"
+                                f"Taking `{str(e)}` while using `accelerate.load_checkpoint_and_dispatch` to mean "
+                                f"{pretrained_model_name_or_path} was saved with deprecated attention block weight "
+                                "names. We will load it with the deprecated attention block names and convert them "
+                                "on the fly to the new attention block format. Please re-save the model after this "
+                                "conversion, so we don't have to do the on the fly renaming in the future. "
+                                "If the model is from a hub checkpoint,"
                                 " please also re-upload it or open a PR on the original repository."
                             )
                             model._temp_convert_self_to_deprecated_attention_blocks()
@@ -1109,7 +1118,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 if isinstance(module, ModelMixin):
                     if module._no_split_modules is None:
                         raise ValueError(
-                            f"{module.__class__.__name__} does not support `device_map='{device_map}'`. To implement support, the model "
+                            f"{module.__class__.__name__} does not support `device_map='{device_map}'`. "
+                            "To implement support, the model "
                             "class needs to implement the `_no_split_modules` attribute."
                         )
                     else:

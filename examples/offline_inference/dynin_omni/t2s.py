@@ -207,10 +207,7 @@ def ensure_local_vq_audio_repo(
         )
 
     if not looks_like_hf_repo_id(source):
-        raise ValueError(
-            "Cannot snapshot_download non-HF source. "
-            f"Expected repo id like 'org/repo', got: {source}"
-        )
+        raise ValueError(f"Cannot snapshot_download non-HF source. Expected repo id like 'org/repo', got: {source}")
 
     try:
         from huggingface_hub import snapshot_download
@@ -438,12 +435,17 @@ def resolve_t2s_runtime_defaults(
                 return float(value)
         return float(default)
 
-    cfg_select = lambda _path: None
+    def cfg_select(_path: str) -> Any:
+        return None
+
     try:
         from omegaconf import OmegaConf
 
         dynin_cfg = OmegaConf.load(dynin_config_path)
-        cfg_select = lambda _path: OmegaConf.select(dynin_cfg, _path)
+
+        def cfg_select(_path: str) -> Any:
+            return OmegaConf.select(dynin_cfg, _path)
+
     except Exception:
         pass
 

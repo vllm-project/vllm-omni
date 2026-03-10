@@ -15,8 +15,6 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-logger = init_logger(__name__)
-
 from .dynin_omni_common import (
     DETOK_TEXT,
     TASK_TO_DETOK,
@@ -28,6 +26,8 @@ from .dynin_omni_common import (
 )
 from .modeling_dynin_omni import DyninOmniModelLM
 from .sampling import get_mask_schedule
+
+logger = init_logger(__name__)
 
 TASK_TO_PROMPTING_TASK = {
     "t2i": "t2i_gen",

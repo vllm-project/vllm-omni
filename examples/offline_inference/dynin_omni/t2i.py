@@ -172,12 +172,18 @@ def resolve_t2i_runtime_defaults(
         return float(default)
 
     dynin_cfg: Any | None = None
-    cfg_select = lambda _path: None
+
+    def cfg_select(_path: str) -> Any:
+        return None
+
     try:
         from omegaconf import OmegaConf
 
         dynin_cfg = OmegaConf.load(dynin_config_path)
-        cfg_select = lambda _path: OmegaConf.select(dynin_cfg, _path)
+
+        def cfg_select(_path: str) -> Any:
+            return OmegaConf.select(dynin_cfg, _path)
+
     except Exception:
         pass
 

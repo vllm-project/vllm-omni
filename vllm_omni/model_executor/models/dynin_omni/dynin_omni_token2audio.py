@@ -262,8 +262,7 @@ class DyninOmniToken2Audio(nn.Module):
                     )
             except Exception as e:
                 raise RuntimeError(
-                    "Failed to load EMOVASpeechTokenizer from Hugging Face remote code "
-                    f"for model path '{model_path}'."
+                    f"Failed to load EMOVASpeechTokenizer from Hugging Face remote code for model path '{model_path}'."
                 ) from e
 
             if not hasattr(self._vq_audio, "decode"):

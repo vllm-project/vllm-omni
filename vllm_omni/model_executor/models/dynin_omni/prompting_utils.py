@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import torch
+
 reserved_token_mapping = {
     "<|soi|>": 126084,
     "<|eoi|>": 126085,
@@ -39,9 +41,6 @@ reserved_token_mapping = {
     "<think>": 126105,
     "</think>": 126106,
 }
-
-
-import torch
 
 
 class UniversalPrompting:
@@ -115,7 +114,7 @@ class UniversalPrompting:
                     "additional_special_tokens": ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"]
                 }
 
-                num_added = self.text_tokenizer.add_special_tokens(special_tokens_dict)
+                self.text_tokenizer.add_special_tokens(special_tokens_dict)
                 new_token_id = self.text_tokenizer.convert_tokens_to_ids(["<|end_header_id|>"])
                 self.sptids_dict["<|end_header_id|>"] = torch.tensor(new_token_id)
                 self.sptids_dict["<|eot_id|>"] = torch.tensor(self.text_tokenizer.convert_tokens_to_ids(["<|eot_id|>"]))
@@ -139,7 +138,6 @@ class UniversalPrompting:
         attention_masks = []
         label_ids = []
         probs = torch.rand(len(text_ids))
-        eos_id = self.text_tokenizer.eos_token_id
 
         for i in range(len(text_ids)):
             if len(text_ids[i]) == 0:
@@ -299,7 +297,8 @@ class UniversalPrompting:
     ):
         """
         Builds a text+image -> text+image sequence:
-        [pads] <|ti2ti|> <|soi|> [src_img] <|eoi|> [src text (padded)] <|soi|> [masked tgt img] <|eoi|> [tgt text (padded)]
+        [pads] <|ti2ti|> <|soi|> [src_img] <|eoi|> [src text (padded)] <|soi|>
+        [masked tgt img] <|eoi|> [tgt text (padded)]
         Prompt (src text) is conditioning-only; target text + target image are supervised.
         """
         device = source_tokens.device
@@ -892,7 +891,6 @@ class UniversalPrompting:
         soi_token = self.sptids_dict["<|soi|>"].to(device).view(-1)
         eoi_token = self.sptids_dict["<|eoi|>"].to(device).view(-1)
         soa_token = self.sptids_dict["<|soa|>"].to(device).view(-1)
-        eoa_token = self.sptids_dict["<|eoa|>"].to(device).view(-1)
 
         max_text_len = self.max_text_len - 1
         max_audio_len = self.max_audio_len_short
@@ -976,12 +974,10 @@ class UniversalPrompting:
             if max_text_len >= len(temp_ids):
                 pad_len = max_text_len - len(temp_ids)
                 temp_ids = temp_ids + [eos_id] * pad_len
-                temp_masks = [1] * (len(temp_ids) + image_ids.shape[-1] + 3) + [0] * pad_len
                 # ignore padded eos in labels
                 pad_labels = torch.full((pad_len,), self.ignore_id, device=device, dtype=torch.long)
             else:
                 temp_ids = temp_ids[: max_text_len - 1] + [self.text_tokenizer.eos_token_id]
-                temp_masks = [1] * (len(temp_ids) + image_ids.shape[-1] + 3)
                 pad_labels = torch.empty(0, device=device, dtype=torch.long)
 
             temp_label_ids = torch.cat(
@@ -1190,11 +1186,9 @@ class UniversalPrompting:
             if max_text_len >= len(temp_ids):
                 pad_len = max_text_len - len(temp_ids)
                 temp_ids = temp_ids + [eos_id] * pad_len
-                temp_masks = [1] * (len(temp_ids) + image_ids.shape[-1] + 3) + [0] * pad_len
                 pad_labels = torch.full((pad_len,), self.ignore_id, device=device, dtype=torch.long)
             else:
                 temp_ids = temp_ids[: max_text_len - 1] + [self.text_tokenizer.eos_token_id]
-                temp_masks = [1] * (len(temp_ids) + image_ids.shape[-1] + 3)  # +2 for two special tokens
                 pad_labels = torch.empty(0, device=device, dtype=torch.long)
 
             # prompting -- [task token] [sot] [text tokens] [eot] [soi] [image tokens] [eoi]
@@ -1883,7 +1877,6 @@ class UniversalPrompting:
         device = image_ids.device
         sequence_ids = []
         prompt_masks = []
-        label_ids = []
         r2i_id = int(self.sptids_dict["<|r2i|>"])
         soi_id = int(self.sptids_dict["<|soi|>"])
         eoi_id = int(self.sptids_dict["<|eoi|>"])

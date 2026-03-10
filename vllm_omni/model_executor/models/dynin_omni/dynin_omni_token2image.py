@@ -20,10 +20,9 @@ from .dynin_omni_common import (
     resolve_hidden_size,
     to_token_1d,
 )
+from .modeling_magvitv2 import MAGVITv2
 
 logger = init_logger(__name__)
-
-from .modeling_magvitv2 import MAGVITv2
 
 
 class DyninOmniToken2Image(nn.Module):

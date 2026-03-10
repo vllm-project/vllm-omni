@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
-from .common_modules import *
+from .common_modules import AttnBlock, Downsample, Normalize, ResnetBlock, Upsample, nonlinearity
 from .modeling_utils import ConfigMixin, ModelMixin, register_to_config
 
 
@@ -15,7 +15,7 @@ class Updateable:
                 continue
             try:
                 module = getattr(self, attr)
-            except:
+            except Exception:
                 continue  # ignore attributes like property, which can't be retrieved using getattr?
             if isinstance(module, Updateable):
                 module.do_update_step(epoch, global_step, on_load_weights=on_load_weights)
@@ -27,7 +27,7 @@ class Updateable:
                 continue
             try:
                 module = getattr(self, attr)
-            except:
+            except Exception:
                 continue  # ignore attributes like property, which can't be retrieved using getattr?
             if isinstance(module, Updateable):
                 module.do_update_step_end(epoch, global_step)
@@ -288,7 +288,6 @@ class VQGANDecoder(ModelMixin, ConfigMixin):
 
         self.z_channels = z_channels
         # compute in_ch_mult, block_in and curr_res at lowest res
-        in_ch_mult = (1,) + tuple(ch_mult)
         block_in = ch * ch_mult[self.num_resolutions - 1]
         curr_res = self.resolution // 2 ** (self.num_resolutions - 1)
         self.z_shape = (1, z_channels, curr_res, curr_res)

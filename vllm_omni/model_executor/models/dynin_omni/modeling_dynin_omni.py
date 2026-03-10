@@ -116,7 +116,8 @@ def calculate_t2s_loss(
 def add_gumbel_noise(logits, temperature):
     """
     The Gumbel max is a method for sampling categorical distributions.
-    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
+    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves
+    perplexity score but reduces generation quality.
     Thus, we use float64.
     """
     if temperature == 0:
@@ -237,7 +238,6 @@ class DyninOmniModelLM(LLaDAModelLM):
         https://github.com/google-research/maskgit/blob/main/maskgit/libml/parallel_decode.py#L79
         """
 
-        mask_count = (input_ids == mask_token_id).sum().item()
         num_vq_tokens = seq_len
         num_new_special_tokens = 0
         uni_prompting = kwargs.get("uni_prompting", None)
@@ -827,8 +827,6 @@ class DyninOmniModelLM(LLaDAModelLM):
         """
 
         # begin with all image token ids masked
-        # 计算有多少个mask token
-        mask_count = (input_ids == mask_token_id).sum().item()
         num_vq_tokens = seq_len
         num_new_special_tokens = 0
         uni_prompting = kwargs.get("uni_prompting", None)
@@ -941,7 +939,6 @@ class DyninOmniModelLM(LLaDAModelLM):
         """
 
         # begin with all image token ids masked
-        mask_count = (input_ids == mask_token_id).sum().item()
         num_vq_tokens = seq_len
         num_new_special_tokens = 0
         uni_prompting = kwargs.get("uni_prompting", None)
@@ -1145,7 +1142,12 @@ class DyninOmniModelLM(LLaDAModelLM):
                         loss_t2i_check = loss_t2i.to(torch.float32)
                         if (not torch.isfinite(loss_t2i_check)) or (loss_t2i_check < 0) or (loss_t2i_check > 10000):
                             label_vals = labels_t2i[valid_mask]
-                            warn_msg = f"t2i loss became non-finite. label_min={label_vals.min().item() if label_vals.numel() > 0 else -1} label_max={label_vals.max().item() if label_vals.numel() > 0 else -1} valid_count={int(valid_mask.sum().item())}"
+                            warn_msg = (
+                                "t2i loss became non-finite. "
+                                f"label_min={label_vals.min().item() if label_vals.numel() > 0 else -1} "
+                                f"label_max={label_vals.max().item() if label_vals.numel() > 0 else -1} "
+                                f"valid_count={int(valid_mask.sum().item())}"
+                            )
                             logger.warning("[t2i warn] %s", warn_msg)
                             warnings.warn(warn_msg)
                             loss_t2i = zero_loss
@@ -1182,7 +1184,12 @@ class DyninOmniModelLM(LLaDAModelLM):
                         )
                         if (not torch.isfinite(loss_i2i)) or (loss_i2i < 0):
                             label_vals = labels_i2i[image_mask]
-                            warn_msg = f"i2i loss became non-finite. label_min={label_vals.min().item() if label_vals.numel() > 0 else -1} label_max={label_vals.max().item() if label_vals.numel() > 0 else -1} valid_count={int(image_mask.sum().item())}"
+                            warn_msg = (
+                                "i2i loss became non-finite. "
+                                f"label_min={label_vals.min().item() if label_vals.numel() > 0 else -1} "
+                                f"label_max={label_vals.max().item() if label_vals.numel() > 0 else -1} "
+                                f"valid_count={int(image_mask.sum().item())}"
+                            )
                             warnings.warn(warn_msg)
                             loss_i2i = zero_loss
         else:
@@ -1689,8 +1696,6 @@ class DyninOmniModelLM(LLaDAModelLM):
         attention_bias = torch.ones(
             input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1], device=input_ids.device
         )
-        input_embeddings = super().model.transformer.wte(input_ids)
-
         logits = self(input_ids, attention_bias=attention_bias).logits
         self.output_size = logits.shape[-1]
 
@@ -1787,12 +1792,6 @@ class DyninOmniModelLM(LLaDAModelLM):
             attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
         else:
             attention_bias = None
-        try:
-            device = idx.device
-        except:
-            device = input_embeddings.device
-
-        result = []
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
         x[:, : idx.shape[1]] = idx.clone()
@@ -1873,12 +1872,6 @@ class DyninOmniModelLM(LLaDAModelLM):
             attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
         else:
             attention_bias = None
-        try:
-            device = idx.device
-        except:
-            device = input_embeddings.device
-
-        result = []
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
         x[:, : idx.shape[1]] = idx.clone()
@@ -1958,12 +1951,6 @@ class DyninOmniModelLM(LLaDAModelLM):
             attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
         else:
             attention_bias = None
-        try:
-            device = idx.device
-        except:
-            device = input_embeddings.device
-
-        result = []
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
         x[:, : idx.shape[1]] = idx.clone()
@@ -2091,7 +2078,6 @@ class DyninOmniModelLM(LLaDAModelLM):
         """
 
         # begin with all image token ids masked
-        mask_count = (input_ids == mask_token_id).sum().item()
         num_vq_tokens = seq_len
         num_new_special_tokens = 0
         uni_prompting = kwargs.get("uni_prompting", None)

@@ -5,9 +5,6 @@ LLaDA configuration
 from dataclasses import dataclass
 from enum import Enum
 from os import PathLike
-from typing import (
-    Union,
-)
 
 from transformers import AutoConfig, PretrainedConfig
 
@@ -20,7 +17,7 @@ __all__ = [
     "ModelConfig",
 ]
 
-PathOrStr = Union[str, PathLike]
+PathOrStr = str | PathLike
 
 
 class StrEnum(str, Enum):
@@ -240,7 +237,8 @@ class ModelConfig:
     """
     Whether to include bias and weight parameters for the layer norms.
     This only affects layer norms that are immediately followed by a linear layer in the forward pass,
-    so everything except QK-norms. To turn off affines for QK norms as well, set :attr:`attention_layer_norm_with_affine`
+    so everything except QK-norms. To turn off affines for QK norms as well, set
+    :attr:`attention_layer_norm_with_affine`
     to ``False``.
     """
 
@@ -340,7 +338,8 @@ class ModelConfig:
 
     init_cutoff_factor: float | None = None
     """
-    A positive factor used to scale the cutoff values when initializing weights with a "fixed distribution" ``init_fn``, such
+    A positive factor used to scale the cutoff values when initializing weights with a
+    "fixed distribution" ``init_fn``, such
     as "normal". Setting this to None means values are not cutoff.
     """
 

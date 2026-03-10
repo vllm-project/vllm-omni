@@ -328,12 +328,17 @@ def resolve_i2t_runtime_defaults(
                 return float(value)
         return float(default)
 
-    cfg_select = lambda _path: None
+    def cfg_select(_path: str) -> Any:
+        return None
+
     try:
         from omegaconf import OmegaConf
 
         dynin_cfg = OmegaConf.load(dynin_config_path)
-        cfg_select = lambda _path: OmegaConf.select(dynin_cfg, _path)
+
+        def cfg_select(_path: str) -> Any:
+            return OmegaConf.select(dynin_cfg, _path)
+
     except Exception:
         pass
 
@@ -849,7 +854,6 @@ def main() -> None:
     i2t_temperature = float(runtime_defaults["i2t_temperature"])
     i2t_cfg_scale = float(runtime_defaults["i2t_cfg_scale"])
     mask_token_id = int(runtime_defaults["mask_token_id"])
-    codebook_size = int(runtime_defaults["codebook_size"])
     image_resolution = int(runtime_defaults["image_resolution"])
 
     validate_generation_args(
