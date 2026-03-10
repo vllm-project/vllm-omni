@@ -67,8 +67,8 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
       <td>&lt;30min</td>
       <td>
-        /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
-        /tests/e2e/offline_inference/test_{model_name}_expansion.py
+        /tests/e2e/online_serving/test_{model_name}.py<br>
+        /tests/e2e/offline_inference/test_{model_name}.py
       </td>
       <td>
         <a href="#chapter-2-l3-level-testing-core-integration-performance-and-accuracy-verification">Chapter 2</a><br>
