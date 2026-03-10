@@ -2,10 +2,10 @@ import warnings
 from dataclasses import dataclass
 
 import numpy as np
-from transformers import PreTrainedTokenizerBase
 from vllm.benchmarks.datasets import SampleRequest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
 from vllm.benchmarks.serve import MILLISECONDS_TO_SECONDS_CONVERSION, TERM_PLOTLIB_AVAILABLE, BenchmarkMetrics, TaskType
+from vllm.tokenizers import TokenizerLike
 
 
 @dataclass
@@ -134,7 +134,7 @@ def calculate_metrics(
     input_requests: list[SampleRequest],
     outputs: list[RequestFuncOutput],
     dur_s: float,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: TokenizerLike | None,
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
     task_type,
@@ -169,17 +169,21 @@ def calculate_metrics(
     audio_rtfs: list[float] = []
     audio_duration: list[float] = []
     audio_frames: list[int] = []
+    input_audio_duration = 0.0
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
 
             if not output_len:
-                # We use the tokenizer to count the number of output tokens
-                # for some serving backends instead of looking at
-                # len(outputs[i].itl) since multiple output tokens may be
-                # bundled together
-                # Note : this may inflate the output token count slightly
-                output_len = len(tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids)
+                if tokenizer is None:
+                    output_len = 1
+                else:
+                    # We use the tokenizer to count the number of output tokens
+                    # for some serving backends instead of looking at
+                    # len(outputs[i].itl) since multiple output tokens may be
+                    # bundled together
+                    # Note : this may inflate the output token count slightly
+                    output_len = len(tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += input_requests[i].prompt_len
             tpot = 0
@@ -196,6 +200,7 @@ def calculate_metrics(
             audio_duration.append(getattr(outputs[i], "audio_duration", 0.0))
             audio_frames.append(getattr(outputs[i], "audio_frames", 0.0))
             e2els.append(outputs[i].latency)
+            input_audio_duration += outputs[i].input_audio_duration
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -335,6 +340,7 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles],
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        rtfx=input_audio_duration / dur_s,
     )
     print_metrics(
         task_type,

@@ -56,6 +56,16 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2",
         "Wan22Pipeline",
     ),
+    "LTX2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2Pipeline",
+    ),
+    "LTX2ImageToVideoPipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2ImageToVideoPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -110,6 +120,16 @@ _DIFFUSION_MODELS = {
         "omnigen2",
         "pipeline_omnigen2",
         "OmniGen2Pipeline",
+    ),
+    "HeliosPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
+    "HeliosPyramidPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
     ),
 }
 
@@ -265,6 +285,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
@@ -275,6 +297,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
+    "HeliosPipeline": "get_helios_post_process_func",
+    "HeliosPyramidPipeline": "get_helios_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -289,6 +313,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
+    "HeliosPipeline": "get_helios_pre_process_func",
+    "HeliosPyramidPipeline": "get_helios_pre_process_func",
 }
 
 

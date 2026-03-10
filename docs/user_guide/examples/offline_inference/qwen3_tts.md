@@ -11,7 +11,7 @@ Qwen3 TTS provides multiple task variants for speech generation:
 
 - **CustomVoice**: Generate speech with a known speaker identity (speaker ID) and optional instruction.
 - **VoiceDesign**: Generate speech from text plus a descriptive instruction that designs a new voice.
-- **Base**: Voice cloning using a reference audio + reference transcript, with optional mode selection.
+- **Base**: Voice cloning using a reference audio + reference transcript, with optional mode selection. The `ref_audio` field accepts a local file path, HTTP URL, or base64 data URL.
 
 ## Setup
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
@@ -98,7 +98,8 @@ Add `--streaming` to stream audio chunks progressively via `AsyncOmni` (requires
 python end2end.py --query-type CustomVoice --streaming --output-dir /tmp/out_stream
 ```
 
-Each 25-frame Code2Wav chunk is logged as it arrives. The final WAV file is written once generation
+Each Code2Wav chunk is logged as it arrives (default 25 frames; configurable via `codec_chunk_frames`
+and `initial_codec_chunk_frames` in the stage config). The final WAV file is written once generation
 completes. This demonstrates that audio data is available progressively rather than only at the end.
 
 > **Note:** Streaming uses `AsyncOmni` internally. The non-streaming path (`Omni`) is unchanged.

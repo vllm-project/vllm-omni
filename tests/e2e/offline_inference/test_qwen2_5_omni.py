@@ -10,11 +10,28 @@ from tests.conftest import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
+    modify_stage_config,
 )
 from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
+
+
+def get_cuda_graph_config():
+    path = modify_stage_config(
+        str(Path(__file__).parent.parent / "stage_configs" / "qwen2_5_omni_ci.yaml"),
+        updates={
+            "stage_args": {
+                0: {
+                    "engine_args.enforce_eager": "true",
+                },
+                1: {"engine_args.enforce_eager": "true"},
+            },
+        },
+    )
+    return path
+
 
 # CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
 if current_omni_platform.is_npu():
@@ -23,7 +40,7 @@ elif current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_config = str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
 else:
-    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
+    stage_config = get_cuda_graph_config()
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models]
