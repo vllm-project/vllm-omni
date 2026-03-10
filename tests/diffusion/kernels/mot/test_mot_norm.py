@@ -22,6 +22,8 @@ from vllm.model_executor.layers.layernorm import rms_norm
 
 from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
