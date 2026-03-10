@@ -235,7 +235,7 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
         "/v1/videos",
         data={
             "prompt": "A fox running through snow.",
-            "image_reference": {json.dumps({"image_url": _make_test_image_data_url((40, 24))})},
+            "image_reference": json.dumps({"image_url": _make_test_image_data_url((40, 24))}),
         },
     )
 
