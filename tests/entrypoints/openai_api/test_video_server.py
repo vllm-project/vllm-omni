@@ -17,7 +17,6 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
-from pydantic import ValidationError
 from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.openai import api_server
@@ -392,14 +391,6 @@ def test_missing_prompt_returns_422(test_client):
         data={"size": "320x240"},
     )
     assert response.status_code == 422
-
-
-def test_invalid_size_format_raises_validation_error(test_client):
-    with pytest.raises(ValidationError):
-        test_client.post(
-            "/v1/videos",
-            data={"prompt": "bad size", "size": "invalid"},
-        )
 
 
 def test_invalid_size_parse_returns_422(test_client):
