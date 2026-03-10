@@ -10,12 +10,14 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 import base64
 import io
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
@@ -241,6 +243,30 @@ def test_models_endpoint_no_engine():
     data = response.json()
     assert data["object"] == "list"
     assert len(data["data"]) == 0
+
+
+def test_get_engine_and_model_reads_base_model_paths_in_diffusion_mode():
+    """Regression test for pure diffusion servers exposing base_model_paths."""
+    from vllm_omni.entrypoints.openai.api_server import (
+        _DiffusionServingModels,
+        _get_engine_and_model,
+    )
+
+    engine_client = SimpleNamespace(stage_list=["diffusion"])
+    state = SimpleNamespace(
+        engine_client=engine_client,
+        stage_configs=[{"stage_type": "diffusion"}],
+        openai_serving_models=_DiffusionServingModels(
+            [BaseModelPath(name="tencent/HunyuanImage-3.0-Instruct", model_path="/models/hunyuan")]
+        ),
+    )
+    raw_request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    returned_engine, model_name, stage_types = _get_engine_and_model(raw_request)
+
+    assert returned_engine is engine_client
+    assert model_name == "tencent/HunyuanImage-3.0-Instruct"
+    assert stage_types == ["diffusion"]
 
 
 def test_generate_single_image(test_client):

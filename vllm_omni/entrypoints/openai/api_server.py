@@ -178,6 +178,10 @@ class _DiffusionServingModels:
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
         self._base_model_paths = base_model_paths
 
+    @property
+    def base_model_paths(self) -> list[BaseModelPath]:
+        return self._base_model_paths
+
     async def show_available_models(self) -> ModelList:
         return ModelList(
             data=[
