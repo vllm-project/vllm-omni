@@ -9,9 +9,14 @@ video models (e.g., Wan2.2).
 """
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
+import time
+from pydantic import BaseModel, Field, field_validator, model_validator
+from vllm_omni.entrypoints.openai.image_api_utils import parse_size
+import uuid
 
-from pydantic import BaseModel, Field, field_validator
+DEFAULT_FPS = 24
+GENERATION_STATUS = Literal["queued", "in_progress", "complete", "failed", "deleted"]
 
 
 class VideoResponseFormat(str, Enum):
@@ -71,8 +76,8 @@ class VideoGenerationRequest(BaseModel):
     # Video-specific fields (top-level for OpenAI-style compatibility)
     width: int | None = Field(default=None, ge=1, description="Video width in pixels")
     height: int | None = Field(default=None, ge=1, description="Video height in pixels")
-    num_frames: int | None = Field(default=None, ge=1, description="Number of frames to generate")
     fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
+    num_frames: int | None = Field(default=None, ge=1, description="Number of frames to generate")
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
@@ -152,6 +157,26 @@ class VideoGenerationRequest(BaseModel):
             return v
         raise ValueError("seconds must be an integer or numeric string")
 
+    def resolve_video_params(self) -> VideoParams:
+        vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
+
+        if self.video_params is not None:
+            vp.width = vp.width or self.video_params.width
+            vp.height = vp.height or self.video_params.height
+            vp.fps = vp.fps or self.video_params.fps
+            vp.num_frames = vp.num_frames or self.video_params.num_frames
+
+        if self.size:
+            vp.width, vp.height = parse_size(self.size)
+
+        if vp.fps is None:
+            vp.fps = DEFAULT_FPS
+
+        if vp.num_frames is None and self.seconds is not None:
+            vp.num_frames = int(self.seconds) * int(vp.fps)
+
+        return vp
+
 
 class VideoData(BaseModel):
     """Single generated video data."""
@@ -166,3 +191,32 @@ class VideoGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[VideoData] = Field(..., description="Array of generated videos")
+
+
+class VideoResponse(BaseModel):
+    model: str
+    id: str = Field(default_factory=lambda: f"video_gen_{uuid.uuid4().hex}")
+    object: str = "video"
+    status: GENERATION_STATUS = "queued"
+    media_type: Literal["video/mp4"] = "video/mp4"
+    size: str = ""
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    completed_at: int | None = None
+    expires_at: int | None = None
+    error: dict[str, Any | None] | None = None
+    file_paths: list[str] = Field(
+        default_factory=list,
+        description="Saved output file paths.",
+    )
+    peak_memory_mb: float | None = None
+    inference_time_s: float | None = None
+
+    @property
+    def file_extension(self) -> str:
+        ext_map = {"video/mp4": "mp4"}
+        return ext_map[self.media_type]
+
+
+class VideoListResponse(BaseModel):
+    data: list[VideoResponse]
+    object: str = "list"
