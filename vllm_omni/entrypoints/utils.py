@@ -203,7 +203,8 @@ def resolve_model_type(model: str) -> str:
         model: Model name or path
 
     Returns:
-        The model type string if found.
+        Model type string (e.g. ``"Qwen3TTSForConditionalGeneration"``,
+        ``"StableAudioPipeline"``).
 
     Raises:
         ValueError: If the model type cannot be determined from any
@@ -244,20 +245,16 @@ def resolve_model_type(model: str) -> str:
 
 
 def load_stage_configs_from_model(config_path: str | None, base_engine_args: dict | None = None) -> list:
-    """Load stage configurations from model's default config file.
-
-    Loads stage configurations based on the model type and device type.
-    First tries to load a device-specific YAML file from stage_configs/{device_type}/
-    directory. If not found, falls back to the default config file.
+    """Load stage configurations from a resolved config file path.
 
     Args:
-        config_path: Path to the YAML configuration file
+        config_path: Path to the YAML configuration file, or None.
+            When None, returns an empty list.
+        base_engine_args: Optional engine arguments to merge with stage configs.
 
     Returns:
-        List of stage configuration dictionaries
-
-    Raises:
-        FileNotFoundError: If no stage config file exists for the model type
+        List of stage configuration dictionaries, or empty list if
+        config_path is None.
     """
     if base_engine_args is None:
         base_engine_args = {}
