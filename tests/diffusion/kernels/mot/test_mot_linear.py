@@ -48,6 +48,8 @@ from vllm_omni.diffusion.layers.mot.ops.mot_gemm import (
     get_best_mot_config,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
