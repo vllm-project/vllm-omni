@@ -120,7 +120,6 @@ _OMNI_EXAMPLE_MODELS: dict[str, _OmniExamplesInfo] = {
         default="Qwen/Qwen2.5-Omni-7B",
         model_stage="talker",
         hf_config_name="talker_config",
-        has_multimodal_processor=True,
     ),
     "Qwen2_5OmniToken2WavModel": _OmniExamplesInfo(
         default="Qwen/Qwen2.5-Omni-7B",

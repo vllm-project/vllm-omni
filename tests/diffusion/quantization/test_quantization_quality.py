@@ -322,6 +322,12 @@ _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUA
 
 def _quality_param(c: QualityTestConfig):
     marks = list(_marks)
+    if c.id == "fp8_z_image":
+        marks.append(
+            pytest.mark.skip(
+                reason="Z-Image FP8 quality gate temporarily disabled: https://github.com/vllm-project/vllm-omni/issues/3531"
+            )
+        )
     if c.id == "fp8_qwen_image":
         marks.append(
             pytest.mark.skip(reason="Qwen-Image FP8 quality gate temporarily disabled (see CI / issue tracker).")

@@ -47,7 +47,7 @@ tts_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_stage_config(),
-            server_args=["--trust-remote-code", "--disable-log-stats", "--no-async-chunk"],
+            server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         id="cosyvoice3",
     )
@@ -58,7 +58,7 @@ tts_async_chunk_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_stage_config(),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
+            server_args=["--trust-remote-code"],
         ),
         id="cosyvoice3_async_chunk",
     )

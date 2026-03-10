@@ -24,6 +24,7 @@ class _FakeDecoder(nn.Module):
         super().__init__()
         self.total_upsample = total_upsample
         self.decode_calls: list[dict[str, int]] = []
+        self.batched_decode_calls: list[dict[str, int]] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
     def to(self, *args, **kwargs):
@@ -40,12 +41,40 @@ class _FakeDecoder(nn.Module):
             {
                 "chunk_size": chunk_size,
                 "left_context_size": left_context_size,
+                "codes_shape": tuple(codes.shape),
             }
         )
+        batch = codes.shape[0]
         frames = codes.shape[-1]
         wav_len = frames * self.total_upsample + 6
-        wav = torch.arange(wav_len, dtype=torch.float32)
-        return wav.view(1, 1, -1)
+        wav = torch.arange(wav_len, dtype=torch.float32).view(1, 1, -1)
+        offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
+        return wav.expand(batch, 1, wav_len) + offsets
+
+    def batched_chunked_decode(
+        self,
+        codes: torch.Tensor,
+        lengths: list[int],
+        *,
+        chunk_size: int = 300,
+        left_context_size: int = 25,
+        max_batch_size: int = 0,
+    ) -> torch.Tensor:
+        self.batched_decode_calls.append(
+            {
+                "chunk_size": chunk_size,
+                "left_context_size": left_context_size,
+                "max_batch_size": max_batch_size,
+                "codes_shape": tuple(codes.shape),
+                "lengths": tuple(lengths),
+            }
+        )
+        batch = codes.shape[0]
+        frames = codes.shape[-1]
+        wav_len = frames * self.total_upsample + 6
+        wav = torch.arange(wav_len, dtype=torch.float32).view(1, 1, -1)
+        offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
+        return wav.expand(batch, 1, wav_len) + offsets
 
     def enable_cudagraph(self, **kwargs):
         self.cudagraph_calls.append(kwargs)
@@ -177,6 +206,7 @@ def test_connector_codec_chunking_does_not_override_decode_chunking():
     assert model.decoder.decode_calls[-1] == {
         "chunk_size": 300,
         "left_context_size": 25,
+        "codes_shape": (1, _NUM_QUANTIZERS, 6),
     }
 
 
@@ -199,6 +229,175 @@ def test_decode_chunking_can_be_overridden_separately():
     assert model._decode_left_context_frames == 17
 
 
+def test_malformed_codec_length_warning_is_rate_limited():
+    model = _make_model()
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger.warning") as warning:
+        out1 = model.forward(input_ids=torch.arange(1, dtype=torch.long))
+        out2 = model.forward(input_ids=torch.arange(1, dtype=torch.long))
+
+    assert warning.call_count == 1
+    assert "not divisible by num_quantizers" in warning.call_args[0][0]
+    assert "suppressing repeats" in warning.call_args[0][0]
+    assert out1.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert out2.multimodal_outputs["model_outputs"][0].numel() == 0
+
+
+def test_forward_batches_equal_length_requests_in_one_decoder_call():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),
+        seq_token_counts=[6, 6],
+        runtime_additional_information=[
+            {"meta": {"left_context_size": 0}},
+            {"meta": {"left_context_size": 1}},
+        ],
+    )
+
+    assert model.decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (2, _NUM_QUANTIZERS, 3),
+        }
+    ]
+    audios = out.multimodal_outputs["model_outputs"]
+    torch.testing.assert_close(audios[0], torch.arange(12, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
+
+
+def test_forward_uses_variable_length_chunk_batching_for_long_bucket_group():
+    model = _make_model()
+    model._decode_batch_bucket_frames = [4]
+    model._decode_variable_chunk_batch_min_frames = 1
+
+    out = model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),
+        seq_token_counts=[4, 8],
+        runtime_additional_information=[
+            {"meta": {"left_context_size": 0}},
+            {"meta": {"left_context_size": 2}},
+        ],
+    )
+
+    assert model.decoder.decode_calls == []
+    assert model.decoder.batched_decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "max_batch_size": 0,
+            "codes_shape": (2, _NUM_QUANTIZERS, 4),
+            "lengths": (2, 4),
+        }
+    ]
+    audios = out.multimodal_outputs["model_outputs"]
+    torch.testing.assert_close(audios[0], torch.arange(8, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1008, 1016, dtype=torch.float32))
+
+
+def test_forward_bucket_batches_different_length_requests_and_trims_rows():
+    model = _make_model()
+    model._decode_batch_bucket_frames = [4]
+
+    out = model.forward(
+        input_ids=torch.arange(18, dtype=torch.long),
+        seq_token_counts=[4, 6, 8],
+        runtime_additional_information=[
+            {"meta": {"left_context_size": 0}},
+            {"meta": {"left_context_size": 1}},
+            {"meta": {"left_context_size": 2}},
+        ],
+    )
+
+    assert model.decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (3, _NUM_QUANTIZERS, 4),
+        }
+    ]
+    assert model.decoder.batched_decode_calls == []
+    audios = out.multimodal_outputs["model_outputs"]
+    torch.testing.assert_close(audios[0], torch.arange(8, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
+    torch.testing.assert_close(audios[2], torch.arange(2008, 2016, dtype=torch.float32))
+
+
+def test_forward_bucket_pads_only_to_group_max_frame_length():
+    model = _make_model()
+    model._decode_batch_bucket_frames = [8]
+
+    out = model.forward(
+        input_ids=torch.arange(10, dtype=torch.long),
+        seq_token_counts=[4, 6],
+        runtime_additional_information=[
+            {"meta": {"left_context_size": 0}},
+            {"meta": {"left_context_size": 0}},
+        ],
+    )
+
+    assert model.decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (2, _NUM_QUANTIZERS, 3),
+        }
+    ]
+    assert model.decoder.batched_decode_calls == []
+    audios = out.multimodal_outputs["model_outputs"]
+    torch.testing.assert_close(audios[0], torch.arange(8, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1000, 1012, dtype=torch.float32))
+
+
+def test_forward_splits_bucket_groups_by_configured_max_batch_size():
+    model = _make_model()
+    model._decode_batch_bucket_frames = [4]
+    model._decode_batch_max_size = 2
+
+    model.forward(
+        input_ids=torch.arange(18, dtype=torch.long),
+        seq_token_counts=[4, 6, 8],
+        runtime_additional_information=[
+            {"meta": {"left_context_size": 0}},
+            {"meta": {"left_context_size": 0}},
+            {"meta": {"left_context_size": 0}},
+        ],
+    )
+
+    assert model.decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (2, _NUM_QUANTIZERS, 3),
+        },
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (1, _NUM_QUANTIZERS, 4),
+        },
+    ]
+    assert model.decoder.batched_decode_calls == []
+
+
+def test_forward_does_not_pad_singleton_bucket_group():
+    model = _make_model()
+    model._decode_batch_bucket_frames = [4]
+
+    model.forward(
+        input_ids=torch.arange(4, dtype=torch.long),
+        runtime_additional_information=[{"meta": {"left_context_size": 0}}],
+    )
+
+    assert model.decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (1, _NUM_QUANTIZERS, 2),
+        }
+    ]
+
+
 def test_decode_chunking_override_is_passed_to_cudagraph():
     model = _make_model(
         async_chunk=True,
@@ -216,12 +415,116 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     _load_weights_noop(model)
 
     assert model.decoder.cudagraph_calls[-1] == {
+        "capture_sizes": None,
+        "capture_batch_sizes": None,
+        "extra_capture_shapes": None,
+        "compile_shapes": None,
         "device": torch.device("cuda"),
         "codec_chunk_frames": 25,
         "codec_left_context_frames": 72,
         "decode_chunk_size": 400,
         "decode_left_context": 17,
     }
+
+
+def test_cudagraph_capture_shapes_can_be_configured():
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_cudagraph_capture_sizes": "97,325",
+                "decode_cudagraph_batch_sizes": [1, 2, 4, 8],
+                "decode_cudagraph_extra_capture_shapes": ["3:325", [5, 325]],
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    call = model.decoder.cudagraph_calls[-1]
+    assert call["capture_sizes"] == [97, 325]
+    assert call["capture_batch_sizes"] == [1, 2, 4, 8]
+    assert call["extra_capture_shapes"] == [(3, 325), (5, 325)]
+
+
+def test_decode_compile_shapes_can_be_configured():
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_compile_shapes": ["1:325", [1, 73]],
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    call = model.decoder.cudagraph_calls[-1]
+    assert call["compile_shapes"] == [(1, 73), (1, 325)]
+
+
+def test_decode_tf32_can_be_configured():
+    old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    old_matmul_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        model = _make_model(
+            async_chunk=True,
+            device=torch.device("cuda"),
+            stage_connector_config={
+                "extra": {
+                    "decode_enable_tf32": "true",
+                }
+            },
+        )
+
+        _load_weights_noop(model)
+
+        assert torch.backends.cuda.matmul.allow_tf32 is True
+        assert torch.backends.cudnn.allow_tf32 is True
+        assert torch.get_float32_matmul_precision() == "high"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+        torch.set_float32_matmul_precision(old_matmul_precision)
+
+
+def test_decode_batch_bucket_frames_can_be_configured():
+    model = _make_model(
+        async_chunk=True,
+        stage_connector_config={
+            "extra": {
+                "decode_batch_bucket_frames": "73,169",
+                "decode_batch_max_size": 10,
+                "decode_variable_chunk_batch_min_frames": 512,
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    assert model._decode_batch_bucket_frames == [73, 169]
+    assert model._decode_batch_max_size == 10
+    assert model._decode_variable_chunk_batch_min_frames == 512
+
+
+def test_invalid_decode_batch_max_size_is_rejected():
+    model = _make_model(
+        async_chunk=True,
+        stage_connector_config={
+            "extra": {
+                "decode_batch_max_size": -1,
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="decode_batch_max_size"):
+        _load_weights_noop(model)
 
 
 def test_invalid_decode_chunking_is_rejected():

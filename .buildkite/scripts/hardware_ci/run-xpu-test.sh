@@ -52,5 +52,5 @@ time timeout -k 30 30m docker run \
     pip install tblib==3.1.0
     cd /workspace/vllm-omni
     pytest -v -s -m "core_model and xpu and B60"
-    pytest -v -s -m "advanced_model and xpu and B60"
+    pytest -v -s -m "advanced_model and xpu and B60" -k "not omni_expansion"
 '

@@ -55,6 +55,7 @@ dev = [
     "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
     "torchmetrics>=1.4.0", # for accuracy similarity metrics
+    "ray[default]", # for RL test
     "jiwer>=3.0.0",
     "zhon>=2.0.0",
     "zhconv>=1.4.2",
@@ -62,7 +63,8 @@ dev = [
     "funasr>=1.0.0",
     "lpips>=0.1.4", # for quantization fp8
     "orjson>=3.11.7", # to make v1/embeddings API fast
-    "voxcpm>=2.0.2" # for voxcpm model test
+    "voxcpm>=2.0.2", # for voxcpm model Test
+    "torchdiffeq>=0.2.5" # for covo_audio Test
 ]
 
 demo = [
