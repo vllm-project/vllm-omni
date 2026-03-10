@@ -34,8 +34,6 @@ from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
 
 class ServerCase(NamedTuple):
     """Parametrizing the model to serve."""
