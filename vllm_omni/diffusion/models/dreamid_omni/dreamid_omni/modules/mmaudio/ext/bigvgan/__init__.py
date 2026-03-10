@@ -1,0 +1,2 @@
+from .bigvgan import BigVGAN
+

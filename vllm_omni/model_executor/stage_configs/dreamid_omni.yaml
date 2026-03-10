@@ -1,0 +1,37 @@
+# Stage config for DreamID-Omni (video + audio diffusion).
+async_chunk: false
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      # Pass --model as the DreamID checkpoint root (ckpt_dir).
+      model_class_name: DreamIDOmniPipeline
+      dtype: bfloat16
+      num_gpus: 1
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      custom_pipeline_args:
+        # Optional overrides:
+        # ckpt_dir: /path/to/ckpts
+        # model_name: "960x960_5s"
+        # config_path: /path/to/inference_r2av.yaml
+        # cpu_offload: false
+    final_output: true
+    final_output_type: video
+    default_sampling_params:
+      num_inference_steps: 45
+      guidance_scale: 4.0
+      guidance_scale_2: 3.0
+      seed: 103
+      extra_args:
+        solver_name: "unipc"
+        shift: 5.0
+        video_frame_height_width: [720, 720]
+        video_negative_prompt: "jitter, bad hands, blur, distortion"
+        audio_negative_prompt: "robotic, muffled, echo, distorted"

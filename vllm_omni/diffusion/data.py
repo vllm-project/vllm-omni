@@ -411,6 +411,9 @@ class OmniDiffusionConfig:
     # Diffusion model loading format
     diffusion_load_format: str = "default"  # "default", "custom_pipeline", "dummy"
 
+    # Disable dummy warmup run during engine initialization
+    disable_dummy_run: bool = False
+
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
     port: int | None = None
@@ -580,7 +583,10 @@ class OmniDiffusionConfig:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
 
     def update_multimodal_support(self) -> None:
-        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
+        self.supports_multimodal_inputs = self.model_class_name in {
+            "QwenImageEditPlusPipeline",
+            "DreamIDOmniPipeline",
+        }
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":

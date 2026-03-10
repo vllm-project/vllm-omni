@@ -59,28 +59,23 @@ class DiffusionEngine:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
 
-        try:
-            self._dummy_run()
-        except Exception as e:
-            logger.error(f"Dummy run failed: {e}")
-            self.close()
-            raise e
+        if not getattr(self.od_config, "disable_dummy_run", False):
+            try:
+                self._dummy_run()
+            except Exception as e:
+                logger.error(f"Dummy run failed: {e}")
+                self.close()
+                raise e
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
-        diffusion_engine_start_time = time.perf_counter()
-
         # Apply pre-processing if available
-        preprocess_time = 0.0
         if self.pre_process_func is not None:
-            preprocess_start_time = time.perf_counter()
+            preprocess_start_time = time.time()
             request = self.pre_process_func(request)
-            preprocess_time = time.perf_counter() - preprocess_start_time
+            preprocess_time = time.time() - preprocess_start_time
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
-        exec_start_time = time.perf_counter()
         output = self.add_req_and_wait_for_response(request)
-        exec_total_time = time.perf_counter() - exec_start_time
-
         if output.error:
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
@@ -98,24 +93,22 @@ class DiffusionEngine:
                 for i, prompt in enumerate(request.prompts)
             ]
 
-        postprocess_start_time = time.perf_counter()
+        postprocess_start_time = time.time()
         outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
         audio_payload = None
+        audio_sample_rate = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
             outputs = outputs.get("video", outputs)
-        postprocess_time = time.perf_counter() - postprocess_start_time
+        if isinstance(output.custom_output, dict):
+            audio_sample_rate = (
+                output.custom_output.get("audio_sample_rate")
+                or output.custom_output.get("sample_rate")
+                or output.custom_output.get("sampling_rate")
+                or output.custom_output.get("sr")
+            )
+        postprocess_time = time.time() - postprocess_start_time
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
-
-        step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
-        logger.info(
-            "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
-            "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
-            preprocess_time * 1000,
-            exec_total_time * 1000,
-            postprocess_time * 1000,
-            step_total_ms,
-        )
 
         # Convert to OmniRequestOutput format
         # Ensure outputs is a list
@@ -123,9 +116,6 @@ class DiffusionEngine:
             outputs = [outputs] if outputs is not None else []
 
         metrics = {
-            "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
-            "diffusion_engine_total_time_ms": exec_total_time * 1000,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
@@ -141,6 +131,9 @@ class DiffusionEngine:
 
             if supports_audio_output(self.od_config.model_class_name):
                 request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
+                mm_output = {"audio": request_audio_payload}
+                if audio_sample_rate is not None:
+                    mm_output["audio_sample_rate"] = audio_sample_rate
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -148,7 +141,7 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
-                        multimodal_output={"audio": request_audio_payload},
+                        multimodal_output=mm_output,
                         final_output_type="audio",
                     ),
                 ]
@@ -156,6 +149,8 @@ class DiffusionEngine:
                 mm_output = {}
                 if audio_payload is not None:
                     mm_output["audio"] = audio_payload
+                if audio_sample_rate is not None:
+                    mm_output["audio_sample_rate"] = audio_sample_rate
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -185,6 +180,9 @@ class DiffusionEngine:
 
                 if supports_audio_output(self.od_config.model_class_name):
                     request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
+                    mm_output = {"audio": request_audio_payload}
+                    if audio_sample_rate is not None:
+                        mm_output["audio_sample_rate"] = audio_sample_rate
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -192,7 +190,7 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
-                            multimodal_output={"audio": request_audio_payload},
+                            multimodal_output=mm_output,
                             final_output_type="audio",
                         ),
                     )
@@ -201,15 +199,17 @@ class DiffusionEngine:
                     if audio_payload is not None:
                         sliced_audio = audio_payload
                         if isinstance(audio_payload, (list, tuple)):
-                            sliced_audio = audio_payload[start_idx:end_idx]
-                            if len(sliced_audio) == 1:
-                                sliced_audio = sliced_audio[0]
+                                sliced_audio = audio_payload[start_idx:end_idx]
+                                if len(sliced_audio) == 1:
+                                    sliced_audio = sliced_audio[0]
                         elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
                             if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
                                 sliced_audio = audio_payload[start_idx:end_idx]
                                 if num_outputs == 1:
                                     sliced_audio = sliced_audio[0]
                         mm_output["audio"] = sliced_audio
+                    if audio_sample_rate is not None:
+                        mm_output["audio_sample_rate"] = audio_sample_rate
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,

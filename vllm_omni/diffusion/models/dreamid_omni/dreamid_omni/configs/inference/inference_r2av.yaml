@@ -1,0 +1,24 @@
+
+ckpt_dir: /mnt/bn/hmbytenas/code/guoxu/ovi/ckpts
+output_dir: ./outputs_r2av_old_one_two
+sample_steps: 45
+solver_name: unipc
+model_name: "dreamid_omni" # ["720x720_5s", "960x960_5s", "960x960_10s"]
+shift: 5.0
+sp_size: 8
+audio_guidance_scale: 3.0
+video_guidance_scale: 4.0
+mode: "r2av" # ["t2v", "i2v", "t2i2v"] all comes with audio
+fp8: False
+cpu_offload: False
+seed: 103
+video_negative_prompt: "jitter, bad hands, blur, distortion"  # Artifacts to avoid in video
+audio_negative_prompt: "robotic, muffled, echo, distorted"    # Artifacts to avoid in audio
+video_frame_height_width: [704, 1280] # only useful if mode = t2v or t2i2v, recommended values: [704, 1280], [1280, 704], [960, 960], [512, 992], [992, 512], [960, 512], [512, 960], [720, 720], [448, 1120]
+text_prompt: example_prompts/gpt_t2v_10s.csv
+slg_layer: 11
+each_example_n_times: 1
+
+image_root_path: '/mnt/bn/lixinghui-hw/guoxu_workspace/ovi_opensora2/test/video_demo/two/image_crop'
+audio_root_path: '/mnt/bn/lixinghui-hw/guoxu_workspace/ovi_opensora2/test/video_demo/two/audio'
+json_root_path: '/mnt/bn/lixinghui-hw/guoxu_workspace/ovi_opensora2/test/video_demo/two/caption'

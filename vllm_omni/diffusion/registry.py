@@ -131,6 +131,11 @@ _DIFFUSION_MODELS = {
         "pipeline_helios",
         "HeliosPipeline",
     ),
+    "DreamIDOmniPipeline": (
+        "dreamid_omni",
+        "pipeline_dreamid_omni",
+        "DreamIDOmniPipeline",
+    ),
 }
 
 
@@ -299,6 +304,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
+    "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
