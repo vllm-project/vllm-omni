@@ -3,9 +3,10 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 from .common_modules import AttnBlock, Downsample, Normalize, ResnetBlock, Upsample, nonlinearity
-from .modeling_utils import ConfigMixin, ModelMixin, register_to_config
+from .modeling_utils import ModelMixin
 
 
 class Updateable:
