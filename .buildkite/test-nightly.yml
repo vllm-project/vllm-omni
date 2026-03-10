@@ -114,7 +114,7 @@ steps:
       - export DEFAULT_INPUT_DIR=tests
       - export DEFAULT_OUTPUT_DIR=tests
       - buildkite-agent artifact download "tests/*.json" . --step nightly-performance
-      - buildkite-agent artifact download "tests/*.html" . --step nightly-testcase-statistics
+      - buildkite-agent artifact download "tests/*.html" . --step nightly-performance
       - python tools/nightly/generate_nightly_perf_excel.py
       - python tools/nightly/send_nightly_email.py --report-file "tests/*.xlsx, tests/*.html"
       - buildkite-agent artifact upload "tests/*.xlsx"
