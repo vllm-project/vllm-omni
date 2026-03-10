@@ -57,7 +57,7 @@ def default_vllm_config():
     """
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 
-    # Use CPU device if no GPU is available (e.g., in CI environments).
+    # Use CPU device if no GPU is available (e.g., in CI environments)
     has_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 0
     device = "cuda" if has_gpu else "cpu"
     device_config = DeviceConfig(device=device)
