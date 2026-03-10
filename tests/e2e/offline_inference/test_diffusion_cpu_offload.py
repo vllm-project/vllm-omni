@@ -27,7 +27,12 @@ def inference(model_name: str, offload: bool = True):
     torch.cuda.reset_peak_memory_stats(device=device_index)
     monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
-    m = Omni(model=model_name, enable_cpu_offload=offload)
+    m = Omni(
+        model=model_name,
+        # TODO: we might want to add overlapped feature e2e tests
+        # cache_backend="cache_dit",
+        enable_cpu_offload=offload,
+    )
     torch.cuda.reset_peak_memory_stats(device=device_index)
     height = 256
     width = 256

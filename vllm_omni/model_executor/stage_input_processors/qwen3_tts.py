@@ -27,13 +27,24 @@ def talker2code2wav(
         # Filter zero-padded frames (EOS/invalid steps), matching _extract_last_frame behavior
         valid_mask = audio_codes.any(dim=1)
         audio_codes = audio_codes[valid_mask]
+        ref_code = output.multimodal_output.get("ref_code")
+        if isinstance(ref_code, list):
+            ref_code = ref_code[0] if ref_code else None
+        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+            ref_code = ref_code.to(torch.long).cpu().contiguous()
+            ref_code_len = int(ref_code.shape[0])
+            audio_codes = torch.cat([ref_code.to(audio_codes.device), audio_codes], dim=0)
+        else:
+            ref_code_len = 0
         # Code2Wav expects codebook-major flat: [Q*num_frames]
         codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
+        additional_information = {"left_context_size": [ref_code_len]} if ref_code_len > 0 else None
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
+                additional_information=additional_information,
             )
         )
     return code2wav_inputs
@@ -61,12 +72,19 @@ def talker2code2wav_async_chunk(
 ) -> dict[str, Any] | None:
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if request_payload is None:
+        request_payload = {}
+        transfer_manager.request_payload = request_payload
 
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+        ref_code = pooling_output.get("ref_code")
+        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
+            request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
     elif not finished:
         # Some steps may not produce pooling_output. Only flush on finish.
         return None
@@ -138,6 +156,14 @@ def talker2code2wav_async_chunk(
         end_index = min(length, left_context_size_config + context_length)
         left_context_size = max(0, int(end_index - context_length))
         window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+
+    # Match offline Base ICL decoding by prepending ref_code only once to the first decoder window.
+    if transfer_manager.put_req_chunk[request_id] == 0:
+        ref_code = request_payload.pop(request_id, None)
+        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+            ref_frames = ref_code.tolist()
+            window_frames = ref_frames + window_frames
+            left_context_size += len(ref_frames)
 
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
