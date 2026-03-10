@@ -89,6 +89,20 @@ python text_to_image.py \
   --output outputs/coffee.png
 ```
 
+Hybrid (Ulysses + Ring, requires 4 GPUs):
+
+```bash
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --prompt "a cup of coffee on the table" \
+  --ulysses-degree 2 \
+  --ring-degree 2 \
+  --ulysses-mode advanced_uaa \
+  --height 1024 \
+  --width 1024 \
+  --output outputs/coffee_hybrid.png
+```
+
 ### NextStep Models
 
 NextStep-1.1 can have extra arguments
@@ -120,6 +134,8 @@ python text_to_image.py \
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
 - `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion_acceleration.md#using-cfg-parallel).
+- `--ulysses-degree/--ring-degree`: enable sequence parallelism across multiple GPUs.
+- `--ulysses-mode`: Ulysses SP mode, "strict" (default) or "advanced_uaa" (UAA).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--guidance-scale`: classifier-free guidance scale.
 
