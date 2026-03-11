@@ -67,6 +67,13 @@ Enabling **async_chunk** (False→True) sharply reduces time-to-first-audio (TTF
   </picture>
 </p>
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/performance/qwen3-omni_e2e_performance.png">
+    <img alt="E2E Performance Data Comparison" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/performance/qwen3-omni_e2e_performance.png" width=100%>
+  </picture>
+</p>
+
 ## Architecture
 ### Data Flow
 
