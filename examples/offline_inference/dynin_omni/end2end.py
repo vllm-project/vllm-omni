@@ -18,7 +18,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-
 TASK_CHOICES = ("t2t", "t2i", "t2s", "i2i", "i2t", "s2t", "v2t")
 
 TASK_DEFAULT_RUNTIME = {
@@ -31,95 +30,9 @@ TASK_DEFAULT_RUNTIME = {
     "v2t": ("v2t", "v2t", 0, "text"),
 }
 
-# Parser-level defaults aligned to each legacy example script.
-TASK_ARG_DEFAULTS: dict[str, dict[str, Any]] = {
-    "t2t": {
-        "output_dir": "/tmp/dynin_end2end_outputs",
-        "max_new_tokens": 512,
-        "steps": 512,
-        "block_length": 16,
-        "temperature": 0.0,
-        "cfg_scale": 0.0,
-    },
-    "t2i": {
-        "output_dir": "/tmp/dynin_t2i_outputs",
-        "prompt_max_text_len": None,
-        "image_token_count": None,
-        "mask_token_id": None,
-        "codebook_size": None,
-        "timesteps": None,
-        "guidance_scale": None,
-        "temperature": None,
-    },
-    "i2i": {
-        "output_dir": "/tmp/dynin_i2i_outputs",
-        "prompt_max_text_len": None,
-        "mask_token_id": None,
-        "codebook_size": None,
-        "timesteps": 18,
-        "guidance_scale": 3.5,
-        "temperature": None,
-        "use_train_i2i_prompt": True,
-    },
-    "i2t": {
-        "output_dir": "/tmp/dynin_i2t_outputs",
-        "prompt_max_text_len": None,
-        "max_new_tokens": 128,
-        "steps": 128,
-        "block_length": 2,
-        "temperature": None,
-        "cfg_scale": 0.0,
-        "remasking": "low_confidence",
-        "mask_token_id": None,
-        "codebook_size": None,
-        "image_resolution": 480,
-    },
-    "s2t": {
-        "output_dir": "/tmp/dynin_s2t_outputs",
-        "prompt_max_text_len": None,
-        "max_new_tokens": None,
-        "steps": None,
-        "block_length": None,
-        "temperature": None,
-        "cfg_scale": None,
-        "remasking": "low_confidence",
-        "mask_token_id": None,
-        "codebook_size": None,
-    },
-    "t2s": {
-        "output_dir": "/tmp/dynin_t2s_outputs",
-        "runtime_task": "t2s_mmu_like",
-        "prompting_task": "t2s_gen",
-        "prompt_max_text_len": None,
-        "t2s_token_length": None,
-        "mask_token_id": None,
-        "codebook_size": None,
-        "audio_codebook_size": None,
-        "steps": None,
-        "block_length": None,
-        "temperature": None,
-        "cfg_scale": None,
-        "t2s_condition": "gender-female_emotion-neutral_speed-normal_pitch-normal",
-    },
-    "v2t": {
-        "output_dir": "/tmp/dynin_v2t_outputs",
-        "prompt_max_text_len": None,
-        "max_new_tokens": 256,
-        "steps": 256,
-        "block_length": 2,
-        "temperature": None,
-        "cfg_scale": 0.0,
-        "remasking": "low_confidence",
-        "mask_token_id": None,
-        "codebook_size": None,
-        "image_resolution": 224,
-        "num_frames": 5,
-    },
-}
-
-# Runtime fallbacks when task defaults are intentionally None in legacy parser.
 TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
     "t2t": {
+        "output_dir": "/tmp/dynin_end2end_outputs",
         "prompt_max_text_len": 1024,
         "max_new_tokens": 512,
         "steps": 512,
@@ -128,6 +41,7 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
         "cfg_scale": 0.0,
     },
     "t2i": {
+        "output_dir": "/tmp/dynin_t2i_outputs",
         "prompt_max_text_len": 128,
         "image_token_count": 1024,
         "mask_token_id": 126336,
@@ -137,6 +51,7 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
         "temperature": 1.0,
     },
     "i2i": {
+        "output_dir": "/tmp/dynin_i2i_outputs",
         "prompt_max_text_len": 128,
         "mask_token_id": 126336,
         "codebook_size": 8192,
@@ -144,19 +59,23 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
         "guidance_scale": 0.0,
         "temperature": 1.0,
         "image_resolution": 336,
+        "use_train_i2i_prompt": True,
     },
     "i2t": {
+        "output_dir": "/tmp/dynin_i2t_outputs",
         "prompt_max_text_len": 1024,
-        "max_new_tokens": 1024,
-        "steps": 512,
-        "block_length": 1024,
+        "max_new_tokens": 128,
+        "steps": 128,
+        "block_length": 2,
         "temperature": 0.0,
         "cfg_scale": 0.0,
         "mask_token_id": 126336,
         "codebook_size": 8192,
-        "image_resolution": 336,
+        "image_resolution": 480,
+        "remasking": "low_confidence",
     },
     "s2t": {
+        "output_dir": "/tmp/dynin_s2t_outputs",
         "prompt_max_text_len": 1024,
         "max_new_tokens": 128,
         "steps": 256,
@@ -165,35 +84,42 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
         "cfg_scale": 0.0,
         "mask_token_id": 126336,
         "codebook_size": 8192,
+        "remasking": "low_confidence",
     },
     "t2s": {
+        "output_dir": "/tmp/dynin_t2s_outputs",
+        "runtime_task": "t2s_mmu_like",
+        "prompting_task": "t2s_gen",
         "prompt_max_text_len": 1024,
-        "t2s_token_length": 383,
+        "t2s_token_length": 384,
         "mask_token_id": 126336,
         "codebook_size": 8192,
         "audio_codebook_size": 4096,
-        "steps": 383,
+        "steps": 384,
         "block_length": 128,
         "temperature": 1.0,
         "cfg_scale": 2.5,
+        "t2s_condition": "gender-female_emotion-neutral_speed-normal_pitch-normal",
     },
     "v2t": {
+        "output_dir": "/tmp/dynin_v2t_outputs",
         "prompt_max_text_len": 1024,
-        "max_new_tokens": 128,
-        "steps": 128,
-        "block_length": 128,
+        "max_new_tokens": 256,
+        "steps": 256,
+        "block_length": 2,
         "temperature": 0.0,
         "cfg_scale": 0.0,
         "mask_token_id": 126336,
         "codebook_size": 8192,
-        "image_resolution": 336,
-        "num_frames": 8,
+        "image_resolution": 224,
+        "num_frames": 5,
+        "remasking": "low_confidence",
     },
 }
 
-DEFAULT_I2T_QUESTION = "Describe this image in one concise paragraph."
+DEFAULT_I2T_QUESTION = "Please describe this image in detail."
 DEFAULT_S2T_INSTRUCTION = "Transcribe the speech and summarize it briefly."
-DEFAULT_V2T_QUESTION = "Describe what happens in this video."
+DEFAULT_V2T_QUESTION = "Please describe this video in detail."
 DEFAULT_T2T_PROMPT = "Explain multimodal LLM inference in 3 sentences."
 DEFAULT_T2S_INSTRUCTION = "Please read the following text naturally."
 
@@ -431,8 +357,7 @@ def encode_audio_tokens(audio_path: Path, vq_audio_model: Any) -> torch.Tensor:
 
 def build_chat_prompt(content: str) -> str:
     return (
-        "<|start_header_id|>user<|end_header_id|>\n"
-        f"{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+        f"<|start_header_id|>user<|end_header_id|>\n{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
     )
 
 
@@ -474,19 +399,35 @@ def load_universal_prompting(
         return UniversalPrompting(tokenizer, **init_kwargs)
 
 
-def _task_default(task: str, key: str, value: Any) -> Any:
+def _runtime_fallback(task: str, key: str, value: Any) -> Any:
     if isinstance(value, str):
         if value.strip() != "":
             return value
     elif value is not None:
         return value
-    return TASK_ARG_DEFAULTS.get(task, {}).get(key)
-
-
-def _runtime_fallback(task: str, key: str, value: Any) -> Any:
-    if value is not None:
-        return value
     return TASK_RUNTIME_FALLBACKS.get(task, {}).get(key)
+
+
+def _validate_generation_args(*, task: str, max_new_tokens: int, steps: int, block_length: int) -> None:
+    # Keep i2t/v2t generation constraints aligned with i2t.py/v2t.py.
+    if task not in {"i2t", "v2t"}:
+        return
+    if max_new_tokens <= 0:
+        raise ValueError(f"{task} requires max_new_tokens > 0.")
+    if block_length <= 0:
+        raise ValueError(f"{task} requires block_length > 0.")
+    if steps <= 0:
+        raise ValueError(f"{task} requires steps > 0.")
+    if max_new_tokens % block_length != 0:
+        raise ValueError(f"{task} requires max_new_tokens % block_length == 0, got {max_new_tokens} % {block_length}")
+    num_blocks = max_new_tokens // block_length
+    if num_blocks <= 0:
+        raise ValueError(f"{task} has invalid num_blocks.")
+    if steps % num_blocks != 0:
+        raise ValueError(
+            f"{task} requires steps % (max_new_tokens // block_length) == 0, "
+            f"got steps={steps}, max_new_tokens={max_new_tokens}, block_length={block_length}"
+        )
 
 
 def make_prompt_payload(
@@ -605,6 +546,116 @@ def _run_uni_prompting(uni_prompting: Any, payload: Any, prompting_task: str) ->
     return input_ids, attention_mask
 
 
+def _get_special_token_id(uni_prompting: Any, token: str) -> int:
+    sptids = getattr(uni_prompting, "sptids_dict", None) or {}
+    if token not in sptids:
+        raise KeyError(f"Special token not found in UniversalPrompting.sptids_dict: {token}")
+    token_ids = _to_1d_int_list(sptids[token])
+    if not token_ids:
+        raise ValueError(f"Special token id is empty for token: {token}")
+    return int(token_ids[0])
+
+
+def _tokenize_chat_query(tokenizer: Any, text: str) -> list[int]:
+    encoded = tokenizer(build_chat_prompt(text), return_tensors="pt").input_ids[0]
+    token_ids = _to_1d_int_list(encoded)
+    if not token_ids:
+        raise RuntimeError("Failed to tokenize chat query text.")
+    return token_ids
+
+
+def _flatten_media_token_ids_with_offset(token_ids: Any, token_offset: int) -> list[int]:
+    media_ids = token_ids
+    if isinstance(media_ids, torch.Tensor):
+        media_ids = media_ids.detach().cpu().reshape(-1).tolist()
+    else:
+        media_ids = np.asarray(media_ids).reshape(-1).tolist()
+    return [int(x) + int(token_offset) for x in media_ids]
+
+
+def _build_i2t_v2t_prompt_ids_via_reference(
+    *,
+    task: str,
+    text: str,
+    tokenizer: Any,
+    uni_prompting: Any,
+    image_tokens: torch.Tensor | None,
+    video_tokens: torch.Tensor | None,
+    image_token_offset: int,
+) -> list[int]:
+    if task == "i2t":
+        if image_tokens is None:
+            raise ValueError("i2t requires media tokens")
+        from i2t import build_i2t_input_ids as _build_i2t_input_ids_ref
+
+        token_ids, _ = _build_i2t_input_ids_ref(
+            image_token_ids=image_tokens,
+            tokenizer=tokenizer,
+            uni_prompting=uni_prompting,
+            question=text,
+            image_token_offset=int(image_token_offset),
+        )
+        return [int(v) for v in token_ids]
+
+    if task == "v2t":
+        if video_tokens is None:
+            raise ValueError("v2t requires media tokens")
+        from v2t import build_v2t_input_ids as _build_v2t_input_ids_ref
+
+        token_ids, _ = _build_v2t_input_ids_ref(
+            video_token_ids=video_tokens,
+            tokenizer=tokenizer,
+            uni_prompting=uni_prompting,
+            question=text,
+            image_token_offset=int(image_token_offset),
+        )
+        return [int(v) for v in token_ids]
+
+    raise ValueError(f"Unsupported task for i2t/v2t reference prompt build: {task}")
+
+
+def make_validation_style_mmu_prompt(
+    *,
+    task: str,
+    text: str,
+    tokenizer: Any,
+    uni_prompting: Any,
+    image_tokens: torch.Tensor | None,
+    audio_tokens: torch.Tensor | None,
+    video_tokens: torch.Tensor | None,
+    image_token_offset: int,
+    speech_token_offset: int,
+) -> tuple[list[int], list[int]]:
+    query_ids = _tokenize_chat_query(tokenizer, text)
+
+    if task in {"i2t", "v2t"}:
+        token_ids = _build_i2t_v2t_prompt_ids_via_reference(
+            task=task,
+            text=text,
+            tokenizer=tokenizer,
+            uni_prompting=uni_prompting,
+            image_tokens=image_tokens,
+            video_tokens=video_tokens,
+            image_token_offset=int(image_token_offset),
+        )
+        return token_ids, [1] * len(token_ids)
+
+    if task == "s2t":
+        if audio_tokens is None:
+            raise ValueError("s2t requires audio tokens")
+        audio_ids = _to_1d_int_list(audio_tokens.long() + int(speech_token_offset))
+        token_ids = [
+            _get_special_token_id(uni_prompting, "<|s2t|>"),
+            _get_special_token_id(uni_prompting, "<|soa|>"),
+            *audio_ids,
+            _get_special_token_id(uni_prompting, "<|eoa|>"),
+            *query_ids,
+        ]
+        return token_ids, [1] * len(token_ids)
+
+    raise ValueError(f"Unsupported task for validation-style MMU prompt: {task}")
+
+
 def iter_mm_outputs(outputs: list[Any]):
     for omni_out in outputs:
         req_out = getattr(omni_out, "request_output", None)
@@ -699,6 +750,7 @@ def extract_audio_output(outputs: list[Any]) -> tuple[np.ndarray, int] | None:
             audio = mm_out.get("speech")
         if audio is None:
             continue
+
         def _to_wav_array(value: Any) -> np.ndarray:
             if isinstance(value, torch.Tensor):
                 return value.detach().cpu().numpy().reshape(-1).astype(np.float32)
@@ -745,6 +797,12 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
         type=str,
         default=str(repo_root / "vllm_omni/model_executor/stage_configs/dynin_omni.yaml"),
         help="Path to stage config yaml.",
+    )
+    parser.add_argument(
+        "--dynin-config-path",
+        type=str,
+        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"),
+        help="Path to DYNIN config yaml (passed through additional_information).",
     )
     parser.add_argument(
         "--model-cache-dir",
@@ -851,23 +909,27 @@ def main() -> None:
     model_source = str(model_dir)
 
     task_name = str(args.task)
+    dynin_config_path = str(Path(args.dynin_config_path).expanduser())
+    os.environ["DYNIN_CONFIG_PATH"] = dynin_config_path
     default_runtime_task, default_prompting_task, default_detok_id, final_modality = TASK_DEFAULT_RUNTIME[task_name]
-    runtime_task = args.runtime_task.strip() or str(_task_default(task_name, "runtime_task", None) or default_runtime_task)
-    prompting_task = args.prompting_task.strip() or str(
-        _task_default(task_name, "prompting_task", None) or default_prompting_task
+    runtime_task = args.runtime_task.strip() or str(
+        _runtime_fallback(task_name, "runtime_task", None) or default_runtime_task
     )
-    detok_id_default = _task_default(task_name, "detok_id", None)
+    prompting_task = args.prompting_task.strip() or str(
+        _runtime_fallback(task_name, "prompting_task", None) or default_prompting_task
+    )
+    detok_id_default = _runtime_fallback(task_name, "detok_id", None)
     if detok_id_default is None:
         detok_id_default = default_detok_id
     detok_id = int(detok_id_default if args.detok_id is None else args.detok_id)
 
-    output_dir_default = _task_default(task_name, "output_dir", args.output_dir)
+    output_dir_default = _runtime_fallback(task_name, "output_dir", args.output_dir)
     resolved_output_dir = str(output_dir_default or "/tmp/dynin_end2end_outputs")
 
     image_resolution_value = _runtime_fallback(
         task_name,
         "image_resolution",
-        _task_default(task_name, "image_resolution", args.image_resolution),
+        args.image_resolution,
     )
     if image_resolution_value is None:
         image_resolution_value = 336
@@ -876,7 +938,7 @@ def main() -> None:
     num_frames_value = _runtime_fallback(
         task_name,
         "num_frames",
-        _task_default(task_name, "num_frames", args.num_frames),
+        args.num_frames,
     )
     if num_frames_value is None:
         num_frames_value = 8
@@ -885,7 +947,7 @@ def main() -> None:
     prompt_max_text_len_value = _runtime_fallback(
         task_name,
         "prompt_max_text_len",
-        _task_default(task_name, "prompt_max_text_len", args.prompt_max_text_len),
+        args.prompt_max_text_len,
     )
     if prompt_max_text_len_value is None:
         prompt_max_text_len_value = 1024
@@ -894,7 +956,7 @@ def main() -> None:
     max_new_tokens_value = _runtime_fallback(
         task_name,
         "max_new_tokens",
-        _task_default(task_name, "max_new_tokens", args.max_new_tokens),
+        args.max_new_tokens,
     )
     if max_new_tokens_value is None:
         max_new_tokens_value = 256
@@ -903,7 +965,7 @@ def main() -> None:
     steps_value = _runtime_fallback(
         task_name,
         "steps",
-        _task_default(task_name, "steps", args.steps),
+        args.steps,
     )
     if steps_value is None:
         steps_value = 256
@@ -912,7 +974,7 @@ def main() -> None:
     block_length_value = _runtime_fallback(
         task_name,
         "block_length",
-        _task_default(task_name, "block_length", args.block_length),
+        args.block_length,
     )
     if block_length_value is None:
         block_length_value = 2
@@ -921,7 +983,7 @@ def main() -> None:
     temperature_value = _runtime_fallback(
         task_name,
         "temperature",
-        _task_default(task_name, "temperature", args.temperature),
+        args.temperature,
     )
     if temperature_value is None:
         temperature_value = 0.0
@@ -930,18 +992,18 @@ def main() -> None:
     cfg_scale_value = _runtime_fallback(
         task_name,
         "cfg_scale",
-        _task_default(task_name, "cfg_scale", args.cfg_scale),
+        args.cfg_scale,
     )
     if cfg_scale_value is None:
         cfg_scale_value = 0.0
     cfg_scale = float(cfg_scale_value)
 
-    remasking = str(_task_default(task_name, "remasking", args.remasking) or "low_confidence")
+    remasking = str(_runtime_fallback(task_name, "remasking", args.remasking) or "low_confidence")
 
     timesteps_value = _runtime_fallback(
         task_name,
         "timesteps",
-        _task_default(task_name, "timesteps", args.timesteps),
+        args.timesteps,
     )
     if timesteps_value is None:
         timesteps_value = 20
@@ -950,7 +1012,7 @@ def main() -> None:
     guidance_scale_value = _runtime_fallback(
         task_name,
         "guidance_scale",
-        _task_default(task_name, "guidance_scale", args.guidance_scale),
+        args.guidance_scale,
     )
     if guidance_scale_value is None:
         guidance_scale_value = 0.0
@@ -959,7 +1021,7 @@ def main() -> None:
     mask_token_id_value = _runtime_fallback(
         task_name,
         "mask_token_id",
-        _task_default(task_name, "mask_token_id", args.mask_token_id),
+        args.mask_token_id,
     )
     if mask_token_id_value is None:
         mask_token_id_value = 126336
@@ -968,7 +1030,7 @@ def main() -> None:
     codebook_size_value = _runtime_fallback(
         task_name,
         "codebook_size",
-        _task_default(task_name, "codebook_size", args.codebook_size),
+        args.codebook_size,
     )
     if codebook_size_value is None:
         codebook_size_value = 8192
@@ -977,7 +1039,7 @@ def main() -> None:
     audio_codebook_size_value = _runtime_fallback(
         task_name,
         "audio_codebook_size",
-        _task_default(task_name, "audio_codebook_size", args.audio_codebook_size),
+        args.audio_codebook_size,
     )
     if audio_codebook_size_value is None:
         audio_codebook_size_value = 4096
@@ -986,25 +1048,32 @@ def main() -> None:
     image_token_count_value = _runtime_fallback(
         task_name,
         "image_token_count",
-        _task_default(task_name, "image_token_count", args.image_token_count),
+        args.image_token_count,
     )
     image_token_count = int(image_token_count_value) if image_token_count_value is not None else 0
 
     t2s_token_length_value = _runtime_fallback(
         task_name,
         "t2s_token_length",
-        _task_default(task_name, "t2s_token_length", args.t2s_token_length),
+        args.t2s_token_length,
     )
     if t2s_token_length_value is None:
         t2s_token_length_value = 383
     t2s_token_length = int(t2s_token_length_value)
 
     t2s_condition = str(
-        _task_default(task_name, "t2s_condition", args.t2s_condition)
+        _runtime_fallback(task_name, "t2s_condition", args.t2s_condition)
         or "gender-female_emotion-neutral_speed-normal_pitch-normal"
     )
 
-    use_train_i2i_prompt = _task_default(task_name, "use_train_i2i_prompt", args.use_train_i2i_prompt)
+    _validate_generation_args(
+        task=task_name,
+        max_new_tokens=max_new_tokens,
+        steps=steps,
+        block_length=block_length,
+    )
+
+    use_train_i2i_prompt = _runtime_fallback(task_name, "use_train_i2i_prompt", args.use_train_i2i_prompt)
     if use_train_i2i_prompt is None:
         use_train_i2i_prompt = bool(task_name == "i2i")
     use_train_i2i_prompt = bool(use_train_i2i_prompt)
@@ -1029,7 +1098,7 @@ def main() -> None:
         if not text:
             text = "Hello. This is a default text-to-speech sample."
         if not args.raw_prompt:
-            instruction = str(_task_default(task_name, "instruction", args.instruction) or "").strip()
+            instruction = str(_runtime_fallback(task_name, "instruction", args.instruction) or "").strip()
             if not instruction:
                 instruction = DEFAULT_T2S_INSTRUCTION
             text = build_chat_prompt(f"{instruction}\n{text}")
@@ -1037,7 +1106,9 @@ def main() -> None:
         text = "A high quality detailed image."
 
     tokenizer_source = args.tokenizer_path.strip() or model_source
-    model_local_only = resolve_local_only(args.model_local_files_only, model_source, default=Path(model_source).is_dir())
+    model_local_only = resolve_local_only(
+        args.model_local_files_only, model_source, default=Path(model_source).is_dir()
+    )
     tokenizer_local_only = resolve_local_only(
         args.tokenizer_local_files_only,
         tokenizer_source,
@@ -1113,22 +1184,6 @@ def main() -> None:
         if not prompt_attention_mask:
             prompt_attention_mask = [1] * len(prompt_token_ids)
     else:
-        prompt_payload, prompting_task = make_prompt_payload(
-            task=task_name,
-            text=text,
-            image_tokens=image_tokens,
-            audio_tokens=audio_tokens,
-            video_tokens=video_tokens,
-            image_placeholder_tokens=image_token_count,
-            audio_placeholder_tokens=int(t2s_token_length),
-            image_token_offset=text_vocab_size,
-            speech_token_offset=text_vocab_size + int(codebook_size),
-            mask_token_id=int(mask_token_id),
-            use_train_i2i_prompt=use_train_i2i_prompt,
-        )
-        if args.prompting_task.strip():
-            prompting_task = args.prompting_task.strip()
-
         max_audio_len_for_prompt = int(max(t2s_token_length, 512))
         if audio_tokens is not None:
             max_audio_len_for_prompt = max(max_audio_len_for_prompt, int(audio_tokens.numel()))
@@ -1143,20 +1198,51 @@ def main() -> None:
             max_audio_len=int(max_audio_len_for_prompt),
             max_audio_len_short=int(max_audio_len_short_for_prompt),
         )
+        prompting_text_vocab_size = int(len(uni_prompting.text_tokenizer))
 
-        prompt_token_ids, prompt_attention_mask = _run_uni_prompting(
-            uni_prompting,
-            prompt_payload,
-            prompting_task,
-        )
+        use_validation_style_mmu = task_name in {"i2t", "s2t", "v2t"} and not args.prompting_task.strip()
+        if use_validation_style_mmu:
+            prompt_token_ids, prompt_attention_mask = make_validation_style_mmu_prompt(
+                task=task_name,
+                text=text,
+                tokenizer=uni_prompting.text_tokenizer,
+                uni_prompting=uni_prompting,
+                image_tokens=image_tokens,
+                audio_tokens=audio_tokens,
+                video_tokens=video_tokens,
+                image_token_offset=prompting_text_vocab_size,
+                speech_token_offset=prompting_text_vocab_size + int(codebook_size),
+            )
+        else:
+            prompt_payload, prompting_task = make_prompt_payload(
+                task=task_name,
+                text=text,
+                image_tokens=image_tokens,
+                audio_tokens=audio_tokens,
+                video_tokens=video_tokens,
+                image_placeholder_tokens=image_token_count,
+                audio_placeholder_tokens=int(t2s_token_length),
+                image_token_offset=text_vocab_size,
+                speech_token_offset=text_vocab_size + int(codebook_size),
+                mask_token_id=int(mask_token_id),
+                use_train_i2i_prompt=use_train_i2i_prompt,
+            )
+            if args.prompting_task.strip():
+                prompting_task = args.prompting_task.strip()
+
+            prompt_token_ids, prompt_attention_mask = _run_uni_prompting(
+                uni_prompting,
+                prompt_payload,
+                prompting_task,
+            )
+
         if task_name in {"i2t", "s2t", "v2t"}:
-            # Legacy text-generation examples use all-ones mask for prompt ids.
             prompt_attention_mask = [1] * len(prompt_token_ids)
         if not prompt_attention_mask:
             prompt_attention_mask = [1] * len(prompt_token_ids)
 
         if task_name in {"t2i", "i2i"} and guidance_scale > 0:
-            uncond_payload, _ = make_prompt_payload(
+            uncond_payload, uncond_prompting_task = make_prompt_payload(
                 task=task_name,
                 text="",
                 image_tokens=image_tokens,
@@ -1172,7 +1258,7 @@ def main() -> None:
             uncond_input_ids, uncond_attention_mask = _run_uni_prompting(
                 uni_prompting,
                 uncond_payload,
-                prompting_task,
+                args.prompting_task.strip() or uncond_prompting_task,
             )
             if not uncond_attention_mask:
                 uncond_attention_mask = [1] * len(uncond_input_ids)
@@ -1180,6 +1266,7 @@ def main() -> None:
     runtime_info: dict[str, Any] = {
         "task": [runtime_task],
         "detok_id": [int(detok_id)],
+        "dynin_config_path": [str(dynin_config_path)],
         "attention_mask": [prompt_attention_mask],
         "prompt_max_text_len": [int(prompt_max_text_len)],
         "prompting_max_text_len": [int(prompt_max_text_len)],
@@ -1228,6 +1315,7 @@ def main() -> None:
     }
 
     from vllm import SamplingParams
+
     from vllm_omni.entrypoints.omni import Omni
 
     stage_config_path = str(Path(args.stage_config_path).expanduser())
@@ -1282,35 +1370,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-"""
-# t2t
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/end2end.py \
-  --task t2t --model snu-aidas/Dynin-Omni --text "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
-
-# i2t
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/end2end.py \
-  --task i2t --model snu-aidas/Dynin-Omni --image /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/image/sofa_under_water.jpg --text "Please describe this image in detail."
-
-# s2t
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/end2end.py \
-  --task s2t --model snu-aidas/Dynin-Omni --audio /path/input.wav --text "Transcribe the given audio."
-
-# t2i
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/end2end.py \
-  --task t2i --model snu-aidas/Dynin-Omni --text "A cinematic cityscape at sunset"
-
-# i2i
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/end2end.py \
-  --task i2i --model snu-aidas/Dynin-Omni --image /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/image/sofa_under_water.jpg --text "Transform this surreal underwater setting into a realistic indoor living room while preserving the sofa layout."
-
-# t2s
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/end2end.py \
-  --task t2s --model snu-aidas/Dynin-Omni --text "Hello. this is dynin omni."
-
-# v2t
-python /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/end2end.py \
-  --task v2t --model snu-aidas/Dynin-Omni --video /home/kdg6245/vllm-omni/examples/offline_inference/dynin_omni/data/video/baseball.mp4 --text "Describe this video in detail."
-
-"""
