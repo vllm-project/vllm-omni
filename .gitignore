@@ -221,7 +221,6 @@ Thumbs.db
 data/
 datasets/
 *.csv
-*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
 *.parquet
