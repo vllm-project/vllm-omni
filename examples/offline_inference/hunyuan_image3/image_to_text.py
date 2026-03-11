@@ -52,8 +52,7 @@ def load_image(image_path: str) -> Image.Image:
 
 
 def main(args: argparse.Namespace) -> None:
-    hf_overrides = {"rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"}}
-    omni = Omni(model=args.model, hf_overrides=hf_overrides)
+    omni = Omni(model=args.model)
 
     prompt_dict = {
         "prompt": args.prompt,
