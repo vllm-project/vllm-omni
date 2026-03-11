@@ -1602,13 +1602,13 @@ class DyninOmniModelLM(LLaDAModelLM):
 
     def forward_t2s(
         self,
-        input_ids,
-        labels,
-        batch_size_t2s=0,
-        max_seq_length=128,
-        p_mask_t2s=None,
-        answer_lengths=None,
-    ):
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        batch_size_t2s: int = 0,
+        max_seq_length: int = 128,
+        p_mask_t2s: torch.Tensor | None = None,
+        answer_lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for text-to-speech (T2S) diffusion LM training.
 

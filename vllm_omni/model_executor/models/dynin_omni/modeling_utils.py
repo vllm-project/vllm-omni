@@ -527,71 +527,13 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             pretrained_model_name_or_path (`str` or `os.PathLike`, *optional*):
                 Can be either:
 
-                    - A string, the *model id* (for example `google/ddpm-celebahq-256`) of a pretrained model hosted on
-                      the Hub.
+                    - A string, the *model id* (for example `google/ddpm-celebahq-256`) of a pretrained model hosted
+                      on the Hub.
                     - A path to a *directory* (for example `./my_model_directory`) containing the model weights saved
                       with [`~ModelMixin.save_pretrained`].
-
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
-                Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
-                is not used.
-            torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If `"auto"` is passed, the
-                dtype is automatically derived from the model's weights.
-            force_download (`bool`, *optional*, defaults to `False`):
-                Whether or not to force the (re-)download of the model weights and configuration files, overriding the
-                cached versions if they exist.
-            proxies (`Dict[str, str]`, *optional*):
-                A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
-                'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
-            output_loading_info (`bool`, *optional*, defaults to `False`):
-                Whether or not to also return a dictionary containing missing keys, unexpected keys and error messages.
-            local_files_only(`bool`, *optional*, defaults to `False`):
-                Whether to only load local model weights and configuration files or not. If set to `True`, the model
-                won't be downloaded from the Hub.
-            token (`str` or *bool*, *optional*):
-                The token to use as HTTP bearer authorization for remote files. If `True`, the token generated from
-                `diffusers-cli login` (stored in `~/.huggingface`) is used.
-            revision (`str`, *optional*, defaults to `"main"`):
-                The specific model version to use. It can be a branch name, a tag name, a commit id, or any identifier
-                allowed by Git.
-            from_flax (`bool`, *optional*, defaults to `False`):
-                Load the model weights from a Flax checkpoint save file.
-            subfolder (`str`, *optional*, defaults to `""`):
-                The subfolder location of a model file within a larger model repository on the Hub or locally.
-            mirror (`str`, *optional*):
-                Mirror source to resolve accessibility issues if you're downloading a model in China. We do not
-                guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
-                information.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
-                A map that specifies where each submodule should go. It doesn't need to be defined for each
-                parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
-                same device. Defaults to `None`, meaning that the model will be loaded on CPU.
-
-                Set `device_map="auto"` to have 🤗 Accelerate automatically compute the most optimized `device_map`. For
-                more information about each option see [designing a device
-                map](https://hf.co/docs/accelerate/main/en/usage_guides/big_modeling#designing-a-device-map).
-            max_memory (`Dict`, *optional*):
-                A dictionary device identifier for the maximum memory. Will default to the maximum memory available for
-                each GPU and the available CPU RAM if unset.
-            offload_folder (`str` or `os.PathLike`, *optional*):
-                The path to offload weights if `device_map` contains the value `"disk"`.
-            offload_state_dict (`bool`, *optional*):
-                If `True`, temporarily offloads the CPU state dict to the hard drive to avoid running out of CPU RAM if
-                the weight of the CPU state dict + the biggest shard of the checkpoint does not fit. Defaults to `True`
-                when there is some disk offload.
-            low_cpu_mem_usage (`bool`, *optional*, defaults to `True` if torch version >= 1.9.0 else `False`):
-                Speed up model loading only loading the pretrained weights and not initializing the weights. This also
-                tries to not use more than 1x model size in CPU memory (including peak memory) while loading the model.
-                Only supported for PyTorch >= 1.9.0. If you are using an older version of PyTorch, setting this
-                argument to `True` will raise an error.
-            variant (`str`, *optional*):
-                Load weights from a specified `variant` filename such as `"fp16"` or `"ema"`. This is ignored when
-                loading `from_flax`.
-            use_safetensors (`bool`, *optional*, defaults to `None`):
-                If set to `None`, the `safetensors` weights are downloaded if they're available **and** if the
-                `safetensors` library is installed. If set to `True`, the model is forcibly loaded from `safetensors`
-                weights. If set to `False`, `safetensors` weights are not loaded.
+            **kwargs:
+                Additional loading options (e.g. cache/revision/device_map/offload/safetensors) forwarded to the
+                internal diffusers-compatible loading utilities.
 
         <Tip>
 

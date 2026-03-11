@@ -485,7 +485,8 @@ class UniversalPrompting:
     def ti2ti_gen_prompt(self, prompts, target_texts, source_tokens, placeholder_tokens):
         """
         Generation prompt for TI2TI:
-        [ti2ti][soi]src[eoi][cond text][soi]placeholder[eoi][tgt text (masked by caller)]
+        `<|ti2ti|> <|soi|> src <|eoi|> cond_text <|soi|> placeholder <|eoi|> tgt_text`
+        (target text is masked by caller).
         """
         device = source_tokens.device
         ti2ti_id = int(self.sptids_dict["<|ti2ti|>"])
@@ -940,7 +941,12 @@ class UniversalPrompting:
 
         return torch.cat(sequences, dim=0), torch.cat(attention_masks, dim=0)
 
-    def mmu_prompt(self, batch_image_ids_list, batch_text_ids, max_text_len_override=None):
+    def mmu_prompt(
+        self,
+        batch_image_ids_list: list[list[torch.Tensor]],
+        batch_text_ids: list[list[int]],
+        max_text_len_override: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             batch_image_ids_list: List[List[Tensor]] where each inner list is multiple images (per sample)

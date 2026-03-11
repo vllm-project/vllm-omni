@@ -4,8 +4,7 @@
 E2E offline smoke tests for Dynin-Omni.
 
 - model: "snu-aidas/Dynin-Omni"
-- stage config: tests/e2e/offline_inference/stage_configs/dynin_omni_ci.yaml
-- dynin config: vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni_demo.yaml
+- stage config: tests/e2e/stage_configs/dynin_omni_ci.yaml
 """
 
 from __future__ import annotations
@@ -26,11 +25,10 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_DYNIN_CONFIG_PATH = _REPO_ROOT / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni_demo.yaml"
-_DEFAULT_STAGE_CONFIG_PATH = Path(__file__).parent / "stage_configs" / "dynin_omni_ci.yaml"
+_DEFAULT_DYNIN_CONFIG_PATH = _REPO_ROOT / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"
+_DEFAULT_STAGE_CONFIG_PATH = _REPO_ROOT / "tests" / "e2e" / "stage_configs" / "dynin_omni_ci.yaml"
 
-# models = ["snu-aidas/Dynin-Omni"]
-models = ["/tmp/dynin_localized_models/snu-aidas_Dynin-Omni"]
+models = ["snu-aidas/Dynin-Omni"]
 stage_configs = [str(_DEFAULT_STAGE_CONFIG_PATH)]
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
