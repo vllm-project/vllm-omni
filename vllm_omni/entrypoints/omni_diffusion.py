@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 import uuid
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
@@ -11,6 +13,8 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
+
+logger = init_logger(__name__)
 
 
 class OmniDiffusion:
@@ -58,7 +62,8 @@ class OmniDiffusion:
                 od_config.model,
             )
             if config_dict is not None:
-                od_config.model_class_name = config_dict.get("_class_name", None)
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
 
                 tf_config_dict = get_hf_file_to_dict(
@@ -91,8 +96,9 @@ class OmniDiffusion:
             if pipeline_class is None:
                 raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")
 
-            od_config.model_class_name = pipeline_class
-            od_config.tf_model_config = TransformerConfig()
+            if od_config.model_class_name is None:
+                od_config.model_class_name = pipeline_class
+            od_config.tf_model_config = TransformerConfig().from_dict(cfg)
             od_config.update_multimodal_support()
 
         if cfg_kv_collect_func is not None:
@@ -106,6 +112,7 @@ class OmniDiffusion:
         sampling_params: OmniDiffusionSamplingParams,
         request_ids: list[str] = [],
     ) -> list[OmniRequestOutput]:
+        _t0 = time.perf_counter()
         if isinstance(prompts, (str, dict)):
             prompts = [prompts]
         else:
@@ -116,7 +123,10 @@ class OmniDiffusion:
             request_ids.extend(f"{i + len(request_ids)}_{uuid.uuid4()}" for i in range(len(prompts) - len(request_ids)))
 
         request = OmniDiffusionRequest(prompts, sampling_params, request_ids)
-        return self._run_engine(request)
+        result = self._run_engine(request)
+        _t_ms = (time.perf_counter() - _t0) * 1000
+        logger.info("OmniDiffusion.generate total: %.2f ms", _t_ms)
+        return result
 
     def _run_engine(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         return self.engine.step(request)

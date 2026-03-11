@@ -114,6 +114,14 @@ class OmniServeCommand(CLISubcommand):
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
         omni_config_group.add_argument(
+            "--task-type",
+            type=str,
+            default=None,
+            choices=["CustomVoice", "VoiceDesign", "Base"],
+            help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
+            "If not specified, will be inferred from model path.",
+        )
+        omni_config_group.add_argument(
             "--stage-configs-path",
             type=str,
             default=None,
@@ -194,6 +202,13 @@ class OmniServeCommand(CLISubcommand):
             help="Number of GPUs to use for diffusion model inference.",
         )
         omni_config_group.add_argument(
+            "--model-class-name",
+            dest="model_class_name",
+            type=str,
+            default=None,
+            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",
@@ -204,6 +219,7 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--ring",
+            "--ring-degree",
             dest="ring_degree",
             type=int,
             default=None,
@@ -319,6 +335,14 @@ class OmniServeCommand(CLISubcommand):
             choices=[1, 2],
             help="Number of devices for CFG parallel computation for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
+        )
+        omni_config_group.add_argument(
+            "--vae-patch-parallel-size",
+            type=int,
+            default=1,
+            help="VAE Patch Parallelism degree for diffusion models. "
+            "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
+            "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
 
         # Default sampling parameters

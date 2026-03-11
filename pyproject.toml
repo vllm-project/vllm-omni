@@ -51,6 +51,7 @@ dev = [
     "mooncake-transfer-engine==0.3.8.post1",
     "av", # for ComfyUI tests
     "openpyxl>=3.0.0", # for nightly CI
+    "pyttsx3>=2.99"
 ]
 
 docs = [

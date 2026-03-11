@@ -4,8 +4,8 @@ import asyncio
 import copy
 import time
 import weakref
-from collections.abc import AsyncGenerator, Iterable, Sequence
-from typing import Any
+from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from typing import Any, TypeVar
 
 from vllm.config import VllmConfig
 from vllm.inputs.preprocess import InputPreprocessor
@@ -35,11 +35,20 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.metrics import OrchestratorAggregator
 from vllm_omni.outputs import OmniRequestOutput
 
+_R = TypeVar("_R")
+
 logger = init_logger(__name__)
 
 
-def _weak_close_cleanup_async(stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None):
+def _weak_close_cleanup_async(
+    stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None, inline_engine=None
+):
     """Weak reference cleanup function for AsyncOmni instances."""
+    if inline_engine is not None:
+        try:
+            inline_engine.close()
+        except Exception as e:
+            logger.warning("Failed to close inline diffusion engine: %s", e)
     if stage_list:
         for q in stage_in_queues:
             try:
@@ -105,9 +114,16 @@ class AsyncOmni(OmniBase):
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
 
+        # Sleep mode tracking
+        self._is_sleeping: bool = False
+
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
+
+        # RPC results storage: {stage_id: {rpc_id: result}}
+        # Used to avoid race condition between output_handler and collective_rpc
+        self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
 
         super().__init__(model, **kwargs)
 
@@ -121,6 +137,7 @@ class AsyncOmni(OmniBase):
             self._ray_pg,
             self.output_handler,
             self._zmq_ctx,
+            getattr(self, "_inline_engine", None),
         )
 
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -140,7 +157,9 @@ class AsyncOmni(OmniBase):
             ring_degree = kwargs.get("ring_degree") or 1
             sequence_parallel_size = kwargs.get("sequence_parallel_size")
             tensor_parallel_size = kwargs.get("tensor_parallel_size") or 1
+            enable_expert_parallel = kwargs.get("enable_expert_parallel") or False
             cfg_parallel_size = kwargs.get("cfg_parallel_size") or 1
+            vae_patch_parallel_size = kwargs.get("vae_patch_parallel_size") or 1
             use_hsdp = kwargs.get("use_hsdp", False)
             hsdp_shard_size = kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = kwargs.get("hsdp_replicate_size", 1)
@@ -161,10 +180,12 @@ class AsyncOmni(OmniBase):
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
                 tensor_parallel_size=tensor_parallel_size,
+                enable_expert_parallel=enable_expert_parallel,
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
                 cfg_parallel_size=cfg_parallel_size,
+                vae_patch_parallel_size=vae_patch_parallel_size,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
@@ -180,6 +201,7 @@ class AsyncOmni(OmniBase):
                 },
                 "engine_args": {
                     "parallel_config": parallel_config,
+                    "model_class_name": kwargs.get("model_class_name", None),
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
                     "cache_backend": cache_backend,
@@ -190,6 +212,8 @@ class AsyncOmni(OmniBase):
                     "enforce_eager": kwargs.get("enforce_eager", False),
                     "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+                    "worker_extension_cls": kwargs.get("worker_extension_cls", None),
+                    "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
                 },
@@ -250,6 +274,26 @@ class AsyncOmni(OmniBase):
             self.io_processor = None
             self.model_config = None
 
+    def _setup_rpc_result_checkers(self) -> None:
+        """Override base class to use async-friendly RPC result checkers.
+
+        In the async path the output_handler task drains the output queues
+        and stashes collective_rpc results into ``_rpc_results``.  The
+        checker therefore only needs to look there (no queue draining).
+        """
+        for stage in self.stage_list:
+            sid = stage.stage_id
+
+            def make_rpc_checker(stage_id: int):
+                def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
+                    if stage_id in self._rpc_results and rpc_id in self._rpc_results[stage_id]:
+                        return self._rpc_results[stage_id].pop(rpc_id)
+                    return None
+
+                return rpc_checker
+
+            stage._rpc_result_checker = make_rpc_checker(sid)
+
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC.
 
@@ -295,6 +339,11 @@ class AsyncOmni(OmniBase):
         # Wait until generation is resumed if the engine is paused.
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
+
+        if self._inline_diffusion:
+            async for output in self._generate_inline(prompt, request_id, sampling_params_list, output_modalities):
+                yield output
+            return
 
         logger.debug(f"[{self._name}] generate() called")
         try:
@@ -387,6 +436,97 @@ class AsyncOmni(OmniBase):
             logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
 
+    async def _generate_inline(
+        self,
+        prompt: OmniPromptType,
+        request_id: str,
+        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
+        output_modalities: list[str] | None = None,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Generate using inline diffusion engine (no stage worker subprocess).
+
+        Eliminates Hop3 IPC overhead by running OmniDiffusion directly in the
+        orchestrator process.  The blocking generate() call is offloaded to a
+        thread executor so the asyncio event loop remains responsive.
+        """
+        _wall_start_ts = time.time()
+
+        if sampling_params_list is None:
+            sampling_params_list = self.default_sampling_params_list
+        sp0 = sampling_params_list[0]
+
+        stage = self.stage_list[0]
+        final_stage_id_for_e2e = 0
+
+        metrics = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=self.log_stats,
+            wall_start_ts=_wall_start_ts,
+            final_stage_id_for_e2e=final_stage_id_for_e2e,
+        )
+        metrics.stage_first_ts[0] = time.time()
+
+        logger.info(
+            "[%s] Inline diffusion generate for request %s",
+            self._name,
+            request_id,
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(
+                None,
+                self._inline_engine.generate,
+                prompt,
+                sp0,
+                [request_id],
+            )
+
+            for result in results:
+                images = getattr(result, "images", None) or []
+                finished = getattr(result, "finished", True)
+
+                output_to_yield = OmniRequestOutput(
+                    stage_id=0,
+                    final_output_type=stage.final_output_type,
+                    request_output=result,
+                    images=images,
+                    finished=finished,
+                )
+
+                metrics.stage_last_ts[0] = time.time()
+                yield output_to_yield
+
+            try:
+                metrics.on_finalize_request(
+                    final_stage_id_for_e2e,
+                    request_id,
+                    _wall_start_ts,
+                )
+                metrics.build_and_log_summary()
+            except Exception as e:
+                logger.exception(
+                    "[%s] Failed to finalize inline metrics: %s",
+                    self._name,
+                    e,
+                )
+
+        except (asyncio.CancelledError, GeneratorExit):
+            logger.info(
+                "[%s] Inline request %s cancelled.",
+                self._name,
+                request_id,
+            )
+            raise
+        except Exception as e:
+            logger.exception(
+                "[%s] Inline diffusion failed for request %s: %s",
+                self._name,
+                request_id,
+                e,
+            )
+            raise
+
     async def _process_async_results(
         self,
         request_id: str,
@@ -398,7 +538,10 @@ class AsyncOmni(OmniBase):
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         all_stages_finished = {stage_id: False for stage_id in range(final_stage_id_for_e2e + 1)}
         submit_flag = True
+        _loop_iter = 0
+        _last_progress_ts = time.time()
         while not all(all_stages_finished.values()):
+            _loop_iter += 1
             for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
                 if all_stages_finished[stage_id]:
                     continue
@@ -407,6 +550,7 @@ class AsyncOmni(OmniBase):
                 except asyncio.QueueEmpty:
                     await asyncio.sleep(0.001)
                     continue
+                _last_progress_ts = time.time()
                 engine_outputs, finished, output_to_yield = self._process_single_result(
                     result,
                     stage,
@@ -415,11 +559,20 @@ class AsyncOmni(OmniBase):
                 )
                 if submit_flag and stage_id == 0:
                     submit_flag = False
-                    prompt_token_ids = engine_outputs.prompt_token_ids
+                    prompt_token_ids = getattr(engine_outputs, "prompt_token_ids", None)
+                    if prompt_token_ids is None:
+                        prompt_token_ids = []
                     engine_input = copy.deepcopy(prompt)
-                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    try:
+                        next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    except Exception:
+                        raise
                     engine_input["prompt_token_ids"] = [0] * next_prompt_len
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
+                    for _mm_key in ("mm_kwargs", "mm_hashes", "mm_placeholders", "multi_modal_uuids"):
+                        engine_input.pop(_mm_key, None)
+                    if engine_input.get("type") == "multimodal":
+                        engine_input["type"] = "token"
                     for i in range(1, len(self.stage_list)):
                         task = {
                             "request_id": request_id,
@@ -522,6 +675,7 @@ class AsyncOmni(OmniBase):
             raise RuntimeError(result)
 
         engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+
         if isinstance(engine_outputs, list):
             engine_outputs = engine_outputs[0]
 
@@ -539,12 +693,17 @@ class AsyncOmni(OmniBase):
                     images = engine_outputs.images
 
             if stage.final_output_type == "image":
+                # Propagate custom_output from inner diffusion output
+                custom_output = {}
+                if isinstance(engine_outputs, OmniRequestOutput):
+                    custom_output = engine_outputs.custom_output or {}
                 output_to_yield = OmniRequestOutput(
                     stage_id=stage_id,
                     final_output_type=stage.final_output_type,
                     request_output=engine_outputs,
                     images=images,
                     finished=finished,
+                    _custom_output=custom_output,
                 )
             else:
                 output_to_yield = OmniRequestOutput(
@@ -594,6 +753,15 @@ class AsyncOmni(OmniBase):
                             # so we wait for a short time and try again
                             await asyncio.sleep(0.05)
                             continue
+                        # Handle collective_rpc results separately to avoid
+                        # race condition with the polling in collective_rpc
+                        if result.get("type") == "collective_rpc_result":
+                            rpc_id = result.get("rpc_id")
+                            if rpc_id:
+                                if stage_id not in self._rpc_results:
+                                    self._rpc_results[stage_id] = {}
+                                self._rpc_results[stage_id][rpc_id] = result
+                            continue
                         req_id = result.get("request_id")
                         req_state = request_states.get(req_id)
                         if req_state is None:
@@ -629,7 +797,8 @@ class AsyncOmni(OmniBase):
 
     @property
     def is_running(self) -> bool:
-        # Is None before the loop is started.
+        if self._inline_diffusion:
+            return self._inline_engine is not None
         return len(self._stage_in_queues) > 0
 
     @property
@@ -653,10 +822,24 @@ class AsyncOmni(OmniBase):
         return EngineDeadError()
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
+        if self._inline_diffusion:
+            if self._inline_engine is not None:
+                self._inline_engine.engine.abort(request_id)
+            return None
         abort_task = {"type": OmniStageTaskType.ABORT, "request_id": request_id}
         for stage in self.stage_list:
             stage.submit(abort_task)
         return None
+
+    async def get_supported_tasks(self) -> set[str]:
+        tasks: set[str] = set()
+        has_comprehension = any(stage.is_comprehension for stage in self.stage_list)
+        if has_comprehension:
+            tasks.add("generate")
+        for stage in self.stage_list:
+            if getattr(stage, "final_output_type", None) == "audio":
+                tasks.add("speech")
+        return tasks if tasks else {"generate"}
 
     async def get_vllm_config(self) -> VllmConfig:
         for stage in self.stage_list:
@@ -696,6 +879,8 @@ class AsyncOmni(OmniBase):
         OMNI: Required by upstream OpenAIServingModels.__init__ which
         accesses engine_client.renderer.
         """
+        if self.input_processor is None:
+            return None
         return self.input_processor.renderer
 
     async def do_log_stats(self) -> None:
@@ -710,19 +895,73 @@ class AsyncOmni(OmniBase):
     async def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
         pass
 
+    async def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        """Execute an RPC call on all stages asynchronously.
+
+        Args:
+            method: Name of the method to execute or callable
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+
+        Returns:
+            List of results from each stage
+        """
+        self._run_output_handler()
+        # Run synchronous collective_rpc in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+
+        async def run_stage_rpc(stage: OmniStage) -> _R:
+            return await loop.run_in_executor(
+                None,
+                stage.collective_rpc,
+                method,
+                timeout,
+                args,
+                kwargs,
+            )
+
+        # Run all stages concurrently
+        results = await asyncio.gather(*[run_stage_rpc(stage) for stage in self.stage_list])
+        return list(results)
+
     async def sleep(self, level: int = 1) -> None:
-        pass
+        self._is_sleeping = True
+        await self.collective_rpc(method="sleep", args=(level,))
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
-        pass
+        self._is_sleeping = False
+        await self.collective_rpc(method="wake_up", args=(tags,))
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""
-        return False
+        return getattr(self, "_is_sleeping", False)
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
-        return False
+        result = await self.collective_rpc(method="add_lora", args=(lora_request,))
+        return result[0][0]
+
+    async def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA adapter from the engine."""
+        result = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
+        return result[0][0]
+
+    async def list_loras(self) -> list[int]:
+        """List all loaded LoRA adapter IDs."""
+        result = await self.collective_rpc(method="list_loras")
+        return result[0][0]
+
+    async def pin_lora(self, adapter_id: int) -> bool:
+        """Pin a LoRA adapter so it is not evicted from the cache."""
+        result = await self.collective_rpc(method="pin_lora", args=(adapter_id,))
+        return result[0][0]
 
     async def encode(
         self,

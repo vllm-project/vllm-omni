@@ -1,8 +1,7 @@
 import argparse
 import os
-from typing import cast
 
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
+from vllm_omni.inputs.data import OmniPromptType
 
 
 def parse_args():
@@ -51,6 +50,14 @@ def parse_args():
     parser.add_argument(
         "--negative-prompt", type=str, default=None, help="Negative prompt for CFG (default: empty prompt)"
     )
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
 
     args = parser.parse_args()
     return args
@@ -81,106 +88,80 @@ def main():
 
     from PIL import Image
 
-    if args.modality == "img2img":
-        from PIL import Image
+    from vllm_omni.entrypoints.omni import Omni
 
-        from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
+    omni_kwargs = {}
+    if args.stage_configs_path:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path
 
-        print("[Info] Running in img2img mode (Stage 1 only)")
-        client = OmniDiffusion(model=model_name)
+    omni_kwargs.update(
+        {
+            "log_stats": args.log_stats,
+            "init_sleep_seconds": args.init_sleep_seconds,
+            "batch_timeout": args.batch_timeout,
+            "init_timeout": args.init_timeout,
+            "shm_threshold_bytes": args.shm_threshold_bytes,
+            "worker_backend": args.worker_backend,
+            "ray_address": args.ray_address,
+        }
+    )
 
-        if args.image_path:
-            if os.path.exists(args.image_path):
-                loaded_image = Image.open(args.image_path).convert("RGB")
-                prompts = [
-                    {
-                        "prompt": cast(str, p),
-                        "multi_modal_data": {"image": loaded_image},
-                    }
-                    for p in prompts
-                ]
-            else:
-                print(f"[Warning] Image path {args.image_path} does not exist.")
+    omni = Omni(model=model_name, **omni_kwargs)
 
-        result = client.generate(
-            prompts,
-            OmniDiffusionSamplingParams(
-                seed=52,
-                need_kv_receive=False,
-                num_inference_steps=args.steps,
-                extra_args={
-                    "cfg_text_scale": args.cfg_text_scale,
-                    "cfg_img_scale": args.cfg_img_scale,
-                },
-            ),
-        )
-
-        # Ensure result is a list for iteration
-        if not isinstance(result, list):
-            omni_outputs = [result]
-        else:
-            omni_outputs = result
-
-    else:
-        from vllm_omni.entrypoints.omni import Omni
-
-        omni_kwargs = {}
-        if args.stage_configs_path:
-            omni_kwargs["stage_configs_path"] = args.stage_configs_path
-
-        omni_kwargs.update(
-            {
-                "log_stats": args.log_stats,
-                "init_sleep_seconds": args.init_sleep_seconds,
-                "batch_timeout": args.batch_timeout,
-                "init_timeout": args.init_timeout,
-                "shm_threshold_bytes": args.shm_threshold_bytes,
-                "worker_backend": args.worker_backend,
-                "ray_address": args.ray_address,
+    formatted_prompts = []
+    for p in prompts:
+        if args.modality == "img2img":
+            if not args.image_path or not os.path.exists(args.image_path):
+                raise ValueError(f"img2img requires --image-path pointing to an existing file, got: {args.image_path}")
+            loaded_image = Image.open(args.image_path).convert("RGB")
+            final_prompt_text = f"<|fim_middle|><|im_start|>{p}<|im_end|>"
+            prompt_dict = {
+                "prompt": final_prompt_text,
+                "multi_modal_data": {"img2img": loaded_image},
+                "modalities": ["img2img"],
             }
-        )
-
-        omni = Omni(model=model_name, **omni_kwargs)
-
-        formatted_prompts = []
-        for p in args.prompts:
-            if args.modality == "img2text":
-                if args.image_path:
-                    loaded_image = Image.open(args.image_path).convert("RGB")
-                    final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
-                    prompt_dict = {
-                        "prompt": final_prompt_text,
-                        "multi_modal_data": {"image": loaded_image},
-                        "modalities": ["text"],
-                    }
-                    formatted_prompts.append(prompt_dict)
-            elif args.modality == "text2text":
-                final_prompt_text = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
-                prompt_dict = {"prompt": final_prompt_text, "modalities": ["text"]}
-                formatted_prompts.append(prompt_dict)
-            else:
-                # text2img
-                final_prompt_text = f"<|im_start|>{p}<|im_end|>"
-                prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
-                if args.negative_prompt is not None:
-                    prompt_dict["negative_prompt"] = args.negative_prompt
-                formatted_prompts.append(prompt_dict)
-
-        params_list = omni.default_sampling_params_list
-        if args.modality == "text2img":
-            params_list[0].max_tokens = 1  # type: ignore # The first stage is a SamplingParam (vllm)
-            if len(params_list) > 1:
-                diffusion_params = params_list[1]
-                diffusion_params.num_inference_steps = args.steps  # type: ignore
-                extra = {
-                    "cfg_text_scale": args.cfg_text_scale,
-                    "cfg_img_scale": args.cfg_img_scale,
+            if args.negative_prompt is not None:
+                prompt_dict["negative_prompt"] = args.negative_prompt
+            formatted_prompts.append(prompt_dict)
+        elif args.modality == "img2text":
+            if args.image_path:
+                loaded_image = Image.open(args.image_path).convert("RGB")
+                final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                prompt_dict = {
+                    "prompt": final_prompt_text,
+                    "multi_modal_data": {"image": loaded_image},
+                    "modalities": ["text"],
                 }
-                if args.negative_prompt is not None:
-                    extra["negative_prompt"] = args.negative_prompt
-                diffusion_params.extra_args = extra  # type: ignore
+                formatted_prompts.append(prompt_dict)
+        elif args.modality == "text2text":
+            final_prompt_text = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            prompt_dict = {"prompt": final_prompt_text, "modalities": ["text"]}
+            formatted_prompts.append(prompt_dict)
+        else:
+            final_prompt_text = f"<|im_start|>{p}<|im_end|>"
+            prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
+            if args.negative_prompt is not None:
+                prompt_dict["negative_prompt"] = args.negative_prompt
+            formatted_prompts.append(prompt_dict)
 
-        omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
+    params_list = omni.default_sampling_params_list
+    if args.modality in ("text2img", "img2img"):
+        params_list[0].max_tokens = 1  # type: ignore
+        if len(params_list) > 1:
+            diffusion_params = params_list[1]
+            diffusion_params.num_inference_steps = args.steps  # type: ignore
+            diffusion_params.cfg_parallel_size = args.cfg_parallel_size  # type: ignore
+            if args.seed is not None:
+                diffusion_params.seed = args.seed  # type: ignore
+            extra = {
+                "cfg_text_scale": args.cfg_text_scale,
+                "cfg_img_scale": args.cfg_img_scale,
+            }
+            if args.negative_prompt is not None:
+                extra["negative_prompt"] = args.negative_prompt
+            diffusion_params.extra_args = extra  # type: ignore
+
+    omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 
     for i, req_output in enumerate(omni_outputs):
         images = getattr(req_output, "images", None)

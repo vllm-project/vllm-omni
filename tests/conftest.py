@@ -12,6 +12,7 @@ if "VLLM_TARGET_DEVICE" not in os.environ:
 
 import concurrent.futures
 import gc
+import multiprocessing
 import socket
 import subprocess
 import sys
@@ -217,101 +218,192 @@ def generate_synthetic_audio(
     sample_rate: int = 48000,  # Default use 48000Hz.
     save_to_file: bool = False,
 ) -> dict[str, Any]:
-    """ "Generate synthetic audio with rain."""
+    """
+    Generate TTS speech with pyttsx3 and return base64 string.
+    """
+    import tempfile
+
+    import pyttsx3
     import soundfile as sf
 
-    # Initialize audio data array
-    num_samples = int(sample_rate * duration)
+    def _pick_voice(engine: pyttsx3.Engine) -> str | None:
+        voices = engine.getProperty("voices")
+        if not voices:
+            return None
+
+        preferred_tokens = (
+            "natural",
+            "jenny",
+            "sonia",
+            "susan",
+            "zira",
+            "aria",
+            "hazel",
+            "samantha",
+            "ava",
+            "allison",
+            "female",
+            "woman",
+            "english-us",
+            "en-us",
+            "english",
+        )
+        discouraged_tokens = (
+            "espeak",
+            "robot",
+            "mbrola",
+            "microsoft david",
+            "male",
+            "man",
+        )
+
+        best_voice = voices[0]
+        best_score = float("-inf")
+        for voice in voices:
+            voice_text = f"{getattr(voice, 'id', '')} {getattr(voice, 'name', '')}".lower()
+            voice_languages = " ".join(
+                lang.decode(errors="ignore") if isinstance(lang, bytes) else str(lang)
+                for lang in getattr(voice, "languages", [])
+            ).lower()
+            combined_text = f"{voice_text} {voice_languages}"
+            score = 0
+            for idx, token in enumerate(preferred_tokens):
+                if token in combined_text:
+                    score += 20 - idx
+            for token in discouraged_tokens:
+                if token in combined_text:
+                    score -= 10
+            if "english" in combined_text or "en_" in combined_text or "en-" in combined_text:
+                score += 4
+            if "en-us" in combined_text or "english-us" in combined_text:
+                score += 4
+            if score > best_score:
+                best_score = score
+                best_voice = voice
+
+        return best_voice.id
+
+    def _resample_audio(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+        if src_sr == dst_sr or len(audio) == 0:
+            return audio.astype(np.float32)
+
+        src_len = audio.shape[0]
+        dst_len = max(1, int(round(src_len * float(dst_sr) / float(src_sr))))
+        src_idx = np.arange(src_len, dtype=np.float32)
+        dst_idx = np.linspace(0, src_len - 1, dst_len, dtype=np.float32)
+
+        resampled_channels: list[np.ndarray] = []
+        for ch in range(audio.shape[1]):
+            resampled_channels.append(np.interp(dst_idx, src_idx, audio[:, ch]).astype(np.float32))
+        return np.stack(resampled_channels, axis=1)
+
+    def _match_channels(audio: np.ndarray, target_channels: int) -> np.ndarray:
+        current_channels = audio.shape[1]
+        if current_channels == target_channels:
+            return audio.astype(np.float32)
+        if target_channels == 1:
+            return np.mean(audio, axis=1, keepdims=True, dtype=np.float32)
+        if current_channels == 1:
+            return np.repeat(audio, target_channels, axis=1).astype(np.float32)
+
+        collapsed = np.mean(audio, axis=1, keepdims=True, dtype=np.float32)
+        return np.repeat(collapsed, target_channels, axis=1).astype(np.float32)
+
+    def _trim_silence(audio: np.ndarray, threshold: float = 0.01) -> np.ndarray:
+        if len(audio) == 0:
+            return audio
+        energy = np.max(np.abs(audio), axis=1)
+        voiced = np.where(energy > threshold)[0]
+        if len(voiced) == 0:
+            return audio
+        start = max(0, int(voiced[0]) - int(sample_rate * 0.02))
+        end = min(len(audio), int(voiced[-1]) + int(sample_rate * 0.04) + 1)
+        return audio[start:end]
+
+    def _enhance_speech(audio: np.ndarray) -> np.ndarray:
+        if len(audio) == 0:
+            return audio.astype(np.float32)
+        enhanced = audio.astype(np.float32).copy()
+        enhanced -= np.mean(enhanced, axis=0, keepdims=True, dtype=np.float32)
+        if len(enhanced) > 1:
+            preemphasis = enhanced.copy()
+            preemphasis[1:] = enhanced[1:] - 0.94 * enhanced[:-1]
+            enhanced = 0.7 * enhanced + 0.3 * preemphasis
+        # Mild dynamic-range compression for ASR/TTS robustness.
+        enhanced = np.sign(enhanced) * np.sqrt(np.abs(enhanced))
+        # Light fade to avoid clicks after trimming/repeating.
+        fade = min(len(enhanced) // 4, max(1, int(sample_rate * 0.01)))
+        if fade > 1:
+            ramp_in = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            ramp_out = np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            enhanced[:fade] *= ramp_in[:, None]
+            enhanced[-fade:] *= ramp_out[:, None]
+        peak = float(np.max(np.abs(enhanced)))
+        if peak > 1e-8:
+            enhanced = enhanced / peak * 0.95
+        return enhanced.astype(np.float32)
+
+    phrase_text = "test"
+    num_samples = int(sample_rate * max(1, duration))
     audio_data = np.zeros((num_samples, num_channels), dtype=np.float32)
 
-    # Configure parameters based on rain intensity
-    drop_density = 10  # Number of raindrops per second
-    drop_volume = 0.15  # Volume of individual raindrops
-    background_volume = 0.02  # Volume of background rain noise
+    engine = pyttsx3.init()
+    engine.setProperty("rate", 112)
+    engine.setProperty("volume", 1.0)
+    selected_voice = _pick_voice(engine)
+    if selected_voice is not None:
+        engine.setProperty("voice", selected_voice)
 
-    # Pink noise sounds more natural than white noise for rain
-    white_noise = np.random.randn(num_samples)
-    pink_noise = np.convolve(white_noise, np.ones(8) / 8, mode="same")
-    pink_noise = pink_noise / np.max(np.abs(pink_noise)) if np.max(np.abs(pink_noise)) > 0 else pink_noise
-    bg_noise = pink_noise * background_volume
+    temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    temp_wav.close()
 
-    # Add background noise to all channels
-    for ch in range(num_channels):
-        audio_data[:, ch] += bg_noise
+    try:
+        engine.save_to_file(phrase_text, temp_wav.name)
+        engine.runAndWait()
+        engine.stop()
 
-    # Total number of raindrops = density × duration × channels for stereo effect
-    total_drops = int(drop_density * duration * num_channels)
+        ready = False
+        for _ in range(50):
+            if os.path.exists(temp_wav.name) and os.path.getsize(temp_wav.name) > 44:
+                ready = True
+                break
+            time.sleep(0.1)
 
-    for _ in range(total_drops):
-        # Random timing for raindrop
-        drop_time = random.uniform(0, duration)
+        if not ready:
+            raise RuntimeError("pyttsx3 did not produce a WAV file in time.")
 
-        # Random duration of raindrop sound (0.01-0.05 seconds)
-        drop_duration = random.uniform(0.01, 0.05)
+        tts_audio, tts_sr = sf.read(temp_wav.name, dtype="float32", always_2d=True)
+    finally:
+        if os.path.exists(temp_wav.name):
+            os.unlink(temp_wav.name)
 
-        # Random frequency gives variation in raindrop pitch
-        drop_freq = random.uniform(500, 5000)  # Hz
+    if len(tts_audio) == 0:
+        raise RuntimeError("pyttsx3 produced an empty WAV file.")
 
-        # Random channel selection for stereo positioning
-        channel = random.randint(0, num_channels - 1)
+    tts_audio = _resample_audio(tts_audio, tts_sr, sample_rate)
+    tts_audio = _match_channels(tts_audio, num_channels)
+    tts_audio = _trim_silence(tts_audio, threshold=0.012)
+    tts_audio = _enhance_speech(tts_audio)
 
-        # Calculate sample positions for this raindrop
-        start_sample = int(drop_time * sample_rate)
-        drop_samples = int(drop_duration * sample_rate)
-        end_sample = min(start_sample + drop_samples, num_samples)
+    lead_silence = min(int(sample_rate * 0.02), num_samples // 8)
+    pause_samples = int(sample_rate * 0.18)
+    start = lead_silence
+    phrase_len = tts_audio.shape[0]
 
-        if start_sample < end_sample:
-            # Generate the raindrop sound
-            num_drop_samples = end_sample - start_sample
-            t = np.arange(num_drop_samples) / sample_rate
+    while start < num_samples:
+        take = min(phrase_len, num_samples - start)
+        audio_data[start : start + take] = tts_audio[:take]
+        start += phrase_len + pause_samples
 
-            # Basic sine wave for raindrop sound
-            drop_sound = drop_volume * np.sin(2 * math.pi * drop_freq * t)
-
-            # Apply envelope for natural attack and decay
-            envelope = np.ones(num_drop_samples)
-            attack_samples = int(num_drop_samples * 0.1)  # 10% of samples for attack
-            decay_samples = num_drop_samples - attack_samples
-
-            if attack_samples > 0:
-                # Linear attack: volume increases from 0 to 1
-                envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
-
-            if decay_samples > 0:
-                # Exponential decay for natural sound fade
-                decay = np.exp(-8 * t[attack_samples:] / drop_duration)
-                envelope[attack_samples:] = decay
-
-            # Apply envelope to raindrop sound
-            drop_sound *= envelope
-
-            # Add raindrop sound to selected channel
-            audio_data[start_sample:end_sample, channel] += drop_sound
-
-    # Step 3: Add simple reverb effect for realism
-    # Reverb simulates sound reflections in environment
-    if duration > 2:
-        # Single delay reverb (100ms delay)
-        delay_samples = int(0.1 * sample_rate)
-        if delay_samples < num_samples:
-            for ch in range(num_channels):
-                delayed = np.zeros(num_samples)
-                delayed[delay_samples:] = audio_data[:-delay_samples, ch] * 0.3
-                audio_data[:, ch] += delayed
-
-    # Step 4: Normalize audio to prevent clipping
-    # Find maximum amplitude and scale to 80% of maximum volume
-    max_amp = np.max(np.abs(audio_data))
+    max_amp = float(np.max(np.abs(audio_data)))
     if max_amp > 0:
-        audio_data = audio_data / max_amp * 0.8
+        audio_data = audio_data / max_amp * 0.95
 
-    audio_array = audio_data.copy()
-    result = {
-        "np_array": audio_array,
+    audio_bytes: bytes | None = None
+    output_path: str | None = None
+    result: dict[str, Any] = {
+        "np_array": audio_data.copy(),
     }
-
-    # Handle file saving
-    audio_bytes = None
 
     if save_to_file:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -617,24 +709,38 @@ def convert_audio_to_text(audio_data):
     return text
 
 
-def convert_audio_file_to_text(output_path):
+def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
-    model = whisper.load_model("small")
-    text = model.transcribe(
-        output_path,
-        temperature=0.0,
-        word_timestamps=True,
-        condition_on_previous_text=False,
-    )["text"]
-    del model
-    if torch.cuda.is_available():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = whisper.load_model("small", device=device)
+    try:
+        text = model.transcribe(
+            output_path,
+            temperature=0.0,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+        )["text"]
+    finally:
+        # Sync GPU so in-flight ops finish before we free the model; otherwise
+        # freed memory may not show up until those ops complete.
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        del model
         gc.collect()
-        torch.cuda.empty_cache()
-    if text:
-        return text
-    else:
-        return ""
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return text or ""
+
+
+def convert_audio_file_to_text(output_path: str) -> str:
+    """Convert an audio file to text in an isolated subprocess."""
+    # Import locally to avoid impacting test module import time.
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+        future = executor.submit(_whisper_transcribe_in_current_process, output_path)
+        return future.result()
 
 
 def merge_base64_and_convert_to_text(base64_list):
@@ -951,15 +1057,16 @@ class OmniServer:
         max_wait = 1200  # 20 minutes
         start_time = time.time()
         while time.time() - start_time < max_wait:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1)
-                    result = sock.connect_ex((self.host, self.port))
-                    if result == 0:
-                        print(f"Server ready on {self.host}:{self.port}")
-                        return
-            except Exception:
-                pass
+            # Check for process status
+            ret = self.proc.poll()
+            if ret is not None:
+                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                result = sock.connect_ex((self.host, self.port))
+                if result == 0:
+                    print(f"Server ready on {self.host}:{self.port}")
+                    return
             time.sleep(2)
 
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
@@ -1105,7 +1212,7 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
     assert response.success, "The request failed."
     e2e_latency = response.e2e_latency
     if e2e_latency is not None:
-        print(f"the avg e2e is: {e2e_latency}")
+        print(f"the avg e2e latency is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
