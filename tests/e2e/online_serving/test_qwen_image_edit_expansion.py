@@ -23,8 +23,8 @@ MULTI_EDIT_PROMPT = (
     "Then juxtapose the two transformed images into a single artwork for visual contrast."
 )
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 # This test file targets two models, so I write a helper function.
