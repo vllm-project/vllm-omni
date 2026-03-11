@@ -37,6 +37,7 @@ from vllm_omni.distributed.ray_utils.utils import (
 )
 from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.omni_stage import OmniStage
+from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
@@ -137,7 +138,7 @@ def omni_snapshot_download(model_id) -> str:
     return model_id
 
 
-class OmniBase:
+class OmniBase(PDDisaggregationMixin):
     """Base class for serving Omni models.
 
     Args:
@@ -193,6 +194,8 @@ class OmniBase:
         # based on stage_type in YAML config (handled in omni_stage.py)
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
+
+        self._init_pd_state()
 
     def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
@@ -1109,6 +1112,8 @@ class Omni(OmniBase):
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
+        sampling_params_list = self._maybe_expand_sampling_params(sampling_params_list)
+
         if len(sampling_params_list) != len(self.stage_list):
             raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
@@ -1174,8 +1179,14 @@ class Omni(OmniBase):
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
+        _seed_is_prefill = self._pd_separation_pair is not None and self._pd_separation_pair[0] == 0
+
         for req_id, prompt in request_id_to_prompt.items():
             sp0 = sampling_params_list[0]  # type: ignore[index]
+
+            if _seed_is_prefill:
+                sp0 = self._prepare_prefill_sampling_params(req_id, sp0)
+
             task = {
                 "request_id": req_id,
                 "engine_inputs": prompt,
@@ -1225,6 +1236,8 @@ class Omni(OmniBase):
                 made_progress = True
                 req_id = result.get("request_id")
                 if "error" in result:
+                    if req_id is not None:
+                        self._drop_pd_kv_params(req_id)
                     logger.error(
                         f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                     )
@@ -1269,6 +1282,16 @@ class Omni(OmniBase):
                     continue
 
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+
+                if (
+                    self._pd_separation_pair is not None
+                    and req_id is not None
+                    and stage_id == self._pd_separation_pair[0]
+                ):
+                    kv_params = self._extract_kv_transfer_params(engine_outputs)
+                    if kv_params is not None:
+                        with self._pd_kv_params_lock:
+                            self._pd_kv_params_by_req[req_id] = kv_params
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
@@ -1392,20 +1415,32 @@ class Omni(OmniBase):
                         continue
 
                     next_stage: OmniStage = self.stage_list[next_stage_id]
-                    try:
-                        # Derive inputs for the next stage, record preprocess time
-                        with metrics.stage_postprocess_timer(stage_id, req_id):
-                            next_inputs = next_stage.process_engine_inputs(
-                                self.stage_list, [request_id_to_prompt[req_id]]
-                            )
-                    except Exception as e:
-                        completed_requests += 1
-                        logger.exception(
-                            f"[{self._name}] Process engine inputs error for req {req_id}"
-                            f" at stage {next_stage_id}: {e} ({completed_requests}/{total_requests})",
+
+                    if self._is_pd_routing(stage_id, next_stage_id):
+                        next_inputs, sp_next = self._prepare_pd_decode_routing(
+                            req_id,
+                            request_id_to_prompt[req_id],
+                            sampling_params_list[next_stage_id],
+                            prefill_kv_fallback=result.get("kv_transfer_params"),
                         )
-                        continue
-                    sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
+                    else:
+                        try:
+                            # Derive inputs for the next stage, record preprocess time
+                            with metrics.stage_postprocess_timer(stage_id, req_id):
+                                next_inputs = next_stage.process_engine_inputs(
+                                    self.stage_list, [request_id_to_prompt[req_id]]
+                                )
+                        except Exception as e:
+                            completed_requests += 1
+                            logger.exception(
+                                f"[{self._name}] Process engine inputs error for req {req_id}"
+                                f" at stage {next_stage_id}: {e} ({completed_requests}/{total_requests})",
+                            )
+                            continue
+                        sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
+
+                    if self._pd_separation_pair is not None and next_stage_id == self._pd_separation_pair[0]:
+                        sp_next = self._prepare_prefill_sampling_params(req_id, sp_next)
 
                     # Check if we have a connector for this edge
                     connector_key = (str(stage_id), str(next_stage_id))
@@ -1429,13 +1464,14 @@ class Omni(OmniBase):
                             f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
                             "Configure a connector for this edge or inspect connector logs for details."
                         )
-
                     logger.debug(
                         f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
                     )
                     remaining_by_stage[next_stage_id] += 1
                 else:
                     completed_requests += 1
+                    if req_id is not None:
+                        self._drop_pd_kv_params(req_id)
                     if pbar:
                         final_mod = self.output_modalities[final_stage_id_to_prompt[req_id]]
                         pbar.unit = "img" if final_mod == "image" else "req"
@@ -1443,6 +1479,7 @@ class Omni(OmniBase):
                     logger.debug(
                         f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
                     )
+
             for timed_out_id in cfg.check_timeouts():
                 completed_requests += 1
                 logger.error(
@@ -1456,6 +1493,9 @@ class Omni(OmniBase):
 
         if pbar:
             pbar.close()
+
+        for rid in request_ids:
+            self._drop_pd_kv_params(rid)
 
         # Summarize and print stats
         try:

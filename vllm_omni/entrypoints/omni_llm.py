@@ -257,9 +257,11 @@ class OmniLLM(LLM):
         total_out_toks = 0
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
+
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
+
                     if use_tqdm:
                         if isinstance(output, RequestOutput):
                             # Calculate tokens only for RequestOutput
@@ -281,4 +283,70 @@ class OmniLLM(LLM):
         # Sort the outputs by the int part of request ID which is in format of 'int-uuid'.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
+
+        # PD disaggregation: flush any pending KV connector sends that were
+        # added by request_finished() after the last build_connector_meta()
+        # call.  Without this flush, the prefill engine's worker never
+        # receives the block IDs needed for KV transfer to the decode engine.
+        self._flush_kv_connector_sends()
+
         return sorted(outputs, key=lambda x: int(x.request_id.split("-")[0]))
+
+    def _flush_kv_connector_sends(self) -> None:
+        """Flush pending KV connector send metadata to workers.
+
+        When _run_engine() finishes a batch, request_finished() may have
+        added entries to _reqs_need_send *after* the last
+        build_connector_meta() call within that step's schedule().  In
+        standard vLLM online serving this is not a problem because the
+        engine loop continues and the next schedule() picks them up.  In
+        OmniLLM batch mode the loop exits immediately, so we must run one
+        more empty-request step to deliver the metadata.
+
+        NOTE: This method reaches into vLLM internals
+        (engine_core → scheduler → connector → connector_scheduler →
+        _reqs_need_send) and fabricates a SchedulerOutput to call
+        execute_model() directly.  There is no public Engine API to
+        "flush pending KV sends" because vLLM assumes the engine loop
+        runs continuously.  OmniLLM's batch mode breaks that assumption.
+        If upstream refactors rename or restructure these internals, this
+        method will need to be updated.  Tested against vLLM >= 0.8.x.
+        """
+        try:
+            engine_core = getattr(self.llm_engine, "engine_core", None)
+            if engine_core is None:
+                return
+            scheduler = getattr(engine_core, "scheduler", None)
+            if scheduler is None:
+                return
+            connector = getattr(scheduler, "connector", None)
+            if connector is None:
+                return
+            cs = getattr(connector, "connector_scheduler", None)
+            if cs is None:
+                return
+
+            pending = getattr(cs, "_reqs_need_send", None)
+            if not pending:
+                return
+
+            from vllm.v1.core.sched.output import SchedulerOutput
+
+            # Create an empty scheduler output and attach connector metadata.
+            so = SchedulerOutput.make_empty()
+            so.kv_connector_metadata = connector.build_connector_meta(so)
+
+            # Run an empty model step: the worker sees
+            # total_num_scheduled_tokens == 0 and takes the no_forward()
+            # path, which only processes connector metadata
+            # (record_send_reqs → sets ready event on SendBlockMeta).
+            model_executor = getattr(engine_core, "model_executor", None)
+            if model_executor is None:
+                return
+            model_executor.execute_model(so)
+            logger.debug("[OmniLLM] KV connector sends flushed")
+        except Exception:
+            logger.warning(
+                "[OmniLLM] Failed to flush KV connector sends",
+                exc_info=True,
+            )

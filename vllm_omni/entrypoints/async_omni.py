@@ -354,6 +354,8 @@ class AsyncOmni(OmniBase):
             if sampling_params_list is None:
                 sampling_params_list = self.default_sampling_params_list
 
+            sampling_params_list = self._maybe_expand_sampling_params(sampling_params_list)
+
             if len(sampling_params_list) != len(self.stage_list):
                 raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
@@ -381,11 +383,25 @@ class AsyncOmni(OmniBase):
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
+
+            if self._pd_separation_pair is not None and self._pd_separation_pair[0] == 0:
+                sp0 = self._prepare_prefill_sampling_params(request_id, sp0)
+                logger.info(
+                    "[%s] PD prefill SP prepared for req %s: max_tokens=%s, extra_args keys=%s, kv_transfer_params=%s",
+                    self._name,
+                    request_id,
+                    sp0.max_tokens,
+                    list(sp0.extra_args.keys()) if sp0.extra_args else None,
+                    sp0.extra_args.get("kv_transfer_params") if sp0.extra_args else None,
+                )
+
             task = {
                 "request_id": request_id,
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
             }
+            if sp0.extra_args and "kv_transfer_params" in sp0.extra_args:
+                task["_kv_transfer_params"] = sp0.extra_args["kv_transfer_params"]
             self.stage_list[0].submit(task)
             metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
             _req_start_ts[request_id] = time.time()
@@ -615,10 +631,19 @@ class AsyncOmni(OmniBase):
             next_stage_id = stage_id + 1
             if next_stage_id <= final_stage_id_for_e2e:
                 next_stage: OmniStage = self.stage_list[next_stage_id]
-                # Derive inputs for the next stage, record postprocess time
-                with metrics.stage_postprocess_timer(stage_id, request_id):
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
-                sp_next: SamplingParams = sampling_params_list[next_stage_id]
+
+                if self._is_pd_routing(stage_id, next_stage_id):
+                    next_inputs, sp_next = self._prepare_pd_decode_routing(
+                        request_id,
+                        prompt,
+                        sampling_params_list[next_stage_id],
+                        engine_outputs=engine_outputs,
+                    )
+                else:
+                    # Derive inputs for the next stage, record postprocess time
+                    with metrics.stage_postprocess_timer(stage_id, request_id):
+                        next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
+                    sp_next: SamplingParams = sampling_params_list[next_stage_id]
 
                 # Check if we have a connector for this edge
                 connector_key = (str(stage_id), str(next_stage_id))

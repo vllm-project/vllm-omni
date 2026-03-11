@@ -1,5 +1,8 @@
 """
 E2E Online tests for Qwen3-Omni model with video input and audio output.
+
+Includes PD (Prefill-Decode) disaggregation tests that use a separate
+stage config YAML splitting the thinker into prefill + decode stages.
 """
 
 import os
@@ -52,6 +55,10 @@ else:
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+
+# PD disaggregation stage config (requires 3x GPUs)
+pd_stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_pd_ci.yaml")]
+pd_test_params = [(model, sc) for model in models for sc in pd_stage_configs]
 
 
 def get_system_prompt():
@@ -147,3 +154,76 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_request(request_config, request_num=get_max_batch_size())
+
+
+# ===================================================================
+# PD (Prefill-Decode) disaggregation tests
+# ===================================================================
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=3)
+@pytest.mark.parametrize("omni_server", pd_test_params, indirect=True)
+def test_pd_text_to_text(omni_server, openai_client) -> None:
+    """
+    Test PD disaggregation with text-only output via OpenAI API.
+    Deploy Setting: PD separation yaml
+    Input Modal: text
+    Output Modal: text
+    Input Setting: stream=False
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text_only"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+        "key_words": {"text": ["beijing"]},
+    }
+
+    openai_client.send_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=3)
+@pytest.mark.parametrize("omni_server", pd_test_params, indirect=True)
+def test_pd_mix_to_text_audio(omni_server, openai_client) -> None:
+    """
+    Test PD disaggregation with multi-modal input and text+audio output via OpenAI API.
+    Deploy Setting: PD separation yaml
+    Input Modal: text + audio + video + image
+    Output Modal: text + audio
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text=get_prompt("mix"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {
+            "audio": ["water", "chirping", "crackling", "rain"],
+            "image": ["square", "quadrate"],
+        },
+    }
+
+    openai_client.send_request(request_config)
