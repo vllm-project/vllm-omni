@@ -118,11 +118,11 @@ def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHan
     request_config = {
         "model": omni_server.model,
         "messages": messages,
-        "negative_prompt": NEGATIVE_PROMPT,
         "extra_body": {
             "height": 512,
             "width": 512,
             "num_inference_steps": 2,
+            "negative_prompt": NEGATIVE_PROMPT,
             "true_cfg_scale": 4.0,
             "seed": 42,
         },
@@ -151,11 +151,11 @@ def test_qwen_image_edit_2509(omni_server: OmniServer, openai_client: OpenAIClie
     request_config = {
         "model": omni_server.model,
         "messages": messages,
-        "negative_prompt": NEGATIVE_PROMPT,
         "extra_body": {
             "height": 512,
             "width": 512,
             "num_inference_steps": 2,
+            "negative_prompt": NEGATIVE_PROMPT,
             "true_cfg_scale": 4.0,
             "seed": 42,
         },
