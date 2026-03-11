@@ -38,13 +38,3 @@ steps:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:
       queue: "cpu_queue_premerge"
-
-  # L5 Test
-  - label: "🚀 Bootstrap intel tests"
-    key: bootstrap-intel-omni
-    if: build.branch == "main"
-    commands:
-      - "chmod +x .buildkite/bootstrap-intel-omni.sh"
-      - "./.buildkite/bootstrap-intel-omni.sh"
-    agents:
-      queue: "cpu_queue_premerge"
