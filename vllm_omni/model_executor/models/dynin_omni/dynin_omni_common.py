@@ -6,10 +6,11 @@ import os
 import sys
 import threading
 import types
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import torch
 from omegaconf import OmegaConf
@@ -716,8 +717,7 @@ def _load_dynin_remote_module(
     module_path = Path(snapshot_dir) / f"{module_name}.py"
     if not module_path.is_file():
         raise ImportError(
-            f"Dynin remote code module '{module_name}.py' not found under '{snapshot_dir}'. "
-            f"source={source!r}"
+            f"Dynin remote code module '{module_name}.py' not found under '{snapshot_dir}'. source={source!r}"
         )
 
     package_name = _ensure_dynin_remote_package(snapshot_dir)
@@ -951,6 +951,5 @@ def get_dynin_magvit_attr(
         )
 
     raise ImportError(
-        f"Failed to resolve MAGVIT attr '{attr_name}' from source={resolved_source!r} "
-        f"(revision={resolved_revision!r})."
+        f"Failed to resolve MAGVIT attr '{attr_name}' from source={resolved_source!r} (revision={resolved_revision!r})."
     )

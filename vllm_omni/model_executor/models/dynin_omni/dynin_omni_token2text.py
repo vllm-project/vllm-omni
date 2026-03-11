@@ -116,8 +116,7 @@ class DyninOmniToken2Text(nn.Module):
                 )
         except Exception as e:
             raise RuntimeError(
-                "Failed to load DyninOmniModelLM via remote Dynin code "
-                f"for model path '{model_path}'."
+                f"Failed to load DyninOmniModelLM via remote Dynin code for model path '{model_path}'."
             ) from e
 
     def get_language_model(self) -> Any:
