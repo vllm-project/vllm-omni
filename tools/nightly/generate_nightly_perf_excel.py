@@ -53,8 +53,10 @@ BENCHMARK_COLUMNS: tuple[str, ...] = (
 NUMERIC_FORMAT_COLUMNS: tuple[str, ...] = tuple(
     c for c in BENCHMARK_COLUMNS if c not in ("request_rate", "max_concurrency")
 )
+DATASET_NAME_ALLOWED = ("random", "random-mm")
 
 _COLUMNS_FILENAME = "nightly_perf_summary_columns.txt"
+_RESULT_JSON_PREFIX = "result_test_"
 DEFAULT_INPUT_DIR = os.getenv("DEFAULT_INPUT_DIR") if os.getenv("DEFAULT_INPUT_DIR") else "tests"
 DEFAULT_OUTPUT_DIR = os.getenv("DEFAULT_OUTPUT_DIR") if os.getenv("DEFAULT_OUTPUT_DIR") else "tests"
 
@@ -68,6 +70,8 @@ def _load_summary_columns(script_dir: str) -> list[str]:
         "backend",
         "model_id",
         "tokenizer_id",
+        "test_name",
+        "dataset_name",
         "num_prompts",
         "request_rate",
         "burstiness",
@@ -183,6 +187,52 @@ def _load_json_file(path: str) -> dict[str, Any] | None:
     return data
 
 
+def _parse_from_filename(filename: str) -> dict[str, Any]:
+    """Parse test-related metadata from a result JSON filename.
+
+    Expected pattern (after prefix/suffix stripped):
+    <test_name>_<dataset_name>_<max_concurrency>_<num_prompts>_<timestamp>
+    """
+    name, ext = os.path.splitext(filename)
+    if ext != ".json" or not name.startswith(_RESULT_JSON_PREFIX):
+        return {}
+
+    core = name[len(_RESULT_JSON_PREFIX) :]
+    parts = core.split("_")
+    if len(parts) < 5:
+        LOGGER.warning("filename '%s' does not match expected pattern, skip parsing test metadata", filename)
+        return {}
+
+    timestamp = parts[-1]
+    num_prompts_str = parts[-2]
+    max_concurrency_str = parts[-3]
+    dataset_name = parts[-4]
+    test_name = "_".join(parts[:-4]) if parts[:-4] else ""
+
+    parsed: dict[str, Any] = {}
+
+    if len(timestamp) >= 15:
+        parsed["date"] = timestamp
+
+    if dataset_name in DATASET_NAME_ALLOWED:
+        parsed["dataset_name"] = dataset_name
+
+    try:
+        parsed["num_prompts"] = int(num_prompts_str)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        parsed["max_concurrency"] = int(max_concurrency_str)
+    except (TypeError, ValueError):
+        pass
+
+    if test_name:
+        parsed["test_name"] = test_name
+
+    return parsed
+
+
 def _iter_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
     """Iterate over JSON files in the input directory and yield normalized records.
     commit_sha/build_id/build_url are not set here; they are applied later only to
@@ -195,6 +245,9 @@ def _iter_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
     for entry in sorted(os.listdir(input_dir)):
         if not entry.endswith(".json"):
             continue
+        if not entry.startswith(_RESULT_JSON_PREFIX):
+            LOGGER.warning("skip non-result json file '%s'", entry)
+            continue
         full_path = os.path.join(input_dir, entry)
         if not os.path.isfile(full_path):
             continue
@@ -204,7 +257,30 @@ def _iter_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
             continue
 
         record: dict[str, Any] = dict(data)
-        record.setdefault("date", datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+        filename_meta = _parse_from_filename(os.path.basename(full_path))
+
+        if "date" not in record or not record["date"]:
+            if "date" in filename_meta:
+                record["date"] = filename_meta["date"]
+            else:
+                record["date"] = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+
+        if "num_prompts" not in record or record["num_prompts"] is None:
+            if "num_prompts" in filename_meta:
+                record["num_prompts"] = filename_meta["num_prompts"]
+
+        if "max_concurrency" not in record or record["max_concurrency"] is None:
+            if "max_concurrency" in filename_meta:
+                record["max_concurrency"] = filename_meta["max_concurrency"]
+
+        if "test_name" not in record or not record.get("test_name"):
+            if "test_name" in filename_meta:
+                record["test_name"] = filename_meta["test_name"]
+
+        if "dataset_name" not in record or not record.get("dataset_name"):
+            if "dataset_name" in filename_meta:
+                record["dataset_name"] = filename_meta["dataset_name"]
+
         record["source_file"] = os.path.basename(full_path)
         yield record
 
@@ -241,9 +317,18 @@ def _apply_build_metadata_to_latest_only(
 
 
 def _sort_records_for_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Sort so that same model_id is grouped, newest date first within each group."""
+    """Sort so that same test configuration is grouped, newest date first within each group."""
     by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
-    return sorted(by_date_desc, key=lambda r: (r.get("model_id") or ""))
+    return sorted(
+        by_date_desc,
+        key=lambda r: (
+            r.get("model_id") or "",
+            r.get("test_name") or "",
+            r.get("dataset_name") or "",
+            r.get("max_concurrency") or 0,
+            r.get("num_prompts") or 0,
+        ),
+    )
 
 
 def _values_differ(a: Any, b: Any) -> bool:
