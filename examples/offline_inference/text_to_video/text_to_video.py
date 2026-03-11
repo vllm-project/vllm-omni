@@ -127,6 +127,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
+    )
     return parser.parse_args()
 
 
@@ -160,6 +165,7 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Check if profiling is requested via environment variable
@@ -193,7 +199,7 @@ def main():
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
-        f" vae_patch_parallel_size={args.vae_patch_parallel_size}"
+        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")

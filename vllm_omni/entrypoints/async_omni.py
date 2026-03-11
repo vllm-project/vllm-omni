@@ -157,6 +157,7 @@ class AsyncOmni(OmniBase):
             ring_degree = kwargs.get("ring_degree") or 1
             sequence_parallel_size = kwargs.get("sequence_parallel_size")
             tensor_parallel_size = kwargs.get("tensor_parallel_size") or 1
+            enable_expert_parallel = kwargs.get("enable_expert_parallel") or False
             cfg_parallel_size = kwargs.get("cfg_parallel_size") or 1
             vae_patch_parallel_size = kwargs.get("vae_patch_parallel_size") or 1
             use_hsdp = kwargs.get("use_hsdp", False)
@@ -179,6 +180,7 @@ class AsyncOmni(OmniBase):
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
                 tensor_parallel_size=tensor_parallel_size,
+                enable_expert_parallel=enable_expert_parallel,
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,

@@ -208,6 +208,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
+    )
     parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
     parser.add_argument(
         "--resolution",
@@ -348,6 +353,7 @@ def main():
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Configure cache based on backend type
@@ -402,7 +408,7 @@ def main():
     else:
         print(f"  Input image size: {input_image.size}")
     print(
-        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}"
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}, enable_expert_parallel: {args.enable_expert_parallel}"
     )
     print(f"{'=' * 60}\n")
 
