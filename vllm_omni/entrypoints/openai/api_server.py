@@ -245,7 +245,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         else:
             supported_tasks = ("generate",)
         if not supported_tasks:
-            supported_tasks = ("generate",)
+            # Only default to "generate" when get_supported_tasks is not implemented;
+            # TTS-only models intentionally return an empty set.
+            if not hasattr(engine_client, "get_supported_tasks"):
+                supported_tasks = ("generate",)
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
