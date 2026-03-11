@@ -17,7 +17,6 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalInputs,
     MultiModalKwargsItems,
-    MultiModalUUIDDict,
     PlaceholderRange,
 )
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
@@ -25,7 +24,9 @@ from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
+    ProcessorInputs,
     PromptUpdate,
+    TimingContext,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
@@ -307,28 +308,14 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
 
     def apply(
         self,
-        prompt: str | list[int],
-        mm_data: MultiModalDataDict | MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object] | None = None,
-        *,
-        mm_uuids: MultiModalUUIDDict | None = None,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
     ) -> MultiModalInputs:
-        if tokenization_kwargs is None:
-            tokenization_kwargs = {}
+        prompt = inputs.prompt
+        mm_items = inputs.mm_data_items
 
-        # vLLM >= 0.16 removed BaseMultiModalProcessor._to_mm_items.
-        # Normalize here using processing info for compatibility.
-        if isinstance(mm_data, MultiModalDataItems):
-            mm_items = mm_data
-        else:
-            mm_items = self.info.parse_mm_data(mm_data)
-        mm_hashes = self._hash_mm_items(
-            mm_items,
-            hf_processor_mm_kwargs,
-            tokenization_kwargs,
-            mm_uuids=mm_uuids,
-        )
+        with timing_ctx.record("get_mm_hashes"):
+            mm_hashes = inputs.get_mm_hashes(self.info.model_id)
 
         tokenizer = self.info.ctx.tokenizer
         prompt_token_ids = self._to_prompt_token_ids(prompt, tokenizer)
