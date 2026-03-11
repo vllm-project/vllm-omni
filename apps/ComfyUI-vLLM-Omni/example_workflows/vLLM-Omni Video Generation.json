@@ -1,0 +1,513 @@
+{
+    "id": "3aea1d08-7de5-4997-ba71-b2f66ad72a21",
+    "revision": 0,
+    "last_node_id": 14,
+    "last_link_id": 28,
+    "nodes": [
+        {
+            "id": 10,
+            "type": "MarkdownNote",
+            "pos": [
+                227.99306819575278,
+                -231.24143306069843
+            ],
+            "size": [
+                240.3326478922474,
+                136.3505820791881
+            ],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [],
+            "outputs": [],
+            "title": "Note: Task and Input",
+            "properties": {},
+            "widgets_values": [
+                "vLLM-Omni nodes are categorized based on the output modality. The \"Generate Video\" node supports both text-to-video generation and image-to-video generation. The node will create corresponding payload depending on whether an input image is present or not."
+            ],
+            "color": "#432",
+            "bgcolor": "#000"
+        },
+        {
+            "id": 4,
+            "type": "LoadImage",
+            "pos": [
+                496.31859627609606,
+                -229.71277089860084
+            ],
+            "size": [
+                270,
+                314
+            ],
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "image",
+                    "name": "image",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "image"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "choose file to upload",
+                    "name": "upload",
+                    "type": "IMAGEUPLOAD",
+                    "widget": {
+                        "name": "upload"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "localized_name": "IMAGE",
+                    "name": "IMAGE",
+                    "type": "IMAGE",
+                    "links": [
+                        25
+                    ]
+                },
+                {
+                    "localized_name": "MASK",
+                    "name": "MASK",
+                    "type": "MASK",
+                    "links": null
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "LoadImage"
+            },
+            "widgets_values": [
+                "cute-cat.jpg",
+                "image"
+            ]
+        },
+        {
+            "id": 8,
+            "type": "VLLMOmniDiffusionSampling",
+            "pos": [
+                465.5140218220927,
+                148.80072646828987
+            ],
+            "size": [
+                284.205078125,
+                226
+            ],
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "n",
+                    "name": "n",
+                    "type": "INT",
+                    "widget": {
+                        "name": "n"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "num_inference_steps",
+                    "name": "num_inference_steps",
+                    "type": "INT",
+                    "widget": {
+                        "name": "num_inference_steps"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "guidance_scale",
+                    "name": "guidance_scale",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "guidance_scale"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "true_cfg_scale",
+                    "name": "true_cfg_scale",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "true_cfg_scale"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "vae_use_slicing",
+                    "name": "vae_use_slicing",
+                    "type": "BOOLEAN",
+                    "widget": {
+                        "name": "vae_use_slicing"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "vae_use_tiling",
+                    "name": "vae_use_tiling",
+                    "type": "BOOLEAN",
+                    "widget": {
+                        "name": "vae_use_tiling"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "seed",
+                    "name": "seed",
+                    "type": "INT",
+                    "widget": {
+                        "name": "seed"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "localized_name": "diffusion sampling params",
+                    "name": "diffusion sampling params",
+                    "type": "SAMPLING_PARAMS",
+                    "links": [
+                        27
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VLLMOmniDiffusionSampling"
+            },
+            "widgets_values": [
+                1,
+                50,
+                1,
+                1,
+                false,
+                false,
+                1992,
+                "randomize"
+            ]
+        },
+        {
+            "id": 14,
+            "type": "VLLMOmniWanParams",
+            "pos": [
+                518.6005521845747,
+                428.4455663719664
+            ],
+            "size": [
+                270,
+                106
+            ],
+            "flags": {},
+            "order": 3,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "guidance_scale_2",
+                    "name": "guidance_scale_2",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "guidance_scale_2"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "boundary_ratio",
+                    "name": "boundary_ratio",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "boundary_ratio"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "flow_shift",
+                    "name": "flow_shift",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "flow_shift"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "localized_name": "Wan video params",
+                    "name": "Wan video params",
+                    "type": "VIDEO_PARAMS",
+                    "links": [
+                        28
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VLLMOmniWanParams"
+            },
+            "widgets_values": [
+                4,
+                0.875,
+                5
+            ]
+        },
+        {
+            "id": 12,
+            "type": "VLLMOmniGenerateVideo",
+            "pos": [
+                827.2566336087867,
+                -73.77449831827545
+            ],
+            "size": [
+                400,
+                346
+            ],
+            "flags": {},
+            "order": 4,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "image",
+                    "name": "image",
+                    "shape": 7,
+                    "type": "IMAGE",
+                    "link": 25
+                },
+                {
+                    "localized_name": "sampling_params",
+                    "name": "sampling_params",
+                    "shape": 7,
+                    "type": "SAMPLING_PARAMS",
+                    "link": 27
+                },
+                {
+                    "localized_name": "lora",
+                    "name": "lora",
+                    "shape": 7,
+                    "type": "REMOTE_LORA",
+                    "link": null
+                },
+                {
+                    "localized_name": "model_params",
+                    "name": "model_params",
+                    "shape": 7,
+                    "type": "VIDEO_PARAMS",
+                    "link": 28
+                },
+                {
+                    "localized_name": "url",
+                    "name": "url",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "url"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "model",
+                    "name": "model",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "model"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "prompt",
+                    "name": "prompt",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "prompt"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "negative_prompt",
+                    "name": "negative_prompt",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "negative_prompt"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "width",
+                    "name": "width",
+                    "type": "INT",
+                    "widget": {
+                        "name": "width"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "height",
+                    "name": "height",
+                    "type": "INT",
+                    "widget": {
+                        "name": "height"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "fps",
+                    "name": "fps",
+                    "type": "INT",
+                    "widget": {
+                        "name": "fps"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "num_frames",
+                    "name": "num_frames",
+                    "type": "INT",
+                    "widget": {
+                        "name": "num_frames"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "localized_name": "video",
+                    "name": "video",
+                    "type": "VIDEO",
+                    "links": [
+                        26
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VLLMOmniGenerateVideo"
+            },
+            "widgets_values": [
+                "http://localhost:8000/v1",
+                "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+                "Make the cat in the attached video yawning. Eye closed and mouth wide open. Keep the original realistic style.",
+                "Cartoonish",
+                900,
+                1200,
+                12,
+                41
+            ]
+        },
+        {
+            "id": 13,
+            "type": "SaveVideo",
+            "pos": [
+                1257.5441369501657,
+                -44.12956394419863
+            ],
+            "size": [
+                374,
+                372.34896826553796
+            ],
+            "flags": {},
+            "order": 5,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "video",
+                    "name": "video",
+                    "type": "VIDEO",
+                    "link": 26
+                },
+                {
+                    "localized_name": "filename_prefix",
+                    "name": "filename_prefix",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "filename_prefix"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "format",
+                    "name": "format",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "format"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "codec",
+                    "name": "codec",
+                    "type": "COMBO",
+                    "widget": {
+                        "name": "codec"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [],
+            "properties": {},
+            "widgets_values": [
+                "video/ComfyUI",
+                "auto",
+                "auto"
+            ]
+        }
+    ],
+    "links": [
+        [
+            25,
+            4,
+            0,
+            12,
+            0,
+            "IMAGE"
+        ],
+        [
+            26,
+            12,
+            0,
+            13,
+            0,
+            "VIDEO"
+        ],
+        [
+            27,
+            8,
+            0,
+            12,
+            1,
+            "SAMPLING_PARAMS"
+        ],
+        [
+            28,
+            14,
+            0,
+            12,
+            3,
+            "VIDEO_PARAMS"
+        ]
+    ],
+    "groups": [
+        {
+            "id": 1,
+            "title": "Input",
+            "bounding": [
+                213.1706010087147,
+                -313.20095750667554,
+                560.8246471437027,
+                407.4246532472182
+            ],
+            "color": "#3f789e",
+            "font_size": 24,
+            "flags": {}
+        }
+    ],
+    "config": {},
+    "extra": {
+        "workflowRendererVersion": "LG",
+        "ds": {
+            "scale": 1.1469075819486894,
+            "offset": [
+                101.7632950847089,
+                492.29121889347806
+            ]
+        }
+    },
+    "version": 0.4
+}
