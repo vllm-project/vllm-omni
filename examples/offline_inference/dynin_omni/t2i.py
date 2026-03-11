@@ -215,13 +215,13 @@ def resolve_t2i_runtime_defaults(
         timesteps,
         cfg_select,
         ("training.generation_timesteps",),
-        18,
+        20,
     )
     resolved_guidance_scale = _pick_float(
         guidance_scale,
         cfg_select,
         ("training.guidance_scale",),
-        0.0,
+        3.5,
     )
     resolved_temperature = _pick_float(
         temperature,
@@ -337,7 +337,17 @@ def load_uni_prompting_for_t2i(
 ) -> Any:
     from transformers import AutoTokenizer
 
-    from vllm_omni.model_executor.models.dynin_omni.prompting_utils import UniversalPrompting
+    from vllm_omni.model_executor.models.dynin_omni.dynin_omni_common import (
+        get_dynin_remote_attr,
+    )
+
+    UniversalPrompting = get_dynin_remote_attr(
+        "UniversalPrompting",
+        module_name="prompting_utils",
+        source=tokenizer_source,
+        local_files_only=bool(local_files_only),
+        fallback_module_names=("modeling_dynin_omni",),
+    )
 
     load_kwargs = {
         "padding_side": "left",

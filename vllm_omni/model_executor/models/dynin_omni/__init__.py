@@ -5,14 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from .dynin_omni import DyninOmniForConditionalGeneration
+from .dynin_omni_common import get_dynin_magvit_attr, get_dynin_modeling_attr, get_dynin_sampling_attr
 
 if TYPE_CHECKING:
     from .dynin_omni_token2audio import DyninOmniToken2Audio
     from .dynin_omni_token2image import DyninOmniToken2Image
     from .dynin_omni_token2text import DyninOmniToken2Text
-    from .modeling_dynin_omni import DyninOmniConfig, DyninOmniModelLM, VideoTokenMerger
-    from .modeling_magvitv2 import LFQuantizer, MAGVITv2, VQGANDecoder, VQGANEncoder
-    from .sampling import get_mask_schedule
 
 
 def __getattr__(name: str) -> Any:
@@ -29,26 +27,11 @@ def __getattr__(name: str) -> Any:
 
         return DyninOmniToken2Text
     if name in ("DyninOmniConfig", "DyninOmniModelLM", "VideoTokenMerger"):
-        from .modeling_dynin_omni import DyninOmniConfig, DyninOmniModelLM, VideoTokenMerger
-
-        return {
-            "DyninOmniConfig": DyninOmniConfig,
-            "DyninOmniModelLM": DyninOmniModelLM,
-            "VideoTokenMerger": VideoTokenMerger,
-        }[name]
+        return get_dynin_modeling_attr(name)
     if name in ("VQGANEncoder", "VQGANDecoder", "LFQuantizer", "MAGVITv2"):
-        from .modeling_magvitv2 import LFQuantizer, MAGVITv2, VQGANDecoder, VQGANEncoder
-
-        return {
-            "VQGANEncoder": VQGANEncoder,
-            "VQGANDecoder": VQGANDecoder,
-            "LFQuantizer": LFQuantizer,
-            "MAGVITv2": MAGVITv2,
-        }[name]
+        return get_dynin_magvit_attr(name)
     if name == "get_mask_schedule":
-        from .sampling import get_mask_schedule
-
-        return get_mask_schedule
+        return get_dynin_sampling_attr("get_mask_schedule")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

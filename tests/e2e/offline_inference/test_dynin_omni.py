@@ -279,6 +279,29 @@ def _numel(value: Any) -> int:
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("test_config", test_params)
+def test_dynin_t2i_decode_to_image(test_config: tuple[str, str]) -> None:
+    model, stage_config_path = test_config
+    os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
+    prompt = _build_t2i_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
+
+    with OmniRunner(
+        model,
+        seed=42,
+        stage_configs_path=stage_config_path,
+        stage_init_timeout=600,
+        init_timeout=600,
+    ) as runner:
+        outputs = runner.generate([prompt])
+
+    image_output = _find_stage_output(outputs, "image")
+    assert image_output is not None
+    image_value = _extract_image(image_output)
+    assert image_value is not None
+    assert _numel(image_value) > 0
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@pytest.mark.parametrize("test_config", test_params)
 def test_dynin_mmu_to_text(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
     os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
@@ -381,26 +404,3 @@ def test_dynin_t2s_decode_to_audio(test_config: tuple[str, str]) -> None:
     audio_value = _extract_audio(audio_output)
     assert audio_value is not None
     assert _numel(audio_value) > 0
-
-
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("test_config", test_params)
-def test_dynin_t2i_decode_to_image(test_config: tuple[str, str]) -> None:
-    model, stage_config_path = test_config
-    os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
-    prompt = _build_t2i_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
-
-    with OmniRunner(
-        model,
-        seed=42,
-        stage_configs_path=stage_config_path,
-        stage_init_timeout=600,
-        init_timeout=600,
-    ) as runner:
-        outputs = runner.generate([prompt])
-
-    image_output = _find_stage_output(outputs, "image")
-    assert image_output is not None
-    image_value = _extract_image(image_output)
-    assert image_value is not None
-    assert _numel(image_value) > 0

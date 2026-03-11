@@ -457,7 +457,7 @@ def resolve_vq_model_path(
     dynin_config_path: str,
     default_model_local_files_only: bool,
 ) -> tuple[str, bool]:
-    source = "showlab/magvitv2"
+    source = "snu-aidas/magvitv2"
     local_files_only = bool(default_model_local_files_only)
     try:
         from omegaconf import OmegaConf
@@ -490,8 +490,16 @@ def load_uni_prompting(
 ) -> Any:
     from transformers import AutoTokenizer
 
-    from vllm_omni.model_executor.models.dynin_omni.prompting_utils import (
-        UniversalPrompting,
+    from vllm_omni.model_executor.models.dynin_omni.dynin_omni_common import (
+        get_dynin_remote_attr,
+    )
+
+    UniversalPrompting = get_dynin_remote_attr(
+        "UniversalPrompting",
+        module_name="prompting_utils",
+        source=tokenizer_source,
+        local_files_only=bool(local_files_only),
+        fallback_module_names=("modeling_dynin_omni",),
     )
 
     load_kwargs = {
@@ -535,8 +543,9 @@ def load_uni_prompting(
 
 
 def load_vq_encoder(vq_path: str, device: torch.device, local_files_only: bool = False) -> Any:
-    from vllm_omni.model_executor.models.dynin_omni.modeling_magvitv2 import MAGVITv2
+    from vllm_omni.model_executor.models.dynin_omni.dynin_omni_common import get_dynin_magvit_attr
 
+    MAGVITv2 = get_dynin_magvit_attr("MAGVITv2", source=vq_path, local_files_only=local_files_only)
     vq_model = MAGVITv2.from_pretrained(vq_path, local_files_only=local_files_only).to(device)
     vq_model.requires_grad_(False)
     vq_model.eval()

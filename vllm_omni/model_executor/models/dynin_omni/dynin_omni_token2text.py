@@ -19,13 +19,14 @@ from .dynin_omni_common import (
     DETOK_TEXT,
     TASK_TO_DETOK,
     first_value,
+    get_dynin_modeling_attr,
+    get_dynin_remote_attr,
+    get_dynin_sampling_attr,
     get_runtime_info,
     resolve_dynin_infer_sources,
     resolve_hidden_size,
     to_token_1d,
 )
-from .modeling_dynin_omni import DyninOmniModelLM
-from .sampling import get_mask_schedule
 
 logger = init_logger(__name__)
 
@@ -98,8 +99,10 @@ class DyninOmniToken2Text(nn.Module):
 
     @staticmethod
     def _load_text_model(model_path: str, *, local_files_only: bool = False) -> Any:
-        # Use local DYNIN implementation from vllm_omni/.../dynin_omni/models.
+        # Load Dynin model class from the model's remote code (HF snapshot),
+        # then load weights from model_path.
         try:
+            DyninOmniModelLM = get_dynin_modeling_attr("DyninOmniModelLM")
             try:
                 return DyninOmniModelLM.from_pretrained(
                     model_path,
@@ -113,7 +116,7 @@ class DyninOmniToken2Text(nn.Module):
                 )
         except Exception as e:
             raise RuntimeError(
-                "Failed to load DyninOmniModelLM from local DYNIN submodel implementation "
+                "Failed to load DyninOmniModelLM via remote Dynin code "
                 f"for model path '{model_path}'."
             ) from e
 
@@ -467,7 +470,16 @@ class DyninOmniToken2Text(nn.Module):
 
         if self._uni_prompting is None:
             try:
-                from .prompting_utils import UniversalPrompting
+                UniversalPrompting = get_dynin_remote_attr(
+                    "UniversalPrompting",
+                    module_name="prompting_utils",
+                    source=self._infer_sources.model_source,
+                    local_files_only=self._infer_sources.model_local_files_only,
+                    fallback_module_names=("modeling_dynin_omni",),
+                    optional=True,
+                )
+                if UniversalPrompting is None:
+                    raise ImportError("UniversalPrompting is not available in the configured remote Dynin code.")
 
                 init_kwargs: dict[str, Any] = {
                     "use_reserved_token": use_reserved_token,
@@ -542,6 +554,7 @@ class DyninOmniToken2Text(nn.Module):
             first_value(runtime_info.get("noise_schedule_params"), kwargs.get("noise_schedule_params"))
         )
         try:
+            get_mask_schedule = get_dynin_sampling_attr("get_mask_schedule")
             return get_mask_schedule(schedule_name, **schedule_params)
         except Exception as e:
             logger.warning(

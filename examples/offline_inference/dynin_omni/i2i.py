@@ -272,13 +272,14 @@ def resolve_vq_model_path(
             return str(repo_id), local_only
     except Exception:
         pass
-    return "showlab/magvitv2", False
+    return "snu-aidas/magvitv2", False
 
 
 def load_vq_encoder(vq_path: str, device: torch.device, local_files_only: bool = False) -> Any:
     """Load MAGVITv2 for source image VQ encoding."""
-    from vllm_omni.model_executor.models.dynin_omni.modeling_magvitv2 import MAGVITv2
+    from vllm_omni.model_executor.models.dynin_omni.dynin_omni_common import get_dynin_magvit_attr
 
+    MAGVITv2 = get_dynin_magvit_attr("MAGVITv2", source=vq_path, local_files_only=local_files_only)
     vq_model = MAGVITv2.from_pretrained(vq_path, local_files_only=local_files_only).to(device)
     vq_model.requires_grad_(False)
     vq_model.eval()
@@ -316,7 +317,17 @@ def load_uni_prompting(
     """Initialise UniversalPrompting with the DYNIN tokenizer."""
     from transformers import AutoTokenizer
 
-    from vllm_omni.model_executor.models.dynin_omni.prompting_utils import UniversalPrompting
+    from vllm_omni.model_executor.models.dynin_omni.dynin_omni_common import (
+        get_dynin_remote_attr,
+    )
+
+    UniversalPrompting = get_dynin_remote_attr(
+        "UniversalPrompting",
+        module_name="prompting_utils",
+        source=tokenizer_source,
+        local_files_only=bool(local_files_only),
+        fallback_module_names=("modeling_dynin_omni",),
+    )
 
     load_kwargs = {
         "padding_side": "left",
@@ -640,7 +651,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--timesteps",
         type=int,
-        default=128,
+        default=18,
         help="Generation timesteps. Default: training.generation_timesteps from config.",
     )
     parser.add_argument(

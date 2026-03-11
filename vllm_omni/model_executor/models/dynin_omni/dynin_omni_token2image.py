@@ -15,12 +15,12 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .dynin_omni_common import (
     DETOK_IMAGE,
     first_value,
+    get_dynin_magvit_attr,
     get_runtime_info,
     resolve_dynin_infer_sources,
     resolve_hidden_size,
     to_token_1d,
 )
-from .modeling_magvitv2 import MAGVITv2
 
 logger = init_logger(__name__)
 
@@ -130,6 +130,11 @@ class DyninOmniToken2Image(nn.Module):
                 local_files_only,
             )
             try:
+                MAGVITv2 = get_dynin_magvit_attr(
+                    "MAGVITv2",
+                    source=model_path,
+                    local_files_only=local_files_only,
+                )
                 try:
                     self._vq_model = MAGVITv2.from_pretrained(
                         model_path,

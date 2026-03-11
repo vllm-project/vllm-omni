@@ -540,7 +540,17 @@ def load_uni_prompting_for_t2s(
 ) -> Any:
     from transformers import AutoTokenizer
 
-    from vllm_omni.model_executor.models.dynin_omni.prompting_utils import UniversalPrompting
+    from vllm_omni.model_executor.models.dynin_omni.dynin_omni_common import (
+        get_dynin_remote_attr,
+    )
+
+    UniversalPrompting = get_dynin_remote_attr(
+        "UniversalPrompting",
+        module_name="prompting_utils",
+        source=tokenizer_source,
+        local_files_only=bool(local_files_only),
+        fallback_module_names=("modeling_dynin_omni",),
+    )
 
     load_kwargs = {
         "padding_side": "left",
