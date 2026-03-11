@@ -6,12 +6,17 @@ Original source at https://github.com/dougbtv/comfyui-vllm-omni, distributed und
 
 import base64
 import mimetypes
+from fractions import Fraction
 from io import BytesIO
 
 import av
 import numpy as np
 import torch
+from av.audio.frame import AudioFrame
+from av.audio.resampler import AudioResampler
+from av.video.frame import VideoFrame
 from comfy_api.input import AudioInput, VideoInput
+from comfy_api.latest import InputImpl, Types
 from comfy_extras import nodes_audio
 from PIL import Image
 
@@ -136,6 +141,71 @@ def video_to_base64(video: VideoInput, filename: str = "video.mp4") -> str:
     base64_str = base64.b64encode(byte_data).decode("utf-8")
     mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return f"data:{mime_type};base64,{base64_str}"
+
+
+def base64_to_video(base64_str: str) -> VideoInput:
+    if base64_str.startswith("data:video"):
+        _, base64_str = base64_str.split(",", 1)
+
+    try:
+        video_bytes = base64.b64decode(base64_str)
+    except Exception as e:
+        raise ValueError(f"Invalid base64 string: {e}")
+
+    video_buffer = BytesIO(video_bytes)
+
+    try:
+        with av.open(video_buffer, mode="r") as container:
+            video_stream = next((s for s in container.streams if s.type == "video"), None)
+            if video_stream is None:
+                raise ValueError("No video stream found in decoded payload.")
+
+            frames = []
+            for frame in container.decode(video_stream):
+                if not isinstance(frame, VideoFrame):
+                    continue
+                image = frame.to_ndarray(format="rgb24")
+                frames.append(torch.from_numpy(image).float() / 255.0)
+
+            if len(frames) == 0:
+                raise ValueError("No video frames found in decoded payload.")
+
+            images = torch.stack(frames, dim=0)
+            frame_rate = Fraction(video_stream.average_rate) if video_stream.average_rate else Fraction(1)
+
+            audio: AudioInput | None = None
+            if len(container.streams.audio):
+                audio_stream = container.streams.audio[-1]
+                audio_frames = []
+                resampler = AudioResampler(format="fltp")
+                for frame in container.decode(audio_stream):
+                    if not isinstance(frame, AudioFrame):
+                        continue
+                    resampled = resampler.resample(frame)
+                    if not isinstance(resampled, list):
+                        resampled = [resampled]
+                    for audio_frame in resampled:
+                        if audio_frame is not None:
+                            audio_frames.append(audio_frame.to_ndarray())
+
+                if len(audio_frames) > 0:
+                    audio_data = np.concatenate(audio_frames, axis=1)
+                    sample_rate = int(audio_stream.sample_rate) if audio_stream.sample_rate else 1
+                    audio = {
+                        "waveform": torch.from_numpy(audio_data).unsqueeze(0),
+                        "sample_rate": sample_rate,
+                    }
+
+            components = Types.VideoComponents(
+                images=images,
+                frame_rate=frame_rate,
+                audio=audio,
+                metadata=container.metadata if container.metadata else None,
+            )
+    except Exception as e:
+        raise RuntimeError(f"Failed to decode video: {e}")
+
+    return InputImpl.VideoFromComponents(components)
 
 
 def audio_to_bytes(audio: AudioInput, filename: str = "audio.mp3", quality: str = "128k") -> BytesIO:
