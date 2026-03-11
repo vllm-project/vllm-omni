@@ -14,6 +14,31 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | CustomVoice | Smaller/faster variant                                |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-Base`        | Base        | Smaller/faster variant for voice cloning              |
 
+## Gradio Demo
+
+Two interactive Gradio demos are available, both supporting all 3 task types:
+
+| Demo | File | Transport | Streaming Quality |
+| ---- | ---- | --------- | ----------------- |
+| Standard | `gradio_demo.py` | HTTP chunked | May have small gaps between chunks |
+| FastRTC | `gradio_fastrtc_demo.py` | WebRTC | Gapless streaming (requires `pip install fastrtc`) |
+
+```bash
+# Option 1: Launch server + Standard Gradio together
+./run_gradio_demo.sh                                # CustomVoice (default)
+./run_gradio_demo.sh --task-type VoiceDesign        # VoiceDesign
+./run_gradio_demo.sh --task-type Base               # Voice cloning
+
+# Option 2: If server is already running
+python gradio_demo.py --api-base http://localhost:8000
+
+# Option 3: FastRTC demo (gapless streaming)
+pip install fastrtc
+python gradio_fastrtc_demo.py --api-base http://localhost:8000
+```
+
+Then open http://localhost:7860 in your browser.
+
 ## Run examples (Qwen3-TTS)
 
 ### Launch the Server
