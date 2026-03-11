@@ -91,13 +91,14 @@ def find_anomalies(rows: list[dict], high_pct: int = 95, low_pct: int = 5) -> li
 
 
 def build_series_by_gpu(rows: list[dict]) -> tuple[list[float], dict[int, list[float]]]:
-    """Deduplicate timestamps in time order and build a utilization series for each GPU."""
+    """Deduplicate timestamps in time order and build a memory usage series (GB) for each GPU."""
     times = []
     by_ts_gpu = defaultdict(dict)
     for r in rows:
         t = r["timestamp_epoch"]
         g = r["gpu_index"]
-        by_ts_gpu[t][g] = r["memory_util_pct"]
+        # Convert MB to GB for chart display.
+        by_ts_gpu[t][g] = r["memory_used_mb"] / 1024.0
     for t in sorted(by_ts_gpu.keys()):
         times.append(t)
     gpu_series = defaultdict(list)
@@ -198,7 +199,14 @@ def render_html(
 
     const commonOptions = {{
       responsive: true,
-      scales: {{ y: {{ min: 0, max: 100 }} }}
+      scales: {{
+        y: {{
+          title: {{
+            display: true,
+            text: "Memory used (GB)"
+          }}
+        }}
+      }}
     }};
 
     function destroyCharts() {{
