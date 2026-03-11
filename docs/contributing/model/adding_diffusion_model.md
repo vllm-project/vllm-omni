@@ -657,16 +657,19 @@ For comprehensive testing guidelines and the definition of test levels (L1-L5), 
 The following tests are required to add:
 
 - L4 test of the model's full *functionality* (i.e., all the *diffusion features* that are supported by this model), including several [parallelism acceleration methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism_acceleration/), [CPU offloading](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cpu_offload_diffusion/), [TeaCache](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/teacache/) and [Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/) cache backends, [quantization methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/quantization/overview/).
-  - Test goal: L4 tests should mimic typical real-world scenarios. Hence, set `num_inference_steps` and other sampling params to common real-world, advised values.
-  - Test cases: Currently all the features are available in online serving mode. Hence, only need to add `tests/e2e/online_serving/test_{model}_expansion.py`. There is no need to test them once again in offline mode. Write one test case for each *individual* diffusion feature. Don't add test cases that combine several features.
+  - Test cases: Currently all the features are available in online serving mode. Hence, only need to add `tests/e2e/online_serving/test_{model}_expansion.py`. The following test cases shall cover all features:
+    - Single GPU: TeaCache & GGUF (or fallback to FP8, or disable it) & Layer-wise CPU offloading (or fallback to Module-wise)
+    - Parallel: Cache-DiT & FP8 (or fallback to GGUF, or disable it) & Ulysses = 2
+    - Parallel: Cache-DiT & GGUF (or fallback to FP8, or disable it) & Ring = 2
+    - Parallel: TeaCache & FP8 (or fallback to GGUF, or disable it) & CFG Parallel = 2
+    - Parallel: Cache-DiT & FP8 (or fallback to GGUF, or disable it) & Tensor Parallel = 2 & VAE Patch Parallel = 2
+    - Parallel: Cache-DiT & GGUF (or fallback to FP8, or disable it) & HSDP = 2 & VAE Patch Parallel = 2
   - Validation: test that the multimodal output files of your model have the correct shapes.
   - Test marks: always add `advanced_model` and `diffusion`. Add `parallel` and GPU-related marks if needed. Ref: [Markers for Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/tests_markers/)
-  - Code reuse:
-    - Reuse the `omni_server` and `openai_client` fixtures in `tests/conftest.py` to start online services, send API requests, and parse responses. Use `@pytest.mark.parametrize("omni_server", ..., indirect=True)` to inject dependencies into `omni_server`.
-    - Reuse `generate_synthetic_image` in `tests/conftest.py` to generate multimodal input files.
-    - Reuse (and maybe enhance) the helper functions `assert_XXX_valid` in `tests/conftest.py` for output validation.
-    - Use `@hardware_test(...)` or `hardware_marks` in `tests/utils.py` to conveniently add GPU-related test marks.
-    - Use `pytest.parametrize` to test several features with minimal repetitive code.
+  - To maximize code reuse, you may refer to
+    - `tests/conftest.py` for `omni_server` and `openai_client` fixtures, `generate_synthetic_image` and `assert_XXX_valid` helper.
+    - `tests/utils.py` for `@hardware_test(...)` and `hardware_marks`.
+    - [Parametrizing tests (pytest doc)](https://docs.pytest.org/en/stable/example/parametrize.html) to reuse test function implementation for different cases.
   - Doc: add a concise dostring for each test function.
   - Reference L4 test implementation: [tests/e2e/online_serving/test_qwen_image_edit_expansion.py](https://github.com/vllm-project/vllm-omni/blob/main/tests/e2e/online_serving/test_qwen_image_edit_expansion.py).
 

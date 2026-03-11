@@ -114,6 +114,7 @@ def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHan
 
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=EDIT_PROMPT)
 
+    # CFG parallel is only activated when a negative prompt and true_cfg_scale > 1.0 are both present
     request_config = {
         "model": omni_server.model,
         "messages": messages,
@@ -146,6 +147,7 @@ def test_qwen_image_edit_2509(omni_server: OmniServer, openai_client: OpenAIClie
         image_data_url=[image_data_url_1, image_data_url_2], content_text=MULTI_EDIT_PROMPT
     )
 
+    # CFG parallel is only activated when a negative prompt and true_cfg_scale > 1.0 are both present
     request_config = {
         "model": omni_server.model,
         "messages": messages,
