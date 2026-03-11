@@ -98,7 +98,7 @@ class OmniDiffusion:
 
             if od_config.model_class_name is None:
                 od_config.model_class_name = pipeline_class
-            od_config.tf_model_config = TransformerConfig()
+            od_config.tf_model_config = TransformerConfig().from_dict(cfg)
             od_config.update_multimodal_support()
 
         if cfg_kv_collect_func is not None:
