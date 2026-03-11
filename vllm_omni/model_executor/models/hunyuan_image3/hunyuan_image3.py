@@ -1603,7 +1603,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                     i += 1
 
                 # VAE tokens: 2D grid positions
-                vae_h, vae_w = vae_grids[image_idx]
+                if image_idx < len(vae_grids):
+                    vae_h, vae_w = vae_grids[image_idx]
+                else:
+                    vae_h, vae_w = 0, 0
                 L = pos
                 wh = vae_w * vae_h
                 beta_y = L + (wh - vae_h) / 2
@@ -1628,8 +1631,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                     i += 1
 
                 # ViT tokens: 2D grid positions
+                if image_idx < len(vit_grids):
+                    vit_h, vit_w = vit_grids[image_idx]
+                else:
+                    vit_h, vit_w = 0, 0
                 L = pos
-                vit_h, vit_w = vit_grids[image_idx]
                 wh = vit_w * vit_h
                 beta_y = L + (wh - vit_h) / 2
                 beta_x = L + (wh - vit_w) / 2
