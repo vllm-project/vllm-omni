@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.utils import GPUMemoryMonitor, hardware_test
+from tests.utils import DeviceMemoryMonitor, hardware_test
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -93,9 +93,9 @@ def _run_zimage_generate(
     if num_requests < 2:
         raise ValueError("num_requests must be >= 2 (1 warmup + >=1 timed)")
 
-    torch.cuda.empty_cache()
-    device_index = torch.cuda.current_device()
-    monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
+    current_omni_platform.empty_cache()
+    device_index = current_omni_platform.current_device()
+    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
     m = Omni(
         model=_get_zimage_model(),
@@ -161,8 +161,8 @@ def _run_zimage_generate(
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
+    if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
+        pytest.skip("Z-Image TP=2 requires >= 2 devices.")
 
     enforce_eager = False
 
@@ -223,8 +223,8 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 CUDA devices.")
+    if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
+        pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 devices.")
 
     enforce_eager = False
 
