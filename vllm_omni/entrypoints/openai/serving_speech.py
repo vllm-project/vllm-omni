@@ -84,7 +84,6 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
-        self.model_name = kwargs.pop("model_name", None)
         super().__init__(*args, **kwargs)
         # Initialize uploaded speakers storage
         speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
@@ -757,8 +756,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
 
         try:
-            sampling_params_list = self.engine_client.default_sampling_params_list
-            default_sr = 24000  # Default sample rate for TTS models
             if self._is_tts:
                 # Validate TTS parameters
                 validation_error = self._validate_tts_request(request)
@@ -783,6 +780,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 tts_params.get("task_type", ["unknown"])[0],
             )
+
+            sampling_params_list = self.engine_client.default_sampling_params_list
 
             generator = self.engine_client.generate(
                 prompt=prompt,
@@ -810,7 +809,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return self.create_error_response("TTS model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            sr_raw = audio_output.get("sr", default_sr)
+            sr_raw = audio_output.get("sr", 24000)
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
