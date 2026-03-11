@@ -1972,7 +1972,7 @@ async def create_video(
 @router.get("/v1/videos", response_model=VideoListResponse)
 async def list_videos(
     after: str | None = None,
-    limit: int | None = Query(None, ge=1, le=100),
+    limit: int | None = Query(None, ge=0, le=100),
     order: Annotated[Literal["asc", "desc"], Query()] = "desc",
 ):
     """List stored video generation jobs.
