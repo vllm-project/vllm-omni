@@ -191,8 +191,15 @@ def _run_one_benchmark_batch(
             num_prompt=num_prompts,
         )
         return result
-    except (FileNotFoundError, OSError):
-        return {"completed": 0, "failed": 0, "duration": 0.0}
+    except (FileNotFoundError, OSError) as e:
+        # Surface batch failure so the stability test does not false-pass when
+        # run_benchmark fails before writing JSON (e.g. command not found).
+        return {
+            "completed": 0,
+            "failed": 1,
+            "duration": 0.0,
+            "errors": [f"Benchmark batch failed: {type(e).__name__}: {e}"],
+        }
     finally:
         if old_benchmark_dir is not None:
             os.environ["BENCHMARK_DIR"] = old_benchmark_dir
