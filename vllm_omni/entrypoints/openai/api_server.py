@@ -2096,6 +2096,8 @@ async def download_video(video_id: str) -> FileResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Video not found")
 
+    if job.status == VideoGenerationStatus.FAILED:
+        raise HTTPException(status_code=422, detail="Video generation failed. Check job status for error details.")
     if not job.file_name:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
