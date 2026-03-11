@@ -16,12 +16,13 @@ from tests.conftest import (
 )
 from tests.utils import hardware_marks
 
-EDIT_PROMPT = "Transform this image of colorful geometric shapes into a Piet Mondrian style abstract painting."
+EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 MULTI_EDIT_PROMPT = (
-    "Transform the first image of colorful geometric shapes into a Piet Mondrian style abstract painting. "
-    "Transform the second image of colorful geometric shapes into a Vincent van Gogh style painting. "
+    "Transform the first image into a Dadaism collage art. "
+    "Transform the second image into a Vincent van Gogh style painting. "
     "Then juxtapose the two transformed images into a single artwork for visual contrast."
 )
+NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2, parallel=True)
 
@@ -50,12 +51,6 @@ def _get_diffusion_feature_cases(model: str):
                     "cache_dit",
                     "--ulysses-degree",
                     "2",
-                    "--tensor-parallel-size",
-                    "2",
-                    "--vae-patch-parallel-size",
-                    "2",
-                    "--vae-use-slicing",
-                    "--vae-use-tiling",
                 ],
             ),
             id="parallel_001",
@@ -66,15 +61,9 @@ def _get_diffusion_feature_cases(model: str):
                 model=model,
                 server_args=[
                     "--cache-backend",
-                    "tea_cache",
+                    "cache_dit",
                     "--ring",
                     "2",
-                    "--tensor-parallel-size",
-                    "2",
-                    "--vae-patch-parallel-size",
-                    "2",
-                    "--vae-use-slicing",
-                    "--vae-use-tiling",
                 ],
             ),
             id="parallel_002",
@@ -88,15 +77,25 @@ def _get_diffusion_feature_cases(model: str):
                     "tea_cache",
                     "--cfg-parallel-size",
                     "2",
+                ],
+            ),
+            id="parallel_003",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--cache-backend",
+                    "cache_dit",
                     "--tensor-parallel-size",
                     "2",
                     "--vae-patch-parallel-size",
                     "2",
-                    "--vae-use-slicing",
                     "--vae-use-tiling",
                 ],
             ),
-            id="parallel_003",
+            id="parallel_004",
             marks=PARALLEL_FEATURE_MARKS,
         ),
     ]
@@ -118,11 +117,12 @@ def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHan
     request_config = {
         "model": omni_server.model,
         "messages": messages,
+        "negative_prompt": NEGATIVE_PROMPT,
         "extra_body": {
             "height": 512,
             "width": 512,
             "num_inference_steps": 2,
-            "guidance_scale": 1,
+            "true_cfg_scale": 4.0,
             "seed": 42,
         },
     }
@@ -149,11 +149,12 @@ def test_qwen_image_edit_2509(omni_server: OmniServer, openai_client: OpenAIClie
     request_config = {
         "model": omni_server.model,
         "messages": messages,
+        "negative_prompt": NEGATIVE_PROMPT,
         "extra_body": {
             "height": 512,
             "width": 512,
             "num_inference_steps": 2,
-            "guidance_scale": 1,
+            "true_cfg_scale": 4.0,
             "seed": 42,
         },
     }
