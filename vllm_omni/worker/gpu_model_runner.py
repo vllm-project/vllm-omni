@@ -73,13 +73,6 @@ class OmniGPUModelRunner(GPUModelRunner):
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
 
-        # Some multi-modal models lack the 'mrope_section' key in their config.json.
-        # This results in 'self.uses_mrope' being mistakenly evaluated as False.
-        if not self.uses_mrope and supports_mrope(self.get_model()):
-            self.uses_mrope = True
-            if not hasattr(self, "mrope_positions"):
-                self.mrope_positions = self._make_buffer((3, self.max_num_tokens + 1), dtype=torch.int64)
-
         # TODO move this model specific logic to a separate class
         # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
         talker_mtp = getattr(self.model, "talker_mtp", None)

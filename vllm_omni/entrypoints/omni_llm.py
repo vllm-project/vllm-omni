@@ -156,6 +156,7 @@ class OmniLLM(LLM):
             compilation_config=compilation_config_instance,
             structured_outputs_config=structured_outputs_instance,
             omni_kv_config=omni_kv_config,
+            hf_overrides=hf_overrides,
             **filter_dataclass_kwargs(OmniEngineArgs, kwargs),
         )
 
