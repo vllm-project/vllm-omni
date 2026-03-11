@@ -7,7 +7,6 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
-- [vllm_omni.entrypoints.cfg_companion_tracker.CfgCompanionTracker][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
 - [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
@@ -25,7 +24,6 @@ Main entry points for vLLM-Omni inference and serving.
 
 Input data structures for multi-modal inputs.
 
-- [vllm_omni.inputs.data.OmniCustomPrompt][]
 - [vllm_omni.inputs.data.OmniDiffusionSamplingParams][]
 - [vllm_omni.inputs.data.OmniEmbedsPrompt][]
 - [vllm_omni.inputs.data.OmniTextPrompt][]
@@ -66,19 +64,6 @@ Core scheduling and caching components.
 - [vllm_omni.core.sched.output.OmniCachedRequestData][]
 - [vllm_omni.core.sched.output.OmniNewRequestData][]
 - [vllm_omni.core.sched.output.OmniSchedulerOutput][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm.BASECFM][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm.CausalConditionalCFM][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm.CausalMaskedDiffWithDiT][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm.ConditionalCFM][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.CausalConv1d][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.CausalConv1dUpsample][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.CausalConvRNNF0Predictor][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.CausalHiFTGenerator][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.HiFTGenerator][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.SineGen][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.SineGen2][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.Snake][]
-- [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.SourceModuleHnNSF][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedGroupResidualVectorQuantization][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedResidualVectorQuantization][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.EuclideanCodebook][]
@@ -93,7 +78,6 @@ Configuration classes.
 - [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 - [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
 - [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
-- [vllm_omni.model_executor.models.cosyvoice3.config.CosyVoice3Config][]
 - [vllm_omni.model_executor.models.mimo_audio.config_mimo_audio.MiMoAudioConfig][]
 - [vllm_omni.model_executor.models.mimo_audio.config_mimo_audio.MiMoAudioTokenizerConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSConfig][]
@@ -107,10 +91,6 @@ Configuration classes.
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderDiTConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1EncoderConfig][]
-- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Config][]
-- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLConfig][]
-- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLTextConfig][]
-- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLVisionConfig][]
 
 ## Workers
 
