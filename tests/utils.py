@@ -443,7 +443,7 @@ def npu_marks(*, res: str, num_cards: int):
         return [mark for mark in [test_platform, test_resource, test_distributed] if mark is not None]
 
 
-def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1, parallel: bool = False):
+def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     """
     Get a collection of pytest marks to apply for `@hardware_test`,
     including CUDA, ROCm, and NPU,
@@ -471,8 +471,6 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1, 
 
     # Collect marks from all platforms
     all_marks: list[pytest.MarkDecorator] = []
-    if parallel:
-        all_marks.append(pytest.mark.parallel)
     for platform, resource in res.items():
         cards = num_cards_dict[platform]
         if platform == "cuda" or platform == "rocm":
@@ -485,7 +483,7 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1, 
     return all_marks
 
 
-def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1, parallel: bool = False):
+def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     """
     Decorate a test for multiple hardware platforms with a single call.
     Automatically wraps the test with @create_new_process_for_each_test() for distributed tests.
@@ -498,19 +496,16 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1, p
         num_cards: Number of cards required. Can be:
             - int: same card count for all platforms (default: 1)
             - dict: per-platform card count, e.g., {"cuda": 2, "rocm": 2}
-        parallel: Whether to mark that this test is for parallelism features.
-            If True, it adds @pytest.mark.parallel.
 
     Example:
         @hardware_test(
             res={"cuda": "L4", "rocm": "MI325", "npu": "A2"},
             num_cards={"cuda": 2, "rocm": 2, "npu": 2},
-            parallel=True
         )
         def test_multi_platform():
             ...
     """
-    all_marks = hardware_marks(res=res, num_cards=num_cards, parallel=parallel)
+    all_marks = hardware_marks(res=res, num_cards=num_cards)
 
     def wrapper(f: Callable[_P, None]) -> Callable[_P, None]:
         func = f

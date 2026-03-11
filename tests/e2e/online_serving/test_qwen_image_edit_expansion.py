@@ -24,7 +24,7 @@ MULTI_EDIT_PROMPT = (
 )
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2, parallel=True)
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2)
 
 
 # This test file targets two models, so I write a helper function.
