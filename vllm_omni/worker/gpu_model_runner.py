@@ -1339,10 +1339,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         req_state = self.requests.get(req_id)
         if req_state is None:
             return
+        # Check if the model declares keys that should stay on GPU
+        gpu_keys: set[str] = set()
+        if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
+            gpu_keys = self.model.gpu_resident_buffer_keys
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
         for k, v in upd.items():
             if isinstance(v, torch.Tensor):
-                existing[k] = v.detach().to("cpu").contiguous()
+                if k in gpu_keys:
+                    existing[k] = v.detach().clone()
+                else:
+                    existing[k] = v.detach().to("cpu").contiguous()
             elif isinstance(v, list):
                 existing[k] = [
                     (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in v
