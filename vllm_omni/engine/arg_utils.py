@@ -8,6 +8,7 @@ from vllm.transformers_utils.gguf_utils import is_gguf
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.plugins import load_omni_general_plugins
+from vllm_omni.engine.output_modality import OutputModality
 
 logger = init_logger(__name__)
 
@@ -210,6 +211,11 @@ class OmniEngineArgs(EngineArgs):
 
         return omni_config
 
+    @property
+    def output_modality(self) -> OutputModality:
+        """Parse engine_output_type into a type-safe OutputModality flag."""
+        return OutputModality.from_string(self.engine_output_type)
+
 
 @dataclass
 class AsyncOmniEngineArgs(AsyncEngineArgs):
@@ -371,3 +377,8 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         omni_config.hf_config.architectures = omni_config.architectures
 
         return omni_config
+
+    @property
+    def output_modality(self) -> OutputModality:
+        """Parse engine_output_type into a type-safe OutputModality flag."""
+        return OutputModality.from_string(self.engine_output_type)
