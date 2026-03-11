@@ -6,7 +6,7 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.utils import GPUMemoryMonitor, hardware_test
+from tests.utils import DeviceMemoryMonitor, hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -23,9 +23,9 @@ models = ["riverclouds/qwen_image_random"]
 def inference(model_name: str, offload: bool = True):
     gc.collect()
     current_omni_platform.empty_cache()
-    device_index = torch.cuda.current_device()
-    torch.cuda.reset_peak_memory_stats(device=device_index)
-    monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
+    device_index = current_omni_platform.current_device()
+    current_omni_platform.reset_peak_memory_stats()
+    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
     m = Omni(
         model=model_name,
@@ -33,7 +33,7 @@ def inference(model_name: str, offload: bool = True):
         # cache_backend="cache_dit",
         enable_cpu_offload=offload,
     )
-    torch.cuda.reset_peak_memory_stats(device=device_index)
+    current_omni_platform.reset_peak_memory_stats()
     height = 256
     width = 256
 
@@ -44,7 +44,7 @@ def inference(model_name: str, offload: bool = True):
             width=width,
             num_inference_steps=9,
             guidance_scale=0.0,
-            generator=torch.Generator("cuda").manual_seed(42),
+            generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
         ),
     )
     peak = monitor.peak_used_mb
