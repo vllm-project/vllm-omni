@@ -12,7 +12,7 @@ The overall flow matches the perf logic: `load_configs`, `modify_stage`,
 
 All test-specific parameters, such as `duration_sec`, `request_rate` /
 `max_concurrency`, and `num_prompts_per_batch`, are configured in
-`tests/e2e/stability/tests/stability_test.json` and are no longer overridden
+`tests/e2e/stability/tests/test.json` and are no longer overridden
 through environment variables.
 """
 
@@ -30,7 +30,7 @@ from tests.perf.scripts.run_benchmark import run_benchmark
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
 STAGE_CONFIGS_DIR = STABILITY_DIR / "stage_configs"
-CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "stability_test.json")
+CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test.json")
 DEFAULT_NUM_PROMPTS_PER_BATCH = 20
 
 
