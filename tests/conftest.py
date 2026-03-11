@@ -1057,15 +1057,16 @@ class OmniServer:
         max_wait = 1200  # 20 minutes
         start_time = time.time()
         while time.time() - start_time < max_wait:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1)
-                    result = sock.connect_ex((self.host, self.port))
-                    if result == 0:
-                        print(f"Server ready on {self.host}:{self.port}")
-                        return
-            except Exception:
-                pass
+            # Check for process status
+            ret = self.proc.poll()
+            if ret is not None:
+                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                result = sock.connect_ex((self.host, self.port))
+                if result == 0:
+                    print(f"Server ready on {self.host}:{self.port}")
+                    return
             time.sleep(2)
 
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")

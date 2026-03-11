@@ -87,10 +87,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
-from vllm_omni.entrypoints.openai.protocol.audio import (
-    OpenAICreateAudioGenerateRequest,
-    OpenAICreateSpeechRequest,
-)
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -100,7 +97,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationResponse,
 )
-from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
@@ -179,29 +175,8 @@ class _DiffusionServingModels:
     provide a lightweight fallback.
     """
 
-    class _NullModelConfig:
-        def __getattr__(self, name):
-            return None
-
-    class _Unsupported:
-        def __init__(self, name: str):
-            self.name = name
-
-        def __call__(self, *args, **kwargs):
-            raise NotImplementedError(f"{self.name} is not supported in diffusion mode")
-
-        def __getattr__(self, attr):
-            raise NotImplementedError(f"{self.name}.{attr} is not supported in diffusion mode")
-
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
         self._base_model_paths = base_model_paths
-        self.model_config = self._NullModelConfig()
-
-    def __getattr__(self, name):
-        """Return a sentinel that raises NotImplementedError if called or
-        accessed, so any use of unsupported OpenAIServingModels features in
-        diffusion mode fails loudly with a descriptive message."""
-        return self._Unsupported(name)
 
     async def show_available_models(self) -> ModelList:
         return ModelList(
@@ -459,10 +434,10 @@ async def omni_init_app_state(
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-    model_name = served_model_names[0] if served_model_names else args.model
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
+        model_name = served_model_names[0] if served_model_names else args.model
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
@@ -475,16 +450,6 @@ async def omni_init_app_state(
             model_name=model_name,
         )
 
-        # audio related
-        state.openai_serving_speech = None
-        state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
-            engine_client,
-            state.openai_serving_models,
-            request_logger=request_logger,
-            model_name=model_name,
-        )
-
-        # video related
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
@@ -492,6 +457,7 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
 
+        state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
         return
@@ -766,11 +732,7 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
-    )
-
-    state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+        engine_client, state.openai_serving_models, request_logger=request_logger
     )
 
     state.openai_serving_video = OmniOpenAIServingVideo(
@@ -793,10 +755,6 @@ def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
 
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
-
-
-def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None:
-    return getattr(request.app.state, "openai_serving_audio_generate", None)
 
 
 @router.post(
@@ -905,34 +863,6 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
                 status_code=result.error.code if result.error else 400,
             )
         return result
-    except Exception as e:
-        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
-
-
-@router.post(
-    "/v1/audio/generate",
-    dependencies=[Depends(validate_json_request)],
-    responses={
-        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-@with_cancellation
-@load_aware_call
-async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
-    handler = OmniAudioGenerate(raw_request)
-    if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
-        if base_server is None:
-            raise HTTPException(
-                status_code=HTTPStatus.NOT_FOUND.value,
-                detail="The model does not support Audio Generate API",
-            )
-        return base_server.create_error_response(message="The model does not support Audio Generate API")
-    try:
-        return await handler.create_audio_generate(request, raw_request)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 

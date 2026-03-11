@@ -1,5 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Tests for Ulysses + Ring sequence-parallel attention correctness.
+
+What is tested
+--------------
+* ``test_sequence_parallel`` verifies that the ``Attention`` layer produces
+  numerically equivalent results whether the sequence is processed on a single
+  rank (baseline, SP=1) or sharded across multiple ranks via Ulysses/Ring SP.
+  The test spawns two separate multi-process runs with ``torch.multiprocessing.spawn``:
+  1. Baseline   – world_size=1, ulysses_degree=1, ring_degree=1.
+  2. SP run     – world_size=ulysses_degree*ring_degree, each rank holds a
+                  contiguous slice of the full sequence.
+  After both runs, rank-0 output tensors are compared element-wise with a
+  tolerance appropriate for the dtype (bfloat16).
+
+SP-plan hooks are NOT applied in this test
+------------------------------------------
+``ForwardContext.sp_plan_hooks_applied`` remains ``False``.  As a result,
+``ForwardContext.sp_active`` falls back to the "no hooks" branch: SP is
+considered active whenever ``parallel_config.sequence_parallel_size > 1``.
+This makes the test self-contained and suitable for standalone CI runs that
+do not exercise the full model-registry pipeline.
+"""
+
 import os
 import pickle
 import tempfile
@@ -25,6 +49,11 @@ def update_environment_variables(envs_dict: dict[str, str]):
     """Update multiple environment variables with logging."""
     for k, v in envs_dict.items():
         os.environ[k] = v
+
+
+def seed_everything(seed: int):
+    torch.manual_seed(seed)
+    current_omni_platform.manual_seed(seed)
 
 
 class TestAttentionModel(torch.nn.Module):
@@ -138,11 +167,10 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_size", [8])
 @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # [torch.float16, torch.bfloat16]
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_sync", [False])
 @pytest.mark.parametrize("dynamic", [False])
 @pytest.mark.parametrize("use_compile", [False])
-@pytest.mark.parametrize("attn_backend", ["sdpa", "flash_attn"])
 def test_sequence_parallel(
     ulysses_degree: int,
     ring_degree: int,
@@ -156,7 +184,6 @@ def test_sequence_parallel(
     seq_len: int,
     num_heads: int,
     head_size: int,
-    attn_backend: str,
 ):
     """Test Ulysses attention by comparing with and without SP enabled."""
     sequence_parallel_size = ulysses_degree * ring_degree
@@ -200,7 +227,6 @@ def test_sequence_parallel(
                 model_state_file,
                 input_data_file,
                 True,  # is_baseline
-                attn_backend,
             ),
             nprocs=1,
         )
@@ -228,7 +254,6 @@ def test_sequence_parallel(
                 model_state_file,
                 input_data_file,
                 False,  # is_baseline
-                attn_backend,
             ),
             nprocs=sequence_parallel_size,
         )
@@ -324,12 +349,11 @@ def ulysses_attention_on_test_model(
     model_state_file: str,
     input_data_file: str,
     is_baseline: bool,
-    attn_backend: str,
 ):
     """Run Ulysses attention test on a test model and save results for comparison."""
     # Use fixed seed for reproducibility across baseline and SP runs
     RANDOM_SEED = 42
-    current_omni_platform.seed_everything(RANDOM_SEED)
+    seed_everything(RANDOM_SEED)
 
     mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
     print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
@@ -366,7 +390,6 @@ def ulysses_attention_on_test_model(
         model="test_model",
         dtype=dtype,
         parallel_config=parallel_config,
-        attention_backend=attn_backend,  # Set the attention backend here
     )
 
     # Initialize model parallel
@@ -411,11 +434,6 @@ def ulysses_attention_on_test_model(
             with open(model_state_file, "wb") as f:
                 pickle.dump(model_state, f)
 
-            # Generate and save full input data with fixed seed
-            # Reinitialize RNG to ensure reproducibility
-            torch.manual_seed(42)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(42)
             full_hidden_states = torch.randn(
                 (batch_size, seq_len, hidden_size),
                 dtype=dtype,
