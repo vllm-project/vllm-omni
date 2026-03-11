@@ -25,14 +25,14 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_DYNIN_CONFIG_PATH = _REPO_ROOT / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"
+_DEFAULT_DYNIN_CONFIG_PATH: Path | None = None
 _DEFAULT_STAGE_CONFIG_PATH = _REPO_ROOT / "tests" / "e2e" / "stage_configs" / "dynin_omni_ci.yaml"
 
 models = ["snu-aidas/Dynin-Omni"]
 stage_configs = [str(_DEFAULT_STAGE_CONFIG_PATH)]
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
-DYNIN_CONFIG_PATH = str(_DEFAULT_DYNIN_CONFIG_PATH)
+DYNIN_CONFIG_PATH = str(_DEFAULT_DYNIN_CONFIG_PATH) if _DEFAULT_DYNIN_CONFIG_PATH is not None else None
 
 pytestmark = [
     pytest.mark.core_model,
@@ -41,23 +41,25 @@ pytestmark = [
 
 
 # prompting util
-def _build_mmu_prompt(tokenizer: Any, question: str, dynin_config_path: str) -> dict[str, Any]:
+def _build_mmu_prompt(tokenizer: Any, question: str, dynin_config_path: str | None) -> dict[str, Any]:
     encoded = tokenizer(question, return_tensors="pt", add_special_tokens=True)
     token_ids = [int(v) for v in encoded["input_ids"][0].tolist()]
     attention_mask = [int(v) for v in encoded["attention_mask"][0].tolist()]
+    additional_information: dict[str, Any] = {
+        "task": ["mmu"],
+        "detok_id": [0],
+        "prompt_length": [len(token_ids)],
+        "attention_mask": [attention_mask],
+        "max_new_tokens": [64],
+        "steps": [64],
+        "block_length": [16],
+        "temperature": [0.0],
+    }
+    if dynin_config_path:
+        additional_information["dynin_config_path"] = [str(dynin_config_path)]
     return {
         "prompt_token_ids": token_ids,
-        "additional_information": {
-            "task": ["mmu"],
-            "detok_id": [0],
-            "prompt_length": [len(token_ids)],
-            "attention_mask": [attention_mask],
-            "dynin_config_path": [str(dynin_config_path)],
-            "max_new_tokens": [64],
-            "steps": [64],
-            "block_length": [16],
-            "temperature": [0.0],
-        },
+        "additional_information": additional_information,
         "modalities": ["text"],
     }
 
@@ -65,7 +67,7 @@ def _build_mmu_prompt(tokenizer: Any, question: str, dynin_config_path: str) -> 
 def _build_mmu_multimodal_prompt(
     tokenizer: Any,
     question: str,
-    dynin_config_path: str,
+    dynin_config_path: str | None,
     *,
     image: Any | None = None,
     audio: tuple[np.ndarray, int] | None = None,
@@ -109,38 +111,49 @@ def _generate_synthetic_audio(duration_s: int = 5, sample_rate: int = 48_000) ->
 
 
 # prompting util
-def _build_t2s_decode_prompt(dynin_config_path: str) -> dict[str, Any]:
+def _build_t2s_decode_prompt(dynin_config_path: str | None) -> dict[str, Any]:
     # Bypass stage-0 generation and directly validate token->audio decode path.
     generated_audio_token_ids = [int(v) for v in ([10, 11, 12, 13, 14] * 32)]
+    additional_information: dict[str, Any] = {
+        "task": ["t2s"],
+        "detok_id": [1],
+        "generated_token_ids": [generated_audio_token_ids],
+        "audio_codebook_size": [4096],
+    }
+    if dynin_config_path:
+        additional_information["dynin_config_path"] = [str(dynin_config_path)]
     return {
         "prompt_token_ids": [0],
-        "additional_information": {
-            "task": ["t2s"],
-            "detok_id": [1],
-            "generated_token_ids": [generated_audio_token_ids],
-            "audio_codebook_size": [4096],
-            "dynin_config_path": [str(dynin_config_path)],
-        },
+        "additional_information": additional_information,
         "modalities": ["audio"],
     }
 
 
 # prompting util
-def _build_t2i_decode_prompt(dynin_config_path: str) -> dict[str, Any]:
+def _build_t2i_decode_prompt(dynin_config_path: str | None) -> dict[str, Any]:
     # Bypass stage-0 generation and directly validate token->image decode path.
     # MAGVIT decode path expects a square token grid; 1024 tokens -> 32x32.
     generated_image_token_ids = [int(v) for v in ([10, 11, 12, 13, 14, 15, 16, 17] * 128)]
+    additional_information: dict[str, Any] = {
+        "task": ["t2i"],
+        "detok_id": [2],
+        "generated_token_ids": [generated_image_token_ids],
+        "codebook_size": [8192],
+    }
+    if dynin_config_path:
+        additional_information["dynin_config_path"] = [str(dynin_config_path)]
     return {
         "prompt_token_ids": [0],
-        "additional_information": {
-            "task": ["t2i"],
-            "detok_id": [2],
-            "generated_token_ids": [generated_image_token_ids],
-            "codebook_size": [8192],
-            "dynin_config_path": [str(dynin_config_path)],
-        },
+        "additional_information": additional_information,
         "modalities": ["image"],
     }
+
+
+def _configure_dynin_config_env() -> None:
+    if DYNIN_CONFIG_PATH:
+        os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
+    else:
+        os.environ.pop("DYNIN_CONFIG_PATH", None)
 
 
 def _is_finished_request_output(request_output: Any) -> bool:
@@ -281,7 +294,7 @@ def _numel(value: Any) -> int:
 @pytest.mark.parametrize("test_config", test_params)
 def test_dynin_t2i_decode_to_image(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
-    os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
+    _configure_dynin_config_env()
     prompt = _build_t2i_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
 
     with OmniRunner(
@@ -304,7 +317,7 @@ def test_dynin_t2i_decode_to_image(test_config: tuple[str, str]) -> None:
 @pytest.mark.parametrize("test_config", test_params)
 def test_dynin_mmu_to_text(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
-    os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
+    _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     prompt = _build_mmu_prompt(
         tokenizer=tokenizer,
@@ -331,7 +344,7 @@ def test_dynin_mmu_to_text(test_config: tuple[str, str]) -> None:
 @pytest.mark.parametrize("test_config", test_params)
 def test_dynin_image_to_text(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
-    os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
+    _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     prompt = _build_mmu_multimodal_prompt(
         tokenizer=tokenizer,
@@ -359,7 +372,7 @@ def test_dynin_image_to_text(test_config: tuple[str, str]) -> None:
 @pytest.mark.parametrize("test_config", test_params)
 def test_dynin_speech_to_text(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
-    os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
+    _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     prompt = _build_mmu_multimodal_prompt(
         tokenizer=tokenizer,
@@ -387,7 +400,7 @@ def test_dynin_speech_to_text(test_config: tuple[str, str]) -> None:
 @pytest.mark.parametrize("test_config", test_params)
 def test_dynin_t2s_decode_to_audio(test_config: tuple[str, str]) -> None:
     model, stage_config_path = test_config
-    os.environ["DYNIN_CONFIG_PATH"] = str(DYNIN_CONFIG_PATH)
+    _configure_dynin_config_env()
     prompt = _build_t2s_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
 
     with OmniRunner(

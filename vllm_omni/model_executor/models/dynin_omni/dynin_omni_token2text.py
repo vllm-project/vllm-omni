@@ -162,8 +162,6 @@ class DyninOmniToken2Text(nn.Module):
             runtime_info=runtime_info,
             kwargs=kwargs,
         )
-        # from remote_pdb import RemotePdb; RemotePdb("127.0.0.1", 4444).set_trace()
-
         if detok_id != DETOK_TEXT:
             return OmniOutput(
                 text_hidden_states=None,
@@ -220,7 +218,6 @@ class DyninOmniToken2Text(nn.Module):
                 f"DYNIN model does not expose '{fn_name}'. "
                 "Pass additional_information.generated_token_ids or adjust task mapping."
             )
-        # from remote_pdb import RemotePdb; RemotePdb("127.0.0.1", 4444).set_trace()
         gen_fn = getattr(self.model, fn_name)
         gen_kwargs: dict[str, Any] = {}
         for key in (

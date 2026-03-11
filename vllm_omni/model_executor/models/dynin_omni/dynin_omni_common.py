@@ -254,135 +254,30 @@ def _find_dynin_config_under_root(root: Path) -> Path | None:
     return None
 
 
-def _resolve_hf_modules_transformers_root() -> Path:
-    def _to_transformers_modules_root(path: Path) -> Path:
-        resolved = path.expanduser().resolve()
-        if resolved.name == "transformers_modules":
-            return resolved
-        return (resolved / "transformers_modules").resolve()
-
-    modules_root = os.getenv("HF_MODULES_CACHE")
-    if modules_root:
-        return _to_transformers_modules_root(Path(modules_root))
-    hf_home = os.getenv("HF_HOME")
-    if hf_home:
-        return (Path(hf_home).expanduser().resolve() / "modules" / "transformers_modules").resolve()
-    try:
-        from transformers.utils.hub import HF_MODULES_CACHE
-
-        return _to_transformers_modules_root(Path(HF_MODULES_CACHE))
-    except Exception:
-        pass
-    return (Path.home() / ".cache" / "huggingface" / "modules" / "transformers_modules").resolve()
-
-
-def _resolve_hf_hub_cache_root() -> Path:
-    for env_name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
-        env_value = os.getenv(env_name)
-        if env_value:
-            return Path(env_value).expanduser().resolve()
-    hf_home = os.getenv("HF_HOME")
-    if hf_home:
-        return (Path(hf_home).expanduser().resolve() / "hub").resolve()
-    return (Path.home() / ".cache" / "huggingface" / "hub").resolve()
-
-
-def _iter_hf_module_dirs(repo_id: str) -> list[Path]:
-    root = _resolve_hf_modules_transformers_root()
-    if not root.is_dir():
-        return []
-
-    org, repo = repo_id.split("/", 1)
-    org_token = org.replace("-", "_hyphen_")
-    repo_token = repo.replace("-", "_hyphen_")
-    repo_vllm_token = f"{repo_token}_vllm"
-
-    candidates = [
-        root / f"{org_token}_{repo_token}",
-        root / f"{org_token}_{repo_vllm_token}",
-        root / repo_token,
-        root / repo_vllm_token,
-        root / org_token / repo_token,
-        root / org_token / repo_vllm_token,
-    ]
-    candidates.extend(root.glob(f"*{repo_token}*"))
-    org_dir = root / org_token
-    if org_dir.is_dir():
-        candidates.extend(org_dir.glob(f"*{repo_token}*"))
-
-    unique_dirs: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except Exception:
-            continue
-        key = str(resolved)
-        if key in seen or not resolved.is_dir():
-            continue
-        seen.add(key)
-        unique_dirs.append(resolved)
-    return unique_dirs
-
-
-def _iter_hf_snapshot_dirs(repo_id: str) -> list[Path]:
-    hub_root = _resolve_hf_hub_cache_root()
-    if not hub_root.is_dir():
-        return []
-
-    org, repo = repo_id.split("/", 1)
-    repo_cache_dir = hub_root / f"models--{org}--{repo}"
-    snapshots_dir = repo_cache_dir / "snapshots"
-    if not snapshots_dir.is_dir():
-        return []
-
-    candidates: list[Path] = []
-    ref_main = repo_cache_dir / "refs" / "main"
-    if ref_main.is_file():
-        try:
-            pinned = ref_main.read_text(encoding="utf-8").strip()
-            if pinned:
-                pinned_dir = (snapshots_dir / pinned).resolve()
-                if pinned_dir.is_dir():
-                    candidates.append(pinned_dir)
-        except Exception:
-            pass
-
-    try:
-        snapshot_dirs = sorted(
-            (p.resolve() for p in snapshots_dir.iterdir() if p.is_dir()),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except Exception:
-        snapshot_dirs = []
-    candidates.extend(snapshot_dirs)
-
-    unique_dirs: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_dirs.append(candidate)
-    return unique_dirs
-
-
 @lru_cache(maxsize=16)
 def _resolve_dynin_config_from_hf_repo(repo_id: str) -> str | None:
     if not _looks_like_hf_repo_id(repo_id):
         return None
+    if snapshot_download is None:
+        return None
 
-    for module_dir in _iter_hf_module_dirs(repo_id):
-        found = _find_dynin_config_under_root(module_dir)
-        if found is not None:
-            return str(found)
+    # Use huggingface_hub cache resolution directly instead of manually walking
+    # HF cache internals. Keep local_files_only=True to preserve prior behavior
+    # (cache lookup only; no network fetch during config auto-discovery).
+    download_kwargs: dict[str, Any] = {
+        "repo_id": repo_id,
+        "repo_type": "model",
+        "allow_patterns": list(_DYNIN_CONFIG_CANDIDATE_RELPATHS),
+        "local_files_only": True,
+    }
+    try:
+        snapshot_dir = Path(snapshot_download(**download_kwargs)).expanduser().resolve()
+    except Exception:
+        return None
 
-    for snapshot_dir in _iter_hf_snapshot_dirs(repo_id):
-        found = _find_dynin_config_under_root(snapshot_dir)
-        if found is not None:
-            return str(found)
+    found = _find_dynin_config_under_root(snapshot_dir)
+    if found is not None:
+        return str(found)
 
     return None
 
@@ -427,6 +322,23 @@ def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) 
     else:
         hf_name_or_path = getattr(hf_config, "_name_or_path", None)
 
+    # Prefer resolving from HF repo cache/snapshots early when model/tokenizer
+    # source is a repo id.
+    hf_repo_candidates: list[str] = []
+    for source in (model_source, tokenizer_source, hf_name_or_path):
+        if not _looks_like_hf_repo_id(source):
+            continue
+        source_text = str(source)
+        if source_text in hf_repo_candidates:
+            continue
+        hf_repo_candidates.append(source_text)
+
+    for source in hf_repo_candidates:
+        resolved = _resolve_dynin_config_from_hf_repo(source)
+        if resolved is not None:
+            logger.info("Resolved dynin config from Hugging Face cache for %s: %s", source, resolved)
+            return resolved
+
     # If model/tokenizer source itself is a local directory, prefer local config there first.
     for source in (model_source, tokenizer_source):
         source_path = Path(source).expanduser()
@@ -444,23 +356,6 @@ def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) 
     for bundled in bundled_candidates:
         if bundled.exists():
             return str(bundled)
-
-    # As a final fallback, try to resolve config from HF remote code caches/snapshots.
-    hf_repo_candidates: list[str] = []
-    for source in (model_source, tokenizer_source, hf_name_or_path):
-        if not _looks_like_hf_repo_id(source):
-            continue
-        source_text = str(source)
-        if source_text in hf_repo_candidates:
-            continue
-        hf_repo_candidates.append(source_text)
-
-    for source in hf_repo_candidates:
-        if _looks_like_hf_repo_id(source):
-            resolved = _resolve_dynin_config_from_hf_repo(source)
-            if resolved is not None:
-                logger.info("Resolved dynin config from Hugging Face cache for %s: %s", source, resolved)
-                return resolved
 
     return None
 

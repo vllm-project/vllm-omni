@@ -83,7 +83,7 @@ class DyninOmniToken2Image(nn.Module):
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={
-                "image": image,  # TODO (joon): pass token_ids for the case of ti2ti
+                "image": image,
                 "detok_id": torch.tensor([detok_id], dtype=torch.long, device=image.device),
             },
         )
@@ -104,7 +104,7 @@ class DyninOmniToken2Image(nn.Module):
         if image_vocab_offset is not None:
             off = int(image_vocab_offset)
             token_ids = torch.where(token_ids >= off, token_ids - off, token_ids)
-        token_ids = torch.clamp(token_ids, min=0, max=max(0, codebook_size - 1))  # TODO (joon): check for ti2ti
+        token_ids = torch.clamp(token_ids, min=0, max=max(0, codebook_size - 1))
         token_ids = token_ids.unsqueeze(0)
 
         decoded = vq_model.decode_code(token_ids)
