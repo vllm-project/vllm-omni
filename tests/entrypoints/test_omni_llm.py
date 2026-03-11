@@ -577,7 +577,7 @@ def test_initialize_stage_configs_called_when_none(
     """Test that stage configs are auto-loaded when stage_configs_path is None."""
 
     def _fake_loader(
-        config_path: str,
+        model: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -654,7 +654,7 @@ def test_generate_raises_on_length_mismatch(monkeypatch: pytest.MonkeyPatch, moc
     """Test that generate raises ValueError when sampling_params_list length doesn't match."""
 
     def _fake_loader(
-        config_path: str,
+        model: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -711,7 +711,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch: pytest.MonkeyPatch, mo
     stage_cfg1["processed_input"] = ["processed-for-stage-1"]
 
     def _fake_loader(
-        config_path: str,
+        model: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -819,7 +819,7 @@ def test_generate_no_final_output_returns_empty(
     stage_cfg1["final_output"] = False
 
     def _fake_loader(
-        config_path: str,
+        model: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -911,7 +911,7 @@ def test_generate_sampling_params_none_use_default(
     stage_cfg1["final_output"] = False
 
     def _fake_loader(
-        config_path: str,
+        model: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -988,7 +988,7 @@ def test_wait_for_stages_ready_timeout(monkeypatch: pytest.MonkeyPatch, mocker: 
     """Test that _wait_for_stages_ready handles timeout correctly."""
 
     def _fake_loader(
-        config_path: str,
+        model: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -1052,7 +1052,7 @@ def test_generate_handles_error_messages(monkeypatch: pytest.MonkeyPatch, mocker
     """Test that generate handles error messages from stages correctly."""
 
     def _fake_loader(
-        config_path: str,
+        model: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
@@ -1135,7 +1135,7 @@ def test_close_sends_shutdown_signal(monkeypatch: pytest.MonkeyPatch, mocker: Mo
     """Test that close() sends shutdown signal to all input queues."""
 
     def _fake_loader(
-        config_path: str,
+        model: str,
         stage_configs_path: str | None = None,
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,

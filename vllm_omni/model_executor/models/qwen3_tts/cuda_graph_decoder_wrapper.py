@@ -29,7 +29,7 @@ class CUDAGraphDecoderWrapper:
         output = wrapper.decode(codes)  # Automatically uses CUDA graph if possible
     """
 
-    DEFAULT_CAPTURE_SIZES = [25, 50, 100, 150, 200, 250, 300]
+    DEFAULT_CAPTURE_SIZES = [2, 4, 8, 16, 25, 32, 50, 100, 150, 200, 250, 300]
 
     def __init__(
         self,
