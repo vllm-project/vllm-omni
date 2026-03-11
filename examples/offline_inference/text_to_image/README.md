@@ -106,6 +106,23 @@ python text_to_image.py \
   --seed 42
 ```
 
+### Flux.2-dev Models
+To start Flux.2-dev with a single GPU, cpu-offload must be enabled because the total size of its weights exceeds the 80GB memory capacity of the GPU.
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model black-forest-labs/FLUX.2-dev \
+  --prompt "a lovely bunny holding a sign that says 'vllm-omni'" \
+  --seed 42 \
+  --tensor-parallel-size 1 \
+  --num-images-per-prompt 1 \
+  --num-inference-steps 50 \
+  --guidance-scale 4.0 \
+  --height 1024 \
+  --width 1024 \
+  --enable-cpu-offload \
+  --output flux2-dev.png
+```
+
 ### Key Arguments
 
 **Common arguments:**

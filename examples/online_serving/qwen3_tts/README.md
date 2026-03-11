@@ -14,6 +14,31 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | CustomVoice | Smaller/faster variant                                |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-Base`        | Base        | Smaller/faster variant for voice cloning              |
 
+## Gradio Demo
+
+Two interactive Gradio demos are available, both supporting all 3 task types:
+
+| Demo | File | Transport | Streaming Quality |
+| ---- | ---- | --------- | ----------------- |
+| Standard | `gradio_demo.py` | HTTP chunked | May have small gaps between chunks |
+| FastRTC | `gradio_fastrtc_demo.py` | WebRTC | Gapless streaming (requires `pip install fastrtc`) |
+
+```bash
+# Option 1: Launch server + Standard Gradio together
+./run_gradio_demo.sh                                # CustomVoice (default)
+./run_gradio_demo.sh --task-type VoiceDesign        # VoiceDesign
+./run_gradio_demo.sh --task-type Base               # Voice cloning
+
+# Option 2: If server is already running
+python gradio_demo.py --api-base http://localhost:8000
+
+# Option 3: FastRTC demo (gapless streaming)
+pip install fastrtc
+python gradio_fastrtc_demo.py --api-base http://localhost:8000
+```
+
+Then open http://localhost:7860 in your browser.
+
 ## Run examples (Qwen3-TTS)
 
 ### Launch the Server
@@ -289,7 +314,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | `language`       | string | "Auto"        | Language (see supported languages below)                                     |
 | `instructions`   | string | ""            | Voice style/emotion instructions                                             |
 | `max_new_tokens` | int    | 2048          | Maximum tokens to generate                                                   |
-| `initial_codec_chunk_frames` | int | null | Initial chunk size for reduced TTFA (overrides stage config)                 |
+| `initial_codec_chunk_frames` | int | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `stream`         | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian

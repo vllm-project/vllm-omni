@@ -236,6 +236,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.put_req_chunk[request_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
 
+        if is_finished:
+            self.code_prompt_token_ids.pop(request_id, None)
+
     ########################################################################
     # Cleanup
     ########################################################################

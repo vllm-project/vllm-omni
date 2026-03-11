@@ -58,7 +58,7 @@ class OpenAICreateSpeechRequest(BaseModel):
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
-        description="Initial chunk size for reduced TTFA. Overrides stage config for this request.",
+        description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
 
     @field_validator("stream_format")
