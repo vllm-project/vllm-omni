@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,47 @@ _TTS_LANGUAGES: set[str] = {
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
+
+
+def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """Create a WAV header with placeholder size values for streaming.
+
+    Uses 0xFFFFFFFF as placeholder for data size fields, which is accepted
+    by most audio clients and matches OpenAI's streaming WAV implementation.
+
+    Args:
+        sample_rate: Audio sample rate in Hz
+        num_channels: Number of audio channels (1 for mono, 2 for stereo)
+        bits_per_sample: Bits per sample (typically 16)
+
+    Returns:
+        44-byte WAV header as bytes
+    """
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+
+    # Use 0xFFFFFFFF as placeholder for unknown size (streaming)
+    placeholder_size = 0xFFFFFFFF
+
+    # ref https://docs.fileformat.com/audio/wav/
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",  # ChunkID
+        placeholder_size,  # ChunkSize (placeholder)
+        b"WAVE",  # Format
+        b"fmt ",  # Subchunk1ID
+        16,  # Subchunk1Size (16 for PCM)
+        1,  # AudioFormat (1 for PCM)
+        num_channels,  # NumChannels
+        sample_rate,  # SampleRate
+        byte_rate,  # ByteRate
+        block_align,  # BlockAlign
+        bits_per_sample,  # BitsPerSample
+        b"data",  # Subchunk2ID
+        placeholder_size,  # Subchunk2Size (placeholder)
+    )
+
+    return header
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -575,8 +617,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             wav_np = np.mean(wav_np, axis=-1)
         return wav_np.tolist(), int(sr)
 
-    async def _generate_pcm_chunks(self, generator, request_id: str):
-        """Generate PCM audio chunks for streaming response.
+    async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
+        """Generate audio chunks for streaming response.
 
         Handles two audio output modes from the engine:
         - Cumulative mode (list): Engine returns growing list of chunks;
@@ -587,12 +629,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Args:
             generator: Async generator from the engine
             request_id: Request identifier for logging
+            response_format: Audio format (pcm or wav)
 
         Yields:
-            Raw PCM bytes for each audio chunk
+            Raw audio bytes for each chunk (with WAV header for first chunk if wav format)
         """
         prev_count = 0
         sample_rate_val = 24000
+        first_chunk = True
+
         try:
             async for res in generator:
                 audio_output, audio_key = self._extract_audio_output(res)
@@ -623,6 +668,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    # For WAV format, emit header before first audio chunk
+                    if response_format == "wav" and first_chunk:
+                        # Assert that sample rate has been set from chunk metadata (not just default)
+                        # This ensures the WAV header contains the correct sample rate
+                        assert sr_raw is not None, (
+                            "First audio chunk must include sample rate metadata for WAV streaming"
+                        )
+                        wav_header = _create_wav_header(sample_rate=sample_rate_val, num_channels=1, bits_per_sample=16)
+                        yield wav_header
+                        first_chunk = False
+
+                    # Convert audio to PCM bytes
                     audio_obj = CreateAudio(
                         audio_tensor=chunk_np,
                         sample_rate=sample_rate_val,
@@ -833,8 +890,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
 
-        Streaming is supported via stream=True with response_format='pcm'.
-        Each Code2Wav chunk is yielded as raw PCM bytes as soon as it is decoded.
+        Streaming is supported via stream=True with response_format='pcm' or 'wav'.
+        Each Code2Wav chunk is yielded as raw audio bytes as soon as it is decoded.
+        For WAV format, a header with placeholder size values is emitted first.
         """
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
@@ -843,10 +901,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         try:
             if request.stream:
+                # Determine response format and media type for streaming
+                response_format = (request.response_format or "wav").lower()
+
+                # Only pcm and wav support streaming without post-processing
+                if response_format not in ["pcm", "wav"]:
+                    return self.create_error_response(
+                        f"Streaming is only supported for 'pcm' and 'wav' formats. "
+                        f"Got '{response_format}'. For other formats, use stream=False."
+                    )
+
+                # Check if speed adjustment is requested (not compatible with streaming)
+                if request.speed is not None and request.speed != 1.0:
+                    return self.create_error_response(
+                        "Streaming is not supported with speed adjustment. "
+                        "Use stream=False or remove the speed parameter."
+                    )
+
+                media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 request_id, generator, _ = await self._prepare_speech_generation(request)
                 return StreamingResponse(
-                    self._generate_pcm_chunks(generator, request_id),
-                    media_type="audio/pcm",
+                    self._generate_audio_chunks(generator, request_id, response_format),
+                    media_type=media_type,
                 )
 
             audio_bytes, media_type = await self._generate_audio_bytes(request)

@@ -9,12 +9,10 @@ to DiffusionModelRunner.
 """
 
 import gc
-import json
 import multiprocessing as mp
 import os
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -47,16 +45,6 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
 
-MODEL_PARAM_COUNTS = {
-    "bagel": 13.5e9,  # BAGEL-7B-MoT
-    "flux": 12.0e9,  # FLUX.1-dev
-    "default": 10.0e9,
-}
-
-# 2.5 GiB is the empirical peak activation footprint (intermediate tensors +
-# attention workspace) for models like Bagel-7B/Flux at 1024x1024 resolution.
-ACTIVATION_MEMORY_MULTIPLIER = 2.5
-
 
 class DiffusionWorker:
     """
@@ -70,60 +58,6 @@ class DiffusionWorker:
     All model-related operations (loading, compilation, execution) are
     delegated to DiffusionModelRunner.
     """
-
-    @staticmethod
-    def predict_resource_usage(od_config: OmniDiffusionConfig) -> dict[str, float]:
-        from vllm.utils.mem_utils import GiB_bytes
-
-        total_params = 0
-        estimate_source = "fallback"
-        try:
-            model_path = Path(getattr(od_config, "model", ""))
-            index_file = model_path / "model.safetensors.index.json"
-            if index_file.exists():
-                with open(index_file) as f:
-                    data = json.load(f)
-                    # metadata.total_size
-                    total_params = int(data.get("metadata", {}).get("total_size", 0))
-                    if total_params > 0:
-                        estimate_source = "safetensors index"
-        except Exception as e:
-            logger.debug(f"Failed to parse safetensors metadata: {e}")
-        if total_params == 0:
-            m_name = str(getattr(od_config, "model", "")).lower()
-            if "bagel" in m_name:
-                total_params = MODEL_PARAM_COUNTS["bagel"]
-                estimate_source = "bagel"
-            elif "flux" in m_name:
-                total_params = MODEL_PARAM_COUNTS["flux"]
-                estimate_source = "flux"
-            else:
-                total_params = MODEL_PARAM_COUNTS["default"]
-                estimate_source = "default"
-        logger.info(f"VRAM Quota: Estimated {total_params / 1e9:.2f}B params using {estimate_source} logic")
-
-        dtype = getattr(od_config, "dtype", torch.bfloat16)
-        dtype_str = str(dtype).lower()
-        # Calculate the number of bytes per parameter
-        # based on different levels of precision.
-        if "int4" in dtype_str:
-            bytes_per_param = 0.5
-        elif any(kw in dtype_str for kw in ["float8", "int8"]):
-            bytes_per_param = 1
-        elif any(kw in dtype_str for kw in ["float16", "bfloat16", "half"]):
-            bytes_per_param = 2
-        elif any(kw in dtype_str for kw in ["float32", "int32"]):
-            bytes_per_param = 4
-        else:
-            bytes_per_param = 4
-        static_gb = (total_params * bytes_per_param) / GiB_bytes
-        h, w = getattr(od_config, "height", 1024), getattr(od_config, "width", 1024)
-        dynamic_gb = ACTIVATION_MEMORY_MULTIPLIER * (h * w / (1024 * 1024))
-        return {
-            "static_gb": round(static_gb, 2),
-            "dynamic_gb": round(dynamic_gb, 2),
-            "total_gb": round(static_gb + dynamic_gb, 2),
-        }
 
     def __init__(
         self,
