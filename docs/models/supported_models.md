@@ -49,6 +49,7 @@ th {
 |`GlmImageForConditionalGeneration` | GLM-Image | `zai-org/GLM-Image` |
 |`NextStep11Pipeline` | NextStep-1.1 | `stepfun-ai/NextStep-1.1` |
 |`MiMoAudioForConditionalGeneration` | MiMo-Audio-7B-Instruct | `XiaomiMiMo/MiMo-Audio-7B-Instruct` |
+|`Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` |
 
 
 ## List of Supported Models for NPU

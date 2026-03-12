@@ -1017,3 +1017,39 @@ class TestStreamingResponse:
         response = client.post("/v1/audio/speech", json={"input": "Hello", "response_format": "wav"})
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
+
+
+class TestAsyncOmniSupportedTasks:
+    """Test that AsyncOmni reports correct supported tasks based on output modalities."""
+
+    @pytest.mark.asyncio
+    async def test_tts_only_no_generate_task(self):
+        """TTS-only models (audio output, no text) should not include 'generate'."""
+        from unittest.mock import MagicMock
+
+        from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+        omni = AsyncOmni.__new__(AsyncOmni)
+        omni.output_modalities = [None, "audio"]
+        stage = MagicMock()
+        stage.is_comprehension = False
+        omni.stage_list = [stage]
+        tasks = await omni.get_supported_tasks()
+        assert "generate" not in tasks
+        assert "speech" in tasks
+
+    @pytest.mark.asyncio
+    async def test_omni_model_includes_generate(self):
+        """Models with text output (e.g. Qwen3-Omni) should include 'generate'."""
+        from unittest.mock import MagicMock
+
+        from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+        omni = AsyncOmni.__new__(AsyncOmni)
+        omni.output_modalities = ["text", None, "audio"]
+        stage = MagicMock()
+        stage.is_comprehension = True
+        omni.stage_list = [stage]
+        tasks = await omni.get_supported_tasks()
+        assert "generate" in tasks
+        assert "speech" in tasks

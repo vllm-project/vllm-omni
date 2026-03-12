@@ -169,46 +169,22 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     return obj
 
 
-def resolve_model_config_path(model_type: str) -> str | None:
-    """Resolve the stage config file path from the model type.
+def resolve_model_config_path(model: str) -> str:
+    """Resolve the stage config file path from the model name.
 
     Resolves stage configuration path based on the model type and device type.
     First tries to find a device-specific YAML file from stage_configs/{device_type}/
     directory. If not found, falls back to the default config file.
 
     Args:
-        model_type: Model type string
+        model: Model name or path (used to determine model_type)
 
     Returns:
-        String path to the stage configuration file if found, None otherwise
-    """
-    default_config_path = current_omni_platform.get_default_stage_config_path()
-    config_file_name = f"{model_type}.yaml"
-    complete_config_path = PROJECT_ROOT / default_config_path / config_file_name
-    if os.path.exists(complete_config_path):
-        return str(complete_config_path)
-
-    # Fall back to default config
-    stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
-    stage_config_path = PROJECT_ROOT / stage_config_file
-    if not os.path.exists(stage_config_path):
-        return None
-    return str(stage_config_path)
-
-
-def resolve_model_type(model: str) -> str:
-    """Resolve the model type from the model name.
-
-    Args:
-        model: Model name or path
-
-    Returns:
-        Model type string (e.g. ``"Qwen3TTSForConditionalGeneration"``,
-        ``"StableAudioPipeline"``).
+        String path to the stage configuration file
 
     Raises:
-        ValueError: If the model type cannot be determined from any
-            available configuration file.
+        ValueError: If model_type cannot be determined
+        FileNotFoundError: If no stage config file exists for the model type
     """
     # Try to get config from standard transformers format first
     try:
@@ -241,26 +217,42 @@ def resolve_model_type(model: str) -> str:
                 f"Please ensure the model has proper configuration files with 'model_type' field"
             )
 
-    return model_type
+    default_config_path = current_omni_platform.get_default_stage_config_path()
+    model_type_str = f"{model_type}.yaml"
+    complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
+    if os.path.exists(complete_config_path):
+        return str(complete_config_path)
+
+    # Fall back to default config
+    stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
+    stage_config_path = PROJECT_ROOT / stage_config_file
+    if not os.path.exists(stage_config_path):
+        return None
+    return str(stage_config_path)
 
 
-def load_stage_configs_from_model(config_path: str | None, base_engine_args: dict | None = None) -> list:
-    """Load stage configurations from a resolved config file path.
+def load_stage_configs_from_model(model: str, base_engine_args: dict | None = None) -> list:
+    """Load stage configurations from model's default config file.
+
+    Loads stage configurations based on the model type and device type.
+    First tries to load a device-specific YAML file from stage_configs/{device_type}/
+    directory. If not found, falls back to the default config file.
 
     Args:
-        config_path: Path to the YAML configuration file, or None.
-            When None, returns an empty list.
-        base_engine_args: Optional engine arguments to merge with stage configs.
+        model: Model name or path (used to determine model_type)
 
     Returns:
-        List of stage configuration dictionaries, or empty list if
-        config_path is None.
+        List of stage configuration dictionaries
+
+    Raises:
+        FileNotFoundError: If no stage config file exists for the model type
     """
     if base_engine_args is None:
         base_engine_args = {}
-    if config_path is None:
+    stage_config_path = resolve_model_config_path(model)
+    if stage_config_path is None:
         return []
-    stage_configs = load_stage_configs_from_yaml(config_path=config_path, base_engine_args=base_engine_args)
+    stage_configs = load_stage_configs_from_yaml(config_path=stage_config_path, base_engine_args=base_engine_args)
     return stage_configs
 
 
@@ -314,10 +306,9 @@ def load_and_resolve_stage_configs(
     Returns:
         Tuple of (config_path, stage_configs)
     """
-    model_type = resolve_model_type(model)
     if stage_configs_path is None:
-        config_path = resolve_model_config_path(model_type)
-        stage_configs = load_stage_configs_from_model(config_path, base_engine_args=kwargs)
+        config_path = resolve_model_config_path(model)
+        stage_configs = load_stage_configs_from_model(model, base_engine_args=kwargs)
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
