@@ -15,8 +15,6 @@ from tests.conftest import (
     create_unique_server_params,
     get_benchmark_params_for_server,
     load_configs,
-    modify_stage,
-    modify_stage_config,
 )
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
