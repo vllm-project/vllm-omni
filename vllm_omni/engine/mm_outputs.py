@@ -1,10 +1,7 @@
 """Multimodal output data structures for vLLM-Omni.
 
-This module defines structured types for multimodal outputs, replacing
-the current pattern of dynamic ``setattr``/``getattr`` attachment on
-``CompletionOutput`` objects.
+This module defines structured types for multimodal outputs.
 
-Part of RFC #1601: Decouple Multimodal Output Channel & Simplify Output Processor.
 """
 
 from __future__ import annotations
@@ -19,9 +16,6 @@ import torch
 class MultimodalPayload:
     """Structured multimodal output payload.
 
-    Replaces ``dict[str, Any]`` with type-safe access for multimodal
-    tensors produced by model stages (image, audio, latent, etc.).
-
     Attributes:
         tensors: Dictionary mapping modality/key names to their tensors.
         metadata: Optional dictionary for non-tensor metadata
@@ -34,9 +28,6 @@ class MultimodalPayload:
     @property
     def primary_tensor(self) -> torch.Tensor | None:
         """Return the first tensor in the payload, or None if empty.
-
-        Useful when the payload contains a single modality and callers
-        just need "the tensor" without knowing the key name.
         """
         if self.tensors:
             return next(iter(self.tensors.values()))
@@ -61,14 +52,8 @@ class MultimodalPayload:
     def from_dict(cls, data: dict[str, Any] | None) -> MultimodalPayload | None:
         """Create a MultimodalPayload from a raw dictionary.
 
-        Separates torch.Tensor values into ``tensors`` and everything
-        else into ``metadata``.
-
-        Args:
-            data: Raw dictionary, or None.
-
-        Returns:
-            A ``MultimodalPayload`` instance, or None if data is None/empty.
+        Separates torch.Tensor values into tensors and everything
+        else into metadata.
         """
         if not data:
             return None
@@ -86,16 +71,6 @@ class MultimodalPayload:
 
 class MultimodalCompletionOutput:
     """CompletionOutput wrapper with a first-class multimodal_output field.
-
-    This replaces the current pattern of using ``setattr(base_output,
-    "multimodal_output", {})`` on vLLM's ``CompletionOutput``.
-
-    Instead of subclassing ``CompletionOutput`` (which would require
-    matching its evolving ``__init__`` signature), this is a thin wrapper
-    that holds a reference to the base output plus the multimodal payload.
-
-    Delegates all attribute access to the wrapped ``base_output`` so it
-    is a drop-in replacement everywhere ``CompletionOutput`` is used.
 
     Attributes:
         base_output: The original ``CompletionOutput`` from vLLM.
