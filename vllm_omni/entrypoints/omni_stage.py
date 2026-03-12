@@ -9,6 +9,7 @@ the original input processing utilities for cross-stage data wiring.
 import asyncio
 import fcntl
 import importlib
+import logging
 import multiprocessing as mp
 import os
 import queue
@@ -61,6 +62,25 @@ from vllm_omni.metrics import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+class _RepoUtilsLocalPathFilter(logging.Filter):
+    """Filter out noisy HF Hub errors that always fire for local paths."""
+
+    _SUPPRESSED_FRAGMENTS = (
+        "Error retrieving file list",
+        "Error retrieving safetensors",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(f in msg for f in self._SUPPRESSED_FRAGMENTS)
+
+
+def _suppress_repo_utils_errors_for_local_path(model: str) -> None:
+    """Install a filter to suppress harmless HF Hub errors for local model paths."""
+    if os.path.exists(model):
+        logging.getLogger("vllm.transformers_utils.repo_utils").addFilter(_RepoUtilsLocalPathFilter())
 
 
 @contextmanager
@@ -747,24 +767,7 @@ def _stage_worker(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
-    # Suppress only known-harmless repo_utils ERROR messages for local model
-    # paths; keep the logger level intact so real errors are still visible.
-    if _os.path.exists(model):
-        import logging as _logging
-
-        class _RepoUtilsLocalPathFilter(_logging.Filter):
-            """Filter out noisy HF Hub errors that always fire for local paths."""
-
-            _SUPPRESSED_FRAGMENTS = (
-                "Error retrieving file list",
-                "Error retrieving safetensors",
-            )
-
-            def filter(self, record: _logging.LogRecord) -> bool:
-                msg = record.getMessage()
-                return not any(f in msg for f in self._SUPPRESSED_FRAGMENTS)
-
-        _logging.getLogger("vllm.transformers_utils.repo_utils").addFilter(_RepoUtilsLocalPathFilter())
+    _suppress_repo_utils_errors_for_local_path(model)
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
@@ -1176,24 +1179,7 @@ async def _stage_worker_async(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
-    # Suppress only known-harmless repo_utils ERROR messages for local model
-    # paths; keep the logger level intact so real errors are still visible.
-    if _os.path.exists(model):
-        import logging as _logging
-
-        class _RepoUtilsLocalPathFilter(_logging.Filter):
-            """Filter out noisy HF Hub errors that always fire for local paths."""
-
-            _SUPPRESSED_FRAGMENTS = (
-                "Error retrieving file list",
-                "Error retrieving safetensors",
-            )
-
-            def filter(self, record: _logging.LogRecord) -> bool:
-                msg = record.getMessage()
-                return not any(f in msg for f in self._SUPPRESSED_FRAGMENTS)
-
-        _logging.getLogger("vllm.transformers_utils.repo_utils").addFilter(_RepoUtilsLocalPathFilter())
+    _suppress_repo_utils_errors_for_local_path(model)
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
