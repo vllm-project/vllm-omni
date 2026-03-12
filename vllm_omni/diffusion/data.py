@@ -466,16 +466,18 @@ class OmniDiffusionConfig:
                 logger.warning(f"Unknown dtype string '{self.dtype}', defaulting to bfloat16")
                 self.dtype = torch.bfloat16
 
-        # Normalize quantization method string (diffusion-only).
-        if isinstance(self.quantization, str):
-            self.quantization = normalize_diffusion_quant_method(self.quantization)
-
         # Convert cache_config dict to DiffusionCacheConfig if needed
         if isinstance(self.cache_config, dict):
             self.cache_config = DiffusionCacheConfig.from_dict(self.cache_config)
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+
+        def _normalize_method_for_compare(method: str | None) -> str | None:
+            normalized = normalize_diffusion_quant_method(method)
+            if normalized in ("bitsandbytes_8bit", "bitsandbytes_4bit"):
+                return "bitsandbytes"
+            return normalized
 
         # Convert quantization config
         if self.quantization is not None or self.quantization_config is not None:
@@ -490,7 +492,11 @@ class OmniDiffusionConfig:
                 quant_method = normalize_diffusion_quant_method(quant_method, quant_kwargs)
 
                 # Validate conflicting methods
-                if self.quantization is not None and quant_method is not None and quant_method != self.quantization:
+                if (
+                    self.quantization is not None
+                    and quant_method is not None
+                    and _normalize_method_for_compare(self.quantization) != _normalize_method_for_compare(quant_method)
+                ):
                     logger.warning(
                         f"Conflicting quantization methods: quantization={self.quantization!r}, "
                         f"quantization_config['method']={quant_method!r}. Using quantization_config['method']."
@@ -511,7 +517,7 @@ class OmniDiffusionConfig:
             if current_platform.is_rocm():
                 try:
                     from vllm.platforms.rocm import on_gfx9
-                except Exception:
+                except ImportError:
                     on_gfx9 = None
                 if on_gfx9 is not None and on_gfx9():
                     raise ValueError("bitsandbytes is not supported on ROCm gfx9 GPUs.")

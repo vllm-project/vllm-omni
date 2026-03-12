@@ -6,6 +6,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
+from vllm_omni.diffusion.quantization.bitsandbytes import get_bnb_offload_skip_components
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
@@ -181,7 +182,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
             logger.warning("No encoder modules found, skipping model-level offloading")
             return
 
-        skip_components = set(getattr(pipeline, "_bnb_offload_skip_components", None) or set())
+        skip_components = get_bnb_offload_skip_components(pipeline)
         offload_dits = [module for name, module in zip(modules.dit_names, modules.dits) if name not in skip_components]
         offload_encoders = [
             module for name, module in zip(modules.encoder_names, modules.encoders) if name not in skip_components

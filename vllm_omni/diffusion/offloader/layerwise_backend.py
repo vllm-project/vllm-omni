@@ -9,6 +9,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
+from vllm_omni.diffusion.quantization.bitsandbytes import get_bnb_offload_skip_components
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
@@ -241,7 +242,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
             logger.warning("No DiT/transformer modules found, skipping layer-wise offloading")
             return
 
-        skip_components = set(getattr(pipeline, "_bnb_offload_skip_components", None) or set())
+        skip_components = get_bnb_offload_skip_components(pipeline)
         if skip_components:
             logger.debug("Skipping offload for quantized components: %s", sorted(skip_components))
 

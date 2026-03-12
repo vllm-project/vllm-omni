@@ -34,7 +34,7 @@ outputs = omni.generate(
 )
 ```
 
-2. **CLI**: pass `--quantization fp8` and optionally `--ignored-layers`.
+2. **CLI**: pass `--diffusion-quantization fp8` (for `vllm serve --omni`) and optionally `--ignored-layers`.
 
 ```bash
 # All layers
@@ -44,7 +44,7 @@ python text_to_image.py --model <your-model> --quantization fp8
 python text_to_image.py --model <your-model> --quantization fp8 --ignored-layers "img_mlp"
 
 # Online serving
-vllm serve <your-model> --omni --quantization fp8
+vllm serve <your-model> --omni --diffusion-quantization fp8
 ```
 
 | Parameter | Type | Default | Description |

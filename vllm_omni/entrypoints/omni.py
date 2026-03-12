@@ -29,6 +29,7 @@ from vllm_omni.distributed.ray_utils.utils import (
     get_ray_queue_class,
     try_close_ray,
 )
+from vllm_omni.diffusion.quantization import get_diffusion_quant_config, normalize_diffusion_quant_method
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -187,6 +188,24 @@ class OmniBase:
         cache_backend = kwargs.get("cache_backend", "none")
         cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
         quantization_config = self._normalize_quantization_config(kwargs.get("quantization_config", None))
+        quant_method = kwargs.get("quantization", None)
+        if isinstance(quantization_config, dict) and "method" in quantization_config:
+            quant_method = quantization_config.get("method")
+        if isinstance(quant_method, str):
+            normalized = normalize_diffusion_quant_method(quant_method)
+            if normalized is None:
+                logger.warning("Invalid diffusion quantization method %r; disabling quantization.", quant_method)
+                kwargs["quantization"] = None
+                if isinstance(quantization_config, dict):
+                    quantization_config.pop("method", None)
+            else:
+                try:
+                    get_diffusion_quant_config(normalized)
+                except ValueError:
+                    logger.warning("Unsupported diffusion quantization method %r; disabling quantization.", quant_method)
+                    kwargs["quantization"] = None
+                    if isinstance(quantization_config, dict):
+                        quantization_config.pop("method", None)
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
         # TODO: hack, calculate devices based on parallel config.

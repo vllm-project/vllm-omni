@@ -66,14 +66,10 @@ class OmniServeCommand(CLISubcommand):
             self.name,
             description=DESCRIPTION,
             usage="vllm serve [model_tag] --omni [options]",
-            conflict_handler="resolve",
         )
 
         serve_parser = make_arg_parser(serve_parser)
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
-
-        # With conflict_handler="resolve", re-adding quantization flags below
-        # will override the upstream ones without poking argparse internals.
 
         # Create OmniConfig argument group for omni-related parameters
         # This ensures the parameters appear in --help output
@@ -187,16 +183,17 @@ class OmniServeCommand(CLISubcommand):
 
         # Quantization parameters (diffusion-only)
         omni_config_group.add_argument(
-            "--quantization",
-            "-q",
+            "--diffusion-quantization",
             type=str,
             default=None,
+            dest="quantization",
             help="Diffusion quantization method (e.g., bitsandbytes).",
         )
         omni_config_group.add_argument(
-            "--quantization-config",
+            "--diffusion-quantization-config",
             type=str,
             default=None,
+            dest="quantization_config",
             help=(
                 "JSON string for diffusion quantization config. For bitsandbytes, "
                 'use fields like \'{"load_in_4bit": true, "bnb_4bit_compute_dtype": "bfloat16", '

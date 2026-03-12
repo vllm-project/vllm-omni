@@ -7,9 +7,10 @@ import contextvars
 import fnmatch
 import os
 import threading
+import weakref
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
@@ -34,13 +35,63 @@ _BNB_PATCH_ORIG = None
 _BNB_PATCH_TARGET = None
 
 
+@dataclass
+class _BnbPipelineState:
+    quantized_components: set[str] = field(default_factory=set)
+    offload_skip_components: set[str] = field(default_factory=set)
+
+
+_BNB_PIPELINE_STATE: "weakref.WeakKeyDictionary[Any, _BnbPipelineState]" = weakref.WeakKeyDictionary()
+
+
+def _get_bnb_pipeline_state(pipeline: Any) -> _BnbPipelineState:
+    try:
+        state = _BNB_PIPELINE_STATE.get(pipeline)
+    except TypeError:
+        state = getattr(pipeline, "_bnb_pipeline_state", None)
+        if state is None:
+            state = _BnbPipelineState()
+            try:
+                setattr(pipeline, "_bnb_pipeline_state", state)
+            except Exception:
+                pass
+        return state
+    if state is None:
+        state = _BnbPipelineState()
+        _BNB_PIPELINE_STATE[pipeline] = state
+    return state
+
+
+def get_bnb_quantized_components(pipeline: Any) -> set[str]:
+    return set(_get_bnb_pipeline_state(pipeline).quantized_components)
+
+
+def set_bnb_quantized_components(pipeline: Any, components: set[str] | Iterable[str]) -> None:
+    state = _get_bnb_pipeline_state(pipeline)
+    state.quantized_components = set(components)
+
+
+def update_bnb_quantized_components(pipeline: Any, components: Iterable[str]) -> None:
+    state = _get_bnb_pipeline_state(pipeline)
+    state.quantized_components.update(components)
+
+
+def get_bnb_offload_skip_components(pipeline: Any) -> set[str]:
+    return set(_get_bnb_pipeline_state(pipeline).offload_skip_components)
+
+
+def set_bnb_offload_skip_components(pipeline: Any, components: Iterable[str]) -> None:
+    state = _get_bnb_pipeline_state(pipeline)
+    state.offload_skip_components = set(components)
+
+
 def _normalize_modules(modules: Sequence[str] | str | None) -> list[str] | None:
     if modules is None:
         return None
     if isinstance(modules, str):
         items = [m.strip() for m in modules.split(",")]
     else:
-        items = [str(m).strip() for m in list(modules)]
+        items = [str(m).strip() for m in modules]
     return [m for m in items if m]
 
 
@@ -210,11 +261,6 @@ def _ensure_transformers_bnb_patch() -> bool:
     patch_transformers_for_bnb_load.
     """
     global _BNB_PATCH_APPLIED, _BNB_PATCH_REFCOUNT, _BNB_PATCH_ORIG, _BNB_PATCH_TARGET
-    if _BNB_PATCH_APPLIED:
-        with _BNB_PATCH_LOCK:
-            _BNB_PATCH_REFCOUNT += 1
-        return True
-
     try:
         from transformers.modeling_utils import PreTrainedModel  # type: ignore[import-not-found]
     except Exception:
@@ -354,7 +400,7 @@ def apply_bnb_quantization(
     available_modules = list(only_modules) if only_modules is not None else _get_pipeline_component_names(pipeline)
     quant_modules = _resolve_module_patterns(available_modules, requested_modules)
     if skip_modules is not None:
-        skip = {m for m in skip_modules}
+        skip = set(skip_modules)
         quant_modules = [m for m in quant_modules if m not in skip]
     if not quant_modules:
         if only_modules is None:
@@ -595,6 +641,11 @@ def _convert_linear_module(
     else:
         target_device = original_device
 
+    # Bias handling truth table (only affects inner module bias allocation):
+    # - return_bias=False, skip_bias_add=False -> keep bias
+    # - return_bias=False, skip_bias_add=True  -> keep bias (caller ignores)
+    # - return_bias=True,  skip_bias_add=False -> keep bias (bias added inside)
+    # - return_bias=True,  skip_bias_add=True  -> drop bias (bias returned separately)
     inner_has_bias = has_bias if not (is_vllm_linear and return_bias and skip_bias_add) else False
     if backend == "bitsandbytes_8bit":
         new_linear = bnb.nn.Linear8bitLt(

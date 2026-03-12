@@ -31,6 +31,8 @@ from vllm_omni.diffusion.quantization.bitsandbytes import (
     DiffusionBitsAndBytesConfig,
     apply_bnb_quantization,
     matches_bnb_module_name,
+    set_bnb_quantized_components,
+    _is_vllm_linear,
     patch_transformers_for_bnb_load,
 )
 from vllm_omni.diffusion.registry import initialize_model
@@ -282,7 +284,7 @@ class DiffusersPipelineLoader:
                         copy_weights=False,
                         only_modules=only_modules,
                     )
-                model._bnb_quantized_components = quantized_components
+                set_bnb_quantized_components(model, quantized_components)
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model)
@@ -340,14 +342,4 @@ class DiffusersPipelineLoader:
 
 def _component_contains_vllm_linear(component: nn.Module) -> bool:
     """Return True if component includes vLLM LinearBase modules."""
-    try:
-        from vllm.model_executor.layers.linear import LinearBase
-    except Exception:
-        LinearBase = None
-    for module in component.modules():
-        module_path = getattr(module.__class__, "__module__", "")
-        if module_path.startswith("vllm.model_executor.layers.linear"):
-            return True
-        if LinearBase is not None and isinstance(module, LinearBase):
-            return True
-    return False
+    return any(_is_vllm_linear(module) for module in component.modules())

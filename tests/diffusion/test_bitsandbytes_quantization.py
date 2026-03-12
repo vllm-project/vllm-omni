@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import builtins
 import sys
 import types
 
@@ -246,3 +247,29 @@ def test_vllm_linear_bnb4_return_bias_semantics(monkeypatch):
     out2, out_bias2 = linear2(x)
     assert torch.allclose(out2, x @ linear2.weight.t() + linear2.bias)
     assert out_bias2 is None
+
+
+def test_apply_bnb_quantization_missing_bnb_raises(monkeypatch):
+    orig_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "bitsandbytes":
+            raise ImportError("bitsandbytes missing")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    pipeline = nn.Sequential(nn.Linear(4, 4))
+    cfg = OmniDiffusionConfig(
+        model="dummy-model",
+        quantization="bitsandbytes",
+        quantization_config={"load_in_8bit": True},
+    )
+
+    with pytest.raises(ImportError, match="bitsandbytes is required"):
+        apply_bnb_quantization(pipeline, cfg.quantization_config)
+
+
+def test_bnb_config_requires_load_in_flag():
+    with pytest.raises(ValueError, match="requires load_in_8bit or load_in_4bit"):
+        DiffusionBitsAndBytesConfig(load_in_8bit=False, load_in_4bit=False)
