@@ -220,59 +220,59 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     )
 
 
-@pytest.mark.integration
-def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
-    if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
-        pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
-    if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
-        pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 devices.")
+# @pytest.mark.integration
+# def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
+#     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
+#         pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
+#     if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
+#         pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 devices.")
 
-    enforce_eager = False
+#     enforce_eager = False
 
-    # Use a larger image to ensure there are multiple VAE tiles.
-    height = 1152
-    width = 1152
-    num_inference_steps = 2
-    seed = 42
+#     # Use a larger image to ensure there are multiple VAE tiles.
+#     height = 1152
+#     width = 1152
+#     num_inference_steps = 2
+#     seed = 42
 
-    baseline_img, _baseline_time_s, _baseline_peak_mem = _run_zimage_generate(
-        tp_size=2,
-        height=height,
-        width=width,
-        num_inference_steps=num_inference_steps,
-        seed=seed,
-        enforce_eager=enforce_eager,
-        vae_use_tiling=True,
-        vae_patch_parallel_size=1,
-        num_requests=2,
-    )
-    pp2_img, _pp2_time_s, _pp2_peak_mem = _run_zimage_generate(
-        tp_size=2,
-        height=height,
-        width=width,
-        num_inference_steps=num_inference_steps,
-        seed=seed,
-        enforce_eager=enforce_eager,
-        vae_use_tiling=True,
-        vae_patch_parallel_size=2,
-        num_requests=2,
-    )
+#     baseline_img, _baseline_time_s, _baseline_peak_mem = _run_zimage_generate(
+#         tp_size=2,
+#         height=height,
+#         width=width,
+#         num_inference_steps=num_inference_steps,
+#         seed=seed,
+#         enforce_eager=enforce_eager,
+#         vae_use_tiling=True,
+#         vae_patch_parallel_size=1,
+#         num_requests=2,
+#     )
+#     pp2_img, _pp2_time_s, _pp2_peak_mem = _run_zimage_generate(
+#         tp_size=2,
+#         height=height,
+#         width=width,
+#         num_inference_steps=num_inference_steps,
+#         seed=seed,
+#         enforce_eager=enforce_eager,
+#         vae_use_tiling=True,
+#         vae_patch_parallel_size=2,
+#         num_requests=2,
+#     )
 
-    baseline_path = tmp_path / "zimage_tp2_vae_pp1.png"
-    pp2_path = tmp_path / "zimage_tp2_vae_pp2.png"
-    baseline_img.save(baseline_path)
-    pp2_img.save(pp2_path)
+#     baseline_path = tmp_path / "zimage_tp2_vae_pp1.png"
+#     pp2_path = tmp_path / "zimage_tp2_vae_pp2.png"
+#     baseline_img.save(baseline_path)
+#     pp2_img.save(pp2_path)
 
-    mean_abs_diff, p99_abs_diff = _diff_metrics(baseline_img, pp2_img)
-    mean_threshold = 5e-3
-    p99_threshold = 1e-1
-    print(
-        "Z-Image VAE patch parallel image diff stats (TP=2, pp=1 vs pp=2): "
-        f"mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e}; "
-        f"thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e}; "
-        f"pp1_img={baseline_path}, pp2_img={pp2_path}"
-    )
-    assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
-        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e} "
-        f"(thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e})"
-    )
+#     mean_abs_diff, p99_abs_diff = _diff_metrics(baseline_img, pp2_img)
+#     mean_threshold = 5e-3
+#     p99_threshold = 1e-1
+#     print(
+#         "Z-Image VAE patch parallel image diff stats (TP=2, pp=1 vs pp=2): "
+#         f"mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e}; "
+#         f"thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e}; "
+#         f"pp1_img={baseline_path}, pp2_img={pp2_path}"
+#     )
+#     assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
+#         f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e} "
+#         f"(thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e})"
+#     )

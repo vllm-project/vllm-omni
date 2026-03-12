@@ -18,7 +18,7 @@ If users want to modify some part of it. The custom stage_configs file can be in
 For offline (Assume necessary dependencies have ben imported):
 ```python
 model_name = "Qwen/Qwen2.5-Omni-7B"
-omni_llm = OmniLLM(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
+omni_llm = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
 ```
 
 For online serving:

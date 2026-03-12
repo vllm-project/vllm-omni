@@ -984,6 +984,80 @@ def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], 
     return refresh_cache_context
 
 
+def enable_cache_for_flux2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for Flux.2-dev pipeline.
+
+    Args:
+        pipeline: The Flux2 pipeline instance.
+        cache_config: DiffusionCacheConfig instance with cache configuration.
+    Returns:
+        A refresh function that can be called with a new ``num_inference_steps``
+        to update the cache context for the pipeline.
+    """
+    # Build DBCacheConfig for transformer
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    # Build ParamsModifier for transformer
+    modifier = ParamsModifier(
+        cache_config=db_cache_config,
+        calibrator_config=calibrator,
+    )
+
+    logger.info(
+        f"Enabling cache-dit on Flux transformer with BlockAdapter: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
+    )
+
+    # Enable cache-dit using BlockAdapter for transformer
+    cache_dit.enable_cache(
+        (
+            BlockAdapter(
+                transformer=pipeline.transformer,
+                blocks=[
+                    pipeline.transformer.transformer_blocks,
+                    pipeline.transformer.single_transformer_blocks,
+                ],
+                forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_2],
+                params_modifiers=[modifier],
+            )
+        ),
+        cache_config=db_cache_config,
+    )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        """Refresh cache context for the transformer with new num_inference_steps.
+
+        Args:
+            pipeline: The Flux2 pipeline instance.
+            num_inference_steps: New number of inference steps.
+        """
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_inference_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_inference_steps,
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
 # Register custom cache-dit enablers after function definitions
 CUSTOM_DIT_ENABLERS.update(
     {
@@ -998,6 +1072,7 @@ CUSTOM_DIT_ENABLERS.update(
         "LTX2Pipeline": enable_cache_for_ltx2,
         "LTX2ImageToVideoPipeline": enable_cache_for_ltx2,
         "BagelPipeline": enable_cache_for_bagel,
+        "Flux2Pipeline": enable_cache_for_flux2,
     }
 )
 

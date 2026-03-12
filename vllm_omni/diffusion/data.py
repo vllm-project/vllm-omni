@@ -463,11 +463,13 @@ class OmniDiffusionConfig:
     @property
     def is_moe(self) -> bool:
         num_experts = self.tf_model_config.get("num_experts", None)
+        if not isinstance(num_experts, (list, tuple, int)):
+            return False
         if isinstance(num_experts, int):
-            return num_experts > 1
+            return num_experts > 0
 
         if isinstance(num_experts, (list, tuple)):
-            return any(isinstance(n, int) and n > 1 for n in num_experts)
+            return any(isinstance(n, int) and n > 0 for n in num_experts)
 
         return False
 

@@ -70,6 +70,11 @@ def test_cpu_offload_diffusion_model(model_name: str):
         pytest.fail("Inference failed")
     print(f"Offload peak memory: {offload_peak_memory} MB")
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
-    assert offload_peak_memory + 2500 < no_offload_peak_memory, (
-        f"Offload peak memory {offload_peak_memory} MB should be less than no offload peak memory {no_offload_peak_memory} MB"
+    # Set platform-specific VRAM saving thresholds to account
+    # for varying runtime memory overhead and fragmentation between CUDA and ROCm.
+    is_rocm = torch.version.hip is not None
+    threshold = 2500 if not is_rocm else 2100
+    assert offload_peak_memory + threshold < no_offload_peak_memory, (
+        f"Offload peak memory {offload_peak_memory} MB should be less than "
+        f"no offload peak memory {no_offload_peak_memory} MB by {threshold} MB"
     )
