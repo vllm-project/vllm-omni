@@ -11,7 +11,6 @@ from __future__ import annotations
 import re
 from enum import Enum, Flag, auto
 
-
 _MODALITY_ALIASES: dict[str, str] = {
     "speech": "audio",
     "images": "image",
@@ -80,10 +79,7 @@ class OutputModality(Flag):
             try:
                 result |= cls[p.upper()]
             except KeyError:
-                raise ValueError(
-                    f"Unknown modality: {p!r}. "
-                    f"Supported: {[m.name.lower() for m in cls]}"
-                )
+                raise ValueError(f"Unknown modality: {p!r}. Supported: {[m.name.lower() for m in cls]}")
         return result
 
     @property
