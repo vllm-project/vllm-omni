@@ -1561,58 +1561,6 @@ def apply_stage_default_sampling_params(
                     setattr(sampling_params, param_name, param_value)
 
 
-@profiler_router.post("/start_profile")
-async def start_profile(raw_request: Request, request: ProfileRequest | None = None):
-    """Start profiling for the engine.
-
-    Args:
-        request: Optional request body with stages to profile.
-            - stages: List of stage IDs to profile. If None, profiles all stages.
-
-    Example:
-        POST /start_profile
-        {"stages": [0, 1]}  # Profile only stages 0 and 1
-    """
-    try:
-        stages = request.stages if request else None
-        logger.info("Starting profiler for stages: %s", stages if stages else "all")
-        engine_client = raw_request.app.state.engine_client
-        result = await engine_client.start_profile(stages=stages)
-        logger.info("Profiler started.")
-        return JSONResponse(content=result)
-    except Exception as e:
-        logger.exception("Failed to start profiler: %s", e)
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to start profiler: {str(e)}"
-        )
-
-
-@profiler_router.post("/stop_profile")
-async def stop_profile(raw_request: Request, request: ProfileRequest | None = None):
-    """Stop profiling for the engine.
-
-    Args:
-        request: Optional request body with stages to stop profiling.
-            - stages: List of stage IDs to stop profiling. If None, stops all stages.
-
-    Example:
-        POST /stop_profile
-        {"stages": [0, 1]}  # Stop profiling only stages 0 and 1
-    """
-    try:
-        stages = request.stages if request else None
-        logger.info("Stopping profiler for stages: %s", stages if stages else "all")
-        engine_client = raw_request.app.state.engine_client
-        result = await engine_client.stop_profile(stages=stages)
-        logger.info("Profiler stopped.")
-        return JSONResponse(content=result)
-    except Exception as e:
-        logger.exception("Failed to stop profiler: %s", e)
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to stop profiler: {str(e)}"
-        )
-
-
 def _resolve_video_runtime_context(raw_request: Request) -> tuple[str | None, list[Any] | None]:
     app_model_name = None
     serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
