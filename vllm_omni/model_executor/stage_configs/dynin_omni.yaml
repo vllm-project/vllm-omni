@@ -31,7 +31,7 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       engine_output_type: latent
       trust_remote_code: true
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.1
       enforce_eager: true
       enable_prefix_caching: false
       async_scheduling: false
@@ -53,7 +53,7 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       engine_output_type: latent
       trust_remote_code: true
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.1
       enforce_eager: true
       enable_prefix_caching: false
       async_scheduling: false

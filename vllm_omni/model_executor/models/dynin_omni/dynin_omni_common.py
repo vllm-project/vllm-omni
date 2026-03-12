@@ -188,6 +188,22 @@ def resolve_hidden_size(
     return default
 
 
+def build_zero_input_embeddings(
+    *,
+    input_ids: torch.Tensor,
+    hidden_size: int,
+    stage_name: str,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    if input_ids.ndim == 0:
+        return torch.zeros((1, hidden_size), dtype=dtype, device=input_ids.device)
+    if input_ids.ndim == 1:
+        return torch.zeros((input_ids.shape[0], hidden_size), dtype=dtype, device=input_ids.device)
+    if input_ids.ndim == 2:
+        return torch.zeros((input_ids.shape[0], input_ids.shape[1], hidden_size), dtype=dtype, device=input_ids.device)
+    raise ValueError(f"Unsupported input_ids rank for {stage_name}: {input_ids.ndim}")
+
+
 def _to_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default

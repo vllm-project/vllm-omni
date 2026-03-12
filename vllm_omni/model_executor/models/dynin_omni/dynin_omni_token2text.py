@@ -18,6 +18,8 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .dynin_omni_common import (
     DETOK_TEXT,
     TASK_TO_DETOK,
+    _to_bool,
+    build_zero_input_embeddings,
     first_value,
     get_dynin_modeling_attr,
     get_dynin_remote_attr,
@@ -83,21 +85,6 @@ class DyninOmniToken2Text(nn.Module):
         self._uni_prompting_init_spec: tuple[Any, ...] | None = None
 
     @staticmethod
-    def _as_bool(value: Any, default: bool = False) -> bool:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        text = str(value).strip().lower()
-        if text in ("1", "true", "yes", "y", "on"):
-            return True
-        if text in ("0", "false", "no", "n", "off", "none", "null", ""):
-            return False
-        return default
-
-    @staticmethod
     def _load_text_model(model_path: str, *, local_files_only: bool = False) -> Any:
         # Load Dynin model class from the model's remote code (HF snapshot),
         # then load weights from model_path.
@@ -124,7 +111,7 @@ class DyninOmniToken2Text(nn.Module):
 
     @staticmethod
     def _load_tokenizer(model_path: str, *, local_files_only: bool = False) -> Any:
-        local_only = DyninOmniToken2Text._as_bool(local_files_only, default=False)
+        local_only = _to_bool(local_files_only, default=False)
         load_kwargs = {"trust_remote_code": False, "local_files_only": local_only}
         try:
             try:
@@ -404,7 +391,7 @@ class DyninOmniToken2Text(nn.Module):
         if self.tokenizer is None:
             return None
 
-        use_reserved_token = self._as_bool(
+        use_reserved_token = _to_bool(
             first_value(
                 runtime_info.get("use_reserved_token"),
                 first_value(runtime_info.get("prompting_use_reserved_token"), True),
@@ -811,7 +798,7 @@ class DyninOmniToken2Text(nn.Module):
                 ),
             ),
         )
-        local_only = self._as_bool(
+        local_only = _to_bool(
             runtime_local_files_only,
             default=self._infer_sources.model_local_files_only,
         )
@@ -847,26 +834,11 @@ class DyninOmniToken2Text(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         del multimodal_embeddings, is_multimodal, kwargs
-        hidden_size = self.hidden_size
-        if input_ids.ndim == 0:
-            return torch.zeros(
-                (1, hidden_size),
-                dtype=torch.bfloat16,
-                device=input_ids.device,
-            )
-        if input_ids.ndim == 1:
-            return torch.zeros(
-                (input_ids.shape[0], hidden_size),
-                dtype=torch.bfloat16,
-                device=input_ids.device,
-            )
-        if input_ids.ndim == 2:
-            return torch.zeros(
-                (input_ids.shape[0], input_ids.shape[1], hidden_size),
-                dtype=torch.bfloat16,
-                device=input_ids.device,
-            )
-        raise ValueError(f"Unsupported input_ids rank for Dynin token2text: {input_ids.ndim}")
+        return build_zero_input_embeddings(
+            input_ids=input_ids,
+            hidden_size=self.hidden_size,
+            stage_name="Dynin token2text",
+        )
 
     @staticmethod
     def _iter_mm_items(value: Any) -> list[Any]:

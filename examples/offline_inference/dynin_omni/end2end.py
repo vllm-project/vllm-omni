@@ -55,8 +55,8 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
         "prompt_max_text_len": 128,
         "mask_token_id": 126336,
         "codebook_size": 8192,
-        "timesteps": 18,
-        "guidance_scale": 0.0,
+        "timesteps": 20,
+        "guidance_scale": 3.5,
         "temperature": 1.0,
         "image_resolution": 336,
         "use_train_i2i_prompt": True,
@@ -801,7 +801,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument(
         "--dynin-config-path",
         type=str,
-        default=str(repo_root / "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml"),
+        default="",
         help="Path to DYNIN config yaml (passed through additional_information).",
     )
     parser.add_argument(

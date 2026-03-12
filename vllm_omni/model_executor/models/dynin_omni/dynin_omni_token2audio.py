@@ -16,6 +16,8 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .dynin_omni_common import (
     DETOK_AUDIO,
+    _looks_like_hf_repo_id,
+    build_zero_input_embeddings,
     first_value,
     get_runtime_info,
     resolve_dynin_infer_sources,
@@ -24,15 +26,6 @@ from .dynin_omni_common import (
 )
 
 logger = init_logger(__name__)
-
-
-def _looks_like_hf_repo_id(value: str | None) -> bool:
-    if not isinstance(value, str):
-        return False
-    if value.count("/") != 1:
-        return False
-    org, name = value.split("/", 1)
-    return bool(org) and bool(name)
 
 
 def _get_hf_token() -> str | None:
@@ -176,20 +169,13 @@ class DyninOmniToken2Audio(nn.Module):
         created_tmp = False
         if output_wav_file is None:
             fd, tmp_wav = tempfile.mkstemp(prefix="dynin_t2s_", suffix=".wav")
-            try:
-                import os
-
-                os.close(fd)
-            except Exception:
-                pass
+            os.close(fd)
             output_wav_file = tmp_wav
             created_tmp = True
 
         audio_array = vq_audio.decode(speech_unit_for_decode, condition=condition, output_wav_file=output_wav_file)
         if created_tmp:
             try:
-                import os
-
                 os.remove(output_wav_file)
             except Exception:
                 pass
@@ -295,26 +281,11 @@ class DyninOmniToken2Audio(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         del multimodal_embeddings, is_multimodal, kwargs
-        hidden_size = self.hidden_size
-        if input_ids.ndim == 0:
-            return torch.zeros(
-                (1, hidden_size),
-                dtype=torch.bfloat16,
-                device=input_ids.device,
-            )
-        if input_ids.ndim == 1:
-            return torch.zeros(
-                (input_ids.shape[0], hidden_size),
-                dtype=torch.bfloat16,
-                device=input_ids.device,
-            )
-        if input_ids.ndim == 2:
-            return torch.zeros(
-                (input_ids.shape[0], input_ids.shape[1], hidden_size),
-                dtype=torch.bfloat16,
-                device=input_ids.device,
-            )
-        raise ValueError(f"Unsupported input_ids rank for Dynin token2audio: {input_ids.ndim}")
+        return build_zero_input_embeddings(
+            input_ids=input_ids,
+            hidden_size=self.hidden_size,
+            stage_name="Dynin token2audio",
+        )
 
     def embed_multimodal(self, **kwargs: Any) -> Any:
         del kwargs

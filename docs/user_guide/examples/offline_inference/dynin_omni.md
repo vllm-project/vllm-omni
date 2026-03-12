@@ -1,5 +1,8 @@
 # Dynin-Omni Offline End2End Example
 
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/dynin_omni>.
+
+
 This folder contains a unified offline inference entrypoint:
 
 - `end2end.py`
@@ -42,7 +45,7 @@ pip install \
 ## 3. Hardware and VRAM Requirements
 
 This example uses a 3-stage pipeline on one GPU by default
-([`dynin_omni.yaml`](../../../vllm_omni/model_executor/stage_configs/dynin_omni.yaml)):
+([`dynin_omni.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/model_executor/stage_configs/dynin_omni.yaml)):
 
 - Stage-0 (`token2text`): `gpu_memory_utilization: 0.5`
 - Stage-1 (`token2image`): `gpu_memory_utilization: 0.1`
@@ -108,3 +111,38 @@ python <REPO_ROOT>/examples/offline_inference/dynin_omni/end2end.py \
 - If you see the warning
   `max_num_batched_tokens (32768) exceeds max_num_seqs * max_model_len (4096)`,
   reduce `max_num_batched_tokens` in stage config (for example, `4096` in CI config).
+
+## Example materials
+
+??? abstract "data/text/i2i_edits.json"
+    ``````json
+    --8<-- "examples/offline_inference/dynin_omni/data/text/i2i_edits.json"
+    ``````
+??? abstract "data/text/lm_questions.jsonl"
+    ``````jsonl
+    --8<-- "examples/offline_inference/dynin_omni/data/text/lm_questions.jsonl"
+    ``````
+??? abstract "data/text/mmu_prompts.jsonl"
+    ``````jsonl
+    --8<-- "examples/offline_inference/dynin_omni/data/text/mmu_prompts.jsonl"
+    ``````
+??? abstract "data/text/mmu_prompts_with_vqa.json"
+    ``````json
+    --8<-- "examples/offline_inference/dynin_omni/data/text/mmu_prompts_with_vqa.json"
+    ``````
+??? abstract "data/text/prompts.jsonl"
+    ``````jsonl
+    --8<-- "examples/offline_inference/dynin_omni/data/text/prompts.jsonl"
+    ``````
+??? abstract "data/text/prompts_with_vqa.json"
+    ``````json
+    --8<-- "examples/offline_inference/dynin_omni/data/text/prompts_with_vqa.json"
+    ``````
+??? abstract "data/text/t2i_metadata.jsonl"
+    ``````jsonl
+    --8<-- "examples/offline_inference/dynin_omni/data/text/t2i_metadata.jsonl"
+    ``````
+??? abstract "end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/dynin_omni/end2end.py"
+    ``````
