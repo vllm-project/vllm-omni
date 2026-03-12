@@ -147,21 +147,31 @@ def _parse_collect_only_stdout(stdout: str, *, raise_on_empty: bool = True, stde
     return out
 
 
-def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_line: str) -> tuple[str, str, int]:
+def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_line: str) -> tuple[list[str], str, int]:
     """
-    Resolve target + repo_root + extra to (path_arg, fallback_path, timeout).
+    Resolve target + repo_root + extra to (path_args, fallback_path, timeout).
     Raises FileNotFoundError/RuntimeError on invalid config.
     """
     if target.endswith(".py"):
-        path = (repo_root / target).resolve()
+        # Target extracted from buildkite yaml may include glob patterns like
+        # tests/e2e/online_serving/test_*_expansion.py. Pytest does not reliably
+        # expand globs across platforms, so expand them here.
+        rel = Path(target)
+        if any(ch in target for ch in ["*", "?", "["]):
+            matches = sorted(repo_root.glob(rel.as_posix()))
+            if not matches:
+                raise FileNotFoundError(f"Pytest target glob did not match any files: {repo_root / target}")
+            return [str(p.resolve()) for p in matches], target.replace("\\", "/"), 90
+
+        path = (repo_root / rel).resolve()
         if not path.exists():
             raise FileNotFoundError(f"Pytest target path does not exist: {path}")
-        return str(path), target.replace("\\", "/"), 60
+        return [str(path)], target.replace("\\", "/"), 60
     if not extra:
         raise RuntimeError(f"Failed to parse -m/--run-level from pytest line: {raw_line!r}")
     if not (repo_root / "tests").exists():
         raise FileNotFoundError("tests/ directory not found under repo root")
-    return "tests/", "tests/", 120
+    return ["tests/"], "tests/", 120
 
 
 def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]:
@@ -170,9 +180,9 @@ def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]
     target: path like tests/foo.py or marker string (e.g. "-m expr"). raw_line used for -m/--run-level.
     """
     extra = _parse_extra_args_from_line(raw_line)
-    path_arg, _fallback, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
+    path_args, _fallback, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
 
-    cmd_quiet = [sys.executable, "-m", "pytest", path_arg, "--collect-only", "-q"]
+    cmd_quiet = [sys.executable, "-m", "pytest", *path_args, "--collect-only", "-q"]
     cmd_quiet.extend(extra)
     result = subprocess.run(
         cmd_quiet,
@@ -182,8 +192,8 @@ def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]
         timeout=timeout_quiet,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"pytest --collect-only failed for {path_arg} with args {extra}: {result.stderr.strip()}")
-    print(f"pytest --collect-only success for {path_arg} with args {extra}: {result.stdout.strip()}")
+        raise RuntimeError(f"pytest --collect-only failed for {path_args} with args {extra}: {result.stderr.strip()}")
+    print(f"pytest --collect-only success for {path_args} with args {extra}: {result.stdout.strip()}")
     return _parse_collect_only_stdout(result.stdout or "", stderr=result.stderr or "")
 
 
@@ -214,12 +224,12 @@ def get_skip_status(target: str, raw_line: str, repo_root: Path) -> set[str]:
     """
     extra = _parse_extra_args_from_line(raw_line)
     try:
-        path_arg, _, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
+        path_args, _, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
     except (FileNotFoundError, RuntimeError):
         return set()
 
     extra_skip = _extra_with_skip_marker(extra)
-    cmd = [sys.executable, "-m", "pytest", path_arg, "--collect-only", "-q"]
+    cmd = [sys.executable, "-m", "pytest", *path_args, "--collect-only", "-q"]
     cmd.extend(extra_skip)
     try:
         result = subprocess.run(
