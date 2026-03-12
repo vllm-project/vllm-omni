@@ -208,10 +208,11 @@ async def async_request_openai_chat_omni_completions(
 async def async_request_openai_audio_speech(
     request_func_input: RequestFuncInput, session: aiohttp.ClientSession, pbar: tqdm | None = None
 ) -> MixRequestFuncOutput:
-    """Non-streaming request to /v1/audio/speech endpoint.
+    """Streaming request to /v1/audio/speech endpoint.
 
-    The endpoint returns raw audio bytes (e.g. WAV). Pass voice, instructions,
-    and other TTS-specific fields via ``extra_body``.
+    Sends ``stream=true`` with ``response_format=pcm`` so the server returns
+    raw PCM chunks as they are decoded. This allows measuring TTFP (time to
+    first audio packet) separately from E2EL.
     """
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
@@ -219,15 +220,10 @@ async def async_request_openai_audio_speech(
     payload = {
         "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
         "input": request_func_input.prompt,
+        "stream": True,
+        "response_format": "pcm",
     }
     _update_payload_common(payload, request_func_input)
-
-    response_format = payload.get("response_format", "wav")
-    if response_format == "pcm":
-        raise ValueError(
-            "pcm response format is not supported yet. \
-        Please use other formats like wav, mp3, etc. instead."
-        )
 
     headers = {
         "Content-Type": "application/json",
@@ -238,41 +234,38 @@ async def async_request_openai_audio_speech(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
+    # PCM format: 16-bit signed, 24 kHz, mono
+    sample_rate = 24000
+    sample_width = 2  # 16-bit = 2 bytes
+    channels = 1
+
     st = time.perf_counter()
     output.start_time = st
+    total_pcm_bytes = 0
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
-                audio_bytes = await response.read()
+                async for chunk in response.content.iter_any():
+                    if not chunk:
+                        continue
+                    timestamp = time.perf_counter()
+                    if output.audio_ttfp == 0.0:
+                        output.audio_ttfp = timestamp - st
+                        output.ttft = output.audio_ttfp
+                    total_pcm_bytes += len(chunk)
+
                 end_time = time.perf_counter()
                 output.latency = end_time - st
-                # ttft = latency since this is a non-streaming request
-                # hence there is no distinction between first and last token/audio
-                output.ttft = output.latency
-                output.audio_ttfp = output.latency
 
-                try:
-                    audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes))
-                    output.audio_duration = len(audio_segment) / 1000.0
-                    frame_width = audio_segment.frame_width
-                    if frame_width > 0:
-                        output.audio_frames = len(audio_segment.raw_data) // frame_width
-                    else:
-                        output.audio_frames = 0
-                        logger.warning("Audio frame width is zero")
-                    if output.audio_duration > 0:
-                        # rtf = audio_generate_time / audio_duration and
-                        # audio_generate_time = latency since this is a non-streaming request
-                        # so the time to receive last portion of audio is the latency
-                        output.audio_rtf = output.latency / output.audio_duration
-                    else:
-                        output.audio_rtf = 0
-                        logger.warning("Audio duration is zero")
-                    output.success = True
-                except Exception as e:
-                    output.success = False
-                    output.error = f"Failed to parse audio response: {e}"
-                    logger.error(f"ERROR: Failed to parse audio response: {e}")
+                total_samples = total_pcm_bytes // (sample_width * channels)
+                output.audio_duration = total_samples / sample_rate
+                output.audio_frames = total_samples
+                if output.audio_duration > 0:
+                    output.audio_rtf = output.latency / output.audio_duration
+                else:
+                    output.audio_rtf = 0
+                    logger.warning("Audio duration is zero")
+                output.success = True
             else:
                 output.error = response.reason or ""
                 output.success = False

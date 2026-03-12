@@ -63,6 +63,12 @@ def _setup_comfyui_test_environment():
     mock_comfy_api_input.AudioInput = AudioInput
     mock_comfy_api_input.VideoInput = VideoInput
     mock_comfy_api.input = mock_comfy_api_input
+    mock_comfy_api_latest = MagicMock()
+    mock_comfy_api_latest.Types.VideoComponents = MagicMock(side_effect=lambda **kwargs: kwargs)
+    mock_comfy_api_latest.InputImpl.VideoFromComponents = MagicMock(
+        side_effect=lambda _: VideoInput(b"mock_video_from_components")
+    )
+    mock_comfy_api.latest = mock_comfy_api_latest
 
     def mock_load(_: str | BinaryIO):
         """Mock nodes_audio.load that returns a waveform tensor (channels, samples) and sample rate."""
@@ -78,5 +84,6 @@ def _setup_comfyui_test_environment():
     # Install mock modules BEFORE importing any comfyui_vllm_omni code
     sys.modules["comfy_api"] = mock_comfy_api
     sys.modules["comfy_api.input"] = mock_comfy_api_input
+    sys.modules["comfy_api.latest"] = mock_comfy_api_latest
     sys.modules["comfy_extras"] = mock_comfy_extras
     sys.modules["comfy_extras.nodes_audio"] = mock_nodes_audio

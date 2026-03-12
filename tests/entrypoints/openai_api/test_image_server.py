@@ -136,7 +136,6 @@ def mock_async_diffusion(mocker: MockerFixture):
 
     async def generate(**kwargs):
         # Return n PIL images wrapped in result object
-        print("!!!!!!!!!!!!!!!!!!!!! kwargs", kwargs)
         n = kwargs["sampling_params_list"][0].num_outputs_per_prompt
         mock.captured_sampling_params_list = kwargs["sampling_params_list"]
         mock.captured_prompt = kwargs["prompt"]
