@@ -269,7 +269,10 @@ class OmniStage:
         self.engine_args = stage_config.engine_args
         self.model_stage = stage_config.engine_args.model_stage
         self.requires_multimodal_data = getattr(stage_config.runtime, "requires_multimodal_data", False)
-        self.engine_input_source = getattr(stage_config, "engine_input_source", [])
+        # Support both 'input_sources' (new format) and 'engine_input_source' (legacy)
+        self.engine_input_source = (
+            getattr(stage_config, "input_sources", None) or getattr(stage_config, "engine_input_source", []) or []
+        )
         self.engine_output_type = getattr(stage_config.engine_args, "engine_output_type", None)
         self.engine_outputs = None
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
