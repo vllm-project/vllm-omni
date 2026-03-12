@@ -164,6 +164,42 @@ curl -X POST http://localhost:8091/v1/audio/voices \
   -F "name=custom_voice_1"
 ```
 
+## Streaming Text Input (WebSocket)
+
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally and generates audio per sentence as boundaries are detected.
+
+> Note: text input is always streamed incrementally. Audio output remains sentence-scoped:
+> use `stream_audio=false` for one binary frame per sentence, or `stream_audio=true` for one or more PCM chunks per sentence.
+
+### WebSocket Protocol
+
+Client -> Server:
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "session.config", ...}` | Session configuration (sent once, first message) |
+| `{"type": "input.text", "text": "..."}` | Text chunk |
+| `{"type": "input.done"}` | End of input, flushes remaining buffer |
+
+Server -> Client:
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for a sentence |
+| Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
+| `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for a sentence |
+| `{"type": "session.done", "total_sentences": N}` | Session complete |
+| `{"type": "error", "message": "..."}` | Non-fatal error |
+
+### Session Config Parameters
+
+All REST API parameters are supported, plus:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `stream_audio` | bool | false | Stream one or more PCM chunks per sentence over WebSocket |
+| `split_granularity` | string | "sentence" | Text splitting granularity |
+
 
 ```bash
 DELETE /v1/audio/voices/{name}
