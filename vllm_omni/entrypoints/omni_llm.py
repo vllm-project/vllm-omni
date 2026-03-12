@@ -25,10 +25,7 @@ from vllm_omni.engine.input_processor import OmniInputProcessor, reinject_omni_f
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.utils import (
     filter_dataclass_kwargs,
-    load_stage_configs_from_model,
-    load_stage_configs_from_yaml,
     resolve_model_config_path,
-    resolve_model_type,
 )
 
 logger = init_logger(__name__)
@@ -44,8 +41,6 @@ class OmniLLM(LLM):
 
     Args:
         model: Model name or path to load
-        stage_configs_path: Optional path to YAML file containing stage
-            configurations. If None, configurations are loaded from the model.
         log_stats: Whether to enable statistics logging
         compilation_config: Optional compilation configuration. Can be an
             integer (compilation level), dict, or CompilationConfig instance.
@@ -69,7 +64,6 @@ class OmniLLM(LLM):
     def __init__(
         self,
         model: str,
-        stage_configs_path: str | None = None,
         log_stats: bool = False,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         hf_overrides: dict[str, Any] | None = None,
@@ -85,16 +79,10 @@ class OmniLLM(LLM):
         self.worker_backend = kwargs.get("worker_backend", "multi_process")
         self.ray_address = kwargs.get("ray_address", None)
         self.batch_timeout = batch_timeout
-        self.model_type = resolve_model_type(model)
         self.log_stats: bool = bool(log_stats)
 
-        # Load stage configurations
-        if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(self.model_type)
-            self.stage_configs = load_stage_configs_from_model(config_path=self.config_path)
-        else:
-            self.config_path = stage_configs_path
-            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
+        # Resolve model config path for connectors
+        self.config_path = resolve_model_config_path(model)
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
@@ -156,6 +144,7 @@ class OmniLLM(LLM):
             compilation_config=compilation_config_instance,
             structured_outputs_config=structured_outputs_instance,
             omni_kv_config=omni_kv_config,
+            hf_overrides=hf_overrides or {},
             **filter_dataclass_kwargs(OmniEngineArgs, kwargs),
         )
 

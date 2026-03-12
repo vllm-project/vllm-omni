@@ -19,10 +19,9 @@ from typing import Annotated, Any, cast
 
 import httpx
 import vllm.envs as envs
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
-from pydantic import BaseModel, Field
 from starlette.datastructures import State
 from starlette.routing import Route
 from vllm import SamplingParams
@@ -87,10 +86,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
-from vllm_omni.entrypoints.openai.protocol.audio import (
-    OpenAICreateAudioGenerateRequest,
-    OpenAICreateSpeechRequest,
-)
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -100,9 +96,9 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationResponse,
 )
-from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
@@ -110,30 +106,6 @@ from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 router = APIRouter()
-profiler_router = APIRouter()
-
-
-def _should_enable_profiler_endpoints(args: Namespace) -> bool:
-    # Check upstream vLLM's profiler_config
-    profiler_config = getattr(args, "profiler_config", None)
-    if profiler_config is not None:
-        # profiler_config exists, check if profiler is set
-        profiler = getattr(profiler_config, "profiler", None)
-        if profiler is not None:
-            return True
-
-    # TODO: remove this env after refactoring torch profiler to CLI args
-    env_value = os.environ.get("VLLM_TORCH_PROFILER_DIR")
-    return env_value is not None
-
-
-class ProfileRequest(BaseModel):
-    """Request model for profiling endpoints."""
-
-    stages: list[int] | None = Field(
-        default=None,
-        description="List of stage IDs to profile. If None, profiles all stages.",
-    )
 
 
 def _remove_route_from_router(
@@ -179,29 +151,12 @@ class _DiffusionServingModels:
     provide a lightweight fallback.
     """
 
-    class _NullModelConfig:
-        def __getattr__(self, name):
-            return None
-
-    class _Unsupported:
-        def __init__(self, name: str):
-            self.name = name
-
-        def __call__(self, *args, **kwargs):
-            raise NotImplementedError(f"{self.name} is not supported in diffusion mode")
-
-        def __getattr__(self, attr):
-            raise NotImplementedError(f"{self.name}.{attr} is not supported in diffusion mode")
-
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
         self._base_model_paths = base_model_paths
-        self.model_config = self._NullModelConfig()
 
-    def __getattr__(self, name):
-        """Return a sentinel that raises NotImplementedError if called or
-        accessed, so any use of unsupported OpenAIServingModels features in
-        diffusion mode fails loudly with a descriptive message."""
-        return self._Unsupported(name)
+    @property
+    def base_model_paths(self) -> list[BaseModelPath]:
+        return self._base_model_paths
 
     async def show_available_models(self) -> ModelList:
         return ModelList(
@@ -266,7 +221,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         else:
             supported_tasks = ("generate",)
         if not supported_tasks:
-            supported_tasks = ("generate",)
+            # Only default to "generate" when get_supported_tasks is not implemented;
+            # TTS-only models intentionally return an empty set.
+            if not hasattr(engine_client, "get_supported_tasks"):
+                supported_tasks = ("generate",)
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
@@ -276,11 +234,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         app.include_router(router)
 
         await omni_init_app_state(engine_client, app.state, args)
-
-        # Conditionally register profiler endpoints based on config or env var
-        if _should_enable_profiler_endpoints(args):
-            logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
-            app.include_router(profiler_router)
 
         vllm_config = await engine_client.get_vllm_config()
 
@@ -312,7 +265,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             ssl_certfile=args.ssl_certfile,
             ssl_ca_certs=args.ssl_ca_certs,
             ssl_cert_reqs=args.ssl_cert_reqs,
-            ssl_ciphers=args.ssl_ciphers,
             h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
             h11_max_header_count=args.h11_max_header_count,
             **uvicorn_kwargs,
@@ -459,10 +411,10 @@ async def omni_init_app_state(
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-    model_name = served_model_names[0] if served_model_names else args.model
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
+        model_name = served_model_names[0] if served_model_names else args.model
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
@@ -475,16 +427,6 @@ async def omni_init_app_state(
             model_name=model_name,
         )
 
-        # audio related
-        state.openai_serving_speech = None
-        state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
-            engine_client,
-            state.openai_serving_models,
-            request_logger=request_logger,
-            model_name=model_name,
-        )
-
-        # video related
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
@@ -492,6 +434,7 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
 
+        state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
         return
@@ -766,11 +709,11 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+        engine_client, state.openai_serving_models, request_logger=request_logger
     )
 
-    state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+    state.openai_streaming_speech = OmniStreamingSpeechHandler(
+        speech_service=state.openai_serving_speech,
     )
 
     state.openai_serving_video = OmniOpenAIServingVideo(
@@ -793,10 +736,6 @@ def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
 
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
-
-
-def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None:
-    return getattr(request.app.state, "openai_serving_audio_generate", None)
 
 
 @router.post(
@@ -909,34 +848,6 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
 
-@router.post(
-    "/v1/audio/generate",
-    dependencies=[Depends(validate_json_request)],
-    responses={
-        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-@with_cancellation
-@load_aware_call
-async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
-    handler = OmniAudioGenerate(raw_request)
-    if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
-        if base_server is None:
-            raise HTTPException(
-                status_code=HTTPStatus.NOT_FOUND.value,
-                detail="The model does not support Audio Generate API",
-            )
-        return base_server.create_error_response(message="The model does not support Audio Generate API")
-    try:
-        return await handler.create_audio_generate(request, raw_request)
-    except Exception as e:
-        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
-
-
 @router.get(
     "/v1/audio/voices",
     responses={
@@ -952,113 +863,29 @@ async def list_voices(raw_request: Request):
     if handler is None:
         return base(raw_request).create_error_response(message="The model does not support Speech API")
 
-    # Get all speakers (both model built-in and uploaded)
     speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
-
-    # Get uploaded speakers details
-    uploaded_speakers = []
-    if hasattr(handler, "uploaded_speakers"):
-        for voice_name, info in handler.uploaded_speakers.items():
-            uploaded_speakers.append(
-                {
-                    "name": info.get("name", voice_name),
-                    "consent": info.get("consent", ""),
-                    "created_at": info.get("created_at", 0),
-                    "file_size": info.get("file_size", 0),
-                    "mime_type": info.get("mime_type", ""),
-                }
-            )
-
-    return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
+    return JSONResponse(content={"voices": speakers})
 
 
-@router.post(
-    "/v1/audio/voices",
-    responses={
-        HTTPStatus.OK.value: {"model": dict},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-async def upload_voice(
-    raw_request: Request,
-    audio_sample: UploadFile = File(...),
-    consent: str = Form(...),
-    name: str = Form(...),
-):
-    """Upload a new voice sample for voice cloning.
+@router.websocket("/v1/audio/speech/stream")
+async def streaming_speech(websocket: WebSocket):
+    """WebSocket endpoint for streaming text input TTS.
 
-    Uploads an audio file that can be used as a reference for voice cloning
-    in Base task TTS requests. The voice can then be referenced by name
-    in subsequent TTS requests.
-
-    Args:
-        audio_sample: Audio file (max 10MB)
-        consent: Consent recording ID
-        name: Name for the new voice
-        raw_request: Raw FastAPI request
-
-    Returns:
-        JSON response with voice information
+    Accepts text incrementally, splits at sentence boundaries, and
+    returns audio per sentence. See serving_speech_stream.py for protocol.
     """
-    handler = Omnispeech(raw_request)
+    handler = getattr(websocket.app.state, "openai_streaming_speech", None)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
-
-    try:
-        # Upload the voice
-        result = await handler.upload_voice(audio_sample, consent, name)
-
-        return JSONResponse(content={"success": True, "voice": result})
-
-    except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
-    except Exception as e:
-        logger.exception(f"Failed to upload voice: {e}")
-        return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
-
-
-@router.delete(
-    "/v1/audio/voices/{name}",
-    responses={
-        HTTPStatus.OK.value: {"model": dict},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-async def delete_voice(name: str, raw_request: Request):
-    """Delete an uploaded voice.
-
-    Deletes the voice sample and associated metadata. Also removes any
-    cached voice clone prompts for this voice.
-
-    Args:
-        name: Name of the voice to delete
-        raw_request: Raw FastAPI request
-
-    Returns:
-        JSON response indicating success or failure
-    """
-    handler = Omnispeech(raw_request)
-    if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
-
-    try:
-        # Delete the voice
-        success = await handler.delete_voice(name)
-        if not success:
-            return JSONResponse(
-                content={"success": False, "error": f"Voice '{name}' not found"},
-                status_code=HTTPStatus.NOT_FOUND.value,
-            )
-
-        return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
-
-    except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
-    except Exception as e:
-        logger.exception(f"Failed to delete voice '{name}': {e}")
-        return base(raw_request).create_error_response(message=f"Failed to delete voice: {str(e)}")
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "Streaming speech is not available",
+            }
+        )
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
 
 
 # Health and Model endpoints for diffusion mode
@@ -1698,58 +1525,6 @@ def apply_stage_default_sampling_params(
             for param_name, param_value in stage_defaults.items():
                 if hasattr(sampling_params, param_name):
                     setattr(sampling_params, param_name, param_value)
-
-
-@profiler_router.post("/start_profile")
-async def start_profile(raw_request: Request, request: ProfileRequest | None = None):
-    """Start profiling for the engine.
-
-    Args:
-        request: Optional request body with stages to profile.
-            - stages: List of stage IDs to profile. If None, profiles all stages.
-
-    Example:
-        POST /start_profile
-        {"stages": [0, 1]}  # Profile only stages 0 and 1
-    """
-    try:
-        stages = request.stages if request else None
-        logger.info("Starting profiler for stages: %s", stages if stages else "all")
-        engine_client = raw_request.app.state.engine_client
-        result = await engine_client.start_profile(stages=stages)
-        logger.info("Profiler started.")
-        return JSONResponse(content=result)
-    except Exception as e:
-        logger.exception("Failed to start profiler: %s", e)
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to start profiler: {str(e)}"
-        )
-
-
-@profiler_router.post("/stop_profile")
-async def stop_profile(raw_request: Request, request: ProfileRequest | None = None):
-    """Stop profiling for the engine.
-
-    Args:
-        request: Optional request body with stages to stop profiling.
-            - stages: List of stage IDs to stop profiling. If None, stops all stages.
-
-    Example:
-        POST /stop_profile
-        {"stages": [0, 1]}  # Stop profiling only stages 0 and 1
-    """
-    try:
-        stages = request.stages if request else None
-        logger.info("Stopping profiler for stages: %s", stages if stages else "all")
-        engine_client = raw_request.app.state.engine_client
-        result = await engine_client.stop_profile(stages=stages)
-        logger.info("Profiler stopped.")
-        return JSONResponse(content=result)
-    except Exception as e:
-        logger.exception("Failed to stop profiler: %s", e)
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to stop profiler: {str(e)}"
-        )
 
 
 async def _run_video_generation(

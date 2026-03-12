@@ -140,6 +140,15 @@ class AsyncOmni(OmniBase):
             getattr(self, "_inline_engine", None),
         )
 
+    async def get_supported_tasks(self) -> set[str]:
+        """Return supported tasks based on stage output modalities and capabilities."""
+        tasks: set[str] = set()
+        if "text" in self.output_modalities or any(stage.is_comprehension for stage in self.stage_list):
+            tasks.add("generate")
+        if "audio" in self.output_modalities:
+            tasks.add("speech")
+        return tasks
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # TODO: here is different from the Omni class. We should merge the two in the future.
@@ -157,6 +166,7 @@ class AsyncOmni(OmniBase):
             ring_degree = kwargs.get("ring_degree") or 1
             sequence_parallel_size = kwargs.get("sequence_parallel_size")
             tensor_parallel_size = kwargs.get("tensor_parallel_size") or 1
+            enable_expert_parallel = kwargs.get("enable_expert_parallel") or False
             cfg_parallel_size = kwargs.get("cfg_parallel_size") or 1
             vae_patch_parallel_size = kwargs.get("vae_patch_parallel_size") or 1
             use_hsdp = kwargs.get("use_hsdp", False)
@@ -179,6 +189,7 @@ class AsyncOmni(OmniBase):
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
                 tensor_parallel_size=tensor_parallel_size,
+                enable_expert_parallel=enable_expert_parallel,
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
@@ -828,16 +839,6 @@ class AsyncOmni(OmniBase):
         for stage in self.stage_list:
             stage.submit(abort_task)
         return None
-
-    async def get_supported_tasks(self) -> set[str]:
-        tasks: set[str] = set()
-        has_comprehension = any(stage.is_comprehension for stage in self.stage_list)
-        if has_comprehension:
-            tasks.add("generate")
-        for stage in self.stage_list:
-            if getattr(stage, "final_output_type", None) == "audio":
-                tasks.add("speech")
-        return tasks if tasks else {"generate"}
 
     async def get_vllm_config(self) -> VllmConfig:
         for stage in self.stage_list:

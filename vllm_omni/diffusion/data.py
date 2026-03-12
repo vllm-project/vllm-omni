@@ -43,6 +43,9 @@ class DiffusionParallelConfig:
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
 
+    enable_expert_parallel: bool = False
+    """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
+
     sequence_parallel_size: int | None = None
     """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
 
@@ -456,6 +459,19 @@ class OmniDiffusionConfig:
     # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)
     quantization: str | None = None
     quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
+
+    @property
+    def is_moe(self) -> bool:
+        num_experts = self.tf_model_config.get("num_experts", None)
+        if not isinstance(num_experts, (list, tuple, int)):
+            return False
+        if isinstance(num_experts, int):
+            return num_experts > 0
+
+        if isinstance(num_experts, (list, tuple)):
+            return any(isinstance(n, int) and n > 0 for n in num_experts)
+
+        return False
 
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
