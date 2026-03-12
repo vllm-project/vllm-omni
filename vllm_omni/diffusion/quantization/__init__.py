@@ -22,7 +22,7 @@ Example usage:
     linear_layer = QKVParallelLinear(..., quant_config=vllm_config)
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -50,6 +50,47 @@ _QUANT_CONFIG_REGISTRY: dict[str, type[DiffusionQuantizationConfig]] = {
 }
 
 SUPPORTED_QUANTIZATION_METHODS = list(_QUANT_CONFIG_REGISTRY.keys())
+
+DIFFUSION_QUANTIZATION_ALIASES: dict[str, str] = {
+    "": "none",
+    "null": "none",
+    "none": "none",
+    "no": "none",
+    "false": "none",
+    "bnb_8bit": "bitsandbytes_8bit",
+    "bnb8": "bitsandbytes_8bit",
+    "bitsandbytes_8bit": "bitsandbytes_8bit",
+    "bitsandbytes8bit": "bitsandbytes_8bit",
+    "bnb_4bit": "bitsandbytes_4bit",
+    "bnb4": "bitsandbytes_4bit",
+    "bitsandbytes_4bit": "bitsandbytes_4bit",
+    "bitsandbytes4bit": "bitsandbytes_4bit",
+}
+
+
+def normalize_diffusion_quant_method(
+    method: str | None,
+    quant_kwargs: dict[str, Any] | None = None,
+) -> str | None:
+    """Normalize diffusion quantization method names and aliases.
+
+    When quant_kwargs is provided, bitsandbytes 4bit/8bit aliases are normalized
+    to "bitsandbytes" and the corresponding load_in_* flags are populated.
+    """
+    if method is None:
+        return None
+    if isinstance(method, str):
+        method = method.strip().lower()
+        method = DIFFUSION_QUANTIZATION_ALIASES.get(method, method)
+    if method in ("none", ""):
+        return None
+    if method in ("bitsandbytes_8bit", "bitsandbytes_4bit"):
+        if quant_kwargs is not None:
+            quant_kwargs.setdefault("load_in_8bit", method.endswith("8bit"))
+            quant_kwargs.setdefault("load_in_4bit", method.endswith("4bit"))
+            return "bitsandbytes"
+        return method
+    return method
 
 
 def get_diffusion_quant_config(
@@ -79,24 +120,9 @@ def get_diffusion_quant_config(
             ignored_layers=["proj_out"],
         )
     """
-    if quantization is None or quantization.lower() == "none":
+    quantization = normalize_diffusion_quant_method(quantization, kwargs)
+    if quantization is None:
         return None
-
-    quantization = quantization.lower()
-    alias_map = {
-        "bnb_8bit": "bitsandbytes_8bit",
-        "bnb8": "bitsandbytes_8bit",
-        "bitsandbytes8bit": "bitsandbytes_8bit",
-        "bnb_4bit": "bitsandbytes_4bit",
-        "bnb4": "bitsandbytes_4bit",
-        "bitsandbytes4bit": "bitsandbytes_4bit",
-    }
-    quantization = alias_map.get(quantization, quantization)
-    if quantization in ("bitsandbytes_8bit", "bitsandbytes_4bit"):
-        kwargs = dict(kwargs)
-        kwargs.setdefault("load_in_8bit", quantization.endswith("8bit"))
-        kwargs.setdefault("load_in_4bit", quantization.endswith("4bit"))
-        quantization = "bitsandbytes"
     if quantization not in _QUANT_CONFIG_REGISTRY:
         raise ValueError(
             f"Unknown quantization method: {quantization!r}. Supported methods: {SUPPORTED_QUANTIZATION_METHODS}"
@@ -136,4 +162,6 @@ __all__ = [
     "get_diffusion_quant_config",
     "get_vllm_quant_config_for_layers",
     "SUPPORTED_QUANTIZATION_METHODS",
+    "DIFFUSION_QUANTIZATION_ALIASES",
+    "normalize_diffusion_quant_method",
 ]

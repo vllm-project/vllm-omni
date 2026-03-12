@@ -19,6 +19,7 @@ from vllm_omni.diffusion.quantization import (
     DiffusionBitsAndBytesConfig,
     DiffusionQuantizationConfig,
     get_diffusion_quant_config,
+    normalize_diffusion_quant_method,
 )
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 
@@ -467,24 +468,7 @@ class OmniDiffusionConfig:
 
         # Normalize quantization method string (diffusion-only).
         if isinstance(self.quantization, str):
-            quantization = self.quantization.strip().lower()
-            quantization_aliases = {
-                "": "none",
-                "null": "none",
-                "none": "none",
-                "no": "none",
-                "false": "none",
-                "bnb_8bit": "bitsandbytes_8bit",
-                "bnb8": "bitsandbytes_8bit",
-                "bitsandbytes_8bit": "bitsandbytes_8bit",
-                "bitsandbytes8bit": "bitsandbytes_8bit",
-                "bnb_4bit": "bitsandbytes_4bit",
-                "bnb4": "bitsandbytes_4bit",
-                "bitsandbytes_4bit": "bitsandbytes_4bit",
-                "bitsandbytes4bit": "bitsandbytes_4bit",
-            }
-            quantization = quantization_aliases.get(quantization, quantization)
-            self.quantization = None if quantization in ("none", "") else quantization
+            self.quantization = normalize_diffusion_quant_method(self.quantization)
 
         # Convert cache_config dict to DiffusionCacheConfig if needed
         if isinstance(self.cache_config, dict):
@@ -492,31 +476,6 @@ class OmniDiffusionConfig:
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
-
-        def _normalize_quant_method(method: str | None, quant_kwargs: dict[str, Any]) -> str | None:
-            if method is None:
-                return None
-            if isinstance(method, str):
-                method = method.strip().lower()
-                method_aliases = {
-                    "": "none",
-                    "null": "none",
-                    "none": "none",
-                    "no": "none",
-                    "false": "none",
-                    "bnb_8bit": "bitsandbytes_8bit",
-                    "bnb8": "bitsandbytes_8bit",
-                    "bitsandbytes8bit": "bitsandbytes_8bit",
-                    "bnb_4bit": "bitsandbytes_4bit",
-                    "bnb4": "bitsandbytes_4bit",
-                    "bitsandbytes4bit": "bitsandbytes_4bit",
-                }
-                method = method_aliases.get(method, method)
-            if method in ("bitsandbytes_8bit", "bitsandbytes_4bit"):
-                quant_kwargs.setdefault("load_in_8bit", method.endswith("8bit"))
-                quant_kwargs.setdefault("load_in_4bit", method.endswith("4bit"))
-                return "bitsandbytes"
-            return method
 
         # Convert quantization config
         if self.quantization is not None or self.quantization_config is not None:
@@ -528,7 +487,7 @@ class OmniDiffusionConfig:
                 quant_method = config_dict.get("method", self.quantization)
                 # Filter out "method" key for kwargs
                 quant_kwargs = {k: v for k, v in config_dict.items() if k != "method"}
-                quant_method = _normalize_quant_method(quant_method, quant_kwargs)
+                quant_method = normalize_diffusion_quant_method(quant_method, quant_kwargs)
 
                 # Validate conflicting methods
                 if self.quantization is not None and quant_method is not None and quant_method != self.quantization:
@@ -540,7 +499,7 @@ class OmniDiffusionConfig:
                 self.quantization_config = get_diffusion_quant_config(quant_method, **quant_kwargs)
             elif self.quantization_config is None and self.quantization is not None:
                 quant_kwargs: dict[str, Any] = {}
-                quant_method = _normalize_quant_method(self.quantization, quant_kwargs)
+                quant_method = normalize_diffusion_quant_method(self.quantization, quant_kwargs)
                 self.quantization_config = get_diffusion_quant_config(quant_method, **quant_kwargs)
             elif not isinstance(self.quantization_config, DiffusionQuantizationConfig):
                 raise TypeError(

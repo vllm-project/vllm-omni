@@ -132,6 +132,8 @@ class DiffusionModelRunner:
             else None
         )
         if bnb_config is not None:
+            # Run a post-load pass to quantize any components that weren't
+            # covered by load-time bnb injection (or were loaded later).
             skip_modules = set(getattr(self.pipeline, "_bnb_quantized_components", set()) or set())
             quantized_now = apply_bnb_quantization(self.pipeline, bnb_config, skip_modules=skip_modules)
             if quantized_now:
