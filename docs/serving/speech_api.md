@@ -96,7 +96,7 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
-| `initial_codec_chunk_frames` | integer | null | Initial chunk size for reduced TTFA (overrides stage config) |
+| `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
@@ -104,7 +104,7 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ref_audio` | string | null | Reference audio (URL or base64 data URL) |
+| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
@@ -124,6 +124,117 @@ Lists available voices for the loaded model.
 {
     "voices": ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"]
 }
+```
+```
+POST /v1/audio/voices
+Content-Type: multipart/form-data
+```
+
+Upload a new voice sample for voice cloning in Base task TTS requests.
+
+**Form Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4) |
+| `consent` | string | Yes | Consent recording ID |
+| `name` | string | Yes | Name for the new voice |
+
+**Response Example:**
+
+```json
+{
+  "success": true,
+  "voice": {
+    "name": "custom_voice_1",
+    "consent": "user_consent_id",
+    "created_at": 1738660000,
+    "mime_type": "audio/wav",
+    "file_size": 1024000
+  }
+}
+```
+
+**Usage Example:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/voices \
+  -F "audio_sample=@/path/to/voice_sample.wav" \
+  -F "consent=user_consent_id" \
+  -F "name=custom_voice_1"
+```
+
+## Streaming Text Input (WebSocket)
+
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally and generates audio per sentence as boundaries are detected.
+
+> Note: text input is always streamed incrementally. Audio output remains sentence-scoped:
+> use `stream_audio=false` for one binary frame per sentence, or `stream_audio=true` for one or more PCM chunks per sentence.
+
+### WebSocket Protocol
+
+Client -> Server:
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "session.config", ...}` | Session configuration (sent once, first message) |
+| `{"type": "input.text", "text": "..."}` | Text chunk |
+| `{"type": "input.done"}` | End of input, flushes remaining buffer |
+
+Server -> Client:
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for a sentence |
+| Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
+| `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for a sentence |
+| `{"type": "session.done", "total_sentences": N}` | Session complete |
+| `{"type": "error", "message": "..."}` | Non-fatal error |
+
+### Session Config Parameters
+
+All REST API parameters are supported, plus:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `stream_audio` | bool | false | Stream one or more PCM chunks per sentence over WebSocket |
+| `split_granularity` | string | "sentence" | Text splitting granularity |
+
+
+```bash
+DELETE /v1/audio/voices/{name}
+```
+
+Delete an uploaded voice sample.
+
+**Path Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | Yes | Name of the voice to delete |
+
+**Response Example:**
+
+```json
+{
+  "success": true,
+  "message": "Voice 'custom_voice_1' deleted successfully"
+}
+```
+
+**Error Response (404 Not Found):**
+
+```json
+{
+  "success": false,
+  "error": "Voice 'unknown_voice' not found"
+}
+```
+
+**Usage Example:**
+
+```bash
+curl -X DELETE http://localhost:8091/v1/audio/voices/custom_voice_1
 ```
 
 ## Examples
@@ -182,6 +293,25 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "task_type": "Base",
         "ref_audio": "https://example.com/reference.wav",
         "ref_text": "Original transcript of the reference audio"
+    }' --output cloned.wav
+```
+
+upload voice
+```bash
+curl -X POST http://localhost:8091/v1/audio/voices \
+  -F "audio_sample=@/path/to/voice_sample.wav" \
+  -F "consent=user_consent_id" \
+  -F "name=custom_voice_1"
+```
+
+use upload voice
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a cloned voice",
+        "task_type": "Base",
+        "voice": "custom_voice_1"
     }' --output cloned.wav
 ```
 

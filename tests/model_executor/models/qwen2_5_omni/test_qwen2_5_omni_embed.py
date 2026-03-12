@@ -19,6 +19,8 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     merge_interleaved_embeddings,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # Fake token IDs
 AUDIO_TOKEN_ID = 1001
 IMAGE_TOKEN_ID = 1002

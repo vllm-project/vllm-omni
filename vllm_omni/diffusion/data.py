@@ -43,6 +43,9 @@ class DiffusionParallelConfig:
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
 
+    enable_expert_parallel: bool = False
+    """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
+
     sequence_parallel_size: int | None = None
     """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
 
@@ -111,11 +114,12 @@ class DiffusionParallelConfig:
         # 1. Standalone: when other parallelism is all 1, HSDP determines world_size
         # 2. Combined: HSDP overlays on top of other parallelism
         if self.use_hsdp:
-            if self.tensor_parallel_size > 1:
+            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
                 raise ValueError(
-                    "HSDP (use_hsdp=True) cannot be used with Tensor Parallelism "
-                    f"(tensor_parallel_size={self.tensor_parallel_size}). "
-                    "Set tensor_parallel_size=1 when using HSDP."
+                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
+                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
+                    f"data_parallel_size={self.data_parallel_size}). "
+                    "Set tensor_parallel_size=1 and data_parallel_size=1 when using HSDP."
                 )
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
@@ -456,6 +460,19 @@ class OmniDiffusionConfig:
     quantization: str | None = None
     quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
 
+    @property
+    def is_moe(self) -> bool:
+        num_experts = self.tf_model_config.get("num_experts", None)
+        if not isinstance(num_experts, (list, tuple, int)):
+            return False
+        if isinstance(num_experts, int):
+            return num_experts > 0
+
+        if isinstance(num_experts, (list, tuple)):
+            return any(isinstance(n, int) and n > 0 for n in num_experts)
+
+        return False
+
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
         Find an available port with retry logic.
@@ -617,6 +634,10 @@ class DiffusionOutput:
     error: str | None = None
 
     post_process_func: Callable[..., Any] | None = None
+
+    # Extra custom output data (e.g. latent trajectories, prompt embeds)
+    # passed through to OmniRequestOutput.custom_output
+    custom_output: dict[str, Any] = field(default_factory=dict)
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None

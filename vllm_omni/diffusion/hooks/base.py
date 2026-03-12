@@ -107,7 +107,7 @@ class ModelHook:
             The output of the forward pass.
         """
         args, kwargs = self.pre_forward(module, *args, **kwargs)
-        output = module._original_forward(*args, **kwargs)  # type: ignore[attr-defined]
+        output = module._omni_original_forward(*args, **kwargs)  # type: ignore[attr-defined]
         return self.post_forward(module, output)
 
     def reset_state(self, module: nn.Module) -> nn.Module:
@@ -131,7 +131,7 @@ class _WrappedForward:
     def __call__(self, *args: Any, **kwargs: Any):
         registry: HookRegistry | None = getattr(self.module, "_hook_registry", None)
         if registry is None or not registry._hooks:
-            return self.module._original_forward(*args, **kwargs)
+            return self.module._omni_original_forward(*args, **kwargs)
         return registry.dispatch(*args, **kwargs)
 
 
@@ -162,8 +162,10 @@ class HookRegistry:
             setattr(module, "_hook_registry", registry)
 
             # Wrap module.forward once so hooks can intercept calls.
-            if not hasattr(module, "_original_forward"):
-                module._original_forward = module.forward  # type: ignore[attr-defined]
+            # NOTE: Use `_omni_original_forward` to avoid collision with cache-dit's
+            # `_original_forward` attribute on the same module.
+            if not hasattr(module, "_omni_original_forward"):
+                module._omni_original_forward = module.forward  # type: ignore[attr-defined]
                 module.forward = _WrappedForward(module)  # type: ignore[assignment]
 
         return registry
@@ -212,7 +214,7 @@ class HookRegistry:
             The output of the forward pass.
         """
         if not self._hooks:
-            return self.module._original_forward(*args, **kwargs)  # type: ignore[attr-defined]
+            return self.module._omni_original_forward(*args, **kwargs)  # type: ignore[attr-defined]
 
         # For single hook case, call directly
         if len(self._hooks) == 1:
@@ -228,7 +230,7 @@ class HookRegistry:
             args, kwargs = hook.pre_forward(self.module, *args, **kwargs)
 
         # Call original forward
-        output = self.module._original_forward(*args, **kwargs)  # type: ignore[attr-defined]
+        output = self.module._omni_original_forward(*args, **kwargs)  # type: ignore[attr-defined]
 
         # Apply all post_forward hooks in reverse order
         for _, hook in reversed(sorted_hooks):

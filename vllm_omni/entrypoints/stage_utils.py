@@ -9,7 +9,7 @@ from collections.abc import Callable
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
-from omegaconf import OmegaConf
+from vllm_omni.config.yaml_util import to_dict as _omega_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ class OmniStageTaskType(enum.Enum):
     SHUTDOWN = "shutdown"
     PROFILER_START = "profiler_start"
     PROFILER_STOP = "profiler_stop"
+    COLLECTIVE_RPC = "collective_rpc"
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
@@ -314,7 +315,7 @@ def _to_dict(x: Any) -> dict[str, Any]:
     try:
         if isinstance(x, dict):
             return dict(x)
-        return OmegaConf.to_container(x, resolve=True)  # type: ignore[arg-type]
+        return _omega_to_dict(x)
     except Exception:
         try:
             return dict(x)

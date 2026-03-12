@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import torch
 from vllm.logger import init_logger
 from vllm_ascend.platform import NPUPlatform
@@ -32,6 +34,23 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/platforms/npu/stage_configs"
+
+    @classmethod
+    def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
+        if op_name == "hunyuan_fused_moe":
+            return "vllm_omni.platforms.npu.models.hunyuan_fused_moe.AscendHunyuanFusedMoE"
+        return super().get_diffusion_model_impl_qualname(op_name)
+
+    @classmethod
+    def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        if op_name != "hunyuan_fused_moe":
+            return
+
+        from vllm_omni.platforms.npu.models.hunyuan_fused_moe import (
+            prepare_hunyuan_fused_moe_runtime,
+        )
+
+        prepare_hunyuan_fused_moe_runtime()
 
     @classmethod
     def get_diffusion_attn_backend_cls(

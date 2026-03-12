@@ -16,7 +16,7 @@ def validate_model_and_sampling_params_types(
     # Skip if no spec or no sampling params
     pipeline_spec, _ = lookup_model_spec(model_name)
     if pipeline_spec is None:
-        logger.info("skipping sampling params check because spec is not found")
+        logger.info(f"skipping sampling params check because spec for {model_name} is not found")
         return
     if sampling_param_list is None:
         return
