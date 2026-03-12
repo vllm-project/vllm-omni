@@ -693,8 +693,14 @@ class OmniStage:
         assert self._out_q is not None
         try:
             return self._out_q.get_nowait()
-        except Exception:
-            return None
+        except queue.Empty:
+            pass
+        except Exception as e:
+            logger.error("Unexpected error when collecting OmniStage output queue:", exc_info=e)
+            self.stop_stage_worker()
+            raise
+        if self._proc is not None and not self._proc.is_alive():
+            raise RuntimeError(f"OmniStage Worker process died unexpectedly with exit code {self._proc.exitcode}")
 
     def process_engine_inputs(
         self,

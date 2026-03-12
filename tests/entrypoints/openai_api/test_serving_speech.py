@@ -1,19 +1,23 @@
 # tests/entrypoints/openai/test_serving_speech.py
+import asyncio
 import logging
 import os
 from inspect import Signature, signature
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
+from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
+from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio, OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import (
@@ -1025,19 +1029,60 @@ class TestAsyncOmniSupportedTasks:
     @pytest.mark.asyncio
     async def test_tts_only_no_generate_task(self):
         """TTS-only models (audio output, no text) should not include 'generate'."""
+        from unittest.mock import MagicMock
+
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         omni = AsyncOmni.__new__(AsyncOmni)
         omni.output_modalities = [None, "audio"]
+        stage = MagicMock()
+        stage.is_comprehension = False
+        omni.stage_list = [stage]
         tasks = await omni.get_supported_tasks()
         assert "generate" not in tasks
+        assert "speech" in tasks
 
     @pytest.mark.asyncio
     async def test_omni_model_includes_generate(self):
         """Models with text output (e.g. Qwen3-Omni) should include 'generate'."""
+        from unittest.mock import MagicMock
+
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         omni = AsyncOmni.__new__(AsyncOmni)
         omni.output_modalities = ["text", None, "audio"]
+        stage = MagicMock()
+        stage.is_comprehension = True
+        omni.stage_list = [stage]
         tasks = await omni.get_supported_tasks()
         assert "generate" in tasks
+
+
+def test_api_server_create_speech_wraps_error_response_status():
+    handler = MagicMock()
+    handler.create_speech = AsyncMock(
+        return_value=ErrorResponse(
+            error=ErrorInfo(message="bad request", type="BadRequestError", param=None, code=400),
+        )
+    )
+
+    app = FastAPI()
+    app.state.openai_serving_speech = handler
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/audio/speech",
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    raw_request = Request(scope)
+    request = OpenAICreateSpeechRequest(input="Hello")
+
+    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 400
