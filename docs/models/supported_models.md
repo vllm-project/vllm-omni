@@ -19,7 +19,6 @@ th {
 |--------------|--------|-------------------|
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` |
-| `DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` |
 | `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
@@ -51,7 +50,7 @@ th {
 |`NextStep11Pipeline` | NextStep-1.1 | `stepfun-ai/NextStep-1.1` |
 |`MiMoAudioForConditionalGeneration` | MiMo-Audio-7B-Instruct | `XiaomiMiMo/MiMo-Audio-7B-Instruct` |
 |`Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` |
-
+|`DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` |
 
 ## List of Supported Models for NPU
 
