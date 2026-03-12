@@ -319,7 +319,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
             )
         elif sampling_case.kind is SamplingKind.VIDEO_DIFFUSION_SINGLE:
             assert len(received_sampling_params_list) == 1
-            expected = DIFFUSION_SINGLE_SAMPLING_PARAMS.copy()
+            expected = DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS.copy()
             # expected["num_outputs_per_prompt"] = expected.pop("n")  # convert from n to num_outputs_per_prompt
             _assert_sampling_param_values(
                 received_sampling_params_list[0],
