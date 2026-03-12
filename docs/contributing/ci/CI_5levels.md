@@ -508,7 +508,9 @@ L3 level testing executes after code is merged into the main branch. Its core pu
     **2.4.5 Request Execution**
 
     ```python
-    openai_client.send_request(request_config, request_num=1)
+    openai_client.send_omni_request(request_config, request_num=1)  # for omni-understanding models
+    # or
+    openai_client.send_diffusion_request(request_config, request_num=1)  # for diffusion models
     ```
 
     **Explanation**:
@@ -517,7 +519,7 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
-    **Implicit Validation**: The send_request method internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model performs deep validation.
+    **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model performs deep validation.
 
 -   ***Run Command***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
 
