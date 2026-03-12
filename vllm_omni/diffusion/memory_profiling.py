@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import os
 from typing import Any
 
@@ -15,8 +16,13 @@ def _is_truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
+def _is_diffusion_debug_logging_enabled() -> bool:
+    logger = logging.getLogger("vllm_omni.core.sched.omni_generation_scheduler")
+    return logger.isEnabledFor(logging.DEBUG)
+
+
 def is_memory_profiling_enabled() -> bool:
-    return _is_truthy(os.environ.get(_MEMORY_LOG_ENV))
+    return _is_truthy(os.environ.get(_MEMORY_LOG_ENV)) or _is_diffusion_debug_logging_enabled()
 
 
 def get_memory_log_env_var() -> str:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import sys
 from collections.abc import Generator
 from pathlib import Path
@@ -65,12 +66,29 @@ def test_memory_log_env_var_name_is_stable(memory_profiling_module):
 
 def test_memory_profiling_disabled_by_default(monkeypatch, memory_profiling_module):
     monkeypatch.delenv("VLLM_OMNI_DIFFUSION_LOG_MEMORY", raising=False)
-    assert memory_profiling_module.is_memory_profiling_enabled() is False
+    logger = logging.getLogger("vllm_omni.core.sched.omni_generation_scheduler")
+    original_level = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        assert memory_profiling_module.is_memory_profiling_enabled() is False
+    finally:
+        logger.setLevel(original_level)
 
 
 def test_memory_profiling_truthy_values(monkeypatch, memory_profiling_module):
     monkeypatch.setenv("VLLM_OMNI_DIFFUSION_LOG_MEMORY", "true")
     assert memory_profiling_module.is_memory_profiling_enabled() is True
+
+
+def test_memory_profiling_enabled_by_debug_log_level(monkeypatch, memory_profiling_module):
+    monkeypatch.delenv("VLLM_OMNI_DIFFUSION_LOG_MEMORY", raising=False)
+    logger = logging.getLogger("vllm_omni.core.sched.omni_generation_scheduler")
+    original_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        assert memory_profiling_module.is_memory_profiling_enabled() is True
+    finally:
+        logger.setLevel(original_level)
 
 
 def test_format_cuda_memory_snapshot_none(memory_profiling_module):
