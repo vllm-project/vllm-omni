@@ -85,12 +85,7 @@ def _build_user_content(query_type: str, prompt: str, image_path: str | None) ->
 
 @lru_cache(maxsize=1)
 def _load_offline_end2end_module() -> Any:
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "offline_inference"
-        / "dynin_omni"
-        / "end2end.py"
-    )
+    path = Path(__file__).resolve().parents[2] / "offline_inference" / "dynin_omni" / "end2end.py"
     spec = importlib.util.spec_from_file_location("dynin_end2end_offline", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load end2end module spec from: {path}")
