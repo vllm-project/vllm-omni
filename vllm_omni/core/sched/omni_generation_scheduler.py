@@ -17,6 +17,11 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.diffusion.memory_profiling import (
+    capture_cuda_memory_snapshot,
+    format_cuda_memory_snapshot,
+    is_memory_profiling_enabled,
+)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
@@ -30,8 +35,24 @@ class OmniGenerationScheduler(VLLMScheduler):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
+        self._memory_profiling_enabled = is_memory_profiling_enabled()
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+
+    def _log_allocation_failure(self, request: Request, required_tokens: int, token_budget: int) -> None:
+        if not self._memory_profiling_enabled:
+            return
+        snapshot = capture_cuda_memory_snapshot()
+        logger.warning(
+            "Diffusion scheduler allocation failed for request_id=%s required_tokens=%s token_budget=%s "
+            "computed_tokens=%s prompt_tokens=%s %s",
+            request.request_id,
+            required_tokens,
+            token_budget,
+            request.num_computed_tokens,
+            len(request.prompt_token_ids),
+            format_cuda_memory_snapshot(snapshot),
+        )
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -103,6 +124,11 @@ class OmniGenerationScheduler(VLLMScheduler):
                 num_lookahead_tokens=self.num_lookahead_tokens,
             )
             if new_blocks is None:
+                self._log_allocation_failure(
+                    request=request,
+                    required_tokens=required_tokens,
+                    token_budget=token_budget,
+                )
                 # Allocation failed (e.g., VRAM pressure); stop fast path and
                 # fall back to default scheduling
                 # Put the current request back to the head of the waiting queue
@@ -170,6 +196,11 @@ class OmniGenerationScheduler(VLLMScheduler):
                 num_lookahead_tokens=self.num_lookahead_tokens,
             )
             if new_blocks is None:
+                self._log_allocation_failure(
+                    request=request,
+                    required_tokens=required_tokens,
+                    token_budget=token_budget,
+                )
                 # Allocation failed (e.g., VRAM pressure); stop fast path and
                 # fall back to default scheduling
                 # Put the current request back to the head of the waiting queue
@@ -566,3 +597,4 @@ class OmniGenerationScheduler(VLLMScheduler):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
