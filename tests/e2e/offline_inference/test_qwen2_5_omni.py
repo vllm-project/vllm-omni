@@ -36,14 +36,17 @@ def get_cuda_graph_config():
 # CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
 if current_omni_platform.is_npu():
     stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
+    config_id = "default"
 elif current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_config = str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
+    config_id = "default"
 else:
     stage_config = get_cuda_graph_config()
+    config_id = "no_cuda_graph"
 
-# Create parameter combinations for model and stage config
-test_params = [(model, stage_config) for model in models]
+# Create parameter combinations for model and stage config with readable param ids
+test_params = [pytest.param((model, stage_config), id=config_id) for model in models]
 
 
 def get_question(prompt_type="mix"):

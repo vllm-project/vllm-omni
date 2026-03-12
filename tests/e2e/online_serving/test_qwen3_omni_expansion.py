@@ -49,14 +49,19 @@ def get_chunk_config(default_path):
 
 # CI stage config for 2*H100-80G GPUs
 default_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
-stage_configs = [default_path, get_chunk_config(default_path)]
-# Create parameter combinations for model and stage config
+stage_configs_with_id = [
+    (default_path, "default"),
+    (get_chunk_config(default_path), "async_chunk"),
+]
+# Create parameter combinations for model and stage config with readable param ids
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    pytest.param(OmniServerParams(model=model, stage_config_path=path), id=config_id)
+    for model in models
+    for path, config_id in stage_configs_with_id
 ]
 
 
-def get_system_prompt():
+def get_system_prompt(*, voice_gender: str | None = None):
     return {
         "role": "system",
         "content": [
@@ -66,6 +71,7 @@ def get_system_prompt():
                     "You are Qwen, a virtual human developed by the Qwen Team, "
                     "Alibaba Group, capable of perceiving auditory and visual inputs, "
                     "as well as generating text and speech."
+                    + (f" When speaking, use a {voice_gender} voice." if voice_gender in {"male", "female"} else "")
                 ),
             }
         ],
@@ -75,6 +81,7 @@ def get_system_prompt():
 def get_prompt(prompt_type="text_only"):
     prompts = {
         "text_only": "What is the capital of China? Answer in 20 words.",
+        "text_only_chinese": "中国的首都在哪里？",
         "mix": "What is recited in the audio? What is in this image? What is in this video?",
         "text_video": "What is in this video? ",
         "text_image": "What is in this image? ",
@@ -387,3 +394,57 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"audio": AUDIO_KEY, "image": IMAGE_KEY, "video": VIDEO_KEY},
     }
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_voice_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text
+    Output Modal: text, audio
+    Language: English
+    Input Setting: stream=True
+    Voice: female
+    Datasets: few requests
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(voice_gender="female"),
+        content_text=get_prompt("text_only"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {"text": ["beijing"]},
+    }
+    openai_client.send_omni_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_voice_002(omni_server, openai_client) -> None:
+    """
+    Input Modal: text
+    Language: Chinese
+    Output Modal: text, audio
+    Input Setting: stream=True
+    Voice: male
+    Datasets: few requests
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(voice_gender="male"),
+        content_text=get_prompt("text_only_chinese"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "key_words": {"text": ["北京"]},
+    }
+    openai_client.send_omni_request(request_config)

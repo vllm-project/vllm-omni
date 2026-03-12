@@ -47,13 +47,17 @@ def get_chunk_config():
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
 if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
+    stage_configs_with_id = [
+        (str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml"), "default"),
+    ]
 else:
-    stage_configs = [get_chunk_config()]
+    stage_configs_with_id = [(get_chunk_config(), "async_chunk")]
 
-# Create parameter combinations for model and stage config
+# Create parameter combinations for model and stage config with readable param ids
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    pytest.param(OmniServerParams(model=model, stage_config_path=path), id=config_id)
+    for model in models
+    for path, config_id in stage_configs_with_id
 ]
 
 
@@ -76,7 +80,7 @@ def get_system_prompt():
 def get_prompt(prompt_type="text_only"):
     prompts = {
         "text_only": "What is the capital of China? Answer in 20 words.",
-        "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
+        "mix": "What is recited in the audio? What is in this image? What is in this video?",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 

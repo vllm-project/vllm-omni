@@ -4,6 +4,7 @@ import io
 import math
 import os
 import random
+import re
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 # Set CPU device for CI environments without GPU
@@ -708,6 +709,8 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
 def preprocess_text(text):
     import re
 
+    import opencc
+
     word_to_num = {
         "zero": "0",
         "one": "1",
@@ -728,6 +731,8 @@ def preprocess_text(text):
 
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
+    cc = opencc.OpenCC("t2s")
+    text = cc.convert(text)
     return text.lower().strip()
 
 
@@ -807,24 +812,135 @@ def convert_audio_file_to_text(output_path: str) -> str:
         return future.result()
 
 
+def _merge_base64_audio_to_segment(base64_list: list[str]):
+    """Merge a list of base64-encoded audio chunks into one pydub AudioSegment."""
+    from pydub import AudioSegment
+
+    merged = None
+    for b64 in base64_list:
+        raw = base64.b64decode(b64.split(",", 1)[-1])
+        seg = AudioSegment.from_file(io.BytesIO(raw))
+        merged = seg if merged is None else merged + seg
+    return merged
+
+
 def merge_base64_and_convert_to_text(base64_list):
     """
     Merge a list of base64 encoded audio data and convert to text.
     """
-    from pydub import AudioSegment
-
-    merged_audio = None
-    for base64_data in base64_list:
-        audio_data = base64.b64decode(base64_data.split(",", 1)[-1])
-        seg = AudioSegment.from_file(io.BytesIO(audio_data))
-        if merged_audio is None:
-            merged_audio = seg
-        else:
-            merged_audio += seg
+    merged_audio = _merge_base64_audio_to_segment(base64_list)
     output_path = f"./test_{int(time.time())}"
     merged_audio.export(output_path, format="wav")
+    print(f"audio data is saved: {output_path}")
     text = convert_audio_file_to_text(output_path)
     return text
+
+
+def _extract_expected_voice_gender(messages: list[dict[str, Any]] | None) -> str | None:
+    """Parse expected voice gender from system prompt text ('male'/'female') if present."""
+    if not messages:
+        return None
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(
+                item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
+            )
+        else:
+            text = ""
+        m = re.search(r"\buse a (male|female) voice\b", text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+def _get_merged_audio_bytes(audio_data: list[str] | None) -> bytes | None:
+    """Merge base64 audio chunks (stream or single) into one WAV bytes for analysis."""
+    if not audio_data:
+        return None
+    merged = _merge_base64_audio_to_segment(audio_data)
+    buf = io.BytesIO()
+    merged.export(buf, format="wav")
+    return buf.getvalue()
+
+
+def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
+    """
+    Estimate voice gender from WAV bytes by fundamental frequency (F0).
+    Male typical F0 ~85-180 Hz, female ~165-255 Hz. Returns 'male' or 'female'.
+    Uses autocorrelation-based F0 estimate with harmonic-doubling mitigation.
+    """
+    data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+    if data.size == 0:
+        raise ValueError("Empty audio")
+    mono = np.mean(data, axis=1)
+
+    def _estimate_f0(seg: np.ndarray) -> float | None:
+        seg = seg - float(np.mean(seg))
+        if float(np.max(np.abs(seg))) < 1e-3:
+            return None
+        min_lag = max(2, int(sr / 350))
+        max_lag = min(len(seg) // 2, int(sr / 60))
+        if max_lag <= min_lag + 2:
+            return None
+        corr = np.correlate(seg, seg, mode="same")
+        mid = len(corr) // 2
+        valid = corr[mid + min_lag : mid + max_lag + 1]
+        # local maxima above threshold
+        the = float(np.max(valid)) * 0.5
+        peaks: list[tuple[int, float]] = []
+        for i in range(1, len(valid) - 1):
+            v = float(valid[i])
+            if v > the and v >= float(valid[i - 1]) and v >= float(valid[i + 1]):
+                peaks.append((min_lag + i, v))
+        if not peaks:
+            lag = min_lag + int(np.argmax(valid))
+            return float(sr) / float(lag)
+        # Prefer lower F0 (longer lag) to mitigate harmonic doubling, but also
+        # explicitly check for octave errors when two peaks are similarly strong.
+        best_v = max(v for _, v in peaks)
+        close = [(lag, v) for lag, v in peaks if v >= best_v * 0.85]
+        # Start with the longest-lag candidate.
+        lag = max(lag for lag, _ in close)
+
+        # If there is also a strong peak around 2*lag (i.e. current pick is doubled F0),
+        # switch to the longer lag.
+        cand2 = [(lag2, v) for lag2, v in peaks if abs(lag2 - 2 * lag) <= max(2, int(0.03 * (2 * lag)))]
+        if cand2:
+            best2 = max(v for _, v in cand2)
+            if best2 >= best_v * 0.75:
+                lag = max(lag_val for lag_val, _ in cand2)
+        return float(sr) / float(lag)
+
+    # Estimate from multiple windows and use median to stabilize
+    win_len = min(int(sr * 0.8), len(mono))
+    if win_len < int(sr * 0.2):
+        raise ValueError("Cannot estimate F0: audio too short")
+    starts = [
+        max(0, (len(mono) - win_len) // 4),
+        max(0, (len(mono) - win_len) // 2),
+        max(0, (len(mono) - win_len) * 3 // 4),
+    ]
+    f0s = [f for f in (_estimate_f0(mono[s : s + win_len]) for s in starts) if f is not None]
+    if not f0s:
+        raise ValueError("Cannot estimate F0: no voiced segment found")
+    f0s.sort()
+    f0 = float(f0s[len(f0s) // 2])
+
+    # Post-correction for octave (harmonic) errors:
+    # If halving produces a plausible adult male F0, prefer it.
+    if f0 > 170.0:
+        half = f0 / 2.0
+        if 75.0 <= half <= 185.0:
+            f0 = half
+
+    result = "female" if f0 > 165.0 else "male"
+    print(f"estimated f0 is: {f0:.1f} Hz; gender is: {result}")
+    return result
 
 
 def modify_stage_config(
@@ -1302,6 +1418,19 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
     if "audio" in modalities:
         assert response.audio_content is not None, "No audio output is generated"
         print(f"audio content is: {response.audio_content}")
+        expected_gender = _extract_expected_voice_gender(request_config.get("messages"))
+        if expected_gender is not None:
+            assert response.audio_data, "No audio data is available for voice gender validation"
+            try:
+                audio_bytes = _get_merged_audio_bytes(response.audio_data)
+                assert audio_bytes, "No audio bytes generated for voice gender validation"
+                estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
+                assert estimated_gender == expected_gender, (
+                    f"Voice gender mismatch: expected {expected_gender} (from system prompt), "
+                    f"estimated {estimated_gender} from returned audio"
+                )
+            except (ValueError, Exception) as e:
+                raise AssertionError(f"Voice gender validation failed: {e}") from e
 
     if "text" in modalities:
         assert response.text_content is not None, "No text output is generated"
@@ -1500,8 +1629,9 @@ class OpenAIClientHandler:
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
-            # Populate result object
+            # Populate result object (audio_data for voice/gender validation)
             result.text_content = text_content
+            result.audio_data = [audio_data] if audio_data is not None else None
             result.audio_content = audio_content
             result.similarity = similarity
             result.success = True
@@ -1567,48 +1697,47 @@ class OpenAIClientHandler:
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
 
+        def _create_kwargs():
+            return {
+                "model": request_config.get("model"),
+                "messages": request_config.get("messages"),
+                "stream": stream,
+                "modalities": modalities,
+            }
+
         if request_num == 1:
-            # Send single request
-            chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"),
-                messages=request_config.get("messages"),
-                stream=stream,
-                modalities=modalities,
-            )
+            # Send single request; measure e2e from request start to response processed
+            start_time = time.perf_counter()
+            chat_completion = self.client.chat.completions.create(**_create_kwargs())
 
             if stream:
                 response = self._process_stream_omni_response(chat_completion)
             else:
                 response = self._process_non_stream_omni_response(chat_completion)
 
+            response.e2e_latency = time.perf_counter() - start_time
             assert_omni_response(response, request_config, run_level=self.run_level)
             responses.append(response)
 
         else:
-            # Send concurrent requests
+            # Send concurrent requests; each request measures e2e from its create() to process done
+            create_kwargs = _create_kwargs()
+
+            def _run_one_request() -> OmniResponse:
+                start_time = time.perf_counter()
+                chat_completion = self.client.chat.completions.create(**create_kwargs)
+                if stream:
+                    response = self._process_stream_omni_response(chat_completion)
+                else:
+                    response = self._process_non_stream_omni_response(chat_completion)
+                response.e2e_latency = time.perf_counter() - start_time
+                return response
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                futures = []
+                futures = [executor.submit(_run_one_request) for _ in range(request_num)]
 
-                # Submit all request tasks
-                for _ in range(request_num):
-                    future = executor.submit(
-                        self.client.chat.completions.create,
-                        model=request_config.get("model"),
-                        messages=request_config.get("messages"),
-                        modalities=modalities,
-                        stream=stream,
-                    )
-                    futures.append(future)
-
-                # Process completed tasks
                 for future in concurrent.futures.as_completed(futures):
-                    chat_completion = future.result()
-
-                    if stream:
-                        response = self._process_stream_omni_response(chat_completion)
-                    else:
-                        response = self._process_non_stream_omni_response(chat_completion)
-
+                    response = future.result()
                     assert_omni_response(response, request_config, run_level=self.run_level)
                     responses.append(response)
 
