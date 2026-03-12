@@ -13,18 +13,35 @@ import pytest
 
 from tests.conftest import (
     generate_synthetic_video,
+    modify_stage_config,
 )
 from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
+
+def get_cuda_graph_config():
+    path = modify_stage_config(
+        str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml"),
+        updates={
+            "stage_args": {
+                0: {
+                    "engine_args.enforce_eager": "true",
+                },
+                1: {"engine_args.enforce_eager": "true"},
+            },
+        },
+    )
+    return path
+
+
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
 if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
 else:
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+    stage_configs = [get_cuda_graph_config()]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]

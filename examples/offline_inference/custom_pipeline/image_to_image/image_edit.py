@@ -29,8 +29,8 @@ Accelerated with cache_dit:
     python image_edit.py \
         --image input.png \
         --prompt "Edit description" \
-        --cache_backend cache_dit \
-        --cache_dit_enable_taylorseer
+        --cache-backend cache_dit \
+        --cache-dit-enable-taylorseer
 
 Layered RGBA output:
     python image_edit.py \
@@ -66,38 +66,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="Qwen/Qwen-Image-Edit", help="Model name or local path.")
     parser.add_argument("--image", type=str, nargs="+", required=True, help="Input image file(s).")
     parser.add_argument("--prompt", type=str, required=True, help="Edit description prompt.")
-    parser.add_argument("--negative_prompt", type=str, default=None)
+    parser.add_argument("--negative-prompt", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--cfg_scale", type=float, default=4.0)
-    parser.add_argument("--guidance_scale", type=float, default=1.0)
+    parser.add_argument("--cfg-scale", type=float, default=4.0)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--output", type=str, default="output.png")
-    parser.add_argument("--num_outputs_per_prompt", type=int, default=1)
-    parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--cache_backend", type=str, default=None, choices=["cache_dit", "tea_cache"])
-    parser.add_argument("--ulysses_degree", type=int, default=1)
-    parser.add_argument("--ring_degree", type=int, default=1)
-    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--num-outputs-per-prompt", type=int, default=1)
+    parser.add_argument("--num-inference-steps", type=int, default=50)
+    parser.add_argument("--cache-backend", type=str, default=None, choices=["cache_dit", "tea_cache"])
+    parser.add_argument("--ulysses-degree", type=int, default=1)
+    parser.add_argument("--ring-degree", type=int, default=1)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--resolution", type=int, default=640)
     parser.add_argument("--color-format", type=str, default="RGB")
 
     # Acceleration + Optimization Options
-    parser.add_argument("--cache_dit_fn_compute_blocks", type=int, default=1)
-    parser.add_argument("--cache_dit_bn_compute_blocks", type=int, default=0)
-    parser.add_argument("--cache_dit_max_warmup_steps", type=int, default=4)
-    parser.add_argument("--cache_dit_residual_diff_threshold", type=float, default=0.24)
-    parser.add_argument("--cache_dit_max_continuous_cached_steps", type=int, default=3)
-    parser.add_argument("--cache_dit_enable_taylorseer", action="store_true", default=False)
-    parser.add_argument("--cache_dit_taylorseer_order", type=int, default=1)
+    parser.add_argument("--cache-dit-fn-compute-blocks", type=int, default=1)
+    parser.add_argument("--cache-dit-bn-compute-blocks", type=int, default=0)
+    parser.add_argument("--cache-dit-max-warmup-steps", type=int, default=4)
+    parser.add_argument("--cache-dit-residual-diff-threshold", type=float, default=0.24)
+    parser.add_argument("--cache-dit-max-continuous-cached-steps", type=int, default=3)
+    parser.add_argument("--cache-dit-enable-taylorseer", action="store_true", default=False)
+    parser.add_argument("--cache-dit-taylorseer-order", type=int, default=1)
     parser.add_argument(
-        "--cache_dit_scm_steps_mask_policy", type=str, default=None, choices=[None, "slow", "medium", "fast", "ultra"]
+        "--cache-dit-scm-steps-mask-policy", type=str, default=None, choices=[None, "slow", "medium", "fast", "ultra"]
     )
-    parser.add_argument("--cache_dit_scm_steps_policy", type=str, default="dynamic", choices=["dynamic", "static"])
-    parser.add_argument("--tea_cache_rel_l1_thresh", type=float, default=0.2)
-    parser.add_argument("--cfg_parallel_size", type=int, default=1, choices=[1, 2])
-    parser.add_argument("--enforce_eager", action="store_true")
-    parser.add_argument("--vae_use_slicing", action="store_true")
-    parser.add_argument("--vae_use_tiling", action="store_true")
+    parser.add_argument("--cache-dit-scm-steps-policy", type=str, default="dynamic", choices=["dynamic", "static"])
+    parser.add_argument("--tea-cache-rel-l1-thresh", type=float, default=0.2)
+    parser.add_argument("--cfg-parallel-size", type=int, default=1, choices=[1, 2])
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--vae-use-slicing", action="store_true")
+    parser.add_argument("--vae-use-tiling", action="store_true")
     parser.add_argument("--enable-cpu-offload", action="store_true")
 
     return parser.parse_args()

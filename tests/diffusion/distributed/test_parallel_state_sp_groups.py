@@ -11,10 +11,7 @@ import torch
 
 from vllm_omni.diffusion.distributed.parallel_state import RankGenerator, set_seq_parallel_pg
 
-pytestmark = [
-    pytest.mark.diffusion,
-    pytest.mark.parallel,
-]
+pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _fake_new_group_factory(created_groups: list[SimpleNamespace]):

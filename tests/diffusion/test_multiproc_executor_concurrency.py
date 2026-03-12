@@ -12,7 +12,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.scheduler import Scheduler
 
-pytestmark = [pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
 
 # ───────────────────────────────────────────── helpers ─────────────────────

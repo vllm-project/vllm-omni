@@ -39,7 +39,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
-        self.model_mode = getattr(model_config, "worker_type", "ar")
+        self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
         self.custom_process_next_stage_input_func = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -185,9 +185,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.request_payload[req_id] = payload_data
             return payload_data
         origin_payload = self.request_payload[req_id]
+        override_keys = payload_data.pop("override_keys", [])
         for key, value in payload_data.items():
             if key == "finished":
                 continue
+            elif key in override_keys:
+                payload_data[key] = value
             elif isinstance(value, torch.Tensor) and key in origin_payload:
                 payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
             elif isinstance(value, list) and key in origin_payload:
@@ -232,6 +235,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[request_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+
+        if is_finished:
+            self.code_prompt_token_ids.pop(request_id, None)
 
     ########################################################################
     # Cleanup
