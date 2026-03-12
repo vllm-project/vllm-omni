@@ -412,7 +412,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
         # update the inputs_embeds and code_predictor_codes
         code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
-        out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
+        out_key = getattr(self.model, "talker_mtp_output_key", "codes.audio")
         for idx, req_id in enumerate(decode_req_ids):
             req_index = self.input_batch.req_ids.index(req_id)
             start_offset = int(self.query_start_loc.cpu[req_index])

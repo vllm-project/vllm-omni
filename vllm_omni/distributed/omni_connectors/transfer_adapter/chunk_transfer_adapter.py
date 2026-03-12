@@ -147,23 +147,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if self.model_mode == "ar":
                 self._update_request_payload(external_req_id, payload_data)
                 request.additional_information = payload_data
-                if payload_data.get("finished"):
+                if payload_data.get("meta.finished"):
                     self.finished_requests.add(req_id)
             else:
-                if payload_data.get("finished"):
+                if payload_data.get("meta.finished"):
                     self.finished_requests.add(req_id)
 
-                new_ids = payload_data.get("code_predictor_codes", [])
+                new_ids = payload_data.get("codes.audio", [])
                 request.prompt_token_ids = new_ids
-                # Pass additional fields (like left_context_size) to the request
+                # Pass additional fields (like meta.left_context_size) to the request
                 # Only pass chunk context metadata in additional_information
                 request.additional_information = {}
-                if "left_context_size" in payload_data:
-                    request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                if "meta.left_context_size" in payload_data:
+                    request.additional_information["meta.left_context_size"] = payload_data["meta.left_context_size"]
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
-                if not new_ids and not payload_data.get("finished"):
+                if not new_ids and not payload_data.get("meta.finished"):
                     return True
 
             # Mark as finished for consumption
@@ -185,9 +185,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.request_payload[req_id] = payload_data
             return payload_data
         origin_payload = self.request_payload[req_id]
-        override_keys = payload_data.pop("override_keys", [])
+        override_keys = payload_data.pop("meta.override_keys", [])
         for key, value in payload_data.items():
-            if key == "finished":
+            if key == "meta.finished":
                 continue
             elif key in override_keys:
                 payload_data[key] = value

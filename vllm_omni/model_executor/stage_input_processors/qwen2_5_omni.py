@@ -34,15 +34,15 @@ def thinker2talker(
         prompt_token_ids = thinker_output.prompt_token_ids
         thinker_output_ids = output.token_ids
         prompt_token_ids_len = len(prompt_token_ids)
-        latent = output.multimodal_output["latent"]
+        latent = output.multimodal_output["hidden_states.output"]
         thinker_hidden_states = latent.clone().detach().to(latent.device)
         additional_information = {
-            "thinker_result": thinker_hidden_states[prompt_token_ids_len:].to(torch.float32),
-            "prompt_embeds": thinker_hidden_states[:prompt_token_ids_len].to(torch.float32),
-            "prompt_token_ids": prompt_token_ids,
-            "thinker_output_token_ids": thinker_output_ids,
-            "thinker_result_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
-            "prompt_embeds_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
+            "hidden_states.output": thinker_hidden_states[prompt_token_ids_len:].to(torch.float32),
+            "embed.prefill": thinker_hidden_states[:prompt_token_ids_len].to(torch.float32),
+            "ids.prompt": prompt_token_ids,
+            "ids.output": thinker_output_ids,
+            "hidden_states.output_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
+            "embed.prefill_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
         }
         talker_inputs.append(
             OmniTokensPrompt(

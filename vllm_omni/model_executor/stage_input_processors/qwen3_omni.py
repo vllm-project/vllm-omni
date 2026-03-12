@@ -19,9 +19,9 @@ def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda")
     user_token_id = 872
     assistant_token_id = 77091
 
-    thinker_sequences = torch.tensor(info["thinker_sequences"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+    thinker_sequences = torch.tensor(info["ids.all"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
-    input_ids = torch.tensor(info["thinker_input_ids"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+    input_ids = torch.tensor(info["ids.prompt"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
     im_start_indexes = torch.cat(
         [
@@ -105,15 +105,15 @@ def thinker2talker_async_chunk(
         all_token_ids = _ensure_list(all_token_ids)
         prompt_token_ids = _ensure_list(prompt_token_ids)
         talker_additional_info = {
-            "thinker_prefill_embeddings": pooling_output.get("0").detach().cpu(),
-            "thinker_hidden_states": pooling_output.get("24").detach().cpu(),
-            "thinker_sequences": all_token_ids,
-            "thinker_input_ids": prompt_token_ids,
+            "embed.prefill": pooling_output.get("hidden_states.layer_0").detach().cpu(),
+            "hidden_states.output": pooling_output.get("hidden_states.layer_24").detach().cpu(),
+            "ids.all": all_token_ids,
+            "ids.prompt": prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
-            "tts_bos_embed": pooling_output.get("tts_bos_embed").detach().cpu(),
-            "tts_eos_embed": pooling_output.get("tts_eos_embed").detach().cpu(),
-            "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
-            "finished": torch.tensor(is_finished, dtype=torch.bool),
+            "embed.tts_bos": pooling_output.get("embed.tts_bos").detach().cpu(),
+            "embed.tts_eos": pooling_output.get("embed.tts_eos").detach().cpu(),
+            "embed.tts_pad": pooling_output.get("embed.tts_pad").detach().cpu(),
+            "meta.finished": torch.tensor(is_finished, dtype=torch.bool),
         }
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
@@ -121,15 +121,15 @@ def thinker2talker_async_chunk(
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
-            talker_additional_info["thinker_prefill_embeddings"] = torch.cat(
+            talker_additional_info["embed.prefill"] = torch.cat(
                 (
-                    save_payload.get("thinker_prefill_embeddings"),
-                    talker_additional_info.get("thinker_prefill_embeddings"),
+                    save_payload.get("embed.prefill"),
+                    talker_additional_info.get("embed.prefill"),
                 ),
                 dim=0,
             )
-            talker_additional_info["thinker_hidden_states"] = torch.cat(
-                (save_payload.get("thinker_hidden_states"), talker_additional_info.get("thinker_hidden_states")),
+            talker_additional_info["hidden_states.output"] = torch.cat(
+                (save_payload.get("hidden_states.output"), talker_additional_info.get("hidden_states.output")),
                 dim=0,
             )
     else:
@@ -138,16 +138,16 @@ def thinker2talker_async_chunk(
         output_token_ids = _ensure_list(output_token_ids)
 
         talker_additional_info = {
-            "finished": torch.tensor(is_finished, dtype=torch.bool),
+            "meta.finished": torch.tensor(is_finished, dtype=torch.bool),
         }
         if output_token_ids:
-            talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
-            talker_additional_info["thinker_decode_embeddings"] = pooling_output.get("0").detach().cpu()
-            talker_additional_info["thinker_output_token_ids"] = output_token_ids
+            talker_additional_info["meta.override_keys"] = ["embed.decode", "ids.output"]
+            talker_additional_info["embed.decode"] = pooling_output.get("hidden_states.layer_0").detach().cpu()
+            talker_additional_info["ids.output"] = output_token_ids
         else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
-            talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
+            talker_additional_info["embed.prefill"] = pooling_output.get("hidden_states.layer_0").detach().cpu()
+            talker_additional_info["hidden_states.output"] = pooling_output.get("hidden_states.layer_24").detach().cpu()
     return talker_additional_info
 
 
@@ -184,16 +184,18 @@ def thinker2talker(
         output = thinker_output.outputs[0]
 
         info = {
-            "thinker_prefill_embeddings": output.multimodal_output["0"].detach().to(device=device, dtype=torch.float),
-            "thinker_hidden_states": output.multimodal_output["24"].detach().to(device=device, dtype=torch.float),
-            "thinker_sequences": (
-                thinker_output.prompt_token_ids + output.token_ids
-            ),  # the thinker_sequences is the whole ids
-            "thinker_input_ids": thinker_output.prompt_token_ids,
+            "embed.prefill": output.multimodal_output["hidden_states.layer_0"]
+            .detach()
+            .to(device=device, dtype=torch.float),
+            "hidden_states.output": output.multimodal_output["hidden_states.layer_24"]
+            .detach()
+            .to(device=device, dtype=torch.float),
+            "ids.all": (thinker_output.prompt_token_ids + output.token_ids),  # the thinker_sequences is the whole ids
+            "ids.prompt": thinker_output.prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
-            "tts_bos_embed": output.multimodal_output["tts_bos_embed"].detach().to(device=device, dtype=torch.float),
-            "tts_eos_embed": output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
-            "tts_pad_embed": output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
+            "embed.tts_bos": output.multimodal_output["embed.tts_bos"].detach().to(device=device, dtype=torch.float),
+            "embed.tts_eos": output.multimodal_output["embed.tts_eos"].detach().to(device=device, dtype=torch.float),
+            "embed.tts_pad": output.multimodal_output["embed.tts_pad"].detach().to(device=device, dtype=torch.float),
         }
 
         prompt_len = _compute_talker_prompt_ids_length(info, device=device)
@@ -224,7 +226,7 @@ def talker2code2wav_async_chunk(
     """
     Pooling version.
     """
-    if "code_predictor_codes" not in pooling_output:
+    if "codes.audio" not in pooling_output:
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -233,7 +235,7 @@ def talker2code2wav_async_chunk(
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
 
-    code_predictor_codes = pooling_output["code_predictor_codes"]
+    code_predictor_codes = pooling_output["codes.audio"]
 
     if code_predictor_codes is None:
         return None
@@ -276,9 +278,9 @@ def talker2code2wav_async_chunk(
     )
 
     info = {
-        "code_predictor_codes": codes,
-        "left_context_size": left_context_size,
-        "finished": torch.tensor(is_finished, dtype=torch.bool),
+        "codes.audio": codes,
+        "meta.left_context_size": left_context_size,
+        "meta.finished": torch.tensor(is_finished, dtype=torch.bool),
     }
     return info
 
@@ -315,7 +317,7 @@ def talker2code2wav(
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
         codec_codes = (
-            output.multimodal_output["code_predictor_codes"][-seq_len:]
+            output.multimodal_output["codes.audio"][-seq_len:]
             .to(torch.long)
             .transpose(0, 1)
             .cpu()

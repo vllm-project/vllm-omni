@@ -187,7 +187,7 @@ def ar2diffusion(
         is_i2i = False
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
-            if isinstance(mm_output, dict) and mm_output.get("prior_token_image_ids") is not None:
+            if isinstance(mm_output, dict) and mm_output.get("ids.prior_image") is not None:
                 is_i2i = True
 
         # Parse and upsample prior tokens
@@ -202,7 +202,7 @@ def ar2diffusion(
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
             if isinstance(mm_output, dict):
-                raw_prior_image_ids = mm_output.get("prior_token_image_ids")
+                raw_prior_image_ids = mm_output.get("ids.prior_image")
                 if raw_prior_image_ids is not None:
                     # Handle different formats:
                     # 1. Single tensor -> wrap in list
@@ -228,7 +228,7 @@ def ar2diffusion(
                 mm_output = output.multimodal_output
                 logger.debug(f"[ar2diffusion] Request {i}: found multimodal_output on CompletionOutput (fallback)")
                 if isinstance(mm_output, dict):
-                    raw_prior_image_ids = mm_output.get("prior_token_image_ids")
+                    raw_prior_image_ids = mm_output.get("ids.prior_image")
                     if raw_prior_image_ids is not None:
                         if isinstance(raw_prior_image_ids, torch.Tensor):
                             prior_token_image_ids = [raw_prior_image_ids]
@@ -241,7 +241,7 @@ def ar2diffusion(
             "width": pixel_w,
             "extra": {
                 "prior_token_ids": prior_token_ids,
-                "prior_token_image_ids": prior_token_image_ids,
+                "ids.prior_image": prior_token_image_ids,
             },
         }
 

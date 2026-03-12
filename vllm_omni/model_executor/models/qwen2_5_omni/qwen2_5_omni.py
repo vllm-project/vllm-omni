@@ -677,10 +677,10 @@ class Qwen2_5OmniForConditionalGeneration(
     ):
         update_dict = {}
 
-        prompt_embeds = info_dict.get("prompt_embeds")  # Tensor [P,H]
-        thinker_result = info_dict.get("thinker_result")  # Tensor [K,H]
-        prompt_token_ids = info_dict.get("prompt_token_ids")  # list[int]
-        thinker_output_token_ids = info_dict.get("thinker_output_token_ids")  # list[int]
+        prompt_embeds = info_dict.get("embed.prefill")  # Tensor [P,H]
+        thinker_result = info_dict.get("hidden_states.output")  # Tensor [K,H]
+        prompt_token_ids = info_dict.get("ids.prompt")  # list[int]
+        thinker_output_token_ids = info_dict.get("ids.output")  # list[int]
 
         if not isinstance(prompt_embeds, torch.Tensor):
             prompt_embeds = torch.zeros(
@@ -765,7 +765,7 @@ class Qwen2_5OmniForConditionalGeneration(
             update_dict["thinker_reply_part"] = new_q
         else:
             # B) per-request provided decode vector (optional)
-            dv = info_dict.get("decode_output_prompt_embeds") if isinstance(info_dict, dict) else None
+            dv = info_dict.get("embed.decode") if isinstance(info_dict, dict) else None
             if isinstance(dv, torch.Tensor) and dv.numel() > 0:
                 step_vec = dv[0:1] if dv.ndim == 2 else dv.view(1, -1)
             elif (
