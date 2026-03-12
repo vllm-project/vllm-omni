@@ -7,7 +7,6 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
-
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
 - [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
@@ -24,7 +23,6 @@ Main entry points for vLLM-Omni inference and serving.
 ## Inputs
 
 Input data structures for multi-modal inputs.
-
 
 - [vllm_omni.inputs.data.OmniDiffusionSamplingParams][]
 - [vllm_omni.inputs.data.OmniEmbedsPrompt][]
