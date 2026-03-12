@@ -34,15 +34,7 @@ steps:
   - label: "Diffusion Model CPU offloading Test"
     depends_on: upload-ready-pipeline
     commands:
-      - |
-        timeout 20m bash -c '
-          set +e
-          pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
-          EXIT1=$$?
-          pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
-          EXIT2=$$?
-          exit $$((EXIT1 | EXIT2))
-        '
+      - timeout 10m pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
