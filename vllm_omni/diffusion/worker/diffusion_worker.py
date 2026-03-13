@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -105,6 +106,7 @@ class DiffusionWorker:
         vllm_config = VllmConfig(compilation_config=CompilationConfig())
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
+        vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
@@ -125,6 +127,8 @@ class DiffusionWorker:
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
+                hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
+                enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
             init_workspace_manager(self.device)
 
@@ -375,6 +379,10 @@ class WorkerProc:
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
+            try:
+                pack_diffusion_output_shm(output)
+            except Exception as e:
+                logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
             self.result_mq.enqueue(output)
 
     def recv_message(self):

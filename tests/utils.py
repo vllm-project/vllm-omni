@@ -20,6 +20,8 @@ from typing_extensions import ParamSpec
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import cuda_device_count_stateless
 
+from vllm_omni.platforms import current_omni_platform
+
 _P = ParamSpec("_P")
 
 if current_platform.is_rocm():
@@ -441,27 +443,11 @@ def npu_marks(*, res: str, num_cards: int):
         return [mark for mark in [test_platform, test_resource, test_distributed] if mark is not None]
 
 
-def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
+def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     """
-    Decorate a test for multiple hardware platforms with a single call.
-    Automatically wraps the test with @create_new_process_for_each_test() for distributed tests.
-
-    Args:
-        res: Mapping from platform to resource type. Supported platforms/resources:
-            - cuda: L4, H100
-            - rocm: MI325
-            - npu: A2, A3
-        num_cards: Number of cards required. Can be:
-            - int: same card count for all platforms (default: 1)
-            - dict: per-platform card count, e.g., {"cuda": 2, "rocm": 2}
-
-    Example:
-        @hardware_test(
-            res={"cuda": "L4", "rocm": "MI325", "npu": "A2"},
-            num_cards={"cuda": 2, "rocm": 2, "npu": 2},
-        )
-        def test_multi_platform():
-            ...
+    Get a collection of pytest marks to apply for `@hardware_test`,
+    including CUDA, ROCm, and NPU,
+    based on the specified platforms and resources.
     """
     # Validate platforms
     # Don't validate platform details in this decorator
@@ -484,7 +470,7 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
                 num_cards_dict[platform] = 1
 
     # Collect marks from all platforms
-    all_marks: list[Callable[[Callable[_P, None]], Callable[_P, None]]] = []
+    all_marks: list[pytest.MarkDecorator] = []
     for platform, resource in res.items():
         cards = num_cards_dict[platform]
         if platform == "cuda" or platform == "rocm":
@@ -494,6 +480,32 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
         else:
             raise ValueError(f"Unsupported platform: {platform}")
         all_marks.extend(marks)
+    return all_marks
+
+
+def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
+    """
+    Decorate a test for multiple hardware platforms with a single call.
+    Automatically wraps the test with @create_new_process_for_each_test() for distributed tests.
+
+    Args:
+        res: Mapping from platform to resource type. Supported platforms/resources:
+            - cuda: L4, H100
+            - rocm: MI325
+            - npu: A2, A3
+        num_cards: Number of cards required. Can be:
+            - int: same card count for all platforms (default: 1)
+            - dict: per-platform card count, e.g., {"cuda": 2, "rocm": 2}
+
+    Example:
+        @hardware_test(
+            res={"cuda": "L4", "rocm": "MI325", "npu": "A2"},
+            num_cards={"cuda": 2, "rocm": 2, "npu": 2},
+        )
+        def test_multi_platform():
+            ...
+    """
+    all_marks = hardware_marks(res=res, num_cards=num_cards)
 
     def wrapper(f: Callable[_P, None]) -> Callable[_P, None]:
         func = f
@@ -504,8 +516,8 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     return wrapper
 
 
-class GPUMemoryMonitor:
-    """Poll global device memory usage via CUDA APIs."""
+class DeviceMemoryMonitor:
+    """Poll global device memory usage."""
 
     def __init__(self, device_index: int, interval: float = 0.05):
         self.device_index = device_index
@@ -518,8 +530,8 @@ class GPUMemoryMonitor:
         def monitor_loop() -> None:
             while not self._stop_event.is_set():
                 try:
-                    with torch.cuda.device(self.device_index):
-                        free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    with current_omni_platform.device(self.device_index):
+                        free_bytes, total_bytes = current_omni_platform.mem_get_info()
                     used_mb = (total_bytes - free_bytes) / (1024**2)
                     self._peak_used_mb = max(self._peak_used_mb, used_mb)
                 except Exception:
@@ -537,8 +549,8 @@ class GPUMemoryMonitor:
 
     @property
     def peak_used_mb(self) -> float:
-        fallback_alloc = torch.cuda.max_memory_allocated(device=self.device_index) / (1024**2)
-        fallback_reserved = torch.cuda.max_memory_reserved(device=self.device_index) / (1024**2)
+        fallback_alloc = current_omni_platform.max_memory_allocated(device=self.device_index) / (1024**2)
+        fallback_reserved = current_omni_platform.max_memory_reserved(device=self.device_index) / (1024**2)
         return max(self._peak_used_mb, fallback_alloc, fallback_reserved)
 
     def __del__(self):

@@ -1,6 +1,9 @@
 # Speech API
 
-vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation using Qwen3-TTS models.
+vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation. Supported TTS models include:
+
+- **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
+- **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -9,13 +12,22 @@ Each server instance runs a single model (specified at startup via `vllm serve <
 ### Start the Server
 
 ```bash
-# CustomVoice model (predefined speakers)
+# Qwen3-TTS: CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
     --enforce-eager
+
+# Fish Speech S2 Pro
+vllm-omni serve fishaudio/s2-pro \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml \
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager \
+    --gpu-memory-utilization 0.9
 ```
 
 ### Generate Speech
@@ -96,7 +108,7 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
-| `initial_codec_chunk_frames` | integer | null | Initial chunk size for reduced TTFA (overrides stage config) |
+| `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
@@ -163,6 +175,42 @@ curl -X POST http://localhost:8091/v1/audio/voices \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1"
 ```
+
+## Streaming Text Input (WebSocket)
+
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally and generates audio per sentence as boundaries are detected.
+
+> Note: text input is always streamed incrementally. Audio output remains sentence-scoped:
+> use `stream_audio=false` for one binary frame per sentence, or `stream_audio=true` for one or more PCM chunks per sentence.
+
+### WebSocket Protocol
+
+Client -> Server:
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "session.config", ...}` | Session configuration (sent once, first message) |
+| `{"type": "input.text", "text": "..."}` | Text chunk |
+| `{"type": "input.done"}` | End of input, flushes remaining buffer |
+
+Server -> Client:
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for a sentence |
+| Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
+| `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for a sentence |
+| `{"type": "session.done", "total_sentences": N}` | Session complete |
+| `{"type": "error", "message": "..."}` | Non-fatal error |
+
+### Session Config Parameters
+
+All REST API parameters are supported, plus:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `stream_audio` | bool | false | Stream one or more PCM chunks per sentence over WebSocket |
+| `split_granularity` | string | "sentence" | Text splitting granularity |
 
 
 ```bash
@@ -281,6 +329,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ## Supported Models
 
+### Qwen3-TTS
+
 | Model | Task Type | Description |
 |-------|-----------|-------------|
 | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | CustomVoice | Predefined speaker voices with optional style control |
@@ -288,6 +338,14 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base | Voice cloning from reference audio |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | CustomVoice | Smaller/faster variant |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Base | Smaller/faster variant for voice cloning |
+
+### Fish Speech S2 Pro
+
+| Model | Description |
+|-------|-------------|
+| `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
+
+Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech online serving example](../user_guide/examples/online_serving/fish_speech.md) for details.
 
 ## Error Responses
 

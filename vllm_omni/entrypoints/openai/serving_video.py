@@ -141,6 +141,7 @@ class OmniOpenAIServingVideo:
         )
 
         result = await self._run_generation(prompt, gen_params, request_id, raw_request)
+        _t_encode_start = time.perf_counter()
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         output_fps = fps or 24
@@ -161,6 +162,8 @@ class OmniOpenAIServingVideo:
             )
             for idx, video in enumerate(videos)
         ]
+        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+        logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
         return VideoGenerationResponse(created=int(time.time()), data=video_data)
 
     def _resolve_model_name(self, raw_request: Request | None) -> str | None:
