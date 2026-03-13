@@ -76,7 +76,8 @@ class TeaCacheHook(ModelHook):
             The initialized module.
         """
         # Get extractor function based on transformer_type from config
-        # transformer_type is the transformer class name (e.g., "QwenImageTransformer2DModel")
+        # transformer_type is the transformer class name
+        # (e.g., "QwenImageTransformer2DModel")
         self.extractor_fn = get_extractor(self.config.transformer_type)
 
         # Set default context
@@ -136,6 +137,39 @@ class TeaCacheHook(ModelHook):
         context_name = f"teacache_{cache_branch}"
         self.state_manager.set_context(context_name)
         state = self.state_manager.get_state()
+
+        # ============================================================================
+        # DEVICE SYNCHRONIZATION FOR CPU OFFLOAD
+        # ============================================================================
+        # Ensure cached tensors are on the same device as the module.
+        # This is necessary when using CPU offloading, as the module may be
+        # moved between CPU and GPU, but the cached state tensors remain on
+        # the original device.
+        #
+        # IMPORTANT: This must be done AFTER set_context() to ensure we get the
+        # correct state for the current CFG branch. StateManager keeps separate
+        # TeaCache states per context (positive/negative branches). Calling
+        # get_state() before set_context() would return the wrong branch's state,
+        # causing device mismatch in alternating CFG steps.
+        #
+        # TODO: Consider moving device sync into StateManager.set_context() for
+        # better architecture consistency. Currently each caller needs to handle
+        # device sync after set_context().
+        try:
+            module_device = next(module.parameters()).device
+        except StopIteration:
+            # Module has no parameters, skip device sync
+            module_device = None
+
+        if module_device is not None:
+            for attr in [
+                "previous_modulated_input",
+                "previous_residual",
+                "previous_residual_encoder",
+            ]:
+                tensor = getattr(state, attr, None)
+                if tensor is not None and tensor.device != module_device:
+                    setattr(state, attr, tensor.to(module_device))
 
         # Decide whether to compute or cache based on modulated input similarity
         should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
