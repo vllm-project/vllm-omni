@@ -53,9 +53,6 @@ th {
 |`Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` |
 |`FishSpeechSlowARForConditionalGeneration` | Fish Speech S2 Pro | `fishaudio/s2-pro` |
 
-For FunAudioChat S2S with local checkpoints, override both stage `engine_args.model` paths in the stage config instead of using the default HF repo IDs.
-
-
 ## List of Supported Models for NPU
 
 <style>

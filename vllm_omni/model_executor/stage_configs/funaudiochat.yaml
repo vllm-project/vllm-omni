@@ -1,3 +1,5 @@
+# For local checkpoints, override `engine_args.model` in both stages below
+# instead of using the default HF repo IDs.
 stage_args:
   - stage_id: 0
     stage_type: llm
