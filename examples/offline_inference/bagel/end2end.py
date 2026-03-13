@@ -34,6 +34,13 @@ def parse_args():
         help="Path to input image for img2img.",
     )
 
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=".",
+        help="Output directory to save images.",
+    )
+
     # OmniLLM init args
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
@@ -65,6 +72,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    os.makedirs(args.output, exist_ok=True)
     model_name = args.model
     prompts: list[OmniPromptType] = []
     try:
@@ -173,13 +181,17 @@ def main():
 
         if images:
             for j, img in enumerate(images):
-                img.save(f"output_{i}_{j}.png")
+                save_path = os.path.join(args.output, f"output_{i}_{j}.png")
+                img.save(save_path)
 
         if hasattr(req_output, "request_output") and req_output.request_output:
             for stage_out in req_output.request_output:
                 if hasattr(stage_out, "images") and stage_out.images:
                     for k, img in enumerate(stage_out.images):
-                        save_path = f"output_{i}_stage_{getattr(stage_out, 'stage_id', '?')}_{k}.png"
+                        save_path = os.path.join(
+                            args.output,
+                            f"output_{i}_stage_{getattr(stage_out, 'stage_id', '?')}_{k}.png",
+                        )
                         img.save(save_path)
                         print(f"[Info] Saved stage output image to {save_path}")
 
