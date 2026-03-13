@@ -279,9 +279,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, delay connector finalization until
-        # after draft model runs in sample_tokens.
-        defer_finalize = self.speculative_config is not None
+        # When spec decode is enabled, delay clearing connector metadata
+        # until after draft model runs in sample_tokens.
+        clear_kv_metadata = self.speculative_config is None
         with (
             set_forward_context(
                 attn_metadata,
@@ -294,7 +294,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output, defer_finalize=defer_finalize) as kv_connector_output,
+            self.maybe_get_kv_connector_output(
+                scheduler_output, clear_metadata=clear_kv_metadata
+            ) as kv_connector_output,
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -657,7 +659,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # This was deferred from target model forward to allow draft model
         # to also save its KV cache.
         if self.speculative_config is not None:
-            self.finalize_kv_connector()
+            self.clear_kv_connector_metadata()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()

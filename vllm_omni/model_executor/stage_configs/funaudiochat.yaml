@@ -8,6 +8,11 @@ stage_args:
       model: FunAudioLLM/Fun-Audio-Chat-8B
       model_stage: s2s
       model_arch: FunAudioChatForConditionalGeneration
+      hf_overrides:
+        audio_config:
+          max_source_positions: 100
+      limit_mm_per_prompt:
+        audio: 1
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       trust_remote_code: true
