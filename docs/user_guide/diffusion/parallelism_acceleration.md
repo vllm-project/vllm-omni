@@ -39,6 +39,7 @@ The following table shows which models are currently supported by parallelism me
 | **FLUX.1-dev**           | `black-forest-labs/FLUX.1-dev`       |     ❌      |    ❌    |      ✅       |        ✅        |         ❌          |        N/A        |
 | **FLUX.2-dev**           | `black-forest-labs/FLUX.2-dev`       |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |        N/A        |
 | **HunyuanImage3.0**      | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |        ✅        |
+| **DreamID-Omni**           | `XuGuo699/DreamID-Omni`       |     ❌      |    ❌    |      ✅       |        ❌        |         ❌          |        N/A        |
 
 !!! note "TP Limitations for Diffusion Models"
     We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
