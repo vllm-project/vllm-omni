@@ -189,6 +189,7 @@ class FluxPipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
         self.default_sample_size = 128
 
         self.setup_diffusion_pipeline_profiler()
+        self.clear_profiler_records()
 
     def check_inputs(
         self,
@@ -752,7 +753,7 @@ class FluxPipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(output=image, stage_durations=self.stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

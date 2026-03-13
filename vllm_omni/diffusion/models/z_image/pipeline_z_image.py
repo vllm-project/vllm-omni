@@ -187,6 +187,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
         )
         self.setup_diffusion_pipeline_profiler()
+        self.clear_profiler_records()
 
     def encode_prompt(
         self,
@@ -642,7 +643,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             image = self.vae.decode(latents, return_dict=False)[0]
             # image = self.image_processor.postprocess(image, output_type=output_type)
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(output=image, stage_durations=self.stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

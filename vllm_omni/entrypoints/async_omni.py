@@ -494,6 +494,7 @@ class AsyncOmni(OmniBase):
             for result in results:
                 images = getattr(result, "images", None) or []
                 finished = getattr(result, "finished", True)
+                stage_durations = getattr(result, "stage_durations", {})
 
                 output_to_yield = OmniRequestOutput(
                     stage_id=0,
@@ -501,6 +502,7 @@ class AsyncOmni(OmniBase):
                     request_output=result,
                     images=images,
                     finished=finished,
+                    stage_durations=stage_durations,
                 )
 
                 metrics.stage_last_ts[0] = time.time()

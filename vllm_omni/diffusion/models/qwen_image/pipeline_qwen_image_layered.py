@@ -285,6 +285,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         self.stage = None
         self.setup_diffusion_pipeline_profiler()
+        self.clear_profiler_records()
 
     def check_inputs(
         self,
@@ -845,7 +846,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             for bidx in range(b):
                 images.append(image[bidx * f : (bidx + 1) * f])
 
-        return DiffusionOutput(output=images)
+        return DiffusionOutput(output=images, stage_durations=self.stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

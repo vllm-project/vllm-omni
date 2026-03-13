@@ -151,6 +151,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         self._num_timesteps = None
         self._current_timestep = None
         self.setup_diffusion_pipeline_profiler()
+        self.clear_profiler_records()
 
     @property
     def guidance_scale(self):
@@ -571,7 +572,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         # Trim to requested length
         audio = audio[:, :, waveform_start:waveform_end]
 
-        return DiffusionOutput(output=audio)
+        return DiffusionOutput(output=audio, stage_durations=self.stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

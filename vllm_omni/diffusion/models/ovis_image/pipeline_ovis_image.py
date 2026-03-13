@@ -190,6 +190,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
         self.tokenizer_max_length = 256 + self.user_prompt_begin_id
         self.default_sample_size = 128
         self.setup_diffusion_pipeline_profiler()
+        self.clear_profiler_records()
 
     def _get_messages(
         self,
@@ -736,7 +737,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(output=image, stage_durations=self.stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

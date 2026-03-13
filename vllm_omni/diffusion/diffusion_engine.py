@@ -150,6 +150,7 @@ class DiffusionEngine:
                         latents=output.trajectory_latents,
                         multimodal_output={"audio": request_audio_payload},
                         final_output_type="audio",
+                        stage_durations=output.stage_durations,
                     ),
                 ]
             else:
@@ -165,6 +166,7 @@ class DiffusionEngine:
                         latents=output.trajectory_latents,
                         custom_output=output.custom_output or {},
                         multimodal_output=mm_output,
+                        stage_durations=output.stage_durations,
                     ),
                 ]
         else:
@@ -194,6 +196,7 @@ class DiffusionEngine:
                             latents=output.trajectory_latents,
                             multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
+                            stage_durations=output.stage_durations,
                         ),
                     )
                 else:
@@ -219,6 +222,7 @@ class DiffusionEngine:
                             latents=output.trajectory_latents,
                             custom_output=output.custom_output or {},
                             multimodal_output=mm_output,
+                            stage_durations=output.stage_durations,
                         ),
                     )
 

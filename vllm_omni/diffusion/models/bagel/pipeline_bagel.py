@@ -257,6 +257,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         self.to(self.device)
         self.setup_diffusion_pipeline_profiler()
+        self.clear_profiler_records()
 
     @staticmethod
     def _decode_image_from_latent(
@@ -623,7 +624,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
-        return DiffusionOutput(output=img)
+        return DiffusionOutput(output=img, stage_durations=self.stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         state = self.state_dict()

@@ -1,8 +1,9 @@
 import functools
 import os
+from threading import Lock
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Dict
 
 from vllm.logger import init_logger
 
@@ -11,8 +12,8 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
-def profiler(name: str, func: Callable) -> Callable:
-    """Timing a function execution,"""
+def profiler(name: str, func: Callable, instance: Any) -> Callable:
+    """Timing a function execution."""
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs) -> Any:
@@ -26,6 +27,9 @@ def profiler(name: str, func: Callable) -> Callable:
                 current_omni_platform.synchronize()
             duration = time.perf_counter() - start_time
             logger.info(f"[DiffusionTiming] {name} took {duration:.6f}s")
+            # record the profiling data: duration of stages
+            with instance._profiler_lock:
+                instance._stage_durations[name] = duration
 
     return wrapper
 
@@ -45,6 +49,10 @@ def _get_attribute_by_path(obj: Any, path: str) -> tuple[Any, str]:
 
 def wrap_methods_by_paths(root_obj: Any, method_paths: list[str]) -> None:
     """Wrap specified methods of an object with profiler."""
+    if not hasattr(root_obj, "_profiler_lock"):
+        root_obj._profiler_lock = Lock()
+        root_obj._stage_durations: Dict[str, float] = {}
+
     for path in method_paths:
         obj, method_name = _get_attribute_by_path(root_obj, path)
         if not obj or not hasattr(obj, method_name):
@@ -57,7 +65,7 @@ def wrap_methods_by_paths(root_obj: Any, method_paths: list[str]) -> None:
             continue
 
         profiler_name = f"{root_obj.__class__.__name__}.{path}"
-        setattr(obj, method_name, profiler(profiler_name, original_method))
+        setattr(obj, method_name, profiler(profiler_name, original_method, root_obj))
 
 
 class DiffusionPipelineProfilerMixin:
@@ -76,3 +84,12 @@ class DiffusionPipelineProfilerMixin:
             self,
             profiler_targets,
         )
+    
+    @property
+    def stage_durations(self) -> Dict[str, float]:
+        with self._profiler_lock:
+            return self._stage_durations.copy()
+        
+    def clear_profiler_records(self) -> None:
+        with self._profiler_lock:
+            self._stage_durations.clear()

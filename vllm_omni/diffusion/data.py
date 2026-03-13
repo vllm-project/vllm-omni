@@ -642,6 +642,9 @@ class DiffusionOutput:
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
 
+    # logged duration of stages
+    stage_durations: dict[str, float] = field(default_factory=dict)
+
 
 class AttentionBackendEnum(enum.Enum):
     FA = enum.auto()

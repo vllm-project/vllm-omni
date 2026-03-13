@@ -246,6 +246,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         self._current_timestep = None
         self._interrupt = False
         self.setup_diffusion_pipeline_profiler()
+        self.clear_profiler_records()
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -993,7 +994,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
                 latents = latents.to(self.vae.dtype)
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(output=image, stage_durations=self.stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

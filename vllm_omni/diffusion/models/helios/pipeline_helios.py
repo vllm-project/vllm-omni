@@ -230,6 +230,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         self._num_timesteps = None
         self._current_timestep = None
         self.setup_diffusion_pipeline_profiler()
+        self.clear_profiler_records()
 
     @property
     def guidance_scale(self):
@@ -649,7 +650,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         else:
             output = history_video
 
-        return DiffusionOutput(output=output)
+        return DiffusionOutput(output=output, stage_durations=self.stage_durations)
 
     def _stage1_sample(
         self,

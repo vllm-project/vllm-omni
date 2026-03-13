@@ -35,6 +35,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     response_body: dict[str, Any] = field(default_factory=dict)
+    stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
 
@@ -108,6 +109,18 @@ async def async_request_chat_completions(
                 output.success = True
                 if "peak_memory_mb" in resp_json:
                     output.peak_memory_mb = resp_json["peak_memory_mb"]
+                try:
+                    choices = resp_json.get("choices", [])
+                    if choices and isinstance(choices, list):
+                        msg = choices[0].get("message", {})
+                        if isinstance(msg, dict):
+                            content = msg.get("content", [])
+                            if content and isinstance(content, list) and len(content) > 0:
+                                first_item = content[0]
+                                if isinstance(first_item, dict):
+                                    output.stage_durations = first_item.get("stage_durations")
+                except (IndexError, TypeError, AttributeError):
+                    pass
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
