@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
+from tests.conftest import OmniServer
+from tests.dfx.conftest import (
     create_benchmark_indices,
     create_test_parameter_mapping,
     create_unique_server_params,

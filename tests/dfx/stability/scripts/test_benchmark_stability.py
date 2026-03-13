@@ -8,7 +8,6 @@ The overall flow matches the perf logic: `load_configs`, `modify_stage`,
 `get_benchmark_params_for_server`, `create_benchmark_indices`, and the
 `omni_server` fixture are aligned with perf. Only the benchmark execution
 (`run_stability_benchmark`, which is duration-based here) and the test cases differ.
-`tests/perf` is not modified.
 
 All test-specific parameters, such as `duration_sec`, `request_rate` /
 `max_concurrency`, and `num_prompts_per_batch`, are configured in
@@ -25,15 +24,15 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
+from tests.conftest import OmniServer
+from tests.dfx.conftest import (
     create_benchmark_indices,
     create_test_parameter_mapping,
     create_unique_server_params,
     get_benchmark_params_for_server,
     load_configs,
 )
-from tests.perf.scripts.run_benchmark import run_benchmark
+from tests.dfx.perf.scripts.run_benchmark import run_benchmark
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
 STAGE_CONFIGS_DIR = STABILITY_DIR / "stage_configs"

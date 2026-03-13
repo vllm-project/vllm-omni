@@ -552,7 +552,7 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 -   ***Script Example***:
 <details>
 <summary> Test Examples</summary>
-When you want to add L4-level performance test cases, you can refer to the following format for case addition in tests/perf/tests/test.json:
+When you want to add L4-level performance test cases, you can refer to the following format for case addition in tests/dfx/perf/tests/test.json:
 
 ```JSON
 {
