@@ -34,8 +34,8 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
     "t2t": {
         "output_dir": "/tmp/dynin_end2end_outputs",
         "prompt_max_text_len": 1024,
-        "max_new_tokens": 512,
-        "steps": 512,
+        "max_new_tokens": 1024,
+        "steps": 1024,
         "block_length": 16,
         "temperature": 0.0,
         "cfg_scale": 0.0,
@@ -55,7 +55,7 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
         "prompt_max_text_len": 128,
         "mask_token_id": 126336,
         "codebook_size": 8192,
-        "timesteps": 20,
+        "timesteps": 64,
         "guidance_scale": 3.5,
         "temperature": 1.0,
         "image_resolution": 336,
@@ -63,7 +63,7 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
     },
     "i2t": {
         "output_dir": "/tmp/dynin_i2t_outputs",
-        "prompt_max_text_len": 1024,
+        "prompt_max_text_len": 128,
         "max_new_tokens": 128,
         "steps": 128,
         "block_length": 2,
@@ -78,7 +78,7 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
         "output_dir": "/tmp/dynin_s2t_outputs",
         "prompt_max_text_len": 1024,
         "max_new_tokens": 128,
-        "steps": 256,
+        "steps": 128,
         "block_length": 2,
         "temperature": 0.0,
         "cfg_scale": 0.0,
@@ -91,11 +91,11 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
         "runtime_task": "t2s_mmu_like",
         "prompting_task": "t2s_gen",
         "prompt_max_text_len": 1024,
-        "t2s_token_length": 384,
+        "t2s_token_length": 512,
         "mask_token_id": 126336,
         "codebook_size": 8192,
         "audio_codebook_size": 4096,
-        "steps": 384,
+        "steps": 512,
         "block_length": 128,
         "temperature": 1.0,
         "cfg_scale": 2.5,
@@ -104,8 +104,8 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
     "v2t": {
         "output_dir": "/tmp/dynin_v2t_outputs",
         "prompt_max_text_len": 1024,
-        "max_new_tokens": 256,
-        "steps": 256,
+        "max_new_tokens": 128,
+        "steps": 128,
         "block_length": 2,
         "temperature": 0.0,
         "cfg_scale": 0.0,
@@ -372,12 +372,14 @@ def load_universal_prompting(
     max_audio_len_short: int = 256,
 ) -> Any:
     from vllm_omni.model_executor.models.dynin_omni.dynin_omni_common import (
-        get_dynin_remote_attr,
+        DYNIN_REMOTE_SETTINGS,
+        resolve_remote_attr,
     )
 
-    UniversalPrompting = get_dynin_remote_attr(
+    UniversalPrompting = resolve_remote_attr(
         "UniversalPrompting",
         module_name="prompting_utils",
+        settings=DYNIN_REMOTE_SETTINGS,
         source=tokenizer_source,
         local_files_only=bool(local_files_only),
         fallback_module_names=("modeling_dynin_omni",),
@@ -573,48 +575,85 @@ def _flatten_media_token_ids_with_offset(token_ids: Any, token_offset: int) -> l
     return [int(x) + int(token_offset) for x in media_ids]
 
 
-def _build_i2t_v2t_prompt_ids_via_reference(
+def _scalar_token_id(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            raise ValueError("Empty special-token tensor.")
+        return int(value.view(-1)[0].item())
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("Empty special-token list.")
+        return int(value[0])
+    return int(value)
+
+
+def build_v2t_input_ids(
     *,
-    task: str,
-    text: str,
+    video_token_ids: Any,
     tokenizer: Any,
     uni_prompting: Any,
-    image_tokens: torch.Tensor | None,
-    video_tokens: torch.Tensor | None,
+    question: str,
     image_token_offset: int,
-) -> list[int]:
-    if task == "i2t":
-        if image_tokens is None:
-            raise ValueError("i2t requires media tokens")
-        from i2t import build_i2t_input_ids as _build_i2t_input_ids_ref
+) -> tuple[list[int], str]:
+    media_ids = video_token_ids
+    if isinstance(media_ids, torch.Tensor):
+        media_ids = media_ids.detach().cpu().reshape(-1).tolist()
+    else:
+        media_ids = np.asarray(media_ids).reshape(-1).tolist()
+    media_ids = [int(x) + int(image_token_offset) for x in media_ids]
 
-        token_ids, _ = _build_i2t_input_ids_ref(
-            image_token_ids=image_tokens,
-            tokenizer=tokenizer,
-            uni_prompting=uni_prompting,
-            question=text,
-            image_token_offset=int(image_token_offset),
-        )
-        return [int(v) for v in token_ids]
+    sptids = uni_prompting.sptids_dict
+    task_id = _scalar_token_id(sptids["<|v2t|>"])
+    soi_id = _scalar_token_id(sptids["<|soi|>"])
+    eoi_id = _scalar_token_id(sptids["<|eoi|>"])
+    sot_id = _scalar_token_id(sptids["<|sot|>"])
 
-    if task == "v2t":
-        if video_tokens is None:
-            raise ValueError("v2t requires media tokens")
-        from v2t import build_v2t_input_ids as _build_v2t_input_ids_ref
-
-        token_ids, _ = _build_v2t_input_ids_ref(
-            video_token_ids=video_tokens,
-            tokenizer=tokenizer,
-            uni_prompting=uni_prompting,
-            question=text,
-            image_token_offset=int(image_token_offset),
-        )
-        return [int(v) for v in token_ids]
-
-    raise ValueError(f"Unsupported task for i2t/v2t reference prompt build: {task}")
+    prompt_text = build_v2t_chat_prompt(question)
+    query_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].detach().cpu().tolist()
+    input_ids = [task_id, soi_id] + media_ids + [eoi_id, sot_id] + [int(v) for v in query_ids]
+    return input_ids, prompt_text
 
 
-def make_validation_style_mmu_prompt(
+def build_i2t_input_ids(
+    *,
+    image_token_ids: Any,
+    tokenizer: Any,
+    uni_prompting: Any,
+    question: str,
+    image_token_offset: int,
+) -> tuple[list[int], str]:
+    image_ids = image_token_ids
+    if isinstance(image_ids, torch.Tensor):
+        image_ids = image_ids.detach().cpu().reshape(-1).tolist()
+    else:
+        image_ids = np.asarray(image_ids).reshape(-1).tolist()
+    image_ids = [int(x) + int(image_token_offset) for x in image_ids]
+
+    sptids = uni_prompting.sptids_dict
+    task_id = _scalar_token_id(sptids["<|mmu|>"])
+    soi_id = _scalar_token_id(sptids["<|soi|>"])
+    eoi_id = _scalar_token_id(sptids["<|eoi|>"])
+    sot_id = _scalar_token_id(sptids["<|sot|>"])
+
+    prompt_text = build_i2t_chat_prompt(question)
+    query_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].detach().cpu().tolist()
+    input_ids = [task_id, soi_id] + image_ids + [eoi_id, sot_id] + [int(v) for v in query_ids]
+    return input_ids, prompt_text
+
+
+def build_v2t_chat_prompt(question: str) -> str:
+    return (
+        f"<|start_header_id|>user<|end_header_id|>\n{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+    )
+
+
+def build_i2t_chat_prompt(question: str) -> str:
+    return (
+        f"<|start_header_id|>user<|end_header_id|>\n{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+    )
+
+
+def make_mmu_prompt(
     *,
     task: str,
     text: str,
@@ -628,16 +667,26 @@ def make_validation_style_mmu_prompt(
 ) -> tuple[list[int], list[int]]:
     query_ids = _tokenize_chat_query(tokenizer, text)
 
-    if task in {"i2t", "v2t"}:
-        token_ids = _build_i2t_v2t_prompt_ids_via_reference(
-            task=task,
-            text=text,
+    if task == "i2t":
+        token_ids, _ = build_i2t_input_ids(
+            image_token_ids=image_tokens,
             tokenizer=tokenizer,
             uni_prompting=uni_prompting,
-            image_tokens=image_tokens,
-            video_tokens=video_tokens,
+            question=text,
             image_token_offset=int(image_token_offset),
         )
+        token_ids = [int(v) for v in token_ids]
+        return token_ids, [1] * len(token_ids)
+
+    if task == "v2t":
+        token_ids, _ = build_v2t_input_ids(
+            video_token_ids=video_tokens,
+            tokenizer=tokenizer,
+            uni_prompting=uni_prompting,
+            question=text,
+            image_token_offset=int(image_token_offset),
+        )
+        token_ids = [int(v) for v in token_ids]
         return token_ids, [1] * len(token_ids)
 
     if task == "s2t":
@@ -1200,9 +1249,9 @@ def main() -> None:
         )
         prompting_text_vocab_size = int(len(uni_prompting.text_tokenizer))
 
-        use_validation_style_mmu = task_name in {"i2t", "s2t", "v2t"} and not args.prompting_task.strip()
-        if use_validation_style_mmu:
-            prompt_token_ids, prompt_attention_mask = make_validation_style_mmu_prompt(
+        is_mmu_task = task_name in {"i2t", "s2t", "v2t"} and not args.prompting_task.strip()
+        if is_mmu_task:
+            prompt_token_ids, prompt_attention_mask = make_mmu_prompt(
                 task=task_name,
                 text=text,
                 tokenizer=uni_prompting.text_tokenizer,

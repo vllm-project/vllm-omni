@@ -1,34 +1,34 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
 from typing import Any
 
 import torch
-import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+from .dynin_omni import DyninOmniStageBase
 from .dynin_omni_common import (
-    DETOK_IMAGE,
+    DetokTarget,
     _to_bool,
-    build_zero_input_embeddings,
-    first_value,
+    coerce_token_ids_1d,
     get_dynin_magvit_attr,
-    get_runtime_info,
+    normalize_runtime_info,
     resolve_dynin_infer_sources,
     resolve_hidden_size,
-    to_token_1d,
+    unwrap_first_value,
 )
 
 logger = init_logger(__name__)
 
 
-class DyninOmniToken2Image(nn.Module):
+class DyninOmniToken2Image(DyninOmniStageBase):
     """Stage-2: token detokenization to image (or pass-through)."""
+
+    stage_name = "Dynin token2image"
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         del prefix
@@ -53,11 +53,11 @@ class DyninOmniToken2Image(nn.Module):
         del positions, intermediate_tensors, inputs_embeds
         if input_ids is None:
             raise ValueError("token2image stage requires input_ids")
-        runtime_info = get_runtime_info(kwargs.get("runtime_additional_information"))
-        detok_id = int(first_value(runtime_info.get("detok_id"), 0))
-        tokens = to_token_1d(input_ids)
+        runtime_info = normalize_runtime_info(kwargs.get("runtime_additional_information"))
+        detok_id = int(unwrap_first_value(runtime_info.get("detok_id"), 0))
+        tokens = coerce_token_ids_1d(input_ids)
 
-        if detok_id != DETOK_IMAGE:
+        if detok_id != DetokTarget.IMAGE:
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -79,11 +79,11 @@ class DyninOmniToken2Image(nn.Module):
         # Follow DYNIN validation path:
         #   tokens -> clamp -> vq_model.decode_code -> (x+1)/2 -> [0,1].
         vq_model = self._ensure_vq_model(runtime_info=runtime_info, ref_device=tokens.device)
-        codebook_size = int(first_value(runtime_info.get("codebook_size"), 8192))
-        image_vocab_offset = first_value(runtime_info.get("image_vocab_offset"), None)
+        codebook_size = int(unwrap_first_value(runtime_info.get("codebook_size"), 8192))
+        image_vocab_offset = unwrap_first_value(runtime_info.get("image_vocab_offset"), None)
         if image_vocab_offset is None:
-            text_vocab_size = first_value(runtime_info.get("text_vocab_size"), None)
-            num_new_special_tokens = int(first_value(runtime_info.get("num_new_special_tokens"), 0))
+            text_vocab_size = unwrap_first_value(runtime_info.get("text_vocab_size"), None)
+            num_new_special_tokens = int(unwrap_first_value(runtime_info.get("num_new_special_tokens"), 0))
             if text_vocab_size is not None:
                 image_vocab_offset = int(text_vocab_size) + num_new_special_tokens
 
@@ -105,9 +105,9 @@ class DyninOmniToken2Image(nn.Module):
         model_path = str(sources.vq_image_source)
         local_files_only = bool(sources.vq_image_local_files_only)
         if self._vq_model is None or self._vq_model_path != model_path or self._vq_local_files_only != local_files_only:
-            disable_xet = first_value(
+            disable_xet = unwrap_first_value(
                 runtime_info.get("hf_hub_disable_xet"),
-                first_value(runtime_info.get("disable_hf_xet"), True),
+                unwrap_first_value(runtime_info.get("disable_hf_xet"), True),
             )
             if _to_bool(disable_xet, default=True):
                 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -145,46 +145,6 @@ class DyninOmniToken2Image(nn.Module):
             self._vq_model = self._vq_model.to(ref_device)
         return self._vq_model
 
-    def make_empty_intermediate_tensors(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> IntermediateTensors:
-        del batch_size, dtype, device
-        return IntermediateTensors({})
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: Any = None,
-        is_multimodal: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        del multimodal_embeddings, is_multimodal, kwargs
-        return build_zero_input_embeddings(
-            input_ids=input_ids,
-            hidden_size=self.hidden_size,
-            stage_name="Dynin token2image",
-        )
-
     def embed_multimodal(self, **kwargs: Any) -> Any:
         del kwargs
-        return None
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loaded_params: set[str] = set()
-        for name, _ in weights:
-            loaded_params.add(name)
-        return loaded_params
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor | OmniOutput,
-        sampling_metadata: Any = None,
-    ) -> torch.Tensor | None:
-        del hidden_states, sampling_metadata
         return None

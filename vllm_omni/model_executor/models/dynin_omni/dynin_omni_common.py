@@ -8,12 +8,12 @@ import threading
 import types
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import torch
-from omegaconf import OmegaConf
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
@@ -25,39 +25,41 @@ except Exception:  # pragma: no cover
     snapshot_download = None
 
 
-DETOK_TEXT = 0
-DETOK_AUDIO = 1
-DETOK_IMAGE = 2
+class DetokTarget(IntEnum):
+    TEXT = 0
+    AUDIO = 1
+    IMAGE = 2
 
 
 TASK_TO_DETOK = {
-    "mmu": DETOK_TEXT,
-    "s2t": DETOK_TEXT,
-    "mmu_fast": DETOK_TEXT,
-    "mmu_fastdllm_v1": DETOK_TEXT,
-    "v2t": DETOK_TEXT,
-    "t2s": DETOK_AUDIO,
-    "t2s_mmu_like": DETOK_AUDIO,
-    "t2s_fixed": DETOK_AUDIO,
-    "s2s": DETOK_AUDIO,
-    "v2s": DETOK_AUDIO,
-    "t2i": DETOK_IMAGE,
-    "i2i": DETOK_IMAGE,
-    "ti2ti": DETOK_IMAGE,
+    "mmu": DetokTarget.TEXT,
+    "s2t": DetokTarget.TEXT,
+    "mmu_fast": DetokTarget.TEXT,
+    "mmu_fastdllm_v1": DetokTarget.TEXT,
+    "v2t": DetokTarget.TEXT,
+    "t2s": DetokTarget.AUDIO,
+    "t2s_mmu_like": DetokTarget.AUDIO,
+    "t2s_fixed": DetokTarget.AUDIO,
+    "s2s": DetokTarget.AUDIO,
+    "v2s": DetokTarget.AUDIO,
+    "t2i": DetokTarget.IMAGE,
+    "i2i": DetokTarget.IMAGE,
+    "ti2ti": DetokTarget.IMAGE,
 }
 
 DEFAULT_VQ_IMAGE_SOURCE = "snu-aidas/magvitv2"
 DEFAULT_VQ_AUDIO_SOURCE = "snu-aidas/emova_speech_tokenizer_vllm"
 DEFAULT_MAGVIT_REMOTE_CODE_REPO = "snu-aidas/magvitv2"
-
 DEFAULT_DYNIN_REMOTE_CODE_REPO = "snu-aidas/Dynin-Omni"
-_DYNIN_REMOTE_REPO_ENV = "DYNIN_REMOTE_CODE_REPO_ID"
-_DYNIN_REMOTE_REV_ENV = "DYNIN_REMOTE_CODE_REVISION"
-_DYNIN_REMOTE_LOCAL_ONLY_ENV = "DYNIN_REMOTE_CODE_LOCAL_FILES_ONLY"
+
+_DYNIN_CONFIG_CANDIDATE_RELPATHS = (
+    "configs/dynin_omni.yaml",
+    "models/configs/dynin_omni.yaml",
+    "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml",
+    "dynin_omni.yaml",
+)
+
 _DYNIN_REMOTE_ALLOW_PATTERNS = ("*.py", "*.json", "*.yaml", "*.yml")
-_DYNIN_MAGVIT_REMOTE_REPO_ENV = "DYNIN_MAGVIT_REMOTE_CODE_REPO_ID"
-_DYNIN_MAGVIT_REMOTE_REV_ENV = "DYNIN_MAGVIT_REMOTE_CODE_REVISION"
-_DYNIN_MAGVIT_REMOTE_LOCAL_ONLY_ENV = "DYNIN_MAGVIT_REMOTE_CODE_LOCAL_FILES_ONLY"
 
 _DYNIN_REMOTE_CACHE_LOCK = threading.Lock()
 _DYNIN_REMOTE_PACKAGE_BY_SNAPSHOT: dict[str, str] = {}
@@ -77,17 +79,37 @@ class DyninInferSources:
 
     @property
     def local_files_only(self) -> bool:
-        # Backward compatibility for old call sites.
         return self.model_local_files_only
 
 
-def first_value(value: Any, default: Any = None) -> Any:
+@dataclass(frozen=True)
+class RemoteCodeSettings:
+    default_repo: str
+    repo_env: str
+    revision_env: str
+    local_only_env: str
+
+
+DYNIN_REMOTE_SETTINGS = RemoteCodeSettings(
+    default_repo=DEFAULT_DYNIN_REMOTE_CODE_REPO,
+    repo_env="DYNIN_REMOTE_CODE_REPO_ID",
+    revision_env="DYNIN_REMOTE_CODE_REVISION",
+    local_only_env="DYNIN_REMOTE_CODE_LOCAL_FILES_ONLY",
+)
+
+MAGVIT_REMOTE_SETTINGS = RemoteCodeSettings(
+    default_repo=DEFAULT_MAGVIT_REMOTE_CODE_REPO,
+    repo_env="DYNIN_MAGVIT_REMOTE_CODE_REPO_ID",
+    revision_env="DYNIN_MAGVIT_REMOTE_CODE_REVISION",
+    local_only_env="DYNIN_MAGVIT_REMOTE_CODE_LOCAL_FILES_ONLY",
+)
+
+
+def unwrap_first_value(value: Any, default: Any = None) -> Any:
     if value is None:
         return default
     if isinstance(value, list):
-        if not value:
-            return default
-        return value[0]
+        return default if not value else value[0]
     if isinstance(value, torch.Tensor):
         if value.numel() == 0:
             return default
@@ -97,20 +119,24 @@ def first_value(value: Any, default: Any = None) -> Any:
     return value
 
 
-def get_runtime_info(runtime_additional_information: Any) -> dict[str, Any]:
+def normalize_runtime_info(runtime_additional_information: Any) -> dict[str, Any]:
     if isinstance(runtime_additional_information, list):
         if not runtime_additional_information:
             return {}
-        value = runtime_additional_information[0]
-        return value if isinstance(value, dict) else {}
+        first = runtime_additional_information[0]
+        return first if isinstance(first, dict) else {}
     if isinstance(runtime_additional_information, dict):
         return runtime_additional_information
     return {}
 
 
-def to_token_1d(value: Any, ref_device: torch.device | None = None) -> torch.Tensor:
+def coerce_token_ids_1d(
+    value: Any,
+    ref_device: torch.device | None = None,
+) -> torch.Tensor:
     if isinstance(value, tuple):
         value = value[0]
+
     if isinstance(value, list):
         if not value:
             device = ref_device or torch.device("cpu")
@@ -118,15 +144,22 @@ def to_token_1d(value: Any, ref_device: torch.device | None = None) -> torch.Ten
         if isinstance(value[0], torch.Tensor):
             value = value[0]
         else:
-            value = torch.tensor(value[0] if isinstance(value[0], list) else value, dtype=torch.long)
+            value = torch.tensor(
+                value[0] if isinstance(value[0], list) else value,
+                dtype=torch.long,
+            )
+
     if not isinstance(value, torch.Tensor):
         value = torch.tensor(value, dtype=torch.long)
+
     if value.ndim == 0:
         value = value.unsqueeze(0)
     if value.ndim > 1:
         value = value[0]
+
     if ref_device is not None and value.device != ref_device:
         value = value.to(ref_device)
+
     return value.to(dtype=torch.long).contiguous()
 
 
@@ -138,12 +171,10 @@ def _first_positive_int(value: Any) -> int | None:
             return None
         value = value.item()
     try:
-        ivalue = int(value)
+        value = int(value)
     except (TypeError, ValueError):
         return None
-    if ivalue <= 0:
-        return None
-    return ivalue
+    return value if value > 0 else None
 
 
 def resolve_hidden_size(
@@ -169,18 +200,14 @@ def resolve_hidden_size(
             if hidden_size is not None:
                 return hidden_size
 
-    config_candidates = [
+    for config_obj in (
         getattr(vllm_config.model_config, "hf_config", None),
         getattr(vllm_config.model_config, "hf_text_config", None),
-    ]
-    for config_obj in config_candidates:
+    ):
         if config_obj is None:
             continue
         for key in ("hidden_size", "d_model", "n_embd", "dim", "model_dim", "embed_dim"):
-            if isinstance(config_obj, dict):
-                value = config_obj.get(key)
-            else:
-                value = getattr(config_obj, key, None)
+            value = config_obj.get(key) if isinstance(config_obj, dict) else getattr(config_obj, key, None)
             hidden_size = _first_positive_int(value)
             if hidden_size is not None:
                 return hidden_size
@@ -196,12 +223,14 @@ def build_zero_input_embeddings(
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     if input_ids.ndim == 0:
-        return torch.zeros((1, hidden_size), dtype=dtype, device=input_ids.device)
-    if input_ids.ndim == 1:
-        return torch.zeros((input_ids.shape[0], hidden_size), dtype=dtype, device=input_ids.device)
-    if input_ids.ndim == 2:
-        return torch.zeros((input_ids.shape[0], input_ids.shape[1], hidden_size), dtype=dtype, device=input_ids.device)
-    raise ValueError(f"Unsupported input_ids rank for {stage_name}: {input_ids.ndim}")
+        shape = (1, hidden_size)
+    elif input_ids.ndim == 1:
+        shape = (input_ids.shape[0], hidden_size)
+    elif input_ids.ndim == 2:
+        shape = (input_ids.shape[0], input_ids.shape[1], hidden_size)
+    else:
+        raise ValueError(f"Unsupported input_ids rank for {stage_name}: {input_ids.ndim}")
+    return torch.zeros(shape, dtype=dtype, device=input_ids.device)
 
 
 def _to_bool(value: Any, default: bool = False) -> bool:
@@ -211,6 +240,7 @@ def _to_bool(value: Any, default: bool = False) -> bool:
         return value
     if isinstance(value, (int, float)):
         return bool(value)
+
     text = str(value).strip().lower()
     if text in ("1", "true", "yes", "y", "on"):
         return True
@@ -220,7 +250,15 @@ def _to_bool(value: Any, default: bool = False) -> bool:
 
 
 def _runtime_value(runtime_info: dict[str, Any], key: str) -> Any:
-    return first_value(runtime_info.get(key), None)
+    return unwrap_first_value(runtime_info.get(key), None)
+
+
+def _runtime_first_value(runtime_info: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = _runtime_value(runtime_info, key)
+        if value is not None:
+            return value
+    return None
 
 
 def _node_value(node: Any, key: str, default: Any = None) -> Any:
@@ -234,24 +272,6 @@ def _node_value(node: Any, key: str, default: Any = None) -> Any:
         return getattr(node, key, default)
 
 
-def _runtime_first_value(runtime_info: dict[str, Any], keys: tuple[str, ...]) -> Any:
-    for key in keys:
-        value = _runtime_value(runtime_info, key)
-        if value is not None:
-            return value
-    return None
-
-
-_DYNIN_CONFIG_CANDIDATE_RELPATHS = (
-    "configs/dynin_omni.yaml",
-    # Backward compatibility for older tree layouts.
-    "models/configs/dynin_omni.yaml",
-    # Some repos may keep the full project path in root.
-    "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml",
-    "dynin_omni.yaml",
-)
-
-
 def _looks_like_hf_repo_id(value: str | None) -> bool:
     if not isinstance(value, str):
         return False
@@ -262,9 +282,8 @@ def _looks_like_hf_repo_id(value: str | None) -> bool:
 
 
 def _find_dynin_config_under_root(root: Path) -> Path | None:
-    root = root.expanduser()
     for rel_path in _DYNIN_CONFIG_CANDIDATE_RELPATHS:
-        candidate = root / rel_path
+        candidate = root.expanduser() / rel_path
         if candidate.exists():
             return candidate.resolve()
     return None
@@ -272,82 +291,72 @@ def _find_dynin_config_under_root(root: Path) -> Path | None:
 
 @lru_cache(maxsize=16)
 def _resolve_dynin_config_from_hf_repo(repo_id: str) -> str | None:
-    if not _looks_like_hf_repo_id(repo_id):
-        return None
-    if snapshot_download is None:
+    if not _looks_like_hf_repo_id(repo_id) or snapshot_download is None:
         return None
 
-    # Use huggingface_hub cache resolution directly instead of manually walking
-    # HF cache internals. Keep local_files_only=True to preserve prior behavior
-    # (cache lookup only; no network fetch during config auto-discovery).
-    download_kwargs: dict[str, Any] = {
-        "repo_id": repo_id,
-        "repo_type": "model",
-        "allow_patterns": list(_DYNIN_CONFIG_CANDIDATE_RELPATHS),
-        "local_files_only": True,
-    }
     try:
-        snapshot_dir = Path(snapshot_download(**download_kwargs)).expanduser().resolve()
+        snapshot_dir = (
+            Path(
+                snapshot_download(
+                    repo_id=repo_id,
+                    repo_type="model",
+                    allow_patterns=list(_DYNIN_CONFIG_CANDIDATE_RELPATHS),
+                    local_files_only=True,
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
     except Exception:
         return None
 
     found = _find_dynin_config_under_root(snapshot_dir)
-    if found is not None:
-        return str(found)
+    return str(found) if found is not None else None
 
+
+def _resolve_existing_path(path_like: Any, source_name: str) -> str | None:
+    if path_like is None:
+        return None
+    text = str(path_like).strip()
+    if not text:
+        return None
+
+    path = Path(text).expanduser()
+    if path.exists():
+        return str(path.resolve())
+
+    logger.warning(
+        "DYNIN config path from %s does not exist: %s. Falling back to auto-discovery.",
+        source_name,
+        path,
+    )
     return None
 
 
 def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) -> str | None:
-    def _resolve_if_exists(path_like: Any, source_name: str) -> str | None:
-        if path_like is None:
-            return None
-        text = str(path_like).strip()
-        if not text:
-            return None
-        path = Path(text).expanduser()
-        if path.exists():
-            return str(path.resolve())
-        logger.warning(
-            "DYNIN config path from %s does not exist: %s. Falling back to auto-discovery.",
-            source_name,
-            path,
-        )
-        return None
-
-    runtime_path = _runtime_value(runtime_info, "dynin_config_path")
-    resolved_runtime_path = _resolve_if_exists(runtime_path, "runtime_info.dynin_config_path")
-    if resolved_runtime_path:
-        return resolved_runtime_path
-
-    env_path = os.getenv("DYNIN_CONFIG_PATH")
-    resolved_env_path = _resolve_if_exists(env_path, "DYNIN_CONFIG_PATH")
-    if resolved_env_path:
-        return resolved_env_path
-
-    cfg_path = getattr(vllm_config.model_config, "dynin_config_path", None)
-    resolved_cfg_path = _resolve_if_exists(cfg_path, "vllm_config.model_config.dynin_config_path")
-    if resolved_cfg_path:
-        return resolved_cfg_path
+    for value, name in (
+        (_runtime_value(runtime_info, "dynin_config_path"), "runtime_info.dynin_config_path"),
+        (os.getenv("DYNIN_CONFIG_PATH"), "DYNIN_CONFIG_PATH"),
+        (getattr(vllm_config.model_config, "dynin_config_path", None), "vllm_config.model_config.dynin_config_path"),
+    ):
+        resolved = _resolve_existing_path(value, name)
+        if resolved:
+            return resolved
 
     model_source = str(getattr(vllm_config.model_config, "model", "") or "")
     tokenizer_source = str(getattr(vllm_config.model_config, "tokenizer", "") or "")
     hf_config = getattr(vllm_config.model_config, "hf_config", None)
-    if isinstance(hf_config, dict):
-        hf_name_or_path = hf_config.get("_name_or_path", None)
-    else:
-        hf_name_or_path = getattr(hf_config, "_name_or_path", None)
+    hf_name_or_path = (
+        hf_config.get("_name_or_path") if isinstance(hf_config, dict) else getattr(hf_config, "_name_or_path", None)
+    )
 
-    # Prefer resolving from HF repo cache/snapshots early when model/tokenizer
-    # source is a repo id.
     hf_repo_candidates: list[str] = []
     for source in (model_source, tokenizer_source, hf_name_or_path):
         if not _looks_like_hf_repo_id(source):
             continue
-        source_text = str(source)
-        if source_text in hf_repo_candidates:
-            continue
-        hf_repo_candidates.append(source_text)
+        source = str(source)
+        if source not in hf_repo_candidates:
+            hf_repo_candidates.append(source)
 
     for source in hf_repo_candidates:
         resolved = _resolve_dynin_config_from_hf_repo(source)
@@ -355,7 +364,6 @@ def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) 
             logger.info("Resolved dynin config from Hugging Face cache for %s: %s", source, resolved)
             return resolved
 
-    # If model/tokenizer source itself is a local directory, prefer local config there first.
     for source in (model_source, tokenizer_source):
         source_path = Path(source).expanduser()
         if source_path.is_dir():
@@ -364,12 +372,10 @@ def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) 
                 return str(found)
 
     module_root = Path(__file__).resolve().parent
-    bundled_candidates = (
+    for bundled in (
         module_root / "configs" / "dynin_omni.yaml",
-        # Backward compatibility if an old tree layout is still present.
         module_root / "models" / "configs" / "dynin_omni.yaml",
-    )
-    for bundled in bundled_candidates:
+    ):
         if bundled.exists():
             return str(bundled)
 
@@ -378,6 +384,12 @@ def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) 
 
 @lru_cache(maxsize=16)
 def _load_omega_config(config_path: str) -> Any:
+    try:
+        from omegaconf import OmegaConf
+    except ImportError as e:
+        raise ImportError(
+            f"omegaconf is required to load Dynin config files. Install it to read config: {config_path}"
+        ) from e
     return OmegaConf.load(config_path)
 
 
@@ -434,16 +446,28 @@ def resolve_dynin_infer_sources(
         if config_file.exists():
             try:
                 dynin_cfg = _load_omega_config(str(config_file))
-                model_source = resolve_model_pretrained_source_fn(dynin_cfg, default=model_source)
-                tokenizer_source = resolve_tokenizer_source_fn(dynin_cfg, default=tokenizer_source)
+                model_source = resolve_model_pretrained_source_fn(
+                    dynin_cfg,
+                    default=model_source,
+                )
+                tokenizer_source = resolve_tokenizer_source_fn(
+                    dynin_cfg,
+                    default=tokenizer_source,
+                )
                 model_local_files_only = resolve_model_local_files_only_fn(
                     dynin_cfg,
                     default=model_local_files_only,
                 )
                 vq_image_cfg = resolve_vq_cfg_block_fn(dynin_cfg, modality="image")
                 vq_audio_cfg = resolve_vq_cfg_block_fn(dynin_cfg, modality="audio")
-                vq_image_source = resolve_vq_repo_source_fn(vq_image_cfg, default=vq_image_source)
-                vq_audio_source = resolve_vq_repo_source_fn(vq_audio_cfg, default=vq_audio_source)
+                vq_image_source = resolve_vq_repo_source_fn(
+                    vq_image_cfg,
+                    default=vq_image_source,
+                )
+                vq_audio_source = resolve_vq_repo_source_fn(
+                    vq_audio_cfg,
+                    default=vq_audio_source,
+                )
                 vq_image_local_files_only = _to_bool(
                     _node_value(vq_image_cfg, "local_files_only", None),
                     default=model_local_files_only,
@@ -453,7 +477,11 @@ def resolve_dynin_infer_sources(
                     default=model_local_files_only,
                 )
             except Exception as e:
-                logger.warning("Failed to resolve DYNIN inference config from %s: %s", config_file, e)
+                logger.warning(
+                    "Failed to resolve DYNIN inference config from %s: %s",
+                    config_file,
+                    e,
+                )
         else:
             logger.warning("DYNIN config path does not exist: %s", config_file)
 
@@ -501,15 +529,22 @@ def resolve_dynin_infer_sources(
             vq_audio_local_files_only = global_local
 
     if runtime_local_model is not None:
-        model_local_files_only = _to_bool(runtime_local_model, default=model_local_files_only)
+        model_local_files_only = _to_bool(
+            runtime_local_model,
+            default=model_local_files_only,
+        )
     if runtime_local_vq_image is not None:
-        vq_image_local_files_only = _to_bool(runtime_local_vq_image, default=vq_image_local_files_only)
+        vq_image_local_files_only = _to_bool(
+            runtime_local_vq_image,
+            default=vq_image_local_files_only,
+        )
     if runtime_local_vq_audio is not None:
-        vq_audio_local_files_only = _to_bool(runtime_local_vq_audio, default=vq_audio_local_files_only)
+        vq_audio_local_files_only = _to_bool(
+            runtime_local_vq_audio,
+            default=vq_audio_local_files_only,
+        )
 
     if runtime_local_global is None and runtime_local_model is None and local_vllm_model_source is not None:
-        # In vllm-omni stages, vllm_config.model_config.model is typically already
-        # a localized model dir. Prefer it over YAML repo_id for Stage-0 init.
         model_local_files_only = True
 
     if local_vllm_model_source is not None:
@@ -536,7 +571,7 @@ def resolve_dynin_infer_sources(
     )
 
 
-def _resolve_dynin_remote_source(source: str | None) -> str:
+def _resolve_remote_source(source: str | None, settings: RemoteCodeSettings) -> str:
     if isinstance(source, str):
         stripped = source.strip()
         if stripped:
@@ -546,29 +581,29 @@ def _resolve_dynin_remote_source(source: str | None) -> str:
             if _looks_like_hf_repo_id(stripped):
                 return stripped
 
-    env_repo = os.getenv(_DYNIN_REMOTE_REPO_ENV)
+    env_repo = os.getenv(settings.repo_env)
     if _looks_like_hf_repo_id(env_repo):
         return str(env_repo).strip()
 
-    return DEFAULT_DYNIN_REMOTE_CODE_REPO
+    return settings.default_repo
 
 
-def _resolve_dynin_remote_revision(revision: str | None) -> str | None:
+def _resolve_remote_revision(revision: str | None, settings: RemoteCodeSettings) -> str | None:
     if isinstance(revision, str) and revision.strip():
         return revision.strip()
-    env_revision = os.getenv(_DYNIN_REMOTE_REV_ENV)
+    env_revision = os.getenv(settings.revision_env)
     if isinstance(env_revision, str) and env_revision.strip():
         return env_revision.strip()
     return None
 
 
-def _resolve_dynin_remote_local_files_only(local_files_only: bool | None) -> bool:
+def _resolve_remote_local_only(local_files_only: bool | None, settings: RemoteCodeSettings) -> bool:
     if local_files_only is not None:
         return bool(local_files_only)
-    return _to_bool(os.getenv(_DYNIN_REMOTE_LOCAL_ONLY_ENV), default=False)
+    return _to_bool(os.getenv(settings.local_only_env), default=False)
 
 
-def _resolve_dynin_remote_snapshot_dir(
+def _resolve_remote_snapshot_dir(
     *,
     source: str,
     revision: str | None,
@@ -579,7 +614,7 @@ def _resolve_dynin_remote_snapshot_dir(
         return str(source_path.resolve())
 
     if snapshot_download is None:
-        raise RuntimeError("huggingface_hub is required to load remote Dynin-Omni code.")
+        raise RuntimeError("huggingface_hub is required to load remote code.")
 
     kwargs: dict[str, Any] = {
         "repo_id": source,
@@ -597,42 +632,44 @@ def _resolve_dynin_remote_snapshot_dir(
         return str(snapshot_download(**kwargs))
 
 
-def _ensure_dynin_remote_package(snapshot_dir: str) -> str:
+def _ensure_remote_package(snapshot_dir: str) -> str:
     with _DYNIN_REMOTE_CACHE_LOCK:
-        package_name = _DYNIN_REMOTE_PACKAGE_BY_SNAPSHOT.get(snapshot_dir)
-        if package_name is not None:
-            return package_name
+        existing = _DYNIN_REMOTE_PACKAGE_BY_SNAPSHOT.get(snapshot_dir)
+        if existing is not None:
+            return existing
 
         digest = hashlib.sha1(snapshot_dir.encode("utf-8")).hexdigest()[:12]
         package_name = f"_dynin_hf_remote_{digest}"
+
         package = types.ModuleType(package_name)
         package.__path__ = [snapshot_dir]  # type: ignore[attr-defined]
         package.__file__ = str(Path(snapshot_dir) / "__init__.py")
+
         sys.modules.setdefault(package_name, package)
         _DYNIN_REMOTE_PACKAGE_BY_SNAPSHOT[snapshot_dir] = package_name
         return package_name
 
 
-def _load_dynin_remote_module(
+def _load_remote_module(
     *,
     module_name: str,
     source: str,
     revision: str | None,
     local_files_only: bool,
 ):
-    snapshot_dir = _resolve_dynin_remote_snapshot_dir(
+    snapshot_dir = _resolve_remote_snapshot_dir(
         source=source,
         revision=revision,
         local_files_only=local_files_only,
     )
+
     module_path = Path(snapshot_dir) / f"{module_name}.py"
     if not module_path.is_file():
-        raise ImportError(
-            f"Dynin remote code module '{module_name}.py' not found under '{snapshot_dir}'. source={source!r}"
-        )
+        raise ImportError(f"Remote code module '{module_name}.py' not found under '{snapshot_dir}'. source={source!r}")
 
-    package_name = _ensure_dynin_remote_package(snapshot_dir)
+    package_name = _ensure_remote_package(snapshot_dir)
     full_name = f"{package_name}.{module_name}"
+
     existing = sys.modules.get(full_name)
     if existing is not None:
         return existing
@@ -652,19 +689,20 @@ def _load_dynin_remote_module(
     return module
 
 
-def get_dynin_remote_attr(
+def resolve_remote_attr(
     attr_name: str,
     *,
     module_name: str,
+    settings: RemoteCodeSettings,
     source: str | None = None,
     revision: str | None = None,
     local_files_only: bool | None = None,
     fallback_module_names: Iterable[str] = (),
     optional: bool = False,
 ) -> Any | None:
-    resolved_source = _resolve_dynin_remote_source(source)
-    resolved_revision = _resolve_dynin_remote_revision(revision)
-    resolved_local_only = _resolve_dynin_remote_local_files_only(local_files_only)
+    resolved_source = _resolve_remote_source(source, settings)
+    resolved_revision = _resolve_remote_revision(revision, settings)
+    resolved_local_only = _resolve_remote_local_only(local_files_only, settings)
 
     module_candidates = [module_name, *[m for m in fallback_module_names if m and m != module_name]]
     last_error: Exception | None = None
@@ -676,7 +714,7 @@ def get_dynin_remote_attr(
             return cached
 
         try:
-            module = _load_dynin_remote_module(
+            module = _load_remote_module(
                 module_name=candidate,
                 source=resolved_source,
                 revision=resolved_revision,
@@ -688,12 +726,11 @@ def get_dynin_remote_attr(
                 return value
         except Exception as e:
             last_error = e
-            continue
 
     if optional:
         if last_error is not None:
             logger.debug(
-                "Optional Dynin remote attr not found: attr=%s source=%s revision=%s err=%s",
+                "Optional remote attr not found: attr=%s source=%s revision=%s err=%s",
                 attr_name,
                 resolved_source,
                 resolved_revision,
@@ -702,7 +739,7 @@ def get_dynin_remote_attr(
         return None
 
     raise ImportError(
-        f"Failed to resolve '{attr_name}' from remote Dynin code "
+        f"Failed to resolve '{attr_name}' from remote code "
         f"(source={resolved_source!r}, revision={resolved_revision!r}, modules={module_candidates})."
     ) from last_error
 
@@ -712,14 +749,6 @@ _DYNIN_MODELING_REMOTE_EXPORTS = {
     "DyninOmniModelLM": "DyninOmniModelLM",
     "VideoTokenMerger": "VideoTokenMerger",
 }
-
-
-def get_dynin_modeling_attr(name: str) -> Any:
-    attr_name = _DYNIN_MODELING_REMOTE_EXPORTS.get(name)
-    if attr_name is None:
-        raise AttributeError(f"Unsupported Dynin modeling export: {name!r}")
-    return get_dynin_remote_attr(attr_name, module_name="modeling_dynin_omni")
-
 
 _DYNIN_SAMPLING_REMOTE_EXPORTS = {
     "log": "log",
@@ -735,14 +764,6 @@ _DYNIN_SAMPLING_REMOTE_EXPORTS = {
     "top_k_top_p_filtering": "top_k_top_p_filtering",
 }
 
-
-def get_dynin_sampling_attr(name: str) -> Any:
-    attr_name = _DYNIN_SAMPLING_REMOTE_EXPORTS.get(name)
-    if attr_name is None:
-        raise AttributeError(f"Unsupported Dynin sampling export: {name!r}")
-    return get_dynin_remote_attr(attr_name, module_name="sampling")
-
-
 _DYNIN_CONFIG_RESOLVER_REMOTE_EXPORTS = {
     "resolve_model_pretrained_source": "resolve_model_pretrained_source",
     "resolve_tokenizer_source": "resolve_tokenizer_source",
@@ -750,6 +771,57 @@ _DYNIN_CONFIG_RESOLVER_REMOTE_EXPORTS = {
     "resolve_vq_cfg_block": "resolve_vq_cfg_block",
     "resolve_vq_repo_source": "resolve_vq_repo_source",
 }
+
+_DYNIN_MAGVIT_REMOTE_EXPORTS = {
+    "VQGANEncoder": "VQGANEncoder",
+    "VQGANDecoder": "VQGANDecoder",
+    "LFQuantizer": "LFQuantizer",
+    "MAGVITv2": "MAGVITv2",
+}
+
+
+def _get_export_attr(
+    name: str,
+    export_map: dict[str, str],
+    *,
+    module_name: str,
+    settings: RemoteCodeSettings,
+    source: str | None = None,
+    revision: str | None = None,
+    local_files_only: bool | None = None,
+    optional: bool = False,
+) -> Any | None:
+    attr_name = export_map.get(name)
+    if attr_name is None:
+        raise AttributeError(f"Unsupported export: {name!r}")
+
+    return resolve_remote_attr(
+        attr_name,
+        module_name=module_name,
+        settings=settings,
+        source=source,
+        revision=revision,
+        local_files_only=local_files_only,
+        optional=optional,
+    )
+
+
+def get_dynin_modeling_attr(name: str) -> Any:
+    return _get_export_attr(
+        name,
+        _DYNIN_MODELING_REMOTE_EXPORTS,
+        module_name="modeling_dynin_omni",
+        settings=DYNIN_REMOTE_SETTINGS,
+    )
+
+
+def get_dynin_sampling_attr(name: str) -> Any:
+    return _get_export_attr(
+        name,
+        _DYNIN_SAMPLING_REMOTE_EXPORTS,
+        module_name="sampling",
+        settings=DYNIN_REMOTE_SETTINGS,
+    )
 
 
 def get_dynin_config_resolver_attr(
@@ -764,9 +836,10 @@ def get_dynin_config_resolver_attr(
         raise AttributeError(f"Unsupported Dynin config_resolver export: {name!r}")
 
     if source is not None:
-        value = get_dynin_remote_attr(
+        value = resolve_remote_attr(
             attr_name,
             module_name="config_resolver",
+            settings=DYNIN_REMOTE_SETTINGS,
             source=source,
             revision=revision,
             local_files_only=local_files_only,
@@ -775,53 +848,15 @@ def get_dynin_config_resolver_attr(
         if value is not None:
             return value
 
-    return get_dynin_remote_attr(
+    return resolve_remote_attr(
         attr_name,
         module_name="config_resolver",
+        settings=DYNIN_REMOTE_SETTINGS,
         source=DEFAULT_DYNIN_REMOTE_CODE_REPO,
         revision=revision,
         local_files_only=local_files_only,
+        optional=False,
     )
-
-
-_DYNIN_MAGVIT_REMOTE_EXPORTS = {
-    "VQGANEncoder": "VQGANEncoder",
-    "VQGANDecoder": "VQGANDecoder",
-    "LFQuantizer": "LFQuantizer",
-    "MAGVITv2": "MAGVITv2",
-}
-
-
-def _resolve_magvit_remote_source(source: str | None) -> str:
-    if isinstance(source, str):
-        stripped = source.strip()
-        if stripped:
-            source_path = Path(stripped).expanduser()
-            if source_path.is_dir():
-                return str(source_path.resolve())
-            if _looks_like_hf_repo_id(stripped):
-                return stripped
-
-    env_repo = os.getenv(_DYNIN_MAGVIT_REMOTE_REPO_ENV)
-    if _looks_like_hf_repo_id(env_repo):
-        return str(env_repo).strip()
-
-    return DEFAULT_MAGVIT_REMOTE_CODE_REPO
-
-
-def _resolve_magvit_remote_revision(revision: str | None) -> str | None:
-    if isinstance(revision, str) and revision.strip():
-        return revision.strip()
-    env_revision = os.getenv(_DYNIN_MAGVIT_REMOTE_REV_ENV)
-    if isinstance(env_revision, str) and env_revision.strip():
-        return env_revision.strip()
-    return None
-
-
-def _resolve_magvit_remote_local_files_only(local_files_only: bool | None) -> bool:
-    if local_files_only is not None:
-        return bool(local_files_only)
-    return _to_bool(os.getenv(_DYNIN_MAGVIT_REMOTE_LOCAL_ONLY_ENV), default=False)
 
 
 def get_dynin_magvit_attr(
@@ -835,26 +870,27 @@ def get_dynin_magvit_attr(
     if attr_name is None:
         raise AttributeError(f"Unsupported Dynin MAGVIT export: {name!r}")
 
-    resolved_source = _resolve_magvit_remote_source(source)
-    resolved_revision = _resolve_magvit_remote_revision(revision)
-    resolved_local_only = _resolve_magvit_remote_local_files_only(local_files_only)
-
-    value = get_dynin_remote_attr(
+    value = resolve_remote_attr(
         attr_name,
         module_name="modeling_magvitv2",
-        source=resolved_source,
-        revision=resolved_revision,
-        local_files_only=resolved_local_only,
+        settings=MAGVIT_REMOTE_SETTINGS,
+        source=source,
+        revision=revision,
+        local_files_only=local_files_only,
         optional=True,
     )
     if value is not None:
         return value
 
-    # Fallback to default MAGVIT remote repository if caller source does not expose code file.
+    resolved_source = _resolve_remote_source(source, MAGVIT_REMOTE_SETTINGS)
+    resolved_revision = _resolve_remote_revision(revision, MAGVIT_REMOTE_SETTINGS)
+    resolved_local_only = _resolve_remote_local_only(local_files_only, MAGVIT_REMOTE_SETTINGS)
+
     if resolved_source != DEFAULT_MAGVIT_REMOTE_CODE_REPO:
-        return get_dynin_remote_attr(
+        return resolve_remote_attr(
             attr_name,
             module_name="modeling_magvitv2",
+            settings=MAGVIT_REMOTE_SETTINGS,
             source=DEFAULT_MAGVIT_REMOTE_CODE_REPO,
             revision=resolved_revision,
             local_files_only=resolved_local_only,

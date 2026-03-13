@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import Any
 
 import torch
-import torch.nn as nn
 from transformers import AutoTokenizer
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -15,19 +13,20 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+from .dynin_omni import DyninOmniStageBase
 from .dynin_omni_common import (
-    DETOK_TEXT,
+    DYNIN_REMOTE_SETTINGS,
     TASK_TO_DETOK,
+    DetokTarget,
     _to_bool,
-    build_zero_input_embeddings,
-    first_value,
+    coerce_token_ids_1d,
     get_dynin_modeling_attr,
-    get_dynin_remote_attr,
     get_dynin_sampling_attr,
-    get_runtime_info,
+    normalize_runtime_info,
     resolve_dynin_infer_sources,
     resolve_hidden_size,
-    to_token_1d,
+    resolve_remote_attr,
+    unwrap_first_value,
 )
 
 logger = init_logger(__name__)
@@ -48,56 +47,151 @@ TASK_TO_PROMPTING_TASK = {
     "v2t": "v2t",
 }
 
-# UniversalPrompting in DYNIN covers all task families, so keep it enabled
-# for every task key we route in this stage.
-TASKS_REQUIRE_UNI_PROMPTING = set(TASK_TO_PROMPTING_TASK.keys())
+TASK_TO_GENERATE_FN = {
+    "t2i": "t2i_generate",
+    "i2i": "i2i_generate",
+    "ti2ti": "ti2ti_generate",
+    "t2s": "t2s_generate",
+    "t2s_mmu_like": "t2s_generate_mmu_like",
+    "t2s_fixed": "t2s_fixed_generate",
+    "s2s": "t2s_generate_mmu_like",
+    "v2s": "t2s_generate_mmu_like",
+    "s2t": "s2t_generate",
+    "mmu": "mmu_generate",
+    "t2t": "generate",
+    "mmu_fast": "mmu_generate_fast",
+    "mmu_fastdllm_v1": "mmu_generate_fastdllm_v1",
+    "v2t": "mmu_generate",
+}
+
+TASKS_USING_UNI_PROMPTING = set(TASK_TO_PROMPTING_TASK.keys())
+
+GENERATE_RUNTIME_KWARG_KEYS = (
+    "uncond_input_ids",
+    "uncond_attention_mask",
+    "noise_schedule",
+    "generator",
+    "config",
+    "uni_prompting",
+    "resolution",
+    "max_new_tokens",
+    "steps",
+    "block_length",
+    "temperature",
+    "top_k",
+    "eot_token",
+    "cfg_scale",
+    "remasking",
+    "mask_id",
+    "attention_mask",
+    "timesteps",
+    "guidance_scale",
+    "noise_type",
+    "seq_len",
+    "mask_token_id",
+    "codebook_size",
+    "audio_codebook_size",
+    "use_cache",
+    "threshold",
+    "factor",
+)
+
+PASSTHROUGH_GENERATE_KWARG_KEYS = (
+    "attention_mask",
+    "uncond_input_ids",
+    "uncond_attention_mask",
+    "noise_schedule",
+    "uni_prompting",
+    "generator",
+    "noise_type",
+)
+
+PROMPTING_PAYLOAD_KEYS = (
+    "prompting_input",
+    "prompting_inputs",
+    "dynin_inputs",
+    "model_inputs",
+    "raw_inputs",
+)
+
+UNCOND_PROMPTING_PAYLOAD_KEYS = (
+    "uncond_prompting_input",
+    "uncond_prompting_inputs",
+)
+
+PROMPTING_META_KEYS = (
+    "uncond_prompting_input",
+    "uncond_prompting_inputs",
+    "uni_prompting",
+    "prompting_task",
+    "prompting_config",
+)
+
+MM_INPUT_ALIASES = {
+    "image": ("pixel_values", "image_embeds"),
+    "video": ("pixel_values_videos", "video_embeds"),
+    "audio": ("input_audio_features", "audio_embeds"),
+}
 
 
-class DyninOmniToken2Text(nn.Module):
-    """Stage-1: DYNIN generation + text detokenization (or pass-through)."""
+class DyninOmniToken2Text(DyninOmniStageBase):
+    """Stage-1: DYNIN generation + text detokenization or pass-through."""
+
+    stage_name = "Dynin token2text"
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         del prefix
         super().__init__()
+
         self.vllm_config = vllm_config
         self.have_multimodal_outputs = True
         self.requires_raw_input_tokens = True
-        self._infer_sources = resolve_dynin_infer_sources(vllm_config=vllm_config)
-        model_path = self._infer_sources.model_source
-        tokenizer_path = self._infer_sources.tokenizer_source
-        local_files_only = self._infer_sources.model_local_files_only
-        if self._infer_sources.config_path:
-            logger.info("DYNIN token2text using inference config: %s", self._infer_sources.config_path)
 
-        self.model = self._load_text_model(model_path, local_files_only=local_files_only)
+        self._infer_sources = resolve_dynin_infer_sources(vllm_config=vllm_config)
+        if self._infer_sources.config_path:
+            logger.info(
+                "DYNIN token2text using inference config: %s",
+                self._infer_sources.config_path,
+            )
+
+        self.model = self._load_text_model(
+            self._infer_sources.model_source,
+            local_files_only=self._infer_sources.model_local_files_only,
+        )
         self.model.eval()
         self.model.requires_grad_(False)
-        self.hidden_size = resolve_hidden_size(vllm_config=vllm_config, model=self.model)
 
-        self.tokenizer = None
+        self.hidden_size = resolve_hidden_size(
+            vllm_config=vllm_config,
+            model=self.model,
+        )
+
+        self.tokenizer: Any | None = None
         self._tokenizer_path: str | None = None
-        try:
-            self.tokenizer = self._load_tokenizer(tokenizer_path, local_files_only=local_files_only)
-            self._tokenizer_path = tokenizer_path
-        except Exception:
-            self.tokenizer = None
         self._uni_prompting: Any | None = None
         self._uni_prompting_init_spec: tuple[Any, ...] | None = None
 
+        try:
+            self._set_tokenizer(
+                self._infer_sources.tokenizer_source,
+                local_files_only=self._infer_sources.model_local_files_only,
+            )
+        except Exception:
+            self.tokenizer = None
+            self._tokenizer_path = None
+
     @staticmethod
     def _load_text_model(model_path: str, *, local_files_only: bool = False) -> Any:
-        # Load Dynin model class from the model's remote code (HF snapshot),
-        # then load weights from model_path.
         try:
-            DyninOmniModelLM = get_dynin_modeling_attr("DyninOmniModelLM")
+            dynin_model_cls = get_dynin_modeling_attr("DyninOmniModelLM")
             try:
-                return DyninOmniModelLM.from_pretrained(
+                return dynin_model_cls.from_pretrained(
                     model_path,
                     torch_dtype=torch.bfloat16,
                     local_files_only=local_files_only,
                 )
             except TypeError:
-                return DyninOmniModelLM.from_pretrained(
+                return dynin_model_cls.from_pretrained(
                     model_path,
                     torch_dtype=torch.bfloat16,
                 )
@@ -106,27 +200,52 @@ class DyninOmniToken2Text(nn.Module):
                 f"Failed to load DyninOmniModelLM via remote Dynin code for model path '{model_path}'."
             ) from e
 
+    @staticmethod
+    def _load_tokenizer_from_source(
+        source: str,
+        *,
+        local_files_only: bool = False,
+        trust_remote_code: bool = False,
+    ) -> Any:
+        load_kwargs = {
+            "trust_remote_code": trust_remote_code,
+            "local_files_only": _to_bool(local_files_only, default=False),
+        }
+        try:
+            return AutoTokenizer.from_pretrained(source, **load_kwargs)
+        except TypeError:
+            load_kwargs.pop("local_files_only", None)
+            return AutoTokenizer.from_pretrained(source, **load_kwargs)
+
+    def _set_tokenizer(self, source: str, *, local_files_only: bool) -> None:
+        try:
+            tokenizer = self._load_tokenizer_from_source(
+                source,
+                local_files_only=local_files_only,
+                trust_remote_code=False,
+            )
+        except Exception as e:
+            logger.info(
+                "Falling back to trust_remote_code=True tokenizer loading for %s: %s",
+                source,
+                e,
+            )
+            tokenizer = self._load_tokenizer_from_source(
+                source,
+                local_files_only=local_files_only,
+                trust_remote_code=True,
+            )
+
+        self.tokenizer = tokenizer
+        self._tokenizer_path = source
+        self._reset_uni_prompting_cache()
+
+    def _reset_uni_prompting_cache(self) -> None:
+        self._uni_prompting = None
+        self._uni_prompting_init_spec = None
+
     def get_language_model(self) -> Any:
         return self.model
-
-    @staticmethod
-    def _load_tokenizer(model_path: str, *, local_files_only: bool = False) -> Any:
-        local_only = _to_bool(local_files_only, default=False)
-        load_kwargs = {"trust_remote_code": False, "local_files_only": local_only}
-        try:
-            try:
-                return AutoTokenizer.from_pretrained(model_path, **load_kwargs)
-            except TypeError:
-                load_kwargs.pop("local_files_only", None)
-                return AutoTokenizer.from_pretrained(model_path, **load_kwargs)
-        except Exception as e:
-            logger.info("Falling back to trust_remote_code=True tokenizer loading for %s: %s", model_path, e)
-            load_kwargs = {"trust_remote_code": True, "local_files_only": local_only}
-            try:
-                return AutoTokenizer.from_pretrained(model_path, **load_kwargs)
-            except TypeError:
-                load_kwargs.pop("local_files_only", None)
-                return AutoTokenizer.from_pretrained(model_path, **load_kwargs)
 
     def forward(
         self,
@@ -137,36 +256,54 @@ class DyninOmniToken2Text(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         del positions, intermediate_tensors, inputs_embeds
+
         if input_ids is None:
             raise ValueError("token2text stage requires input_ids")
 
-        runtime_info = get_runtime_info(kwargs.get("runtime_additional_information"))
-        task = str(first_value(runtime_info.get("task"), "mmu")).lower()
-        detok_id = int(first_value(runtime_info.get("detok_id"), TASK_TO_DETOK.get(task, DETOK_TEXT)))
+        runtime_info = normalize_runtime_info(kwargs.get("runtime_additional_information"))
+        task = str(unwrap_first_value(runtime_info.get("task"), "mmu")).lower()
+
+        detok_id = int(
+            unwrap_first_value(
+                runtime_info.get("detok_id"),
+                TASK_TO_DETOK.get(task, DetokTarget.TEXT),
+            )
+        )
+
         token_ids = self._generate_token_ids(
             task=task,
             input_ids=input_ids,
             runtime_info=runtime_info,
             kwargs=kwargs,
         )
-        if detok_id != DETOK_TEXT:
+
+        if detok_id != int(DetokTarget.TEXT):
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
                     "token_ids": token_ids,
-                    "detok_id": torch.tensor([detok_id], dtype=torch.long, device=token_ids.device),
+                    "detok_id": torch.tensor(
+                        [detok_id],
+                        dtype=torch.long,
+                        device=token_ids.device,
+                    ),
                 },
             )
 
         decode_tokens = self._extract_decode_tokens(token_ids, runtime_info=runtime_info)
         decoded_text = self._decode_text(decode_tokens, runtime_info=runtime_info)
+
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={
                 "token_ids": token_ids,
                 "text_tokens": decode_tokens,
                 "text": decoded_text,
-                "detok_id": torch.tensor([detok_id], dtype=torch.long, device=token_ids.device),
+                "detok_id": torch.tensor(
+                    [detok_id],
+                    dtype=torch.long,
+                    device=token_ids.device,
+                ),
             },
         )
 
@@ -177,95 +314,36 @@ class DyninOmniToken2Text(nn.Module):
         runtime_info: dict[str, Any],
         kwargs: dict[str, Any],
     ) -> torch.Tensor:
-        precomputed = runtime_info.get("generated_token_ids")
-        if precomputed is None:
-            precomputed = runtime_info.get("token_ids")
+        precomputed = self._get_precomputed_token_ids(runtime_info)
         if precomputed is not None:
-            return to_token_1d(precomputed, ref_device=input_ids.device)
+            return coerce_token_ids_1d(precomputed, ref_device=input_ids.device)
 
-        fn_map = {
-            "t2i": "t2i_generate",
-            "i2i": "i2i_generate",
-            "ti2ti": "ti2ti_generate",
-            "t2s": "t2s_generate",
-            "t2s_mmu_like": "t2s_generate_mmu_like",
-            "t2s_fixed": "t2s_fixed_generate",
-            "s2s": "t2s_generate_mmu_like",
-            "v2s": "t2s_generate_mmu_like",
-            "s2t": "s2t_generate",
-            "mmu": "mmu_generate",
-            "t2t": "generate",
-            "mmu_fast": "mmu_generate_fast",
-            "mmu_fastdllm_v1": "mmu_generate_fastdllm_v1",
-            "v2t": "mmu_generate",
-        }
-        fn_name = fn_map.get(task, "mmu_generate")
-        if not hasattr(self.model, fn_name):
-            raise RuntimeError(
-                f"DYNIN model does not expose '{fn_name}'. "
-                "Pass additional_information.generated_token_ids or adjust task mapping."
-            )
-        gen_fn = getattr(self.model, fn_name)
-        gen_kwargs: dict[str, Any] = {}
-        for key in (
-            "uncond_input_ids",
-            "uncond_attention_mask",
-            "noise_schedule",
-            "generator",
-            "config",
-            "uni_prompting",
-            "resolution",
-            "max_new_tokens",
-            "steps",
-            "block_length",
-            "temperature",
-            "top_k",
-            "eot_token",
-            "cfg_scale",
-            "remasking",
-            "mask_id",
-            "attention_mask",
-            "timesteps",
-            "guidance_scale",
-            "noise_type",
-            "seq_len",
-            "mask_token_id",
-            "codebook_size",
-            "audio_codebook_size",
-            "use_cache",
-            "threshold",
-            "factor",
-        ):
-            if key in runtime_info:
-                gen_kwargs[key] = first_value(runtime_info[key])
+        gen_fn_name = TASK_TO_GENERATE_FN.get(task, "mmu_generate")
+        gen_fn = self._resolve_generate_fn(gen_fn_name)
 
-        for key in (
-            "attention_mask",
-            "uncond_input_ids",
-            "uncond_attention_mask",
-            "noise_schedule",
-            "uni_prompting",
-            "generator",
-            "noise_type",
-        ):
-            if key not in gen_kwargs and key in kwargs:
-                gen_kwargs[key] = kwargs[key]
+        gen_kwargs = self._collect_generate_kwargs(runtime_info=runtime_info, kwargs=kwargs)
 
         if "noise_schedule" not in gen_kwargs:
-            resolved_noise_schedule = self._resolve_noise_schedule(runtime_info=runtime_info, kwargs=kwargs)
-            if resolved_noise_schedule is not None:
-                gen_kwargs["noise_schedule"] = resolved_noise_schedule
+            noise_schedule = self._resolve_noise_schedule(
+                runtime_info=runtime_info,
+                kwargs=kwargs,
+            )
+            if noise_schedule is not None:
+                gen_kwargs["noise_schedule"] = noise_schedule
 
-        if task in TASKS_REQUIRE_UNI_PROMPTING and "uni_prompting" not in gen_kwargs:
-            uni_prompting = self._resolve_uni_prompting(runtime_info=runtime_info, kwargs=kwargs)
+        if task in TASKS_USING_UNI_PROMPTING and "uni_prompting" not in gen_kwargs:
+            uni_prompting = self._get_or_create_uni_prompting(
+                runtime_info=runtime_info,
+                kwargs=kwargs,
+            )
             if uni_prompting is not None:
                 gen_kwargs["uni_prompting"] = uni_prompting
 
-        should_prepare_prompting_inputs = (task in TASKS_REQUIRE_UNI_PROMPTING) or self._has_prompting_payload(
+        should_prepare_prompting_inputs = task in TASKS_USING_UNI_PROMPTING or self._contains_prompting_payload(
             runtime_info=runtime_info, kwargs=kwargs
         )
         if should_prepare_prompting_inputs:
-            input_ids, gen_kwargs = self._maybe_prepare_inputs_via_prompting(
+            input_ids, gen_kwargs = self._prepare_prompting_inputs_if_needed(
                 task=task,
                 input_ids=input_ids,
                 runtime_info=runtime_info,
@@ -278,29 +356,62 @@ class DyninOmniToken2Text(nn.Module):
             gen_kwargs=gen_kwargs,
             ref_device=input_ids.device,
         )
-        gen_kwargs = self._filter_kwargs_for_generate_fn(gen_fn=gen_fn, gen_kwargs=gen_kwargs, fn_name=fn_name)
-        generated = self._call_generate_fn(gen_fn=gen_fn, input_ids=input_ids, gen_kwargs=gen_kwargs)
+        gen_kwargs = self._filter_supported_generate_kwargs(
+            gen_fn=gen_fn,
+            gen_kwargs=gen_kwargs,
+            fn_name=gen_fn_name,
+        )
 
-        return to_token_1d(generated, ref_device=input_ids.device)
+        generated = self._call_generate_fn(
+            gen_fn=gen_fn,
+            input_ids=input_ids,
+            gen_kwargs=gen_kwargs,
+        )
+        return coerce_token_ids_1d(generated, ref_device=input_ids.device)
 
     @staticmethod
-    def _has_prompting_payload(runtime_info: dict[str, Any], kwargs: dict[str, Any]) -> bool:
-        keys = (
-            "prompting_input",
-            "prompting_inputs",
-            "dynin_inputs",
-            "model_inputs",
-            "raw_inputs",
-            "uncond_prompting_input",
-            "uncond_prompting_inputs",
-            "uni_prompting",
-            "prompting_task",
-            "prompting_config",
-        )
+    def _get_precomputed_token_ids(runtime_info: dict[str, Any]) -> Any | None:
+        precomputed = runtime_info.get("generated_token_ids")
+        if precomputed is None:
+            precomputed = runtime_info.get("token_ids")
+        return precomputed
+
+    def _resolve_generate_fn(self, fn_name: str) -> Any:
+        if not hasattr(self.model, fn_name):
+            raise RuntimeError(
+                f"DYNIN model does not expose '{fn_name}'. "
+                "Pass additional_information.generated_token_ids or adjust task mapping."
+            )
+        return getattr(self.model, fn_name)
+
+    @staticmethod
+    def _collect_generate_kwargs(
+        *,
+        runtime_info: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        gen_kwargs: dict[str, Any] = {}
+
+        for key in GENERATE_RUNTIME_KWARG_KEYS:
+            if key in runtime_info:
+                gen_kwargs[key] = unwrap_first_value(runtime_info[key])
+
+        for key in PASSTHROUGH_GENERATE_KWARG_KEYS:
+            if key not in gen_kwargs and key in kwargs:
+                gen_kwargs[key] = kwargs[key]
+
+        return gen_kwargs
+
+    @staticmethod
+    def _contains_prompting_payload(
+        runtime_info: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> bool:
+        keys = PROMPTING_PAYLOAD_KEYS + PROMPTING_META_KEYS
         return any(key in runtime_info for key in keys) or any(key in kwargs for key in keys)
 
     @staticmethod
-    def _filter_kwargs_for_generate_fn(
+    def _filter_supported_generate_kwargs(
         *,
         gen_fn: Any,
         gen_kwargs: dict[str, Any],
@@ -308,6 +419,7 @@ class DyninOmniToken2Text(nn.Module):
     ) -> dict[str, Any]:
         if not gen_kwargs:
             return gen_kwargs
+
         try:
             signature = inspect.signature(gen_fn)
         except (TypeError, ValueError):
@@ -321,12 +433,18 @@ class DyninOmniToken2Text(nn.Module):
         allowed_keys = {
             name
             for name, param in params.items()
-            if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
         }
         filtered = {k: v for k, v in gen_kwargs.items() if k in allowed_keys}
+
         removed_keys = sorted(set(gen_kwargs.keys()) - set(filtered.keys()))
         if removed_keys:
             logger.debug("Filtered unsupported kwargs for %s: %s", fn_name, removed_keys)
+
         return filtered
 
     @staticmethod
@@ -362,7 +480,7 @@ class DyninOmniToken2Text(nn.Module):
         gen_kwargs: dict[str, Any],
         ref_device: torch.device,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        normalized_input_ids = self._to_2d_long(input_ids, ref_device)
+        normalized_input_ids = self._coerce_long_tensor_2d(input_ids, ref_device)
         if normalized_input_ids is None:
             normalized_input_ids = input_ids
 
@@ -370,13 +488,20 @@ class DyninOmniToken2Text(nn.Module):
         for key in ("attention_mask", "uncond_input_ids", "uncond_attention_mask"):
             if key not in normalized_kwargs:
                 continue
-            normalized_value = self._to_2d_long(normalized_kwargs[key], ref_device)
+            normalized_value = self._coerce_long_tensor_2d(
+                normalized_kwargs[key],
+                ref_device,
+            )
             if normalized_value is not None:
                 normalized_kwargs[key] = normalized_value
 
         return normalized_input_ids, normalized_kwargs
 
-    def _resolve_uni_prompting(self, runtime_info: dict[str, Any], kwargs: dict[str, Any]) -> Any | None:
+    def _get_or_create_uni_prompting(
+        self,
+        runtime_info: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> Any | None:
         runtime_uni_prompting = runtime_info.get("uni_prompting")
         if runtime_uni_prompting is not None:
             runtime_uni_prompting = self._unwrap_singleton(runtime_uni_prompting)
@@ -392,23 +517,23 @@ class DyninOmniToken2Text(nn.Module):
             return None
 
         use_reserved_token = _to_bool(
-            first_value(
+            unwrap_first_value(
                 runtime_info.get("use_reserved_token"),
-                first_value(runtime_info.get("prompting_use_reserved_token"), True),
+                unwrap_first_value(runtime_info.get("prompting_use_reserved_token"), True),
             ),
             default=True,
         )
 
-        max_text_len_value = first_value(
+        max_text_len_value = unwrap_first_value(
             runtime_info.get("prompt_max_text_len"),
-            first_value(
+            unwrap_first_value(
                 runtime_info.get("prompting_max_text_len"),
-                first_value(runtime_info.get("max_text_len"), None),
+                unwrap_first_value(runtime_info.get("max_text_len"), None),
             ),
         )
-        cond_dropout_value = first_value(
+        cond_dropout_value = unwrap_first_value(
             runtime_info.get("cond_dropout_prob"),
-            first_value(runtime_info.get("prompting_cond_dropout_prob"), None),
+            unwrap_first_value(runtime_info.get("prompting_cond_dropout_prob"), None),
         )
 
         max_text_len: int | None = None
@@ -449,19 +574,24 @@ class DyninOmniToken2Text(nn.Module):
         )
 
         if self._uni_prompting is not None and self._uni_prompting_init_spec != desired_spec:
-            self._uni_prompting = None
+            self._reset_uni_prompting_cache()
 
         if self._uni_prompting is None:
             try:
-                UniversalPrompting = get_dynin_remote_attr(
+                universal_prompting_cls = resolve_remote_attr(
                     "UniversalPrompting",
                     module_name="prompting_utils",
+                    settings=DYNIN_REMOTE_SETTINGS,
                     source=self._infer_sources.model_source,
                     local_files_only=self._infer_sources.model_local_files_only,
                     fallback_module_names=("modeling_dynin_omni",),
                     optional=True,
                 )
-                if UniversalPrompting is None:
+            except Exception:
+                universal_prompting_cls = None
+
+            try:
+                if universal_prompting_cls is None:
                     raise ImportError("UniversalPrompting is not available in the configured remote Dynin code.")
 
                 init_kwargs: dict[str, Any] = {
@@ -471,12 +601,13 @@ class DyninOmniToken2Text(nn.Module):
                     init_kwargs["max_text_len"] = max_text_len
                 if cond_dropout_prob is not None:
                     init_kwargs["cond_dropout_prob"] = cond_dropout_prob
-                self._uni_prompting = UniversalPrompting(self.tokenizer, **init_kwargs)
+
+                self._uni_prompting = universal_prompting_cls(self.tokenizer, **init_kwargs)
                 self._uni_prompting_init_spec = desired_spec
             except Exception as e:
                 logger.warning("Failed to initialize UniversalPrompting: %s", e)
-                self._uni_prompting = None
-                self._uni_prompting_init_spec = None
+                self._reset_uni_prompting_cache()
+
         return self._uni_prompting
 
     @staticmethod
@@ -509,8 +640,15 @@ class DyninOmniToken2Text(nn.Module):
                 return {str(k): v for k, v in parsed.items()}
         return {}
 
-    def _resolve_noise_schedule(self, runtime_info: dict[str, Any], kwargs: dict[str, Any]) -> Any | None:
-        runtime_noise_schedule = first_value(runtime_info.get("noise_schedule"), kwargs.get("noise_schedule"))
+    def _resolve_noise_schedule(
+        self,
+        runtime_info: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> Any | None:
+        runtime_noise_schedule = unwrap_first_value(
+            runtime_info.get("noise_schedule"),
+            kwargs.get("noise_schedule"),
+        )
         runtime_noise_schedule = self._unwrap_singleton(runtime_noise_schedule)
         if callable(runtime_noise_schedule):
             return runtime_noise_schedule
@@ -521,11 +659,9 @@ class DyninOmniToken2Text(nn.Module):
 
         if schedule_name is None:
             for key in ("noise_schedule_name", "mask_schedule", "schedule"):
-                value = first_value(runtime_info.get(key), None)
+                value = unwrap_first_value(runtime_info.get(key), None)
                 if value is None and key in kwargs:
                     value = self._unwrap_singleton(kwargs.get(key))
-                if value is None:
-                    continue
                 if isinstance(value, str) and value.strip():
                     schedule_name = value.strip()
                     break
@@ -534,8 +670,12 @@ class DyninOmniToken2Text(nn.Module):
             return None
 
         schedule_params = self._coerce_schedule_params(
-            first_value(runtime_info.get("noise_schedule_params"), kwargs.get("noise_schedule_params"))
+            unwrap_first_value(
+                runtime_info.get("noise_schedule_params"),
+                kwargs.get("noise_schedule_params"),
+            )
         )
+
         try:
             get_mask_schedule = get_dynin_sampling_attr("get_mask_schedule")
             return get_mask_schedule(schedule_name, **schedule_params)
@@ -549,13 +689,13 @@ class DyninOmniToken2Text(nn.Module):
             return None
 
     @staticmethod
-    def _to_2d_long(value: Any, device: torch.device) -> torch.Tensor | None:
+    def _coerce_long_tensor_2d(
+        value: Any,
+        device: torch.device,
+    ) -> torch.Tensor | None:
         if value is None:
             return None
-        if isinstance(value, torch.Tensor):
-            out = value
-        else:
-            out = torch.as_tensor(value)
+        out = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
         if out.ndim == 1:
             out = out.unsqueeze(0)
         if out.ndim > 2:
@@ -592,23 +732,19 @@ class DyninOmniToken2Text(nn.Module):
         return False
 
     @classmethod
-    def _materialize_payload_tensors(cls, value: Any, ref_device: torch.device) -> Any:
-        # Convert token-like numeric payloads to torch.LongTensor while preserving
-        # mixed structures such as [list[str], token_ids].
+    def _materialize_prompting_payload(cls, value: Any, ref_device: torch.device) -> Any:
         if isinstance(value, torch.Tensor):
             return value.to(device=ref_device, dtype=torch.long).contiguous()
         if isinstance(value, dict):
-            return {k: cls._materialize_payload_tensors(v, ref_device) for k, v in value.items()}
+            return {k: cls._materialize_prompting_payload(v, ref_device) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             if cls._is_numeric_token_structure(value):
                 try:
                     return torch.as_tensor(value, dtype=torch.long, device=ref_device)
                 except Exception:
                     pass
-            converted = [cls._materialize_payload_tensors(v, ref_device) for v in value]
-            if isinstance(value, tuple):
-                return tuple(converted)
-            return converted
+            converted = [cls._materialize_prompting_payload(v, ref_device) for v in value]
+            return tuple(converted) if isinstance(value, tuple) else converted
         return value
 
     @contextmanager
@@ -621,7 +757,6 @@ class DyninOmniToken2Text(nn.Module):
                     override_int = int(max_text_len_override)
                     if override_int > 0:
                         restore_values["max_text_len"] = getattr(uni_prompting, "max_text_len")
-                        # UniversalPrompting stores max_text_len as (requested + 1).
                         setattr(uni_prompting, "max_text_len", override_int + 1)
                 except Exception:
                     pass
@@ -633,7 +768,7 @@ class DyninOmniToken2Text(nn.Module):
                 except Exception:
                     pass
 
-    def _prepare_inputs_from_prompting_payload(
+    def _prepare_prompting_input(
         self,
         *,
         payload: Any,
@@ -649,26 +784,38 @@ class DyninOmniToken2Text(nn.Module):
         payload = self._unwrap_singleton(payload)
         prompting_task = str(
             self._unwrap_singleton(
-                first_value(runtime_info.get("prompting_task"), TASK_TO_PROMPTING_TASK.get(task, task))
+                unwrap_first_value(
+                    runtime_info.get("prompting_task"),
+                    TASK_TO_PROMPTING_TASK.get(task, task),
+                )
             )
         )
         prompting_cfg = self._unwrap_singleton(
-            first_value(runtime_info.get("prompting_config"), kwargs.get("prompting_config"))
+            unwrap_first_value(
+                runtime_info.get("prompting_config"),
+                kwargs.get("prompting_config"),
+            )
         )
 
         if isinstance(payload, dict):
-            if "task" in payload and payload["task"] is not None:
+            if payload.get("task") is not None:
                 prompting_task = str(payload["task"])
-            if "config" in payload and payload["config"] is not None:
+            if payload.get("config") is not None:
                 prompting_cfg = payload["config"]
             payload = payload.get("input", payload.get("inputs", payload.get("data", payload)))
-        payload = self._materialize_payload_tensors(payload, ref_device)
+
+        payload = self._materialize_prompting_payload(payload, ref_device)
 
         try:
             with self._temporary_prompting_overrides(uni_prompting, prompting_cfg):
                 prepared = uni_prompting(payload, prompting_task, config=prompting_cfg)
         except Exception as e:
-            logger.warning("UniversalPrompting failed for task=%s prompting_task=%s: %s", task, prompting_task, e)
+            logger.warning(
+                "UniversalPrompting failed for task=%s prompting_task=%s: %s",
+                task,
+                prompting_task,
+                e,
+            )
             return None, None
 
         if isinstance(prepared, tuple):
@@ -679,11 +826,11 @@ class DyninOmniToken2Text(nn.Module):
             prepared_attention_mask = None
 
         return (
-            self._to_2d_long(prepared_input_ids, ref_device),
-            self._to_2d_long(prepared_attention_mask, ref_device),
+            self._coerce_long_tensor_2d(prepared_input_ids, ref_device),
+            self._coerce_long_tensor_2d(prepared_attention_mask, ref_device),
         )
 
-    def _maybe_prepare_inputs_via_prompting(
+    def _prepare_prompting_inputs_if_needed(
         self,
         *,
         task: str,
@@ -694,25 +841,24 @@ class DyninOmniToken2Text(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         uni_prompting = gen_kwargs.get("uni_prompting")
         if uni_prompting is None:
-            uni_prompting = self._resolve_uni_prompting(runtime_info=runtime_info, kwargs=kwargs)
+            uni_prompting = self._get_or_create_uni_prompting(
+                runtime_info=runtime_info,
+                kwargs=kwargs,
+            )
             if uni_prompting is not None:
                 gen_kwargs["uni_prompting"] = uni_prompting
+
         if uni_prompting is None:
             return input_ids, gen_kwargs
 
-        payload = None
-        for key in ("prompting_input", "prompting_inputs", "dynin_inputs", "model_inputs", "raw_inputs"):
-            if key in runtime_info:
-                payload = runtime_info[key]
-                break
-            if key in kwargs:
-                payload = kwargs[key]
-                break
+        payload = self._find_first_payload(
+            runtime_info=runtime_info,
+            kwargs=kwargs,
+            keys=PROMPTING_PAYLOAD_KEYS,
+        )
 
-        prepared_input_ids = None
-        prepared_attention_mask = None
         if payload is not None:
-            prepared_input_ids, prepared_attention_mask = self._prepare_inputs_from_prompting_payload(
+            prepared_input_ids, prepared_attention_mask = self._prepare_prompting_input(
                 payload=payload,
                 task=task,
                 runtime_info=runtime_info,
@@ -720,22 +866,18 @@ class DyninOmniToken2Text(nn.Module):
                 uni_prompting=uni_prompting,
                 ref_device=input_ids.device,
             )
+            if prepared_input_ids is not None:
+                input_ids = prepared_input_ids
+                if prepared_attention_mask is not None and "attention_mask" not in gen_kwargs:
+                    gen_kwargs["attention_mask"] = prepared_attention_mask
 
-        if prepared_input_ids is not None:
-            input_ids = prepared_input_ids
-            if prepared_attention_mask is not None and "attention_mask" not in gen_kwargs:
-                gen_kwargs["attention_mask"] = prepared_attention_mask
-
-        uncond_payload = None
-        for key in ("uncond_prompting_input", "uncond_prompting_inputs"):
-            if key in runtime_info:
-                uncond_payload = runtime_info[key]
-                break
-            if key in kwargs:
-                uncond_payload = kwargs[key]
-                break
+        uncond_payload = self._find_first_payload(
+            runtime_info=runtime_info,
+            kwargs=kwargs,
+            keys=UNCOND_PROMPTING_PAYLOAD_KEYS,
+        )
         if uncond_payload is not None and "uncond_input_ids" not in gen_kwargs:
-            uncond_input_ids, uncond_attention_mask = self._prepare_inputs_from_prompting_payload(
+            uncond_input_ids, uncond_attention_mask = self._prepare_prompting_input(
                 payload=uncond_payload,
                 task=task,
                 runtime_info=runtime_info,
@@ -750,29 +892,49 @@ class DyninOmniToken2Text(nn.Module):
 
         return input_ids, gen_kwargs
 
-    def _extract_decode_tokens(self, tokens: torch.Tensor, runtime_info: dict[str, Any]) -> torch.Tensor:
-        # Keep behavior close to DYNIN usage where prompt portion is removed before decode.
+    @staticmethod
+    def _find_first_payload(
+        *,
+        runtime_info: dict[str, Any],
+        kwargs: dict[str, Any],
+        keys: tuple[str, ...],
+    ) -> Any | None:
+        for key in keys:
+            if key in runtime_info:
+                return runtime_info[key]
+            if key in kwargs:
+                return kwargs[key]
+        return None
+
+    def _extract_decode_tokens(
+        self,
+        tokens: torch.Tensor,
+        runtime_info: dict[str, Any],
+    ) -> torch.Tensor:
         prompt_len = int(
-            first_value(
+            unwrap_first_value(
                 runtime_info.get("prompt_length"),
-                first_value(
+                unwrap_first_value(
                     runtime_info.get("prompt_len"),
-                    first_value(runtime_info.get("prompt_token_len"), 0),
+                    unwrap_first_value(runtime_info.get("prompt_token_len"), 0),
                 ),
             )
         )
+
         decode_tokens = tokens
         if 0 < prompt_len < tokens.numel():
             decode_tokens = tokens[prompt_len:]
 
-        text_vocab_size = first_value(runtime_info.get("text_vocab_size"), None)
+        text_vocab_size = unwrap_first_value(runtime_info.get("text_vocab_size"), None)
         if text_vocab_size is None and self.tokenizer is not None:
             text_vocab_size = len(self.tokenizer)
+
         if text_vocab_size is not None:
             vocab_size = int(text_vocab_size)
             valid = decode_tokens[(decode_tokens >= 0) & (decode_tokens < vocab_size)]
             if valid.numel() > 0:
                 decode_tokens = valid
+
         return decode_tokens.contiguous()
 
     def _decode_text(self, tokens: torch.Tensor, runtime_info: dict[str, Any]) -> str:
@@ -780,19 +942,23 @@ class DyninOmniToken2Text(nn.Module):
         if self.tokenizer is None:
             return ""
         try:
-            return self.tokenizer.decode(tokens.detach().cpu().tolist(), skip_special_tokens=True)
+            return self.tokenizer.decode(
+                tokens.detach().cpu().tolist(),
+                skip_special_tokens=True,
+            )
         except Exception:
             return ""
 
     def _maybe_load_runtime_tokenizer(self, runtime_info: dict[str, Any]) -> None:
-        tokenizer_path = first_value(runtime_info.get("tokenizer_path"), None)
+        tokenizer_path = unwrap_first_value(runtime_info.get("tokenizer_path"), None)
         if tokenizer_path is not None:
             tokenizer_path = str(tokenizer_path)
-        runtime_local_files_only = first_value(
+
+        runtime_local_files_only = unwrap_first_value(
             runtime_info.get("local_files_only_model"),
-            first_value(
+            unwrap_first_value(
                 runtime_info.get("model_local_files_only"),
-                first_value(
+                unwrap_first_value(
                     runtime_info.get("local_files_only"),
                     self._infer_sources.model_local_files_only,
                 ),
@@ -802,46 +968,16 @@ class DyninOmniToken2Text(nn.Module):
             runtime_local_files_only,
             default=self._infer_sources.model_local_files_only,
         )
+
         if tokenizer_path and tokenizer_path != self._tokenizer_path:
             try:
                 logger.info("Loading DYNIN text tokenizer from %s", tokenizer_path)
-                load_kwargs = {"trust_remote_code": True, "local_files_only": local_only}
-                try:
-                    self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **load_kwargs)
-                except TypeError:
-                    load_kwargs.pop("local_files_only", None)
-                    self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **load_kwargs)
-                self._tokenizer_path = tokenizer_path
-                self._uni_prompting = None
-                self._uni_prompting_init_spec = None
+                self._set_tokenizer(tokenizer_path, local_files_only=local_only)
             except Exception as e:
                 logger.warning("Failed to load tokenizer from %s: %s", tokenizer_path, e)
 
-    def make_empty_intermediate_tensors(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> IntermediateTensors:
-        del batch_size, dtype, device
-        return IntermediateTensors({})
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: Any = None,
-        is_multimodal: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        del multimodal_embeddings, is_multimodal, kwargs
-        return build_zero_input_embeddings(
-            input_ids=input_ids,
-            hidden_size=self.hidden_size,
-            stage_name="Dynin token2text",
-        )
-
     @staticmethod
-    def _iter_mm_items(value: Any) -> list[Any]:
+    def _split_mm_items(value: Any) -> list[Any]:
         if value is None:
             return []
         if isinstance(value, torch.Tensor):
@@ -851,7 +987,6 @@ class DyninOmniToken2Text(nn.Module):
         if isinstance(value, list):
             return value
         if isinstance(value, tuple):
-            # Keep (audio_array, sample_rate)-like tuples as one item.
             if len(value) == 2 and isinstance(value[1], (int, float)):
                 return [value]
             return list(value)
@@ -864,7 +999,11 @@ class DyninOmniToken2Text(nn.Module):
             return torch.device("cpu")
 
     @staticmethod
-    def _mm_item_to_tensor(item: Any, *, device: torch.device) -> torch.Tensor:
+    def _coerce_mm_item_to_float_tensor(
+        item: Any,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
         if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], (int, float)):
             item = item[0]
 
@@ -872,13 +1011,18 @@ class DyninOmniToken2Text(nn.Module):
             tensor = item.detach().to(device=device, dtype=torch.float32)
         else:
             tensor = torch.as_tensor(item, dtype=torch.float32, device=device)
+
         return tensor.contiguous()
 
-    def _build_mm_embedding(self, item: Any, *, device: torch.device) -> torch.Tensor:
-        hidden_size = self.hidden_size
-        tensor = self._mm_item_to_tensor(item, device=device)
+    def _build_deterministic_mm_embedding(
+        self,
+        item: Any,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        tensor = self._coerce_mm_item_to_float_tensor(item, device=device)
         if tensor.numel() == 0:
-            return torch.zeros((1, hidden_size), dtype=torch.bfloat16, device=device)
+            return torch.zeros((1, self.hidden_size), dtype=torch.bfloat16, device=device)
 
         flattened = tensor.view(-1)
         first = flattened[0]
@@ -888,48 +1032,37 @@ class DyninOmniToken2Text(nn.Module):
         abs_mean = flattened.abs().mean()
         max_abs = flattened.abs().max()
         l2 = torch.linalg.vector_norm(flattened) / max(float(flattened.numel()), 1.0)
-        base = torch.stack([first, last, mean, std, abs_mean, max_abs, l2], dim=0)
 
+        base = torch.stack([first, last, mean, std, abs_mean, max_abs, l2], dim=0)
         denom = torch.clamp(base.abs().max(), min=1.0)
         base = base / denom
-        repeats = (hidden_size + base.numel() - 1) // base.numel()
-        embedding = base.repeat(repeats)[:hidden_size].to(dtype=torch.bfloat16)
+
+        repeats = (self.hidden_size + base.numel() - 1) // base.numel()
+        embedding = base.repeat(repeats)[: self.hidden_size].to(dtype=torch.bfloat16)
         return embedding.unsqueeze(0).contiguous()
 
-    def embed_multimodal(self, **kwargs: Any) -> Any:
-        # Build deterministic embeddings directly from input modality tensors
-        # so online multimodal requests follow the real mm_kwargs path.
-        mm_input_by_modality: dict[str, Any] = {}
-        for input_key, value in kwargs.items():
-            if input_key in ("pixel_values", "image_embeds") and "image" not in mm_input_by_modality:
-                mm_input_by_modality["image"] = value
-            if input_key in ("pixel_values_videos", "video_embeds") and "video" not in mm_input_by_modality:
-                mm_input_by_modality["video"] = value
-            if input_key in ("input_audio_features", "audio_embeds") and "audio" not in mm_input_by_modality:
-                mm_input_by_modality["audio"] = value
+    def _collect_mm_inputs(self, **kwargs: Any) -> dict[str, Any]:
+        mm_inputs: dict[str, Any] = {}
+        for modality, aliases in MM_INPUT_ALIASES.items():
+            for alias in aliases:
+                if alias in kwargs and kwargs[alias] is not None:
+                    mm_inputs[modality] = kwargs[alias]
+                    break
+        return mm_inputs
 
-        if not mm_input_by_modality:
+    def embed_multimodal(self, **kwargs: Any) -> Any:
+        mm_inputs = self._collect_mm_inputs(**kwargs)
+        if not mm_inputs:
             return None
+
         device = self._default_mm_device()
         mm_embeddings: list[torch.Tensor] = []
-        for value in mm_input_by_modality.values():
-            for item in self._iter_mm_items(value):
-                mm_embeddings.append(self._build_mm_embedding(item, device=device))
+
+        for modality in ("image", "video", "audio"):
+            value = mm_inputs.get(modality)
+            if value is None:
+                continue
+            for item in self._split_mm_items(value):
+                mm_embeddings.append(self._build_deterministic_mm_embedding(item, device=device))
+
         return tuple(mm_embeddings) if mm_embeddings else None
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        loaded_params: set[str] = set()
-        for name, _ in weights:
-            loaded_params.add(name)
-        return loaded_params
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor | OmniOutput,
-        sampling_metadata: Any = None,
-    ) -> torch.Tensor | None:
-        del hidden_states, sampling_metadata
-        return None
