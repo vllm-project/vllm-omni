@@ -83,9 +83,7 @@ def find_anomalies(rows: list[dict], high_pct: int = 95, low_pct: int = 5) -> li
     anomalies = []
     for r in rows:
         pct = r["memory_util_pct"]
-        ts_iso = r.get("timestamp_iso") or datetime.fromtimestamp(r["timestamp_epoch"]).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        ts_iso = r.get("timestamp_iso") or datetime.fromtimestamp(r["timestamp_epoch"]).strftime("%Y-%m-%d %H:%M:%S")
         extra = {"timestamp_iso": ts_iso}
         if pct >= high_pct:
             anomalies.append({**r, **extra, "type": "high", "threshold": high_pct})
@@ -94,9 +92,11 @@ def find_anomalies(rows: list[dict], high_pct: int = 95, low_pct: int = 5) -> li
     return anomalies
 
 
-def merge_anomalies_into_periods(
-    anomalies: list[dict], max_gap_seconds: int = 120
-) -> list[dict]:
+def _anomaly_sort_key(a: dict) -> tuple[int, str, int]:
+    return (a["gpu_index"], a["type"], a["timestamp_epoch"])
+
+
+def merge_anomalies_into_periods(anomalies: list[dict], max_gap_seconds: int = 120) -> list[dict]:
     """Merge consecutive anomalies (same GPU, same type) into time periods for display.
 
     This avoids truncation: instead of showing only the first N raw points, we show
@@ -106,25 +106,26 @@ def merge_anomalies_into_periods(
     if not anomalies:
         return []
     # Sort by GPU, type, then time so we can merge consecutive same-GPU same-type.
-    key = lambda a: (a["gpu_index"], a["type"], a["timestamp_epoch"])
-    sorted_anomalies = sorted(anomalies, key=key)
+    sorted_anomalies = sorted(anomalies, key=_anomaly_sort_key)
     periods = []
     for a in sorted_anomalies:
         ts = a["timestamp_epoch"]
         ts_iso = a.get("timestamp_iso") or datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         if not periods:
-            periods.append({
-                "gpu_index": a["gpu_index"],
-                "type": a["type"],
-                "threshold": a["threshold"],
-                "start_epoch": ts,
-                "end_epoch": ts,
-                "start_iso": ts_iso,
-                "end_iso": ts_iso,
-                "min_pct": a["memory_util_pct"],
-                "max_pct": a["memory_util_pct"],
-                "samples": 1,
-            })
+            periods.append(
+                {
+                    "gpu_index": a["gpu_index"],
+                    "type": a["type"],
+                    "threshold": a["threshold"],
+                    "start_epoch": ts,
+                    "end_epoch": ts,
+                    "start_iso": ts_iso,
+                    "end_iso": ts_iso,
+                    "min_pct": a["memory_util_pct"],
+                    "max_pct": a["memory_util_pct"],
+                    "samples": 1,
+                }
+            )
             continue
         last = periods[-1]
         if (
@@ -138,18 +139,20 @@ def merge_anomalies_into_periods(
             last["max_pct"] = max(last["max_pct"], a["memory_util_pct"])
             last["samples"] += 1
         else:
-            periods.append({
-                "gpu_index": a["gpu_index"],
-                "type": a["type"],
-                "threshold": a["threshold"],
-                "start_epoch": ts,
-                "end_epoch": ts,
-                "start_iso": ts_iso,
-                "end_iso": ts_iso,
-                "min_pct": a["memory_util_pct"],
-                "max_pct": a["memory_util_pct"],
-                "samples": 1,
-            })
+            periods.append(
+                {
+                    "gpu_index": a["gpu_index"],
+                    "type": a["type"],
+                    "threshold": a["threshold"],
+                    "start_epoch": ts,
+                    "end_epoch": ts,
+                    "start_iso": ts_iso,
+                    "end_iso": ts_iso,
+                    "min_pct": a["memory_util_pct"],
+                    "max_pct": a["memory_util_pct"],
+                    "samples": 1,
+                }
+            )
     return periods
 
 

@@ -1,6 +1,6 @@
+import json
 from pathlib import Path
 from typing import Any
-import json
 
 from tests.conftest import modify_stage_config
 
@@ -92,4 +92,3 @@ def create_benchmark_indices(
                 indices.append((test_name, idx))
 
     return indices
-
