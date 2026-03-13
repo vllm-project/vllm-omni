@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
 from time import time
 from typing import Any
@@ -48,6 +48,13 @@ class OmniARScheduler(VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Pending additional_information updates for running requests.
+        # Populated by update_request_additional_info(), consumed by schedule().
+        self._pending_additional_info_updates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Early-arriving updates for requests not yet registered.
+        # Keyed by external request ID, flushed when the request arrives.
+        self._early_additional_info_updates: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -67,6 +74,69 @@ class OmniARScheduler(VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+
+    # ------------------------------------------------------------------ #
+    #  Incremental additional_information updates for running requests     #
+    # ------------------------------------------------------------------ #
+
+    def update_request_additional_info(
+        self, request_id: str, update: dict[str, Any]
+    ) -> None:
+        """Queue an additional_information update for a running request.
+
+        The update is delivered to the model runner on the next scheduler
+        step via OmniSchedulerOutput.  Resolves the external request ID
+        immediately if possible (needed to resume paused requests without
+        waiting for the next schedule() call).
+        """
+        resolved_id = self._resolve_streaming_request_id(request_id)
+        if resolved_id is not None:
+            self._pending_additional_info_updates[resolved_id].append(update)
+            self._maybe_resume_request(resolved_id)
+        else:
+            self._early_additional_info_updates[request_id].append(update)
+
+    def _resolve_streaming_request_id(self, external_id: str) -> str | None:
+        """Resolve an external request ID to the internal (suffixed) ID.
+
+        vLLM appends a random suffix to request IDs (input_processor.py:519).
+        """
+        if external_id in self.requests:
+            return external_id
+        for rid, req in self.requests.items():
+            if getattr(req, "external_req_id", None) == external_id:
+                return rid
+        return None
+
+    def _maybe_resume_request(self, req_id: str) -> None:
+        """Resume a paused request if it was waiting for an update."""
+        req = self.requests.get(req_id)
+        if req is not None and req.status == RequestStatus.WAITING_FOR_CHUNK:
+            req.status = RequestStatus.RUNNING
+            if req not in self.running:
+                self.running.append(req)
+
+    def _flush_early_updates(self) -> None:
+        """Drain buffered updates for requests that have now been registered."""
+        if not self._early_additional_info_updates:
+            return
+        flushed_keys = []
+        for ext_id, updates in list(self._early_additional_info_updates.items()):
+            resolved = self._resolve_streaming_request_id(ext_id)
+            if resolved is not None:
+                self._pending_additional_info_updates[resolved].extend(updates)
+                flushed_keys.append(ext_id)
+                self._maybe_resume_request(resolved)
+        for k in flushed_keys:
+            del self._early_additional_info_updates[k]
+
+    def _drain_pending_additional_info_updates(self) -> dict[str, list[dict[str, Any]]]:
+        """Pop all pending updates. Called during schedule()."""
+        if not self._pending_additional_info_updates:
+            return {}
+        updates = dict(self._pending_additional_info_updates)
+        self._pending_additional_info_updates = defaultdict(list)
+        return updates
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -135,7 +205,17 @@ class OmniARScheduler(VLLMScheduler):
 
         return False
 
+    def add_request(self, *args, **kwargs):
+        """Override to flush early updates when a new request is registered."""
+        super().add_request(*args, **kwargs)
+        # Flush early-arriving streaming updates that were buffered
+        # before this request was registered.
+        self._flush_early_updates()
+
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
+        # Flush early-arriving updates for newly registered requests.
+        self._flush_early_updates()
+
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
@@ -185,9 +265,13 @@ class OmniARScheduler(VLLMScheduler):
         # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
+        # Drain pending additional_information updates for this step.
+        ai_updates = self._drain_pending_additional_info_updates()
+
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
+            additional_information_updates=ai_updates,
         )
 
     def update_from_output(
@@ -195,6 +279,21 @@ class OmniARScheduler(VLLMScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # Pause requests that signalled _streaming_needs_text via the model
+        # runner output.  Skip pausing if updates are already queued.
+        pause_ids = getattr(model_runner_output, "streaming_pause_req_ids", None)
+        if pause_ids:
+            paused = set()
+            for req_id in pause_ids:
+                if req_id in self._pending_additional_info_updates:
+                    continue
+                req = self.requests.get(req_id)
+                if req is not None and not req.is_finished():
+                    req.status = RequestStatus.WAITING_FOR_CHUNK
+                    paused.add(req)
+            if paused:
+                self.running = deque(r for r in self.running if r not in paused)
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

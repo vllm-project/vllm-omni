@@ -1504,6 +1504,7 @@ async def _stage_worker_async(
                 ein = cast(PromptType, ein)
                 llm_sampling_params: SamplingParams = task["sampling_params"]
                 gen_output = None
+
                 async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
                     gen_output = res
                     _gen_t1 = _time.time()
@@ -1520,10 +1521,15 @@ async def _stage_worker_async(
                 }
             )
 
+    # Cache the UPDATE request type for the main loop (avoid per-iteration import).
+    from vllm.v1.engine import EngineCoreRequestType as _ECRType
+    _update_request_type = _ECRType.UPDATE
+
     _batch_gen_t0 = _time.time()
     while True:
         try:
             task = in_q.get_nowait()
+
             task_type = task.get("type", OmniStageTaskType.GENERATE)
             if task_type == OmniStageTaskType.SHUTDOWN:
                 logger.debug("Received shutdown signal")
@@ -1532,9 +1538,21 @@ async def _stage_worker_async(
             elif task_type == OmniStageTaskType.ABORT:
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
+            elif task_type == OmniStageTaskType.UPDATE:
+                # Route additional_information update to the EngineCore's scheduler
+                # via the AsyncLLM engine_core client (fire-and-forget IPC).
+                rid = task["request_id"]
+                upd = task["update"]
+                try:
+                    _engine_core = getattr(stage_engine, "engine_core", None)
+                    if _engine_core is not None:
+                        _engine_core._send_input(
+                            _update_request_type, (rid, upd)
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to send UPDATE for {rid}: {e}")
             elif is_profiler_task(task_type):
                 profiler_data = await handle_profiler_task_async(task_type)
-                # Send result back to orchestrator for STOP command
                 if task_type == OmniStageTaskType.PROFILER_STOP:
                     out_q.put({"type": "profiler_result", "data": profiler_data})
             elif task_type == OmniStageTaskType.COLLECTIVE_RPC:

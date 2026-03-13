@@ -1070,6 +1070,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                 for req_id, req_infos in cached_infos.items():
                     self._update_intermediate_buffer(req_id, req_infos)
 
+        # Process incremental additional_information updates from OmniSchedulerOutput.
+        ai_updates = getattr(scheduler_output, "additional_information_updates", None)
+        if ai_updates:
+            for req_id, update_list in ai_updates.items():
+                for upd in update_list:
+                    self._update_intermediate_buffer(req_id, upd)
+
     def _maybe_attach_mimo_audio_req_infos(
         self,
         req_state: CachedRequestState | None,
@@ -1212,9 +1219,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         # cached requests. This is required for stages without preprocess
         # (e.g., code2wav) so runtime_additional_information can be refreshed
         # from scheduler cached infos on every step.
+        # Always call _update_additional_information (handles both regular
+        # and incremental updates from OmniSchedulerOutput).
         if hasattr(self.model, "has_preprocess") or hasattr(self.model, "enable_update_additional_information"):
-            if self.vllm_config.model_config.async_chunk:
-                self._update_additional_information(scheduler_output)
+            self._update_additional_information(scheduler_output)
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;
@@ -1253,8 +1261,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.text_step.gpu[decode_slice].copy_(text_step)
                     decode_req_ids.append(req_id)
 
+                # Propagate pause signal if the model needs more input
+                if update_dict.get("_streaming_needs_text"):
+                    if not getattr(self, "_streaming_pause_req_ids", None):
+                        self._streaming_pause_req_ids = []
+                    self._streaming_pause_req_ids.append(req_id)
+
                 # TODO(Peiqi): the merge stage could move out from the critical path
-                self._merge_additional_information_update(req_id, update_dict)
+                self._update_intermediate_buffer(req_id, update_dict)
 
                 # update the inputs_embeds and input_ids
                 seg_len = min(span_len, req_embeds.shape[0])
@@ -1333,6 +1347,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_last_model_output = model_output
         return model_output
 
+    # Keys where multiple updates should be concatenated rather than replaced.
+    _APPEND_KEYS = frozenset({"streaming_text_token_ids"})
+
     def _update_intermediate_buffer(self, req_id: str, upd: dict) -> None:
         if not isinstance(upd, dict) or not upd:
             return
@@ -1345,7 +1362,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             gpu_keys = self.model.gpu_resident_buffer_keys
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
         for k, v in upd.items():
-            if isinstance(v, torch.Tensor):
+            # For append-mode keys, concatenate rather than replace.
+            if k in self._APPEND_KEYS and isinstance(v, list) and isinstance(existing.get(k), list):
+                existing[k] = existing[k] + v
+            elif isinstance(v, torch.Tensor):
                 if k in gpu_keys:
                     existing[k] = v.detach().clone()
                 else:

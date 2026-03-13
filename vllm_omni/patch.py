@@ -3,6 +3,13 @@ from functools import cached_property as _cached_property
 
 from aenum import extend_enum
 from vllm.config import ModelConfig as _ModelConfig
+from vllm.v1.engine import EngineCoreRequestType as _ECRType
+
+# Add UPDATE request type for streaming additional_information updates.
+# This follows the same fire-and-forget pattern as ABORT.
+if not hasattr(_ECRType, "UPDATE"):
+    extend_enum(_ECRType, "UPDATE", b"\x05")
+
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -64,6 +71,38 @@ if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
     # The value - 1 is intentionally chosen to ensure it is treated
     # as a non-finished state and remains compatible with existing comparisons.
     extend_enum(RequestStatus, "WAITING_FOR_CHUNK", -1)
+
+
+# ---------------------------------------------------------------------------
+# Patch EngineCore._handle_client_request to support UPDATE messages.
+# UPDATE carries (request_id, update_dict) and routes to the scheduler's
+# update_request_additional_info() method.  Fire-and-forget, same as ABORT.
+# ---------------------------------------------------------------------------
+from vllm.v1.engine.core import EngineCoreProc as _EngineCoreProc
+
+_original_handle_client_request = _EngineCoreProc._handle_client_request
+
+
+def _patched_handle_client_request(self, request_type, request):
+    if request_type == _ECRType.UPDATE:
+        try:
+            req_id, update_dict = request
+        except (TypeError, ValueError):
+            return
+        if hasattr(self.scheduler, "update_request_additional_info"):
+            self.scheduler.update_request_additional_info(req_id, update_dict)
+        return
+    return _original_handle_client_request(self, request_type, request)
+
+
+_EngineCoreProc._handle_client_request = _patched_handle_client_request
+
+# Also patch DPEngineCoreProc if it exists
+try:
+    from vllm.v1.engine.core import DPEngineCoreProc as _DPEngineCoreProc
+    _DPEngineCoreProc._handle_client_request = _patched_handle_client_request
+except ImportError:
+    pass
 
 for module_name, module in sys.modules.items():
     # only do patch on module of vllm, pass others

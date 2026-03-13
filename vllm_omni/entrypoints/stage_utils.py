@@ -34,6 +34,7 @@ class OmniStageTaskType(enum.Enum):
     GENERATE = "generate"
     ABORT = "abort"
     SHUTDOWN = "shutdown"
+    UPDATE = "update"
     PROFILER_START = "profiler_start"
     PROFILER_STOP = "profiler_stop"
     COLLECTIVE_RPC = "collective_rpc"

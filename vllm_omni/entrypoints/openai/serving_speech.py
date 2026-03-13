@@ -1038,3 +1038,126 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
+
+    async def create_speech_streaming(
+        self,
+        initial_text: str,
+        text_stream,  # AsyncGenerator[str, None] — yields text chunks
+        voice: str = "dylan",
+        language: str = "English",
+        instructions: str = "",
+        task_type: str = "CustomVoice",
+    ):
+        """Create streaming speech with true real-time text input.
+
+        Text token IDs are sent via UPDATE_REQUEST and embedded on GPU.
+        The model's tailing_text_hidden queue is extended on the fly —
+        tts_eos_embed (from the initial prompt) stays at the end of the
+        queue, protected by a guard that only releases when
+        streaming_tts_eos is signalled.
+
+        Args:
+            initial_text: First text chunk to start generation with
+            text_stream: Async generator yielding additional text chunks
+            voice: Speaker voice name
+            language: Language code
+            instructions: Style/emotion instructions
+            task_type: "CustomVoice", "VoiceDesign", or "Base"
+
+        Yields:
+            bytes: PCM audio chunks as they're generated
+        """
+        import time as _time
+
+        from transformers import AutoTokenizer
+
+        request_id = f"stream-tts-{random_uuid()}"
+
+        model_path = self.engine_client.model_config.model
+        if not hasattr(self, "_streaming_tokenizer"):
+            self._streaming_tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=True
+            )
+        tok = self._streaming_tokenizer
+
+        tts_params = {
+            "text": [initial_text],
+            "task_type": [task_type],
+            "language": [language],
+            "instruct": [instructions],
+            # non_streaming_mode=False places tts_eos_embed at end of
+            # tailing_text_hidden. _streaming_request enables guard_eos
+            # and scheduler pausing in the decode path.
+            "non_streaming_mode": [False],
+            "_streaming_request": [True],
+        }
+        if voice:
+            tts_params["speaker"] = [voice]
+        tts_params["max_new_tokens"] = [4096]
+
+        ph_len = self._estimate_prompt_len(tts_params)
+        prompt = {
+            "prompt_token_ids": [1] * ph_len,
+            "additional_information": tts_params,
+        }
+
+        sampling_params_list = self.engine_client.default_sampling_params_list
+
+        generator = self.engine_client.generate(
+            prompt=prompt,
+            request_id=request_id,
+            sampling_params_list=sampling_params_list,
+            output_modalities=["audio"],
+        )
+
+        _total_stream_tokens = 0
+        _eos_sent_time = None
+
+        async def _feed_text():
+            nonlocal _total_stream_tokens, _eos_sent_time
+            try:
+                async for text_chunk in text_stream:
+                    if not text_chunk or not text_chunk.strip():
+                        continue
+                    token_ids = tok.encode(text_chunk, add_special_tokens=False)
+                    if not token_ids:
+                        continue
+                    _total_stream_tokens += len(token_ids)
+                    self.engine_client.update_request(request_id, {
+                        "streaming_text_token_ids": token_ids,
+                    })
+            except Exception as e:
+                logger.error(f"[{request_id}] Text stream error: {e}")
+            finally:
+                # Signal end of text: allows the model to pop tts_eos_embed
+                # from tailing_text_hidden (the "don't pop if not done" guard).
+                self.engine_client.update_request(request_id, {
+                    "streaming_tts_eos": True,
+                })
+                _eos_sent_time = _time.monotonic()
+
+        feed_task = asyncio.create_task(_feed_text())
+
+        # Safety abort: if the model doesn't generate natural codec_eos,
+        # stop after an audio budget proportional to the text length.
+        # ~4 codec frames per text token × 80ms/frame × 24kHz × 2 bytes/sample × 2x margin.
+        BYTES_PER_TEXT_TOKEN = int(4 * 0.08 * 24000 * 2 * 2.0)  # ~30720
+        _total_audio_bytes = 0
+        initial_tokens = len(tok.encode(initial_text, add_special_tokens=False))
+
+        async for pcm_bytes in self._generate_pcm_chunks(generator, request_id):
+            _total_audio_bytes += len(pcm_bytes)
+            yield pcm_bytes
+
+            if _eos_sent_time is not None:
+                total_tokens = initial_tokens + _total_stream_tokens
+                max_audio_bytes = total_tokens * BYTES_PER_TEXT_TOKEN
+                if _total_audio_bytes > max_audio_bytes:
+                    logger.info(
+                        f"[{request_id}] Audio budget exceeded "
+                        f"({_total_audio_bytes} > {max_audio_bytes}), aborting"
+                    )
+                    await self.engine_client.abort(request_id)
+                    break
+
+        await feed_task

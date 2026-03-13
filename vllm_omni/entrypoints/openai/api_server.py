@@ -235,6 +235,125 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        # --- Streaming TTS WebSocket endpoint ---
+        from fastapi import WebSocket, WebSocketDisconnect
+
+        @app.websocket("/v1/audio/speech/stream")
+        async def stream_speech_ws(ws: WebSocket):
+            """Streaming text-to-speech via WebSocket.
+
+            Client sends text chunks incrementally, server generates
+            one continuous audio stream with no voice discontinuity.
+
+            Protocol:
+              Client → Server:
+                {"type": "start", "voice": "dylan", "language": "English",
+                 "initial_text": "First words from LLM"}
+                {"type": "text", "content": "more words"}
+                {"type": "end"}
+
+              Server → Client:
+                {"type": "started", "request_id": "..."}
+                {"type": "audio", "data": "<base64 PCM>"}
+                {"type": "done"}
+            """
+            import asyncio as _aio
+
+            await ws.accept()
+            _req_id = f"stream-{uuid.uuid4().hex[:16]}"
+
+            try:
+                start_msg = await _aio.wait_for(ws.receive_json(), timeout=30)
+                if start_msg.get("type") != "start":
+                    await ws.send_json({"type": "error", "message": "Expected 'start'"})
+                    return
+
+                _voice = start_msg.get("voice", "dylan")
+                _lang = start_msg.get("language", "English")
+                _instr = start_msg.get("instructions", "")
+                _init_text = start_msg.get("initial_text") or start_msg.get("text", "")
+
+                if not _init_text:
+                    msg = await _aio.wait_for(ws.receive_json(), timeout=30)
+                    if msg.get("type") == "text":
+                        _init_text = msg["content"]
+                    elif msg.get("type") == "end":
+                        await ws.send_json({"type": "done"})
+                        return
+
+                if not _init_text.strip():
+                    await ws.send_json({"type": "error", "message": "No text"})
+                    return
+
+                logger.info(f"[{_req_id}] Streaming TTS: voice={_voice}, initial='{_init_text[:50]}'")
+                await ws.send_json({"type": "started", "request_id": _req_id})
+
+                # Async generator that yields text chunks from the WebSocket
+                _text_queue: _aio.Queue[str | None] = _aio.Queue()
+
+                async def _recv_text():
+                    try:
+                        while True:
+                            msg = await _aio.wait_for(ws.receive_json(), timeout=120)
+                            if msg.get("type") == "text":
+                                await _text_queue.put(msg["content"])
+                            elif msg.get("type") == "end":
+                                await _text_queue.put(None)
+                                break
+                    except (_aio.TimeoutError, WebSocketDisconnect):
+                        await _text_queue.put(None)
+
+                async def _text_stream():
+                    while True:
+                        chunk = await _text_queue.get()
+                        if chunk is None:
+                            break
+                        yield chunk
+
+                _recv_task = _aio.create_task(_recv_text())
+
+                # Use the streaming speech method
+                _ss = app.state.openai_serving_speech
+                _t0 = time.time()
+                _cc = 0
+
+                async for audio_chunk in _ss.create_speech_streaming(
+                    initial_text=_init_text,
+                    text_stream=_text_stream(),
+                    voice=_voice,
+                    language=_lang,
+                    instructions=_instr,
+                ):
+                    if audio_chunk:
+                        await ws.send_json({
+                            "type": "audio",
+                            "data": base64.b64encode(audio_chunk).decode("utf-8"),
+                        })
+                        _cc += 1
+                        if _cc == 1:
+                            logger.info(f"[{_req_id}] First audio at {time.time()-_t0:.3f}s")
+
+                logger.info(f"[{_req_id}] Done: {_cc} chunks, {time.time()-_t0:.2f}s")
+                await ws.send_json({"type": "done"})
+                _recv_task.cancel()
+
+            except WebSocketDisconnect:
+                logger.info(f"[{_req_id}] Client disconnected")
+            except Exception as e:
+                logger.error(f"[{_req_id}] Streaming TTS error: {e}", exc_info=True)
+                try:
+                    await ws.send_json({"type": "error", "message": str(e)})
+                except Exception:
+                    pass
+
+        logger.info("Registered /v1/audio/speech/stream WebSocket endpoint")
+        # --- End streaming TTS WebSocket endpoint ---
+
+        # Conditionally register profiler endpoints based on config or env var
+        if _should_enable_profiler_endpoints(args):
+            logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+            app.include_router(profiler_router)
+
         vllm_config = await engine_client.get_vllm_config()
 
         # Check if pure diffusion mode (vllm_config will be None)

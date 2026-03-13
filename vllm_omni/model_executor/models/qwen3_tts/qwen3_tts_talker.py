@@ -544,7 +544,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
             is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
             if is_first_prefill:
-                full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len, ref_code = (
+                full_prompt_embeds, tailing_text_hidden, tts_pad_embed, tts_eos_embed, ref_code_len, ref_code = (
                     self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
                 # Store full prompt embeddings + trailing queue on CPU for later chunks/steps.
@@ -553,6 +553,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     "talker_prompt_embeds": prompt_embeds_cpu,
                     "tailing_text_hidden": tailing_text_hidden.detach().to("cpu").contiguous(),
                     "tts_pad_embed": tts_pad_embed.detach().to("cpu").contiguous(),
+                    "tts_eos_embed": tts_eos_embed.detach().to("cpu").contiguous(),
                     "talker_prefill_offset": 0,
                     "codec_streaming": codec_streaming,
                 }
@@ -573,14 +574,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
                 info_update["talker_prefill_offset"] = int(offset + span_len)
             else:
-                # Subsequent prefill chunk: slice from stored embeddings at running offset.
+                # Subsequent prefill chunk: continuation of initial prompt.
                 if tts_pad_embed is None:
                     raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
                 offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
                 if offset < 0:
                     offset = 0
-                s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
-                e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
+
+                prompt_embeds_len = int(prompt_embeds_cpu.shape[0])
+
+                # ---- CHUNKED PREFILL (original prompt continuation) ----
+                s = max(0, min(offset, prompt_embeds_len))
+                e = max(0, min(offset + span_len, prompt_embeds_len))
                 take = prompt_embeds_cpu[s:e]
                 if int(take.shape[0]) < span_len:
                     pad_n = int(span_len - int(take.shape[0]))
@@ -609,10 +614,57 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
         tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
+        # ---- STREAMING TEXT INJECTION ----
+        # streaming_text_token_ids: list[int] — new text to embed and enqueue
+        # streaming_tts_eos: True — signal that text stream is done
+        #
+        # tailing_text_hidden ends with tts_eos_embed from _build_prompt_embeds.
+        # The pop logic below will NOT pop the last element (eos) until
+        # streaming_tts_eos is received — this prevents premature EOS.
+
+        token_ids_data = info_dict.get("streaming_text_token_ids")
+        eos_signal = info_dict.get("streaming_tts_eos")
+
+        # Embed new text tokens on GPU and append to tailing_text_hidden
+        if token_ids_data is not None:
+            if isinstance(token_ids_data, list):
+                ids_tensor = torch.tensor(token_ids_data, dtype=torch.long, device=input_ids.device)
+            elif isinstance(token_ids_data, torch.Tensor):
+                ids_tensor = token_ids_data.to(device=input_ids.device, dtype=torch.long)
+            else:
+                ids_tensor = None
+            if ids_tensor is not None and ids_tensor.numel() > 0:
+                with torch.no_grad():
+                    new_embeds = self.text_projection(
+                        self.text_embedding(ids_tensor.unsqueeze(0))
+                    ).squeeze(0).detach().to("cpu").contiguous()
+                tail = info_dict.get("tailing_text_hidden")
+                if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
+                    # Insert before last element (tts_eos_embed).
+                    # Works for any tail length: [:-1] is empty when len==1.
+                    info_dict["tailing_text_hidden"] = torch.cat(
+                        [tail[:-1], new_embeds, tail[-1:]], dim=0
+                    )
+                else:
+                    info_dict["tailing_text_hidden"] = new_embeds
+
+        # Pop one text embedding from the front of tailing_text_hidden.
+        # Special case: if only 1 element remains, only pop it if the text
+        # stream is done (eos has been appended). Otherwise use pad embed
+        # and wait for more text to arrive.
         tail_cpu = info_dict.get("tailing_text_hidden")
+        is_streaming = bool(info_dict.get("_streaming_request"))
+        text_done = bool(info_dict.get("_streaming_text_done")) or bool(eos_signal)
+
         if isinstance(tail_cpu, torch.Tensor) and tail_cpu.ndim == 2 and tail_cpu.shape[0] > 0:
-            text_step = tail_cpu[:1].to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
-            new_tail = tail_cpu[1:].detach().to("cpu").contiguous() if tail_cpu.shape[0] > 1 else tail_cpu[:0]
+            if tail_cpu.shape[0] == 1 and is_streaming and not text_done:
+                # Last element in queue (eos) but text stream not done — wait.
+                text_step = tts_pad_embed
+                new_tail = tail_cpu
+            else:
+                # Normal pop
+                text_step = tail_cpu[:1].to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+                new_tail = tail_cpu[1:].detach().to("cpu").contiguous() if tail_cpu.shape[0] > 1 else tail_cpu[:0]
         else:
             text_step = tts_pad_embed
             new_tail = tail_cpu if isinstance(tail_cpu, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
@@ -628,10 +680,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         )
         inputs_embeds_out = last_id_hidden.reshape(1, -1)
 
+        # Determine whether the model should pause for more text.
+        # If only eos remains and text stream is not done, signal the
+        # scheduler to pause this request until more text arrives.
+        needs_text = (
+            is_streaming and not text_done
+            and isinstance(new_tail, torch.Tensor) and new_tail.ndim == 2
+            and new_tail.shape[0] <= 1
+        )
+
         info_update = {
             "tailing_text_hidden": new_tail,
             "mtp_inputs": (past_hidden, text_step),
             "codec_streaming": codec_streaming,
+            # Clear consumed updates
+            "streaming_text_token_ids": None,
+            "streaming_tts_eos": None,
+            # Persist streaming state
+            "_streaming_text_done": text_done if text_done else None,
+            "_streaming_needs_text": True if needs_text else None,
         }
         return input_ids, inputs_embeds_out, info_update
 
@@ -1190,7 +1257,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         *,
         task_type: str,
         info_dict: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
         text = (info_dict.get("text") or [""])[0]
         language = (info_dict.get("language") or ["Auto"])[0]
         non_streaming_mode_val = info_dict.get("non_streaming_mode")
@@ -1417,12 +1484,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 else:
                     first_text = self.text_projection(self.text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
                     talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
+                    text_embeds = self.text_projection(self.text_embedding(input_ids[:, 4:-5]))
                     trailing_text_hidden = torch.cat(
-                        (
-                            self.text_projection(self.text_embedding(input_ids[:, 4:-5])),
-                            tts_eos_embed,
-                        ),
-                        dim=1,
+                        (text_embeds, tts_eos_embed), dim=1,
                     )
 
         elif task_type == "CustomVoice":
@@ -1530,6 +1594,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             talker_prompt.squeeze(0),  # [prompt_len, H]
             trailing_text_hidden.squeeze(0),  # [T, H]
             tts_pad_embed.squeeze(0),  # [1, H]
+            tts_eos_embed.squeeze(0),  # [1, H]
             ref_code_len,
             ref_code_prompt.contiguous() if isinstance(ref_code_prompt, torch.Tensor) else None,
         )

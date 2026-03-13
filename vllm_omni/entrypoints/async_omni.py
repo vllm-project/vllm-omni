@@ -840,6 +840,21 @@ class AsyncOmni(OmniBase):
             stage.submit(abort_task)
         return None
 
+    def update_request(
+        self, request_id: str, update: dict, *, stage_id: int = 0
+    ) -> None:
+        """Send an additional_information update to a running request.
+
+        The update dict is merged into the request's additional_information_cpu
+        on the model runner side.  Flow: stage worker → EngineCore → Scheduler
+        → SchedulerOutput → ModelRunner.
+        """
+        self.stage_list[stage_id].submit({
+            "type": OmniStageTaskType.UPDATE,
+            "request_id": request_id,
+            "update": update,
+        })
+
     async def get_vllm_config(self) -> VllmConfig:
         for stage in self.stage_list:
             if stage.is_comprehension:

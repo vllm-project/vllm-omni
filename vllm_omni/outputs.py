@@ -24,6 +24,9 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
+    # IDs of requests that need more input before continuing.
+    # Scheduler pauses these until an UPDATE arrives.
+    streaming_pause_req_ids: list[str] | None = None
 
 
 @dataclass

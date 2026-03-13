@@ -69,6 +69,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._streaming_pause_req_ids: list[str] | None = None
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
@@ -610,6 +611,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
+            # Propagate pause signals from preprocess to scheduler
+            pause_ids = getattr(self, "_streaming_pause_req_ids", None)
+            if pause_ids:
+                output.streaming_pause_req_ids = pause_ids
+                self._streaming_pause_req_ids = None
 
         if not self.use_async_scheduling:
             return output

@@ -75,3 +75,8 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
+
+    # Per-request additional_information updates for running requests.
+    # Maps request_id → list of update dicts to merge into the request's
+    # additional_information_cpu on the model runner.
+    additional_information_updates: dict[str, list[dict]] = field(default_factory=dict)
