@@ -83,11 +83,74 @@ def find_anomalies(rows: list[dict], high_pct: int = 95, low_pct: int = 5) -> li
     anomalies = []
     for r in rows:
         pct = r["memory_util_pct"]
+        ts_iso = r.get("timestamp_iso") or datetime.fromtimestamp(r["timestamp_epoch"]).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        extra = {"timestamp_iso": ts_iso}
         if pct >= high_pct:
-            anomalies.append({**r, "type": "high", "threshold": high_pct})
-        elif pct <= low_pct and pct > 0:
-            anomalies.append({**r, "type": "low", "threshold": low_pct})
+            anomalies.append({**r, **extra, "type": "high", "threshold": high_pct})
+        elif pct <= low_pct:
+            anomalies.append({**r, **extra, "type": "low", "threshold": low_pct})
     return anomalies
+
+
+def merge_anomalies_into_periods(
+    anomalies: list[dict], max_gap_seconds: int = 120
+) -> list[dict]:
+    """Merge consecutive anomalies (same GPU, same type) into time periods for display.
+
+    This avoids truncation: instead of showing only the first N raw points, we show
+    each continuous period once, so all below-threshold (or above-threshold) periods
+    are visible in the report.
+    """
+    if not anomalies:
+        return []
+    # Sort by GPU, type, then time so we can merge consecutive same-GPU same-type.
+    key = lambda a: (a["gpu_index"], a["type"], a["timestamp_epoch"])
+    sorted_anomalies = sorted(anomalies, key=key)
+    periods = []
+    for a in sorted_anomalies:
+        ts = a["timestamp_epoch"]
+        ts_iso = a.get("timestamp_iso") or datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        if not periods:
+            periods.append({
+                "gpu_index": a["gpu_index"],
+                "type": a["type"],
+                "threshold": a["threshold"],
+                "start_epoch": ts,
+                "end_epoch": ts,
+                "start_iso": ts_iso,
+                "end_iso": ts_iso,
+                "min_pct": a["memory_util_pct"],
+                "max_pct": a["memory_util_pct"],
+                "samples": 1,
+            })
+            continue
+        last = periods[-1]
+        if (
+            last["gpu_index"] == a["gpu_index"]
+            and last["type"] == a["type"]
+            and (ts - last["end_epoch"]) <= max_gap_seconds
+        ):
+            last["end_epoch"] = ts
+            last["end_iso"] = ts_iso
+            last["min_pct"] = min(last["min_pct"], a["memory_util_pct"])
+            last["max_pct"] = max(last["max_pct"], a["memory_util_pct"])
+            last["samples"] += 1
+        else:
+            periods.append({
+                "gpu_index": a["gpu_index"],
+                "type": a["type"],
+                "threshold": a["threshold"],
+                "start_epoch": ts,
+                "end_epoch": ts,
+                "start_iso": ts_iso,
+                "end_iso": ts_iso,
+                "min_pct": a["memory_util_pct"],
+                "max_pct": a["memory_util_pct"],
+                "samples": 1,
+            })
+    return periods
 
 
 def build_series_by_gpu(rows: list[dict]) -> tuple[list[float], dict[int, list[float]]]:
@@ -149,15 +212,17 @@ def render_html(
         )
     stats_table = "\n".join(stats_rows)
 
-    anomaly_rows = anomalies[:200]
+    # Use merged periods so every below/above-threshold time period is shown (no truncation).
+    periods = merge_anomalies_into_periods(anomalies)
     anomaly_cells = []
-    for a in anomaly_rows:
-        ts = a.get("timestamp_iso", "")
+    for p in periods:
+        time_range = f"{p['start_iso']} — {p['end_iso']}" if p["start_iso"] != p["end_iso"] else p["start_iso"]
+        pct_str = f"{p['min_pct']}–{p['max_pct']}%" if p["min_pct"] != p["max_pct"] else f"{p['min_pct']}%"
         anomaly_cells.append(
-            f"<tr><td>{ts}</td><td>GPU {a.get('gpu_index')}</td>"
-            f"<td>{a.get('memory_util_pct')}%</td><td>{a.get('type')} (threshold {a.get('threshold')}%)</td></tr>"
+            f"<tr><td>{time_range}</td><td>GPU {p['gpu_index']}</td>"
+            f"<td>{pct_str}</td><td>{p['type']} (threshold {p['threshold']}%)</td><td>{p['samples']}</td></tr>"
         )
-    anomaly_table = "\n".join(anomaly_cells) if anomaly_cells else "<tr><td colspan='4'>None</td></tr>"
+    anomaly_table = "\n".join(anomaly_cells) if anomaly_cells else "<tr><td colspan='5'>None</td></tr>"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -186,8 +251,9 @@ def render_html(
     <canvas id="chart"></canvas>
   </div>
   <h2>Anomalies (high/low threshold)</h2>
+  <p class="meta">Consecutive samples merged into periods; all periods listed.</p>
   <table>
-    <tr><th>Time</th><th>GPU</th><th>Util %</th><th>Type</th></tr>
+    <tr><th>Period</th><th>GPU</th><th>Util %</th><th>Type</th><th>Samples</th></tr>
     {anomaly_table}
   </table>
   <script>
