@@ -53,7 +53,7 @@ Record these parameters when reporting performance results.
 
 ```bash
 python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --backend vllm-omni \
+    --backend v1/videos \
     --dataset <DATASET_NAME> \
     --task t2v \
     --num-prompts <N> \
@@ -66,7 +66,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 | Parameter              | Description                       |
 | ---------------------- | --------------------------------- |
-| `--backend`            | Serving backend (use `vllm-omni`) |
+| `--backend`            | Serving backend (use `v1/videos`) |
 | `--dataset`            | Dataset name (`random` or custom) |
 | `--task`               | Task type (e.g., `t2v`)           |
 | `--num-prompts`        | Total number of requests          |
@@ -127,7 +127,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
     --max-concurrency 1 \
     --enable-negative-prompt \
     --random-request-config '[
-        {"width":854,"height":480,"num_inference_steps":18,"num_frames": 33,"fps":16"weight":1}
+        {"width":854,"height":480,"num_inference_steps":18,"num_frames": 33,"fps":16",weight":1}
     ]'
 ```
 

@@ -235,14 +235,6 @@ class OmniServeCommand(CLISubcommand):
                 'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
             ),
         )
-        omni_config_group.add_argument(
-            "--vae-patch-parallel-size",
-            dest="vae_patch_parallel_size",
-            type=int,
-            default=None,
-            help="Number of GPUs used for VAE patch/tile parallelism (decode). "
-            "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
-        )
 
         # HSDP (Hybrid Sharded Data Parallel) parameters
         omni_config_group.add_argument(

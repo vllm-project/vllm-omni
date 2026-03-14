@@ -65,6 +65,7 @@ import ast
 import asyncio
 import glob
 import json
+import logging
 import os
 import random
 import tempfile
@@ -81,6 +82,8 @@ import requests
 from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
 from PIL import Image
 from tqdm.asyncio import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 class BaseDataset(ABC):
@@ -540,9 +543,7 @@ class TraceDataset(BaseDataset):
 
 class RandomDataset(BaseDataset):
     def __init__(self, args, api_url: str, model: str, enable_negative_prompt: bool = False):
-        self.args = args
-        self.api_url = api_url
-        self.model = model
+        super().__init__(args, api_url, model)
         self.num_prompts = args.num_prompts
         self.enable_negative_prompt = enable_negative_prompt
         self.random_request_config = getattr(args, "random_request_config", None)
@@ -751,6 +752,7 @@ def calculate_metrics(
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,
         "latency_p99": np.percentile(latencies, 99) if latencies else 0,
+        "latency_p95": np.percentile(latencies, 95) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
         "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
@@ -806,6 +808,19 @@ async def benchmark(args):
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
+
+    VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
+    IMAGE_TASKS = {"t2i", "i2i", "ti2i"}
+
+    if args.task in VIDEO_TASKS and args.backend != "v1/videos":
+        logger.warning(
+            f"Video task '{args.task}' requires backend 'v1/videos', "
+            f"but got '{args.backend}'. Overriding backend to 'v1/videos'."
+        )
+        args.backend = "v1/videos"
+    elif args.task in IMAGE_TASKS and args.backend == "v1/videos":
+        logger.warning(f"Image task '{args.task}' can not use backend 'v1/videos', Overriding backend to 'vllm-omni'.")
+        args.backend = "vllm-omni"
 
     # Setup API URL and request function based on backend
     request_func, api_url = backends_function_mapping[args.backend]
@@ -912,6 +927,7 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
+    print("{:<40} {:<15.4f}".format("Latency P95 (s):", metrics["latency_p95"]))
 
     if args.slo:
         print(f"{'-' * 50}")

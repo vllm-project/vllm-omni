@@ -199,7 +199,6 @@ class AsyncOmni(OmniBase):
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 ring_degree=ring_degree,
                 cfg_parallel_size=cfg_parallel_size,
-                vae_patch_parallel_size=vae_patch_parallel_size,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
