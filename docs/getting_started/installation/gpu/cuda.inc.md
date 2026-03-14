@@ -20,7 +20,7 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.16.0 --torch-backend=auto
+uv pip install vllm --torch-backend=auto
 ```
 
 #### Installation of vLLM-Omni
@@ -34,13 +34,13 @@ uv pip install vllm-omni
 # --8<-- [start:build-wheel-from-source]
 
 #### Installation of vLLM
-If you do not need to modify source code of vLLM, you can directly install the stable 0.16.0 release version of the library
+If you do not need to modify source code of vLLM, you can directly install the stable 0.17.0 release version of the library
 
 ```bash
-uv pip install vllm==0.16.0 --torch-backend=auto
+uv pip install vllm==0.17.0 --torch-backend=auto
 ```
 
-The release 0.14.0 of vLLM is based on PyTorch 2.9.0 which requires CUDA 12.9 environment.
+The release 0.17.0 of vLLM is based on PyTorch 2.10.0 which requires CUDA 12.9 environment.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
@@ -56,11 +56,11 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.16.0
+git checkout v0.17.0
 ```
 Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
 ```bash
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_x86_64.whl
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.17.0/vllm-0.17.0-cp38-abi3-manylinux_2_31_x86_64.whl
 ```
 Install vllm with command below (If you have no existing PyTorch).
 ```bash
@@ -91,7 +91,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.14.0 \
+    vllm/vllm-omni:v0.16.0 \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
 ```
 

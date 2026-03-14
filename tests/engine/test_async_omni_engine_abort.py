@@ -15,8 +15,8 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 SEED = 42
 
-stage_config = str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen3_omni_thinker_ci.yaml")
-model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+stage_config = str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_thinker_ci.yaml")
+model = "Qwen/Qwen2.5-Omni-7B"
 
 
 async def generate(
@@ -60,7 +60,7 @@ async def generate(
 
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_abort():
     with ExitStack() as after:

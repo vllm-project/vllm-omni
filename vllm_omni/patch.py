@@ -1,6 +1,8 @@
 import sys
+from functools import cached_property as _cached_property
 
 from aenum import extend_enum
+from vllm.config import ModelConfig as _ModelConfig
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -16,6 +18,46 @@ from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEn
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest
+
+# =============================================================================
+# Patch GlmImageTextConfig to expose mrope_section in rope_parameters
+# =============================================================================
+# GLM-Image uses M-RoPE with mrope_section: [8, 12, 12], but transformers'
+# implementation doesn't expose it in rope_parameters. vLLM's uses_mrope
+# detection relies on "mrope_section" being present in rope_parameters.
+# This patch ensures proper M-RoPE detection for GLM-Image.
+try:
+    from transformers.models.glm_image.configuration_glm_image import GlmImageTextConfig
+
+    _original_glm_image_text_config_init = GlmImageTextConfig.__init__
+
+    def _patched_glm_image_text_config_init(self, *args, **kwargs):
+        _original_glm_image_text_config_init(self, *args, **kwargs)
+        # Ensure rope_parameters exists and contains mrope_section
+        if self.rope_parameters is None:
+            self.rope_parameters = {}
+        if isinstance(self.rope_parameters, dict) and "mrope_section" not in self.rope_parameters:
+            # GLM-Image uses mrope_section: [8, 12, 12] for T/H/W dimensions
+            self.rope_parameters["mrope_section"] = [8, 12, 12]
+
+    GlmImageTextConfig.__init__ = _patched_glm_image_text_config_init
+except ImportError:
+    # GlmImageTextConfig not available, skip patching
+    pass
+
+
+# Patch ModelConfig.is_mm_prefix_lm to include Bagel (bidirectional attention
+# for multimodal prefix positions, same as Gemma3/Molmo2/PaliGemma).
+_orig_is_mm_prefix_lm = _ModelConfig.__dict__["is_mm_prefix_lm"].func
+
+
+@_cached_property
+def _patched_is_mm_prefix_lm(self) -> bool:
+    return _orig_is_mm_prefix_lm(self) or getattr(self.hf_config, "model_type", None) == "bagel"
+
+
+_patched_is_mm_prefix_lm.__set_name__(_ModelConfig, "is_mm_prefix_lm")
+_ModelConfig.is_mm_prefix_lm = _patched_is_mm_prefix_lm
 
 # Extend RequestStatus enum with omni-specific statuses
 if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):

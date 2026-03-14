@@ -41,7 +41,7 @@ class _BnbPipelineState:
     offload_skip_components: set[str] = field(default_factory=set)
 
 
-_BNB_PIPELINE_STATE: "weakref.WeakKeyDictionary[Any, _BnbPipelineState]" = weakref.WeakKeyDictionary()
+_BNB_PIPELINE_STATE: weakref.WeakKeyDictionary[Any, _BnbPipelineState] = weakref.WeakKeyDictionary()
 
 
 def _get_bnb_pipeline_state(pipeline: Any) -> _BnbPipelineState:

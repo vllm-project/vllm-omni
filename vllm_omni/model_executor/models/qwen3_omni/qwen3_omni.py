@@ -5,6 +5,7 @@
 
 from collections.abc import Iterable
 from functools import cached_property
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -15,15 +16,11 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
 )
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
-    Qwen3OmniMoeThinkerDummyInputsBuilder,
-    Qwen3OmniMoeThinkerMultiModalProcessor,
-    Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -35,8 +32,12 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeThinkerDummyInputsBuilder,
+    Qwen3OmniMoeThinkerMultiModalProcessor,
+    Qwen3OmniMoeThinkerProcessingInfo,
+)
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
-from vllm_omni.platforms import current_omni_platform
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -155,9 +156,18 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
             self._init_special_tokens_embeddings()
+            # suppress tokens by setting their probability to ~1e-9 (finite very small)
+            self.suppressed_tokens = self._get_talker_suppressed_tokens()
             self.requires_raw_input_tokens = True
+            # Keys that should stay on GPU in model_intermediate_buffer to avoid CPU↔GPU round-trips
+            self.gpu_resident_buffer_keys: set[str] = {
+                "last_talker_hidden",
+                "trailing_text_hidden",
+                "tts_pad_embed_projected",
+            }
 
         elif self.model_stage == "code2wav":
+            self.enable_update_additional_information = True
             self.thinker = None
             self.talker = None
             # Initialize code2wav (codec codes → audio waveform)
@@ -219,14 +229,16 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     # ==================== Forward Pass ====================
     def _get_talker_suppressed_tokens(self):
-        return [
-            i
-            for i in range(
-                self.config.talker_config.text_config.vocab_size - 1024,
-                self.config.talker_config.text_config.vocab_size,
-            )
-            if i != self.config.talker_config.codec_eos_token_id
-        ]
+        """Return a boolean mask on GPU for suppressed token positions."""
+        vocab_size = self.config.talker_config.text_config.vocab_size
+        mask = torch.zeros(vocab_size, dtype=torch.bool)
+        start = vocab_size - 1024
+        eos_id = self.config.talker_config.codec_eos_token_id
+        for i in range(start, vocab_size):
+            if i != eos_id:
+                mask[i] = True
+        # Will be moved to the correct device on first use
+        return mask
 
     def get_mrope_input_positions(
         self,
@@ -252,7 +264,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         codec: torch.Tensor | None = None,
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
-        additional_information: dict[str, object] | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
@@ -270,27 +282,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 1: Thinker ==========
         if self.model_stage == "thinker":
             thinker_dev = self._module_device(self.thinker)
-            if current_omni_platform.is_npu():
-                # Normalize to batched inputs if needed
-                _added_batch_dim = False
-                if input_ids is not None and input_ids.ndim == 1:
-                    input_ids = input_ids.unsqueeze(0)
-                    _added_batch_dim = True
-                if positions is not None and positions.ndim == 1:
-                    positions = positions.unsqueeze(0)
-                    _added_batch_dim = True
-                if inputs_embeds is not None and inputs_embeds.ndim == 2:
-                    inputs_embeds = inputs_embeds.unsqueeze(0)
-                    _added_batch_dim = True
-
-                # Handle None input_ids
-                if input_ids is None:
-                    input_ids = torch.zeros(
-                        inputs_embeds.shape[1],
-                        dtype=torch.long,
-                        device=thinker_dev,
-                    ).unsqueeze(0)
-                    _added_batch_dim = True
 
             # Move to thinker device
             if input_ids is not None and input_ids.device != thinker_dev:
@@ -309,22 +300,13 @@ class Qwen3OmniMoeForConditionalGeneration(
                     "capture_layer_indices": [0, int(accept_layer)],
                     "return_hidden_states": True,
                 }
-            if current_omni_platform.is_npu():
-                # TODO: remove this hack when NPU supports batched inputs properly
-                thinker_input_ids = input_ids[0] if input_ids is not None and _added_batch_dim else input_ids
-                thinker_inputs_embeds = (
-                    inputs_embeds[0] if inputs_embeds is not None and _added_batch_dim else inputs_embeds
-                )
-            else:
-                thinker_input_ids = input_ids
-                thinker_inputs_embeds = inputs_embeds
 
             # Run thinker
             text_hidden_states, captured_layer_dict = self.thinker(
-                input_ids=thinker_input_ids,
+                input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
-                inputs_embeds=thinker_inputs_embeds,
+                inputs_embeds=inputs_embeds,
                 **capture_kwargs,
                 **kwargs,
             )
@@ -355,13 +337,14 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         # ========== Stage 3: Code2Wav ==========
         elif self.model_stage == "code2wav":
+            seq_token_counts: list[int] | None = kwargs.get("seq_token_counts")
+
             # Extract codec codes from input
             if input_ids.shape[0] % 16 == 0:
-                ubatch_slices = get_forward_context().ubatch_slices
-                if ubatch_slices is not None:
-                    max_seq_len = max(ubatch_slices) // 16
-                    batch_size = len(ubatch_slices)
-                    split_codes = torch.split(input_ids, ubatch_slices, dim=0)
+                if seq_token_counts is not None:
+                    max_seq_len = max(seq_token_counts) // 16
+                    batch_size = len(seq_token_counts)
+                    split_codes = torch.split(input_ids, seq_token_counts, dim=0)
                     codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
                     for idx, code in enumerate(split_codes):
                         seq_len = code.shape[0] // 16
@@ -386,7 +369,15 @@ class Qwen3OmniMoeForConditionalGeneration(
                 codes = input_ids_flatten.reshape(1, 16, -1)
 
             # Generate audio from codec codes
-            audio_tensors = self.generate_audio(codes, voice_type)
+            # Get every request's left_context_size from runtime_additional_information (passed via kwargs)
+            left_context_size = []
+            if runtime_additional_information is not None:
+                for info in runtime_additional_information:
+                    if "left_context_size" in info:
+                        left_context_size.append(info["left_context_size"])
+            else:
+                logger.debug("No additional_information provided to code2wav stage.")
+            audio_tensors = self.generate_audio(codes, voice_type, left_context_size, seq_token_counts)
 
             return audio_tensors
 
@@ -437,11 +428,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_hidden = model_outputs
             # merge the code_predictor_codes from the info_dict list into a single tensor
             multimodal_outputs: dict = None
-            # Here is the only place to use runtime_additional_information. After MTP in the
+            # Here is the only place to use model_intermediate_buffer. After MTP in the
             # preprocess function, the code_predictor_codes are stored in the info_dict list.
             # We need to merge the tensors from different requests into a single tensor.
             # In the future, we may allow user to custom an aggregated function.
-            info_dicts = kwargs.get("runtime_additional_information")
+            info_dicts = kwargs.get("model_intermediate_buffer")
+            if info_dicts is None:
+                info_dicts = kwargs.get("runtime_additional_information")
+
+            if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+                logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
             code_predictor_codes = [info.get("code_predictor_codes") for info in info_dicts]
             multimodal_outputs = {"code_predictor_codes": torch.cat(code_predictor_codes, dim=0)}
             span_len = multimodal_outputs["code_predictor_codes"].shape[0]
@@ -458,16 +454,24 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     # ==================== Audio Generation ====================
 
-    def generate_audio(self, code: torch.Tensor, voice_type: str) -> list[torch.Tensor]:
+    def generate_audio(
+        self,
+        code: torch.Tensor,
+        voice_type: str,
+        left_context_size: list[int] | None = None,
+        seq_token_counts: list[int] | None = None,
+    ) -> list[torch.Tensor]:
         """
         Generate audio waveform from codec codes.
 
         Args:
-            code: [8, T] - 8-layer RVQ codec codes
+            code: [batch, num_quantizers, T] - RVQ codec codes
             voice_type: Voice type (not used in Qwen3, kept for compatibility)
+            left_context_size: Left context size for streaming decode
+            seq_token_counts: Token count for each request in batch
 
         Returns:
-            audio_tensor: [1, waveform_len] - Audio waveform
+            list of audio waveforms
         """
         code2wav_dev = self._module_device(self.code2wav)
 
@@ -487,10 +491,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_codes = talker_codes.expand(1, 16, -1)
 
         if self.vllm_config.model_config.async_chunk:
+            # Only use left_context_size from additional information
             audio_tensors = self.code2wav.chunked_decode_streaming(
                 talker_codes,
-                chunk_size=25,
-                left_context_size=25,
+                left_context_size=left_context_size,
+                seq_token_counts=seq_token_counts,
             )
         else:
             # Use chunked decode for memory efficiency
@@ -498,6 +503,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 talker_codes,
                 chunk_size=300,
                 left_context_size=25,
+                seq_token_counts=seq_token_counts,
             )
 
         return audio_tensors
@@ -580,7 +586,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         Postprocess the talker hidden states.
         """
         update_dict = {}
-        update_dict["last_talker_hidden"] = hidden_states[-1, :].detach().to("cpu").contiguous()
+        update_dict["last_talker_hidden"] = hidden_states[-1, :].detach()
         return update_dict
 
     def talker_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
@@ -605,7 +611,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         else:
             # decode
             if not info_dict.get("decode_flag", False):
-                info_dict["num_processed_tokens"] = len(info_dict.get("thinker_input_ids", [])) + 1
+                info_dict["num_processed_tokens"] = 0
                 update_dict["decode_flag"] = True
 
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
@@ -634,9 +640,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         if inputs_embeds.shape[-1] == 2048:
             inputs_embeds = self.text_projection(inputs_embeds)
         code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
-            input_ids, inputs_embeds.clone(), last_talker_hidden=last_talker_hidden
+            input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden
         )
-        inputs_embeds = summed_embeddings.clone()
+        inputs_embeds = summed_embeddings
         inputs_embeds = (inputs_embeds + text_step).reshape(-1, self.talker_config.text_config.hidden_size)
         return inputs_embeds, code_predictor_codes.squeeze(-1)
 
@@ -675,7 +681,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         start_index = info_dict.get("num_processed_tokens", 0)
         end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill
-        thinker_sequence_embeds = info_dict.get("thinker_embeddings").to(
+        thinker_sequence_embeds = info_dict.get("thinker_prefill_embeddings").to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )  # Tensor [P,H]
         thinker_hidden_states = info_dict.get("thinker_hidden_states").to(
@@ -705,7 +711,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         if thinker_sequence_embeds is None or thinker_hidden_states is None:
             raise ValueError(
                 "additional_information_by_req_id must include "
-                "'thinker_embeddings' and 'thinker_hidden_states' for talker prefill."
+                "'thinker_prefill_embeddings' and 'thinker_hidden_states' for talker prefill."
             )
 
         # Normalize to tensors
@@ -760,7 +766,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     # compatible with old shape [1,S,D]
                     rem_tail = trailing_text_hidden.squeeze(0)
                 if rem_tail.shape[0] > 0:
-                    update_dict["trailing_text_hidden"] = rem_tail.detach().to("cpu").contiguous()
+                    update_dict["trailing_text_hidden"] = rem_tail.detach()
             # Also persist projected tts_pad for decode fallback if needed
             if isinstance(tts_pad_thinker, torch.Tensor):
                 pad_in = tts_pad_thinker
@@ -769,11 +775,37 @@ class Qwen3OmniMoeForConditionalGeneration(
                 if pad_in.ndim == 1:
                     pad_in = pad_in.view(1, 1, -1)
                 pad_proj = self.talker.text_projection(pad_in.to(self._module_device(self.talker)))
-                update_dict["tts_pad_embed_projected"] = pad_proj.detach().to("cpu").contiguous()
+                update_dict["tts_pad_embed_projected"] = pad_proj.detach()
         except Exception:
             pass
+        self._talker_cache_thinker_decode_embeds(info_dict, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
+
+    def _talker_cache_thinker_decode_embeds(
+        self,
+        info_dict: dict[str, Any],
+        update_dict: dict[str, Any],
+    ) -> None:
+        """
+        Cache thinker embeds for decode stage.
+        """
+        thinker_decode_embeds = info_dict.get("thinker_decode_embeddings", None)
+        if thinker_decode_embeds is not None:
+            cached_thinker_decode_embeds = info_dict.get("cached_thinker_decode_embeddings", None)
+            if cached_thinker_decode_embeds is None:
+                update_dict["cached_thinker_decode_embeddings"] = thinker_decode_embeds
+            else:
+                cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(
+                    device=self._module_device(self.talker), dtype=torch.bfloat16
+                )
+                thinker_decode_embeds = thinker_decode_embeds.to(
+                    device=self._module_device(self.talker), dtype=torch.bfloat16
+                )
+                update_dict["cached_thinker_decode_embeddings"] = torch.cat(
+                    [cached_thinker_decode_embeds, thinker_decode_embeds], dim=0
+                )
+        update_dict["thinker_decode_embeddings"] = None
 
     def _thinker_to_talker_prefill(
         self,
@@ -868,15 +900,25 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
-        thinker_embed = info_dict.get("thinker_embeddings", None)
+        cached_thinker_decode_embeds = info_dict.get("cached_thinker_decode_embeddings", None)
+        thinker_decode_embed = info_dict.get("thinker_decode_embeddings", None)
         start_index = info_dict.get("num_processed_tokens", 0)
-        if start_index >= thinker_embed.shape[0]:
+        thinker_output_token_ids = info_dict.get("thinker_output_token_ids", [])
+        if start_index >= len(thinker_output_token_ids) - 1:
             if info_dict.get("finished_flag"):
                 return self.tts_pad_embed.to(device)
             update_dict["finished_flag"] = True
             return self.tts_eos_embed.to(device)
-
-        thinker_embed = thinker_embed[start_index : start_index + 1].to(device)
+        if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
+            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
+            thinker_embed = cached_thinker_decode_embeds[start_index]
+            if thinker_decode_embed is not None:
+                thinker_decode_embed = thinker_decode_embed.to(device)
+                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
+                update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
+        else:
+            thinker_embed = thinker_decode_embed.to(device)
+        update_dict["thinker_decode_embeddings"] = None
         return self.talker.text_projection(thinker_embed).to(device)
 
     def talker_preprocess_decode(
@@ -892,7 +934,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 if isinstance(q_tail, torch.Tensor) and q_tail.numel() > 0:
                     use_vec = q_tail[0:1, :]
                     new_q_tail = (
-                        q_tail[1:, :].detach().to("cpu").contiguous()
+                        q_tail[1:, :].detach()
                         if q_tail.shape[0] > 1
                         else self.tts_pad_embed.to(input_embeds.device, dtype=input_embeds.dtype)
                     )
@@ -1088,18 +1130,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         # implemented by assigning their logits to log(1e-9).
 
         if getattr(self, "model_stage", None) == "talker" and isinstance(logits, torch.Tensor):
-            # suppress tokens by setting their probability to ~1e-9 (finite very small)
-            suppressed_tokens = self._get_talker_suppressed_tokens()
-            try:
-                logits_cpu = logits.cpu()
-                logits_cpu[:, suppressed_tokens] = -1e9
-                logits = logits_cpu.to(logits.device)
-            except Exception as e:
-                print(f"Error in logits suppression: {e}")
-                print(f"logits.shape: {logits.shape}")
-                print(f"suppressed_tokens: {suppressed_tokens}")
-                raise e
-            logits[:, suppressed_tokens] = -1e9
+            # Move mask to device once (lazy), then reuse every step
+            if self.suppressed_tokens.device != logits.device:
+                self.suppressed_tokens = self.suppressed_tokens.to(logits.device)
+            logits.masked_fill_(self.suppressed_tokens.unsqueeze(0), -1e9)
         return logits
 
     def sample(

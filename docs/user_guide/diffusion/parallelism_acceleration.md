@@ -16,23 +16,30 @@ The following parallelism methods are currently supported in vLLM-Omni:
 
 5. [VAE Patch Parallelism](#vae-patch-parallelism): VAE patch parallelism shards VAE decode spatially across ranks. This can reduce the peak memory of VAE decode and (depending on resolution and communication overhead) speed up VAE decode.
 
+6. [HSDP](#hsdp): Hybrid Sharded Data Parallel shards model weights across GPUs using PyTorch FSDP2. This reduces per-GPU memory usage, enabling inference of large models on GPUs with limited memory.
+
+7. [Expert Parallel](#expert-parallelism): Expert Parallelism shards the Experts of a Mixture-of-Experts (MoE) layer across multiple devices. During the forward, a gating mechanism routes tokens to their designated experts, necessitating cross-cards communication(all-to-all) to dispatch tokens to the correct ranks and combine the results. This parallelism allows for massive scaling of model parameters without a proportional increase in the computational load per device.
+
 The following table shows which models are currently supported by parallelism method:
 
 ### ImageGen
 
-| Model                    | Model Identifier                     | Ulysses-SP | Ring-SP | CFG-Parallel | Tensor-Parallel | VAE-Patch-Parallel |
-|--------------------------|--------------------------------------|:----------:|:-------:|:------------:|:---------------:|:------------------:|
-| **LongCat-Image**        | `meituan-longcat/LongCat-Image`      |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |
-| **LongCat-Image-Edit**   | `meituan-longcat/LongCat-Image-Edit` |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |
-| **Ovis-Image**           | `OvisAI/Ovis-Image`                  |     ❌      |    ❌    |      ❌       |        ❌        |         ❌          |
-| **Qwen-Image**           | `Qwen/Qwen-Image`                    |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
-| **Qwen-Image-Edit**      | `Qwen/Qwen-Image-Edit`               |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509`          |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
-| **Qwen-Image-Layered**   | `Qwen/Qwen-Image-Layered`            |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
-| **Z-Image**              | `Tongyi-MAI/Z-Image-Turbo`           |     ✅      |    ✅    |      ❌       |  ✅ (TP=2 only)  |         ✅          |
-| **Stable-Diffusion3.5**  | `stabilityai/stable-diffusion-3.5`   |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |
-| **FLUX.2-klein**         | `black-forest-labs/FLUX.2-klein-4B`  |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |
-| **FLUX.1-dev**           | `black-forest-labs/FLUX.1-dev`       |     ❌      |    ❌    |      ✅       |        ✅        |         ❌          |
+| Model                    | Model Identifier                     | Ulysses-SP | Ring-SP | CFG-Parallel | Tensor-Parallel | VAE-Patch-Parallel | Expert-Parallel |
+|--------------------------|--------------------------------------|:----------:|:-------:|:------------:|:---------------:|:------------------:|:---------------:|
+| **LongCat-Image**        | `meituan-longcat/LongCat-Image`      |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |        N/A        |
+| **LongCat-Image-Edit**   | `meituan-longcat/LongCat-Image-Edit` |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |        N/A        |
+| **Ovis-Image**           | `OvisAI/Ovis-Image`                  |     ❌      |    ❌    |      ❌       |        ❌        |         ❌          |        N/A        |
+| **Qwen-Image**           | `Qwen/Qwen-Image`                    |     ✅      |    ✅    |      ✅       |        ✅        |         ✅          |        N/A        |
+| **Qwen-Image-Edit**      | `Qwen/Qwen-Image-Edit`               |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |        N/A        |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509`          |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |        N/A        |
+| **Qwen-Image-Layered**   | `Qwen/Qwen-Image-Layered`            |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |        N/A        |
+| **Z-Image**              | `Tongyi-MAI/Z-Image-Turbo`           |     ✅      |    ✅    |      ❌       |  ✅ (TP=2 only)  |         ✅          |        N/A        |
+| **Stable-Diffusion3.5**  | `stabilityai/stable-diffusion-3.5`   |     ❌      |    ❌    |      ❌       |        ✅        |         ✅          |        N/A        |
+| **FLUX.2-klein**         | `black-forest-labs/FLUX.2-klein-4B`  |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |        N/A        |
+| **FLUX.1-dev**           | `black-forest-labs/FLUX.1-dev`       |     ❌      |    ❌    |      ✅       |        ✅        |         ❌          |        N/A        |
+| **FLUX.2-dev**           | `black-forest-labs/FLUX.2-dev`       |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |        N/A        |
+| **HunyuanImage3.0**      | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |        ✅        |
+| **DreamID-Omni**           | `XuGuo699/DreamID-Omni`       |     ❌      |    ❌    |      ✅       |        ❌        |         ❌          |        N/A        |
 
 !!! note "TP Limitations for Diffusion Models"
     We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
@@ -49,9 +56,10 @@ The following table shows which models are currently supported by parallelism me
 
 ### VideoGen
 
-| Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel |
-|-------|------------------|------------|---------|--------------------------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ |
+| Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel | HSDP | VAE-Patch-Parallel |
+|-------|------------------|:----------:|:--------------:|:---------------:|:----:| :----:|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **LTX-2** | `Lightricks/LTX-2` | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 ### Tensor Parallelism
 
@@ -83,7 +91,7 @@ outputs = omni.generate(
 VAE patch parallelism distributes the VAE decode workload across multiple ranks by splitting the latent spatially. It is configured via `DiffusionParallelConfig.vae_patch_parallel_size` and can be combined with other parallelism methods (e.g., TP).
 
 !!! note "Enablement and feature gate"
-    - VAE patch parallelism is currently **enabled only for validated pipelines** (currently: `Tongyi-MAI/Z-Image-Turbo`).
+    - VAE patch parallelism is currently **enabled only for validated pipelines** (check [ImageGen](#imagegen) and [VideoGen](#videogen) for more information).
     - If `vae_patch_parallel_size > 1` is set for a validated pipeline, vLLM-Omni will automatically enable `vae_use_tiling` as a safety gate. (We use `vae_use_tiling` because it indicates the VAE supports diffusers tiling parameters like `tile_latent_min_size` and `tile_overlap_factor`.)
 
 #### Offline Inference
@@ -329,4 +337,110 @@ You can enable CFG-Parallel in online serving for diffusion models via `--cfg-pa
 
 ```bash
 vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 --cfg-parallel-size 2
+```
+
+### HSDP
+
+HSDP (Hybrid Sharded Data Parallel) shards model weights across GPUs to reduce per-GPU memory usage. This enables inference of large models (e.g., Wan2.2 14B) on GPUs with limited memory.
+
+Unlike Tensor Parallelism which splits computation, HSDP uses PyTorch's FSDP2 to shard and redistribute weights at runtime. Each GPU only holds a fraction of the model weights, and weights are gathered on-demand during forward passes.
+
+#### Configuration
+
+HSDP is configured via `DiffusionParallelConfig`:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `use_hsdp` | bool | False | Enable HSDP |
+| `hsdp_shard_size` | int | -1 | Number of GPUs to shard weights across. -1 = auto (requires other parallelism > 1) |
+| `hsdp_replicate_size` | int | 1 | Number of replica groups. Each group holds a full sharded copy |
+
+**Constraints:**
+
+- `hsdp_replicate_size × hsdp_shard_size == world_size`
+- HSDP cannot be used with Tensor Parallelism (`tensor_parallel_size` must be 1)
+
+#### Operating Modes
+
+HSDP can work in two modes:
+
+- **Standalone Mode**: HSDP alone without other parallelism. Must specify `hsdp_shard_size` explicitly.
+- **Combined Mode**: HSDP overlays on top of other parallelism (Ulysses Sequence Parallel, CFG Parallel). HSDP dimensions must match world_size.
+
+#### Offline Inference
+
+**Standalone HSDP** (shard across 4 GPUs, no other parallelism):
+
+```python
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    parallel_config=DiffusionParallelConfig(
+        use_hsdp=True,
+        hsdp_shard_size=4,  # Shard across 4 GPUs
+    ),
+)
+
+outputs = omni.generate(
+    "A cat playing piano",
+    OmniDiffusionSamplingParams(num_inference_steps=50),
+)
+```
+
+**Combined HSDP + Sequence Parallel**:
+
+```python
+omni = Omni(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    parallel_config=DiffusionParallelConfig(
+        ulysses_degree=4,  # Sequence parallel
+        use_hsdp=True,     # HSDP overlays on SP
+    ),
+)
+```
+
+#### Online Serving
+
+**Standalone HSDP** (shard model across 4 GPUs):
+
+```bash
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091 --use-hsdp --hsdp-shard-size 4
+```
+
+**Combined with Sequence Parallel**:
+
+```bash
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091 --use-hsdp --usp 4
+```
+
+#### Adding HSDP Support to New Models
+
+For detailed instructions on adding HSDP support to new models, see the [HSDP Contributing Guide](../../design/feature/hsdp.md).
+
+### Expert Parallelism
+
+Unlike Tensor Parallelism which shards every layer's weights, EP only shards the MoE expert MLP blocks. This significantly reduces the memory footprint of MoE models (e.g., HunyuanImage3.0) while maintaining constant dense-equivalent compute efficiency. Expert Parallelism is enabled via `DiffusionParallelConfig.enable_expert_parallel`. And `self.ep = tp * sp * cfg * dp` for now, so at least one of TP/SP/CFG/DP should set when EP enabled.
+
+#### Offline Inference
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="tencent/HunyuanImage-3.0",
+    parallel_config=DiffusionParallelConfig(tensor_parallel_size=8, enable_expert_parallel=True),
+)
+
+outputs = omni.generate(
+    "A brown and white dog is running on the grass",
+    OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+        width=1024,
+        height=1024,
+    ),
+)
 ```

@@ -504,19 +504,39 @@ class Qwen3TTSConfig(PretrainedConfig):
         self.tts_bos_token_id = tts_bos_token_id
         self.tts_eos_token_id = tts_eos_token_id
 
-        # TODO: remove these dummy values after
-        self.image_token_id = 0  # dummy image token id
-        self.video_token_id = 0  # dummy video token id
-        self.vision_start_token_id = 0  # dummy vision start token id
+        # Dummy vision token IDs that must never collide with real codec tokens.
+        # mrope scans prompt_token_ids for these; using -1 ensures no false match.
+        self.image_token_id = -1
+        self.video_token_id = -1
+        self.vision_start_token_id = -1
         self.vision_config = PretrainedConfig()  # dummy vision config
         self.vision_config.spatial_merge_size = 1
+
+    @property
+    def codec_frame_rate_hz(self) -> float | None:
+        pos_per_sec = getattr(self.talker_config, "position_id_per_seconds", None)
+        if pos_per_sec is None:
+            return None
+        try:
+            fps = float(pos_per_sec)
+        except (TypeError, ValueError):
+            return None
+        return fps if fps > 0 else None
 
     def get_text_config(self, **kwargs):
         # vLLM expects text config to expose hidden_size/num_attention_heads.
         # For Qwen3 TTS, the talker config is the text model config.
         config = self.talker_config
-        # if hasattr(config, "rope_parameters"):
-        #     delattr(config, "rope_parameters")
+        # Code2Wav is a pure convolutional waveform decoder; it does NOT use
+        # rotary position embeddings.  When hf_overrides sets architectures
+        # to [Qwen3TTSCode2Wav], strip rope_parameters so that the model
+        # runner sees uses_mrope == False and skips mrope position computation
+        # on codec tokens.  Each stage loads its own config instance, so this
+        # in-place mutation does not affect the Talker stage.
+        archs = getattr(self, "architectures", []) or []
+        if any("Code2Wav" in str(a) for a in archs):
+            if hasattr(config, "rope_parameters"):
+                delattr(config, "rope_parameters")
         return config
 
 

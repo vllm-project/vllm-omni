@@ -20,6 +20,8 @@ from typing_extensions import ParamSpec
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import cuda_device_count_stateless
 
+from vllm_omni.platforms import current_omni_platform
+
 _P = ParamSpec("_P")
 
 if current_platform.is_rocm():
@@ -400,13 +402,41 @@ def rocm_marks(*, res: str, num_cards: int):
         return marks + [test_distributed]
 
 
+def xpu_marks(*, res: str, num_cards: int):
+    """
+    Get a collection of pytest marks to apply for `@xpu_test`.
+
+    Args:
+        res: Resource type, e.g., "B60".
+        num_cards: Number of GPU cards required.
+
+    Returns:
+        List of pytest marks to apply.
+    """
+    test_platform_detail = pytest.mark.xpu
+
+    if res == "B60":
+        test_resource = pytest.mark.B60
+    else:
+        raise ValueError(f"Invalid XPU resource type: {res}. Supported: B60")
+
+    marks = [test_resource, test_platform_detail]
+
+    if num_cards == 1:
+        return marks
+    else:
+        test_distributed = pytest.mark.distributed_rocm(num_cards=num_cards)
+        # TODO: add XPU support for `skipif_xpu` marker
+        return marks + [test_distributed]
+
+
 def gpu_marks(*, res: str, num_cards: int):
     """
     Get a collection of pytest marks to apply for `@gpu_test`.
     Platform is automatically determined based on resource type.
 
     Args:
-        res: Resource type, e.g., "L4", "H100" for CUDA, or "MI325" for ROCm.
+        res: Resource type, e.g., "L4", "H100" for CUDA, or "MI325" for ROCm, or "B60" for XPU.
         num_cards: Number of GPU cards required.
 
     Returns:
@@ -417,6 +447,8 @@ def gpu_marks(*, res: str, num_cards: int):
         return [test_platform] + cuda_marks(res=res, num_cards=num_cards)
     if res == "MI325":
         return [test_platform] + rocm_marks(res=res, num_cards=num_cards)
+    if res == "B60":
+        return [test_platform] + xpu_marks(res=res, num_cards=num_cards)
     raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, MI325")
 
 
@@ -441,6 +473,46 @@ def npu_marks(*, res: str, num_cards: int):
         return [mark for mark in [test_platform, test_resource, test_distributed] if mark is not None]
 
 
+def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
+    """
+    Get a collection of pytest marks to apply for `@hardware_test`,
+    including CUDA, ROCm, XPU, and NPU,
+    based on the specified platforms and resources.
+    """
+    # Validate platforms
+    # Don't validate platform details in this decorator
+    for platform, _ in res.items():
+        if platform not in ("cuda", "rocm", "xpu", "npu"):
+            raise ValueError(f"Unsupported platform: {platform}")
+
+    # Normalize num_cards
+    if isinstance(num_cards, int):
+        num_cards_dict = {platform: num_cards for platform in res.keys()}
+    else:
+        num_cards_dict = num_cards
+        for platform in num_cards_dict.keys():
+            if platform not in res:
+                raise ValueError(
+                    f"Platform '{platform}' in num_cards but not in res. Available platforms: {list(res.keys())}"
+                )
+        for platform in res.keys():
+            if platform not in num_cards_dict:
+                num_cards_dict[platform] = 1
+
+    # Collect marks from all platforms
+    all_marks: list[pytest.MarkDecorator] = []
+    for platform, resource in res.items():
+        cards = num_cards_dict[platform]
+        if platform == "cuda" or platform == "rocm" or platform == "xpu":
+            marks = gpu_marks(res=resource, num_cards=cards)
+        elif platform == "npu":
+            marks = npu_marks(res=resource, num_cards=cards)
+        else:
+            raise ValueError(f"Unsupported platform: {platform}")
+        all_marks.extend(marks)
+    return all_marks
+
+
 def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     """
     Decorate a test for multiple hardware platforms with a single call.
@@ -463,37 +535,7 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
         def test_multi_platform():
             ...
     """
-    # Validate platforms
-    # Don't validate platform details in this decorator
-    for platform, _ in res.items():
-        if platform not in ("cuda", "rocm", "npu"):
-            raise ValueError(f"Unsupported platform: {platform}")
-
-    # Normalize num_cards
-    if isinstance(num_cards, int):
-        num_cards_dict = {platform: num_cards for platform in res.keys()}
-    else:
-        num_cards_dict = num_cards
-        for platform in num_cards_dict.keys():
-            if platform not in res:
-                raise ValueError(
-                    f"Platform '{platform}' in num_cards but not in res. Available platforms: {list(res.keys())}"
-                )
-        for platform in res.keys():
-            if platform not in num_cards_dict:
-                num_cards_dict[platform] = 1
-
-    # Collect marks from all platforms
-    all_marks: list[Callable[[Callable[_P, None]], Callable[_P, None]]] = []
-    for platform, resource in res.items():
-        cards = num_cards_dict[platform]
-        if platform == "cuda" or platform == "rocm":
-            marks = gpu_marks(res=resource, num_cards=cards)
-        elif platform == "npu":
-            marks = npu_marks(res=resource, num_cards=cards)
-        else:
-            raise ValueError(f"Unsupported platform: {platform}")
-        all_marks.extend(marks)
+    all_marks = hardware_marks(res=res, num_cards=num_cards)
 
     def wrapper(f: Callable[_P, None]) -> Callable[_P, None]:
         func = f
@@ -504,8 +546,8 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     return wrapper
 
 
-class GPUMemoryMonitor:
-    """Poll global device memory usage via CUDA APIs."""
+class DeviceMemoryMonitor:
+    """Poll global device memory usage."""
 
     def __init__(self, device_index: int, interval: float = 0.05):
         self.device_index = device_index
@@ -518,8 +560,8 @@ class GPUMemoryMonitor:
         def monitor_loop() -> None:
             while not self._stop_event.is_set():
                 try:
-                    with torch.cuda.device(self.device_index):
-                        free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    with current_omni_platform.device(self.device_index):
+                        free_bytes, total_bytes = current_omni_platform.mem_get_info()
                     used_mb = (total_bytes - free_bytes) / (1024**2)
                     self._peak_used_mb = max(self._peak_used_mb, used_mb)
                 except Exception:
@@ -537,8 +579,8 @@ class GPUMemoryMonitor:
 
     @property
     def peak_used_mb(self) -> float:
-        fallback_alloc = torch.cuda.max_memory_allocated(device=self.device_index) / (1024**2)
-        fallback_reserved = torch.cuda.max_memory_reserved(device=self.device_index) / (1024**2)
+        fallback_alloc = current_omni_platform.max_memory_allocated(device=self.device_index) / (1024**2)
+        fallback_reserved = current_omni_platform.max_memory_reserved(device=self.device_index) / (1024**2)
         return max(self._peak_used_mb, fallback_alloc, fallback_reserved)
 
     def __del__(self):

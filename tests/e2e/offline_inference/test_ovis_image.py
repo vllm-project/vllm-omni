@@ -12,11 +12,11 @@ Strategy:
    and correctness of the model definition itself, independent of the pipeline mocks.
 """
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
+from tests.utils import hardware_test
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 
 # Mock the OvisImageTransformer2DModel to avoid complex init if needed,
@@ -29,15 +29,15 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 @pytest.fixture
-def mock_dependencies(monkeypatch):
+def mock_dependencies(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """
     Mock external dependencies to avoid loading real models.
     """
     device = get_local_device()
 
     # Mock Tokenizer
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.return_value = MagicMock(
+    mock_tokenizer = mocker.MagicMock()
+    mock_tokenizer.return_value = mocker.MagicMock(
         input_ids=torch.zeros((1, 50), dtype=torch.long, device=device),
         attention_mask=torch.ones((1, 50), dtype=torch.long, device=device),
     )
@@ -45,13 +45,13 @@ def mock_dependencies(monkeypatch):
     mock_tokenizer.model_max_length = 1024
 
     # Mock Text Encoder
-    mock_text_encoder = MagicMock()
+    mock_text_encoder = mocker.MagicMock()
     mock_text_encoder.dtype = torch.float32
     # Output of text encoder must be on the same device as inputs (which are moved to execution_device)
     mock_text_encoder.return_value.last_hidden_state = torch.randn(1, 50, 32, device=device)
 
     # Mock VAE
-    mock_vae = MagicMock()
+    mock_vae = mocker.MagicMock()
     mock_vae.config.block_out_channels = [128, 256, 512, 512]  # Scale factor 8
     mock_vae.config.scale_factor_temporal = 1
     mock_vae.config.scale_factor_spatial = 8
@@ -63,8 +63,8 @@ def mock_dependencies(monkeypatch):
     mock_vae.to.return_value = mock_vae
 
     # Mock Scheduler
-    mock_scheduler = MagicMock()
-    mock_scheduler.config = MagicMock()
+    mock_scheduler = mocker.MagicMock()
+    mock_scheduler.config = mocker.MagicMock()
     # Timesteps on device to match latents during denoising loop interaction if needed
     mock_scheduler.timesteps = torch.tensor([1.0, 0.5, 0.0], device=device)
     mock_scheduler.set_timesteps.return_value = None
@@ -95,7 +95,7 @@ def mock_dependencies(monkeypatch):
 
 
 @pytest.fixture
-def ovis_pipeline(mock_dependencies, monkeypatch):
+def ovis_pipeline(mocker: MockerFixture, mock_dependencies, monkeypatch: pytest.MonkeyPatch):
     """
     Creates an OvisImagePipeline instance with mocked components.
     """
@@ -122,8 +122,8 @@ def ovis_pipeline(mock_dependencies, monkeypatch):
 
     # Mock Transformer Layer separately to avoid full init
     # We patch OvisImageTransformer2DModel class in the module
-    mock_transformer_cls = MagicMock()
-    mock_transformer_instance = MagicMock()
+    mock_transformer_cls = mocker.MagicMock()
+    mock_transformer_instance = mocker.MagicMock()
     mock_transformer_instance.dtype = torch.float32
     mock_transformer_instance.in_channels = 16  # Must be 16 so num_channel_latents=4, packed=16
     # Forward return: noise prediction
@@ -144,8 +144,8 @@ def ovis_pipeline(mock_dependencies, monkeypatch):
 
     # Initialize pipeline
     # We use a dummy model path check override
-    with patch("os.path.exists", return_value=True):
-        pipeline = OvisImagePipeline(od_config=od_config)
+    mocker.patch("os.path.exists", return_value=True)
+    pipeline = OvisImagePipeline(od_config=od_config)
 
     return pipeline
 
@@ -223,9 +223,11 @@ def test_resolution_check(ovis_pipeline):
     assert output is not None
 
 
-def test_real_transformer_init_and_forward():
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+def test_real_transformer_init_and_forward(mocker: MockerFixture):
     """Test the real OvisImageTransformer2DModel initialization and forward pass for coverage."""
-    from unittest.mock import patch
 
     from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
 
@@ -249,42 +251,42 @@ def test_real_transformer_init_and_forward():
 
     # Mock distributed state for QKVParallelLinear initialization
     # We patch get_tp_group because get_tensor_model_parallel_rank calls it and asserts _TP is not None
-    mock_group = MagicMock()
+    mock_group = mocker.MagicMock()
     mock_group.rank_in_group = 0
     mock_group.world_size = 1
 
-    with patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group):
-        # Initialize real model
-        model = OvisImageTransformer2DModel(
-            od_config=od_config,
-            patch_size=1,
-            in_channels=16,
-            out_channels=16,
-            num_single_layers=1,
-            attention_head_dim=8,
-            num_attention_heads=2,
-            joint_attention_dim=32,
-            axes_dims_rope=(2, 2, 4),
-        ).to(device)
+    mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+    # Initialize real model
+    model = OvisImageTransformer2DModel(
+        od_config=od_config,
+        patch_size=1,
+        in_channels=16,
+        out_channels=16,
+        num_single_layers=1,
+        attention_head_dim=8,
+        num_attention_heads=2,
+        joint_attention_dim=32,
+        axes_dims_rope=(2, 2, 4),
+    ).to(device)
 
-        # Create dummy inputs
-        B, Seq, C = 1, 16, 16
-        hidden_states = torch.randn(B, Seq, C, device=device)
-        encoder_hidden_states = torch.randn(B, 10, 32, device=device)  # joint_attention_dim=32
-        timestep = torch.tensor([1], device=device)
-        img_ids = torch.zeros(Seq, 3, device=device)
-        txt_ids = torch.zeros(10, 3, device=device)
+    # Create dummy inputs
+    B, Seq, C = 1, 16, 16
+    hidden_states = torch.randn(B, Seq, C, device=device)
+    encoder_hidden_states = torch.randn(B, 10, 32, device=device)  # joint_attention_dim=32
+    timestep = torch.tensor([1], device=device)
+    img_ids = torch.zeros(Seq, 3, device=device)
+    txt_ids = torch.zeros(10, 3, device=device)
 
-        # Run forward
-        output = model(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            timestep=timestep,
-            img_ids=img_ids,
-            txt_ids=txt_ids,
-            return_dict=False,
-        )
+    # Run forward
+    output = model(
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        timestep=timestep,
+        img_ids=img_ids,
+        txt_ids=txt_ids,
+        return_dict=False,
+    )
 
-        assert output is not None
-        assert isinstance(output, tuple)
-        assert output[0].shape == hidden_states.shape
+    assert output is not None
+    assert isinstance(output, tuple)
+    assert output[0].shape == hidden_states.shape

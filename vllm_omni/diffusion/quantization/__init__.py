@@ -34,6 +34,7 @@ from .bitsandbytes import (
     patch_transformers_for_bnb_load,
 )
 from .fp8 import DiffusionFp8Config
+from .gguf import DiffusionGgufConfig
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -47,6 +48,7 @@ logger = init_logger(__name__)
 _QUANT_CONFIG_REGISTRY: dict[str, type[DiffusionQuantizationConfig]] = {
     "fp8": DiffusionFp8Config,
     "bitsandbytes": DiffusionBitsAndBytesConfig,
+    "gguf": DiffusionGgufConfig,
 }
 
 SUPPORTED_QUANTIZATION_METHODS = list(_QUANT_CONFIG_REGISTRY.keys())
@@ -159,6 +161,7 @@ __all__ = [
     "apply_bnb_quantization",
     "get_bnb_module_kwargs",
     "patch_transformers_for_bnb_load",
+    "DiffusionGgufConfig",
     "get_diffusion_quant_config",
     "get_vllm_quant_config_for_layers",
     "SUPPORTED_QUANTIZATION_METHODS",

@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -63,6 +64,7 @@ class DiffusionWorker:
         local_rank: int,
         rank: int,
         od_config: OmniDiffusionConfig,
+        skip_load_model: bool = False,
     ):
         self.local_rank = local_rank
         self.rank = rank
@@ -79,8 +81,9 @@ class DiffusionWorker:
             od_config=self.od_config,
             device=self.device,
         )
-        self.load_model(load_format=self.od_config.diffusion_load_format)
-        self.init_lora_manager()
+        if not skip_load_model:
+            self.load_model(load_format=self.od_config.diffusion_load_format)
+            self.init_lora_manager()
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
@@ -103,6 +106,7 @@ class DiffusionWorker:
         vllm_config = VllmConfig(compilation_config=CompilationConfig())
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
+        vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
@@ -122,6 +126,9 @@ class DiffusionWorker:
                 ring_degree=parallel_config.ring_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
+                hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
+                enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
             init_workspace_manager(self.device)
 
@@ -143,7 +150,10 @@ class DiffusionWorker:
                 self.rank,
                 process_memory / GiB_bytes,
             )
-        assert self.model_runner.pipeline is not None
+
+        # When load_format is "dummy", pipeline will init with custom pipeline later
+        if load_format != "dummy":
+            assert self.model_runner.pipeline is not None
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -192,8 +202,10 @@ class DiffusionWorker:
     def remove_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.remove_adapter(adapter_id)
 
-    def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
-        return self.lora_manager.add_adapter(lora_request, lora_scale)
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        # NOTE (Alex): We have not implemented the API routing
+        # for the frontend server yet.
+        return self.lora_manager.add_adapter(lora_request)
 
     def list_loras(self) -> list[int]:
         return self.lora_manager.list_adapters()
@@ -367,6 +379,10 @@ class WorkerProc:
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
+            try:
+                pack_diffusion_output_shm(output)
+            except Exception as e:
+                logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
             self.result_mq.enqueue(output)
 
     def recv_message(self):
@@ -518,10 +534,15 @@ class WorkerWrapperBase:
         worker_class = self._prepare_worker_class()
 
         # Create the actual worker instance
+        # When custom_pipeline_args is provided, skip initial model loading
+        # since re_init_pipeline will handle it. This avoids allocating memory
+        # through CuMemAllocator twice, which causes assertion failures in
+        # sleep mode.
         self.worker = worker_class(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
+            skip_load_model=(self.custom_pipeline_args is not None),
         )
 
         # Re-initialize pipeline with custom pipeline if provided

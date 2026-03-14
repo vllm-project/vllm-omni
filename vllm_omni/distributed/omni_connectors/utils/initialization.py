@@ -85,14 +85,23 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
     stage_connectors_config = {}
     target_stage = str(stage_id)
 
-    # Iterate through all configured edges
+    # Iterate through all configured edges and inject direction-specific role.
+    # The shared edge-level ConnectorSpec is role-neutral; each stage gets
+    # the correct role ("sender" or "receiver") based on its position in
+    # the edge so that MooncakeTransferEngineConnector (and any future
+    # role-aware connector) initializes correctly.
     for (from_stage, to_stage), spec in transfer_config.connectors.items():
-        # We only care about incoming edges for the worker process
-        # (Worker needs to create connectors to receive data)
         if to_stage == target_stage:
-            stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": spec.extra}}
+            # Incoming edge → this stage is the receiver
+            extra = dict(spec.extra) if spec.extra else {}
+            extra.setdefault("role", "receiver")
+            stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
         elif from_stage == target_stage and target_stage == "0":
-            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": spec.extra}}
+            # Outgoing edge for stage 0 — included for async_chunk spec
+            # extraction (omni_stage.py), NOT for connector instantiation.
+            extra = dict(spec.extra) if spec.extra else {}
+            extra.setdefault("role", "sender")
+            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
 
     return stage_connectors_config
 
@@ -142,42 +151,69 @@ def load_omni_transfer_config(
     for stage_config in stage_args:
         stage_id = str(stage_config["stage_id"])
 
-        # Input connectors
+        # Input connectors (this stage is the receiver)
+        # NOTE: role is NOT injected here — the shared edge-level ConnectorSpec
+        # must remain role-neutral.  Role is injected per-stage in
+        # get_connectors_config_for_stage() / resolve_omni_kv_config_for_stage().
         for input_key, conn_ref in stage_config.get("input_connectors", {}).items():
             if isinstance(conn_ref, str):
                 # Reference to global connector
                 if conn_ref in global_connectors:
                     conn_config = global_connectors[conn_ref]
-                    connector = ConnectorSpec(name=conn_config["name"], extra=conn_config.get("extra", {}))
+                    extra = dict(conn_config.get("extra", {}))
                 else:
                     raise ValueError(f"Undefined connector reference: {conn_ref}")
+                connector = ConnectorSpec(name=conn_config["name"], extra=extra)
             else:
                 # Inline connector definition
-                connector = ConnectorSpec(name=conn_ref["name"], extra=conn_ref.get("extra", {}))
+                extra = dict(conn_ref.get("extra", {}))
+                connector = ConnectorSpec(name=conn_ref["name"], extra=extra)
 
             # Parse from_stage from key (e.g., "from_stage_0" -> "0")
             from_stage = input_key.replace("from_stage_", "")
             edge_key = (from_stage, stage_id)
-            connectors[edge_key] = connector
+            # Both sides of an edge may define the same connector reference;
+            # verify consistency if already registered.
+            if edge_key in connectors:
+                existing = connectors[edge_key]
+                if existing.name != connector.name:
+                    raise ValueError(
+                        f"Connector type mismatch for edge {edge_key[0]}->{edge_key[1]}: "
+                        f"previously registered as '{existing.name}', "
+                        f"but input_connectors of stage {stage_id} specifies '{connector.name}'"
+                    )
+            else:
+                connectors[edge_key] = connector
             expected_edges.add(edge_key)
 
-        # Output connectors
+        # Output connectors (this stage is the sender)
         for output_key, conn_ref in stage_config.get("output_connectors", {}).items():
             if isinstance(conn_ref, str):
                 # Reference to global connector
                 if conn_ref in global_connectors:
                     conn_config = global_connectors[conn_ref]
-                    connector = ConnectorSpec(name=conn_config["name"], extra=conn_config.get("extra", {}))
+                    extra = dict(conn_config.get("extra", {}))
                 else:
                     raise ValueError(f"Undefined connector reference: {conn_ref}")
+                connector = ConnectorSpec(name=conn_config["name"], extra=extra)
             else:
                 # Inline connector definition
-                connector = ConnectorSpec(name=conn_ref["name"], extra=conn_ref.get("extra", {}))
+                extra = dict(conn_ref.get("extra", {}))
+                connector = ConnectorSpec(name=conn_ref["name"], extra=extra)
 
             # Parse to_stage from key (e.g., "to_stage_1" -> "1")
             to_stage = output_key.replace("to_stage_", "")
             edge_key = (stage_id, to_stage)
-            connectors[edge_key] = connector
+            if edge_key in connectors:
+                existing = connectors[edge_key]
+                if existing.name != connector.name:
+                    raise ValueError(
+                        f"Connector type mismatch for edge {edge_key[0]}->{edge_key[1]}: "
+                        f"previously registered as '{existing.name}', "
+                        f"but output_connectors of stage {stage_id} specifies '{connector.name}'"
+                    )
+            else:
+                connectors[edge_key] = connector
             expected_edges.add(edge_key)
 
     # Auto-configure SharedMemoryConnector for missing edges based on runtime edges / engine_input_source
@@ -294,13 +330,16 @@ def build_stage_connectors(
     from .config import ConnectorSpec
 
     connectors: dict[tuple[str, str], Any] = {}
-    # Convert dictionary-formatted config to ConnectorSpec objects
+    # Convert dictionary-formatted config to ConnectorSpec objects.
+    # Only instantiate INPUT connectors ("from_stage_X") — the stage worker
+    # only receives via connectors.  Output connectors are handled at the
+    # orchestrator level (try_send_via_connector uses orchestrator connectors).
     stage_connector_specs = {}
-    for input_key, config in connectors_config.items():
-        if not input_key.startswith("from_stage_"):
+    for key, config in connectors_config.items():
+        if not key.startswith("from_stage_"):
             continue
 
-        from_stage = input_key.replace("from_stage_", "")
+        from_stage = key.replace("from_stage_", "")
         spec_dict = config.get("spec", {})
         if not spec_dict:
             continue
@@ -353,7 +392,8 @@ def resolve_omni_kv_config_for_stage(
     omni_from = None
     omni_to = None
 
-    # Prioritize outgoing (Sender) if exists, else check incoming (Receiver)
+    # Prioritize outgoing (Sender) if exists, else check incoming (Receiver).
+    # Inject direction-specific role so the connector initializes correctly.
     if outgoing:
         if len(outgoing) > 1:
             logger.debug(
@@ -364,6 +404,7 @@ def resolve_omni_kv_config_for_stage(
         outgoing.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
         to_s, spec = outgoing[0]
         omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
+        omni_conn_cfg.setdefault("role", "sender")
         omni_from = stage_id_str
         omni_to = str(to_s)
     elif incoming:
@@ -371,6 +412,7 @@ def resolve_omni_kv_config_for_stage(
         incoming.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
         from_s, spec = incoming[0]
         omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
+        omni_conn_cfg.setdefault("role", "receiver")
         omni_from = str(from_s)
         omni_to = stage_id_str
 

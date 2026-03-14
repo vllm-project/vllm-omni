@@ -19,6 +19,7 @@ stage_args:
       engine_output_type: latent
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
+      mm_processor_cache_gb: 0
     is_comprehension: true
     final_output: true
     final_output_type: text

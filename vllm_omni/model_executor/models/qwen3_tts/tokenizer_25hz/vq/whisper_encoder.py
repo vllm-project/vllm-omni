@@ -23,19 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func
-except ImportError:
-    try:
-        from flash_attn.flash_attn_interface import flash_attn_unpadded_func as flash_attn_varlen_func
-    except ImportError:
-        print(
-            "\n********\nWarning: flash-attn is not installed. "
-            "Will only run the manual PyTorch version. "
-            "Please install flash-attn for faster inference.\n********\n "
-        )
-        flash_attn_varlen_func = None
-
+from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN, flash_attn_varlen_func
 
 N_FFT = 400
 HOP_LENGTH = 160
@@ -152,7 +140,7 @@ class Linear(nn.Linear):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_state: int, n_head: int):
+    def __init__(self, n_state: int, n_head: int, use_flash_attention: bool = True):
         super().__init__()
         self.n_head = n_head
         self.query = Linear(n_state, n_state)
@@ -160,7 +148,7 @@ class MultiHeadAttention(nn.Module):
         self.value = Linear(n_state, n_state)
         self.out = Linear(n_state, n_state)
 
-        self.use_flash_attention = True
+        self.use_flash_attention = use_flash_attention and HAS_FLASH_ATTN
 
     def forward(
         self,
@@ -171,15 +159,8 @@ class MultiHeadAttention(nn.Module):
         k = self.key(x)
         v = self.value(x)
 
-        if self.use_flash_attention:
-            if flash_attn_varlen_func is None:
-                x = self.qkv_attention_manual(q, k, v, cu_seqlens=cu_seqlens)
-            else:
-                if q.dtype not in [torch.float16, torch.bfloat16]:
-                    x = self.qkv_attention_manual(q, k, v, cu_seqlens=cu_seqlens)
-                    self.use_flash_attention = False
-                else:
-                    x = self.qkv_flash_attention(q, k, v, cu_seqlens=cu_seqlens)
+        if self.use_flash_attention and q.dtype in [torch.float16, torch.bfloat16]:
+            x = self.qkv_flash_attention(q, k, v, cu_seqlens=cu_seqlens)
         else:
             x = self.qkv_attention_manual(q, k, v, cu_seqlens=cu_seqlens)
 
@@ -249,7 +230,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, n_state: int, n_head: int, enable_mp: bool = False, sequence_parallel: bool = False):
+    def __init__(self, n_state: int, n_head: int, sequence_parallel: bool = False):
         super().__init__()
         n_mlp = n_state * 4
         self.attn_ln = nn.LayerNorm(n_state)
@@ -274,8 +255,6 @@ class WhisperEncoder(nn.Module):
         n_layer: int,
         n_window: int = 1500,
         output_dim: int = 512,
-        grad_checkpointing: bool = False,
-        enable_mp: bool = False,
         audio_sequence_parallel: bool = False,
     ):
         super().__init__()
@@ -286,10 +265,7 @@ class WhisperEncoder(nn.Module):
         self.n_mels = n_mels
 
         self.blocks = nn.ModuleList(
-            [
-                ResidualAttentionBlock(n_state, n_head, enable_mp=enable_mp, sequence_parallel=audio_sequence_parallel)
-                for _ in range(n_layer)
-            ]
+            [ResidualAttentionBlock(n_state, n_head, sequence_parallel=audio_sequence_parallel) for _ in range(n_layer)]
         )
         self.ln_post = nn.LayerNorm(n_state)
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
@@ -299,8 +275,6 @@ class WhisperEncoder(nn.Module):
         self.audio_bos_eos_token = nn.Embedding(2, output_dim)
 
         self.output_dim = output_dim
-        self.grad_checkpointing = grad_checkpointing
-        self.enable_mp = enable_mp
         self.n_head = n_head
         self.n_state = n_state
         self.n_window = n_window
@@ -308,13 +282,6 @@ class WhisperEncoder(nn.Module):
         self.audio_sequence_parallel = audio_sequence_parallel
 
         self.tp_world_size = 1
-
-        self.set_audio_sync()
-
-    def set_audio_sync(self):
-        for name, param in self.named_parameters():
-            if not name.startswith("blocks"):
-                setattr(param, "audio_sync", True)
 
     def forward(
         self, x_list: list[Tensor], audio_mellens: list[int], audio_aftercnnlens: list[int], audio_seqlens: list[int]
@@ -377,9 +344,3 @@ class WhisperEncoder(nn.Module):
         output[end_ids] = self.audio_bos_eos_token.weight[1].to(x.dtype)
         output[audio_tokens_mask] = x
         return output
-
-    def lock(self, layers: int):
-        self.conv1.requires_grad_(False)
-        self.conv2.requires_grad_(False)
-        for i in range(min(layers, len(self.blocks))):
-            self.blocks[i].requires_grad_(False)

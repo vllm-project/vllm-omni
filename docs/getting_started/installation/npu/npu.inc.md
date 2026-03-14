@@ -3,14 +3,11 @@
 For detailed hardware and software requirements, please refer to the [vllm-ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
 # --8<-- [end:requirements]
-# --8<-- [start:installation]
+# --8<-- [start:installation-release]
 
 The recommended way to use vLLM-Omni on NPU is through the vllm-ascend pre-built Docker images:
 
 ```bash
-# Update DEVICE according to your NPUs (/dev/davinci[0-7])
-export DEVICE0=/dev/davinci0
-export DEVICE1=/dev/davinci1
 # Update the vllm-ascend image
 # Atlas A2:
 # export IMAGE=quay.io/ascend/vllm-ascend:v0.14.0rc1
@@ -20,8 +17,10 @@ export IMAGE=quay.io/ascend/vllm-ascend:v0.14.0rc1
 docker run --rm \
     --name vllm-omni-npu \
     --shm-size=1g \
-    --device $DEVICE0 \
-    --device $DEVICE1 \
+    --device /dev/davinci0 \
+    --device /dev/davinci1 \
+    --device /dev/davinci2 \
+    --device /dev/davinci3 \
     --device /dev/davinci_manager \
     --device /dev/devmm_svm \
     --device /dev/hisi_hdc \
@@ -34,13 +33,18 @@ docker run --rm \
     -p 8000:8000 \
     -it $IMAGE bash
 
+# Because vllm-ascend will release v0.16.0rc1 after vllm-omni 0.16.0,
+# we have to pin vllm-ascend at the current commit.
+cd /vllm-workspace/vllm-ascend
+git checkout e2175d9c7e62b437391dfee996b1375674ba7c18
+pip install -v -e .
+
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
-git clone -b v0.14.0 https://github.com/vllm-project/vllm-omni.git
+git clone -b v0.16.0 https://github.com/vllm-project/vllm-omni.git
 
 cd vllm-omni
-VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
-# OR pip install -v -e . --no-build-isolation
+pip install -v -e .
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
 
@@ -48,13 +52,42 @@ The default workdir is `/workspace`, with vLLM, vLLM-Ascend and vLLM-Omni code p
 
 For other installation methods (pip installation, building from source, custom Docker builds), please refer to the [vllm-ascend installation guide](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
-We are keeping [issue #997](https://github.com/vllm-project/vllm-omni/issues/997) up to date with the aligned versions of vLLM, vLLM-Ascend, and vLLM-Omni, and also outlining the Q1 roadmap there.
+We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) up to date with the aligned versions of vLLM, vLLM-Ascend, and vLLM-Omni, and also outlining the Q1 roadmap there.
 
-# --8<-- [end:installation]
+# --8<-- [end:installation-release]
+
+# --8<-- [start:installation-main]
+
+You can also build vLLM-Omni from the latest main branch if you want to use the latest features or bug fixes. (But sometimes it will break for a while. You can check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for the status of the latest commit of vLLM-Omni main branch on NPU.)
+
+```bash
+# Pin vLLM version to 0.16.0
+cd /vllm-workspace/vllm
+git pull origin main
+git fetch origin --tags
+git checkout v0.16.0
+VLLM_TARGET_DEVICE=empty pip install -v -e .
+
+# Because vllm-ascend has not yet entered continuous development and has not been officially released, we need to pin it to a specific commit. Please note that this commit may change over time.
+cd ../vllm-ascend
+git pull origin main
+git fetch origin --tags
+git checkout e2175d9c7e62b437391dfee996b1375674ba7c18
+pip install -v -e .
+
+# Install vLLM-Omni from the latest main branch
+cd ../vllm-omni
+git clone https://github.com/vllm-project/vllm-omni.git
+pip install -v -e . --no-build-isolation
+# or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+```
+
+# --8<-- [end:installation-main]
 
 # --8<-- [start:pre-built-images]
 
-`vllm-ascend` offers Docker images for deployment. You can just pull the **prebuilt image** from the image repository [ascend/vllm-ascend](https://quay.io/repository/ascend/vllm-ascend?tab=tags) and run it with bash.
+vLLM-Omni offers Docker images for Ascend NPU deployment. You can just pull the **prebuilt image** from the image repository [ascend/vllm-omni](https://quay.io/repository/ascend/vllm-omni?tab=tags) and run it with bash.
 
 Supported images as following.
 
@@ -63,16 +96,14 @@ Supported images as following.
 | image-tag | Atlas A2 | Ubuntu |
 | image-tag-a3 | Atlas A3 | Ubuntu |
 
-vLLM-Omni offers Docker images for Ascend NPU deployment. You can just pull the **prebuilt image** from the image repository [ascend/vllm-ascend](https://quay.io/repository/ascend/vllm-ascend?tab=tags) and run it with bash.
-
-Here's an example deployment command that has been verified on 6 x NPUs:
+Here's an example deployment command that has been verified on 4 x NPUs:
 
 ```bash
 # Atlas A2:
-# export IMAGE=quay.io/ascend/vllm-omni:v0.14.0
+# export IMAGE=quay.io/ascend/vllm-omni:v0.16.0
 # Atlas A3:
-# export IMAGE=quay.io/ascend/vllm-omni:v0.14.0-a3
-export IMAGE=quay.io/ascend/vllm-omni:v0.14.0
+# export IMAGE=quay.io/ascend/vllm-omni:v0.16.0-a3
+export IMAGE=quay.io/ascend/vllm-omni:v0.16.0
 docker run --rm \
     --name vllm-omni-npu \
     --shm-size=1g \
@@ -80,8 +111,6 @@ docker run --rm \
     --device /dev/davinci1 \
     --device /dev/davinci2 \
     --device /dev/davinci3 \
-    --device /dev/davinci4 \
-    --device /dev/davinci5 \
     --device /dev/davinci_manager \
     --device /dev/devmm_svm \
     --device /dev/hisi_hdc \

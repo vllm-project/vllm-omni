@@ -177,6 +177,74 @@ Example configuration for TP=2 on GPUs 0 and 1:
 | `max_inflight`        | `1`     | Maximum inflight requests        |
 | `shm_threshold_bytes` | `65536` | Shared memory threshold (64KB)   |
 
+## Using Mooncake Connector
+
+[Mooncake](https://github.com/kvcache-ai/Mooncake) is a high-performance distributed KV cache transfer engine that enables efficient cross-node data movement via TCP or RDMA, making it ideal for multi-node disaggregated inference.
+
+By default, BAGEL uses `SharedMemoryConnector` for inter-stage communication. You can switch to the Mooncake connector for better performance on multi-GPU setups and to enable multi-node deployment.
+
+### Prerequisites
+
+Install the Mooncake transfer engine:
+
+```bash
+# For CUDA-enabled systems (recommended)
+pip install mooncake-transfer-engine
+
+# For non-CUDA systems
+pip install mooncake-transfer-engine-non-cuda
+```
+
+### Step 1: Start the Mooncake Master
+
+On the **primary node**, start the Mooncake master service (run in a separate terminal or background with `&`):
+
+```bash
+# Optional: enable disk-backed storage by creating a directory and passing --root_fs_dir.
+# Without it, Mooncake runs in memory-only mode, which is sufficient for KV cache transfer.
+mkdir -p ./mc_storage
+
+mooncake_master \
+  --rpc_port=50051 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080 \
+  --metrics_port=9003 \
+  --root_fs_dir=./mc_storage/ \
+  --cluster_id=mc-local-1 &
+```
+
+### Step 2: Run Offline Inference with Mooncake
+
+Use the provided Mooncake stage config [`bagel_multiconnector.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml). Before launching, update the `metadata_server` and `master` addresses in the YAML to match your Mooncake master node's IP (use `127.0.0.1` for single-node testing).
+
+```bash
+cd examples/offline_inference/bagel
+
+# Text to Image with Mooncake
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality text2img \
+                  --prompts "A cute cat" \
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+
+# Image to Text with Mooncake
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality img2text \
+                  --image-path /path/to/image.jpg \
+                  --prompts "Describe this image" \
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+
+# Text to Text with Mooncake
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality text2text \
+                  --prompts "What is the capital of France?" \
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+```
+
+For more details on the Mooncake connector and multi-node setup, see the [Mooncake Store Connector documentation](../../../docs/design/feature/omni_connectors/mooncake_store_connector.md).
+
+------
+
 ## FAQ
 
 - If you encounter an error about the backend of librosa, try to install ffmpeg with the command below.

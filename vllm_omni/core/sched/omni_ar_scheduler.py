@@ -246,7 +246,7 @@ class OmniARScheduler(VLLMScheduler):
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
-            if scheduled_spec_token_ids:
+            if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
@@ -380,6 +380,11 @@ class OmniARScheduler(VLLMScheduler):
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.cleanup(
+                        request.request_id,
+                        getattr(request, "external_req_id", None),
+                    )
 
         # [Omni] Cleanup state for finished requests
         for req in stopped_running_reqs:
@@ -476,10 +481,7 @@ class OmniARScheduler(VLLMScheduler):
         assert request.is_finished()
 
         # 1. Standard cleanup parts from base _free_request
-        connector_delay_free_blocks = False
-        kv_xfer_params = None
-        if self.connector is not None:
-            connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id

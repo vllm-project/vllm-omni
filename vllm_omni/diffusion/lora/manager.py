@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import time
 from collections import OrderedDict
+from typing import get_args
 
 import torch
 import torch.nn as nn
+from vllm.config.lora import MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
@@ -36,6 +39,9 @@ class DiffusionLoRAManager:
     Reuses vLLM's LoRA infrastructure, adapted for diffusion pipelines.
     Uses LRU cache management similar to LRUCacheLoRAModelManager.
     """
+
+    # Valid max allowed ranks for LoRA in vLLM
+    _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
 
     def __init__(
         self,
@@ -131,17 +137,43 @@ class DiffusionLoRAManager:
     def _compute_packed_modules_mapping(self) -> dict[str, list[str]]:
         """Collect packed->sublayer mappings from the diffusion model.
 
-        vLLM models declare `packed_modules_mapping` on the model class. For
-        diffusion pipelines, we attach the same mapping on the transformer
-        module(s) that implement packed (fused) projections, so LoRA loading can
-        accept checkpoints trained against the logical sub-projections.
+        Diffusion models often use packed (fused) projections like `to_qkv` or
+        `w13`, while LoRA checkpoints are typically saved against the logical
+        sub-projections (e.g. `to_q`/`to_k`/`to_v`, `w1`/`w3`). Many diffusion
+        model implementations already define these relationships in
+        `load_weights()` via `stacked_params_mapping`. To avoid duplicating the
+        mapping in multiple places, we derive packed→sublayer mappings from the
+        model's `stacked_params_mapping`.
         """
+
+        def _derive_from_stacked_params_mapping(stacked: object) -> dict[str, list[str]]:
+            if not isinstance(stacked, (list, tuple)):
+                return {}
+            derived: dict[str, list[str]] = {}
+            for item in stacked:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                packed_suffix, sub_suffix = item[0], item[1]
+                if not isinstance(packed_suffix, str) or not packed_suffix:
+                    continue
+                if not isinstance(sub_suffix, str) or not sub_suffix:
+                    continue
+                # The mapping strings are usually suffix patterns (e.g. ".to_qkv"),
+                # but some models scope them under submodules (e.g. ".attn1.to_qkv").
+                # For LoRA we only care about the leaf module names.
+                packed_name = packed_suffix.strip(".").split(".")[-1]
+                sub_name = sub_suffix.strip(".").split(".")[-1]
+                existing = derived.get(packed_name)
+                if existing is None:
+                    derived[packed_name] = [sub_name]
+                elif sub_name not in existing:
+                    existing.append(sub_name)
+            return derived
+
         mapping: dict[str, list[str]] = {}
         for module in self.pipeline.modules():
-            packed = getattr(module, "packed_modules_mapping", None)
-            if not isinstance(packed, dict):
-                continue
-            for packed_name, sub_names in packed.items():
+            derived = _derive_from_stacked_params_mapping(getattr(module, "stacked_params_mapping", None))
+            for packed_name, sub_names in derived.items():
                 if not isinstance(packed_name, str) or not packed_name:
                     continue
                 if not isinstance(sub_names, (list, tuple)) or not all(isinstance(s, str) for s in sub_names):
@@ -155,7 +187,7 @@ class DiffusionLoRAManager:
                     mapping[packed_name] = sub_names_list
                 elif existing != sub_names_list:
                     logger.warning(
-                        "Conflicting packed_modules_mapping for %s: %s vs %s; using %s",
+                        "Conflicting packed module mapping for %s: %s vs %s; using %s",
                         packed_name,
                         existing,
                         sub_names_list,
@@ -170,7 +202,7 @@ class DiffusionLoRAManager:
             return None
         if len(sub_suffixes) != n_slices:
             logger.warning(
-                "packed_modules_mapping[%s] has %d slices but layer expects %d; skipping sublayer lookup",
+                "Packed module mapping[%s] has %d slices but layer expects %d; skipping sublayer lookup",
                 packed_module_suffix,
                 len(sub_suffixes),
                 n_slices,
@@ -189,6 +221,10 @@ class DiffusionLoRAManager:
             logger.debug("No lora_request provided, deactivating all LoRA adapters")
             self._deactivate_all_adapters()
             return
+        elif math.isclose(0.0, lora_scale):
+            logger.warning("Received a request with LoRA scale 0; deactivating all LoRA adapters")
+            self._deactivate_all_adapters()
+            return
 
         adapter_id = lora_request.lora_int_id
         logger.debug(
@@ -202,16 +238,33 @@ class DiffusionLoRAManager:
         )
         if adapter_id not in self._registered_adapters:
             logger.info("Loading new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
-            self.add_adapter(lora_request, lora_scale)
+            # Add the adapter + add to the cache
+            self.add_adapter(lora_request)
         else:
-            logger.debug("Adapter %d already loaded, activating", adapter_id)
+            # Just touch the cache access order
+            self._touch_adapter_info(adapter_id)
 
-            # update access order
-            self._adapter_scales[adapter_id] = lora_scale
-            self._adapter_access_order[adapter_id] = time.time()
-            self._adapter_access_order.move_to_end(adapter_id)
+        self._activate_adapter(adapter_id, lora_scale)
 
-        self._activate_adapter(adapter_id)
+    def _touch_adapter_info(self, adapter_id):
+        """Update the current caching ordering info."""
+        self._adapter_access_order[adapter_id] = time.time()
+        self._adapter_access_order.move_to_end(adapter_id)
+
+    def _update_adapter_scale(self, adapter_id: int, lora_scale: float):
+        """Update the adapter scale for a given adapter ID. To avoid potential
+        issues with using Floats as keys, for now, we round float values to
+        3 decimal points.
+        """
+        scale = DiffusionLoRAManager._get_rounded_scale(lora_scale)
+        self._adapter_scales[adapter_id] = scale
+
+    @staticmethod
+    def _get_rounded_scale(lora_scale: float):
+        """Normalizes a lora scale for use as a key in the _adapter_scales
+        dict; for now we just round scales to 3 decimal places.
+        """
+        return round(lora_scale, 3)
 
     def _load_adapter(
         self,
@@ -365,11 +418,10 @@ class DiffusionLoRAManager:
         if min_rank <= self._max_lora_rank:
             return
 
-        if min_rank <= 0:
-            raise ValueError(f"Invalid LoRA rank: {min_rank}")
+        valid_max_rank = self._get_smallest_valid_max_rank(min_rank)
 
-        logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, min_rank)
-        self._max_lora_rank = min_rank
+        logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
+        self._max_lora_rank = valid_max_rank
 
         if not self._lora_modules:
             return
@@ -389,8 +441,21 @@ class DiffusionLoRAManager:
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
             active_id = self._active_adapter_id
+            active_scale = self._adapter_scales[active_id]
             self._active_adapter_id = None
-            self._activate_adapter(active_id)
+            self._activate_adapter(active_id, active_scale)
+
+    @classmethod
+    def _get_smallest_valid_max_rank(cls, min_rank: int) -> int:
+        """Given a LoRA rank, get the smallest max rank that can support it."""
+        if min_rank <= 0:
+            raise ValueError(f"Invalid LoRA rank: {min_rank}")
+
+        allowed_ranks = [rank for rank in cls._VALID_MAX_RANKS if rank >= min_rank]
+        if not allowed_ranks:
+            raise ValueError(f"LoRA rank of {min_rank} exceeds max allowed rank of {max(cls._VALID_MAX_RANKS)}")
+
+        return min(allowed_ranks)
 
     def _get_lora_weights(
         self,
@@ -416,9 +481,16 @@ class DiffusionLoRAManager:
         module_suffix = full_module_name.split(".")[-1]
         return lora_model.get_lora(module_suffix)
 
-    def _activate_adapter(self, adapter_id: int) -> None:
-        if self._active_adapter_id == adapter_id:
-            logger.debug("Adapter %d already active, skipping", adapter_id)
+    def _is_active_at_scale(self, adapter_id: int, scale: float) -> bool:
+        """True if the adapter_id is active and the current scale matches."""
+        rounded_scale = DiffusionLoRAManager._get_rounded_scale(scale)
+        is_active = self._active_adapter_id == adapter_id
+        matches_scale = self._adapter_scales.get(adapter_id) == rounded_scale
+        return is_active and matches_scale
+
+    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
+        if self._is_active_at_scale(adapter_id, scale):
+            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
             return
 
         logger.info("Activating adapter: id=%d", adapter_id)
@@ -453,7 +525,6 @@ class DiffusionLoRAManager:
                         lora_layer.reset_lora(0)
                         continue
 
-                    scale = self._adapter_scales.get(adapter_id, 1.0)
                     lora_a_list: list[torch.Tensor | None] = []
                     lora_b_list: list[torch.Tensor | None] = []
                     for sub_lora in sub_loras:
@@ -474,8 +545,6 @@ class DiffusionLoRAManager:
                 else:
                     lora_layer.reset_lora(0)
                 continue
-
-            scale = self._adapter_scales.get(adapter_id, 1.0)
 
             # Packed LoRA weights already provide per-slice tensors.
             if isinstance(lora_weights, PackedLoRALayerWeights):
@@ -533,6 +602,7 @@ class DiffusionLoRAManager:
             )
 
         self._active_adapter_id = adapter_id
+        self._update_adapter_scale(adapter_id, scale)
 
     def _deactivate_all_adapters(self) -> None:
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
@@ -541,8 +611,10 @@ class DiffusionLoRAManager:
         self._active_adapter_id = None
         logger.debug("All adapters deactivated")
 
-    def _evict_if_needed(self) -> None:
-        while len(self._registered_adapters) > self.max_cached_adapters:
+    def _evict_for_new_adapter(self) -> None:
+        """Evict unpinned registered adapters until we have room for a new
+        adapter to be loaded."""
+        while len(self._registered_adapters) > (self.max_cached_adapters - 1):
             # Pick LRU among non-pinned adapters
             evict_candidates = [aid for aid in self._adapter_access_order.keys() if aid not in self._pinned_adapters]
             if not evict_candidates:
@@ -562,7 +634,7 @@ class DiffusionLoRAManager:
             )
             self.remove_adapter(lru_adapter_id)
 
-    def add_adapter(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
+    def add_adapter(self, lora_request: LoRARequest) -> bool:
         """
         Add a new adapter to the cache without activating it.
         """
@@ -573,17 +645,17 @@ class DiffusionLoRAManager:
             return False
 
         logger.info("Adding new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
+
+        # evict if cache full before adding the new adapter
+        # so that we don't go over capacity on the new load
+        self._evict_for_new_adapter()
+
         lora_model, peft_helper = self._load_adapter(lora_request)
+        self._touch_adapter_info(adapter_id)
+
         self._registered_adapters[adapter_id] = lora_model
-        self._adapter_scales[adapter_id] = lora_scale
 
         self._replace_layers_with_lora(peft_helper)
-
-        self._adapter_access_order[adapter_id] = time.time()
-        self._adapter_access_order.move_to_end(adapter_id)
-
-        # evict if cache full
-        self._evict_if_needed()
 
         logger.debug(
             "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters

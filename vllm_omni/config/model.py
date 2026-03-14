@@ -34,6 +34,8 @@ class OmniModelConfig(ModelConfig):
             "audio", "latents"). If None, output type is inferred.
         stage_connector_config: Stage connector configuration dictionary.
             Contains "name" (connector name), "extra" (extra connector config).
+        task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
+            If not specified, will be inferred from model path.
 
     Example:
         >>> config = OmniModelConfig(
@@ -46,7 +48,7 @@ class OmniModelConfig(ModelConfig):
     stage_id: int = 0
     async_chunk: bool = False
     model_stage: str = "thinker"
-    model_arch: str = "Qwen2_5OmniForConditionalGeneration"
+    model_arch: str | None = None
     worker_type: str | None = None
     engine_output_type: str | None = None
     hf_config_name: str | None = None
@@ -58,6 +60,8 @@ class OmniModelConfig(ModelConfig):
         }
     )
     omni_kv_config: dict | None = None
+    codec_frame_rate_hz: float | None = None
+    task_type: str | None = None
 
     @property
     def registry(self):
@@ -65,7 +69,9 @@ class OmniModelConfig(ModelConfig):
 
     @property
     def architectures(self) -> list[str]:
-        return [self.model_arch]
+        if self.model_arch is not None:
+            return [self.model_arch]
+        return super().architectures
 
     @property
     def embedding_size(self):
@@ -97,6 +103,7 @@ class OmniModelConfig(ModelConfig):
     def __post_init__(
         self,
         # Multimodal config init vars
+        language_model_only: bool,
         limit_mm_per_prompt: dict[str, int | dict[str, int]] | None,
         enable_mm_embeds: bool | None,
         media_io_kwargs: dict[str, dict[str, Any]] | None,
@@ -113,6 +120,7 @@ class OmniModelConfig(ModelConfig):
     ) -> None:
         # Call parent's __post_init__ to handle all standard ModelConfig initialization
         super().__post_init__(
+            language_model_only=language_model_only,
             limit_mm_per_prompt=limit_mm_per_prompt,
             enable_mm_embeds=enable_mm_embeds,
             media_io_kwargs=media_io_kwargs,
@@ -127,6 +135,21 @@ class OmniModelConfig(ModelConfig):
             skip_mm_profiling=skip_mm_profiling,
             video_pruning_rate=video_pruning_rate,
         )
+
+        # Qwen3-TTS: infer codec frame rate from the model config for online serving.
+        if self.codec_frame_rate_hz is None and self.model_arch == "Qwen3TTSTalkerForConditionalGenerationARVLLM":
+            talker_cfg = getattr(self.hf_config, "talker_config", None)
+            if isinstance(talker_cfg, dict):
+                pos_per_sec = talker_cfg.get("position_id_per_seconds")
+            else:
+                pos_per_sec = getattr(talker_cfg, "position_id_per_seconds", None)
+            if pos_per_sec is not None:
+                try:
+                    fps = float(pos_per_sec)
+                except Exception:
+                    fps = None
+                if fps is not None and fps > 0:
+                    self.codec_frame_rate_hz = fps
 
         # Override hf_text_config with omni-specific logic for multi-stage models
         # (e.g., thinker_config, talker_config)

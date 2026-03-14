@@ -4,6 +4,8 @@ Example online tests for Qwen2.5-Omni-7B model.
 
 import os
 
+from vllm_omni.platforms import current_omni_platform
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import re
@@ -12,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import convert_audio_file_to_text, cosine_similarity_text
+from tests.conftest import OmniServerParams, convert_audio_file_to_text, cosine_similarity_text
 from tests.utils import hardware_test
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
@@ -20,9 +22,18 @@ models = ["Qwen/Qwen2.5-Omni-7B"]
 
 stage_configs = [str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
 
+if current_omni_platform.is_xpu():
+    stage_configs = [
+        str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")
+    ]
+
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving" / "qwen2_5_omni")
 # Create parameter combinations for model and stage config
-test_params = [(8091, model, stage_config) for model in models for stage_config in stage_configs]
+test_params = [
+    OmniServerParams(model=model, port=8091, stage_config_path=stage_config)
+    for model in models
+    for stage_config in stage_configs
+]
 
 
 def run_cmd(command):
@@ -236,7 +247,6 @@ def test_modality_control_003(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.skip(reason="There is a known issue with stream error.")
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})

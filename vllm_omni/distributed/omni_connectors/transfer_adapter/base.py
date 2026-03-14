@@ -3,6 +3,7 @@
 
 import threading
 import time
+from collections import deque
 from typing import Any
 
 from ..utils.logging import get_connector_logger
@@ -22,17 +23,16 @@ class OmniTransferAdapterBase:
         if not hasattr(self, "connector"):
             self.connector = None
         # Requests that are waiting to be polled
-        self._pending_load_reqs = {}
+        self._pending_load_reqs = deque()
         # Requests that have successfully retrieved data
         self._finished_load_reqs = set()
 
         # Requests that are waiting to be saved
-        self._pending_save_reqs = {}
+        self._pending_save_reqs = deque()
         # Requests that have successfully saved data
         self._finished_save_reqs = set()
 
         self.stop_event = threading.Event()
-        self.lock = threading.Lock()
 
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
@@ -48,37 +48,30 @@ class OmniTransferAdapterBase:
         """Loop to poll for incoming data."""
         while not self.stop_event.is_set():
             # Iterate over a snapshot of pending requests
-            with self.lock:
-                pending_reqs_ids = list(self._pending_load_reqs.keys())
-
-            for req_id in pending_reqs_ids:
+            while self._pending_load_reqs:
+                request = self._pending_load_reqs.popleft()
+                request_id = request.request_id
+                self.request_ids_mapping[request_id] = request.external_req_id
                 try:
-                    self._poll_single_request(req_id)
+                    is_success = self._poll_single_request(request)
+                    if not is_success:
+                        self._pending_load_reqs.append(request)
                 except Exception as e:
-                    logger.warning(f"Error receiving data for {req_id}: {e}")
+                    self._pending_load_reqs.append(request)
+                    logger.warning(f"Error receiving data for {request_id}: {e}")
 
             time.sleep(0.001)
 
     def save_loop(self):
         """Loop to send outgoing data."""
         while not self.stop_event.is_set():
-            task = None
-            with self.lock:
-                pending_save_reqs_ids = list(self._pending_save_reqs.keys())
-                for req_id in pending_save_reqs_ids:
-                    if self._pending_save_reqs[req_id]:
-                        task = self._pending_save_reqs[req_id].popleft()
-                        if not self._pending_save_reqs[req_id]:
-                            del self._pending_save_reqs[req_id]
-                        break
-
-            if task:
+            while self._pending_save_reqs:
+                task = self._pending_save_reqs.popleft()
                 try:
                     self._send_single_request(task)
                 except Exception as e:
-                    logger.error(f"Error saving data for {task.get('request_id')}: {e}")
-            else:
-                time.sleep(0.001)
+                    logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
+            time.sleep(0.001)
 
     def _poll_single_request(self, *args, **kwargs):
         """Poll connector for a single request task.

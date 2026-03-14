@@ -4,8 +4,8 @@
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader import sequential_backend
+from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.quantization.bitsandbytes import set_bnb_offload_skip_components
 
 
