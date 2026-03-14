@@ -83,15 +83,15 @@ t2i_eval = T2IEvaluator(
 )
 results = t2i_eval.evaluate(prompts, images)
 
-# I2I evaluation  
+# I2I evaluation
 i2i_eval = I2IEvaluator(
     use_lpips=True,
     use_vlm_judge=True,
     lpips_net="alex"
 )
 results = i2i_eval.evaluate(
-    original_images, 
-    edited_images, 
+    original_images,
+    edited_images,
     instructions
 )
 ```

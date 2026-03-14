@@ -8,7 +8,10 @@ This module implements evaluation metrics for I2I generation:
 import logging
 from typing import Any
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None  # noqa: F811
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,8 @@ class LPIPSMetric:
     ) -> dict[str, Any]:
         """Compute LPIPS distance between original and edited images.
 
+        Uses batch processing for efficiency.
+
         Args:
             original_images: List of original images (before editing)
             edited_images: List of edited images (after editing)
@@ -67,16 +72,23 @@ class LPIPSMetric:
         Returns:
             Dictionary with LPIPS scores
         """
+        if np is None:
+            raise ImportError("numpy is required for LPIPS computation")
+
         if len(original_images) != len(edited_images):
             raise ValueError("Number of original and edited images must match")
 
+        if not original_images:
+            return {
+                "lpips_mean": 0.0,
+                "lpips_std": 0.0,
+                "lpips_per_sample": [],
+            }
+
         self._load_model()
 
-        distances = []
-        for i, (orig, edited) in enumerate(zip(original_images, edited_images)):
-            mask = masks[i] if masks else None
-            dist = self._compute_single(orig, edited, mask)
-            distances.append(dist)
+        # Batch process all images for efficiency
+        distances = self._compute_batch(original_images, edited_images, masks)
 
         return {
             "lpips_mean": np.mean(distances) if distances else 0.0,
@@ -84,20 +96,77 @@ class LPIPSMetric:
             "lpips_per_sample": distances,
         }
 
-    def _compute_single(self, original: Any, edited: Any, mask: Any | None = None) -> float:
-        """Compute LPIPS for a single image pair.
+    def _compute_batch(
+        self,
+        original_images: list[Any],
+        edited_images: list[Any],
+        masks: list[Any] | None = None,
+    ) -> list[float]:
+        """Compute LPIPS for multiple image pairs using batch processing.
 
         Args:
-            original: Original image
-            edited: Edited image
-            mask: Optional mask for preserved regions
+            original_images: List of original PIL Images
+            edited_images: List of edited PIL Images
+            masks: Optional list of mask PIL Images
 
         Returns:
-            LPIPS distance (lower is better for preservation)
+            List of LPIPS distances
         """
-        # TODO: Implement actual LPIPS computation
-        # Placeholder for now
-        return 0.0
+        import torch
+
+        # Convert all images to tensors and stack into batches
+        orig_tensors = [self._pil_to_tensor(img) for img in original_images]
+        edited_tensors = [self._pil_to_tensor(img) for img in edited_images]
+
+        # Stack into batches [N, 3, H, W]
+        orig_batch = torch.cat(orig_tensors, dim=0)
+        edited_batch = torch.cat(edited_tensors, dim=0)
+
+        # Move to model device
+        device = next(self._lpips_model.parameters()).device
+        orig_batch = orig_batch.to(device)
+        edited_batch = edited_batch.to(device)
+
+        # Compute LPIPS in batch
+        with torch.no_grad():
+            distances = self._lpips_model(orig_batch, edited_batch)
+
+        # Apply masks if provided
+        if masks is not None:
+            for i, mask in enumerate(masks):
+                mask_tensor = self._pil_to_tensor(mask, grayscale=True)
+                mask_tensor = mask_tensor.to(device)
+                # Normalize mask to [0, 1]
+                mask_tensor = (mask_tensor + 1) / 2
+                # Weighted distance
+                distances[i] = distances[i] * mask_tensor.mean()
+
+        return distances.cpu().numpy().flatten().tolist()
+
+    def _pil_to_tensor(self, image: Any, grayscale: bool = False) -> Any:
+        """Convert PIL Image to torch tensor in [-1, 1] range.
+
+        Args:
+            image: PIL Image
+            grayscale: Whether to convert to grayscale
+
+        Returns:
+            Tensor of shape [1, C, H, W] in range [-1, 1]
+        """
+        import torch
+
+        if grayscale:
+            image = image.convert("L")
+            img_array = np.array(image).astype(np.float32) / 127.5 - 1.0
+            tensor = torch.from_numpy(img_array).unsqueeze(0).unsqueeze(0)
+        else:
+            image = image.convert("RGB")
+            img_array = np.array(image).astype(np.float32) / 127.5 - 1.0
+            # HWC to CHW
+            img_array = np.transpose(img_array, (2, 0, 1))
+            tensor = torch.from_numpy(img_array).unsqueeze(0)
+
+        return tensor
 
 
 class VLMJudge:
