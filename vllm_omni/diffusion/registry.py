@@ -10,6 +10,7 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
 logger = init_logger(__name__)
@@ -55,6 +56,16 @@ _DIFFUSION_MODELS = {
         "wan2_2",
         "pipeline_wan2_2",
         "Wan22Pipeline",
+    ),
+    "LTX2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2Pipeline",
+    ),
+    "LTX2ImageToVideoPipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2ImageToVideoPipeline",
     ),
     "StableAudioPipeline": (
         "stable_audio",
@@ -121,6 +132,16 @@ _DIFFUSION_MODELS = {
         "pipeline_helios",
         "HeliosPipeline",
     ),
+    "Flux2Pipeline": (
+        "flux2",
+        "pipeline_flux2",
+        "Flux2Pipeline",
+    ),
+    "DreamIDOmniPipeline": (
+        "dreamid_omni",
+        "pipeline_dreamid_omni",
+        "DreamIDOmniPipeline",
+    ),
 }
 
 
@@ -180,9 +201,9 @@ def initialize_model(
             od_config.vae_use_tiling = True
 
         # Configure VAE memory optimization settings from config
-        if hasattr(model.vae, "use_slicing"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model.vae, "use_tiling"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
@@ -254,6 +275,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1
 
+        # update forward context sp_plan_hooks_applied
+        ctx = get_forward_context()
+        ctx.sp_plan_hooks_applied = applied_count > 0
+        logger.debug(f"Setting sp_plan_hooks_applied={ctx.sp_plan_hooks_applied} in ``ForwardContext``!")
+
         if applied_count == 0:
             logger.warning(
                 f"Sequence parallelism is enabled (sp_size={sp_size}) but no transformer with _sp_plan found. "
@@ -275,6 +301,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
@@ -287,6 +315,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
+    "Flux2Pipeline": "get_flux2_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

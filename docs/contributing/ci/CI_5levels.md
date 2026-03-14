@@ -67,8 +67,8 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
       <td>&lt;30min</td>
       <td>
-        /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
-        /tests/e2e/offline_inference/test_{model_name}_expansion.py
+        /tests/e2e/online_serving/test_{model_name}.py<br>
+        /tests/e2e/offline_inference/test_{model_name}.py
       </td>
       <td>
         <a href="#chapter-2-l3-level-testing-core-integration-performance-and-accuracy-verification">Chapter 2</a><br>
@@ -508,7 +508,9 @@ L3 level testing executes after code is merged into the main branch. Its core pu
     **2.4.5 Request Execution**
 
     ```python
-    openai_client.send_request(request_config, request_num=1)
+    openai_client.send_omni_request(request_config, request_num=1)  # for omni-understanding models
+    # or
+    openai_client.send_diffusion_request(request_config, request_num=1)  # for diffusion models
     ```
 
     **Explanation**:
@@ -517,7 +519,7 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
-    **Implicit Validation**: The send_request method internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model performs deep validation.
+    **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model performs deep validation.
 
 -   ***Run Command***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
 

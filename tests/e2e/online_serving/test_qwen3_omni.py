@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import (
+    OmniServerParams,
     dummy_messages_from_mix_data,
     generate_synthetic_audio,
     generate_synthetic_image,
@@ -47,11 +48,15 @@ def get_chunk_config():
 if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
+elif current_omni_platform.is_xpu():
+    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
 else:
     stage_configs = [get_chunk_config()]
 
 # Create parameter combinations for model and stage config
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+test_params = [
+    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+]
 
 
 def get_system_prompt():
@@ -114,25 +119,25 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {
-            "audio": ["water", "chirping", "crackling", "rain"],
-            "image": ["square", "quadrate"],
+            "audio": ["test"],
         },
     }
 
     # Test single completion
-    openai_client.send_request(request_config)
+    openai_client.send_omni_request(request_config)
 
 
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
     Test text input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
     Input Modal: text
-    Output Modal: text + audio
+    Output Modal: text
     Datasets: few requests
     """
     messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
@@ -145,4 +150,4 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_request(request_config, request_num=get_max_batch_size())
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())

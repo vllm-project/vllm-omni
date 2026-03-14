@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -26,6 +26,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -140,7 +141,7 @@ def get_helios_pre_process_func(
     return pre_process_func
 
 
-class HeliosPipeline(nn.Module, CFGParallelMixin):
+class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
 
     Supports T2V, I2V (with image input), and V2V (with video input).
@@ -173,8 +174,17 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
         ]
 
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        # Helios checkpoints store embed_tokens under ``shared.weight`` only,
+        # but the published config sets ``tie_word_embeddings=False``.  When
+        # transformers sees ``tie=False`` it creates a separate
+        # ``encoder.embed_tokens.weight`` that is never loaded from the
+        # checkpoint, leaving it as all-zeros.  This silently destroys prompt
+        # encoding and produces grey/meaningless video output.  Force tying so
+        # that ``embed_tokens`` shares ``shared.weight`` as intended.
+        text_enc_cfg = AutoConfig.from_pretrained(model, subfolder="text_encoder", local_files_only=local_files_only)
+        text_enc_cfg.tie_word_embeddings = True
         self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
         self.vae = AutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
@@ -603,6 +613,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
                     use_zero_init=use_zero_init,
                     zero_steps=zero_steps,
                     device=device,
+                    generator=generator,
                 )
 
             if keep_first_frame and (
@@ -662,67 +673,70 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
         batch_size = latents.shape[0]
         do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
 
-        for i, t in enumerate(timesteps):
-            self._current_timestep = t
-            timestep = t.expand(batch_size)
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                self._current_timestep = t
+                timestep = t.expand(batch_size)
 
-            transformer_kwargs = {
-                "hidden_states": latents.to(transformer_dtype),
-                "timestep": timestep,
-                "indices_hidden_states": indices_hidden_states,
-                "indices_latents_history_short": indices_latents_history_short,
-                "indices_latents_history_mid": indices_latents_history_mid,
-                "indices_latents_history_long": indices_latents_history_long,
-                "latents_history_short": latents_history_short.to(transformer_dtype),
-                "latents_history_mid": latents_history_mid.to(transformer_dtype),
-                "latents_history_long": latents_history_long.to(transformer_dtype),
-                "attention_kwargs": attention_kwargs,
-                "return_dict": False,
-            }
-
-            if use_cfg_zero_star and do_true_cfg:
-                noise_pred = self.transformer(
-                    encoder_hidden_states=prompt_embeds,
-                    **transformer_kwargs,
-                )[0]
-
-                noise_uncond = self.transformer(
-                    encoder_hidden_states=negative_prompt_embeds,
-                    **transformer_kwargs,
-                )[0]
-
-                positive_flat = noise_pred.view(batch_size, -1)
-                negative_flat = noise_uncond.view(batch_size, -1)
-                alpha_cfg = optimized_scale(positive_flat, negative_flat)
-                alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
-                alpha_cfg = alpha_cfg.to(noise_pred.dtype)
-
-                if (i <= zero_steps) and use_zero_init:
-                    noise_pred = noise_pred * 0.0
-                else:
-                    noise_pred = noise_uncond * alpha_cfg + guidance_scale * (noise_pred - noise_uncond * alpha_cfg)
-            else:
-                positive_kwargs = {
-                    "encoder_hidden_states": prompt_embeds,
-                    **transformer_kwargs,
+                transformer_kwargs = {
+                    "hidden_states": latents.to(transformer_dtype),
+                    "timestep": timestep,
+                    "indices_hidden_states": indices_hidden_states,
+                    "indices_latents_history_short": indices_latents_history_short,
+                    "indices_latents_history_mid": indices_latents_history_mid,
+                    "indices_latents_history_long": indices_latents_history_long,
+                    "latents_history_short": latents_history_short.to(transformer_dtype),
+                    "latents_history_mid": latents_history_mid.to(transformer_dtype),
+                    "latents_history_long": latents_history_long.to(transformer_dtype),
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
                 }
-                if do_true_cfg:
-                    negative_kwargs = {
-                        "encoder_hidden_states": negative_prompt_embeds,
+
+                if use_cfg_zero_star and do_true_cfg:
+                    noise_pred = self.transformer(
+                        encoder_hidden_states=prompt_embeds,
+                        **transformer_kwargs,
+                    )[0]
+
+                    noise_uncond = self.transformer(
+                        encoder_hidden_states=negative_prompt_embeds,
+                        **transformer_kwargs,
+                    )[0]
+
+                    positive_flat = noise_pred.view(batch_size, -1)
+                    negative_flat = noise_uncond.view(batch_size, -1)
+                    alpha_cfg = optimized_scale(positive_flat, negative_flat)
+                    alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
+                    alpha_cfg = alpha_cfg.to(noise_pred.dtype)
+
+                    if (i <= zero_steps) and use_zero_init:
+                        noise_pred = noise_pred * 0.0
+                    else:
+                        noise_pred = noise_uncond * alpha_cfg + guidance_scale * (noise_pred - noise_uncond * alpha_cfg)
+                else:
+                    positive_kwargs = {
+                        "encoder_hidden_states": prompt_embeds,
                         **transformer_kwargs,
                     }
-                else:
-                    negative_kwargs = None
+                    if do_true_cfg:
+                        negative_kwargs = {
+                            "encoder_hidden_states": negative_prompt_embeds,
+                            **transformer_kwargs,
+                        }
+                    else:
+                        negative_kwargs = None
 
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
 
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                pbar.update()
 
         return latents
 
@@ -748,6 +762,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
         use_zero_init: bool = True,
         zero_steps: int = 1,
         device: torch.device | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
     ) -> torch.Tensor:
         """Pyramid multi-stage denoising for one chunk."""
         batch_size, num_channel, num_frames_lat, height, width = latents.shape
@@ -800,84 +815,94 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
                 alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
-                noise = self.sample_block_noise(batch_size, num_channel, latents.shape[2], height, width, patch_size)
+                noise = self.sample_block_noise(
+                    batch_size, num_channel, latents.shape[2], height, width, patch_size, generator=generator
+                )
                 noise = noise.to(device=device, dtype=transformer_dtype)
                 latents = alpha * latents + beta * noise
 
                 if self.is_distilled and start_point_list is not None:
                     start_point_list.append(latents)
 
-            for idx, t in enumerate(timesteps):
-                self._current_timestep = t
-                timestep = t.expand(latents.shape[0]).to(torch.int64)
+            with self.progress_bar(total=len(timesteps)) as pbar:
+                for idx, t in enumerate(timesteps):
+                    self._current_timestep = t
+                    timestep = t.expand(latents.shape[0]).to(torch.int64)
 
-                transformer_kwargs = {
-                    "hidden_states": latents.to(transformer_dtype),
-                    "timestep": timestep,
-                    "indices_hidden_states": indices_hidden_states,
-                    "indices_latents_history_short": indices_latents_history_short,
-                    "indices_latents_history_mid": indices_latents_history_mid,
-                    "indices_latents_history_long": indices_latents_history_long,
-                    "latents_history_short": latents_history_short.to(transformer_dtype),
-                    "latents_history_mid": latents_history_mid.to(transformer_dtype),
-                    "latents_history_long": latents_history_long.to(transformer_dtype),
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                }
+                    transformer_kwargs = {
+                        "hidden_states": latents.to(transformer_dtype),
+                        "timestep": timestep,
+                        "indices_hidden_states": indices_hidden_states,
+                        "indices_latents_history_short": indices_latents_history_short,
+                        "indices_latents_history_mid": indices_latents_history_mid,
+                        "indices_latents_history_long": indices_latents_history_long,
+                        "latents_history_short": latents_history_short.to(transformer_dtype),
+                        "latents_history_mid": latents_history_mid.to(transformer_dtype),
+                        "latents_history_long": latents_history_long.to(transformer_dtype),
+                        "attention_kwargs": attention_kwargs,
+                        "return_dict": False,
+                    }
 
-                noise_pred = self.transformer(
-                    encoder_hidden_states=prompt_embeds,
-                    **transformer_kwargs,
-                )[0]
-
-                if do_true_cfg:
-                    noise_uncond = self.transformer(
-                        encoder_hidden_states=negative_prompt_embeds,
+                    noise_pred = self.transformer(
+                        encoder_hidden_states=prompt_embeds,
                         **transformer_kwargs,
                     )[0]
 
-                    if use_cfg_zero_star:
-                        positive_flat = noise_pred.view(batch_size, -1)
-                        negative_flat = noise_uncond.view(batch_size, -1)
-                        alpha_cfg = optimized_scale(positive_flat, negative_flat)
-                        alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
-                        alpha_cfg = alpha_cfg.to(noise_pred.dtype)
+                    if do_true_cfg:
+                        noise_uncond = self.transformer(
+                            encoder_hidden_states=negative_prompt_embeds,
+                            **transformer_kwargs,
+                        )[0]
 
-                        if (i_s == 0 and idx <= zero_steps) and use_zero_init:
-                            noise_pred = noise_pred * 0.0
+                        if use_cfg_zero_star:
+                            positive_flat = noise_pred.view(batch_size, -1)
+                            negative_flat = noise_uncond.view(batch_size, -1)
+                            alpha_cfg = optimized_scale(positive_flat, negative_flat)
+                            alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
+                            alpha_cfg = alpha_cfg.to(noise_pred.dtype)
+
+                            if (i_s == 0 and idx <= zero_steps) and use_zero_init:
+                                noise_pred = noise_pred * 0.0
+                            else:
+                                noise_pred = noise_uncond * alpha_cfg + guidance_scale * (
+                                    noise_pred - noise_uncond * alpha_cfg
+                                )
                         else:
-                            noise_pred = noise_uncond * alpha_cfg + guidance_scale * (
-                                noise_pred - noise_uncond * alpha_cfg
-                            )
-                    else:
-                        noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+                            noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
-                latents = self.scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    return_dict=False,
-                    cur_sampling_step=idx,
-                    dmd_noisy_tensor=start_point_list[i_s] if start_point_list is not None else None,
-                    dmd_sigmas=self.scheduler.sigmas,
-                    dmd_timesteps=self.scheduler.timesteps,
-                    all_timesteps=timesteps,
-                )[0]
+                    latents = self.scheduler.step(
+                        noise_pred,
+                        t,
+                        latents,
+                        return_dict=False,
+                        cur_sampling_step=idx,
+                        dmd_noisy_tensor=start_point_list[i_s] if start_point_list is not None else None,
+                        dmd_sigmas=self.scheduler.sigmas,
+                        dmd_timesteps=self.scheduler.timesteps,
+                        all_timesteps=timesteps,
+                    )[0]
+
+                    pbar.update()
 
         return latents
 
-    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2)):
+    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2), generator=None):
         gamma = self.scheduler.config.gamma
         _, ph, pw = patch_size
         block_size = ph * pw
 
         cov = torch.eye(block_size) * (1 + gamma) - torch.ones(block_size, block_size) * gamma
-        dist = torch.distributions.MultivariateNormal(torch.zeros(block_size, device=cov.device), covariance_matrix=cov)
-        block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
+        cov += torch.eye(block_size) * 1e-8
+        cov = cov.float()  # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
 
-        noise = dist.sample((block_number,))
+        L = torch.linalg.cholesky(cov)
+        block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
+        z = torch.randn(block_number, block_size, generator=generator)
+        noise = z @ L.T
+
         noise = noise.view(batch_size, channel, num_frames, height // ph, width // pw, ph, pw)
         noise = noise.permute(0, 1, 2, 3, 5, 4, 6).reshape(batch_size, channel, num_frames, height, width)
+
         return noise
 
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:
