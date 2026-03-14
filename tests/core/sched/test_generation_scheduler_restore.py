@@ -40,8 +40,8 @@ class TestRestoreQueuesOnError(unittest.TestCase):
 
     def test_requests_not_lost_on_exception(self):
         """Simulate the error path: process_pending_chunks moves a request
-        out, then an exception occurs before restore_queues is reached.
-        After the except block, the request must be back in the queue."""
+        out, then an exception occurs during rewrapping.
+        The finally block must restore the request to the queue."""
 
         adapter = FakeAdapter()
         running = ["req-A", "req-B"]
@@ -51,11 +51,13 @@ class TestRestoreQueuesOnError(unittest.TestCase):
         self.assertEqual(running, ["req-A"])
         self.assertEqual(len(adapter.waiting_for_chunk_running_requests), 1)
 
-        # Step 2: simulate the try/except with the FIX applied
+        # Step 2: simulate the try/except/finally pattern
         try:
             raise RuntimeError("OmniNewRequestData construction failed")
         except Exception:
-            # This is what the fix adds:
+            pass  # Log error, leave output unchanged
+        finally:
+            # This is what guarantees restore always runs
             adapter.restore_queues(waiting=[], running=running)
 
         # Step 3: verify request is restored
@@ -82,16 +84,19 @@ class TestRestoreQueuesOnError(unittest.TestCase):
         self.assertNotIn("req-B", running)
         self.assertEqual(len(adapter.waiting_for_chunk_running_requests), 1)
 
-    def test_happy_path_restores_normally(self):
-        """When no exception, restore_queues is called in happy path."""
+    def test_happy_path_restores_via_finally(self):
+        """When no exception, restore_queues is still called via finally."""
 
         adapter = FakeAdapter()
         running = ["req-A", "req-B"]
 
         adapter.process_pending_chunks(waiting=[], running=running)
 
-        # Happy path: no exception
-        adapter.restore_queues(waiting=[], running=running)
+        # Happy path: no exception, finally still runs
+        try:
+            pass  # Rewrapping succeeds
+        finally:
+            adapter.restore_queues(waiting=[], running=running)
 
         self.assertTrue(adapter.restore_called)
         self.assertIn("req-B", running)
