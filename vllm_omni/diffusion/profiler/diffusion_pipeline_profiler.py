@@ -1,9 +1,9 @@
 import functools
 import os
-from threading import Lock
 import time
 from collections.abc import Callable
-from typing import Any, Dict
+from threading import Lock
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -51,7 +51,7 @@ def wrap_methods_by_paths(root_obj: Any, method_paths: list[str]) -> None:
     """Wrap specified methods of an object with profiler."""
     if not hasattr(root_obj, "_profiler_lock"):
         root_obj._profiler_lock = Lock()
-        root_obj._stage_durations: Dict[str, float] = {}
+        root_obj._stage_durations: dict[str, float] = {}
 
     for path in method_paths:
         obj, method_name = _get_attribute_by_path(root_obj, path)
@@ -84,12 +84,12 @@ class DiffusionPipelineProfilerMixin:
             self,
             profiler_targets,
         )
-    
+
     @property
-    def stage_durations(self) -> Dict[str, float]:
+    def stage_durations(self) -> dict[str, float]:
         with self._profiler_lock:
             return self._stage_durations.copy()
-        
+
     def clear_profiler_records(self) -> None:
         with self._profiler_lock:
             self._stage_durations.clear()
