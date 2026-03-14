@@ -160,7 +160,7 @@ def _run_zimage_generate(
 # @pytest.mark.advanced_model
 # @pytest.mark.diffusion
 # @pytest.mark.parallel
-# @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
+# @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 2})
 # def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 #     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
 #         pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
