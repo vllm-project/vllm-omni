@@ -28,6 +28,7 @@ nav:
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
+      - X-To-Video-Audio: user_guide/examples/offline_inference/x_to_video_audio.md
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md

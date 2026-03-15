@@ -61,18 +61,23 @@ class OmniDiffusion:
                 "model_index.json",
                 od_config.model,
             )
-            if config_dict is not None:
-                if od_config.model_class_name is None:
-                    od_config.model_class_name = config_dict.get("_class_name", None)
-                od_config.update_multimodal_support()
 
+            if config_dict is None:
+                raise FileNotFoundError("model_index.json not found")
+
+            if od_config.model_class_name is None:
+                od_config.model_class_name = config_dict.get("_class_name", None)
+            od_config.update_multimodal_support()
+
+            if od_config.model_class_name == "DreamIDOmniPipeline":
+                od_config.model_config = config_dict
+            else:
                 tf_config_dict = get_hf_file_to_dict(
                     "transformer/config.json",
                     od_config.model,
                 )
                 od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
-            else:
-                raise FileNotFoundError("model_index.json not found")
+
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             cfg = get_hf_file_to_dict("config.json", od_config.model)
             if cfg is None:

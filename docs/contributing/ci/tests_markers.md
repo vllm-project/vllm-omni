@@ -17,6 +17,7 @@ Defined in `pyproject.toml`:
 | `gpu`              | Tests that run on GPU *                                   |
 | `cuda`             | Tests that run on CUDA *                                  |
 | `rocm`             | Tests that run on AMD/ROCm *                              |
+| `xpu`              | Tests that run on Intel XPU *                             |
 | `npu`              | Tests that run on NPU/Ascend *                            |
 | `H100`             | Tests that require H100 GPU  *                            |
 | `L4`               | Tests that require L4 GPU *                               |
@@ -55,7 +56,7 @@ def test_video_to_audio()
 This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/utils.py` performs the following actions:
 
 1. **Applies platform and resource markers**  
-   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `npu`) and resource type (e.g., `L4`, `H100`, `MI325`, `A2`, `A3`).
+   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `MI325`, `B60`, `A2`, `A3`).
    ```
    @pytest.mark.cuda
    @pytest.mark.L4
@@ -80,14 +81,14 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
 - Single call for multiple platforms:
     ```python
     @hardware_test(
-        res={"cuda": "L4", "rocm": "MI325", "npu": "A2"},
-        num_cards={"cuda": 2, "rocm": 2, "npu": 2},
+        res={"cuda": "L4", "rocm": "MI325", "xpu": "B60", "npu": "A2"},
+        num_cards={"cuda": 2, "rocm": 2, "xpu": 2, "npu": 2},
     )
     ```
     or
     ```python
     @hardware_test(
-        res={"cuda": "L4", "rocm": "MI325", "npu": "A2"},
+        res={"cuda": "L4", "rocm": "MI325", "xpu": "B60", "npu": "A2"},
         num_cards=2,
     )
     ```

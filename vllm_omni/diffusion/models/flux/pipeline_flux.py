@@ -160,10 +160,10 @@ class FluxPipeline(nn.Module, CFGParallelMixin):
         )
         self.text_encoder = CLIPTextModel.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self.device)
         self.text_encoder_2 = T5EncoderModel.from_pretrained(
             model, subfolder="text_encoder_2", local_files_only=local_files_only
-        )
+        ).to(self.device)
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
