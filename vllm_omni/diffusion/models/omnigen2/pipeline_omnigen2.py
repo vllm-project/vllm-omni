@@ -618,6 +618,59 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def _parse_transformer_config(transformer_config: dict) -> dict:
+    """Extract and normalize transformer kwargs."""
+    if not transformer_config:
+        return {}
+    transformer_kwargs = {}
+    _tuple_params = {"axes_dim_rope", "axes_lens"}
+    for key in (
+        "patch_size",
+        "in_channels",
+        "out_channels",
+        "hidden_size",
+        "num_layers",
+        "num_refiner_layers",
+        "num_attention_heads",
+        "num_kv_heads",
+        "multiple_of",
+        "ffn_dim_multiplier",
+        "norm_eps",
+        "axes_dim_rope",
+        "axes_lens",
+        "text_feat_dim",
+        "timestep_scale",
+    ):
+        if key in transformer_config:
+            value = transformer_config[key]
+            if isinstance(value, list) and key in _tuple_params:
+                value = tuple(value)
+            transformer_kwargs[key] = value
+    return transformer_kwargs
+
+
+def _load_transformer_config(model: str, local_files_only: bool) -> dict:
+    """Load transformer config.json from local path or HuggingFace."""
+    if local_files_only:
+        config_path = os.path.join(model, "transformer", "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                return json.load(f)
+    else:
+        from huggingface_hub import hf_hub_download
+
+        try:
+            config_path = hf_hub_download(
+                repo_id=model,
+                filename="transformer/config.json",
+            )
+            with open(config_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
 class OmniGen2Pipeline(nn.Module):
     """
     Pipeline for text-to-image generation using OmniGen2.
@@ -673,51 +726,8 @@ class OmniGen2Pipeline(nn.Module):
             self.device
         )
 
-        transformer_kwargs = {}
-        transformer_config = {}
-
-        if local_files_only:
-            transformer_config_path = os.path.join(model, "transformer", "config.json")
-            if os.path.exists(transformer_config_path):
-                with open(transformer_config_path) as f:
-                    transformer_config = json.load(f)
-        else:
-            from huggingface_hub import hf_hub_download
-
-            try:
-                transformer_config_path = hf_hub_download(
-                    repo_id=model,
-                    filename="transformer/config.json",
-                )
-                with open(transformer_config_path) as f:
-                    transformer_config = json.load(f)
-            except Exception:
-                pass
-
-        if transformer_config:
-            _tuple_params = {"axes_dim_rope", "axes_lens"}
-            for key in (
-                "patch_size",
-                "in_channels",
-                "out_channels",
-                "hidden_size",
-                "num_layers",
-                "num_refiner_layers",
-                "num_attention_heads",
-                "num_kv_heads",
-                "multiple_of",
-                "ffn_dim_multiplier",
-                "norm_eps",
-                "axes_dim_rope",
-                "axes_lens",
-                "text_feat_dim",
-                "timestep_scale",
-            ):
-                if key in transformer_config:
-                    value = transformer_config[key]
-                    if isinstance(value, list) and key in _tuple_params:
-                        value = tuple(value)
-                    transformer_kwargs[key] = value
+        transformer_config = _load_transformer_config(model, local_files_only)
+        transformer_kwargs = _parse_transformer_config(transformer_config)
         self.transformer = OmniGen2Transformer2DModel(**transformer_kwargs)
         self.mllm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="mllm", local_files_only=local_files_only
