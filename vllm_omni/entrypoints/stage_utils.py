@@ -246,6 +246,42 @@ def maybe_dump_to_shm(obj: Any, threshold: int) -> tuple[bool, Any]:
     return False, obj
 
 
+def cleanup_shm_from_ipc_meta(container: dict[str, Any], shm_key: str = "engine_outputs_shm") -> bool:
+    """Best-effort cleanup for SHM payload metadata embedded in IPC dicts.
+
+    This is intended for orphaned/aborted request outputs where we need to
+    unlink the SHM segment without deserializing payload bytes.
+    """
+    meta = container.get(shm_key)
+    if not isinstance(meta, dict):
+        return False
+    shm_name = meta.get("name")
+    if not isinstance(shm_name, str) or not shm_name:
+        return False
+
+    shm = None
+    try:
+        shm = _shm.SharedMemory(name=shm_name)
+    except FileNotFoundError:
+        return True
+    except Exception:
+        logger.debug("Failed to open shared memory for cleanup: %s", shm_name, exc_info=True)
+        return False
+
+    try:
+        shm.close()
+    except Exception:
+        pass
+    try:
+        shm.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.debug("Failed to unlink shared memory during cleanup: %s", shm_name, exc_info=True)
+        return False
+    return True
+
+
 def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -> Any:
     """Load object from container that may carry SHM or inline object.
 

@@ -24,7 +24,7 @@ from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import OmniBase
 from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType, cleanup_shm_from_ipc_meta
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
@@ -843,6 +843,9 @@ class AsyncOmni(OmniBase):
                                 f"[{self._name}] Request may have been aborted; \
                                 dropping output for req {req_id} at stage-{stage_id}"
                             )
+                            # Avoid leaking orphaned SHM payloads when request
+                            # state is gone (e.g. aborted/cancelled flows).
+                            cleanup_shm_from_ipc_meta(result, shm_key="engine_outputs_shm")
                             continue
                         if hasattr(req_state, "stage_queues") and stage_id in req_state.stage_queues:
                             await req_state.stage_queues[stage_id].put(result)

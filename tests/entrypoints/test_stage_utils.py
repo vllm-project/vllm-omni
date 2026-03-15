@@ -1,10 +1,11 @@
 import os
 import sys
+from multiprocessing import shared_memory as shm
 
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.stage_utils import set_stage_devices
+from vllm_omni.entrypoints.stage_utils import cleanup_shm_from_ipc_meta, set_stage_devices
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -110,3 +111,21 @@ def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pyte
     set_stage_devices(stage_id=0, devices="0,1")
 
     assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "4,5"
+
+
+def test_cleanup_shm_from_ipc_meta_unlinks_segment():
+    seg = shm.SharedMemory(create=True, size=8)
+    seg.buf[:4] = b"test"
+    name = seg.name
+    seg.close()
+
+    cleaned = cleanup_shm_from_ipc_meta({"engine_outputs_shm": {"name": name, "size": 8}})
+    assert cleaned is True
+
+    with pytest.raises(FileNotFoundError):
+        shm.SharedMemory(name=name)
+
+
+def test_cleanup_shm_from_ipc_meta_returns_false_for_invalid_meta():
+    assert cleanup_shm_from_ipc_meta({}) is False
+    assert cleanup_shm_from_ipc_meta({"engine_outputs_shm": {"size": 8}}) is False
