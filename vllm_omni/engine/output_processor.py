@@ -199,7 +199,7 @@ class OmniRequestState(RequestState):
             if not (
                 finished
                 or self.sent_tokens_offset == 0
-                or len(self.detokenizer.output_token_ids) - self.sent_tokens_offset >= self.stream_interval
+                or self.detokenizer.num_output_tokens() - self.sent_tokens_offset >= self.stream_interval
             ):
                 return None
 
@@ -207,7 +207,7 @@ class OmniRequestState(RequestState):
                 # Send tokens from the offset in DELTA mode, otherwise all
                 # tokens are sent.
                 new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
-                self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
+                self.sent_tokens_offset = self.detokenizer.num_output_tokens()
 
         external_req_id = self.external_req_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
@@ -264,8 +264,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def __init__(
         self,
         tokenizer: TokenizerLike | None,
+        *,
         log_stats: bool,
         stream_interval: int = 1,
+        tracing_enabled: bool = False,
         engine_core_output_type: str | None = None,
     ):
         """Initialize the multimodal output processor.
@@ -278,7 +280,12 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 (e.g., "image", "audio", "latent"). Used to tag multimodal
                 outputs with the correct modality key.
         """
-        super().__init__(tokenizer=tokenizer, log_stats=log_stats, stream_interval=stream_interval)
+        super().__init__(
+            tokenizer=tokenizer,
+            log_stats=log_stats,
+            stream_interval=stream_interval,
+            tracing_enabled=tracing_enabled,
+        )
         self.engine_core_output_type = engine_core_output_type
 
     def add_request(
@@ -320,8 +327,6 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
         )
-        if self._requests_drained.is_set():
-            self._requests_drained.clear()
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req

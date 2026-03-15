@@ -23,6 +23,10 @@ class QwenTTSModelSpecificParams(dict):
     pass
 
 
+class WanModelSpecificParams(dict):
+    pass
+
+
 class ModelMode(Enum):
     IMAGE_GENERATION = auto()
     VIDEO_GENERATION = auto()

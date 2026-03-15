@@ -128,9 +128,9 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
     parser.add_argument(
-        "--log-stats",
+        "--enable-expert-parallel",
         action="store_true",
-        help="Enable vLLM-Omni statistics logging.",
+        help="Enable expert parallelism for MoE layers.",
     )
     return parser.parse_args()
 
@@ -165,6 +165,7 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Check if profiling is requested via environment variable
@@ -181,7 +182,6 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
-        log_stats=args.log_stats,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
     )
@@ -199,7 +199,7 @@ def main():
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
-        f" vae_patch_parallel_size={args.vae_patch_parallel_size}"
+        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")

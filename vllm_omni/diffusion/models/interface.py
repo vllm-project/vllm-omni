@@ -14,5 +14,10 @@ class SupportImageInput(Protocol):
 
 
 @runtime_checkable
+class SupportAudioInput(Protocol):
+    support_audio_input: ClassVar[bool] = True
+
+
+@runtime_checkable
 class SupportAudioOutput(Protocol):
     support_audio_output: ClassVar[bool] = True

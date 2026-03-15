@@ -69,20 +69,8 @@ With `--log-stats` enabled, the server will output detailed metrics logs after e
 | rx_decode_time_ms   | 111.865     | 31.706     |
 | in_flight_time_ms   | 2.015       | 2.819      |
 
-### DiffusionStats
 
-| Field                           |      Value |
-|---------------------------------|------------|
-| batch_id                        |          1 |
-| batch_size                      |          1 |
-| diffusion_engine_exec_time_ms   | 16,363.419 |
-| diffusion_engine_total_time_ms  | 16,234.849 |
-| image_num                       |      1.000 |
-| num_inference_steps             |     50.000 |
-| postprocess_time_ms             |     67.685 |
-| preprocess_time_ms              |     60.106 |
-| resolution                      |    640.000 |
-| stage_gen_time_ms               | 16,363.714 |
+These logs include:
 
 - **Overall summary**: total requests, wall time, average tokens/sec, etc.
 
@@ -91,9 +79,6 @@ With `--log-stats` enabled, the server will output detailed metrics logs after e
 - **Stage table**: per-stage batch and timing details.
 
 - **Transfer table**: data transfer and timing for each edge.
-
-- **DiffusionStats**:preprocessing time, model execution time, postprocessing time, generated images, resolution, and inference steps.
-
 
 You can use these logs to monitor system health, debug performance, and analyze request-level metrics as described above.
 
@@ -145,11 +130,6 @@ For **online inference** (serving mode), the summary is always per-request. `e2e
 | `image_num`               | Number of images generated (for diffusion/image stages).                                        |
 | `resolution`              | Image resolution (for diffusion/image stages).                                                                  |
 | `postprocess_time_ms` | Diffusion/image: post-processing time in ms.                                                    |
-| `preprocess_time_ms`             | Diffusion/image: pre-processing time in ms (before model execution).                                             |
-| `diffusion_engine_exec_time_ms`  | Diffusion/image: model execution time in ms, excluding pre-processing and post-processing.                       |
-| `diffusion_engine_total_time_ms` | Diffusion/image: total diffusion engine time in ms, including pre-processing, model execution, and post-processing. |
-| `num_inference_steps`            | Number of inference steps for diffusion generation.                                                              |
-
 
 ---
 
@@ -161,8 +141,6 @@ For **online inference** (serving mode), the summary is always per-request. `e2e
 | `tx_time_ms`         | Sender transfer time in ms.                                               |
 | `rx_decode_time_ms`  | Receiver decode time in ms.                                               |
 | `in_flight_time_ms`  | In-flight time in ms.                                                     |
-
-
 
 
 ### Expectation of the Numbers (Verification)
@@ -193,14 +171,3 @@ For each edge:
 - 1->2: tx_time_ms (**18.790**) + rx_decode_time_ms (**31.706**) + in_flight_time_ms (**2.819**) = **53.315**
 
 192.581 + 53.315 = **245.896** = transfers_total_time_ms, which matches the calculation (difference is due to rounding)
-
-**diffusion_engine_total_time_ms**
-
-- preprocess_time_ms: Time spent on input preprocessing
-- diffusion_engine_exec_time_ms: Pure model execution time
-- postprocess_time_ms: Time spent on output postprocessing
-- diffusion_engine_total_time_ms: Total time spent in the diffusion engine
-
-so `diffusion_engine_total_time_ms` = `diffusion_engine_exec_time_ms` + `preprocess_time_ms` + `postprocess_time_ms`
-                               = **16,363.419** + **60.106** + **67.685**
-                               = **16,491.210**

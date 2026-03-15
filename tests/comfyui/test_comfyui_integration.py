@@ -20,11 +20,12 @@ import torch
 from comfy_api.input import AudioInput, VideoInput
 from comfyui_vllm_omni.nodes import (
     VLLMOmniGenerateImage,
+    VLLMOmniGenerateVideo,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
     VLLMOmniVoiceClone,
 )
-from comfyui_vllm_omni.utils.types import AutoregressionSamplingParams, DiffusionSamplingParams
+from comfyui_vllm_omni.utils.types import AutoregressionSamplingParams, DiffusionSamplingParams, WanModelSpecificParams
 from PIL import Image
 from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -33,6 +34,8 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class ServerCase(NamedTuple):
@@ -49,6 +52,7 @@ class SamplingCase(NamedTuple):
 
     kind: "SamplingKind"
     sampling_params: dict | list[dict] | None
+    lora: dict | None = None
 
 
 class SamplingKind(StrEnum):
@@ -58,11 +62,17 @@ class SamplingKind(StrEnum):
     UNDERSTANDING_AR_LIST = auto()
     TTS_NONE = auto()
     TTS_DIFFUSION_SINGLE = auto()
+    VIDEO_NONE = auto()
+    VIDEO_DIFFUSION_SINGLE = auto()
 
 
 # Pre-defined arguments to be used in function calls during the tests
 IMAGE_WIDTH = 64
 IMAGE_HEIGHT = 64
+VIDEO_WIDTH = 32
+VIDEO_HEIGHT = 32
+VIDEO_FPS = 8
+VIDEO_NUM_FRAMES = 5
 DIFFUSION_SINGLE_SAMPLING_PARAMS = DiffusionSamplingParams(
     {
         "n": 2,
@@ -71,6 +81,15 @@ DIFFUSION_SINGLE_SAMPLING_PARAMS = DiffusionSamplingParams(
         "true_cfg_scale": 1.5,
     }
 )
+
+DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS = DiffusionSamplingParams(
+    {
+        "num_inference_steps": 30,
+        "guidance_scale": 6.0,
+        "true_cfg_scale": 1.5,
+    }
+)
+
 
 AR_LIST_SAMPLING_PARAMS = [
     AutoregressionSamplingParams(
@@ -101,6 +120,10 @@ AR_LIST_SAMPLING_PARAMS = [
         }
     ),
 ]
+
+VIDEO_MODEL_PARAMS = WanModelSpecificParams({"guidance_scale_2": 5.0, "boundary_ratio": 0.98, "flow_shift": 12.0})
+
+LORA_PARAMS = {"local_path": "test_lora_path", "name": "test_name", "scale": 0.7, "int_id": 10}
 
 
 def _build_image_output(size: tuple[int, int] = (IMAGE_WIDTH, IMAGE_HEIGHT), color: str = "red") -> Image.Image:
@@ -181,6 +204,16 @@ def _build_diffusion_image_output_for_images_endpoint() -> OmniRequestOutput:
     )
 
 
+def _build_diffusion_video_output() -> OmniRequestOutput:
+    # Small video: VIDEO_NUM_FRAMES frames of (VIDEO_HEIGHT x VIDEO_WIDTH) RGB, shape (F, H, W, C)
+    video_frames = torch.zeros((VIDEO_NUM_FRAMES, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32)
+    return OmniRequestOutput.from_diffusion(
+        request_id="test_req_video",
+        images=[video_frames],
+        final_output_type="video",
+    )
+
+
 def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
     request_output = MagicMock()
     request_output.images = [_build_image_output(color="blue")]
@@ -193,11 +226,39 @@ def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
     )
 
 
-def _assert_sampling_param_values(received: OmniSamplingParams, expected: dict[str, Any]):
+def _assert_sampling_param_values(
+    received: OmniSamplingParams, expected: dict[str, Any], expected_lora: dict | None = None
+):
     for key, expected_value in expected.items():
-        actual_value = getattr(received, key, None)
+        actual_value = getattr(received, key)
         assert actual_value == expected_value, (
             f"Expected sampling param '{key}'={expected_value}, got {actual_value}. The received sampling params: {received}"
+        )
+    if expected_lora:
+        assert received.lora_request.lora_name == expected_lora["name"], (
+            f"Expected lora name={(expected_lora['name'])}, got {received.lora_request.lora_name}. The received sampling params: {received}"
+        )
+        assert received.lora_request.lora_int_id == expected_lora["int_id"], (
+            f"Expected lora int_id={expected_lora['int_id']}, got {received.lora_request.lora_int_id}. The received sampling params: {received}"
+        )
+        assert received.lora_request.lora_path == expected_lora["local_path"], (
+            f"Expected lora path={expected_lora['local_path']}, got {received.lora_request.lora_path}. The received sampling params: {received}"
+        )
+        assert received.lora_scale == expected_lora["scale"], (
+            f"Expected lora scale={expected_lora['scale']}, got {received.lora_scale}. The received sampling params: {received}"
+        )
+
+
+def _assert_model_param_values(received: OmniSamplingParams, expected: dict):
+    for key, expected_value in expected.items():
+        try:
+            actual_value = getattr(received, key)
+            expected_param_name = key
+        except AttributeError:
+            actual_value = received.extra_args.get(key, None)
+            expected_param_name = f'extra_args["{key}"]'
+        assert actual_value == expected_value, (
+            f"Expected model param '{expected_param_name}'={expected_value}, got {actual_value}. The received sampling params: {received}"
         )
 
 
@@ -235,6 +296,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     "height": IMAGE_HEIGHT,
                     **expected,
                 },
+                LORA_PARAMS,
             )
         elif sampling_case.kind is SamplingKind.UNDERSTANDING_NONE:
             assert len(received_sampling_params_list) == 3
@@ -244,6 +306,33 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                 _assert_sampling_param_values(received_sampling_params_list[i], expected)
         elif sampling_case.kind in {SamplingKind.TTS_NONE, SamplingKind.TTS_DIFFUSION_SINGLE}:
             assert len(received_sampling_params_list) == 1
+        elif sampling_case.kind is SamplingKind.VIDEO_NONE:
+            assert len(received_sampling_params_list) == 1
+            _assert_sampling_param_values(
+                received_sampling_params_list[0],
+                {
+                    "width": VIDEO_WIDTH,
+                    "height": VIDEO_HEIGHT,
+                    "num_frames": VIDEO_NUM_FRAMES,
+                    "fps": VIDEO_FPS,
+                },
+            )
+        elif sampling_case.kind is SamplingKind.VIDEO_DIFFUSION_SINGLE:
+            assert len(received_sampling_params_list) == 1
+            expected = DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS.copy()
+            # expected["num_outputs_per_prompt"] = expected.pop("n")  # convert from n to num_outputs_per_prompt
+            _assert_sampling_param_values(
+                received_sampling_params_list[0],
+                {
+                    "width": VIDEO_WIDTH,
+                    "height": VIDEO_HEIGHT,
+                    "num_frames": VIDEO_NUM_FRAMES,
+                    "fps": VIDEO_FPS,
+                    **expected,
+                },
+                LORA_PARAMS,
+            )
+            _assert_model_param_values(received_sampling_params_list[0], VIDEO_MODEL_PARAMS)
         else:
             raise AssertionError(f"Unknown sampling case: {sampling_case.kind}")
 
@@ -401,9 +490,15 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
 @pytest.mark.parametrize(
     "sampling_case",
     [
-        pytest.param(SamplingCase(kind=SamplingKind.IMAGE_NONE, sampling_params=None), id="no-sampling-params"),
         pytest.param(
-            SamplingCase(kind=SamplingKind.IMAGE_DIFFUSION_SINGLE, sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS),
+            SamplingCase(kind=SamplingKind.IMAGE_NONE, sampling_params=None, lora=None), id="no-sampling-params"
+        ),
+        pytest.param(
+            SamplingCase(
+                kind=SamplingKind.IMAGE_DIFFUSION_SINGLE,
+                sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS,
+                lora=LORA_PARAMS,
+            ),
             id="single-diffusion-sampling-params",
         ),
     ],
@@ -423,7 +518,8 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
         kwargs["image"] = torch.zeros((1, IMAGE_WIDTH, IMAGE_HEIGHT, 3), dtype=torch.float32)
     if sampling_case.sampling_params is not None:
         kwargs["sampling_params"] = sampling_case.sampling_params
-    print(f"!!!!!! Calling {model} node.generate with kwargs: {sampling_case.sampling_params}")
+    if sampling_case.lora:
+        kwargs["lora"] = sampling_case.lora
 
     result = await node.generate(**kwargs)
 
@@ -565,3 +661,75 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
     assert result[0]["sample_rate"] == 24000
     assert isinstance(result[0]["waveform"], torch.Tensor)
     assert result[0]["waveform"].shape == (1, 1, 24000)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case,model,image_input",
+    [
+        pytest.param(
+            ServerCase(
+                served_model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+                stage_list=["diffusion"],
+                stage_configs=[{"stage_type": "diffusion"}],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            False,
+            id="text-to-video",
+        ),
+        pytest.param(
+            ServerCase(
+                served_model="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+                stage_list=["diffusion"],
+                stage_configs=[{"stage_type": "diffusion"}],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            True,
+            id="image-to-video",
+        ),
+    ],
+    indirect=["server_case"],
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [
+        pytest.param(SamplingCase(kind=SamplingKind.VIDEO_NONE, sampling_params=None), id="no-sampling-params"),
+        pytest.param(
+            SamplingCase(
+                kind=SamplingKind.VIDEO_DIFFUSION_SINGLE,
+                sampling_params=DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS,
+                lora=LORA_PARAMS,
+            ),
+            id="single-diffusion-sampling-params",
+        ),
+    ],
+    indirect=["sampling_case"],
+)
+async def test_video_generation_node(api_server: str, model: str, image_input: bool, sampling_case: SamplingCase):
+    node = VLLMOmniGenerateVideo()
+
+    kwargs = {
+        "url": api_server,
+        "model": model,
+        "prompt": "A beautiful sunset timelapse",
+        "negative_prompt": "",
+        "width": VIDEO_WIDTH,
+        "height": VIDEO_HEIGHT,
+        "fps": VIDEO_FPS,
+        "num_frames": VIDEO_NUM_FRAMES,
+        "model_params": VIDEO_MODEL_PARAMS,
+    }
+    if image_input:
+        kwargs["image"] = torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32)
+    if sampling_case.sampling_params is not None:
+        kwargs["sampling_params"] = sampling_case.sampling_params
+    if sampling_case.lora:
+        kwargs["lora"] = sampling_case.lora
+
+    result = await node.generate(**kwargs)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert isinstance(result[0], VideoInput)

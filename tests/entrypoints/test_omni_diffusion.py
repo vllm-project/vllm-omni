@@ -345,7 +345,7 @@ def _setup_multiprocessing_mocks(monkeypatch: pytest.MonkeyPatch, mocker: Mocker
     fake_process_instance = mocker.MagicMock()
     fake_process_instance.start = mocker.MagicMock()
     fake_process_instance.join = mocker.MagicMock()
-    fake_process_instance.is_alive = mocker.MagicMock(return_value=False)
+    fake_process_instance.is_alive = mocker.MagicMock(return_value=True)
     fake_process_instance.terminate = mocker.MagicMock()
     fake_process_class.return_value = fake_process_instance
 
