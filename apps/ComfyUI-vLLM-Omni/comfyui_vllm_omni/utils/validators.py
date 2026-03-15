@@ -16,7 +16,7 @@ def validate_model_and_sampling_params_types(
     # Skip if no spec or no sampling params
     pipeline_spec, _ = lookup_model_spec(model_name)
     if pipeline_spec is None:
-        logger.info("skipping sampling params check because spec is not found")
+        logger.info(f"skipping sampling params check because spec for {model_name} is not found")
         return
     if sampling_param_list is None:
         return
@@ -70,13 +70,17 @@ def add_sampling_parameters_to_stage(
 
     stages = pipeline_spec["stages"]
     if isinstance(sampling_param_list, dict):
+        sampling_param_list = sampling_param_list.__class__(sampling_param_list)
         sampling_param_list.update(params_to_add)
     elif sampling_param_list is None:
         sampling_param_list = params_to_add.copy()
     else:
         for i, stage in enumerate(stages):
             if stage == stage_type:
-                sampling_param_list[i].update(params_to_add)
+                stage_param = sampling_param_list[i]
+                stage_param = stage_param.__class__(stage_param)
+                stage_param.update(params_to_add)
+                sampling_param_list[i] = stage_param
 
     return sampling_param_list
 
