@@ -402,13 +402,41 @@ def rocm_marks(*, res: str, num_cards: int):
         return marks + [test_distributed]
 
 
+def xpu_marks(*, res: str, num_cards: int):
+    """
+    Get a collection of pytest marks to apply for `@xpu_test`.
+
+    Args:
+        res: Resource type, e.g., "B60".
+        num_cards: Number of GPU cards required.
+
+    Returns:
+        List of pytest marks to apply.
+    """
+    test_platform_detail = pytest.mark.xpu
+
+    if res == "B60":
+        test_resource = pytest.mark.B60
+    else:
+        raise ValueError(f"Invalid XPU resource type: {res}. Supported: B60")
+
+    marks = [test_resource, test_platform_detail]
+
+    if num_cards == 1:
+        return marks
+    else:
+        test_distributed = pytest.mark.distributed_rocm(num_cards=num_cards)
+        # TODO: add XPU support for `skipif_xpu` marker
+        return marks + [test_distributed]
+
+
 def gpu_marks(*, res: str, num_cards: int):
     """
     Get a collection of pytest marks to apply for `@gpu_test`.
     Platform is automatically determined based on resource type.
 
     Args:
-        res: Resource type, e.g., "L4", "H100" for CUDA, or "MI325" for ROCm.
+        res: Resource type, e.g., "L4", "H100" for CUDA, or "MI325" for ROCm, or "B60" for XPU.
         num_cards: Number of GPU cards required.
 
     Returns:
@@ -419,6 +447,8 @@ def gpu_marks(*, res: str, num_cards: int):
         return [test_platform] + cuda_marks(res=res, num_cards=num_cards)
     if res == "MI325":
         return [test_platform] + rocm_marks(res=res, num_cards=num_cards)
+    if res == "B60":
+        return [test_platform] + xpu_marks(res=res, num_cards=num_cards)
     raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, MI325")
 
 
@@ -446,13 +476,13 @@ def npu_marks(*, res: str, num_cards: int):
 def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     """
     Get a collection of pytest marks to apply for `@hardware_test`,
-    including CUDA, ROCm, and NPU,
+    including CUDA, ROCm, XPU, and NPU,
     based on the specified platforms and resources.
     """
     # Validate platforms
     # Don't validate platform details in this decorator
     for platform, _ in res.items():
-        if platform not in ("cuda", "rocm", "npu"):
+        if platform not in ("cuda", "rocm", "xpu", "npu"):
             raise ValueError(f"Unsupported platform: {platform}")
 
     # Normalize num_cards
@@ -473,7 +503,7 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     all_marks: list[pytest.MarkDecorator] = []
     for platform, resource in res.items():
         cards = num_cards_dict[platform]
-        if platform == "cuda" or platform == "rocm":
+        if platform == "cuda" or platform == "rocm" or platform == "xpu":
             marks = gpu_marks(res=resource, num_cards=cards)
         elif platform == "npu":
             marks = npu_marks(res=resource, num_cards=cards)

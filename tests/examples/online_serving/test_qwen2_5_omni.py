@@ -4,6 +4,8 @@ Example online tests for Qwen2.5-Omni-7B model.
 
 import os
 
+from vllm_omni.platforms import current_omni_platform
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import re
@@ -19,6 +21,11 @@ models = ["Qwen/Qwen2.5-Omni-7B"]
 
 
 stage_configs = [str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
+
+if current_omni_platform.is_xpu():
+    stage_configs = [
+        str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")
+    ]
 
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving" / "qwen2_5_omni")
 # Create parameter combinations for model and stage config
