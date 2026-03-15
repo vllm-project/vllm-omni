@@ -11,7 +11,7 @@ Runtime parameters (gpu_memory_utilization, tp_size, etc.) come from CLI.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -279,12 +279,15 @@ class StageConfigFactory:
             for i in range(1, num_devices):
                 devices += f",{i}"
 
-        # Collect engine args – skip non-serializable objects
         engine_args: dict[str, Any] = {}
         for key, value in kwargs.items():
             if key in ("parallel_config",):
                 continue
             engine_args[key] = value
+
+        # Serialize parallel_config as dict for OmegaConf compatibility
+        if "parallel_config" in kwargs:
+            engine_args["parallel_config"] = asdict(kwargs["parallel_config"])
 
         engine_args.setdefault("cache_backend", "none")
         engine_args["model_stage"] = "diffusion"
