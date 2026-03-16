@@ -14,6 +14,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Mammothmoda2Qwen2_5_VLConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLTextConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLVisionConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
+    "FishSpeechConfig": "vllm_omni.transformers_utils.configs.fish_speech",
+    "FishSpeechSlowARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
+    "FishSpeechFastARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
 }
 
 __all__ = [
@@ -21,6 +24,9 @@ __all__ = [
     "Mammothmoda2Qwen2_5_VLConfig",
     "Mammothmoda2Qwen2_5_VLTextConfig",
     "Mammothmoda2Qwen2_5_VLVisionConfig",
+    "FishSpeechConfig",
+    "FishSpeechSlowARConfig",
+    "FishSpeechFastARConfig",
 ]
 
 
@@ -39,4 +45,5 @@ def __dir__():
 
 # Eagerly import all config modules so their AutoConfig.register() side-effects
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
+from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402

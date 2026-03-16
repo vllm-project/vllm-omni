@@ -36,7 +36,7 @@ models = ["riverclouds/qwen_image_random"]
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cache
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
 def test_cache_dit(model_name: str):
     """Test cache-dit backend with diffusion model."""

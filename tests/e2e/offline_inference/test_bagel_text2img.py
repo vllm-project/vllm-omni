@@ -14,10 +14,6 @@ Equivalent to running:
 """
 
 import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
 import signal
 import socket
 import subprocess
@@ -37,23 +33,23 @@ from vllm_omni.entrypoints.omni import Omni
 # "Generated with seed=52, num_inference_steps=15,
 # prompt='A futuristic city skyline at twilight, cyberpunk style'"
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (49, 96, 134)},
-    {"position": (400, 50), "rgb": (63, 127, 167)},
-    {"position": (700, 100), "rgb": (70, 101, 141)},
-    {"position": (150, 400), "rgb": (115, 90, 150)},
-    {"position": (512, 512), "rgb": (98, 86, 119)},
-    {"position": (700, 400), "rgb": (29, 42, 91)},
-    {"position": (100, 700), "rgb": (47, 50, 88)},
-    {"position": (400, 700), "rgb": (36, 52, 91)},
-    {"position": (700, 700), "rgb": (45, 58, 99)},
-    {"position": (256, 256), "rgb": (62, 94, 135)},
+    {"position": (100, 100), "rgb": (121, 118, 100)},
+    {"position": (400, 50), "rgb": (163, 162, 143)},
+    {"position": (700, 100), "rgb": (170, 156, 127)},
+    {"position": (150, 400), "rgb": (129, 127, 112)},
+    {"position": (512, 512), "rgb": (135, 61, 59)},
+    {"position": (700, 400), "rgb": (205, 107, 43)},
+    {"position": (100, 700), "rgb": (197, 177, 157)},
+    {"position": (400, 700), "rgb": (139, 107, 86)},
+    {"position": (700, 700), "rgb": (247, 205, 146)},
+    {"position": (256, 256), "rgb": (171, 160, 153)},
 ]
 
 # Maximum allowed difference per color channel
 PIXEL_TOLERANCE = 5
 
 # Default test prompt
-DEFAULT_PROMPT = "<|im_start|>A futuristic city skyline at twilight, cyberpunk style<|im_end|>"
+DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
 
 def _find_free_port() -> int:

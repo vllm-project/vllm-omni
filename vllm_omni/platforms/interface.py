@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import Enum
+from typing import Any
 
 import torch
 from vllm.platforms import Platform
@@ -51,6 +52,16 @@ class OmniPlatform(Platform):
     @classmethod
     def get_default_stage_config_path(cls) -> str:
         raise NotImplementedError
+
+    @classmethod
+    def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
+        if op_name == "hunyuan_fused_moe":
+            return "vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
+        raise NotImplementedError(f"Unsupported diffusion model op: {op_name}")
+
+    @classmethod
+    def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
 
     @classmethod
     def get_diffusion_attn_backend_cls(

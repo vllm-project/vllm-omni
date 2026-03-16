@@ -1,23 +1,29 @@
 # tests/entrypoints/openai/test_serving_speech.py
+import asyncio
 import logging
 import os
+import struct
 from inspect import Signature, signature
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
+from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
+from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio, OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
+    _create_wav_header,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -916,15 +922,18 @@ class TestStreamingProtocolValidation:
     """Unit tests for the stream field validators in OpenAICreateSpeechRequest."""
 
     def test_stream_validation_errors(self):
-        """stream=True requires response_format='pcm' and speed=1.0."""
-        with pytest.raises(ValidationError, match="response_format='pcm'"):
-            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
+        """stream=True requires response_format not in ('pcm', 'wav') and speed=1.0."""
+        with pytest.raises(ValidationError, match="requires response_format not in \\('pcm', 'wav'\\)"):
+            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
         with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
 
     def test_stream_valid(self):
-        """stream=True + response_format='pcm' + speed=1.0 is accepted."""
+        """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted."""
         req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm")
+        assert req.stream is True
+
+        req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
         assert req.stream is True
 
     def test_sse_stream_format_is_blocked(self):
@@ -1052,4 +1061,221 @@ class TestAsyncOmniSupportedTasks:
         omni.stage_list = [stage]
         tasks = await omni.get_supported_tasks()
         assert "generate" in tasks
-        assert "speech" in tasks
+
+
+def test_api_server_create_speech_wraps_error_response_status():
+    handler = MagicMock()
+    handler.create_speech = AsyncMock(
+        return_value=ErrorResponse(
+            error=ErrorInfo(message="bad request", type="BadRequestError", param=None, code=400),
+        )
+    )
+
+    app = FastAPI()
+    app.state.openai_serving_speech = handler
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/audio/speech",
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    raw_request = Request(scope)
+    request = OpenAICreateSpeechRequest(input="Hello")
+
+    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 400
+
+
+class TestWAVHeaderGeneration:
+    """Unit tests for WAV header generation with placeholder values."""
+
+    def test_wav_header_basic_structure(self):
+        """Test basic WAV header structure with default parameters."""
+        header = _create_wav_header(sample_rate=24000, num_channels=1, bits_per_sample=16)
+
+        # Verify header length (should be 44 bytes)
+        assert len(header) == 44, f"Expected 44 bytes, got {len(header)}"
+
+        # Parse and verify header structure
+        (
+            chunk_id,
+            chunk_size,
+            format_type,
+            subchunk1_id,
+            subchunk1_size,
+            audio_format,
+            num_channels,
+            sample_rate,
+            byte_rate,
+            block_align,
+            bits_per_sample,
+            subchunk2_id,
+            subchunk2_size,
+        ) = struct.unpack("<4sI4s4sIHHIIHH4sI", header)
+
+        # Verify RIFF header
+        assert chunk_id == b"RIFF", f"Expected RIFF, got {chunk_id}"
+        assert chunk_size == 0xFFFFFFFF, f"Expected placeholder 0xFFFFFFFF, got {chunk_size:#x}"
+        assert format_type == b"WAVE", f"Expected WAVE, got {format_type}"
+
+        # Verify fmt chunk
+        assert subchunk1_id == b"fmt ", f"Expected 'fmt ', got {subchunk1_id}"
+        assert subchunk1_size == 16, f"Expected 16, got {subchunk1_size}"
+        assert audio_format == 1, f"Expected PCM (1), got {audio_format}"
+        assert num_channels == 1, f"Expected 1 channel, got {num_channels}"
+        assert sample_rate == 24000, f"Expected 24000 Hz, got {sample_rate}"
+        assert byte_rate == 48000, f"Expected 48000 byte/s, got {byte_rate}"
+        assert block_align == 2, f"Expected 2 bytes block align, got {block_align}"
+        assert bits_per_sample == 16, f"Expected 16 bits, got {bits_per_sample}"
+
+        # Verify data chunk
+        assert subchunk2_id == b"data", f"Expected 'data', got {subchunk2_id}"
+        assert subchunk2_size == 0xFFFFFFFF, f"Expected placeholder 0xFFFFFFFF, got {subchunk2_size:#x}"
+
+    def test_wav_header_different_sample_rates(self):
+        """Test WAV header with different sample rates."""
+        test_cases = [
+            (16000, 1, 16),
+            (22050, 1, 16),
+            (24000, 1, 16),
+            (44100, 1, 16),
+            (48000, 1, 16),
+        ]
+
+        for sample_rate, num_channels, bits_per_sample in test_cases:
+            header = _create_wav_header(sample_rate, num_channels, bits_per_sample)
+            assert len(header) == 44, f"Header length mismatch for {sample_rate} Hz"
+
+            # Parse sample rate from header
+            parsed_sample_rate = struct.unpack("<I", header[24:28])[0]
+            assert parsed_sample_rate == sample_rate, (
+                f"Sample rate mismatch: expected {sample_rate}, got {parsed_sample_rate}"
+            )
+
+    def test_wav_header_stereo(self):
+        """Test WAV header with stereo audio."""
+        header = _create_wav_header(sample_rate=44100, num_channels=2, bits_per_sample=16)
+
+        # Parse header
+        parsed = struct.unpack("<4sI4s4sIHHIIHH4sI", header)
+        num_channels = parsed[6]
+        byte_rate = parsed[8]
+        block_align = parsed[9]
+
+        assert num_channels == 2, f"Expected 2 channels, got {num_channels}"
+        assert byte_rate == 44100 * 2 * 16 // 8, "Byte rate mismatch"
+        assert block_align == 2 * 16 // 8, "Block align mismatch"
+
+    def test_wav_header_placeholder_values(self):
+        """Test that placeholder values are correctly set to 0xFFFFFFFF."""
+        header = _create_wav_header(sample_rate=24000)
+
+        # Extract size fields
+        chunk_size = struct.unpack("<I", header[4:8])[0]
+        subchunk2_size = struct.unpack("<I", header[40:44])[0]
+
+        assert chunk_size == 0xFFFFFFFF, "ChunkSize should be 0xFFFFFFFF for streaming"
+        assert subchunk2_size == 0xFFFFFFFF, "Subchunk2Size should be 0xFFFFFFFF for streaming"
+
+
+class TestWAVStreaming:
+    """Integration tests for WAV format streaming."""
+
+    @pytest.fixture
+    def wav_streaming_app(self, mocker: MockerFixture):
+        """Test app configured for WAV streaming."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+
+        def _make_output(finished: bool) -> OmniRequestOutput:
+            chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
+
+            class MockCompletionOutput:
+                def __init__(self, index: int = 0):
+                    self.index = index
+                    self.text = ""
+                    self.token_ids = []
+                    self.finish_reason = "stop"
+                    self.stop_reason = None
+                    self.logprobs = None
+
+            class MockRequestOutput:
+                def __init__(self, audio_tensor: torch.Tensor):
+                    self.request_id = "speech-wav-stream-test"
+                    self.outputs = [MockCompletionOutput(index=0)]
+                    self.multimodal_output = {"audio": audio_tensor, "sr": 24000}
+                    self.finished = finished
+                    self.prompt_token_ids = None
+                    self.encoder_prompt_token_ids = None
+                    self.num_cached_tokens = None
+                    self.prompt_logprobs = None
+                    self.kv_transfer_params = None
+
+            return OmniRequestOutput(
+                stage_id=0,
+                final_output_type="audio",
+                request_output=MockRequestOutput(audio_tensor=chunk),
+                finished=finished,
+            )
+
+        async def mock_generate_streaming(*args, **kwargs):
+            yield _make_output(finished=False)
+            yield _make_output(finished=True)
+
+        mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
+        mock_engine_client.default_sampling_params_list = [{}]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        speech_server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        original_create_speech = speech_server.create_speech
+        sig = signature(original_create_speech)
+        new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
+        new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+
+        async def awaitable_create_speech(*args, **kwargs):
+            return await original_create_speech(*args, **kwargs)
+
+        awaitable_create_speech.__signature__ = new_sig
+        speech_server.create_speech = awaitable_create_speech
+
+        app = FastAPI()
+        app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        return app
+
+    def test_wav_streaming_success(self, wav_streaming_app):
+        """Test WAV format streaming returns correct content type and includes WAV header."""
+        client = TestClient(wav_streaming_app)
+        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "wav"})
+
+        assert response.status_code == 200
+        assert "audio/wav" in response.headers["content-type"]
+        assert len(response.content) > 44  # Should have WAV header + audio data
+
+        # Verify WAV header is present
+        header = response.content[:44]
+        chunk_id = header[0:4]
+        format_type = header[8:12]
+        assert chunk_id == b"RIFF", "Should start with RIFF"
+        assert format_type == b"WAVE", "Should contain WAVE format"
+
+    def test_streaming_unsupported_format_rejected(self, wav_streaming_app):
+        """Test that unsupported formats are rejected for streaming."""
+        client = TestClient(wav_streaming_app)
+
+        unsupported_formats = ["mp3"]
+        for fmt in unsupported_formats:
+            response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": fmt})
+            assert response.status_code == 422

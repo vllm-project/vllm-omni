@@ -23,7 +23,7 @@ models = ["linyueqian/stable_audio_random"]
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
 def test_stable_audio_model(model_name: str):
     m = Omni(model=model_name)

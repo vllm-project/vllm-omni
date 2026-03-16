@@ -32,10 +32,8 @@ from transformers.modeling_utils import PreTrainedModel
 from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -63,6 +61,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe import HunyuanFusedMoE
 
 logger = logging.getLogger(__name__)
 
@@ -1417,7 +1416,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -1563,22 +1562,6 @@ class HunYuanAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         output = output.reshape(bsz, q_len, -1)
         return output, None, past_key_value
-
-
-class HunyuanFusedMoE(SharedFusedMoE):
-    def __init__(self, *, prefix: str = "", **kwargs):
-        super().__init__(prefix=prefix, **kwargs)
-        self._prefix = prefix
-
-        self._init_hook_handle = self.register_forward_pre_hook(self._initialize_kernel_hook, with_kwargs=True)
-
-    def _initialize_kernel_hook(self, module, args, kwargs):
-        if self.quant_method:
-            self.quant_method.process_weights_after_loading(self)
-        self._init_hook_handle.remove()
-
-    def forward(self, hidden_states, router_logits):
-        return super().forward(hidden_states, router_logits)
 
 
 class HunyuanImage3DecoderLayer(nn.Module):
@@ -2454,7 +2437,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
                     latents = callback_outputs.pop("latents", latents)
-
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
