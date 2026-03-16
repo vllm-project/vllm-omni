@@ -280,7 +280,9 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
 
         self.default_sample_size = 128
         self.tokenizer_max_length = 512
-        self.setup_diffusion_pipeline_profiler()
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
         self.clear_profiler_records()
 
     def _encode_prompt(self, prompt, image):
@@ -706,7 +708,9 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
                 latents = latents.to(dtype=self.vae.dtype)
 
             image = self.vae.decode(latents, return_dict=False)[0]
-        return DiffusionOutput(output=image, stage_durations=self.stage_durations)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

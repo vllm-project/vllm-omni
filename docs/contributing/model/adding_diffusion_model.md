@@ -827,11 +827,15 @@ Diffusion timing is controlled by environment variables.
 
 Enable timing by setting:
 ```
-export ENABLE_DIFFUSION_PIPELINE_PROFILER=1
+vllm serve Qwen/Qwen-Image --omni --port 8091 --enable-diffusion-pipeline-profiler
 ```
 You can optionally specify which modules to profile:
 ```
-export DIFFUSION_PIPELINE_PROFILER_TARGETS="vae.encode,vae.decode,diffuse,text_encoder.forward"
+class YourPipeline(xxx, DiffusionPipelineProfilerMixin):
+    def __init__(self, xxx):
+        ...
+        self.setup_diffusion_pipeline_profiler(profiler_targets=["diffuse"])
+        self.clear_profiler_records()
 ```
 If not specified, the default targets are used:
 ```

@@ -233,7 +233,9 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 allow_patterns_overrides=["model-*.safetensors", "model.safetensors"],
             )
         ]
-        self.setup_diffusion_pipeline_profiler()
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
         self.clear_profiler_records()
 
     @property
@@ -705,7 +707,9 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         sampled_images = self.vae.decode(latents.to(self.vae.dtype)).sample
         sampled_images = sampled_images.detach().cpu().to(torch.float32)
 
-        return DiffusionOutput(output=sampled_images, stage_durations=self.stage_durations)
+        return DiffusionOutput(
+            output=sampled_images, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load model weights."""

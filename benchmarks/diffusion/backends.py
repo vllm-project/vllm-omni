@@ -56,6 +56,7 @@ async def async_request_chat_completions(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
 ) -> RequestFuncOutput:
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
@@ -121,6 +122,8 @@ async def async_request_chat_completions(
                                     output.stage_durations = first_item.get("stage_durations")
                 except (IndexError, TypeError, AttributeError):
                     pass
+                if output.stage_durations:
+                    print(f"[DIFFUSION PIPELINE PROFILER] {output.stage_durations}")
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False

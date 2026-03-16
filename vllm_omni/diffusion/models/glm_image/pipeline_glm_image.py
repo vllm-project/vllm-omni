@@ -321,7 +321,9 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Get transformer config for patch size
         self._patch_size = getattr(self.transformer, "patch_size", 2)
-        self.setup_diffusion_pipeline_profiler()
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
         self.clear_profiler_records()
 
     # ==================== Input Validation ====================
@@ -870,7 +872,9 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         latents = latents * latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
-        return DiffusionOutput(output=image, stage_durations=self.stage_durations)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load transformer weights."""

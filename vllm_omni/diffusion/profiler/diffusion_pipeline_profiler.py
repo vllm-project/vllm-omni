@@ -65,8 +65,14 @@ def wrap_methods_by_paths(root_obj: Any, method_paths: list[str]) -> None:
 
 class DiffusionPipelineProfilerMixin:
     _PROFILER_TARGETS = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
+    enable_diffusion_pipeline_profiler: bool = False
 
-    def setup_diffusion_pipeline_profiler(self, profiler_targets: list[str] | None = None) -> None:
+    def setup_diffusion_pipeline_profiler(
+        self, profiler_targets: list[str] | None = None, enable_diffusion_pipeline_profiler: bool = False
+    ) -> None:
+        if not enable_diffusion_pipeline_profiler:
+            self.enable_diffusion_pipeline_profiler = enable_diffusion_pipeline_profiler
+            return
         self._profiler_lock = Lock()
         self._stage_durations: dict[str, float] = {}
         targets = profiler_targets if profiler_targets is not None else self._PROFILER_TARGETS
@@ -85,5 +91,7 @@ class DiffusionPipelineProfilerMixin:
             return self._stage_durations.copy()
 
     def clear_profiler_records(self) -> None:
+        if not self.enable_diffusion_pipeline_profiler:
+            return
         with self._profiler_lock:
             self._stage_durations.clear()
