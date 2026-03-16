@@ -69,8 +69,7 @@ class OutputModality(Flag):
 
 
 class TensorAccumulationStrategy(Enum):
-    """Strategy for merging incremental multimodal tensors.
-    """
+    """Strategy for merging incremental multimodal tensors."""
 
     CONCAT_DIM0 = "concat_dim0"
     """Concatenate along dimension 0. Used for image/latent tensors."""
@@ -86,8 +85,7 @@ class TensorAccumulationStrategy(Enum):
 
 
 def get_accumulation_strategy(modality: OutputModality) -> TensorAccumulationStrategy:
-    """Determine tensor merge strategy from the multimodal flags.
-    """
+    """Determine tensor merge strategy from the multimodal flags."""
     if OutputModality.AUDIO in modality:
         return TensorAccumulationStrategy.CONCAT_LAST
     if OutputModality.IMAGE in modality or OutputModality.LATENT in modality:

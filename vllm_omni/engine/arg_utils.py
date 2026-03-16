@@ -7,8 +7,8 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.gguf_utils import is_gguf
 
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.plugins import load_omni_general_plugins
 from vllm_omni.engine.output_modality import OutputModality
+from vllm_omni.plugins import load_omni_general_plugins
 
 logger = init_logger(__name__)
 

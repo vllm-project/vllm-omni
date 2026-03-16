@@ -8,14 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from vllm.outputs import CompletionOutput
 
 import torch
+from vllm.outputs import CompletionOutput
 
 
 @dataclass
 class MultimodalPayload:
-    """Structured multimodal output payloa
+    """Structured multimodal output payload.
 
     Attributes:
         tensors: Dictionary mapping modality/key names to their tensors.
@@ -28,8 +28,7 @@ class MultimodalPayload:
 
     @property
     def primary_tensor(self) -> torch.Tensor | None:
-        """Return the first tensor in the payload, or None if empty.
-        """
+        """Return the first tensor in the payload, or None if empty."""
         if self.tensors:
             return next(iter(self.tensors.values()))
         return None
@@ -71,7 +70,6 @@ class MultimodalPayload:
 
 
 class MultimodalCompletionOutput(CompletionOutput):
-
     __slots__ = ("multimodal_output",)
 
     def __init__(
@@ -86,7 +84,4 @@ class MultimodalCompletionOutput(CompletionOutput):
         object.__setattr__(self, name, value)
 
     def __repr__(self) -> str:
-        return (
-            f"MultimodalCompletionOutput("
-            f"multimodal_output={self.multimodal_output!r})"
-        )
+        return f"MultimodalCompletionOutput(multimodal_output={self.multimodal_output!r})"
