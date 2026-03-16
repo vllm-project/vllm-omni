@@ -253,6 +253,7 @@ def stability_benchmark_params(request, omni_server):
     return {"test_name": test_name, "params": all_params[param_index]}
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("stability_benchmark_params", benchmark_indices, indirect=True)
 def test_benchmark_stability(omni_server, stability_benchmark_params):
