@@ -368,6 +368,8 @@ class AsyncOmni(OmniBase):
             if sampling_params_list is None:
                 sampling_params_list = self.default_sampling_params_list
 
+            sampling_params_list = self._maybe_expand_sampling_params(sampling_params_list)
+
             if len(sampling_params_list) != len(self.stage_list):
                 raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
@@ -408,6 +410,8 @@ class AsyncOmni(OmniBase):
             expanded_companions = cfg.expand_prompts({request_id: prompt})
 
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
+            if self._pd_separation_pair is not None and self._pd_separation_pair[0] == 0:
+                sp0 = self._prepare_prefill_sampling_params(request_id, sp0)
             task = {
                 "request_id": request_id,
                 "engine_inputs": prompt,
@@ -675,10 +679,18 @@ class AsyncOmni(OmniBase):
             next_stage_id = stage_id + 1
             if next_stage_id <= final_stage_id_for_e2e:
                 next_stage: OmniStage = self.stage_list[next_stage_id]
-                # Derive inputs for the next stage, record postprocess time
-                with metrics.stage_postprocess_timer(stage_id, request_id):
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
-                sp_next: SamplingParams = sampling_params_list[next_stage_id]
+                if self._is_pd_routing(stage_id, next_stage_id):
+                    next_inputs, sp_next = self._prepare_pd_decode_routing(
+                        request_id,
+                        prompt,
+                        sampling_params_list[next_stage_id],
+                        engine_outputs=engine_outputs,
+                    )
+                else:
+                    # Derive inputs for the next stage, record postprocess time
+                    with metrics.stage_postprocess_timer(stage_id, request_id):
+                        next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
+                    sp_next: SamplingParams = sampling_params_list[next_stage_id]
 
                 if cfg is not None and cfg.is_active and not cfg.is_parent_failed(request_id):
                     if isinstance(sp_next, OmniDiffusionSamplingParams):
