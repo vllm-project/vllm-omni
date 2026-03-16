@@ -46,6 +46,192 @@ class KVCacheTransferData:
         """Convert to dictionary for serialization."""
         return asdict(self)
 
+    def to_bytes(self) -> bytes:
+        """Convert to compact binary format for fast transfer."""
+        import json
+        import struct
+
+        tensors_desc: list[dict[str, Any]] = []
+        tensor_bufs: list[bytes] = []
+        data_offset = 0
+
+        for cache_name in ("key_cache", "value_cache"):
+            cache_list = self.layer_blocks.get(cache_name, [])
+            for layer_idx, tensor in enumerate(cache_list):
+                if tensor is None:
+                    tensors_desc.append({"n": f"{cache_name}_{layer_idx}", "x": True})
+                    continue
+
+                t = tensor.detach().cpu().contiguous()
+                dtype_str = str(t.dtype).removeprefix("torch.")
+                raw = t.view(torch.uint8).numpy().tobytes()
+                tensors_desc.append(
+                    {
+                        "n": f"{cache_name}_{layer_idx}",
+                        "d": dtype_str,
+                        "s": list(t.shape),
+                        "o": data_offset,
+                        "b": len(raw),
+                    }
+                )
+                tensor_bufs.append(raw)
+                data_offset += len(raw)
+
+        header = json.dumps(
+            {
+                "rid": self.request_id,
+                "bids": self.block_ids,
+                "meta": self.metadata,
+                "td": tensors_desc,
+                "nl": len(self.layer_blocks.get("key_cache", [])),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return b"".join([struct.pack(">I", len(header)), header] + tensor_bufs)
+
+    def to_gpu_tensor(self) -> torch.Tensor:
+        """Convert to a packed GPU tensor for raw-data connectors."""
+        import json
+        import struct
+
+        tensors_desc: list[dict[str, Any]] = []
+        gpu_tensors: list[torch.Tensor] = []
+        data_offset = 0
+        device = None
+
+        for cache_name in ("key_cache", "value_cache"):
+            cache_list = self.layer_blocks.get(cache_name, [])
+            for layer_idx, tensor in enumerate(cache_list):
+                if tensor is None:
+                    tensors_desc.append({"n": f"{cache_name}_{layer_idx}", "x": True})
+                    continue
+
+                t = tensor.detach().contiguous()
+                if device is None and t.is_cuda:
+                    device = t.device
+                dtype_str = str(t.dtype).removeprefix("torch.")
+                nbytes = t.numel() * t.element_size()
+                tensors_desc.append(
+                    {
+                        "n": f"{cache_name}_{layer_idx}",
+                        "d": dtype_str,
+                        "s": list(t.shape),
+                        "o": data_offset,
+                        "b": nbytes,
+                    }
+                )
+                gpu_tensors.append(t.view(torch.uint8).flatten())
+                data_offset += nbytes
+
+        if device is None:
+            raise RuntimeError("No CUDA tensors found, use to_bytes() instead")
+
+        header = json.dumps(
+            {
+                "rid": self.request_id,
+                "bids": self.block_ids,
+                "meta": self.metadata,
+                "td": tensors_desc,
+                "nl": len(self.layer_blocks.get("key_cache", [])),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        header_prefix = struct.pack(">I", len(header)) + header
+        total_size = len(header_prefix) + data_offset
+        output = torch.empty(total_size, dtype=torch.uint8, device=device)
+        header_tensor = torch.frombuffer(bytearray(header_prefix), dtype=torch.uint8)
+        output[: len(header_prefix)].copy_(header_tensor)
+
+        pos = len(header_prefix)
+        for t_flat in gpu_tensors:
+            n = t_flat.numel()
+            output[pos : pos + n].copy_(t_flat)
+            pos += n
+
+        return output
+
+    @staticmethod
+    def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
+        """Reconstruct KV cache data from the packed bytes format."""
+        import json
+        import struct
+
+        raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
+        header_len = struct.unpack(">I", raw_mv[:4])[0]
+        header = json.loads(bytes(raw_mv[4 : 4 + header_len]))
+        data_start = 4 + header_len
+        tensor_data_mv = raw_mv[data_start:]
+
+        num_layers = header["nl"]
+        key_cache: list[torch.Tensor | None] = [None] * num_layers
+        value_cache: list[torch.Tensor | None] = [None] * num_layers
+
+        for info in header["td"]:
+            if info.get("x"):
+                continue
+
+            name: str = info["n"]
+            torch_dtype = getattr(torch, info["d"])
+            t = (
+                torch.frombuffer(
+                    tensor_data_mv,
+                    dtype=torch.uint8,
+                    offset=info["o"],
+                    count=info["b"],
+                )
+                .view(torch_dtype)
+                .reshape(info["s"])
+            )
+            layer_idx = int(name.split("_")[-1])
+            if name.startswith("key_cache_"):
+                key_cache[layer_idx] = t
+            elif name.startswith("value_cache_"):
+                value_cache[layer_idx] = t
+
+        return {
+            "request_id": header["rid"],
+            "layer_blocks": {"key_cache": key_cache, "value_cache": value_cache},
+            "block_ids": header["bids"],
+            "metadata": header["meta"],
+        }
+
+    @staticmethod
+    def from_bytes_gpu(gpu_tensor: torch.Tensor) -> dict[str, Any]:
+        """Reconstruct KV cache data from a packed GPU tensor."""
+        import json
+        import struct
+
+        header_len = struct.unpack(">I", gpu_tensor[:4].cpu().numpy().tobytes())[0]
+        header_bytes = gpu_tensor[4 : 4 + header_len].cpu().numpy().tobytes()
+        header = json.loads(header_bytes)
+        data_start = 4 + header_len
+
+        num_layers = header["nl"]
+        key_cache: list[torch.Tensor | None] = [None] * num_layers
+        value_cache: list[torch.Tensor | None] = [None] * num_layers
+
+        for info in header["td"]:
+            if info.get("x"):
+                continue
+
+            name: str = info["n"]
+            torch_dtype = getattr(torch, info["d"])
+            t = gpu_tensor[data_start + info["o"] : data_start + info["o"] + info["b"]].clone()
+            t = t.view(torch_dtype).reshape(info["s"])
+            layer_idx = int(name.split("_")[-1])
+            if name.startswith("key_cache_"):
+                key_cache[layer_idx] = t
+            elif name.startswith("value_cache_"):
+                value_cache[layer_idx] = t
+
+        return {
+            "request_id": header["rid"],
+            "layer_blocks": {"key_cache": key_cache, "value_cache": value_cache},
+            "block_ids": header["bids"],
+            "metadata": header["meta"],
+        }
+
 
 class OmniKVTransferManager:
     """Unified management for OmniConnector and KV cache transfer.
@@ -78,6 +264,13 @@ class OmniKVTransferManager:
             if recv_from is not None and config.stage_id is not None
             else (None, None)
         )
+
+        if config.need_send_cache and config.connector_config:
+            try:
+                _ = self.connector
+                logger.info("Sender connector eagerly initialized")
+            except Exception as e:
+                logger.warning("Failed to eagerly initialize sender connector: %s", e)
 
     @classmethod
     def _create(cls, cfg: dict | None) -> "OmniKVTransferManager":
@@ -140,8 +333,41 @@ class OmniKVTransferManager:
             cfg = self.config.connector_config
             if cfg and (c_type := cfg.get("type")):
                 try:
-                    logger.info(f"Initializing OmniConnector with config: {cfg}")
                     c_extra = {k: v for k, v in cfg.items() if k != "type"}
+                    kv_transfer_port_offset = 100
+
+                    if c_type == "MooncakeTransferEngineConnector":
+                        base_port = c_extra.get("zmq_port", 50051)
+                        c_extra["from_stage"] = (
+                            str(self.config.from_stage) if self.config.from_stage is not None else "0"
+                        )
+                        c_extra["to_stage"] = str(self.config.to_stage) if self.config.to_stage is not None else "1"
+
+                        if self.config.need_send_cache:
+                            c_extra["role"] = "sender"
+                            from_stage = self.config.from_stage
+                            if from_stage is not None:
+                                try:
+                                    c_extra["zmq_port"] = base_port + kv_transfer_port_offset + int(from_stage)
+                                except (TypeError, ValueError):
+                                    c_extra["zmq_port"] = base_port + kv_transfer_port_offset
+                        elif self.config.need_recv_cache:
+                            c_extra["role"] = "receiver"
+                            from_stage = self.config.from_stage
+                            sender_port = base_port + kv_transfer_port_offset
+                            if from_stage is not None:
+                                try:
+                                    sender_port = base_port + kv_transfer_port_offset + int(from_stage)
+                                except (TypeError, ValueError):
+                                    pass
+                            c_extra.setdefault("sender_host", c_extra.get("host", "127.0.0.1"))
+                            c_extra.setdefault("sender_zmq_port", sender_port)
+
+                    logger.info(
+                        "Initializing OmniConnector (purpose=kv_transfer) with config: %s, role: %s",
+                        cfg,
+                        c_extra.get("role", "N/A"),
+                    )
                     self._connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=c_type, extra=c_extra))
                 except Exception as e:
                     logger.error(f"Failed to initialize OmniConnector: {e}")
@@ -156,6 +382,44 @@ class OmniKVTransferManager:
     def get_connector(self):
         """Get connector (compatibility wrapper for existing code)."""
         return self.connector
+
+    def get_sender_connection_info(self) -> dict[str, Any] | None:
+        """Return sender connection info when KV transfer runs in sender mode."""
+        if not self.config.need_send_cache:
+            return None
+        conn = self.connector
+        if conn and hasattr(conn, "get_connection_info"):
+            return conn.get_connection_info()
+        return None
+
+    def update_sender_info(self, sender_info: dict[str, Any]) -> None:
+        """Update receiver-side sender info before loading remote KV cache."""
+        if not self.config.need_recv_cache:
+            return
+
+        actual_info = sender_info
+        if sender_info and "host" not in sender_info:
+            for _, info in sender_info.items():
+                if isinstance(info, dict) and "host" in info:
+                    actual_info = info
+                    break
+
+        if not actual_info or "host" not in actual_info:
+            logger.warning("Invalid sender_info format: %s", sender_info)
+            return
+
+        if self.config.connector_config:
+            self.config.connector_config["sender_host"] = actual_info.get("host")
+            self.config.connector_config["sender_zmq_port"] = actual_info.get("zmq_port")
+
+        if self._connector and hasattr(self._connector, "update_sender_info"):
+            try:
+                self._connector.update_sender_info(actual_info.get("host"), actual_info.get("zmq_port"))
+            except Exception:
+                if hasattr(self._connector, "sender_host"):
+                    self._connector.sender_host = actual_info.get("host")
+                if hasattr(self._connector, "sender_zmq_port"):
+                    self._connector.sender_zmq_port = actual_info.get("zmq_port")
 
     def handle_finished_requests_kv_transfer(
         self,
@@ -203,7 +467,8 @@ class OmniKVTransferManager:
 
                 custom_metadata = data.get("custom_metadata")
 
-                # Extract KV cache from GPU blocks -> CPU tensors
+                # Extract KV cache from GPU blocks and keep it on-device when
+                # possible so raw-data connectors can use the fast path.
                 kv_data = self._extract_kv_cache(
                     req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype, custom_metadata
                 )
@@ -280,9 +545,8 @@ class OmniKVTransferManager:
                 flat_k = flat_k[:seq_len]
                 flat_v = flat_v[:seq_len]
 
-            # Move to CPU
-            key_cache[layer_idx] = flat_k.detach().cpu().contiguous()
-            value_cache[layer_idx] = flat_v.detach().cpu().contiguous()
+            key_cache[layer_idx] = flat_k.detach().contiguous()
+            value_cache[layer_idx] = flat_v.detach().contiguous()
 
         if not any(k is not None for k in key_cache):
             return None
@@ -311,14 +575,42 @@ class OmniKVTransferManager:
         if not from_stage or not to_stage:
             raise ValueError("Transfer stages (omni_from_stage, omni_to_stage) not configured")
 
-        # Prepare data and transfer with retry
-        data_dict = kv_data.to_dict()
-        data_dict["request_id"] = transfer_req_id
+        import time as _time
 
-        success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", data_dict)
+        kv_data.request_id = transfer_req_id
+        serialization_start = _time.perf_counter()
+        transfer_data: torch.Tensor | bytes | dict[str, Any]
+        supports_raw = getattr(self.connector, "supports_raw_data", False)
+
+        try:
+            if supports_raw:
+                transfer_data = kv_data.to_gpu_tensor()
+            else:
+                raise RuntimeError("Connector does not support raw tensor")
+        except Exception:
+            try:
+                transfer_data = kv_data.to_bytes()
+            except Exception:
+                data_dict = kv_data.to_dict()
+                data_dict["request_id"] = transfer_req_id
+                transfer_data = data_dict
+
+        serialization_ms = (_time.perf_counter() - serialization_start) * 1000
+        logger.info("KV cache serialized for %s in %.1f ms", transfer_req_id, serialization_ms)
+
+        transfer_start = _time.perf_counter()
+        success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", transfer_data)
+        elapsed = _time.perf_counter() - transfer_start
 
         if success:
-            logger.info(f"KV transfer OK: {transfer_req_id}, {size} bytes")
+            mbps = (size / 1024 / 1024) / elapsed if elapsed > 0 else 0
+            logger.info(
+                "KV transfer OK: %s, %s bytes, %.3fs, %.1f MB/s",
+                transfer_req_id,
+                size,
+                elapsed,
+                mbps,
+            )
         else:
             logger.error(f"KV transfer FAILED: {transfer_req_id}")
 
@@ -327,7 +619,7 @@ class OmniKVTransferManager:
         from_stage: str,
         to_stage: str,
         request_id: str,
-        data: dict[str, Any],
+        data: "dict[str, Any] | bytes | torch.Tensor",
         max_retries: int = 3,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Transfer data with retry and exponential backoff.
@@ -400,33 +692,72 @@ class OmniKVTransferManager:
             while True:
                 # Build the full key for connector
                 full_request_id = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
+                link_start = time.perf_counter()
                 result = self.connector.get(
                     from_stage=from_stage,
                     to_stage=to_stage,
                     get_key=full_request_id,
                 )
                 if result:
-                    data, size = result
-                    logger.info(f"Successfully received KV cache for {request_id}, {size} bytes")
+                    raw_data, size = result
+                    elapsed = time.time() - start_time
+                    link_ms = (time.perf_counter() - link_start) * 1000
+                    managed_buffer = None
 
-                    # Move tensors to target device if specified
-                    if target_device is not None and isinstance(data, dict) and "layer_blocks" in data:
-                        layer_blocks = data["layer_blocks"]
-                        for cache_list in [
-                            layer_blocks.get("key_cache", []),
-                            layer_blocks.get("value_cache", []),
-                        ]:
-                            for i, tensor in enumerate(cache_list):
-                                if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
-                                    cache_list[i] = tensor.to(target_device).contiguous()
+                    if hasattr(raw_data, "tensor") and hasattr(raw_data, "release"):
+                        managed_buffer = raw_data
+                        try:
+                            buf_tensor = raw_data.tensor
+                            if buf_tensor.is_cuda:
+                                data = KVCacheTransferData.from_bytes_gpu(buf_tensor)
+                                raw_data.release()
+                                managed_buffer = None
+                            else:
+                                data = KVCacheTransferData.from_bytes(memoryview(buf_tensor.numpy()))
+                        except Exception as e:
+                            logger.error("Failed to deserialize KV cache from ManagedBuffer: %s", e)
+                            if managed_buffer is not None:
+                                raw_data.release()
+                            return None, 0
+                    elif isinstance(raw_data, (bytes, bytearray)):
+                        data = KVCacheTransferData.from_bytes(raw_data)
+                    elif isinstance(raw_data, torch.Tensor) and raw_data.dtype == torch.uint8 and raw_data.dim() == 1:
+                        data = KVCacheTransferData.from_bytes(raw_data.cpu().numpy().tobytes())
+                    else:
+                        data = raw_data
 
+                    try:
+                        if isinstance(data, dict) and "layer_blocks" in data:
+                            layer_blocks = data["layer_blocks"]
+                            for cache_list in [
+                                layer_blocks.get("key_cache", []),
+                                layer_blocks.get("value_cache", []),
+                            ]:
+                                for i, tensor in enumerate(cache_list):
+                                    if not isinstance(tensor, torch.Tensor):
+                                        continue
+                                    if target_device is not None and tensor.device != target_device:
+                                        cache_list[i] = tensor.to(target_device).contiguous()
+                                    elif managed_buffer is not None:
+                                        cache_list[i] = tensor.clone()
+                    finally:
+                        if managed_buffer is not None:
+                            managed_buffer.release()
+
+                    logger.info(
+                        "Successfully received KV cache for %s, %s bytes, wait=%.3fs, link=%.1fms",
+                        request_id,
+                        size,
+                        elapsed,
+                        link_ms,
+                    )
                     return data, size
 
                 if time.time() - start_time > timeout:
                     logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
                     return None, 0
 
-                time.sleep(0.5)
+                time.sleep(0.01)
 
         except Exception as e:
             logger.error(f"Error receiving KV cache for {request_id}: {e}")
@@ -470,6 +801,10 @@ class OmniKVTransferManager:
         Returns:
             True if successful, False otherwise
         """
+        kv_sender_info = getattr(req, "kv_sender_info", None)
+        if kv_sender_info:
+            self.update_sender_info(kv_sender_info)
+
         request_id = getattr(req, "request_id", None)
         if not request_id and hasattr(req, "request_ids") and req.request_ids:
             # Adaptation for new OmniDiffusionRequest which has list of prompts/ids

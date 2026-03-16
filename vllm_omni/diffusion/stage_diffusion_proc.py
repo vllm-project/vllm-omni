@@ -128,6 +128,7 @@ class StageDiffusionProc:
         request_id: str,
         prompt: Any,
         sampling_params_dict: dict,
+        kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and run DiffusionEngine.step()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -136,6 +137,7 @@ class StageDiffusionProc:
             prompts=[prompt],
             sampling_params=sampling_params,
             request_ids=[request_id],
+            kv_sender_info=kv_sender_info,
         )
 
         loop = asyncio.get_running_loop()
@@ -150,6 +152,7 @@ class StageDiffusionProc:
         request_id: str,
         prompts: list[Any],
         sampling_params_dict: dict,
+        kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a batched diffusion request and run DiffusionEngine.step().
 
@@ -164,6 +167,7 @@ class StageDiffusionProc:
             prompts=prompts,
             sampling_params=sampling_params,
             request_ids=[request_id] * len(prompts),
+            kv_sender_info=kv_sender_info,
         )
 
         loop = asyncio.get_running_loop()
@@ -325,10 +329,20 @@ class StageDiffusionProc:
 
         tasks: dict[str, asyncio.Task] = {}
 
-        async def _dispatch_request(request_id: str, prompt: Any, sampling_params_dict: dict) -> None:
+        async def _dispatch_request(
+            request_id: str,
+            prompt: Any,
+            sampling_params_dict: dict,
+            kv_sender_info: dict[str, Any] | None = None,
+        ) -> None:
             """Process a single diffusion request and send the response."""
             try:
-                result = await self._process_request(request_id, prompt, sampling_params_dict)
+                result = await self._process_request(
+                    request_id,
+                    prompt,
+                    sampling_params_dict,
+                    kv_sender_info=kv_sender_info,
+                )
                 await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
                 logger.info(
@@ -363,6 +377,7 @@ class StageDiffusionProc:
                             request_id,
                             msg["prompt"],
                             msg["sampling_params"],
+                            msg.get("kv_sender_info"),
                         )
                     )
                     tasks[request_id] = task
@@ -370,9 +385,19 @@ class StageDiffusionProc:
                 elif msg_type == "add_batch_request":
                     request_id = msg["request_id"]
 
-                    async def _dispatch_batch(rid: str, prompts: list, sp_dict: dict) -> None:
+                    async def _dispatch_batch(
+                        rid: str,
+                        prompts: list,
+                        sp_dict: dict,
+                        kv_sender_info: dict[str, Any] | None = None,
+                    ) -> None:
                         try:
-                            result = await self._process_batch_request(rid, prompts, sp_dict)
+                            result = await self._process_batch_request(
+                                rid,
+                                prompts,
+                                sp_dict,
+                                kv_sender_info=kv_sender_info,
+                            )
                             await response_socket.send(encoder.encode({"type": "result", "output": result}))
                         except DiffusionRequestAbortedError as e:
                             logger.info(
@@ -399,6 +424,7 @@ class StageDiffusionProc:
                             request_id,
                             msg["prompts"],
                             msg["sampling_params"],
+                            msg.get("kv_sender_info"),
                         )
                     )
                     tasks[request_id] = task

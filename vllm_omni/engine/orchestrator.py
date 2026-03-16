@@ -477,6 +477,26 @@ class Orchestrator:
             ),
         )
 
+    def _build_kv_sender_info(self, sender_stage_id: int) -> dict[int, dict[str, Any]] | None:
+        """Build per-request sender info for diffusion KV-transfer receivers."""
+        if sender_stage_id < 0 or sender_stage_id >= self.num_stages:
+            return None
+
+        sender_stage = self.stage_clients[sender_stage_id]
+        get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
+        if not callable(get_sender_info):
+            return None
+
+        sender_info = get_sender_info()
+        if not sender_info:
+            logger.warning(
+                "[Orchestrator] Stage-%s has no KV sender info available",
+                sender_stage_id,
+            )
+            return None
+
+        return {sender_stage_id: sender_info}
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -522,14 +542,21 @@ class Orchestrator:
                         req_id,
                     )
 
+            kv_sender_info = self._build_kv_sender_info(sender_stage_id=stage_id)
             if isinstance(diffusion_prompt, list):
                 await next_client.add_batch_request_async(
                     req_id,
                     diffusion_prompt,
                     params,
+                    kv_sender_info=kv_sender_info,
                 )
             else:
-                await next_client.add_request_async(req_id, diffusion_prompt, params)
+                await next_client.add_request_async(
+                    req_id,
+                    diffusion_prompt,
+                    params,
+                    kv_sender_info=kv_sender_info,
+                )
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 
@@ -731,7 +758,16 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             if next_client.stage_type == "diffusion":
-                await next_client.add_request_async(request_id, req_state.prompt, params)
+                source_stage_id = next_stage_id - 1
+                if getattr(next_client, "engine_input_source", None):
+                    source_stage_id = next_client.engine_input_source[0]
+                kv_sender_info = self._build_kv_sender_info(sender_stage_id=source_stage_id)
+                await next_client.add_request_async(
+                    request_id,
+                    req_state.prompt,
+                    params,
+                    kv_sender_info=kv_sender_info,
+                )
                 req_state.stage_submit_ts[next_stage_id] = _time.time()
                 continue
 

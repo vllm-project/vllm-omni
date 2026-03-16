@@ -1,14 +1,17 @@
 # Stage 0: Thinker (multimodal understanding + text generation)
+# RDMA/transfer-engine variant of the current Bagel pipeline config.
 
 stage_args:
   - stage_id: 0
     stage_type: llm
+    prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
     runtime:
       devices: "0"
+      # 3 = 1 user prompt + 2 CFG companions (text-unconditional + image-unconditional).
+      max_batch_size: 3
     engine_args:
       model_stage: thinker
-      max_num_seqs: 1
-      model_arch: BagelForConditionalGeneration
+      model_arch: OmniBagelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.45
@@ -22,7 +25,7 @@ stage_args:
       omni_kv_config:
         need_send_cache: true
         kv_transfer_criteria:
-          type: prefill_finished #or special token generated
+          type: prefill_finished
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -35,16 +38,16 @@ stage_args:
       detokenize: True
       repetition_penalty: 1.05
     output_connectors:
-      to_stage_1: mooncake_connector
-
+      to_stage_1: rdma_connector
 
   - stage_id: 1
     stage_type: diffusion
+    cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.bagel.collect_cfg_kv_caches
     runtime:
       devices: "0"
+      max_batch_size: 1
     engine_args:
       model_stage: dit
-      max_num_seqs: 1
       gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
@@ -56,53 +59,31 @@ stage_args:
       omni_kv_config:
         need_recv_cache: true
     engine_input_source: [0]
-
     final_output: true
     final_output_type: image
     is_comprehension: false
     default_sampling_params:
       seed: 52
     input_connectors:
-      from_stage_0: mooncake_connector
+      from_stage_0: rdma_connector
 
-
-# Runtime edges
 runtime:
   enabled: true
   defaults:
     window_size: -1
     max_inflight: 1
 
-  # Distributed connectors configuration (optional)
-  # More connectors will be supported in the future.
   connectors:
-    # Mooncake connector for cross-node/intra-node communication
-    mooncake_connector:
-      name: MooncakeStoreConnector
-      extra:
-        host: "127.0.0.1"
-        metadata_server: "http://10.90.67.86:8080/metadata"
-        master: "10.90.67.86:50051"
-        segment: 512000000    # 512MB
-        localbuf: 64000000     # 64MB
-        proto: "tcp"
-
-    # Transfer-engine template for RDMA-based Bagel deployment.
-    # See `bagel_rdma.yaml` for the config that switches the Bagel stage edge
-    # from the store connector to this transfer-engine connector directly.
     rdma_connector:
       name: MooncakeTransferEngineConnector
       extra:
-        # NOTE:
-        # - role/sender_host/sender_zmq_port are internal fields resolved by
-        #   orchestration logic and should not be set in user YAML.
-        host: "auto"                  # Auto-detect local IP for RDMA
-        zmq_port: 50051               # ZMQ base port (actual port uses runtime offsets)
+        # role/sender_host/sender_zmq_port are resolved by orchestration.
+        host: "auto"
+        zmq_port: 50051
         protocol: "rdma"
-        device_name: ""               # e.g. "mlx5_0"; empty for auto-detect
-        memory_pool_size: 2147483648  # 2GB
-        memory_pool_device: "cpu"     # "cuda" for GPUDirect RDMA, "cpu" for pinned memory
-
+        device_name: ""
+        memory_pool_size: 2147483648
+        memory_pool_device: "cpu"
 
   edges:
     - from: 0

@@ -21,6 +21,7 @@ def try_send_via_connector(
     original_prompt: Any,
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
     metrics: OrchestratorAggregator,
+    kv_sender_info: dict[int, dict[str, Any]] | None = None,
 ) -> bool:
     """
     Attempts to send data via OmniConnector.
@@ -73,6 +74,8 @@ def try_send_via_connector(
             # Merge connector metadata (e.g. shm handle or inline data) into queue payload
             if metadata:
                 notify_payload["connector_metadata"] = metadata
+            if kv_sender_info:
+                notify_payload["kv_sender_info"] = kv_sender_info
 
             next_stage_queue_submit_fn(notify_payload)
 

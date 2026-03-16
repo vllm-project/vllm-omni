@@ -173,6 +173,7 @@ class CfgCompanionTracker:
         final_stage_id_to_prompt: dict[str, int],
         metrics: Any,
         remaining_by_stage: list[int],
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> bool:
         """Forward a parent request to the next stage with CFG KV request IDs attached."""
         stage_id = parent_result["stage_id"]
@@ -220,6 +221,7 @@ class CfgCompanionTracker:
                 original_prompt=request_id_to_prompt[req_id],
                 next_stage_queue_submit_fn=stage_list[next_stage_id].submit,
                 metrics=metrics,
+                kv_sender_info=kv_sender_info,
             )
 
         if not sent_via_connector:
