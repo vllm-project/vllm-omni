@@ -1915,8 +1915,6 @@ class HunyuanImage3Model(nn.Module):
 
                 assert loaded_weight.shape[0] % den == 0
                 units = loaded_weight.shape[0] // den
-                if name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 offset = 0
@@ -1954,8 +1952,6 @@ class HunyuanImage3Model(nn.Module):
                     name_mapped = name.replace(weight_name, param_name)
                     found_num += 1
                     if is_pp_missing_parameter(name_mapped, self):
-                        continue
-                    if name_mapped not in params_dict:
                         continue
                     param = params_dict[name_mapped]
                     weight_loader = cast(Callable[..., bool], param.weight_loader)
@@ -1996,8 +1992,6 @@ class HunyuanImage3Model(nn.Module):
                     name = "norm.weight"
                 if name == "wte.weight":
                     name = "embed_tokens.weight"
-                if name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
