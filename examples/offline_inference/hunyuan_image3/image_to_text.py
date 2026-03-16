@@ -52,10 +52,12 @@ def load_image(image_path: str) -> Image.Image:
 
 
 def main(args: argparse.Namespace) -> None:
-    omni = Omni(model=args.model)
+    omni = Omni(model=args.model, mode="image-to-text")
+
+    prompt = "<|startoftext|>You are an assistant that understands images and outputs text.<img>" + args.prompt
 
     prompt_dict = {
-        "prompt": args.prompt,
+        "prompt": prompt,
         "modalities": ["text"],
     }
 

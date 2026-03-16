@@ -305,6 +305,7 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
+        "mode": "text-to-image",
         **lora_args,
         **quant_kwargs,
     }
