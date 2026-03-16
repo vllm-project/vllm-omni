@@ -100,6 +100,7 @@ nav:
   - api/vllm_omni
 - CLI Reference: cli
 - Community:
+  - Governance: community/governance.md
   - community/*
   - Slack: https://slack.vllm.ai
   - Blog: https://blog.vllm.ai
