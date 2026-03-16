@@ -652,12 +652,12 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 ### 4.2 Testing Content and Scope
 
--   ***Long-term Stability (Stability) Testing***: Uses the `tests/e2e/stability/weekly.json` configuration to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
+-   ***Long-term Stability (Stability) Testing***: Uses the `tests/dfx/stability/weekly.json` configuration to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
 -   ***Reliability Testing***: Uses `tests/e2e/reliability/test_{model_name}.py` to actively simulate various fault and abnormal scenarios, such as: dependent service interruption, abnormal input data, network flicker, hardware resource preemption, etc., to verify the system's fault tolerance, self-healing, and graceful degradation capabilities.
 
 ### 4.3 Test Directory and Execution Files
 
--   ***Stability Test Configuration***: `tests/e2e/stability/weekly.json`
+-   ***Stability Test Configuration***: `tests/dfx/stability/tests/test.json`
 -   ***Reliability Test Suite***: `tests/e2e/reliability/test_{model_name}.py`
 
 ### 4.4 Execution Method and Example
@@ -667,12 +667,64 @@ L5 level testing focuses on the performance of model services under ***long-runn
 -   ***Script Example***:
 <details>
 <summary> Test Examples</summary>
-```python
-# WIP
+
+When you want to add L5-level stability test cases, you can refer to the following format for case addition in `tests/dfx/stability/tests/test.json`:
+
+```json
+{
+    "test_name": "test_qwen3_omni_stability",
+    "server_params": {
+        "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "stage_config_name": "qwen3_omni.yaml"
+    },
+    "benchmark_params": [
+        {
+            "dataset_name": "random",
+            "duration_sec": 43200,
+            "request_rate": 0.5,
+            "num_prompts_per_batch": 20
+        }
+    ]
+}
 ```
+
+#### Parameter Explanation
+
+***Overview***
+
+| Field            | Required | Description                                                                 |
+| ---------------- | -------- | --------------------------------------------------------------------------- |
+| test_name        | Yes      | Unique identifier for the stability test case                               |
+| server_params    | Yes      | Server-side configuration parameters (model, stage configuration, etc.)     |
+| benchmark_params | Yes      | Stability benchmark running parameters (supports multiple configurations)   |
+
+#### server_params Configuration
+
+##### Basic Parameters
+
+| Parameter         | Required | Example                            | Description                         |
+| ----------------- | -------- | ---------------------------------- | ----------------------------------- |
+| model             | Yes      | "Qwen/Qwen3-Omni-30B-A3B-Instruct" | Model name or path                  |
+| stage_config_name | Yes      | "qwen3_omni.yaml"                  | Stage configuration file name       |
+
+#### benchmark_params Configuration
+
+For stability testing, the key parameters are:
+
+-   **duration_sec**: Total duration (in seconds) during which benchmark traffic is sent. The stability benchmark will keep sending batches until this duration is reached.
+-   **request_rate** / **max_concurrency**: Exactly one of them must be specified. They control how the traffic is generated for each batch:
+    -   `request_rate`: Number of requests per second. The benchmark will send `num_prompts_per_batch` requests at the given rate.
+    -   `max_concurrency`: Maximum number of concurrent requests. When this is used, `request_rate` is set to `inf` internally.
+-   **num_prompts_per_batch**: Number of prompts sent in each batch. Multiple batches will be executed sequentially within `duration_sec`.
+
+All other optional parameters follow the same rules as the performance tests. You can:
+
+1.  Change the `---xxx-xx-xx` running parameters of the benchmark CLI to `xxx_xx_xx` format and fill them as keys in the JSON file.
+2.  For boolean variables in the running parameters, use `true` / `false` values in the JSON file.
+
 </details>
 
--   -   ***Stability***: (Execution would be driven by the configuration in `weekly.json`).
+-   -   ***Stability***: Execution is driven by the configuration in `tests/dfx/stability/tests/test.json` (for each test entry and its benchmark_params).
     -   ***Reliability***: `pytest -s -v tests/e2e/reliability/test_{model_name}.py`
 
 ## Summary
