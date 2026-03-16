@@ -95,7 +95,6 @@ class _CodePredictorAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
 
@@ -116,8 +115,7 @@ class _CodePredictorAttention(nn.Module):
             k,
             v,
             scale=self.scaling,
-            attn_mask=attn_mask,
-            is_causal=(attn_mask is None),
+            is_causal=True,
             enable_gqa=self._use_gqa,
         )
 
@@ -178,11 +176,10 @@ class _CodePredictorDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_ids, attn_mask)
+        hidden_states = self.self_attn(hidden_states, position_ids)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -229,11 +226,10 @@ class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
         for layer in self.layers:
-            hidden_states = layer(hidden_states, position_ids, attn_mask)
+            hidden_states = layer(hidden_states, position_ids)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -350,14 +346,11 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
         # Pre-allocated buffers (lazily initialized on first forward).
         self._proj_buf: torch.Tensor | None = None
-        self._pos_ids: torch.Tensor | None = None
 
-        # torch.compile state (set in _setup_compile).
+        # torch.compile + warmup state (lazily initialized in _setup_compile).
         self._compiled_model_fwd = None
         self._bucket_sizes: list[int] = []
         self._bucket_pos_ids: dict[int, torch.Tensor] = {}
-
-        # Cached module list references.
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
 
@@ -395,7 +388,6 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         max_seq = self._num_groups + 1
         if self._proj_buf is not None and self._proj_buf.device == device and self._proj_buf.dtype == dtype:
             return
-        # Allocate for max batch size so all bucket sizes fit without realloc.
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
         self._proj_buf = torch.zeros(
             max_bsz,
@@ -406,14 +398,11 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         )
 
     def _setup_compile(self) -> None:
-        """Lazily set up torch.compiled model forward with CUDA graph capture.
-
-        Uses ``mode="reduce-overhead"`` with ``dynamic=False`` so Inductor
-        captures internal CUDA graphs for fixed shapes, eliminating kernel
-        launch overhead entirely.
-        """
+        """Set up torch.compile with reduce-overhead mode and warmup buckets."""
         if self._compiled_model_fwd is not None:
             return
+        self._lm_heads_list = list(self.lm_head)
+        self._codec_embeds_list = list(self.model.codec_embedding)
         if not current_omni_platform.supports_torch_inductor():
             logger.warning_once("code_predictor: torch.compile disabled")
             self._compiled_model_fwd = self.model.forward
@@ -423,26 +412,17 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             mode="reduce-overhead",
             dynamic=False,
         )
-        self._lm_heads_list = list(self.lm_head)
-        self._codec_embeds_list = list(self.model.codec_embedding)
         logger.info("code_predictor: torch.compile enabled (mode=reduce-overhead, dynamic=False)")
-        # Warmup: trigger Inductor compilation for common batch sizes.
         self._warmup_compile()
 
     def _padded_bsz(self, bsz: int) -> int:
-        """Map actual batch size to the next pre-warmed bucket size."""
         for bucket in self._bucket_sizes:
             if bsz <= bucket:
                 return bucket
-        # Fallback: if bsz exceeds all buckets (shouldn't happen), use as-is.
         return bsz
 
     def _warmup_compile(self) -> None:
-        """Pre-trigger Inductor compilation for bucket batch sizes.
-
-        Uses power-of-2 buckets up to max_num_seqs. Pre-caches position_ids
-        per bucket to avoid allocation in the hot loop.
-        """
+        """Warmup power-of-2 batch-size buckets to front-load compilation."""
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
         bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
         if max_bsz not in bucket_sizes:
@@ -453,14 +433,10 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         device = next(self.model.parameters()).device
         base_pos = torch.arange(max_seq, device=device, dtype=torch.long)
 
-        # Use slices of the pre-allocated proj_buf so Dynamo guards
-        # (storage().nbytes(), storage_offset) match runtime exactly.
         proj_buf = self._proj_buf
         for bsz in self._bucket_sizes:
             pos_ids = base_pos if bsz == 1 else base_pos.repeat(bsz)
             self._bucket_pos_ids[bsz] = pos_ids
-            # 3 iterations: reduce-overhead needs multiple passes to
-            # compile, capture, and stabilize its internal CUDA graphs.
             for _ in range(3):
                 self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
         logger.info("code_predictor: warmup done for bucket sizes %s", self._bucket_sizes)
@@ -480,14 +456,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         top_k: int = 50,
         top_p: float = 1.0,
     ) -> torch.Tensor:
-        """Predict residual codebooks 1..Q-1 autoregressively via re-prefill.
-
-        torch.compile fuses the ~60 small kernel launches per step into fewer
-        fused kernels, reducing kernel launch overhead by ~75%.
-
-        Projection caching: each token is projected once via small_to_mtp_projection
-        and cached in _proj_buf, avoiding redundant re-projection of past tokens.
-        """
+        """Predict residual codebooks 1..Q-1 autoregressively via re-prefill."""
         bsz = int(layer0_code.shape[0])
         num_groups = self._num_groups
         device = layer0_code.device
@@ -517,11 +486,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
                 "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
             )
 
-        # Pad batch to next pre-warmed bucket
         padded_bsz = self._padded_bsz(bsz)
         full_pos_ids = self._bucket_pos_ids.get(padded_bsz)
         if full_pos_ids is None:
-            # Fallback for unexpected batch size (should not happen in practice).
             base_pos = torch.arange(max_seq, device=device, dtype=torch.long)
             full_pos_ids = base_pos if padded_bsz == 1 else base_pos.repeat(padded_bsz)
 
@@ -529,8 +496,6 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             projected = proj_buf[:padded_bsz, :max_seq, :]
 
             hidden_out = model_fwd(projected, full_pos_ids)
-
-            # Slice back to actual batch size — padding rows are discarded.
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
             if use_sampling:
