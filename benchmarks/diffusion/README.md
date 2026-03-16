@@ -43,6 +43,27 @@ The benchmark supports three dataset modes via `--dataset`:
 
 ### VBench dataset
 
+`vbench` only provides prompt data (and image paths for i2v/i2i); it does not carry
+per-request generation fields. In this mode, all requests share CLI values:
+`--width --height --num-frames --fps --num-inference-steps`
+(pass `--width` and `--height` together).
+
+Example (`t2v`):
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+	--base-url http://localhost:8099 \
+	--model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+	--task t2v \
+	--dataset vbench \
+	--num-prompts 50 \
+	--width 640 --height 480 \
+	--num-frames 81 --fps 16 \
+	--num-inference-steps 40
+```
+
+Note: `vbench` can also be used for other tasks such as `t2i` / `i2v` (and `i2i`). For `t2i`, the loader reuses VBench t2v text prompts; for `i2v` / `i2i`, it loads the VBench i2v dataset (with image paths).
+
 If you use i2v/i2i bench datasets and need auto-download support, you may need:
 
 ```bash
@@ -90,7 +111,7 @@ Common optional flags:
 Related flags: `--width`, `--height`, `--num-frames`, `--fps`, `--num-inference-steps`.
 
 - For `vbench` / `random`: these CLI flags act as global defaults for all generated requests.
-- For `trace`: each request can carry its own fields (e.g., `width/height/num_frames/num_inference_steps`).
+- For `trace`: requests can carry their own fields (e.g., `width/height/num_frames/num_inference_steps`), with overrides/fallbacks as below.
 
 Precedence rules for `trace` (i.e., what actually gets sent):
 

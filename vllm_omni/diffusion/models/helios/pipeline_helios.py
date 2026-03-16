@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -174,8 +174,17 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         ]
 
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        # Helios checkpoints store embed_tokens under ``shared.weight`` only,
+        # but the published config sets ``tie_word_embeddings=False``.  When
+        # transformers sees ``tie=False`` it creates a separate
+        # ``encoder.embed_tokens.weight`` that is never loaded from the
+        # checkpoint, leaving it as all-zeros.  This silently destroys prompt
+        # encoding and produces grey/meaningless video output.  Force tying so
+        # that ``embed_tokens`` shares ``shared.weight`` as intended.
+        text_enc_cfg = AutoConfig.from_pretrained(model, subfolder="text_encoder", local_files_only=local_files_only)
+        text_enc_cfg.tie_word_embeddings = True
         self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
         self.vae = AutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
@@ -604,6 +613,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                     use_zero_init=use_zero_init,
                     zero_steps=zero_steps,
                     device=device,
+                    generator=generator,
                 )
 
             if keep_first_frame and (
@@ -752,6 +762,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         use_zero_init: bool = True,
         zero_steps: int = 1,
         device: torch.device | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
     ) -> torch.Tensor:
         """Pyramid multi-stage denoising for one chunk."""
         batch_size, num_channel, num_frames_lat, height, width = latents.shape
@@ -804,7 +815,9 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
-                noise = self.sample_block_noise(batch_size, num_channel, latents.shape[2], height, width, patch_size)
+                noise = self.sample_block_noise(
+                    batch_size, num_channel, latents.shape[2], height, width, patch_size, generator=generator
+                )
                 noise = noise.to(device=device, dtype=transformer_dtype)
                 latents = alpha * latents + beta * noise
 
@@ -873,18 +886,23 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
         return latents
 
-    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2)):
+    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2), generator=None):
         gamma = self.scheduler.config.gamma
         _, ph, pw = patch_size
         block_size = ph * pw
 
         cov = torch.eye(block_size) * (1 + gamma) - torch.ones(block_size, block_size) * gamma
-        dist = torch.distributions.MultivariateNormal(torch.zeros(block_size, device=cov.device), covariance_matrix=cov)
-        block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
+        cov += torch.eye(block_size) * 1e-8
+        cov = cov.float()  # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
 
-        noise = dist.sample((block_number,))
+        L = torch.linalg.cholesky(cov)
+        block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
+        z = torch.randn(block_number, block_size, generator=generator)
+        noise = z @ L.T
+
         noise = noise.view(batch_size, channel, num_frames, height // ph, width // pw, ph, pw)
         noise = noise.permute(0, 1, 2, 3, 5, 4, 6).reshape(batch_size, channel, num_frames, height, width)
+
         return noise
 
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:

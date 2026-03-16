@@ -95,11 +95,6 @@ def parse_args() -> argparse.Namespace:
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
     parser.add_argument(
-        "--log-stats",
-        action="store_true",
-        help="Enable vLLM-Omni statistics logging.",
-    )
-    parser.add_argument(
         "--ulysses-degree",
         type=int,
         default=1,
@@ -174,6 +169,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
         "--lora-path",
@@ -263,6 +263,7 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Check if profiling is requested via environment variable
@@ -304,7 +305,6 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
-        "log_stats": args.log_stats,
         **lora_args,
         **quant_kwargs,
     }
@@ -329,7 +329,7 @@ def main():
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
         f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
-        f"vae_patch_parallel_size={args.vae_patch_parallel_size}"
+        f"vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}."
     )
     print(f"  CPU offload: {args.enable_cpu_offload}")
     print(f"  Image size: {args.width}x{args.height}")

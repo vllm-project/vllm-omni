@@ -1,0 +1,16 @@
+{{- if .Values.modelCache.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: "{{ .Release.Name }}-model-cache"
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes:
+    {{- toYaml .Values.modelCache.accessModes | nindent 4 }}
+  {{- if .Values.modelCache.storageClassName }}
+  storageClassName: {{ .Values.modelCache.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.modelCache.storageSize }}
+{{- end }}
