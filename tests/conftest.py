@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Generator
 from dataclasses import dataclass
 from io import BytesIO
@@ -827,9 +828,9 @@ def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
     """
     Write raw audio bytes to a temp WAV file suitable for Whisper/ffmpeg.
     Normalizes with soundfile to PCM_16 WAV when possible to avoid codec issues.
-    Caller must os.unlink the returned path when done.
     """
-    output_path = f"./test_{int(time.time())}.wav"
+    # Use high-entropy filename to avoid collisions under concurrency.
+    output_path = f"./test_{uuid.uuid4().hex}.wav"
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
     text = convert_audio_file_to_text(output_path)
@@ -841,7 +842,7 @@ def merge_base64_and_convert_to_text(base64_list):
     Merge a list of base64 encoded audio data and convert to text.
     """
     merged_audio = _merge_base64_audio_to_segment(base64_list)
-    output_path = f"./test_{int(time.time())}.wav"
+    output_path = f"./test_{uuid.uuid4().hex}.wav"
     merged_audio.export(output_path, format="wav")
     print(f"audio data is saved: {output_path}")
     text = convert_audio_file_to_text(output_path)
@@ -1333,19 +1334,6 @@ def _get_merged_audio_bytes(audio_data: list[str] | None) -> bytes | None:
     merged = _merge_base64_audio_to_segment(audio_data)
     buf = io.BytesIO()
     merged.export(buf, format="wav")
-    return buf.getvalue()
-
-
-def _audio_tensor_to_wav_bytes(audio_tensor: Any, sample_rate: int = 24000) -> bytes:
-    """Convert offline pipeline audio tensor to WAV bytes (e.g. for Qwen3-TTS)."""
-    if hasattr(audio_tensor, "float"):
-        arr = audio_tensor.float().detach().cpu().numpy()
-    else:
-        arr = np.asarray(audio_tensor, dtype=np.float32)
-    if arr.ndim > 1:
-        arr = arr.flatten()
-    buf = io.BytesIO()
-    sf.write(buf, arr, sample_rate, format="WAV", subtype="FLOAT")
     return buf.getvalue()
 
 
@@ -2121,6 +2109,7 @@ class OmniRunner:
         )
 
     def _estimate_prompt_len(
+        self,
         additional_information: dict[str, Any],
         model_name: str,
         _cache: dict[str, Any] = {},
@@ -2462,7 +2451,7 @@ class OmniRunnerHandler:
             prompts=prompts, videos=videos, images=images, audios=audios, modalities=modalities
         )
         response = self._process_output(outputs)
-        assert_omni_response(response, request_config, run_level="L2")
+        assert_omni_response(response, request_config, run_level="core_model")
         return response
 
     def send_audio_speech_request(
@@ -2515,10 +2504,9 @@ class OmniRunnerHandler:
             return result
 
         # Convert tensor to WAV bytes for downstream analysis (transcription, gender estimation).
-        raw_bytes = _audio_tensor_to_wav_bytes(audio_tensor, sample_rate=24000)
-        result = OmniResponse(success=True, audio_bytes=raw_bytes)
+        result = OmniResponse(success=True)
         # Use advanced_model to enable similarity / voice checks when configured.
-        assert_audio_speech_response(result, request_config, run_level="advanced_model")
+        assert_audio_speech_response(result, request_config, run_level="core_model")
         return result
 
 
