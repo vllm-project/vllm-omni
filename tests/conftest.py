@@ -1305,38 +1305,6 @@ class DiffusionResponse:
     error_message: str | None = None
 
 
-def _extract_expected_voice_gender(messages: list[dict[str, Any]] | None) -> str | None:
-    """Parse expected voice gender from system prompt text ('male'/'female') if present."""
-    if not messages:
-        return None
-    for msg in messages:
-        if msg.get("role") != "system":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text = " ".join(
-                item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
-            )
-        else:
-            text = ""
-        m = re.search(r"\buse a (male|female) voice\b", text, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).lower()
-    return None
-
-
-def _get_merged_audio_bytes(audio_data: list[str] | None) -> bytes | None:
-    """Merge base64 audio chunks (stream or single) into one WAV bytes for analysis."""
-    if not audio_data:
-        return None
-    merged = _merge_base64_audio_to_segment(audio_data)
-    buf = io.BytesIO()
-    merged.export(buf, format="wav")
-    return buf.getvalue()
-
-
 def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     """
     Estimate voice gender from WAV bytes by fundamental frequency (F0).
@@ -2505,7 +2473,6 @@ class OmniRunnerHandler:
 
         # Convert tensor to WAV bytes for downstream analysis (transcription, gender estimation).
         result = OmniResponse(success=True)
-        # Use advanced_model to enable similarity / voice checks when configured.
         assert_audio_speech_response(result, request_config, run_level="core_model")
         return result
 
