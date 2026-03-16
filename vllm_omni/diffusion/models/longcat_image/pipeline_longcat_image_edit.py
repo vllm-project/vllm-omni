@@ -12,7 +12,6 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models import AutoencoderKL
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
@@ -26,6 +25,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import (
+    DistributedAutoencoderKL,
+)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -253,9 +255,9 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             model, subfolder="text_processor", local_files_only=local_files_only
         )
 
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = DistributedAutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
         self.transformer = LongCatImageTransformer2DModel(od_config=od_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
@@ -709,3 +711,4 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+    
