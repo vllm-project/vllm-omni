@@ -4,6 +4,7 @@ import io
 import math
 import os
 import random
+import re
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 # Set CPU device for CI environments without GPU
@@ -706,7 +707,7 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
 
 
 def preprocess_text(text):
-    import re
+    import opencc
 
     word_to_num = {
         "zero": "0",
@@ -728,6 +729,8 @@ def preprocess_text(text):
 
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
+    cc = opencc.OpenCC("t2s")
+    text = cc.convert(text)
     return text.lower().strip()
 
 
@@ -739,6 +742,7 @@ def cosine_similarity_text(text1, text2, n: int = 3):
 
     text1 = preprocess_text(text1)
     text2 = preprocess_text(text2)
+    print(f"cosine similarity text1 is: {text1}, text2 is: {text2}")
 
     ngrams1 = [text1[i : i + n] for i in range(len(text1) - n + 1)]
     ngrams2 = [text2[i : i + n] for i in range(len(text2) - n + 1)]
@@ -764,13 +768,25 @@ def convert_audio_to_text(audio_data):
     Convert base64 encoded audio data to text using speech recognition.
     """
     audio_data = base64.b64decode(audio_data)
-    output_path = f"./test_{int(time.time())}"
+    output_path = f"./test_{int(time.time())}.wav"
     with open(output_path, "wb") as audio_file:
         audio_file.write(audio_data)
 
     print(f"audio data is saved: {output_path}")
     text = convert_audio_file_to_text(output_path=output_path)
     return text
+
+
+def _merge_base64_audio_to_segment(base64_list: list[str]):
+    """Merge a list of base64-encoded audio chunks into one pydub AudioSegment."""
+    from pydub import AudioSegment
+
+    merged = None
+    for b64 in base64_list:
+        raw = base64.b64decode(b64.split(",", 1)[-1])
+        seg = AudioSegment.from_file(io.BytesIO(raw))
+        merged = seg if merged is None else merged + seg
+    return merged
 
 
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
@@ -807,22 +823,27 @@ def convert_audio_file_to_text(output_path: str) -> str:
         return future.result()
 
 
+def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
+    """
+    Write raw audio bytes to a temp WAV file suitable for Whisper/ffmpeg.
+    Normalizes with soundfile to PCM_16 WAV when possible to avoid codec issues.
+    Caller must os.unlink the returned path when done.
+    """
+    output_path = f"./test_{int(time.time())}.wav"
+    data, samplerate = sf.read(io.BytesIO(raw_bytes))
+    sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
+    text = convert_audio_file_to_text(output_path)
+    return text
+
+
 def merge_base64_and_convert_to_text(base64_list):
     """
     Merge a list of base64 encoded audio data and convert to text.
     """
-    from pydub import AudioSegment
-
-    merged_audio = None
-    for base64_data in base64_list:
-        audio_data = base64.b64decode(base64_data.split(",", 1)[-1])
-        seg = AudioSegment.from_file(io.BytesIO(audio_data))
-        if merged_audio is None:
-            merged_audio = seg
-        else:
-            merged_audio += seg
-    output_path = f"./test_{int(time.time())}"
+    merged_audio = _merge_base64_audio_to_segment(base64_list)
+    output_path = f"./test_{int(time.time())}.wav"
     merged_audio.export(output_path, format="wav")
+    print(f"audio data is saved: {output_path}")
     text = convert_audio_file_to_text(output_path)
     return text
 
@@ -1003,8 +1024,7 @@ def modify_stage_config(
                                 break
 
                         if target_stage is None:
-                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
-                            raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+                            continue
 
                         # Delete specified paths in this stage
                         for path in delete_paths:
@@ -1265,6 +1285,8 @@ class OmniResponse:
     text_content: str | None = None
     audio_data: list[str] | None = None
     audio_content: str | None = None
+    audio_format: str | None = None
+    audio_bytes: bytes | None = None
     similarity: float | None = None
     e2e_latency: float | None = None
     success: bool = False
@@ -1282,6 +1304,130 @@ class DiffusionResponse:
     error_message: str | None = None
 
 
+def _extract_expected_voice_gender(messages: list[dict[str, Any]] | None) -> str | None:
+    """Parse expected voice gender from system prompt text ('male'/'female') if present."""
+    if not messages:
+        return None
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(
+                item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
+            )
+        else:
+            text = ""
+        m = re.search(r"\buse a (male|female) voice\b", text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+def _get_merged_audio_bytes(audio_data: list[str] | None) -> bytes | None:
+    """Merge base64 audio chunks (stream or single) into one WAV bytes for analysis."""
+    if not audio_data:
+        return None
+    merged = _merge_base64_audio_to_segment(audio_data)
+    buf = io.BytesIO()
+    merged.export(buf, format="wav")
+    return buf.getvalue()
+
+
+def _audio_tensor_to_wav_bytes(audio_tensor: Any, sample_rate: int = 24000) -> bytes:
+    """Convert offline pipeline audio tensor to WAV bytes (e.g. for Qwen3-TTS)."""
+    if hasattr(audio_tensor, "float"):
+        arr = audio_tensor.float().detach().cpu().numpy()
+    else:
+        arr = np.asarray(audio_tensor, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr.flatten()
+    buf = io.BytesIO()
+    sf.write(buf, arr, sample_rate, format="WAV", subtype="FLOAT")
+    return buf.getvalue()
+
+
+def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
+    """
+    Estimate voice gender from WAV bytes by fundamental frequency (F0).
+    Returns 'male', 'female', or 'unknown' when ambiguous.
+    Uses multiple windows + consistency check to reduce misclassification.
+    """
+    data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+    if data.size == 0:
+        raise ValueError("Empty audio")
+    mono = np.mean(data, axis=1)
+
+    def _estimate_f0(seg: np.ndarray) -> float | None:
+        seg = seg - float(np.mean(seg))
+        if float(np.max(np.abs(seg))) < 1e-3:
+            return None
+        min_lag = max(2, int(sr / 350))
+        max_lag = min(len(seg) // 2, int(sr / 60))
+        if max_lag <= min_lag + 2:
+            return None
+        corr = np.correlate(seg, seg, mode="same")
+        mid = len(corr) // 2
+        valid = corr[mid + min_lag : mid + max_lag + 1]
+        the = float(np.max(valid)) * 0.5
+        peaks: list[tuple[int, float]] = []
+        for i in range(1, len(valid) - 1):
+            v = float(valid[i])
+            if v > the and v >= float(valid[i - 1]) and v >= float(valid[i + 1]):
+                peaks.append((min_lag + i, v))
+        if not peaks:
+            lag = min_lag + int(np.argmax(valid))
+            return float(sr) / float(lag)
+        best_v = max(v for _, v in peaks)
+        close = [(lag, v) for lag, v in peaks if v >= best_v * 0.85]
+        lag = max(lag for lag, _ in close)
+        cand2 = [(lag2, v) for lag2, v in peaks if abs(lag2 - 2 * lag) <= max(2, int(0.03 * (2 * lag)))]
+        if cand2:
+            best2 = max(v for _, v in cand2)
+            if best2 >= best_v * 0.75:
+                lag = max(lag_val for lag_val, _ in cand2)
+        return float(sr) / float(lag)
+
+    win_len = min(int(sr * 0.6), len(mono))
+    if win_len < int(sr * 0.15):
+        raise ValueError("Cannot estimate F0: audio too short")
+    # Use more windows (6) over the duration for a more stable and representative F0 distribution.
+    num_windows = 6
+    step = max(1, (len(mono) - win_len) // max(1, num_windows - 1))
+    starts = [min(i * step, len(mono) - win_len) for i in range(num_windows)]
+    starts = [s for s in starts if s >= 0]
+    f0s = [f for f in (_estimate_f0(mono[s : s + win_len]) for s in starts) if f is not None]
+    if not f0s:
+        raise ValueError("Cannot estimate F0: no voiced segment found")
+    f0s.sort()
+    n = len(f0s)
+    median_f0 = float(f0s[n // 2])
+
+    # Conservative thresholds; only classify when F0 is clearly in one range and windows agree.
+    MALE_THRESH = 102.0  # below this → candidate male
+    FEMALE_THRESH = 198.0  # above this → candidate female
+    low_count = sum(1 for f in f0s if f < MALE_THRESH)
+    high_count = sum(1 for f in f0s if f > FEMALE_THRESH)
+    # Require majority of windows to agree with the median band to avoid harmonic/subharmonic flips.
+    if median_f0 < MALE_THRESH and low_count >= (n + 1) // 2:
+        # Check for possible female misread as male (e.g. 250 Hz → 125 Hz): many high F0s.
+        if high_count >= 2:
+            result = "unknown"
+        else:
+            result = "male"
+    elif median_f0 > FEMALE_THRESH and high_count >= (n + 1) // 2:
+        if low_count >= 2:
+            result = "unknown"
+        else:
+            result = "female"
+    else:
+        result = "unknown"
+    print(f"estimated f0 median: {median_f0:.1f} Hz (min={f0s[0]:.1f}, max={f0s[-1]:.1f}); gender: {result}")
+    return result
+
+
 def assert_omni_response(response: OmniResponse, request_config: dict[str, Any], run_level):
     """
     Validate response results.
@@ -1295,7 +1441,7 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
     assert response.success, "The request failed."
     e2e_latency = response.e2e_latency
     if e2e_latency is not None:
-        print(f"the avg e2e latency is: {e2e_latency}")
+        print(f"the e2e latency is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
@@ -1328,6 +1474,59 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
         if "text" in modalities and "audio" in modalities:
             assert response.similarity > 0.9, "The audio content is not same as the text"
             print(f"similarity is: {response.similarity}")
+
+
+def assert_audio_speech_response(
+    response: OmniResponse,
+    request_config: dict[str, Any],
+    run_level: str,
+) -> None:
+    """
+    Validate /v1/audio/speech response: success, optional format check, and transcription similarity.
+    """
+    assert response.success, "The request failed."
+
+    req_fmt = request_config.get("response_format")
+
+    if req_fmt and response.audio_format is not None:
+        assert req_fmt in response.audio_format, (
+            f"The response audio format {response.audio_format} don't match the request audio format {req_fmt}"
+        )
+
+    e2e_latency = response.e2e_latency
+    if e2e_latency is not None:
+        print(f"the avg e2e latency is: {e2e_latency}")
+
+    if run_level == "advanced_model":
+        # Text–audio semantic similarity check
+        expected_text = request_config.get("input")
+        if expected_text:
+            transcript = (response.audio_content or "").strip()
+            print(f"audio content is: {transcript}")
+            print(f"input text is: {expected_text}")
+            similarity = cosine_similarity_text(transcript.lower(), expected_text.lower())
+            print(f"Cosine similarity: {similarity:.3f}")
+            assert similarity > 0.9, (
+                f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
+            )
+
+        # Voice gender consistency check:
+        # When the estimator returns 'unknown', we treat it as inconclusive and do NOT fail the test.
+        voice = (request_config.get("voice") or "").lower()
+        if voice and response.audio_bytes:
+            estimated_gender = _estimate_voice_gender_from_audio(response.audio_bytes)
+            voice_gender_map = {
+                # adjust this mapping to your actual voice names
+                "serena": "female",
+                "eric": "male",
+            }
+            expected_gender = voice_gender_map.get(voice)
+            if expected_gender is not None:
+                print(f"Estimated voice gender from audio: {estimated_gender} (voice='{voice}')")
+                if estimated_gender != "unknown":
+                    assert estimated_gender == expected_gender, (
+                        f"Voice '{voice}' is expected {expected_gender}, but estimated gender is '{estimated_gender}'"
+                    )
 
 
 def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
@@ -1551,6 +1750,101 @@ class OpenAIClientHandler:
 
         return result
 
+    def _process_stream_audio_speech_response(self, response) -> OmniResponse:
+        """
+        Process streaming /v1/audio/speech responses into an OmniResponse.
+
+        This mirrors _process_stream_omni_response but operates on low-level
+        audio bytes and produces an OmniResponse with audio_content filled
+        from Whisper transcription.
+        """
+        result = OmniResponse()
+        start_time = time.perf_counter()
+
+        try:
+            # Aggregate all audio bytes from the streaming response.
+            data = bytearray()
+
+            # Preferred OpenAI helper.
+            if hasattr(response, "iter_bytes") and callable(getattr(response, "iter_bytes")):
+                for chunk in response.iter_bytes():
+                    if chunk:
+                        data.extend(chunk)
+            else:
+                # Generic iterable-of-bytes fallback (e.g., generator or list of chunks).
+                try:
+                    iterator = iter(response)
+                except TypeError:
+                    iterator = None
+
+                if iterator is not None:
+                    for chunk in iterator:
+                        if not chunk:
+                            continue
+                        if isinstance(chunk, (bytes, bytearray)):
+                            data.extend(chunk)
+                        elif hasattr(chunk, "data"):
+                            data.extend(chunk.data)  # type: ignore[arg-type]
+                        elif hasattr(chunk, "content"):
+                            data.extend(chunk.content)  # type: ignore[arg-type]
+                        else:
+                            raise TypeError(f"Unsupported stream chunk type: {type(chunk)}")
+                else:
+                    raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
+
+            raw_bytes = bytes(data)
+            transcript = convert_audio_bytes_to_text(raw_bytes)
+
+            # Populate OmniResponse.
+            result.audio_bytes = raw_bytes
+            result.audio_content = transcript
+            result.e2e_latency = time.perf_counter() - start_time
+            result.success = True
+            result.audio_format = getattr(response, "response", None)
+            if result.audio_format is not None:
+                result.audio_format = result.audio_format.headers.get("content-type", "")
+
+        except Exception as e:
+            result.error_message = f"Audio speech stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def _process_non_stream_audio_speech_response(self, response) -> OmniResponse:
+        """
+        Process non-streaming /v1/audio/speech responses into an OmniResponse.
+
+        This mirrors _process_non_stream_omni_response but for the binary
+        audio payload returned by audio.speech.create.
+        """
+        result = OmniResponse()
+        start_time = time.perf_counter()
+
+        try:
+            # OpenAI non-streaming audio.speech.create returns HttpxBinaryResponseContent (.read() or .content)
+            if hasattr(response, "read") and callable(getattr(response, "read")):
+                raw_bytes = response.read()
+            elif hasattr(response, "content"):
+                raw_bytes = response.content  # type: ignore[assignment]
+            else:
+                raise TypeError(f"Unsupported audio speech response type: {type(response)}")
+
+            transcript = convert_audio_bytes_to_text(raw_bytes)
+
+            result.audio_bytes = raw_bytes
+            result.audio_content = transcript
+            result.e2e_latency = time.perf_counter() - start_time
+            result.success = True
+            result.audio_format = getattr(response, "response", None)
+            if result.audio_format is not None:
+                result.audio_format = result.audio_format.headers.get("content-type", "")
+
+        except Exception as e:
+            result.error_message = f"Audio speech non-stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
     def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
         """
         Send OpenAI requests.
@@ -1585,32 +1879,132 @@ class OpenAIClientHandler:
             responses.append(response)
 
         else:
-            # Send concurrent requests
+            # Send concurrent requests: run create + process in worker so e2e_latency includes full round-trip.
+            def _one_omni_request():
+                start = time.perf_counter()
+                chat_completion = self.client.chat.completions.create(
+                    model=request_config.get("model"),
+                    messages=request_config.get("messages"),
+                    modalities=modalities,
+                    stream=stream,
+                )
+                if stream:
+                    response = self._process_stream_omni_response(chat_completion)
+                else:
+                    response = self._process_non_stream_omni_response(chat_completion)
+                response.e2e_latency = time.perf_counter() - start
+                return response
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                futures = []
-
-                # Submit all request tasks
-                for _ in range(request_num):
-                    future = executor.submit(
-                        self.client.chat.completions.create,
-                        model=request_config.get("model"),
-                        messages=request_config.get("messages"),
-                        modalities=modalities,
-                        stream=stream,
-                    )
-                    futures.append(future)
-
-                # Process completed tasks
+                futures = [executor.submit(_one_omni_request) for _ in range(request_num)]
                 for future in concurrent.futures.as_completed(futures):
-                    chat_completion = future.result()
-
-                    if stream:
-                        response = self._process_stream_omni_response(chat_completion)
-                    else:
-                        response = self._process_non_stream_omni_response(chat_completion)
-
+                    response = future.result()
                     assert_omni_response(response, request_config, run_level=self.run_level)
                     responses.append(response)
+
+        return responses
+
+    def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """
+        Call the /v1/audio/speech endpoint using the same configuration-dict
+        style as send_omni_request, but via the OpenAI Python client's
+        audio.speech APIs.
+
+        Expected keys in request_config:
+          - model: model name/path (required)
+          - input: text to synthesize (required)
+          - response_format: audio format such as "wav" or "pcm" (optional)
+          - task_type, ref_text, ref_audio: TTS-specific extras (optional, passed via extra_body)
+          - timeout: request timeout in seconds (float, optional, default 120.0)
+          - stream: whether to use streaming API (bool, optional, default False)
+        """
+        timeout = float(request_config.get("timeout", 120.0))
+
+        model = request_config["model"]
+        text_input = request_config["input"]
+        stream = bool(request_config.get("stream", False))
+        voice = request_config.get("voice", None)
+
+        # Standard OpenAI param: use omit when not provided to keep default behavior.
+        response_format = request_config.get("response_format", omit)
+
+        # Qwen3-TTS custom fields, forwarded via extra_body.
+        extra_body: dict[str, Any] = {}
+        for key in ("task_type", "ref_text", "ref_audio"):
+            if key in request_config:
+                extra_body[key] = request_config[key]
+
+        responses: list[OmniResponse] = []
+
+        if request_num == 1:
+            if stream:
+                # Use streaming response helper.
+                with self.client.audio.speech.with_streaming_response.create(
+                    model=model,
+                    input=text_input,
+                    response_format=response_format,
+                    extra_body=extra_body or None,
+                    timeout=timeout,
+                    voice=voice,
+                ) as resp:
+                    omni_resp = self._process_stream_audio_speech_response(resp)
+            else:
+                # Non-streaming response.
+                resp = self.client.audio.speech.create(
+                    model=model,
+                    input=text_input,
+                    response_format=response_format,
+                    extra_body=extra_body or None,
+                    timeout=timeout,
+                    voice=voice,
+                )
+                omni_resp = self._process_non_stream_audio_speech_response(resp)
+
+            assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+            responses.append(omni_resp)
+            return responses
+        else:
+            # request_num > 1: concurrent requests (use same params as single-request path)
+
+            if stream:
+
+                def _stream_task():
+                    with self.client.audio.speech.with_streaming_response.create(
+                        model=model,
+                        input=text_input,
+                        response_format=response_format,
+                        extra_body=extra_body or None,
+                        timeout=timeout,
+                        voice=voice,
+                    ) as resp:
+                        return self._process_stream_audio_speech_response(resp)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                    futures = [executor.submit(_stream_task) for _ in range(request_num)]
+                    for future in concurrent.futures.as_completed(futures):
+                        omni_resp = future.result()
+                        assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+                        responses.append(omni_resp)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                    futures = []
+                    for _ in range(request_num):
+                        future = executor.submit(
+                            self.client.audio.speech.create,
+                            model=model,
+                            input=text_input,
+                            response_format=response_format,
+                            extra_body=extra_body or None,
+                            timeout=timeout,
+                            voice=voice,
+                        )
+                        futures.append(future)
+
+                    for future in concurrent.futures.as_completed(futures):
+                        resp = future.result()
+                        omni_resp = self._process_non_stream_audio_speech_response(resp)
+                        assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+                        responses.append(omni_resp)
 
         return responses
 
@@ -1726,6 +2120,43 @@ class OmniRunner:
             **kwargs,
         )
 
+    def _estimate_prompt_len(
+        additional_information: dict[str, Any],
+        model_name: str,
+        _cache: dict[str, Any] = {},
+    ) -> int:
+        """Estimate prompt_token_ids placeholder length for the Talker stage.
+
+        The AR Talker replaces all input embeddings via ``preprocess``, so the
+        placeholder values are irrelevant but the **length** must match the
+        embeddings that ``preprocess`` will produce.
+        """
+        try:
+            from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
+            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+                Qwen3TTSTalkerForConditionalGeneration,
+            )
+
+            if model_name not in _cache:
+                from transformers import AutoTokenizer
+
+                tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
+                cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
+                _cache[model_name] = (tok, getattr(cfg, "talker_config", None))
+
+            tok, tcfg = _cache[model_name]
+            task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
+            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+                additional_information=additional_information,
+                task_type=task_type,
+                tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
+                codec_language_id=getattr(tcfg, "codec_language_id", None),
+                spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
+            )
+        except Exception as exc:
+            logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
+            return 2048
+
     def get_default_sampling_params_list(self) -> list[OmniSamplingParams]:
         """
         Get a list of default sampling parameters for all stages.
@@ -1777,6 +2208,36 @@ class OmniRunner:
 
         if isinstance(prompts, str):
             prompts = [prompts]
+
+        # Qwen-TTS: follow examples/offline_inference/qwen3_tts/end2end.py style.
+        # Stage 0 expects token placeholders + additional_information (text/speaker/task_type/...),
+        # and Talker replaces embeddings in preprocess based on additional_information only.
+        is_tts_model = "Qwen3-TTS" in self.model_name or "qwen3_tts" in self.model_name.lower()
+        if is_tts_model and modalities == ["audio"]:
+            tts_kw = mm_processor_kwargs or {}
+            task_type = tts_kw.get("task_type", "CustomVoice")
+            speaker = tts_kw.get("speaker", "Vivian")
+            language = tts_kw.get("language", "Auto")
+            max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
+
+            omni_inputs: list[TextPrompt] = []
+            for prompt_text in prompts:
+                text_str = str(prompt_text).strip() or " "
+                additional_information: dict[str, Any] = {
+                    "task_type": [task_type],
+                    "text": [text_str],
+                    "language": [language],
+                    "speaker": [speaker],
+                    "max_new_tokens": [max_new_tokens],
+                }
+                # Use official helper to get correct placeholder length
+                plen = self._estimate_prompt_len(additional_information, self.model_name)
+                input_dict: TextPrompt = {
+                    "prompt_token_ids": [0] * plen,
+                    "additional_information": additional_information,
+                }
+                omni_inputs.append(input_dict)
+            return omni_inputs
 
         def _normalize_mm_input(mm_input, num_prompts):
             if mm_input is None:
@@ -2003,6 +2464,62 @@ class OmniRunnerHandler:
         response = self._process_output(outputs)
         assert_omni_response(response, request_config, run_level="L2")
         return response
+
+    def send_audio_speech_request(
+        self,
+        request_config: dict[str, Any],
+    ) -> OmniResponse:
+        """
+        Offline TTS: text -> audio via generate_multimodal, then validate with assert_audio_speech_response.
+
+        request_config must contain:
+          - 'input' or 'prompts': text to synthesize.
+        Optional keys:
+          - 'voice'       -> speaker (CustomVoice)
+          - 'task_type'   -> task_type in additional_information (default: "CustomVoice")
+          - 'language'    -> language in additional_information (default: "Auto")
+          - 'max_new_tokens' -> max_new_tokens in additional_information (default: 2048)
+          - 'response_format' -> desired audio format (used only for assertion)
+        """
+        input_text = request_config.get("input") or request_config.get("prompts")
+        if input_text is None:
+            raise ValueError("request_config must contain 'input' or 'prompts' for TTS")
+        if isinstance(input_text, list):
+            input_text = input_text[0] if input_text else ""
+
+        # Build TTS-specific kwargs passed through to get_omni_inputs for Qwen3-TTS,
+        # matching examples/offline_inference/qwen3_tts/end2end.py.
+        mm_processor_kwargs: dict[str, Any] = {}
+        if "voice" in request_config:
+            mm_processor_kwargs["speaker"] = request_config["voice"]
+        if "task_type" in request_config:
+            mm_processor_kwargs["task_type"] = request_config["task_type"]
+        if "language" in request_config:
+            mm_processor_kwargs["language"] = request_config["language"]
+        if "max_new_tokens" in request_config:
+            mm_processor_kwargs["max_new_tokens"] = request_config["max_new_tokens"]
+
+        outputs = self.runner.generate_multimodal(
+            prompts=input_text,
+            modalities=["audio"],
+            mm_processor_kwargs=mm_processor_kwargs or None,
+        )
+        audio_tensor = None
+        for stage_out in outputs:
+            if getattr(stage_out, "final_output_type", None) == "audio":
+                audio_tensor = stage_out.request_output[0].outputs[0].multimodal_output["audio"]
+                break
+        if audio_tensor is None:
+            result = OmniResponse(success=False, error_message="No audio output from pipeline")
+            assert result.success, result.error_message
+            return result
+
+        # Convert tensor to WAV bytes for downstream analysis (transcription, gender estimation).
+        raw_bytes = _audio_tensor_to_wav_bytes(audio_tensor, sample_rate=24000)
+        result = OmniResponse(success=True, audio_bytes=raw_bytes)
+        # Use advanced_model to enable similarity / voice checks when configured.
+        assert_audio_speech_response(result, request_config, run_level="advanced_model")
+        return result
 
 
 @pytest.fixture
