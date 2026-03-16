@@ -21,6 +21,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.utils import is_pp_missing_parameter
 
+from vllm_omni.platforms import current_omni_platform
+
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
 
 logger = init_logger(__name__)
@@ -409,6 +411,10 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         model on the default stream.
         """
         if self._compiled_model_fwd is not None:
+            return
+        if not current_omni_platform.supports_torch_inductor():
+            logger.warning_once("code_predictor: torch.compile disabled")
+            self._compiled_model_fwd = self.model.forward
             return
         self._compiled_model_fwd = torch.compile(
             self.model.forward,
