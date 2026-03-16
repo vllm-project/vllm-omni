@@ -707,6 +707,18 @@ When you want to add L5-level stability test cases, you can refer to the followi
 | model             | Yes      | "Qwen/Qwen3-Omni-30B-A3B-Instruct" | Model name or path                  |
 | stage_config_name | Yes      | "qwen3_omni.yaml"                  | Stage configuration file name       |
 
+##### Dynamic Configuration (update/delete)
+
+Supports incremental modifications based on the basic configuration:
+
+| Operation | Description                          |
+| --------- | ------------------------------------ |
+| update    | Update or add configuration items    |
+| delete    | Delete specified configuration items |
+
+***Example***:
+You can refer to Test Examples in Chapter 3.4
+
 #### benchmark_params Configuration
 
 For stability testing, the key parameters are:
@@ -717,10 +729,7 @@ For stability testing, the key parameters are:
     -   `max_concurrency`: Maximum number of concurrent requests. When this is used, `request_rate` is set to `inf` internally.
 -   **num_prompts_per_batch**: Number of prompts sent in each batch. Multiple batches will be executed sequentially within `duration_sec`.
 
-All other optional parameters follow the same rules as the performance tests. You can:
-
-1.  Change the `---xxx-xx-xx` running parameters of the benchmark CLI to `xxx_xx_xx` format and fill them as keys in the JSON file.
-2.  For boolean variables in the running parameters, use `true` / `false` values in the JSON file.
+All other optional parameters follow the same rules as the in Chapter 3.4.
 
 </details>
 
