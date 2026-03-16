@@ -50,6 +50,8 @@ th {
 |`NextStep11Pipeline` | NextStep-1.1 | `stepfun-ai/NextStep-1.1` |
 |`MiMoAudioForConditionalGeneration` | MiMo-Audio-7B-Instruct | `XiaomiMiMo/MiMo-Audio-7B-Instruct` |
 |`Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` |
+|`FishSpeechSlowARForConditionalGeneration` | Fish Speech S2 Pro | `fishaudio/s2-pro` |
+|`DreamIDOmniPipeline`| DreamID-Omni | `XuGuo699/DreamID-Omni` |
 
 
 ## List of Supported Models for NPU

@@ -256,8 +256,14 @@ class DiffusersPipelineLoader:
         load_device: str,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
+        device: torch.device | None = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
+        # CPU offload + FP8: load weights on device for FP8 quantization
+        if load_device == "cpu" and od_config.quantization and od_config.quantization.lower() != "none":
+            load_device = device.type
+            logger.info(f"Quantization enabled with CPU offload, using {load_device} for weight loading")
+
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
             if od_config.parallel_config.use_hsdp:

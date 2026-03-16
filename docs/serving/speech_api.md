@@ -1,6 +1,9 @@
 # Speech API
 
-vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation using Qwen3-TTS models.
+vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation. Supported TTS models include:
+
+- **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
+- **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -9,13 +12,22 @@ Each server instance runs a single model (specified at startup via `vllm serve <
 ### Start the Server
 
 ```bash
-# CustomVoice model (predefined speakers)
+# Qwen3-TTS: CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
     --enforce-eager
+
+# Fish Speech S2 Pro
+vllm-omni serve fishaudio/s2-pro \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml \
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager \
+    --gpu-memory-utilization 0.9
 ```
 
 ### Generate Speech
@@ -317,6 +329,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ## Supported Models
 
+### Qwen3-TTS
+
 | Model | Task Type | Description |
 |-------|-----------|-------------|
 | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | CustomVoice | Predefined speaker voices with optional style control |
@@ -324,6 +338,14 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base | Voice cloning from reference audio |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | CustomVoice | Smaller/faster variant |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Base | Smaller/faster variant for voice cloning |
+
+### Fish Speech S2 Pro
+
+| Model | Description |
+|-------|-------------|
+| `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
+
+Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech online serving example](../user_guide/examples/online_serving/fish_speech.md) for details.
 
 ## Error Responses
 

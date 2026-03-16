@@ -82,6 +82,15 @@ DIFFUSION_SINGLE_SAMPLING_PARAMS = DiffusionSamplingParams(
     }
 )
 
+DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS = DiffusionSamplingParams(
+    {
+        "num_inference_steps": 30,
+        "guidance_scale": 6.0,
+        "true_cfg_scale": 1.5,
+    }
+)
+
+
 AR_LIST_SAMPLING_PARAMS = [
     AutoregressionSamplingParams(
         {
@@ -310,8 +319,8 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
             )
         elif sampling_case.kind is SamplingKind.VIDEO_DIFFUSION_SINGLE:
             assert len(received_sampling_params_list) == 1
-            expected = DIFFUSION_SINGLE_SAMPLING_PARAMS.copy()
-            expected["num_outputs_per_prompt"] = expected.pop("n")  # convert from n to num_outputs_per_prompt
+            expected = DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS.copy()
+            # expected["num_outputs_per_prompt"] = expected.pop("n")  # convert from n to num_outputs_per_prompt
             _assert_sampling_param_values(
                 received_sampling_params_list[0],
                 {
@@ -690,7 +699,7 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
         pytest.param(
             SamplingCase(
                 kind=SamplingKind.VIDEO_DIFFUSION_SINGLE,
-                sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS,
+                sampling_params=DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS,
                 lora=LORA_PARAMS,
             ),
             id="single-diffusion-sampling-params",

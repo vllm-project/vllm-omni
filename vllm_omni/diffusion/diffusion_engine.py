@@ -6,6 +6,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+import numpy as np
 import PIL.Image
 from vllm.logger import init_logger
 
@@ -28,6 +29,13 @@ def supports_image_input(model_class_name: str) -> bool:
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "support_image_input", False))
+
+
+def supports_audio_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_audio_input", False))
 
 
 def image_color_format(model_class_name: str) -> str:
@@ -369,7 +377,19 @@ class DiffusionEngine:
             dummy_image = PIL.Image.new(color_format, (width, height))
         else:
             dummy_image = None
-        prompt: OmniTextPrompt = {"prompt": "dummy run", "multi_modal_data": {"image": dummy_image}}
+
+        if supports_audio_input(self.od_config.model_class_name):
+            audio_sr = 16000
+            audio_duration_sec = 4
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+        else:
+            dummy_audio = None
+
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
+        }
         req = OmniDiffusionRequest(
             prompts=[prompt],
             sampling_params=OmniDiffusionSamplingParams(

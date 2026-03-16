@@ -202,6 +202,15 @@ class OmniBagelDataParser(MultiModalDataParser):
 
 
 class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingInfo]):
+    IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
+
+    def _cached_apply_hf_processor(self, inputs, timing_ctx):
+        # img2img: prompt text must be modified based on mm data presence,
+        # so text and mm data cannot be tokenized separately — bypass cache.
+        if inputs.mm_data_items.get_all_counts().get("img2img", 0) > 0:
+            return self._apply_hf_processor(inputs, timing_ctx)
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
+
     def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
         return {
             "pixel_values": MultiModalFieldConfig.batched("image"),
@@ -217,6 +226,9 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
     ) -> "BatchFeature":
         has_image = "images" in mm_data
         has_img2img = "pixel_values_img2img" in mm_data
+
+        if has_img2img and self.IMG2IMG_PLACEHOLDER not in prompt:
+            prompt = f"{self.IMG2IMG_PLACEHOLDER}{prompt}"
 
         if has_image and has_img2img:
             outputs = BatchFeature()

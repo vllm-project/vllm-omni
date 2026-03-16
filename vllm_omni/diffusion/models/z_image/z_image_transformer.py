@@ -49,7 +49,7 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -329,10 +329,7 @@ class ZImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        cos = cos.to(query.dtype)
-        sin = sin.to(query.dtype)
-        query = self.rope(query, cos, sin)
-        key = self.rope(key, cos, sin)
+        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
