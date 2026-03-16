@@ -63,40 +63,40 @@ class OmniCoordClientForStage:
 
         Each attempt closes the current socket/context, sleeps ``retry_interval``
         seconds, then creates a new DEALER socket and reconnects to the coordinator.
-        Caller must hold ``_send_lock``.
         Returns True on success, False if all attempts fail.
         """
         if max_retries <= 0:
             return False
 
         for attempt in range(1, max_retries + 1):
-            if self._stop_event.is_set() or self._closed:
-                return False
-            try:
-                self._socket.close(0)
-            except zmq.ZMQError:
-                pass
-            try:
-                self._ctx.term()
-            except zmq.ZMQError:
-                pass
+            with self._send_lock:
+                if self._stop_event.is_set() or self._closed:
+                    return False
+                try:
+                    self._socket.close(0)
+                except zmq.ZMQError:
+                    pass
+                try:
+                    self._ctx.term()
+                except zmq.ZMQError:
+                    pass
+
+                try:
+                    self._ctx = zmq.Context()
+                    self._socket = self._ctx.socket(zmq.DEALER)
+                    self._socket.connect(self._coord_zmq_addr)
+                    return True
+                except zmq.ZMQError as e:
+                    logger.error(
+                        "Stage client reconnect failed (attempt=%d/%d, coord=%s)",
+                        attempt,
+                        max_retries,
+                        self._coord_zmq_addr,
+                        exc_info=e,
+                    )
 
             if retry_interval > 0:
                 time.sleep(retry_interval)
-
-            try:
-                self._ctx = zmq.Context()
-                self._socket = self._ctx.socket(zmq.DEALER)
-                self._socket.connect(self._coord_zmq_addr)
-                return True
-            except zmq.ZMQError as e:
-                logger.error(
-                    "Stage client reconnect failed (attempt=%d/%d, coord=%s)",
-                    attempt,
-                    max_retries,
-                    self._coord_zmq_addr,
-                    exc_info=e,
-                )
         return False
 
     def _send_event(self, event_type: str) -> None:

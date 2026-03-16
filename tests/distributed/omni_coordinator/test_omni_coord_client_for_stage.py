@@ -3,7 +3,6 @@
 
 import json
 import threading
-from unittest.mock import Mock
 
 import pytest
 import zmq
@@ -15,6 +14,8 @@ from vllm_omni.distributed.omni_coordinator import (
 from vllm_omni.distributed.omni_coordinator import (
     omni_coord_client_for_stage as stage_client_module,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _bind_router() -> tuple[zmq.Context, zmq.Socket, str]:
@@ -117,7 +118,7 @@ def test_stage_client_close_sends_down_status():
     ctx.term()
 
 
-def test_stage_client_reconnects_after_send_failure():
+def test_stage_client_reconnects_after_send_failure(mocker):
     """Verify send failure path invokes reconnect before retrying send."""
     ctx, router, endpoint = _bind_router()
 
@@ -146,7 +147,7 @@ def test_stage_client_reconnects_after_send_failure():
 
     flaky_socket = _FlakySocket()
     client._socket = flaky_socket
-    client._reconnect = Mock(return_value=True)
+    client._reconnect = mocker.Mock(return_value=True)
 
     client.update_info(queue_length=1)
 
@@ -158,7 +159,7 @@ def test_stage_client_reconnects_after_send_failure():
     ctx.term()
 
 
-def test_stage_client_raises_when_reconnect_fails():
+def test_stage_client_raises_when_reconnect_fails(mocker):
     """Verify send failure is propagated when reconnect cannot recover."""
     ctx, router, endpoint = _bind_router()
 
@@ -180,7 +181,7 @@ def test_stage_client_raises_when_reconnect_fails():
             pass
 
     client._socket = _AlwaysFailSocket()
-    client._reconnect = Mock(return_value=False)
+    client._reconnect = mocker.Mock(return_value=False)
 
     with pytest.raises(RuntimeError, match="simulated send failure"):
         client.update_info(queue_length=2)
@@ -191,7 +192,7 @@ def test_stage_client_raises_when_reconnect_fails():
     ctx.term()
 
 
-def test_stage_client_close_handles_runtime_error_in_final_update():
+def test_stage_client_close_handles_runtime_error_in_final_update(mocker):
     """Verify close() still releases resources when final update raises RuntimeError."""
     ctx, router, endpoint = _bind_router()
 
@@ -205,7 +206,7 @@ def test_stage_client_close_handles_runtime_error_in_final_update():
     # Discard initial registration event from the real socket.
     _recv_event(router)
 
-    client._send_event = Mock(side_effect=RuntimeError("simulated close-time failure"))
+    client._send_event = mocker.Mock(side_effect=RuntimeError("simulated close-time failure"))
     client.close()
 
     assert client._closed
@@ -238,6 +239,7 @@ def test_reconnect_respects_retry_limit(monkeypatch):
     client._closed = False
     client._coord_zmq_addr = "tcp://127.0.0.1:9999"
     client._stop_event = threading.Event()
+    client._send_lock = threading.RLock()
     client._socket = _FailSocket()
     client._ctx = _FailContext()
 
