@@ -96,3 +96,58 @@ def test_multimodal_payload_and_completion_output():
     )
     assert wrapper.text == "hello"
     assert wrapper.multimodal_output is p
+
+
+def test_output_modality_printed_examples(capsys):
+    """Printed examples for output modality types."""
+    print("\n=== OutputModality Parsing ===")
+    for s in [None, "", "image", "Audio", "speech", "latents", "pixel_values", "text+image"]:
+        print(f"  from_string({s!r:20s}) -> {OutputModality.from_string(s)}")
+
+    print("\n=== Flag Properties ===")
+    for m in [
+        OutputModality.TEXT,
+        OutputModality.IMAGE,
+        OutputModality.AUDIO,
+        OutputModality.TEXT | OutputModality.IMAGE,
+    ]:
+        print(f"  {str(m):40s} has_text={m.has_text}  has_multimodal={m.has_multimodal}")
+
+    print("\n=== Accumulation Strategies ===")
+    for m in [OutputModality.AUDIO, OutputModality.IMAGE, OutputModality.LATENT]:
+        print(f"  {str(m):30s} -> {get_accumulation_strategy(m)}")
+
+    print("\n=== MultimodalPayload ===")
+    data = {"waveform": torch.ones(1, 16000), "sample_rate": 16000}
+    p = MultimodalPayload.from_dict(data)
+    print("  from_dict({waveform: tensor, sample_rate: 16000})")
+    print(f"    tensors keys : {list(p.tensors.keys())}")
+    print(f"    primary_tensor: shape={p.primary_tensor.shape}, dtype={p.primary_tensor.dtype}")
+    print(f"    metadata      : {p.metadata}")
+    print(f"    is_empty={p.is_empty}, len={len(p)}")
+    print(f"  from_dict(None) -> {MultimodalPayload.from_dict(None)}")
+    print(f"  from_dict({{}})   -> {MultimodalPayload.from_dict({})}")
+
+    print("\n=== MultimodalCompletionOutput ===")
+    wrapper = MultimodalCompletionOutput(
+        multimodal_output=p,
+        index=0,
+        text="hello",
+        token_ids=[],
+        cumulative_logprob=None,
+        logprobs=None,
+    )
+    print(f"  text             : {wrapper.text}")
+    print(f"  index            : {wrapper.index}")
+    print(f"  multimodal_output: {wrapper.multimodal_output}")
+    print(f"  repr             : {wrapper!r}")
+
+    print("\n=== Unknown Modality ===")
+    try:
+        OutputModality.from_string("video")
+    except ValueError as e:
+        print(f'  from_string("video") raised ValueError: {e}')
+
+    captured = capsys.readouterr()
+    assert "OutputModality Parsing" in captured.out
+    assert "MultimodalPayload" in captured.out
