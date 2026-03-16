@@ -711,4 +711,3 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
-    
