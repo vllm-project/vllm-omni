@@ -86,14 +86,13 @@ def test_multimodal_payload_and_completion_output():
     assert MultimodalPayload.from_dict(None) is None
     assert MultimodalPayload.from_dict({}) is None
 
-    # Completion output wrapper delegates and holds payload
-    class FakeOutput:
-        text = "hello"
-        index = 0
-
-    base = FakeOutput()
-    wrapper = MultimodalCompletionOutput(base, multimodal_output=p)
-    assert wrapper.text == "hello"  # delegation
-    assert wrapper.multimodal_output is p  # slot access
-    wrapper.text = "world"
-    assert base.text == "world"  # setattr delegation
+    wrapper = MultimodalCompletionOutput(
+        multimodal_output=p,
+        index=0,
+        text="hello",
+        token_ids=[],
+        cumulative_logprob=None,
+        logprobs=None,
+    )
+    assert wrapper.text == "hello"
+    assert wrapper.multimodal_output is p

@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from vllm.outputs import CompletionOutput
 
 import torch
 
 
 @dataclass
 class MultimodalPayload:
-    """Structured multimodal output payload.
+    """Structured multimodal output payloa
 
     Attributes:
         tensors: Dictionary mapping modality/key names to their tensors.
@@ -69,36 +70,23 @@ class MultimodalPayload:
         return cls(tensors=tensors, metadata=metadata)
 
 
-class MultimodalCompletionOutput:
-    """CompletionOutput wrapper with a first-class multimodal_output field.
+class MultimodalCompletionOutput(CompletionOutput):
 
-    Attributes:
-        base_output: The original ``CompletionOutput`` from vLLM.
-        multimodal_output: The structured multimodal payload, or None.
-    """
-
-    __slots__ = ("base_output", "multimodal_output")
+    __slots__ = ("multimodal_output",)
 
     def __init__(
         self,
-        base_output: Any,
         multimodal_output: MultimodalPayload | None = None,
+        **kwargs: Any,
     ):
-        object.__setattr__(self, "base_output", base_output)
         object.__setattr__(self, "multimodal_output", multimodal_output)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.base_output, name)
+        super().__init__(**kwargs)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in ("base_output", "multimodal_output"):
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self.base_output, name, value)
+        object.__setattr__(self, name, value)
 
     def __repr__(self) -> str:
         return (
             f"MultimodalCompletionOutput("
-            f"base_output={self.base_output!r}, "
             f"multimodal_output={self.multimodal_output!r})"
         )
