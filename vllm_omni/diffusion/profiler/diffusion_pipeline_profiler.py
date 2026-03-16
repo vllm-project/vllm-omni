@@ -1,5 +1,4 @@
 import functools
-import os
 import time
 from collections.abc import Callable
 from threading import Lock
@@ -49,10 +48,6 @@ def _get_attribute_by_path(obj: Any, path: str) -> tuple[Any, str]:
 
 def wrap_methods_by_paths(root_obj: Any, method_paths: list[str]) -> None:
     """Wrap specified methods of an object with profiler."""
-    if not hasattr(root_obj, "_profiler_lock"):
-        root_obj._profiler_lock = Lock()
-        root_obj._stage_durations: dict[str, float] = {}
-
     for path in method_paths:
         obj, method_name = _get_attribute_by_path(root_obj, path)
         if not obj or not hasattr(obj, method_name):
@@ -71,18 +66,17 @@ def wrap_methods_by_paths(root_obj: Any, method_paths: list[str]) -> None:
 class DiffusionPipelineProfilerMixin:
     _PROFILER_TARGETS = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
 
-    def setup_diffusion_pipeline_profiler(self) -> None:
-        if "ENABLE_DIFFUSION_PIPELINE_PROFILER" not in os.environ:
+    def setup_diffusion_pipeline_profiler(self, profiler_targets: list[str] | None = None) -> None:
+        self._profiler_lock = Lock()
+        self._stage_durations: dict[str, float] = {}
+        targets = profiler_targets if profiler_targets is not None else self._PROFILER_TARGETS
+        if not targets:
             return
-        default_targets = set(self._PROFILER_TARGETS)
-        env_targets = {
-            t.strip() for t in os.environ.get("DIFFUSION_PIPELINE_PROFILER_TARGETS", "").split(",") if t.strip()
-        }
 
-        profiler_targets = list(dict.fromkeys(default_targets | env_targets))
+        profiler_targets = list(dict.fromkeys(targets))
         wrap_methods_by_paths(
             self,
-            profiler_targets,
+            targets,
         )
 
     @property
