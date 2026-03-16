@@ -115,22 +115,18 @@ def talker2code2wav_async_chunk(
             initial_chunk_size = int(entry.list_data[0])
             per_request_override = True
 
-    # Dynamic IC: always derived from chunk_size, recomputed every call to adapt to load.
+    # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
     if not per_request_override:
-        max_ic = max_ic_for_chunk_size(chunk_size)
-        active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
-        capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
-        initial_chunk_size = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
-        logger.debug(
-            "Dynamic IC: active=%d, capacity=%d, max_ic=%d, ic=%d, cs=%d, req=%s, keys=%d",
-            active,
-            capacity,
-            max_ic,
-            initial_chunk_size,
-            chunk_size,
-            request_id,
-            len(transfer_manager.code_prompt_token_ids),
-        )
+        _ic_cache = getattr(transfer_manager, "_cached_ic", None)
+        if _ic_cache is None:
+            _ic_cache = {}
+            transfer_manager._cached_ic = _ic_cache
+        if request_id not in _ic_cache:
+            max_ic = max_ic_for_chunk_size(chunk_size)
+            active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
+            capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
+            _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
+        initial_chunk_size = _ic_cache[request_id]
 
     if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
         raise ValueError(
