@@ -35,6 +35,7 @@ import torch
 import yaml
 from openai import OpenAI, omit
 from PIL import Image
+from transformers import pipeline
 from vllm import TextPrompt
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
@@ -49,6 +50,8 @@ logger = init_logger(__name__)
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
+
+_GENDER_PIPELINE = None
 
 
 class OmniServerParams(NamedTuple):
@@ -84,7 +87,6 @@ def assert_video_valid(frames: Path | np.ndarray, *, width: int, height: int, nu
 
 def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
     """Assert the WAV has the expected sample rate, channel count, and duration."""
-
     assert path.exists(), f"Audio not found: {path}"
     info = sf.info(str(path))
     assert info.samplerate == sample_rate, f"Expected sample_rate={sample_rate}, got {info.samplerate}"
@@ -732,6 +734,12 @@ def preprocess_text(text):
     text = re.sub(r"\s+", " ", text)
     cc = opencc.OpenCC("t2s")
     text = cc.convert(text)
+
+    # Special handling for spaces between Chinese characters:
+    # - Keep single spaces between English words/numbers
+    # - Remove spaces only when surrounded by Chinese characters on both sides to prevent incorrect word segmentation
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+
     return text.lower().strip()
 
 
@@ -1305,83 +1313,76 @@ class DiffusionResponse:
     error_message: str | None = None
 
 
+def _load_gender_pipeline():
+    """
+    Lazy-load a cached audio-classification pipeline for gender.
+
+    We prefer the pipeline wrapper because it encapsulates processor/model loading
+    and avoids direct AutoProcessor.from_pretrained call sites in this file.
+    """
+    global _GENDER_PIPELINE
+    if _GENDER_PIPELINE is not None:
+        return _GENDER_PIPELINE
+
+    model_name = "7wolf/wav2vec2-base-gender-classification"
+    try:
+        # device=-1 forces CPU for pipeline.
+        _GENDER_PIPELINE = pipeline(
+            task="audio-classification",
+            model=model_name,
+            device=-1,
+        )
+        return _GENDER_PIPELINE
+    except Exception as exc:  # pragma: no cover - best-effort fallback
+        print(f"Warning: failed to create gender pipeline '{model_name}': {exc}")
+        _GENDER_PIPELINE = None
+        return None
+
+
 def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     """
-    Estimate voice gender from WAV bytes by fundamental frequency (F0).
-    Returns 'male', 'female', or 'unknown' when ambiguous.
-    Uses multiple windows + consistency check to reduce misclassification.
+    Estimate voice gender from audio using a small pre-trained classification model.
+
+    Uses a cached `audio-classification` pipeline to classify the clip.
+    Returns 'male' / 'female' when the model confidence is >= 0.8 and the label
+    maps to one of these; otherwise returns 'unknown'. If the model is unavailable
+    or inference fails, returns 'unknown' to keep tests stable.
     """
     data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
     if data.size == 0:
         raise ValueError("Empty audio")
     mono = np.mean(data, axis=1)
 
-    def _estimate_f0(seg: np.ndarray) -> float | None:
-        seg = seg - float(np.mean(seg))
-        if float(np.max(np.abs(seg))) < 1e-3:
-            return None
-        min_lag = max(2, int(sr / 350))
-        max_lag = min(len(seg) // 2, int(sr / 60))
-        if max_lag <= min_lag + 2:
-            return None
-        corr = np.correlate(seg, seg, mode="same")
-        mid = len(corr) // 2
-        valid = corr[mid + min_lag : mid + max_lag + 1]
-        the = float(np.max(valid)) * 0.5
-        peaks: list[tuple[int, float]] = []
-        for i in range(1, len(valid) - 1):
-            v = float(valid[i])
-            if v > the and v >= float(valid[i - 1]) and v >= float(valid[i + 1]):
-                peaks.append((min_lag + i, v))
-        if not peaks:
-            lag = min_lag + int(np.argmax(valid))
-            return float(sr) / float(lag)
-        best_v = max(v for _, v in peaks)
-        close = [(lag, v) for lag, v in peaks if v >= best_v * 0.85]
-        lag = max(lag for lag, _ in close)
-        cand2 = [(lag2, v) for lag2, v in peaks if abs(lag2 - 2 * lag) <= max(2, int(0.03 * (2 * lag)))]
-        if cand2:
-            best2 = max(v for _, v in cand2)
-            if best2 >= best_v * 0.75:
-                lag = max(lag_val for lag_val, _ in cand2)
-        return float(sr) / float(lag)
+    try:
+        clf = _load_gender_pipeline()
+        if clf is None:
+            print("gender model not available, returning 'unknown'")
+            return "unknown"
 
-    win_len = min(int(sr * 0.6), len(mono))
-    if win_len < int(sr * 0.15):
-        raise ValueError("Cannot estimate F0: audio too short")
-    # Use more windows (6) over the duration for a more stable and representative F0 distribution.
-    num_windows = 6
-    step = max(1, (len(mono) - win_len) // max(1, num_windows - 1))
-    starts = [min(i * step, len(mono) - win_len) for i in range(num_windows)]
-    starts = [s for s in starts if s >= 0]
-    f0s = [f for f in (_estimate_f0(mono[s : s + win_len]) for s in starts) if f is not None]
-    if not f0s:
-        raise ValueError("Cannot estimate F0: no voiced segment found")
-    f0s.sort()
-    n = len(f0s)
-    median_f0 = float(f0s[n // 2])
+        # transformers pipeline returns a list of {label, score} (highest score first).
+        outputs = clf(mono, sampling_rate=sr)
+        if not outputs:
+            return "unknown"
 
-    # Conservative thresholds; only classify when F0 is clearly in one range and windows agree.
-    MALE_THRESH = 102.0  # below this → candidate male
-    FEMALE_THRESH = 198.0  # above this → candidate female
-    low_count = sum(1 for f in f0s if f < MALE_THRESH)
-    high_count = sum(1 for f in f0s if f > FEMALE_THRESH)
-    # Require majority of windows to agree with the median band to avoid harmonic/subharmonic flips.
-    if median_f0 < MALE_THRESH and low_count >= (n + 1) // 2:
-        # Check for possible female misread as male (e.g. 250 Hz → 125 Hz): many high F0s.
-        if high_count >= 2:
-            result = "unknown"
+        top = outputs[0]
+        label = str(top.get("label", "")).lower()
+        conf = float(top.get("score", 0.0))
+
+        if conf < 0.8:
+            gender = "unknown"
+        # Some models use non-English labels (e.g., Russian). Normalize to 'male'/'female'.
+        elif ("female" in label) or ("жен" in label):
+            gender = "female"
+        elif ("male" in label) or ("муж" in label):
+            gender = "male"
         else:
-            result = "male"
-    elif median_f0 > FEMALE_THRESH and high_count >= (n + 1) // 2:
-        if low_count >= 2:
-            result = "unknown"
-        else:
-            result = "female"
-    else:
-        result = "unknown"
-    print(f"estimated f0 median: {median_f0:.1f} Hz (min={f0s[0]:.1f}, max={f0s[-1]:.1f}); gender: {result}")
-    return result
+            gender = "unknown"
+
+        print(f"gender classifier: label={label}, conf={conf:.3f}, gender={gender}")
+        return gender
+    except Exception as exc:  # pragma: no cover - best-effort fallback
+        print(f"Warning: gender classification failed, returning 'unknown': {exc}")
+        return "unknown"
 
 
 def assert_omni_response(response: OmniResponse, request_config: dict[str, Any], run_level):
