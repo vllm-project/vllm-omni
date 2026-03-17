@@ -22,6 +22,8 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
+from vllm_omni.platforms import current_omni_platform
+
 logger = init_logger(__name__)
 
 
@@ -342,6 +344,10 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
 
     def _ensure_model_fwd(self) -> None:
         if self._model_fwd is not None:
+            return
+        if not current_omni_platform.supports_torch_inductor():
+            logger.warning_once("code_predictor: torch.compile disabled")
+            self._model_fwd = self.model.forward
             return
         self._model_fwd = torch.compile(
             self.model.forward,
