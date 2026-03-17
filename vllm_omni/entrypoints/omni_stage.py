@@ -284,6 +284,8 @@ class OmniStage:
             and self.stage_id is not None
         ):
             stage_config.engine_args.stage_id = self.stage_id
+        self.is_prefill_only: bool = getattr(stage_config, "is_prefill_only", False)
+        self.is_decode_only: bool = getattr(stage_config, "is_decode_only", False)
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -547,6 +549,8 @@ class OmniStage:
             "cfg_kv_collect_func": getattr(self.stage_config, "cfg_kv_collect_func", None),
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
+            "is_prefill_only": self.is_prefill_only,
+            "is_decode_only": self.is_decode_only,
         }
         try:
             old_env = os.environ.get("VLLM_LOGGING_PREFIX")
@@ -692,6 +696,13 @@ class OmniStage:
             else:
                 _inject_global_id(ein)
 
+        if "_kv_transfer_params" not in payload:
+            sp = payload.get("sampling_params")
+            if sp is not None and hasattr(sp, "extra_args") and sp.extra_args:
+                kv_tp = sp.extra_args.get("kv_transfer_params")
+                if kv_tp is not None:
+                    payload["_kv_transfer_params"] = dict(kv_tp)
+
         self._in_q.put(payload)
 
     def try_collect(self) -> dict[str, Any] | None:
@@ -809,6 +820,12 @@ def _stage_worker(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+    _is_prefill_only = stage_payload.get("is_prefill_only", False)
+    _is_decode_only = stage_payload.get("is_decode_only", False)
+    if _is_prefill_only or _is_decode_only:
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+
+        apply_mooncake_connector_patch()
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
@@ -1059,6 +1076,12 @@ def _stage_worker(
             in_q.put(task_to_readd)
         # Ensure that the popped tasks are with identical sampling params. Take one of them.
         batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0]["sampling_params"]
+        _kv_backup = batch_tasks[0].get("_kv_transfer_params")
+        if _kv_backup is not None and isinstance(batch_engine_sampling_params, SamplingParams):
+            if batch_engine_sampling_params.extra_args is None:
+                batch_engine_sampling_params.extra_args = {}
+            if "kv_transfer_params" not in batch_engine_sampling_params.extra_args:
+                batch_engine_sampling_params.extra_args["kv_transfer_params"] = _kv_backup
 
         batch_request_ids: list[Any] = []
         batch_engine_inputs: list[OmniPromptType] = []
@@ -1253,6 +1276,12 @@ async def _stage_worker_async(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+    _is_prefill_only = stage_payload.get("is_prefill_only", False)
+    _is_decode_only = stage_payload.get("is_decode_only", False)
+    if _is_prefill_only or _is_decode_only:
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+
+        apply_mooncake_connector_patch()
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
@@ -1503,6 +1532,12 @@ async def _stage_worker_async(
             else:
                 ein = cast(PromptType, ein)
                 llm_sampling_params: SamplingParams = task["sampling_params"]
+                _kv_backup = task.get("_kv_transfer_params")
+                if _kv_backup is not None:
+                    if llm_sampling_params.extra_args is None:
+                        llm_sampling_params.extra_args = {}
+                    if "kv_transfer_params" not in llm_sampling_params.extra_args:
+                        llm_sampling_params.extra_args["kv_transfer_params"] = _kv_backup
                 gen_output = None
                 async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
                     gen_output = res

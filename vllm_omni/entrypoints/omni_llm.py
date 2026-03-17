@@ -272,4 +272,36 @@ class OmniLLM(LLM):
         # Sort the outputs by the int part of request ID which is in format of 'int-uuid'.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
+        self._flush_kv_connector_sends()
         return sorted(outputs, key=lambda x: int(x.request_id.split("-")[0]))
+
+    def _flush_kv_connector_sends(self) -> None:
+        try:
+            engine_core = getattr(self.llm_engine, "engine_core", None)
+            if engine_core is None:
+                return
+            scheduler = getattr(engine_core, "scheduler", None)
+            if scheduler is None:
+                return
+            connector = getattr(scheduler, "connector", None)
+            if connector is None:
+                return
+            connector_scheduler = getattr(connector, "connector_scheduler", None)
+            if connector_scheduler is None:
+                return
+
+            pending = getattr(connector_scheduler, "_reqs_need_send", None)
+            if not pending:
+                return
+
+            from vllm.v1.core.sched.output import SchedulerOutput
+
+            scheduler_output = SchedulerOutput.make_empty()
+            scheduler_output.kv_connector_metadata = connector.build_connector_meta(scheduler_output)
+
+            model_executor = getattr(engine_core, "model_executor", None)
+            if model_executor is None:
+                return
+            model_executor.execute_model(scheduler_output)
+        except Exception:
+            logger.warning("[OmniLLM] Failed to flush KV connector sends", exc_info=True)
