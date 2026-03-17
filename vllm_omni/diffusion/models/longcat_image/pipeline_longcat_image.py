@@ -254,7 +254,6 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
-        self.clear_profiler_records()
 
     def rewire_prompt(self, prompt, device):
         prompt = [prompt] if isinstance(prompt, str) else prompt

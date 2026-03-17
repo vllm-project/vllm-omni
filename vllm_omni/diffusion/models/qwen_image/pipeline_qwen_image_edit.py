@@ -270,7 +270,6 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
-        self.clear_profiler_records()
 
     def check_inputs(
         self,

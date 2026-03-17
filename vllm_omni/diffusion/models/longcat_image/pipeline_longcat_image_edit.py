@@ -283,7 +283,6 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
-        self.clear_profiler_records()
 
     def _encode_prompt(self, prompt, image):
         raw_vl_input = self.image_processor_vl(images=image, return_tensors="pt")

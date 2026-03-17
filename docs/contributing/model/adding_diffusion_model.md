@@ -819,6 +819,9 @@ class WanTransformer3DModel(nn.Module):
 When adapting a new diffusion model, it is often useful to analyze the latency of key components such as text encoding, diffusion denoising, and VAE decoding.
 vLLM-Omni provides a timing utility via `DiffusionPipelineProfilerMixin` to help developers quickly identify performance bottlenecks.
 
+!!! info
+      `DiffusionPipelineProfilerMixin` is different from using `torch.profiler` for diffusion models, as introduced in this [tutorial](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/profiling.md#3-profiling-diffusion-models). `DiffusionPipelineProfilerMixin` only prints the timing information of multiple functions (such as `vae.decode`), while `torch.profiler` saves detailed GPU/CPU computation time, call/execution steps.
+
 This tool automatically measures the execution time of selected pipeline modules and prints the results in the logs.
 
 **Enabling Diffusion Timing**
@@ -834,8 +837,7 @@ You can optionally specify which modules to profile:
 class YourPipeline(xxx, DiffusionPipelineProfilerMixin):
     def __init__(self, xxx):
         ...
-        self.setup_diffusion_pipeline_profiler(profiler_targets=["diffuse"])
-        self.clear_profiler_records()
+        self.setup_diffusion_pipeline_profiler(profiler_targets=["diffuse"], enable_diffusion_pipeline_profiler)
 ```
 If not specified, the default targets are used:
 ```
@@ -848,7 +850,7 @@ from vllm_omni.diffusion.utils.diffusion_pipeline_profiler import DiffusionPipel
 
 class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # Optional: Specify custom timing targets
-    _diffusion_timing_targets = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
+    _PROFILER_TARGETS = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
 
     def __init__(
         self,
@@ -863,9 +865,18 @@ class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         ...
 
         # initialize timing profiler
-        self.setup_diffusion_pipeline_profiler()
+        self.setup_diffusion_pipeline_profiler(enable_diffusion_pipeline_profiler)
 ```
 The mixin dynamically wraps selected methods and records their execution time during inference.
+
+If you need to fetch the execution time of different modules, you will need to pass `self.stage_durations` to `DiffusionOutput`, as shown below:
+
+```diff
+-   return DiffusionOutput(output=img)
++   return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
+```
 
 **Pipeline Design for Timing**
 The current diffusion timing utility is function-based, meaning it measures the execution time of individual methods.

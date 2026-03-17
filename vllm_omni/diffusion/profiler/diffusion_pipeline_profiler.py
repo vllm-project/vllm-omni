@@ -16,6 +16,8 @@ def profiler(name: str, func: Callable, instance: Any) -> Callable:
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs) -> Any:
+        if name == f"{instance.__class__.__name__}.forward":
+            instance.clear_profiler_records()
         if current_omni_platform.is_available():
             current_omni_platform.synchronize()
         start_time = time.perf_counter()
@@ -25,7 +27,7 @@ def profiler(name: str, func: Callable, instance: Any) -> Callable:
             if current_omni_platform.is_available():
                 current_omni_platform.synchronize()
             duration = time.perf_counter() - start_time
-            logger.info(f"[DiffusionTiming] {name} took {duration:.6f}s")
+            logger.info(f"[DiffusionPipelineProfiler] {name} took {duration:.6f}s")
             # record the profiling data: duration of stages
             with instance._profiler_lock:
                 instance._stage_durations[name] = duration
@@ -51,12 +53,12 @@ def wrap_methods_by_paths(root_obj: Any, method_paths: list[str]) -> None:
     for path in method_paths:
         obj, method_name = _get_attribute_by_path(root_obj, path)
         if not obj or not hasattr(obj, method_name):
-            logger.warning(f"[DiffusionTiming] Method path {path} not found")
+            logger.warning(f"[DiffusionPipelineProfiler] Method path {path} not found")
             continue
 
         original_method = getattr(obj, method_name)
         if not callable(original_method):
-            logger.warning(f"[DiffusionTiming] Attribute {path} is not callable")
+            logger.warning(f"[DiffusionPipelineProfiler] Attribute {path} is not callable")
             continue
 
         profiler_name = f"{root_obj.__class__.__name__}.{path}"
@@ -65,11 +67,11 @@ def wrap_methods_by_paths(root_obj: Any, method_paths: list[str]) -> None:
 
 class DiffusionPipelineProfilerMixin:
     _PROFILER_TARGETS = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
-    enable_diffusion_pipeline_profiler: bool = False
 
     def setup_diffusion_pipeline_profiler(
         self, profiler_targets: list[str] | None = None, enable_diffusion_pipeline_profiler: bool = False
     ) -> None:
+        self.enable_diffusion_pipeline_profiler = enable_diffusion_pipeline_profiler
         if not enable_diffusion_pipeline_profiler:
             self.enable_diffusion_pipeline_profiler = enable_diffusion_pipeline_profiler
             return
@@ -79,7 +81,11 @@ class DiffusionPipelineProfilerMixin:
         if not targets:
             return
 
-        profiler_targets = list(dict.fromkeys(targets))
+        targets = ["forward"] + [
+            t for t in targets if t != "forward"
+        ]  # ensure "forward" implement 'clear_profiler_records' at first place
+
+        targets = list(dict.fromkeys(targets))
         wrap_methods_by_paths(
             self,
             targets,
@@ -91,7 +97,5 @@ class DiffusionPipelineProfilerMixin:
             return self._stage_durations.copy()
 
     def clear_profiler_records(self) -> None:
-        if not self.enable_diffusion_pipeline_profiler:
-            return
         with self._profiler_lock:
             self._stage_durations.clear()

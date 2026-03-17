@@ -259,7 +259,6 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
-        self.clear_profiler_records()
 
     @staticmethod
     def _decode_image_from_latent(

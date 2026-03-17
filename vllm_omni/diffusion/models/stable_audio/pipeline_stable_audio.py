@@ -150,8 +150,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
-        self.setup_diffusion_pipeline_profiler()
-        self.clear_profiler_records()
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):

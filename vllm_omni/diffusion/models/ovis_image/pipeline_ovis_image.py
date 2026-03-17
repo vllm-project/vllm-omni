@@ -192,7 +192,6 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
-        self.clear_profiler_records()
 
     def _get_messages(
         self,
