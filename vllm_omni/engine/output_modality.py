@@ -28,6 +28,10 @@ class OutputModality(Flag):
 
     Single:   ``OutputModality.TEXT``, ``OutputModality.IMAGE``, ...
     Compound: ``OutputModality.TEXT | OutputModality.IMAGE``  (text+image)
+
+    Note: POOLING is intentionally excluded. Pooling/embedding is vLLM's
+    native path (pooling_output → PoolingRequestOutput), handled entirely
+    by the base OutputProcessor. vLLM-Omni's layer does not participate.
     """
 
     TEXT = auto()

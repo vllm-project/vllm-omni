@@ -68,20 +68,22 @@ class MultimodalPayload:
             return None
         return cls(tensors=tensors, metadata=metadata)
 
-
+@dataclass
 class MultimodalCompletionOutput(CompletionOutput):
-    __slots__ = ("multimodal_output",)
+    """CompletionOutput with multimodal support.
+
+    Inherits all CompletionOutput fields and adds multimodal_output.
+    As a CompletionOutput subclass, compatible with all existing vLLM consumers.
+    """
 
     def __init__(
         self,
         multimodal_output: MultimodalPayload | None = None,
         **kwargs: Any,
     ):
-        object.__setattr__(self, "multimodal_output", multimodal_output)
         super().__init__(**kwargs)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        object.__setattr__(self, name, value)
+        self.multimodal_output = multimodal_output
 
     def __repr__(self) -> str:
-        return f"MultimodalCompletionOutput(multimodal_output={self.multimodal_output!r})"
+        base = super().__repr__()
+        return f"{base[:-1]}, multimodal_output={self.multimodal_output!r})"
