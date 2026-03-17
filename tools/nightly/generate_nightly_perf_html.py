@@ -9,20 +9,218 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections.abc import Sequence
-
-from generate_nightly_perf_html import (
-    _collect_diffusion_records,
-    _collect_omni_records,
-    _default_diffusion_input_dir,
-    _default_input_dir,
-    _default_output_file,
-    _ensure_parent_dir,
-    _sort_diffusion_records,
-    _sort_omni_records,
-)
+import os
+from collections.abc import Iterable, Sequence
+from datetime import datetime, timezone
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
+
+_RESULT_JSON_PREFIX = "result_test_"
+_DIFFUSION_JSON_PREFIX = "diffusion_perf_"
+DEFAULT_INPUT_DIR = os.getenv("DEFAULT_INPUT_DIR") or "tests"
+DEFAULT_OUTPUT_DIR = os.getenv("DEFAULT_OUTPUT_DIR") or "tests"
+DEFAULT_DIFFUSION_INPUT_DIR = os.getenv("DIFFUSION_BENCHMARK_DIR")
+
+
+def _vllm_omni_root() -> str:
+    path = os.path.dirname(os.path.abspath(__file__))
+    while path and path != os.path.dirname(path):
+        if os.path.isdir(os.path.join(path, "tests")):
+            return path
+        path = os.path.dirname(path)
+    return os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."),
+    )
+
+
+def _default_input_dir() -> str:
+    return os.path.join(_vllm_omni_root(), DEFAULT_INPUT_DIR)
+
+
+def _default_output_file() -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return os.path.join(
+        _vllm_omni_root(),
+        DEFAULT_OUTPUT_DIR,
+        f"nightly_perf_{ts}.html",
+    )
+
+
+def _default_diffusion_input_dir(input_dir: str) -> str:
+    return DEFAULT_DIFFUSION_INPUT_DIR if DEFAULT_DIFFUSION_INPUT_DIR else input_dir
+
+
+def _load_json_file(path: str) -> dict[str, Any] | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("failed to load json '%s': %s", path, exc)
+        return None
+
+    if not isinstance(data, dict):
+        LOGGER.warning("json root in '%s' is not an object, skip", path)
+        return None
+
+    return data
+
+
+def _parse_from_filename(filename: str) -> dict[str, Any]:
+    name, ext = os.path.splitext(filename)
+    if ext != ".json" or not name.startswith(_RESULT_JSON_PREFIX):
+        return {}
+
+    core = name[len(_RESULT_JSON_PREFIX) :]
+    parts = core.split("_")
+    if len(parts) < 5:
+        LOGGER.warning(
+            "filename '%s' does not match expected pattern, skip parsing test metadata",
+            filename,
+        )
+        return {}
+
+    timestamp = parts[-1]
+    num_prompts_str = parts[-2]
+    max_concurrency_str = parts[-3]
+    dataset_name = parts[-4]
+    test_name = "_".join(parts[:-4]) if parts[:-4] else ""
+
+    parsed: dict[str, Any] = {}
+    if len(timestamp) >= 15:
+        parsed["date"] = timestamp
+    if dataset_name in ("random", "random-mm"):
+        parsed["dataset_name"] = dataset_name
+    try:
+        parsed["num_prompts"] = int(num_prompts_str)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed["max_concurrency"] = int(max_concurrency_str)
+    except (TypeError, ValueError):
+        pass
+    if test_name:
+        parsed["test_name"] = test_name
+    return parsed
+
+
+def _iter_omni_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
+    if not os.path.isdir(input_dir):
+        LOGGER.warning("input dir '%s' does not exist or is not a directory", input_dir)
+        return
+
+    for entry in sorted(os.listdir(input_dir)):
+        if not entry.endswith(".json") or not entry.startswith(_RESULT_JSON_PREFIX):
+            continue
+        full_path = os.path.join(input_dir, entry)
+        if not os.path.isfile(full_path):
+            continue
+        data = _load_json_file(full_path)
+        if data is None:
+            continue
+
+        record: dict[str, Any] = dict(data)
+        filename_meta = _parse_from_filename(os.path.basename(full_path))
+        if "date" not in record or not record["date"]:
+            record["date"] = filename_meta.get("date") or datetime.now(
+                timezone.utc,
+            ).strftime("%Y%m%d-%H%M%S")
+        if "num_prompts" not in record or record["num_prompts"] is None:
+            if "num_prompts" in filename_meta:
+                record["num_prompts"] = filename_meta["num_prompts"]
+        if "max_concurrency" not in record or record["max_concurrency"] is None:
+            if "max_concurrency" in filename_meta:
+                record["max_concurrency"] = filename_meta["max_concurrency"]
+        if "test_name" not in record or not record.get("test_name"):
+            if "test_name" in filename_meta:
+                record["test_name"] = filename_meta["test_name"]
+        if "dataset_name" not in record or not record.get("dataset_name"):
+            if "dataset_name" in filename_meta:
+                record["dataset_name"] = filename_meta["dataset_name"]
+        record["source_file"] = os.path.basename(full_path)
+        yield record
+
+
+def _parse_diffusion_from_filename(filename: str) -> dict[str, Any]:
+    name, ext = os.path.splitext(filename)
+    if ext != ".json" or not name.startswith(_DIFFUSION_JSON_PREFIX):
+        return {}
+    core = name[len(_DIFFUSION_JSON_PREFIX) :]
+    parts = core.split("_")
+    if len(parts) < 2:
+        return {}
+    timestamp = parts[-1]
+    test_name = "_".join(parts[:-1]) if parts[:-1] else ""
+    parsed: dict[str, Any] = {}
+    if len(timestamp) >= 15:
+        parsed["date"] = timestamp
+    if test_name:
+        parsed["test_name"] = test_name
+    return parsed
+
+
+def _iter_diffusion_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
+    if not os.path.isdir(input_dir):
+        LOGGER.warning(
+            "diffusion input dir '%s' does not exist or is not a directory",
+            input_dir,
+        )
+        return
+
+    for entry in sorted(os.listdir(input_dir)):
+        if not entry.endswith(".json") or not entry.startswith(_DIFFUSION_JSON_PREFIX):
+            continue
+        full_path = os.path.join(input_dir, entry)
+        if not os.path.isfile(full_path):
+            continue
+        data = _load_json_file(full_path)
+        if data is None:
+            continue
+
+        record: dict[str, Any] = dict(data)
+        filename_meta = _parse_diffusion_from_filename(os.path.basename(full_path))
+        if "date" not in record or not record.get("date"):
+            record["date"] = filename_meta.get("date") or datetime.now(
+                timezone.utc,
+            ).strftime("%Y%m%d-%H%M%S")
+        if "test_name" not in record or not record.get("test_name"):
+            if "test_name" in filename_meta:
+                record["test_name"] = filename_meta["test_name"]
+        record["source_file"] = os.path.basename(full_path)
+        yield record
+
+
+def _collect_omni_records(input_dir: str) -> list[dict[str, Any]]:
+    return list(_iter_omni_json_records(input_dir))
+
+
+def _collect_diffusion_records(input_dir: str) -> list[dict[str, Any]]:
+    return list(_iter_diffusion_json_records(input_dir))
+
+
+def _sort_omni_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
+    return sorted(
+        by_date_desc,
+        key=lambda r: (
+            r.get("model_id") or "",
+            r.get("test_name") or "",
+            r.get("dataset_name") or "",
+            r.get("max_concurrency") or 0,
+            r.get("num_prompts") or 0,
+        ),
+    )
+
+
+def _sort_diffusion_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
+    return sorted(by_date_desc, key=lambda r: (r.get("test_name") or ""))
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -158,12 +356,24 @@ section { padding: 18px; margin-bottom: 22px; }
 .stat-sub { color: var(--muted); font-size: 0.82rem; margin-top: 6px; }
 .toolbar {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
   margin-bottom: 12px;
 }
+.toolbar-row {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.toolbar-row.primary {
+  grid-template-columns: minmax(0, 2fr) repeat(3, minmax(0, 1fr));
+}
+.toolbar-row.secondary {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
 .filter-field { display: flex; flex-direction: column; gap: 6px; }
 .filter-field label { color: var(--muted); font-size: 0.82rem; padding-left: 2px; }
+.filter-field.compact label { font-size: 0.78rem; }
+.filter-field { min-width: 0; }
 .filter-input, .ghost {
   width: 100%;
   min-width: 0;
@@ -173,6 +383,34 @@ section { padding: 18px; margin-bottom: 22px; }
   background: rgba(255,255,255,0.035);
   color: var(--text);
   outline: none;
+}
+.filter-input {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.filter-select {
+  width: 100%;
+  min-width: 0;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  padding: 0.72rem 2.1rem 0.72rem 0.88rem;
+  background: rgba(255,255,255,0.035);
+  color: var(--text);
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - 18px) calc(50% - 2px),
+    calc(100% - 12px) calc(50% - 2px);
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+}
+.filter-select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.16);
 }
 .filter-input:focus {
   border-color: var(--accent);
@@ -324,7 +562,10 @@ code {
 }
 @media (max-width: 1280px) {
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .toolbar { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .toolbar-row.primary,
+  .toolbar-row.secondary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 @media (max-width: 980px) {
   .layout { grid-template-columns: 1fr; }
@@ -333,7 +574,11 @@ code {
 @media (max-width: 760px) {
   .container { padding: 16px 12px 56px; }
   .hero { padding: 22px 18px; }
-  .toolbar, .stats-grid { grid-template-columns: 1fr; }
+  .toolbar-row.primary,
+  .toolbar-row.secondary,
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
 }
 """
 
@@ -418,14 +663,13 @@ function compactSeriesLabel(prefix, row, metric, fallback) {{
   return `${{metric}} | ${{parts.join(" | ") || fallback}}`;
 }}
 
-function compactLegendLabel(prefix, row, fallback) {{
+function compactLegendLabel(prefix, row, metric, fallback) {{
   if (prefix === "omni") {{
     const parts = [
-      row.test_name || "",
       row.max_concurrency !== undefined && row.max_concurrency !== null ? `c${{row.max_concurrency}}` : "",
       row.num_prompts !== undefined && row.num_prompts !== null ? `p${{row.num_prompts}}` : "",
     ].filter(Boolean);
-    return parts.join(" | ") || fallback;
+    return `${{metric}} | ${{parts.join(" | ") || fallback}}`;
   }}
   const parts = [
     (row.test_name || "").replace(/^test_/, ""),
@@ -472,6 +716,27 @@ function fillDatalist(el, values) {{
     opt.value = String(v);
     el.appendChild(opt);
   }});
+}}
+
+function fillSelect(el, values, selectedValue) {{
+  if (!el) return;
+  const previous = selectedValue ?? el.value;
+  el.innerHTML = "";
+  const allOption = document.createElement("option");
+  allOption.value = "";
+  allOption.textContent = "All";
+  el.appendChild(allOption);
+  values.forEach((v) => {{
+    const opt = document.createElement("option");
+    opt.value = String(v);
+    opt.textContent = String(v);
+    el.appendChild(opt);
+  }});
+  if (previous && values.map((v) => String(v)).includes(String(previous))) {{
+    el.value = String(previous);
+  }} else {{
+    el.value = "";
+  }}
 }}
 
 function sortRows(rows, column, desc, numericCols) {{
@@ -749,7 +1014,7 @@ function renderChartGroups(container, rowsAsc, groups, metaKeys, configFields, l
             const fallback = cfgKey.replaceAll("||", " | ");
             seriesByKey.set(key, {{
               label: compactSeriesLabel(prefix, row, metric, fallback),
-              legend: compactLegendLabel(prefix, row, fallback),
+              legend: compactLegendLabel(prefix, row, metric, fallback),
               points: [],
             }});
           }}
@@ -863,6 +1128,18 @@ function filterRows(rows, filters) {{
     if (filters.model && String(row[filters.modelKey] || "") !== filters.model) return false;
     if (filters.testName && String(row.test_name || "") !== filters.testName) return false;
     if (filters.datasetName && String(row[filters.datasetKey] || "") !== filters.datasetName) return false;
+    if (
+      filters.maxConcurrency &&
+      String(row.max_concurrency || "") !== filters.maxConcurrency
+    ) {{
+      return false;
+    }}
+    if (
+      filters.numPrompts &&
+      String(row.num_prompts || "") !== filters.numPrompts
+    ) {{
+      return false;
+    }}
     if (filters.backend && String(row.backend || "") !== filters.backend) return false;
     if (
       filters.extraKey &&
@@ -891,6 +1168,8 @@ function initSection(prefix, columns, data, numericCols, groups) {{
   const modelSearchInput = document.getElementById(`${{prefix}}-model-search`);
   const testInput = document.getElementById(`${{prefix}}-test`);
   const datasetInput = document.getElementById(`${{prefix}}-dataset`);
+  const concurrencyInput = document.getElementById(`${{prefix}}-concurrency`);
+  const promptsInput = document.getElementById(`${{prefix}}-prompts`);
   const backendInput = document.getElementById(`${{prefix}}-backend`);
   const extraInput = document.getElementById(`${{prefix}}-extra`);
   const statsEl = document.getElementById(`${{prefix}}-stats`);
@@ -923,10 +1202,12 @@ function initSection(prefix, columns, data, numericCols, groups) {{
   const latestMetric = prefix === "diff" ? "throughput_qps" : "output_throughput";
   const secondaryMetric = prefix === "diff" ? "latency_mean" : "mean_e2el_ms";
   const modelList = document.getElementById(`${{prefix}}-model-list`);
-  const testList = document.getElementById(`${{prefix}}-test-list`);
-  const datasetList = document.getElementById(`${{prefix}}-dataset-list`);
-  const backendList = document.getElementById(`${{prefix}}-backend-list`);
-  const extraList = document.getElementById(`${{prefix}}-extra-list`);
+  const testList = document.getElementById(`${{prefix}}-test`);
+  const datasetList = document.getElementById(`${{prefix}}-dataset`);
+  const concurrencyList = document.getElementById(`${{prefix}}-concurrency`);
+  const promptsList = document.getElementById(`${{prefix}}-prompts`);
+  const backendList = document.getElementById(`${{prefix}}-backend`);
+  const extraList = document.getElementById(`${{prefix}}-extra`);
 
   function currentFilters() {{
     return {{
@@ -934,6 +1215,8 @@ function initSection(prefix, columns, data, numericCols, groups) {{
       modelSearch: modelSearchInput ? modelSearchInput.value.trim() : "",
       testName: testInput.value.trim(),
       datasetName: datasetInput.value.trim(),
+      maxConcurrency: concurrencyInput ? concurrencyInput.value.trim() : "",
+      numPrompts: promptsInput ? promptsInput.value.trim() : "",
       backend: backendInput.value.trim(),
       extraValue: extraInput ? extraInput.value.trim() : "",
       extraKey,
@@ -944,11 +1227,41 @@ function initSection(prefix, columns, data, numericCols, groups) {{
 
   function refreshOptionLists(baseRows) {{
     fillDatalist(modelList, uniqSorted(baseRows.map((row) => row[modelKey])));
-    fillDatalist(testList, uniqSorted(baseRows.map((row) => row.test_name)));
-    fillDatalist(datasetList, uniqSorted(baseRows.map((row) => row[datasetKey])));
-    fillDatalist(backendList, uniqSorted(baseRows.map((row) => row.backend)));
+    fillSelect(
+      testList,
+      uniqSorted(baseRows.map((row) => row.test_name)),
+      testInput.value,
+    );
+    fillSelect(
+      datasetList,
+      uniqSorted(baseRows.map((row) => row[datasetKey])),
+      datasetInput.value,
+    );
+    if (concurrencyList) {{
+      fillSelect(
+        concurrencyList,
+        uniqSorted(baseRows.map((row) => row.max_concurrency)),
+        concurrencyInput.value,
+      );
+    }}
+    if (promptsList) {{
+      fillSelect(
+        promptsList,
+        uniqSorted(baseRows.map((row) => row.num_prompts)),
+        promptsInput.value,
+      );
+    }}
+    fillSelect(
+      backendList,
+      uniqSorted(baseRows.map((row) => row.backend)),
+      backendInput.value,
+    );
     if (extraList) {{
-      fillDatalist(extraList, uniqSorted(baseRows.map((row) => row[extraKey])));
+      fillSelect(
+        extraList,
+        uniqSorted(baseRows.map((row) => row[extraKey])),
+        extraInput.value,
+      );
     }}
   }}
 
@@ -968,6 +1281,8 @@ function initSection(prefix, columns, data, numericCols, groups) {{
       ...currentFilters(),
       testName: "",
       datasetName: "",
+      maxConcurrency: "",
+      numPrompts: "",
       backend: "",
       extraValue: "",
       modelSearch: "",
@@ -979,6 +1294,8 @@ function initSection(prefix, columns, data, numericCols, groups) {{
     rows = filterRows(data, {{
       ...currentFilters(),
       datasetName: "",
+      maxConcurrency: "",
+      numPrompts: "",
       backend: "",
       extraValue: "",
       modelSearch: "",
@@ -986,6 +1303,29 @@ function initSection(prefix, columns, data, numericCols, groups) {{
 
     if (!datasetInput.value.trim()) {{
       datasetInput.value = firstValue(rows, datasetKey);
+    }}
+    rows = filterRows(data, {{
+      ...currentFilters(),
+      maxConcurrency: "",
+      numPrompts: "",
+      backend: "",
+      extraValue: "",
+      modelSearch: "",
+    }});
+
+    if (concurrencyInput && !concurrencyInput.value.trim()) {{
+      concurrencyInput.value = firstValue(rows, "max_concurrency");
+    }}
+    rows = filterRows(data, {{
+      ...currentFilters(),
+      numPrompts: "",
+      backend: "",
+      extraValue: "",
+      modelSearch: "",
+    }});
+
+    if (promptsInput && !promptsInput.value.trim()) {{
+      promptsInput.value = firstValue(rows, "num_prompts");
     }}
     rows = filterRows(data, {{
       ...currentFilters(),
@@ -1025,6 +1365,8 @@ function initSection(prefix, columns, data, numericCols, groups) {{
       ...filters,
       testName: "",
       datasetName: "",
+      maxConcurrency: "",
+      numPrompts: "",
       backend: "",
       extraValue: "",
       modelSearch: "",
@@ -1064,6 +1406,22 @@ function initSection(prefix, columns, data, numericCols, groups) {{
         <div class="kv-row"><div class="kv-label">Dataset</div><div class="kv-value"><code>${{escapeHtml(
           filters.datasetName || "All",
         )}}</code></div></div>
+        ${{
+          prefix === "diff"
+            ? ""
+            : (
+              `<div class="kv-row"><div class="kv-label">Concurrency</div>` +
+              `<div class="kv-value"><code>${{escapeHtml(filters.maxConcurrency || "All")}}</code></div></div>`
+            )
+        }}
+        ${{
+          prefix === "diff"
+            ? ""
+            : (
+              `<div class="kv-row"><div class="kv-label">Num prompts</div>` +
+              `<div class="kv-value"><code>${{escapeHtml(filters.numPrompts || "All")}}</code></div></div>`
+            )
+        }}
         <div class="kv-row"><div class="kv-label">Backend</div><div class="kv-value"><code>${{escapeHtml(
           filters.backend || "All",
         )}}</code></div></div>
@@ -1118,14 +1476,26 @@ function initSection(prefix, columns, data, numericCols, groups) {{
     );
   }}
 
-  [modelInput, modelSearchInput, testInput, datasetInput, backendInput, extraInput].filter(Boolean).forEach((el) => {{
+  [
+    modelInput,
+    modelSearchInput,
+    testInput,
+    datasetInput,
+    concurrencyInput,
+    promptsInput,
+    backendInput,
+    extraInput,
+  ].filter(Boolean).forEach((el) => {{
     el.addEventListener("input", render);
+    el.addEventListener("change", render);
   }});
   clearBtn.addEventListener("click", () => {{
     modelInput.value = "";
     if (modelSearchInput) modelSearchInput.value = "";
     testInput.value = "";
     datasetInput.value = "";
+    if (concurrencyInput) concurrencyInput.value = "";
+    if (promptsInput) promptsInput.value = "";
     backendInput.value = "";
     if (extraInput) extraInput.value = "";
     applyDefaultSelections();
@@ -1232,6 +1602,7 @@ window.addEventListener("load", () => {{
             ),
             '      <div class="stats-grid" id="omni-stats"></div>',
             '      <div class="toolbar">',
+            '        <div class="toolbar-row primary">',
             (
                 '        <div class="filter-field"><label>model_id</label><input '
                 'class="filter-input" type="text" id="omni-model" '
@@ -1239,39 +1610,42 @@ window.addEventListener("load", () => {{
                 'id="omni-model-list"></datalist></div>'
             ),
             (
-                '        <div class="filter-field"><label>model_search</label><input '
+                '        <div class="filter-field compact"><label>search</label><input '
                 'class="filter-input" type="text" id="omni-model-search" '
                 'placeholder="Fuzzy search model_id" /></div>'
             ),
             (
-                '        <div class="filter-field"><label>test_name</label><input '
-                'class="filter-input" type="text" id="omni-test" '
-                'list="omni-test-list" placeholder="All tests" /><datalist '
-                'id="omni-test-list"></datalist></div>'
+                '        <div class="filter-field compact"><label>test</label>'
+                '<select class="filter-select" id="omni-test"></select></div>'
             ),
             (
-                '        <div class="filter-field"><label>dataset_name</label><input '
-                'class="filter-input" type="text" id="omni-dataset" '
-                'list="omni-dataset-list" placeholder="All datasets" /><datalist '
-                'id="omni-dataset-list"></datalist></div>'
+                '        <div class="filter-field compact"><label>dataset</label>'
+                '<select class="filter-select" id="omni-dataset"></select></div>'
+            ),
+            "        </div>",
+            '        <div class="toolbar-row secondary">',
+            (
+                '        <div class="filter-field compact"><label>max_conc</label>'
+                '<select class="filter-select" id="omni-concurrency"></select></div>'
             ),
             (
-                '        <div class="filter-field"><label>backend</label><input '
-                'class="filter-input" type="text" id="omni-backend" '
-                'list="omni-backend-list" placeholder="All backends" /><datalist '
-                'id="omni-backend-list"></datalist></div>'
+                '        <div class="filter-field compact"><label>prompts</label>'
+                '<select class="filter-select" id="omni-prompts"></select></div>'
             ),
             (
-                '        <div class="filter-field"><label>tokenizer_id</label><input '
-                'class="filter-input" type="text" id="omni-extra" '
-                'list="omni-extra-list" placeholder="All tokenizers" /><datalist '
-                'id="omni-extra-list"></datalist></div>'
+                '        <div class="filter-field compact"><label>backend</label>'
+                '<select class="filter-select" id="omni-backend"></select></div>'
             ),
             (
-                '        <div class="filter-field"><label>&nbsp;</label><button '
+                '        <div class="filter-field compact"><label>tokenizer</label>'
+                '<select class="filter-select" id="omni-extra"></select></div>'
+            ),
+            (
+                '        <div class="filter-field compact"><label>&nbsp;</label><button '
                 'class="ghost" type="button" id="omni-clear">Clear filters</button>'
                 "</div>"
             ),
+            "        </div>",
             "      </div>",
             (
                 '      <div class="hint">Searchable inputs use browser datalist '
@@ -1296,6 +1670,7 @@ window.addEventListener("load", () => {{
             ),
             '      <div class="stats-grid" id="diff-stats"></div>',
             '      <div class="toolbar">',
+            '        <div class="toolbar-row primary">',
             (
                 '        <div class="filter-field"><label>model</label><input '
                 'class="filter-input" type="text" id="diff-model" '
@@ -1303,33 +1678,30 @@ window.addEventListener("load", () => {{
                 'id="diff-model-list"></datalist></div>'
             ),
             (
-                '        <div class="filter-field"><label>model_search</label><input '
+                '        <div class="filter-field compact"><label>search</label><input '
                 'class="filter-input" type="text" id="diff-model-search" '
                 'placeholder="Fuzzy search model" /></div>'
             ),
             (
-                '        <div class="filter-field"><label>test_name</label><input '
-                'class="filter-input" type="text" id="diff-test" '
-                'list="diff-test-list" placeholder="All tests" /><datalist '
-                'id="diff-test-list"></datalist></div>'
+                '        <div class="filter-field compact"><label>test</label>'
+                '<select class="filter-select" id="diff-test"></select></div>'
             ),
             (
-                '        <div class="filter-field"><label>dataset</label><input '
-                'class="filter-input" type="text" id="diff-dataset" '
-                'list="diff-dataset-list" placeholder="All datasets" /><datalist '
-                'id="diff-dataset-list"></datalist></div>'
+                '        <div class="filter-field compact"><label>dataset</label>'
+                '<select class="filter-select" id="diff-dataset"></select></div>'
+            ),
+            "        </div>",
+            '        <div class="toolbar-row secondary">',
+            (
+                '        <div class="filter-field compact"><label>backend</label>'
+                '<select class="filter-select" id="diff-backend"></select></div>'
             ),
             (
-                '        <div class="filter-field"><label>backend</label><input '
-                'class="filter-input" type="text" id="diff-backend" '
-                'list="diff-backend-list" placeholder="All backends" /><datalist '
-                'id="diff-backend-list"></datalist></div>'
-            ),
-            (
-                '        <div class="filter-field"><label>&nbsp;</label><button '
+                '        <div class="filter-field compact"><label>&nbsp;</label><button '
                 'class="ghost" type="button" id="diff-clear">Clear filters</button>'
                 "</div>"
             ),
+            "        </div>",
             "      </div>",
             (
                 '      <div class="hint">Charts automatically skip empty metric '
