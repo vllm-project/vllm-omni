@@ -1887,7 +1887,8 @@ class OpenAIClientHandler:
 
         # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
-        for key in ("task_type", "ref_text", "ref_audio"):
+        # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
+        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens"):
             if key in request_config:
                 extra_body[key] = request_config[key]
 
@@ -2177,6 +2178,8 @@ class OmniRunner:
             speaker = tts_kw.get("speaker", "Vivian")
             language = tts_kw.get("language", "Auto")
             max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
+            ref_audio = tts_kw.get("ref_audio", None)
+            ref_text = tts_kw.get("ref_text", None)
 
             omni_inputs: list[TextPrompt] = []
             for prompt_text in prompts:
@@ -2188,6 +2191,10 @@ class OmniRunner:
                     "speaker": [speaker],
                     "max_new_tokens": [max_new_tokens],
                 }
+                if ref_audio is not None:
+                    additional_information["ref_audio"] = [ref_audio]
+                if ref_text is not None:
+                    additional_information["ref_text"] = [ref_text]
                 # Use official helper to get correct placeholder length
                 plen = self._estimate_prompt_len(additional_information, self.model_name)
                 input_dict: TextPrompt = {
@@ -2452,6 +2459,10 @@ class OmniRunnerHandler:
             mm_processor_kwargs["speaker"] = request_config["voice"]
         if "task_type" in request_config:
             mm_processor_kwargs["task_type"] = request_config["task_type"]
+        if "ref_audio" in request_config:
+            mm_processor_kwargs["ref_audio"] = request_config["ref_audio"]
+        if "ref_text" in request_config:
+            mm_processor_kwargs["ref_text"] = request_config["ref_text"]
         if "language" in request_config:
             mm_processor_kwargs["language"] = request_config["language"]
         if "max_new_tokens" in request_config:
@@ -2472,7 +2483,7 @@ class OmniRunnerHandler:
             assert result.success, result.error_message
             return result
 
-        # Convert tensor to WAV bytes for downstream analysis (transcription, gender estimation).
+        # Keep the offline path lightweight: downstream validation can be done elsewhere if needed.
         result = OmniResponse(success=True)
         assert_audio_speech_response(result, request_config, run_level="core_model")
         return result

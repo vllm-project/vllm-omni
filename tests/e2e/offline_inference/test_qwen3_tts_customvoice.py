@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E offline tests for Qwen3-TTS model with text input and audio output.
+E2E offline tests for Qwen3-TTS CustomVoice model with text input and audio output.
 
 Async_chunk disable, cuda_graph disabled (no_async_chunk stage config).
+CUDA graph is disabled by setting engine_args.enforce_eager=true via modify_stage_config().
 Same structure as test_qwen3_omni (models, stage_configs, test_params, parametrize omni_runner).
 """
 
@@ -62,9 +63,12 @@ def get_prompt():
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
     """
-    Text-to-audio E2E (offline): pure text input, audio output.
-    Async_chunk disable, cuda_graph disabled. Single request.
-    Uses send_audio_speech_request for TT-S-specific validation (same style as online /v1/audio/speech).
+    Test text input processing and audio output via offline Omni runner.
+    Deploy Setting: qwen3_tts_no_async_chunk.yaml + enforce_eager=true
+    Input Modal: text
+    Output Modal: audio
+    Input Setting: stream=False
+    Datasets: few requests
     """
     request_config = {"input": get_prompt(), "voice": "vivian"}
     omni_runner_handler.send_audio_speech_request(request_config)

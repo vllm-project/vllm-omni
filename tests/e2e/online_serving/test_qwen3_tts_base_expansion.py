@@ -52,7 +52,15 @@ tts_server_params = [
             server_args=["--trust-remote-code", "--disable-log-stats"],
         ),
         id="async_chunk",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_stage_config("qwen3_tts_no_async_chunk.yaml"),
+            server_args=["--trust-remote-code", "--disable-log-stats"],
+        ),
+        id="no_async_chunk",
+    ),
 ]
 
 
@@ -61,45 +69,19 @@ tts_server_params = [
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
-    """
-    Test text input processing and audio output via OpenAI API.
-    Deploy Setting: default yaml
-    Input Modal: text
-    Output Modal: audio
-    Input Setting: stream=False
-    Datasets: few requests
-    """
-
-    request_config = {
-        "model": omni_server.model,
-        "input": get_prompt(),
-        "stream": False,
-        "response_format": "wav",
-        "task_type": "Base",
-        "voice": "clone",
-        "ref_audio": REF_AUDIO_URL,
-        "ref_text": REF_TEXT,
-    }
-    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_002(omni_server, openai_client) -> None:
+def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
     Input Modal: text
     Output Modal: audio
     Input Setting: stream=True
-    Datasets: single request
+    Datasets: few requests
     """
+
     request_config = {
         "model": omni_server.model,
-        "input": "The weather is nice today, perfect for a walk in the park.",
+        "input": get_prompt(),
         "stream": True,
         "response_format": "wav",
         "task_type": "Base",
@@ -107,4 +89,4 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
