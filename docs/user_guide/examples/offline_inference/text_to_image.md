@@ -3,7 +3,7 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_image>.
 
 
-This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` `stepfun-ai/NextStep-1.1` using vLLM-Omni, note that NextStep-1.1 has different architecture so we treat it differently regarding running arguments and pipeline.
+This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` `stepfun-ai/NextStep-1.1` `stable-diffusion-v1-5/stable-diffusion-v1-5` using vLLM-Omni, note that NextStep-1.1 has different architecture so we treat it differently regarding running arguments and pipeline.
 
 - `text_to_image.py`: command-line script for single image generation with advanced options.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
@@ -108,6 +108,23 @@ python text_to_image.py \
   --output nextstep_output.png \
   --seed 42
 ```
+
+### Stable Diffusion v1.5
+
+```bash
+python text_to_image.py \
+  --model stable-diffusion-v1-5/stable-diffusion-v1-5 \
+  --prompt "a cat sitting on a windowsill watching the rain" \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 20 \
+  --guidance-scale 7.5 \
+  --output sd15_output.png \
+  --enforce-eager \
+  --seed 42
+```
+
+SD v1.5 is a UNet-based model (not DiT). It generates 512x512 images. Use `--enforce-eager` for best compatibility. Recommended `--guidance-scale` is 7.0–8.5.
 
 ### Key Arguments
 

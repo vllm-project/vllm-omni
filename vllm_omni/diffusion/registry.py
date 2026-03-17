@@ -142,6 +142,11 @@ _DIFFUSION_MODELS = {
         "pipeline_dreamid_omni",
         "DreamIDOmniPipeline",
     ),
+    "StableDiffusionPipeline": (
+        "sd1_5",
+        "pipeline_sd1_5",
+        "StableDiffusion15Pipeline",
+    ),
 }
 
 
@@ -158,6 +163,7 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "StableDiffusionPipeline",
 }
 
 
@@ -316,6 +322,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
     "Flux2Pipeline": "get_flux2_post_process_func",
+    "StableDiffusionPipeline": "get_sd15_image_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
