@@ -45,6 +45,129 @@ For larger models or multi-GPU environments, you can enable Tensor Parallelism (
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/your/custom_bagel.yaml
 ```
 
+#### Using Mooncake Connector
+
+By default, BAGEL uses `SharedMemoryConnector` for inter-stage communication. You can use the [Mooncake](https://github.com/kvcache-ai/Mooncake) connector to transfer KV cache between stages, which also enables multi-node deployment.
+
+**1. Install Mooncake**
+
+```bash
+# For CUDA-enabled systems (recommended)
+pip install mooncake-transfer-engine
+
+# For non-CUDA systems
+pip install mooncake-transfer-engine-non-cuda
+```
+
+**2. Start Mooncake Master** on the primary node:
+
+```bash
+# Optional: enable disk-backed storage by creating a directory and passing --root_fs_dir.
+# Without it, Mooncake runs in memory-only mode, which is sufficient for KV cache transfer.
+mkdir -p ./mc_storage
+
+mooncake_master \
+  --rpc_port=50051 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080 \
+  --metrics_port=9003 \
+  --root_fs_dir=./mc_storage/ \
+  --cluster_id=mc-local-1 &
+```
+
+**3. Launch the server** with the Mooncake stage config:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+```
+
+> **Note**: Before launching, edit [`bagel_multiconnector.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml) and replace the `metadata_server` and `master` addresses with your Mooncake master node's actual IP. For single-node testing, `127.0.0.1` works.
+
+The client-side usage is identical to the default setup -- the Mooncake connector is transparent to the API. See the requests section below.
+
+For more details on the Mooncake connector configuration, see the [Mooncake Store Connector documentation](../../../docs/design/feature/omni_connectors/mooncake_store_connector.md).
+
+#### Multi-Node Deployment
+
+You can deploy each stage on a **separate node** for better resource utilization. In this example, the orchestrator (Stage 0 / Thinker) and Stage 1 (DiT) run on different machines, connected via Mooncake.
+
+Replace `<ORCHESTRATOR_IP>` below with the actual IP address of your orchestrator node (e.g., `10.244.227.244`).
+
+> [!WARNING]
+> **Before launching**, edit [`bagel_multiconnector.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml) and replace the `metadata_server` and `master` addresses with your Mooncake master node's actual IP. Mismatched addresses will cause silent connection failures.
+
+**1. Start Mooncake Master** (on the orchestrator node):
+
+```bash
+mooncake_master \
+  --rpc_port=50051 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=<ORCHESTRATOR_IP> \
+  --http_metadata_server_port=8080 \
+  --metrics_port=9003
+```
+
+**2. Launch Stage 0 (Thinker / Orchestrator)** on the orchestrator node:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
+    --port 8000 \ # API server port for client requests
+    --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml \
+    --stage-id 0 \
+    -oma <ORCHESTRATOR_IP> \
+    -omp 8091
+```
+
+**3. Launch Stage 1 (DiT)** on the remote node in headless mode:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml \
+    --stage-id 1 \
+    --headless \
+    -oma <ORCHESTRATOR_IP> \
+    -omp 8091
+```
+
+**Mooncake Master arguments:**
+
+| Argument | Description |
+| :------- | :---------- |
+| `--rpc_port` | Mooncake RPC port for control-plane coordination between stages |
+| `--enable_http_metadata_server` | Enable the HTTP metadata server for service discovery |
+| `--http_metadata_server_host` | IP address to bind the metadata server (use the orchestrator node's IP) |
+| `--http_metadata_server_port` | Port for the HTTP metadata server |
+| `--metrics_port` | Port for Prometheus-compatible metrics endpoint |
+
+**vllm serve arguments:**
+
+| Argument | Description |
+| :------- | :---------- |
+| `--stage-id` | Which stage this process runs (0 = Thinker, 1 = DiT) |
+| `--headless` | Run without the API server (worker-only mode) |
+| `-oma` | Orchestrator master address |
+| `-omp` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination |
+
+> [!IMPORTANT]
+> **Startup Order**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless).
+> Stage 0 will appear to hang on startup until Stage 1 (worker) connects — this is expected behavior.
+
+**Network Requirements**
+
+All nodes must have network connectivity to each other. Ensure the following ports are open **between all participating nodes**:
+
+| Port | Protocol | Service | Direction |
+| :--- | :------- | :------ | :-------- |
+| 50051 | TCP | Mooncake Master RPC | Worker → Orchestrator |
+| 8080 | TCP | Mooncake HTTP Metadata Server | Worker → Orchestrator |
+| 8091 | TCP | Orchestrator Master (`-omp`) | Worker → Orchestrator |
+| 8000 | TCP | API Server (`--port`) | Client → Orchestrator |
+| 9003 | TCP | Metrics (optional) | Monitoring → Orchestrator |
+
+> **Tip**: If nodes are behind a firewall or in different VPCs/security groups, make sure the above ports are allowed in ingress/egress rules. All nodes should be reachable via their IP addresses (no NAT). Using nodes on the same subnet or VPC is recommended to minimize latency for Mooncake KV cache transfers.
+
 ### Send Multi-modal Request
 
 Get into the bagel folder:

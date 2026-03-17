@@ -2,6 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
+Example script for image editing with OmniGen2.
+
+    python image_edit.py \
+        --image input.png \
+        --model "OmniGen2/OmniGen2" \
+        --prompt "Change the background to classroom." \
+        --negative-prompt "(((deformed))), blurry, over saturation, bad anatomy, disfigured, poorly drawn face, mutation, mutated, (extra_limb), (ugly), (poorly drawn hands), fused fingers, messy drawing, broken legs censor, censored, censor_bar" \
+        --num-inference-steps 50 \
+        --seed 0 \
+        --guidance-scale 5.0 \
+        --guidance-scale-2 2.0 \
+        --output outputs/image_edit.png \
+        --num-outputs-per-prompt 2
+
+    Note: For OmniGen2, `guidance_scale` works as `text_guidance_scale`,
+    and `guidance_scale_2` works as `image_guidance_scale`.
+
 Example script for image editing with Qwen-Image-Edit.
 
 Usage (single image):
@@ -142,6 +159,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--guidance-scale-2", type=float, default=None, help="image guidance scale for image-to-image generation."
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="output_image_edit.png",
@@ -187,6 +207,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
     parser.add_argument(
@@ -328,6 +353,7 @@ def main():
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Configure cache based on backend type
@@ -382,7 +408,7 @@ def main():
     else:
         print(f"  Input image size: {input_image.size}")
     print(
-        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}"
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}, enable_expert_parallel: {args.enable_expert_parallel}"
     )
     print(f"{'=' * 60}\n")
 
@@ -403,6 +429,7 @@ def main():
             generator=generator,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_2,
             num_inference_steps=args.num_inference_steps,
             num_outputs_per_prompt=args.num_outputs_per_prompt,
             layers=args.layers,

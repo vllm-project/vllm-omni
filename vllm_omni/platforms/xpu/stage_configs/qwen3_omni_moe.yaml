@@ -3,19 +3,19 @@
 # Stage 1: Talker (text embeddings → 8-layer RVQ codec codes)
 # Stage 2: Code2Wav (8-layer RVQ codes → audio waveform)
 
-# The following config has been verified on 4x 1550-64G XPUs.
+# The following config is verified with 8 * Intel Arc Pro B60 XPU.
 stage_args:
   - stage_id: 0
     stage_type: llm # Use llm stage type to launch OmniLLM
     runtime:
-      devices: "0,1"
+      devices: "0,1,2,3"
       max_batch_size: 1
     engine_args:
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.9 # thinker weight is around 61.08GB for Qwen3-Omni-30B-A3B-Instruct
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent # Output hidden states for talker
@@ -23,7 +23,8 @@ stage_args:
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       hf_config_name: thinker_config
-      tensor_parallel_size: 2
+      tensor_parallel_size: 4
+      max_cudagraph_capture_size: 0
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -39,14 +40,14 @@ stage_args:
   - stage_id: 1
     stage_type: llm # Use llm stage type to launch OmniLLM
     runtime:
-      devices: "2"
+      devices: "4"
       max_batch_size: 1
     engine_args:
       model_stage: talker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.6 # talker weight is around 8.5GB for Qwen3-Omni-30B-A3B-Instruct
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent # Output codec codes for code2wav
@@ -54,6 +55,7 @@ stage_args:
       max_num_batched_tokens: 32768
       distributed_executor_backend: "mp"
       hf_config_name: talker_config
+      max_cudagraph_capture_size: 0
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     # final_output: true
@@ -70,7 +72,7 @@ stage_args:
   - stage_id: 2
     stage_type: llm # Use llm stage type to launch OmniLLM
     runtime:
-      devices: "3"
+      devices: "4"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
@@ -81,10 +83,11 @@ stage_args:
       trust_remote_code: true
       enable_prefix_caching: false
       engine_output_type: audio # Final output: audio waveform
-      gpu_memory_utilization: 0.1
+      gpu_memory_utilization: 0.3 # code2wav weight is around 0.4GB for Qwen3-Omni-30B-A3B-Instruct
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config
+      max_cudagraph_capture_size: 0
     engine_input_source: [1]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
     final_output: true

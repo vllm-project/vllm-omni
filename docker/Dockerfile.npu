@@ -1,5 +1,5 @@
 ARG VLLM_ASCEND_IMAGE=quay.io/ascend/vllm-ascend
-ARG VLLM_ASCEND_TAG=v0.14.0rc1
+ARG VLLM_ASCEND_TAG=v0.17.0rc1
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
 
 ARG APP_DIR=/vllm-workspace/vllm-omni
@@ -7,8 +7,11 @@ WORKDIR ${APP_DIR}
 
 COPY . .
 
-# Install vllm-omni with dev dependencies
-RUN pip install --no-cache-dir -e . --no-build-isolation
+RUN export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh && \
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
+    python3 -m pip install -v -e /vllm-workspace/vllm-omni/ --no-build-isolation
 
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 

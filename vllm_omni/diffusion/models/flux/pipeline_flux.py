@@ -27,6 +27,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_g
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
+from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -159,14 +160,15 @@ class FluxPipeline(nn.Module, CFGParallelMixin):
         )
         self.text_encoder = CLIPTextModel.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self.device)
         self.text_encoder_2 = T5EncoderModel.from_pretrained(
             model, subfolder="text_encoder_2", local_files_only=local_files_only
-        )
+        ).to(self.device)
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = FluxTransformer2DModel(od_config=od_config)
+        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        self.transformer = FluxTransformer2DModel(od_config=od_config, quant_config=quant_config)
 
         self.tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.tokenizer_2 = T5TokenizerFast.from_pretrained(

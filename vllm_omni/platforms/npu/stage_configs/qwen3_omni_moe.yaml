@@ -7,7 +7,7 @@
 stage_args:
   - stage_id: 0
     runtime:
-      devices: "0,1,2,3"
+      devices: "0,1"
       max_batch_size: 1
     engine_args:
       model_stage: thinker
@@ -21,7 +21,7 @@ stage_args:
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
       hf_config_name: thinker_config
-      tensor_parallel_size: 4
+      tensor_parallel_size: 2
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -36,14 +36,14 @@ stage_args:
 
   - stage_id: 1
     runtime:
-       devices: "4"
+       devices: "2"
        max_batch_size: 1
     engine_args:
        model_stage: talker
        model_arch: Qwen3OmniMoeForConditionalGeneration
        worker_type: ar
        scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-       gpu_memory_utilization: 0.2
+       gpu_memory_utilization: 0.6
        enforce_eager: true # haven't supported talker ACL graph on NPU
        trust_remote_code: true
        engine_output_type: latent  # Output codec codes for code2wav
@@ -66,7 +66,7 @@ stage_args:
 
   - stage_id: 2
     runtime:
-      devices: "0"
+      devices: "2"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
@@ -78,7 +78,7 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio  # Final output: audio waveform
-      gpu_memory_utilization: 0.1
+      gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config

@@ -1,0 +1,38 @@
+steps:
+  - label: ":docker: Build image"
+    key: image-build
+    commands:
+      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+      - "docker build --progress=plain --file docker/Dockerfile.ci -t vllm-omni-ci ."
+      - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L2 Test
+  - label: "Upload Ready Pipeline"
+    depends_on: image-build
+    key: upload-ready-pipeline
+    commands:
+      - buildkite-agent pipeline upload .buildkite/test-ready.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L3 Test
+  - label: "Upload Merge Pipeline"
+    depends_on: image-build
+    key: upload-merge-pipeline
+    commands:
+      - buildkite-agent pipeline upload .buildkite/test-merge.yml
+    agents:
+      queue: "cpu_queue_premerge"
+
+  # L4 Test
+  - label: "Upload Nightly Pipeline"
+    depends_on: image-build
+    key: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1"
+    commands:
+      - buildkite-agent pipeline upload .buildkite/test-nightly.yml
+    agents:
+      queue: "cpu_queue_premerge"

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import logging
+import time
 import uuid
 from collections.abc import Sequence
 
@@ -13,9 +13,6 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
-
-# TODO configure logging properly
-logging.basicConfig(level=logging.INFO)
 
 logger = init_logger(__name__)
 
@@ -35,6 +32,7 @@ class OmniDiffusion:
         # Capture stage info from kwargs before they might be filtered out
         stage_id = kwargs.get("stage_id")
         engine_input_source = kwargs.get("engine_input_source")
+        cfg_kv_collect_func = kwargs.pop("cfg_kv_collect_func", None)
 
         if od_config is None:
             od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
@@ -54,36 +52,62 @@ class OmniDiffusion:
         if engine_input_source is not None:
             self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
+        # Detect model class and load config
         # Diffusers-style models expose `model_index.json` with `_class_name`.
-        # Bagel models (and other non-diffusers) typically expose `config.json`.
+        # Non-diffusers models (e.g. Bagel, NextStep, GLM-Image) only have `config.json`,
+        # so we fall back to reading that and mapping model_type manually.
         try:
             config_dict = get_hf_file_to_dict(
                 "model_index.json",
                 od_config.model,
             )
-            od_config.model_class_name = config_dict.get("_class_name", None)
+
+            if config_dict is None:
+                raise FileNotFoundError("model_index.json not found")
+
+            if od_config.model_class_name is None:
+                od_config.model_class_name = config_dict.get("_class_name", None)
             od_config.update_multimodal_support()
 
-            tf_config_dict = get_hf_file_to_dict(
-                "transformer/config.json",
-                od_config.model,
-            )
-            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
-        except (AttributeError, OSError, ValueError):
+            if od_config.model_class_name == "DreamIDOmniPipeline":
+                od_config.model_config = config_dict
+            else:
+                tf_config_dict = get_hf_file_to_dict(
+                    "transformer/config.json",
+                    od_config.model,
+                )
+                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+
+        except (AttributeError, OSError, ValueError, FileNotFoundError):
             cfg = get_hf_file_to_dict("config.json", od_config.model)
             if cfg is None:
                 raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
 
+            # Map model_type or architecture to pipeline class
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
+            pipeline_class = None
+            # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
             if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                od_config.model_class_name = "BagelPipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
+                pipeline_class = "BagelPipeline"
+            elif model_type == "nextstep":
+                if od_config.model_class_name is None:
+                    pipeline_class = "NextStep11Pipeline"
+            elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
+                pipeline_class = "GlmImagePipeline"
             elif architectures and len(architectures) == 1:
-                od_config.model_class_name = architectures[0]
-            else:
-                raise
+                pipeline_class = architectures[0]
+
+            if pipeline_class is None:
+                raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")
+
+            if od_config.model_class_name is None:
+                od_config.model_class_name = pipeline_class
+            od_config.tf_model_config = TransformerConfig().from_dict(cfg)
+            od_config.update_multimodal_support()
+
+        if cfg_kv_collect_func is not None:
+            od_config.cfg_kv_collect_func = cfg_kv_collect_func
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
@@ -93,6 +117,7 @@ class OmniDiffusion:
         sampling_params: OmniDiffusionSamplingParams,
         request_ids: list[str] = [],
     ) -> list[OmniRequestOutput]:
+        _t0 = time.perf_counter()
         if isinstance(prompts, (str, dict)):
             prompts = [prompts]
         else:
@@ -103,7 +128,10 @@ class OmniDiffusion:
             request_ids.extend(f"{i + len(request_ids)}_{uuid.uuid4()}" for i in range(len(prompts) - len(request_ids)))
 
         request = OmniDiffusionRequest(prompts, sampling_params, request_ids)
-        return self._run_engine(request)
+        result = self._run_engine(request)
+        _t_ms = (time.perf_counter() - _t0) * 1000
+        logger.info("OmniDiffusion.generate total: %.2f ms", _t_ms)
+        return result
 
     def _run_engine(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         return self.engine.step(request)

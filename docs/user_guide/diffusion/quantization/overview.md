@@ -7,6 +7,7 @@ vLLM-Omni supports quantization of DiT linear layers to reduce memory usage and 
 | Method | Guide |
 |--------|-------|
 | FP8 | [FP8](fp8.md) |
+| GGUF | [GGUF](gguf.md) |
 
 ## Device Compatibility
 

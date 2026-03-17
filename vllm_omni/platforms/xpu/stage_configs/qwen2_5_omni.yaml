@@ -1,6 +1,6 @@
 # stage config for running qwen2.5-omni with architecture of OmniLLM.
 
-# The following config has been verified on 2x 1550-64G XPUs.
+# The following config is verified with 2 * Intel Arc Pro B60 XPU.
 stage_args:
   - stage_id: 0
     stage_type: llm # Use llm stage type to launch OmniLLM
@@ -13,7 +13,7 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.9 # thinker weight is around 16.74GB for Qwen2.5-Omni-7B
       enforce_eager: false
       trust_remote_code: true
       engine_output_type: latent
@@ -40,7 +40,7 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.5  # talker weight is 6.03GB for Qwen2.5-Omni-7B
       enforce_eager: false
       trust_remote_code: true
       enable_prefix_caching: false
@@ -61,14 +61,14 @@ stage_args:
     stage_type: llm # Use llm stage type to launch OmniLLM
     runtime:
       process: true
-      devices: "0"
+      devices: "1"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      gpu_memory_utilization: 0.15
+      gpu_memory_utilization: 0.3 # code2wav weight is around 1.46GB for Qwen2.5-Omni-7B
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false

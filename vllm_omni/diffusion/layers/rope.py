@@ -157,3 +157,29 @@ class RotaryEmbedding(CustomOp):
             sin,
             interleaved=self.interleaved,
         )
+
+
+def apply_rope_to_qk(
+    rope: RotaryEmbedding,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary positional embeddings to query and key tensors.
+
+    Args:
+        rope: RotaryEmbedding instance for applying position embeddings
+        query: Query tensor [B, S, H, D]
+        key: Key tensor [B, S, H, D]
+        image_rotary_emb: Tuple of (cos, sin) tensors or None
+
+    Returns:
+        Tuple of (query, key) with RoPE applied if rotary embeddings provided
+    """
+    if image_rotary_emb is not None:
+        cos, sin = image_rotary_emb
+        cos = cos.to(query.dtype)
+        sin = sin.to(query.dtype)
+        query = rope(query, cos, sin)
+        key = rope(key, cos, sin)
+    return query, key

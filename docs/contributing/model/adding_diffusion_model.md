@@ -1,4 +1,4 @@
-# Adding a Diffusion Model to vLLM-Omni
+# Adding a Diffusion Model
 
 This guide walks you through adding a new diffusion model to vLLM-Omni. We use **Qwen-Image** as the primary example, with references to other models (LongCat, Flux, Wan2.2) to illustrate different patterns.
 
@@ -651,8 +651,27 @@ For a fair comparison, keep the same **prompt**, **seed**, **resolution**, **num
 
 #### 5.2 Functionality Check in CI
 
-To ensure project maintainability and sustainable development, we encourage contributors to submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes.
-For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
+To ensure project maintainability and sustainable development, please submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes.
+
+For comprehensive testing guidelines and the definition of test levels (L1-L5), please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
+The following tests are required to add:
+
+- L4 test of the model's full *functionality* (i.e., all the *diffusion features* that are supported by this model), including several [parallelism acceleration methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism_acceleration/), [CPU offloading](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cpu_offload_diffusion/), [TeaCache](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/teacache/) and [Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/) cache backends, [quantization methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/quantization/overview/).
+  - Test cases: Currently all the features are available in online serving mode. Hence, only need to add `tests/e2e/online_serving/test_{model}_expansion.py`. The following test cases shall cover all features:
+    - 1 GPU: TeaCache & GGUF (or fallback to FP8, or disable it) & Layer-wise CPU offloading (or fallback to Module-wise)
+    - 2 GPUs: Cache-DiT & FP8 (or fallback to GGUF, or disable it) & Ulysses = 2
+    - 2 GPUs: Cache-DiT & GGUF (or fallback to FP8, or disable it) & Ring = 2
+    - 2 GPUs: TeaCache & FP8 (or fallback to GGUF, or disable it) & CFG Parallel = 2
+    - 2 GPUs: Cache-DiT & FP8 (or fallback to GGUF, or disable it) & Tensor Parallel = 2 & VAE Patch Parallel = 2
+    - 2 GPUs: Cache-DiT & GGUF (or fallback to FP8, or disable it) & HSDP = 2 & VAE Patch Parallel = 2
+  - Validation: test that the multimodal output files of your model have the correct shapes.
+  - Test marks: always add `advanced_model` and `diffusion`. Add `parallel` and GPU-related marks if needed. Ref: [Markers for Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/tests_markers/)
+  - To maximize code reuse, you may refer to
+    - `tests/conftest.py` for `omni_server` and `openai_client` fixtures, `generate_synthetic_image` and `assert_XXX_valid` helper.
+    - `tests/utils.py` for `@hardware_test(...)` and `hardware_marks`.
+    - [Parametrizing tests (pytest doc)](https://docs.pytest.org/en/stable/example/parametrize.html) to reuse test function implementation for different cases.
+  - Doc: add a concise dostring for each test function.
+  - Reference L4 test implementation: [tests/e2e/online_serving/test_qwen_image_edit_expansion.py](https://github.com/vllm-project/vllm-omni/blob/main/tests/e2e/online_serving/test_qwen_image_edit_expansion.py).
 
 ---
 
@@ -680,7 +699,7 @@ vLLM-Omni automatically compiles blocks in `_repeated_blocks` when `torch.compil
 
 ### Tensor Parallelism
 
-See detailed guide: [How to add Tensor Parallel support](../features/tensor_parallel.md)
+See detailed guide: [How to add Tensor Parallel support](../../design/feature/tensor_parallel.md)
 
 **Quick setup:**
 
@@ -694,7 +713,7 @@ omni = Omni(model="your-model", tensor_parallel_size=2)
 
 ### CFG Parallelism
 
-See detailed guide: [How to add CFG-Parallel support](../features/cfg_parallel.md)
+See detailed guide: [How to add CFG-Parallel support](../../design/feature/cfg_parallel.md)
 
 **Quick setup:**
 
@@ -708,7 +727,7 @@ omni = Omni(model="your-model", cfg_parallel_size=2)
 
 ### Sequence Parallelism
 
-See detailed guide: [How to add Sequence Parallel support](../features/sequence_parallel.md)
+See detailed guide: [How to add Sequence Parallel support](../../design/feature/sequence_parallel.md)
 
 **Quick setup:**
 
@@ -724,7 +743,7 @@ omni = Omni(model="your-model", ulysses_degree=2, ring_degree=2)
 
 #### TeaCache
 
-See detailed guide: [How to add TeaCache support](../features/teacache.md)
+See detailed guide: [How to add TeaCache support](../../design/feature/teacache.md)
 
 **Quick setup:**
 
@@ -744,7 +763,7 @@ omni = Omni(model="your-model",
 
 #### Cache-DiT
 
-See detailed guide: [How to add Cache-DiT support](../features/cache_dit.md)
+See detailed guide: [How to add Cache-DiT support](../../design/feature/cache_dit.md)
 
 **Quick setup:**
 

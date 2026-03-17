@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import glob
 import inspect
 import logging
 import math
-import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -22,7 +20,6 @@ from diffusers.utils.outputs import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from PIL import Image
-from safetensors.torch import load_file
 from torch import nn
 from torchvision import transforms
 from transformers import PretrainedConfig, Siglip2ImageProcessorFast
@@ -35,10 +32,8 @@ from transformers.modeling_utils import PreTrainedModel
 from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -66,6 +61,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe import HunyuanFusedMoE
 
 logger = logging.getLogger(__name__)
 
@@ -355,14 +351,6 @@ def build_batch_2d_rope(
         return stacked_cos, stacked_sin, all_pos_list
 
     return stacked_cos, stacked_sin
-
-
-def get_full_state_dict(model_path):
-    files = glob.glob(os.path.join(model_path, "*.safetensors"))
-    full_sd = {}
-    for f in files:
-        full_sd.update(load_file(f))
-    return full_sd
 
 
 def rotate_half(x):
@@ -1428,7 +1416,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -1574,22 +1562,6 @@ class HunYuanAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         output = output.reshape(bsz, q_len, -1)
         return output, None, past_key_value
-
-
-class HunyuanFusedMoE(SharedFusedMoE):
-    def __init__(self, *, prefix: str = "", **kwargs):
-        super().__init__(prefix=prefix, **kwargs)
-        self._prefix = prefix
-
-        self._init_hook_handle = self.register_forward_pre_hook(self._initialize_kernel_hook, with_kwargs=True)
-
-    def _initialize_kernel_hook(self, module, args, kwargs):
-        if self.quant_method:
-            self.quant_method.process_weights_after_loading(self)
-        self._init_hook_handle.remove()
-
-    def forward(self, hidden_states, router_logits):
-        return super().forward(hidden_states, router_logits)
 
 
 class HunyuanImage3DecoderLayer(nn.Module):
@@ -1744,7 +1716,6 @@ class HunyuanImage3Model(nn.Module):
         lora_vocab = (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1)) if lora_config else 0
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
-        self.wte = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         if get_pp_group().is_first_rank or (config.tie_word_embeddings and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
@@ -2047,7 +2018,7 @@ class HunyuanImage3Model(nn.Module):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -2466,7 +2437,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
                     latents = callback_outputs.pop("latents", latents)
-
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()

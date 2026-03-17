@@ -36,7 +36,7 @@ stage_args:
       repetition_penalty: 1.05
     # Distributed connector configuration
     output_connectors:
-      to_stage_1: connector_of_mooncake
+      to_stage_1: mooncake_connector
 
   - stage_id: 1
     stage_type: llm  # Use llm stage type to launch OmniLLM
@@ -70,9 +70,9 @@ stage_args:
       stop_token_ids: [2150]
     # Distributed connector configuration
     input_connectors:
-      from_stage_0: connector_of_mooncake
+      from_stage_0: mooncake_connector
     output_connectors:
-      to_stage_2: connector_of_mooncake
+      to_stage_2: mooncake_connector
 
   - stage_id: 2
     stage_type: llm  # Use llm stage type to launch OmniLLM
@@ -106,7 +106,7 @@ stage_args:
       repetition_penalty: 1.1
     # Distributed connector configuration
     input_connectors:
-      from_stage_1: connector_of_mooncake
+      from_stage_1: mooncake_connector
 
 # Top-level runtime config: default windows and stage edges
 runtime:
@@ -118,8 +118,8 @@ runtime:
   # Distributed connectors configuration
   connectors:
     # Mooncake connector for cross-node/intra-node communication
-    connector_of_mooncake:
-      name: MooncakeConnector
+    mooncake_connector:
+      name: MooncakeStoreConnector
       extra:
         host: "127.0.0.1"
         metadata_server: "http://10.90.67.86:8080/metadata"
@@ -129,7 +129,7 @@ runtime:
         proto: "tcp"
 
     # SharedMemory connector for intra-node communication
-    connector_of_shared_memory:
+    shared_memory_connector:
       name: SharedMemoryConnector
       extra:
         shm_threshold_bytes: 65536 # 64KB threshold

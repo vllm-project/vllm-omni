@@ -8,6 +8,8 @@ import torch
 
 from vllm_omni.diffusion.distributed import vae_patch_parallel as vae_patch_parallel
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class _DummyConfig:
     def __init__(self, **attrs):

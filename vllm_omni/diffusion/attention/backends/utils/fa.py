@@ -68,7 +68,7 @@ else:
 
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
-HAS_FLASH_ATTN = flash_attn_func is not None
+HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
 
 
 def _index_first_axis(tensor, indices):

@@ -14,10 +14,6 @@ Equivalent to running:
 """
 
 import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
 import signal
 import socket
 import subprocess
@@ -37,23 +33,23 @@ from vllm_omni.entrypoints.omni import Omni
 # "Generated with seed=52, num_inference_steps=15,
 # prompt='A futuristic city skyline at twilight, cyberpunk style'"
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (68, 107, 134)},
-    {"position": (400, 50), "rgb": (95, 139, 166)},
-    {"position": (700, 100), "rgb": (99, 122, 151)},
-    {"position": (150, 400), "rgb": (111, 125, 153)},
-    {"position": (512, 512), "rgb": (97, 107, 131)},
-    {"position": (700, 400), "rgb": (48, 64, 98)},
-    {"position": (100, 700), "rgb": (79, 63, 84)},
-    {"position": (400, 700), "rgb": (40, 58, 79)},
-    {"position": (700, 700), "rgb": (60, 75, 103)},
-    {"position": (256, 256), "rgb": (97, 128, 156)},
+    {"position": (100, 100), "rgb": (121, 118, 100)},
+    {"position": (400, 50), "rgb": (163, 162, 143)},
+    {"position": (700, 100), "rgb": (170, 156, 127)},
+    {"position": (150, 400), "rgb": (129, 127, 112)},
+    {"position": (512, 512), "rgb": (135, 61, 59)},
+    {"position": (700, 400), "rgb": (205, 107, 43)},
+    {"position": (100, 700), "rgb": (197, 177, 157)},
+    {"position": (400, 700), "rgb": (139, 107, 86)},
+    {"position": (700, 700), "rgb": (247, 205, 146)},
+    {"position": (256, 256), "rgb": (171, 160, 153)},
 ]
 
 # Maximum allowed difference per color channel
 PIXEL_TOLERANCE = 5
 
 # Default test prompt
-DEFAULT_PROMPT = "<|im_start|>A futuristic city skyline at twilight, cyberpunk style<|im_end|>"
+DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
 
 def _find_free_port() -> int:
@@ -80,6 +76,10 @@ def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_st
     params_list[0].max_tokens = max_tokens  # type: ignore
     if len(params_list) > 1:
         params_list[1].num_inference_steps = num_inference_steps  # type: ignore
+        params_list[1].extra_args = {  # type: ignore
+            "cfg_text_scale": 4.0,
+            "cfg_img_scale": 1.5,
+        }
     return params_list
 
 
