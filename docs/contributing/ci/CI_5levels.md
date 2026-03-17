@@ -86,7 +86,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
         /tests/e2e/offline_inference/test_{model_name}_expansion.py<br>
         <strong>Performance:</strong><br>
-        /tests/e2e/perf/nightly.json<br>
+        /tests/dfx/perf/tests/test.json<br>
         <strong>Doc Test:</strong><br>
         tests/example/online_serving/test_{model_name}.py<br>
         tests/example/offline_inference/test_{model_name}.py
@@ -104,7 +104,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td> Depends on reality </td>
       <td>
         <strong>Stability:</strong><br>
-        tests/e2e/stability/weekly.json<br>
+        /tests/dfx/stability/tests/test.json<br>
         <strong>Reliability:</strong><br>
         tests/e2e/reliability/test_{model_name}.py
       </td>
@@ -534,13 +534,13 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 ### 3.2 Testing Content and Scope
 
 -   ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
--   ***Performance Testing***: Uses the `/tests/e2e/perf/nightly.json` configuration file to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
+-   ***Performance Testing***: Uses the `tests/dfx/perf/tests/test.json` configuration file to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
 -   ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
 ### 3.3 Test Directory and Execution Files
 
 -   ***Functional Testing***: Same directories as L3.
--   ***Performance Test Configuration***: `/tests/e2e/perf/nightly.json`
+-   ***Performance Test Configuration***: `tests/dfx/perf/tests/test.json`
 -   ***Documentation Example Tests***:
 -   -   `tests/example/online_serving/test_{model_name}.py`
     -   `tests/example/offline_inference/test_{model_name}.py`
@@ -652,7 +652,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 ### 4.2 Testing Content and Scope
 
--   ***Long-term Stability (Stability) Testing***: Uses the `tests/dfx/stability/weekly.json` configuration to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
+-   ***Long-term Stability (Stability) Testing***: Uses the `tests/dfx/stability/tests/test.json` configuration to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
 -   ***Reliability Testing***: Uses `tests/e2e/reliability/test_{model_name}.py` to actively simulate various fault and abnormal scenarios, such as: dependent service interruption, abnormal input data, network flicker, hardware resource preemption, etc., to verify the system's fault tolerance, self-healing, and graceful degradation capabilities.
 
 ### 4.3 Test Directory and Execution Files
