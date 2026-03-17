@@ -64,6 +64,25 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+def _voice_type_from_runtime_info(
+    runtime_additional_information: list[dict[str, Any]] | None,
+) -> str | None:
+    """Extract voice_type from the first per-request info that has it (from additional_information)."""
+    if not runtime_additional_information:
+        return None
+    for info in runtime_additional_information:
+        vt = info.get("voice_type")
+        if vt is None:
+            continue
+        if isinstance(vt, (list, tuple)) and len(vt) > 0:
+            vt = vt[0]
+        if isinstance(vt, str) and vt.strip():
+            return vt.strip()
+        if vt is not None:
+            return str(vt).strip()
+    return None
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -278,6 +297,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             OmniOutput with text_hidden_states and optional audio
         """
+        # update voice type for each request
+        effective_voice_type = _voice_type_from_runtime_info(runtime_additional_information)
+        if effective_voice_type is None:
+            effective_voice_type = "ethan"
+        self.voice_type = effective_voice_type
 
         # ========== Stage 1: Thinker ==========
         if self.model_stage == "thinker":
@@ -321,10 +345,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Ensure we have base embeddings when only ids are provided
             if inputs_embeds is None and input_ids is not None:
                 inputs_embeds = self.talker.embed_input_ids(input_ids)
-
-            # TODO(Peiqi): temporal hack here to support voice_type.
-            if not hasattr(self, "voice_type"):
-                self.voice_type = voice_type
 
             # Run talker forward
             with torch.inference_mode():
@@ -377,7 +397,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                         left_context_size.append(info["left_context_size"])
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
-            audio_tensors = self.generate_audio(codes, voice_type, left_context_size, seq_token_counts)
+            audio_tensors = self.generate_audio(codes, self.voice_type, left_context_size, seq_token_counts)
 
             return audio_tensors
 
@@ -678,8 +698,15 @@ class Qwen3OmniMoeForConditionalGeneration(
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: dict[str, dict] = {}
-        # TODO(Peiqi): add voice_type support
-        voice_type = self.voice_type
+
+        voice_type = info_dict.get("voice_type")
+        logger.info(f"voice_type: {voice_type}")
+        if voice_type is not None and isinstance(voice_type, (list, tuple)) and len(voice_type) > 0:
+            voice_type = voice_type[0]
+        if not isinstance(voice_type, str) or not voice_type.strip():
+            voice_type = getattr(self, "voice_type", None) or self.default_tts_text_spk_type
+        else:
+            voice_type = str(voice_type).strip()
         start_index = info_dict.get("num_processed_tokens", 0)
         end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill

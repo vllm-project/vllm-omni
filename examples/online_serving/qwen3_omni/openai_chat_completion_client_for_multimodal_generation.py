@@ -404,6 +404,9 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
     if args.query_type == "use_audio_in_video":
         extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
 
+    if getattr(args, "voice", None) and args.voice.strip():
+        extra_body["voice"] = args.voice.strip()
+
     if args.modalities is not None:
         output_modalities = args.modalities.split(",")
     else:
@@ -545,6 +548,12 @@ def parse_args():
         type=str,
         default="localhost",
         help="Host/IP of the vLLM Omni API server.",
+    )
+    parser.add_argument(
+        "--voice",
+        type=str,
+        default=None,
+        help="TTS speaker/voice for audio output (e.g. Ethan, Vivian). Passed via extra_body to the talker stage.",
     )
     return parser.parse_args()
 

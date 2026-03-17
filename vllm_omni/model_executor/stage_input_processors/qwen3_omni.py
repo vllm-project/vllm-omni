@@ -83,6 +83,46 @@ def _validate_stage_inputs(stage_list, engine_input_source):
 # =========================
 
 
+def _extract_voice_type_from_request(request: Any) -> str | None:
+    """Extract voice_type from a request's additional_information field.
+
+    Returns the voice_type as a single-element list (for serialization
+    compatibility), or None if not present.
+    """
+    additional_information = getattr(request, "additional_information", None)
+    if additional_information is None:
+        return None
+    entries = getattr(additional_information, "entries", None)
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get("voice_type")
+    if entry is None:
+        return None
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, list) and list_data:
+        return list_data[0]
+    return None
+
+
+def _extract_voice_type_from_prompt(
+    prompt: OmniTokensPrompt | TextPrompt | list[Any] | None,
+    index: int = 0,
+) -> str | None:
+    if prompt is None:
+        return None
+    p = prompt[index] if isinstance(prompt, list) and index < len(prompt) else prompt
+    if p is None:
+        return None
+    print(f"_extract_voice_type_from_prompt p: {p}")
+    add_info = p.get("additional_information")
+    if not isinstance(add_info, dict):
+        return None
+    voice_type = add_info.get("voice_type")
+    if isinstance(voice_type, list) and voice_type:
+        return voice_type
+    return None
+
+
 def thinker2talker_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
@@ -115,6 +155,9 @@ def thinker2talker_async_chunk(
             "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
+        voice_type = _extract_voice_type_from_request(request)
+        if voice_type is not None:
+            talker_additional_info["voice_type"] = voice_type
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
                 transfer_manager.request_payload[request_id] = talker_additional_info
@@ -140,6 +183,10 @@ def thinker2talker_async_chunk(
         talker_additional_info = {
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
+        voice_type = _extract_voice_type_from_request(request)
+        if voice_type is not None:
+            talker_additional_info["voice_type"] = voice_type
+
         if output_token_ids:
             talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
             talker_additional_info["thinker_decode_embeddings"] = pooling_output.get("0").detach().cpu()
@@ -148,6 +195,7 @@ def thinker2talker_async_chunk(
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
             talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
             talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
+
     return talker_additional_info
 
 
@@ -180,7 +228,7 @@ def thinker2talker(
     device = torch.device(current_platform.device_type)
 
     # Process each thinker output
-    for thinker_output in thinker_outputs:
+    for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
 
         info = {
@@ -195,6 +243,9 @@ def thinker2talker(
             "tts_eos_embed": output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
             "tts_pad_embed": output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
         }
+        voice_type = _extract_voice_type_from_prompt(prompt, index=i)
+        if voice_type is not None:
+            info["voice_type"] = voice_type
 
         prompt_len = _compute_talker_prompt_ids_length(info, device=device)
 
