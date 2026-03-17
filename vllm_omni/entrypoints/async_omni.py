@@ -20,6 +20,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length, try_send_via_connector
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
+from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import OmniBase
 from vllm_omni.entrypoints.omni_stage import OmniStage
@@ -28,7 +29,7 @@ from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
 )
-from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
 
 # Internal imports (our code)
 from vllm_omni.lora.request import LoRARequest
@@ -125,6 +126,9 @@ class AsyncOmni(OmniBase):
         # Used to avoid race condition between output_handler and collective_rpc
         self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
 
+        # CFG companion → parent request ID mapping for output routing
+        self._companion_to_parent: dict[str, str] = {}
+
         super().__init__(model, **kwargs)
 
         # Register weak reference cleanup (called on garbage collection)
@@ -139,6 +143,15 @@ class AsyncOmni(OmniBase):
             self._zmq_ctx,
             getattr(self, "_inline_engine", None),
         )
+
+    async def get_supported_tasks(self) -> set[str]:
+        """Return supported tasks based on stage output modalities and capabilities."""
+        tasks: set[str] = set()
+        if "text" in self.output_modalities or any(stage.is_comprehension for stage in self.stage_list):
+            tasks.add("generate")
+        if "audio" in self.output_modalities:
+            tasks.add("speech")
+        return tasks
 
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
@@ -212,6 +225,7 @@ class AsyncOmni(OmniBase):
                     "enforce_eager": kwargs.get("enforce_eager", False),
                     "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+                    "quantization": kwargs.get("quantization", None),
                     "worker_extension_cls": kwargs.get("worker_extension_cls", None),
                     "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
@@ -380,6 +394,19 @@ class AsyncOmni(OmniBase):
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
+
+            # Ensure modalities is in the prompt dict for CFG expansion
+            # (offline path includes it; online serving passes it separately)
+            if isinstance(prompt, dict) and output_modalities and "modalities" not in prompt:
+                prompt["modalities"] = output_modalities
+
+            # CFG companion tracking (prompt expansion + lifecycle management)
+            cfg = CfgCompanionTracker(
+                prompt_expand_func=getattr(self.stage_list[0], "prompt_expand_func", None),
+                stage0_sampling_params=sampling_params_list[0],
+            )
+            expanded_companions = cfg.expand_prompts({request_id: prompt})
+
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
             task = {
                 "request_id": request_id,
@@ -387,6 +414,18 @@ class AsyncOmni(OmniBase):
                 "sampling_params": sp0,
             }
             self.stage_list[0].submit(task)
+
+            # Submit CFG companion requests to stage-0
+            if cfg.is_active:
+                for companion_id, companion_prompt in expanded_companions:
+                    self._companion_to_parent[companion_id] = request_id
+                    companion_task = {
+                        "request_id": companion_id,
+                        "engine_inputs": companion_prompt,
+                        "sampling_params": cfg.stage0_sampling_params,
+                    }
+                    self.stage_list[0].submit(companion_task)
+
             metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
             _req_start_ts[request_id] = time.time()
             logger.info(
@@ -412,6 +451,7 @@ class AsyncOmni(OmniBase):
                     final_stage_id_for_e2e,
                     sampling_params_list,
                     prompt,
+                    cfg=cfg,
                 ):
                     yield output
 
@@ -431,6 +471,9 @@ class AsyncOmni(OmniBase):
                 logger.exception(f"[{self._name}] Request {request_id} Failed to finalized/build/log summary: {e}")
             finally:
                 self.request_states.pop(request_id, None)
+                if cfg.is_active:
+                    for cid in cfg.get_companion_request_ids(request_id).values():
+                        self._companion_to_parent.pop(cid, None)
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
             logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
@@ -594,12 +637,29 @@ class AsyncOmni(OmniBase):
         final_stage_id_for_e2e: int,
         sampling_params_list: list[SamplingParams],
         prompt: Any,
+        cfg: CfgCompanionTracker | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
+            cfg_stage0 = stage_id == 0 and cfg is not None and cfg.is_active
             finished = False
-            while not finished:
+
+            while True:
+                if finished and (
+                    not cfg_stage0 or cfg.all_companions_done(request_id) or cfg.is_parent_failed(request_id)
+                ):
+                    break
+
                 result = await req_state.queue.get()
-                assert stage_id == req_state.stage_id
+
+                if cfg is not None and cfg.is_companion(result.get("request_id", "")):
+                    if cfg_stage0:
+                        rid = result.get("request_id")
+                        if "error" in result:
+                            cfg.on_companion_error(rid)
+                        else:
+                            cfg.on_companion_completed(rid)
+                    continue
+
                 engine_outputs, finished, output_to_yield = self._process_single_result(
                     result,
                     stage,
@@ -619,6 +679,16 @@ class AsyncOmni(OmniBase):
                 with metrics.stage_postprocess_timer(stage_id, request_id):
                     next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                 sp_next: SamplingParams = sampling_params_list[next_stage_id]
+
+                if cfg is not None and cfg.is_active and not cfg.is_parent_failed(request_id):
+                    if isinstance(sp_next, OmniDiffusionSamplingParams):
+                        sp_next = copy.deepcopy(sp_next)
+                        sp_next.cfg_kv_request_ids = cfg.get_companion_request_ids(request_id)
+                        logger.info(
+                            "Attaching cfg_kv_request_ids=%s to request %s",
+                            sp_next.cfg_kv_request_ids,
+                            request_id,
+                        )
 
                 # Check if we have a connector for this edge
                 connector_key = (str(stage_id), str(next_stage_id))
@@ -738,6 +808,7 @@ class AsyncOmni(OmniBase):
 
         stage_list = self.stage_list
         request_states = self.request_states
+        companion_to_parent = self._companion_to_parent
 
         async def output_handler():
             try:
@@ -764,6 +835,10 @@ class AsyncOmni(OmniBase):
                             continue
                         req_id = result.get("request_id")
                         req_state = request_states.get(req_id)
+                        if req_state is None:
+                            parent_id = companion_to_parent.get(req_id)
+                            if parent_id is not None:
+                                req_state = request_states.get(parent_id)
                         if req_state is None:
                             logger.debug(
                                 f"[{self._name}] Request may have been aborted; \
@@ -830,16 +905,6 @@ class AsyncOmni(OmniBase):
         for stage in self.stage_list:
             stage.submit(abort_task)
         return None
-
-    async def get_supported_tasks(self) -> set[str]:
-        tasks: set[str] = set()
-        has_comprehension = any(stage.is_comprehension for stage in self.stage_list)
-        if has_comprehension:
-            tasks.add("generate")
-        for stage in self.stage_list:
-            if getattr(stage, "final_output_type", None) == "audio":
-                tasks.add("speech")
-        return tasks if tasks else {"generate"}
 
     async def get_vllm_config(self) -> VllmConfig:
         for stage in self.stage_list:

@@ -366,7 +366,7 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
         )
         self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self._execution_device)
         self.tokenizer = PixtralProcessor.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
         )

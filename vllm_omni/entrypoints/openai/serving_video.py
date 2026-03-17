@@ -4,28 +4,34 @@
 from __future__ import annotations
 
 import time
-import uuid
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, cast
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException
 from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoData,
     VideoGenerationRequest,
     VideoGenerationResponse,
 )
-from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference, encode_video_base64
+from vllm_omni.entrypoints.openai.video_api_utils import encode_video_base64
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class ReferenceImage:
+    """Reference class for tracking additional metadata if needed"""
+
+    data: Image.Image
 
 
 class OmniOpenAIServingVideo:
@@ -40,6 +46,18 @@ class OmniOpenAIServingVideo:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+
+    @property
+    def model_name(self) -> str | None:
+        return self._model_name
+
+    @property
+    def stage_configs(self) -> list[Any] | None:
+        return self._stage_configs
+
+    def set_stage_configs_if_missing(self, stage_configs: list[Any] | None) -> None:
+        if self._stage_configs is None and stage_configs is not None:
+            self._stage_configs = stage_configs
 
     @classmethod
     def for_diffusion(
@@ -57,57 +75,32 @@ class OmniOpenAIServingVideo:
     async def generate_videos(
         self,
         request: VideoGenerationRequest,
-        raw_request: Request | None = None,
+        reference_id: str,
         *,
-        input_reference_bytes: bytes | None = None,
+        reference_image: ReferenceImage | None = None,
     ) -> VideoGenerationResponse:
-        if request.stream:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="Streaming video generation is not supported yet.",
-            )
-
-        request_id = f"video_gen_{uuid.uuid4().hex}"
-        model_name = self._resolve_model_name(raw_request)
-
-        if request.model is not None and model_name is not None and request.model != model_name:
-            logger.warning(
-                "Model mismatch: request specifies '%s' but server is running '%s'. Using server model.",
-                request.model,
-                model_name,
-            )
-
-        prompt: OmniTextPrompt = {"prompt": request.prompt}
+        prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        input_image = None
-        try:
-            input_image = decode_input_reference(request.input_reference, input_reference_bytes)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail=str(exc),
-            ) from exc
+        gen_params = OmniDiffusionSamplingParams()
 
-        gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-
-        width, height, num_frames, fps = self._resolve_video_params(request)
-        if input_image is not None and width is not None and height is not None:
-            target_size = (width, height)
+        input_image = None if reference_image is None else reference_image.data
+        vp = request.resolve_video_params()
+        if input_image is not None and vp.width is not None and vp.height is not None:
+            target_size = (vp.width, vp.height)
             if input_image.size != target_size:
                 input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)
         if input_image is not None:
             prompt["multi_modal_data"] = {"image": input_image}
-
-        if width is not None and height is not None:
-            gen_params.width = width
-            gen_params.height = height
-        if num_frames is not None:
-            gen_params.num_frames = num_frames
-        if fps is not None:
-            gen_params.fps = fps
-            gen_params.frame_rate = float(fps)
+        if vp.width is not None and vp.height is not None:
+            gen_params.width = vp.width
+            gen_params.height = vp.height
+        if vp.num_frames is not None:
+            gen_params.num_frames = vp.num_frames
+        if vp.fps is not None:
+            gen_params.fps = vp.fps
+            gen_params.frame_rate = float(vp.fps)
 
         if request.num_inference_steps is not None:
             gen_params.num_inference_steps = request.num_inference_steps
@@ -140,12 +133,12 @@ class OmniOpenAIServingVideo:
             gen_params.seed,
         )
 
-        result = await self._run_generation(prompt, gen_params, request_id, raw_request)
+        result = await self._run_generation(prompt, gen_params, reference_id)
         _t_encode_start = time.perf_counter()
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
-        output_fps = fps or 24
         audio_sample_rate = self._resolve_audio_sample_rate(result)
+        output_fps = vp.fps or 24
 
         video_data = [
             VideoData(
@@ -165,37 +158,6 @@ class OmniOpenAIServingVideo:
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
         return VideoGenerationResponse(created=int(time.time()), data=video_data)
-
-    def _resolve_model_name(self, raw_request: Request | None) -> str | None:
-        if self._model_name:
-            return self._model_name
-        if raw_request is None:
-            return None
-        serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
-        if serving_models and getattr(serving_models, "base_model_paths", None):
-            base_paths = serving_models.base_model_paths
-            if base_paths:
-                return base_paths[0].name
-        return None
-
-    @staticmethod
-    def _resolve_video_params(request: VideoGenerationRequest) -> tuple[int | None, int | None, int | None, int | None]:
-        width = request.width or (request.video_params.width if request.video_params else None)
-        height = request.height or (request.video_params.height if request.video_params else None)
-        num_frames = request.num_frames or (request.video_params.num_frames if request.video_params else None)
-        fps = request.fps or (request.video_params.fps if request.video_params else None)
-        seconds = request.seconds
-
-        if request.size:
-            width, height = parse_size(request.size)
-
-        if fps is None:
-            fps = 24  # Default FPS if not specified
-
-        if num_frames is None and seconds is not None:
-            num_frames = int(seconds) * int(fps)
-
-        return width, height, num_frames, fps
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
@@ -237,22 +199,15 @@ class OmniOpenAIServingVideo:
         prompt: OmniTextPrompt,
         gen_params: OmniDiffusionSamplingParams,
         request_id: str,
-        raw_request: Request | None,
     ) -> Any:
         has_stage_list = hasattr(self._engine_client, "stage_list")
         logger.info(
             "Video generation routing: stage_configs=%s, has_stage_list=%s, engine_type=%s",
-            "present"
-            if (self._stage_configs or (getattr(raw_request.app.state, "stage_configs", None) if raw_request else None))
-            else "missing",
+            "present" if self._stage_configs else "missing",
             has_stage_list,
             type(self._engine_client).__name__,
         )
-        stage_configs = (
-            self._stage_configs
-            or (getattr(raw_request.app.state, "stage_configs", None) if raw_request else None)
-            or getattr(self._engine_client, "stage_configs", None)
-        )
+        stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
 
         if not stage_configs:
             if not hasattr(self._engine_client, "stage_list"):

@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from vllm.utils import random_uuid
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.metadata_manager import MetadataManager
 from vllm_omni.entrypoints.openai.protocol.audio import (
+    AudioResponse,
     CreateAudio,
     OpenAICreateSpeechRequest,
 )
@@ -27,8 +29,8 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
-# TTS Configuration (currently supports Qwen3-TTS)
-_TTS_MODEL_STAGES: set[str] = {"qwen3_tts"}
+# TTS Configuration
+_TTS_MODEL_STAGES: set[str] = {"qwen3_tts", "fish_speech_slow_ar"}
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -45,6 +47,47 @@ _TTS_LANGUAGES: set[str] = {
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
+
+
+def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """Create a WAV header with placeholder size values for streaming.
+
+    Uses 0xFFFFFFFF as placeholder for data size fields, which is accepted
+    by most audio clients and matches OpenAI's streaming WAV implementation.
+
+    Args:
+        sample_rate: Audio sample rate in Hz
+        num_channels: Number of audio channels (1 for mono, 2 for stereo)
+        bits_per_sample: Bits per sample (typically 16)
+
+    Returns:
+        44-byte WAV header as bytes
+    """
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+
+    # Use 0xFFFFFFFF as placeholder for unknown size (streaming)
+    placeholder_size = 0xFFFFFFFF
+
+    # ref https://docs.fileformat.com/audio/wav/
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",  # ChunkID
+        placeholder_size,  # ChunkSize (placeholder)
+        b"WAVE",  # Format
+        b"fmt ",  # Subchunk1ID
+        16,  # Subchunk1Size (16 for PCM)
+        1,  # AudioFormat (1 for PCM)
+        num_channels,  # NumChannels
+        sample_rate,  # SampleRate
+        byte_rate,  # ByteRate
+        block_align,  # BlockAlign
+        bits_per_sample,  # BitsPerSample
+        b"data",  # Subchunk2ID
+        placeholder_size,  # Subchunk2Size (placeholder)
+    )
+
+    return header
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -97,6 +140,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Find and cache the TTS stage (if any) during initialization
         self._tts_stage = self._find_tts_stage()
         self._is_tts = self._tts_stage is not None
+        self._is_fish_speech = (
+            self._tts_stage is not None and getattr(self._tts_stage, "model_stage", None) == "fish_speech_slow_ar"
+        )
+        self._fish_speech_tokenizer = None
 
         # Cache TTS configuration values (computed once, reused per request)
         self._max_instructions_length = self._compute_max_instructions_length()
@@ -574,8 +621,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             wav_np = np.mean(wav_np, axis=-1)
         return wav_np.tolist(), int(sr)
 
-    async def _generate_pcm_chunks(self, generator, request_id: str):
-        """Generate PCM audio chunks for streaming response.
+    async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
+        """Generate audio chunks for streaming response.
 
         Handles two audio output modes from the engine:
         - Cumulative mode (list): Engine returns growing list of chunks;
@@ -586,12 +633,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Args:
             generator: Async generator from the engine
             request_id: Request identifier for logging
+            response_format: Audio format (pcm or wav)
 
         Yields:
-            Raw PCM bytes for each audio chunk
+            Raw audio bytes for each chunk (with WAV header for first chunk if wav format)
         """
         prev_count = 0
         sample_rate_val = 24000
+        first_chunk = True
+
         try:
             async for res in generator:
                 audio_output, audio_key = self._extract_audio_output(res)
@@ -622,6 +672,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    # For WAV format, emit header before first audio chunk
+                    if response_format == "wav" and first_chunk:
+                        # Assert that sample rate has been set from chunk metadata (not just default)
+                        # This ensures the WAV header contains the correct sample rate
+                        assert sr_raw is not None, (
+                            "First audio chunk must include sample rate metadata for WAV streaming"
+                        )
+                        wav_header = _create_wav_header(sample_rate=sample_rate_val, num_channels=1, bits_per_sample=16)
+                        yield wav_header
+                        first_chunk = False
+
+                    # Convert audio to PCM bytes
                     audio_obj = CreateAudio(
                         audio_tensor=chunk_np,
                         sample_rate=sample_rate_val,
@@ -636,6 +698,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise
         except Exception as e:
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
+            raise
 
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
@@ -650,7 +713,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             mm = getattr(ro, "multimodal_output", None) if ro else None
         if not mm:
             return None, None
-        key = "audio" if "audio" in mm else None
+        key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -721,6 +784,194 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return params
 
+    def _build_fish_speech_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+        ref_audio_data: tuple[list[float], int] | None = None,
+    ) -> dict[str, Any]:
+        """Build prompt for Fish Speech S2 Pro.
+
+        Without voice cloning:
+          <|im_start|>user\\n<|speaker:0|>{text}<|im_end|>\\n<|im_start|>assistant\\n<|voice|>
+
+        With voice cloning (ref_audio + ref_text):
+          <|im_start|>system\\n<|speaker:0|>{ref_text}<|audio_start|>{semantic_tokens}<|audio_end|><|im_end|>
+          <|im_start|>user\\n<|speaker:0|>{text}<|im_end|>\\n<|im_start|>assistant\\n<|voice|>
+        """
+        from transformers import AutoTokenizer
+
+        if self._fish_speech_tokenizer is None:
+            model_name = self.engine_client.model_config.model
+            self._fish_speech_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+        tokenizer = self._fish_speech_tokenizer
+        model_name = self.engine_client.model_config.model
+
+        if ref_audio_data is not None and request.ref_text:
+            # Voice cloning: encode reference audio and build system message.
+            from vllm_omni.model_executor.models.fish_speech.dac_encoder import (
+                encode_reference_audio,
+            )
+
+            wav_samples, sr = ref_audio_data
+            semantic_token_ids = encode_reference_audio(model_name, wav_samples, sr)
+
+            # Build system message with ref text + audio tokens.
+            audio_start_id = tokenizer.encode("<|audio_start|>", add_special_tokens=False)
+            audio_end_id = tokenizer.encode("<|audio_end|>", add_special_tokens=False)
+
+            # System content: <|speaker:0|>{ref_text}<|audio_start|>{codes}<|audio_end|>
+            prefix_text = f"<|speaker:0|>{request.ref_text}"
+            prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+            system_content_ids = prefix_ids + audio_start_id + semantic_token_ids + audio_end_id
+
+            # Manually build system turn: <|im_start|>system\n{content}<|im_end|>\n
+            im_start = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+            im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+            system_tag = tokenizer.encode("system\n", add_special_tokens=False)
+            newline = tokenizer.encode("\n", add_special_tokens=False)
+            system_ids = im_start + system_tag + system_content_ids + im_end + newline
+
+            # User turn via chat template.
+            user_text = f"<|speaker:0|>{request.input}"
+            user_messages = [{"role": "user", "content": user_text}]
+            user_ids = tokenizer.apply_chat_template(user_messages, tokenize=True, add_generation_prompt=True)
+            prompt_ids = system_ids + user_ids
+        else:
+            # No voice cloning: simple user message.
+            user_text = f"<|speaker:0|>{request.input}"
+            messages = [{"role": "user", "content": user_text}]
+            prompt_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+
+        # Append <|voice|> token to signal voice generation.
+        voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
+        prompt_ids = prompt_ids + voice_token_id
+
+        additional_information: dict[str, Any] = {
+            "text": [request.input],
+            "max_new_tokens": [request.max_new_tokens or 4096],
+        }
+
+        return {
+            "prompt_token_ids": prompt_ids,
+            "additional_information": additional_information,
+        }
+
+    async def _prepare_speech_generation(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> tuple[str, Any, dict[str, Any]]:
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        if self._is_fish_speech:
+            if not request.input or not request.input.strip():
+                raise ValueError("Input text cannot be empty")
+            ref_audio_data = None
+            if request.ref_audio is not None:
+                if not request.ref_text or not request.ref_text.strip():
+                    raise ValueError("Voice cloning requires 'ref_text' (transcript of the reference audio)")
+                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                ref_audio_data = (wav_list, sr)
+            prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
+            tts_params = {}
+        elif self._is_tts:
+            validation_error = self._validate_tts_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+
+            tts_params = self._build_tts_params(request)
+            if request.ref_audio is not None:
+                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                tts_params["ref_audio"] = [[wav_list, sr]]
+
+            ph_len = self._estimate_prompt_len(tts_params)
+            prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
+        else:
+            tts_params = {}
+            prompt = {"prompt": request.input}
+
+        request_id = f"speech-{random_uuid()}"
+        model_type = (
+            "fish_speech"
+            if self._is_fish_speech
+            else tts_params.get("task_type", ["unknown"])[0]
+            if self._is_tts
+            else "generic"
+        )
+        logger.info(
+            "TTS speech request %s: text=%r, model=%s",
+            request_id,
+            request.input[:50] + "..." if len(request.input) > 50 else request.input,
+            model_type,
+        )
+
+        sampling_params_list = self.engine_client.default_sampling_params_list
+
+        # Override Stage-0 max_tokens if caller specified max_new_tokens (Fish Speech).
+        if self._is_fish_speech and request.max_new_tokens is not None and sampling_params_list:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].max_tokens = request.max_new_tokens
+
+        generator = self.engine_client.generate(
+            prompt=prompt,
+            request_id=request_id,
+            sampling_params_list=sampling_params_list,
+            output_modalities=["audio"],
+        )
+        return request_id, generator, tts_params
+
+    async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
+        """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
+        request_id, generator, _ = await self._prepare_speech_generation(request)
+        async for chunk in self._generate_pcm_chunks(generator, request_id):
+            yield chunk
+
+    async def _generate_audio_bytes(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> tuple[bytes, str]:
+        request_id, generator, _ = await self._prepare_speech_generation(request)
+
+        final_output: OmniRequestOutput | None = None
+        async for res in generator:
+            final_output = res
+
+        if final_output is None:
+            raise ValueError("No output generated from the model.")
+
+        audio_output, audio_key = self._extract_audio_output(final_output)
+        if audio_key is None:
+            raise ValueError("TTS model did not produce audio output.")
+
+        audio_tensor = audio_output[audio_key]
+        sr_raw = audio_output.get("sr", 24000)
+        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+        sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+
+        if isinstance(audio_tensor, list):
+            import torch
+
+            audio_tensor = torch.cat(audio_tensor, dim=-1)
+        if hasattr(audio_tensor, "float"):
+            audio_tensor = audio_tensor.float().detach().cpu().numpy()
+
+        if audio_tensor.ndim > 1:
+            audio_tensor = audio_tensor.squeeze()
+
+        audio_obj = CreateAudio(
+            audio_tensor=audio_tensor,
+            sample_rate=sample_rate,
+            response_format=request.response_format or "wav",
+            speed=request.speed or 1.0,
+            stream_format=request.stream_format,
+            base64_encode=False,
+        )
+        audio_response: AudioResponse = self.create_audio(audio_obj)
+        return audio_response.audio_data, audio_response.media_type
+
     async def create_speech(
         self,
         request: OpenAICreateSpeechRequest,
@@ -742,97 +993,43 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
 
-        Streaming is supported via stream=True with response_format='pcm'.
-        Each Code2Wav chunk is yielded as raw PCM bytes as soon as it is decoded.
+        Streaming is supported via stream=True with response_format='pcm' or 'wav'.
+        Each Code2Wav chunk is yielded as raw audio bytes as soon as it is decoded.
+        For WAV format, a header with placeholder size values is emitted first.
         """
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
 
-        if self.engine_client.errored:
-            raise self.engine_client.dead_error
-
-        request_id = f"speech-{random_uuid()}"
-
         try:
-            if self._is_tts:
-                # Validate TTS parameters
-                validation_error = self._validate_tts_request(request)
-                if validation_error:
-                    return self.create_error_response(validation_error)
-
-                tts_params = self._build_tts_params(request)
-                if request.ref_audio is not None:
-                    wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                    tts_params["ref_audio"] = [[wav_list, sr]]
-
-                # Prompt length must match model-side embeddings; values are placeholders.
-                ph_len = self._estimate_prompt_len(tts_params)
-                prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
-            else:
-                tts_params = {}
-                prompt = {"prompt": request.input}
-
-            logger.info(
-                "TTS speech request %s: text=%r, task_type=%s",
-                request_id,
-                request.input[:50] + "..." if len(request.input) > 50 else request.input,
-                tts_params.get("task_type", ["unknown"])[0],
-            )
-
-            sampling_params_list = self.engine_client.default_sampling_params_list
-
-            generator = self.engine_client.generate(
-                prompt=prompt,
-                request_id=request_id,
-                sampling_params_list=sampling_params_list,
-                output_modalities=["audio"],
-            )
-
             if request.stream:
+                # Determine response format and media type for streaming
+                response_format = (request.response_format or "wav").lower()
+
+                # Only pcm and wav support streaming without post-processing
+                if response_format not in ["pcm", "wav"]:
+                    return self.create_error_response(
+                        f"Streaming is only supported for 'pcm' and 'wav' formats. "
+                        f"Got '{response_format}'. For other formats, use stream=False."
+                    )
+
+                # Check if speed adjustment is requested (not compatible with streaming)
+                if request.speed is not None and request.speed != 1.0:
+                    return self.create_error_response(
+                        "Streaming is not supported with speed adjustment. "
+                        "Use stream=False or remove the speed parameter."
+                    )
+
+                media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
+                request_id, generator, _ = await self._prepare_speech_generation(request)
                 return StreamingResponse(
-                    self._generate_pcm_chunks(generator, request_id),
-                    media_type="audio/pcm",
+                    self._generate_audio_chunks(generator, request_id, response_format),
+                    media_type=media_type,
                 )
 
-            # Non-streaming: collect final output
-            final_output: OmniRequestOutput | None = None
-            async for res in generator:
-                final_output = res
-
-            if final_output is None:
-                return self.create_error_response("No output generated from the model.")
-
-            audio_output, audio_key = self._extract_audio_output(final_output)
-            if audio_key is None:
-                return self.create_error_response("TTS model did not produce audio output.")
-
-            audio_tensor = audio_output[audio_key]
-            sr_raw = audio_output.get("sr", 24000)
-            sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-            sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-
-            # async_chunk mode accumulates chunks as a list; concat first.
-            if isinstance(audio_tensor, list):
-                import torch
-
-                audio_tensor = torch.cat(audio_tensor, dim=-1)
-            if hasattr(audio_tensor, "float"):
-                audio_tensor = audio_tensor.float().detach().cpu().numpy()
-            if audio_tensor.ndim > 1:
-                audio_tensor = audio_tensor.squeeze()
-
-            audio_obj = CreateAudio(
-                audio_tensor=audio_tensor,
-                sample_rate=sample_rate,
-                response_format=request.response_format or "wav",
-                speed=request.speed or 1.0,
-                stream_format=request.stream_format,
-                base64_encode=False,
-            )
-            audio_response = self.create_audio(audio_obj)
-            return Response(content=audio_response.audio_data, media_type=audio_response.media_type)
+            audio_bytes, media_type = await self._generate_audio_bytes(request)
+            return Response(content=audio_bytes, media_type=media_type)
 
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")

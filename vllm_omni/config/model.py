@@ -48,7 +48,7 @@ class OmniModelConfig(ModelConfig):
     stage_id: int = 0
     async_chunk: bool = False
     model_stage: str = "thinker"
-    model_arch: str = "Qwen2_5OmniForConditionalGeneration"
+    model_arch: str | None = None
     worker_type: str | None = None
     engine_output_type: str | None = None
     hf_config_name: str | None = None
@@ -69,7 +69,9 @@ class OmniModelConfig(ModelConfig):
 
     @property
     def architectures(self) -> list[str]:
-        return [self.model_arch]
+        if self.model_arch is not None:
+            return [self.model_arch]
+        return super().architectures
 
     @property
     def embedding_size(self):

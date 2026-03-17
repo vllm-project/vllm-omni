@@ -69,7 +69,7 @@ The following table shows which models are currently supported by each accelerat
 | **FLUX.1-dev** | `black-forest-labs/FLUX.1-dev` | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
 | **NextStep-1.1** | `stepfun-ai/NextStep-1.1` | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ |
 | **FLUX.2-klein** | `black-forest-labs/FLUX.2-klein-4B` | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
-| **FLUX.2-dev** | `black-forest-labs/FLUX.2-dev` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **FLUX.2-dev** | `black-forest-labs/FLUX.2-dev` | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
 
 ### VideoGen
 
@@ -77,6 +77,7 @@ The following table shows which models are currently supported by each accelerat
 |-------|------------------|:--------:|:---------:|:----------:|:--------------:|:------------:|:----:|:----:|
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **LTX-2** | `Lightricks/LTX-2` | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| **DreamID-Omni** | `XuGuo699/DreamID-Omni` | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
 
 ### Quantization
 

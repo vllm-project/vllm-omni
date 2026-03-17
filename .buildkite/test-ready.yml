@@ -34,15 +34,7 @@ steps:
   - label: "Diffusion Model CPU offloading Test"
     depends_on: upload-ready-pipeline
     commands:
-      - |
-        timeout 20m bash -c '
-          set +e
-          pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
-          EXIT1=$$?
-          pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
-          EXIT2=$$?
-          exit $$((EXIT1 | EXIT2))
-        '
+      - timeout 10m pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -269,39 +261,117 @@ steps:
   #                 path: /mnt/hf-cache
   #                 type: DirectoryOrCreate
 
-  # - label: "Bagel Text2Img Model Test with H100"
-  #   depends_on: upload-ready-pipeline
-  #   commands:
-  #     - |
-  #       timeout 30m bash -c '
-  #         export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  #         pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py
-  #       '
-  #   agents:
-  #     queue: "mithril-h100-pool"
-  #   plugins:
-  #     - kubernetes:
-  #         podSpec:
-  #           containers:
-  #             - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-  #               resources:
-  #                 limits:
-  #                   nvidia.com/gpu: 1
-  #               volumeMounts:
-  #                 - name: devshm
-  #                   mountPath: /dev/shm
-  #                 - name: hf-cache
-  #                   mountPath: /root/.cache/huggingface
-  #               env:
-  #                 - name: HF_HOME
-  #                   value: /root/.cache/huggingface
-  #           nodeSelector:
-  #             node.kubernetes.io/instance-type: gpu-h100-sxm
-  #           volumes:
-  #             - name: devshm
-  #               emptyDir:
-  #                 medium: Memory
-  #             - name: hf-cache
-  #               hostPath:
-  #                 path: /mnt/hf-cache
-  #                 type: DirectoryOrCreate
+  - label: "Bagel Text2Img Model Test with H100"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 30m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  - label: "Bagel Img2Img Model Test with H100"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 30m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  - label: "Bagel Online Serving Test with H100"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 40m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          export VLLM_IMAGE_FETCH_TIMEOUT=60
+          pytest -s -v tests/e2e/online_serving/test_bagel_online.py
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
