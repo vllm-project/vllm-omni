@@ -67,6 +67,7 @@ class OmniEngineArgs(EngineArgs):
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
             If not specified, will be inferred from model path.
+        model_extra_config: Optional dictionary for model-specific extra configuration.
     """
 
     stage_id: int = 0
@@ -81,6 +82,7 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     worker_type: str | None = None
     task_type: str | None = None
+    model_extra_config: dict | None = None
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
@@ -205,6 +207,7 @@ class OmniEngineArgs(EngineArgs):
             stage_connector_config=stage_connector_config,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
+            model_extra_config=self.model_extra_config,
         )
         omni_config.hf_config.architectures = omni_config.architectures
 

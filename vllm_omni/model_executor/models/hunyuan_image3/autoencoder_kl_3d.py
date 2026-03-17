@@ -461,7 +461,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         shift_factor: float | None = None,
         downsample_match_channel: bool = True,
         upsample_match_channel: bool = True,
-        only_encoder: bool = False,
+        only_encoder: bool = True,  # Decoder never used in llm
         only_decoder: bool = False,
     ):
         super().__init__()

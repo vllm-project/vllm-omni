@@ -1201,6 +1201,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         # vae
         self.vae = AutoencoderKLConv3D.from_config(config.vae)
+        if vllm_config.model_config.model_extra_config is not None and vllm_config.model_config.model_extra_config.get(
+            "enable_spatial_tiling", False
+        ):
+            self.vae.enable_spatial_tiling()
         self.patch_embed = UNetDown(
             patch_size=config.patch_size,
             emb_channels=config.hidden_size,
@@ -1491,6 +1495,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             "guidance_emb",
             "timestep_r_emb",
         ]
+        if not hasattr(self.vae, "decoder"):
+            unexpected_keywords.append("vae.decoder")
         skip_prefixes.extend(unexpected_keywords)
         loader = AutoWeightsLoader(
             self,
