@@ -680,9 +680,15 @@ When you want to add L5-level stability test cases, you can refer to the followi
     "benchmark_params": [
         {
             "dataset_name": "random",
+            "backend": "openai-chat-omni",
+            "endpoint": "/v1/chat/completions",
             "duration_sec": 43200,
             "request_rate": 0.5,
-            "num_prompts_per_batch": 20
+            "num_prompts_per_batch": 20,
+            "random_input_len": 2500,
+            "random_output_len": 900,
+            "ignore_eos": true,
+            "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
         }
     ]
 }
@@ -733,7 +739,7 @@ All other optional parameters follow the same rules as the in Chapter 3.4.
 
 </details>
 
--   -   ***Stability***: Execution is driven by the configuration in `tests/dfx/stability/tests/test.json` (for each test entry and its benchmark_params).
+-   -   ***Stability***: `pytest -s -v tests/e2e/dfx/stability/scripts/test_{model_name}.py`
     -   ***Reliability***: `pytest -s -v tests/e2e/reliability/test_{model_name}.py`
 
 ## Summary
