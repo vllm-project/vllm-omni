@@ -99,14 +99,12 @@ def main() -> None:
 
     lines: list[str] = []
     for stage_outputs in outputs:
-        req_outputs = getattr(stage_outputs, "request_output", stage_outputs)
-        req_outputs = req_outputs if isinstance(req_outputs, list) else [req_outputs]
-        for ro in req_outputs:
-            text = ro.outputs[0].text if getattr(ro, "outputs", None) else str(ro)
-            lines.append(f"request_id: {getattr(ro, 'request_id', 'unknown')}\n")
-            lines.append("answer:\n")
-            lines.append(text.strip() + "\n")
-            lines.append("\n")
+        ro = getattr(stage_outputs, "request_output", stage_outputs)
+        text = ro.outputs[0].text if getattr(ro, "outputs", None) else str(ro)
+        lines.append(f"request_id: {getattr(ro, 'request_id', 'unknown')}\n")
+        lines.append("answer:\n")
+        lines.append(text.strip() + "\n")
+        lines.append("\n")
 
     print("\n".join(lines))
 

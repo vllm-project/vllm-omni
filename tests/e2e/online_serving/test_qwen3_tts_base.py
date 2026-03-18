@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 import httpx
+import numpy as np
 import pytest
 
 from tests.conftest import (
@@ -99,6 +100,34 @@ def assert_not_silence(pcm_bytes: bytes):
 
 
 MIN_AUDIO_BYTES = 10000
+MIN_HNR_DB = 1.2  # Clean voice clone > 1.2 dB; distorted < 1.0 dB
+
+
+def compute_hnr_db(pcm_samples: np.ndarray, sr: int = 24000) -> float:
+    """Compute mean Harmonic-to-Noise Ratio (dB) for speech quality.
+
+    Clean cloned speech has HNR > 1.2 dB; distorted speech (e.g. lost
+    ref_code decoder context) drops below 1.0 dB.
+    """
+    frame_len = int(0.03 * sr)  # 30ms frames
+    hop = frame_len // 2
+    hnr_values: list[float] = []
+
+    for start in range(0, len(pcm_samples) - frame_len, hop):
+        frame = pcm_samples[start : start + frame_len]
+        if np.max(np.abs(frame)) < 0.01:
+            continue
+        ac = np.correlate(frame, frame, mode="full")[len(frame) - 1 :]
+        ac = ac / (ac[0] + 1e-10)
+        min_lag = int(sr / 400)
+        max_lag = min(int(sr / 80), len(ac))
+        if min_lag >= max_lag:
+            continue
+        peak = float(np.max(ac[min_lag:max_lag]))
+        if 0 < peak < 1:
+            hnr_values.append(10 * np.log10(peak / (1 - peak + 1e-10)))
+
+    return float(np.mean(hnr_values)) if hnr_values else 0.0
 
 
 class TestQwen3TTSBaseVoiceClone:
@@ -165,3 +194,30 @@ class TestQwen3TTSBaseVoiceClone:
         assert response.headers.get("content-type") == "audio/wav"
         assert verify_wav_audio(response.content), "Response is not valid WAV"
         assert len(response.content) > MIN_AUDIO_BYTES
+
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
+    def test_base_voice_clone_no_distortion(self, omni_server) -> None:
+        """Audio must not be distorted (regression for ref_code context loss).
+
+        When the decoder loses ref_code speaker context on later streaming
+        chunks, HNR drops below 1.0 dB.  Clean voice clone should be > 1.2 dB.
+        See https://github.com/vllm-project/vllm-omni/issues/1944
+        """
+        response = make_base_speech_request(
+            host=omni_server.host,
+            port=omni_server.port,
+            response_format="pcm",
+        )
+
+        assert response.status_code == 200, f"Request failed: {response.text}"
+        assert len(response.content) > MIN_AUDIO_BYTES
+
+        pcm_samples = np.frombuffer(response.content, dtype=np.int16).astype(np.float32) / 32768.0
+        hnr = compute_hnr_db(pcm_samples)
+        print(f"Voice clone HNR: {hnr:.2f} dB (threshold: {MIN_HNR_DB} dB)")
+        assert hnr >= MIN_HNR_DB, (
+            f"Audio distortion detected: HNR={hnr:.2f} dB < {MIN_HNR_DB} dB. "
+            "Voice clone decoder may be losing ref_code speaker context on later chunks."
+        )

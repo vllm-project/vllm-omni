@@ -67,12 +67,12 @@ According to analysis for current popular open-source models, most of them have 
 | Component         | Description                                                                                                                              |
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | **OmniRouter**    | provide an intelligent router for Omni-modality requests dispatch                                                                        |
-| **EntryPoints**   | define the APIs for offline/online serving (APIServer, Omni/AsyncOmni) and provide the OmniStage abstraction for different AR/DiT stages |
+| **EntryPoints**   | define the APIs for offline/online serving (APIServer, Omni/AsyncOmni), while `AsyncOmniEngine` and `Orchestrator` coordinate multi-stage AR/DiT execution |
 | **AR**            | adapted for omni-modality models while inheriting efficient features from vLLM, such as cache management                                 |
 | **Diffusion**     | natively implemented and optimized using acceleration components                                                                         |
 | **OmniConnector** | supports fully disaggregation based on E/P/D/G (Encoding/Processing/Decoding/Generation) disaggregation across stages                    |
 
-Disaggregated stages are managed through configuration, such as in the Qwen3-Omni example, where stages like Thinker, Talker, and Code2wav are defined as separate OmniStage instances with specific resources and input/output type.
+Disaggregated stages are managed through stage configuration. In Qwen3-Omni, Thinker/Talker/Code2wav are declared as separate configured stages, and runtime routing is handled by `Orchestrator` over `StageEngineCoreClient` / `StageDiffusionClient`.
 
 ## Main features
 
@@ -127,10 +127,10 @@ Taking **Qwen3-Omni** as an example:
 The **Omni** class provides a Python interface for offline batched inference. Users initialize the Omni class with a Hugging Face model name and use the generate method, passing inputs that include both text prompts and multi-modal data:
 
 ```
-# Create an omni_lm with HF model name.
+# Create an omni runtime with HF model name.
 from vllm_omni.entrypoints.omni import Omni
 
-omni_lm = Omni(model="Qwen/Qwen3-Omni-30B-A3B-Instruct")
+omni = Omni(model="Qwen/Qwen3-Omni-30B-A3B-Instruct")
 
 # Example prompts.
 om_inputs = {"prompt": prompt,
@@ -140,7 +140,7 @@ om_inputs = {"prompt": prompt,
              }}
 
 # Generate texts and audio from the multi-modality inputs.
-outputs = omni_lm.generate(om_inputs, sampling_params_list)
+outputs = omni.generate(om_inputs, sampling_params_list)
 ```
 
 ## Online Serving
