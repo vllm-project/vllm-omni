@@ -302,6 +302,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
+            request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
 
     def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:

@@ -9,7 +9,7 @@ from PIL import Image
 from vllm_omni.entrypoints.omni import Omni
 
 """
-The tencent/HunyuanImage-3.0-Instruct base model is built on the Hunyuan v1 architecture, specifically the tencent/Hunyuan-A13B-Instruct model. It utilizes two tokenizer delimiter templates:
+The tencent/HunyuanImage-3.0-Instruct base model uses the tencent/Hunyuan-A13B-Instruct backbone. It utilizes two tokenizer delimiter templates:
 
 1) Pretrained template (default for gen_text mode), which concatenates system, image
    tokens, and user question WITHOUT role delimiters:
@@ -70,8 +70,8 @@ def main(args: argparse.Namespace) -> None:
     prompts = [prompt_dict]
     omni_outputs = omni.generate(prompts=prompts)
 
-    prompt_text = omni_outputs[0].request_output[0].prompt
-    generated_text = omni_outputs[0].request_output[0].outputs[0].text
+    prompt_text = omni_outputs[0].request_output.prompt
+    generated_text = omni_outputs[0].request_output.outputs[0].text
     print(f"Prompt: {prompt_text}")
     print(f"Text: {generated_text}")
 

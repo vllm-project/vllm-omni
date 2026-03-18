@@ -7,6 +7,7 @@ async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm
+    is_comprehension: true
     runtime:
       devices: "0"
       max_batch_size: 4

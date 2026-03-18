@@ -1,4 +1,4 @@
-# stage config for running mimo-audio with architecture of OmniLLM.
+# stage config for running mimo-audio for multi-stage omni runtime.
 
 # The following config has been verified on 1x H20-96G GPU.
 async_chunk: false
