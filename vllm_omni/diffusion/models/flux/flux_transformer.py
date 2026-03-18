@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
 
@@ -224,12 +224,7 @@ class FluxAttention(torch.nn.Module):
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
 
-        if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb  # [S, D/2]
-            cos = cos.to(query.dtype)
-            sin = sin.to(query.dtype)
-            query = self.rope(query, cos, sin)
-            key = self.rope(key, cos, sin)
+        query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
 
         hidden_states = self.attn(
             query,
@@ -475,6 +470,12 @@ class FluxTransformer2DModel(nn.Module):
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["FluxTransformerBlock"]
+
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return ("transformer_blocks" in name or "single_transformer_blocks" in name) and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],

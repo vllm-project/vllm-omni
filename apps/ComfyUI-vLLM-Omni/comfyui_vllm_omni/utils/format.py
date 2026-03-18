@@ -143,15 +143,7 @@ def video_to_base64(video: VideoInput, filename: str = "video.mp4") -> str:
     return f"data:{mime_type};base64,{base64_str}"
 
 
-def base64_to_video(base64_str: str) -> VideoInput:
-    if base64_str.startswith("data:video"):
-        _, base64_str = base64_str.split(",", 1)
-
-    try:
-        video_bytes = base64.b64decode(base64_str)
-    except Exception as e:
-        raise ValueError(f"Invalid base64 string: {e}")
-
+def bytes_to_video(video_bytes: bytes) -> VideoInput:
     video_buffer = BytesIO(video_bytes)
 
     try:
@@ -206,6 +198,18 @@ def base64_to_video(base64_str: str) -> VideoInput:
         raise RuntimeError(f"Failed to decode video: {e}")
 
     return InputImpl.VideoFromComponents(components)
+
+
+def base64_to_video(base64_str: str) -> VideoInput:
+    if base64_str.startswith("data:video"):
+        _, base64_str = base64_str.split(",", 1)
+
+    try:
+        video_bytes = base64.b64decode(base64_str)
+    except Exception as e:
+        raise ValueError(f"Invalid base64 string: {e}")
+
+    return bytes_to_video(video_bytes)
 
 
 def audio_to_bytes(audio: AudioInput, filename: str = "audio.mp3", quality: str = "128k") -> BytesIO:

@@ -5,9 +5,13 @@ import pytest
 
 from tests.conftest import OmniServerParams
 from tests.utils import hardware_test
+from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
+
+if current_omni_platform.is_xpu():
+    stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")]
 
 # Create parameter combinations for model and stage config
 test_params = [
@@ -17,7 +21,7 @@ test_params = [
 
 @pytest.mark.core_model
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "L4"}, num_cards=3)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=3)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bench_serve_chat(omni_server):
     command = [

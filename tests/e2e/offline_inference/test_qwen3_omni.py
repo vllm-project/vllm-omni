@@ -40,6 +40,8 @@ def get_cuda_graph_config():
 if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
+elif current_omni_platform.is_xpu():
+    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
 else:
     stage_configs = [get_cuda_graph_config()]
 
