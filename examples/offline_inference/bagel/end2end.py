@@ -34,7 +34,7 @@ def parse_args():
         help="Path to input image for img2img.",
     )
 
-    # OmniLLM init args
+    # Omni runtime init args
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
     parser.add_argument("--batch-timeout", type=int, default=5)
@@ -163,25 +163,17 @@ def main():
 
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 
-    for i, req_output in enumerate(omni_outputs):
+    img_idx = 0
+    for req_output in omni_outputs:
         images = getattr(req_output, "images", None)
-        if not images and hasattr(req_output, "output"):
-            if isinstance(req_output.output, list):
-                images = req_output.output
-            else:
-                images = [req_output.output]
+        if not images:
+            continue
 
-        if images:
-            for j, img in enumerate(images):
-                img.save(f"output_{i}_{j}.png")
-
-        if hasattr(req_output, "request_output") and req_output.request_output:
-            for stage_out in req_output.request_output:
-                if hasattr(stage_out, "images") and stage_out.images:
-                    for k, img in enumerate(stage_out.images):
-                        save_path = f"output_{i}_stage_{getattr(stage_out, 'stage_id', '?')}_{k}.png"
-                        img.save(save_path)
-                        print(f"[Info] Saved stage output image to {save_path}")
+        for j, img in enumerate(images):
+            save_path = f"output_{img_idx}_{j}.png"
+            img.save(save_path)
+            print(f"[Info] Saved image to {save_path}")
+        img_idx += 1
 
     print(omni_outputs)
 
