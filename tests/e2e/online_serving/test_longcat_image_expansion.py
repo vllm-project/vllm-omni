@@ -28,7 +28,6 @@ SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
-
 def _get_diffusion_feature_cases(model: str):
     return [
         pytest.param(
