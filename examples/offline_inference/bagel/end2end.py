@@ -174,27 +174,14 @@ def main():
     img_idx = 0
     for req_output in omni_outputs:
         images = getattr(req_output, "images", None)
-        if not images and hasattr(req_output, "output"):
-            if isinstance(req_output.output, list):
-                images = req_output.output
-            else:
-                images = [req_output.output]
 
-        if images:
-            for j, img in enumerate(images):
-                save_path = os.path.join(args.output, f"output_{i}_{j}.png")
-                img.save(save_path)
+        if not images:
+            continue
 
-        if hasattr(req_output, "request_output") and req_output.request_output:
-            for stage_out in req_output.request_output:
-                if hasattr(stage_out, "images") and stage_out.images:
-                    for k, img in enumerate(stage_out.images):
-                        save_path = os.path.join(
-                            args.output,
-                            f"output_{i}_stage_{getattr(stage_out, 'stage_id', '?')}_{k}.png",
-                        )
-                        img.save(save_path)
-                        print(f"[Info] Saved stage output image to {save_path}")
+        for j, img in enumerate(images):
+            save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
+            img.save(save_path)
+        img_idx += 1
 
     print(omni_outputs)
 
