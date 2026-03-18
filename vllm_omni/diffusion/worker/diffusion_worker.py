@@ -833,15 +833,17 @@ class WorkerWrapperBase:
         wake_event: mp.Event = None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        rank: int | None = None,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
 
         Args:
-            gpu_id: GPU device ID
+            gpu_id: GPU device ID (used as local_rank)
             od_config: OmniDiffusionConfig configuration
             worker_extension_cls: Optional qualified name of worker extension class
             custom_pipeline_args: Optional arguments for custom pipeline initialization
+            rank: Global rank. If None, defaults to gpu_id.
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
@@ -859,7 +861,7 @@ class WorkerWrapperBase:
         # sleep mode.
         self.worker = worker_class(
             local_rank=gpu_id,
-            rank=gpu_id,
+            rank=rank if rank is not None else gpu_id,
             od_config=od_config,
             skip_load_model=(self.custom_pipeline_args is not None),
         )

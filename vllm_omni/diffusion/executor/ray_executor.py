@@ -64,14 +64,17 @@ class RayDiffusionWorkerWrapper:
 
         load_omni_general_plugins()
 
-        from vllm_omni.diffusion.worker import DiffusionWorker
+        from vllm_omni.diffusion.worker.diffusion_worker import WorkerWrapperBase
 
         self.rpc_rank = int(os.environ["RANK"])
-        self.worker = DiffusionWorker(
-            local_rank=int(os.environ["LOCAL_RANK"]),
-            rank=self.rpc_rank,
+        wrapper = WorkerWrapperBase(
+            gpu_id=int(os.environ["LOCAL_RANK"]),
             od_config=od_config,
+            worker_extension_cls=od_config.worker_extension_cls,
+            custom_pipeline_args=getattr(od_config, "custom_pipeline_args", None),
+            rank=self.rpc_rank,
         )
+        self.worker = wrapper.worker
         self.od_config = od_config
 
     def execute_model(self, request: OmniDiffusionRequest) -> DiffusionOutput:
@@ -126,9 +129,10 @@ class RayDiffusionExecutor(DiffusionExecutor):
             logger.info("Using existing placement group")
             return current_pg
 
-        # Pin at least one bundle to the driver node
         bundles = [{"GPU": 1} for _ in range(num_gpus)]
-        bundles[0][f"node:{get_ip()}"] = 0.001
+        # Pin first bundle to the driver node if it has GPUs
+        if ray.cluster_resources().get("GPU", 0) > 0:
+            bundles[0][f"node:{get_ip()}"] = 0.001
 
         placement_group = ray.util.placement_group(bundles, strategy="PACK")
         logger.info(f"Waiting for placement group with {num_gpus} GPU bundles...")

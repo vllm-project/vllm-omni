@@ -42,9 +42,7 @@ def _generate(num_gpus: int, ulysses_degree: int = 1):
                 num_frames=NUM_FRAMES,
                 num_inference_steps=NUM_STEPS,
                 guidance_scale=1.0,
-                generator=torch.Generator(
-                    current_omni_platform.device_type
-                ).manual_seed(SEED),
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(SEED),
             ),
         )
         return outputs
@@ -62,7 +60,7 @@ def test_ray_executor_single_gpu():
     assert first_output.final_output_type == "image"
     assert first_output.request_output
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     assert isinstance(req_out, OmniRequestOutput)
 
     frames = req_out.images[0]
@@ -83,7 +81,7 @@ def test_ray_executor_parallel_ulysses():
     assert first_output.final_output_type == "image"
     assert first_output.request_output
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     assert isinstance(req_out, OmniRequestOutput)
 
     frames = req_out.images[0]

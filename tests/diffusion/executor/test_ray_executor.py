@@ -24,6 +24,7 @@ def mock_od_config(mocker: MockerFixture):
     config.ray_address = None
     config.distributed_executor_backend = "ray"
     config.worker_extension_cls = None
+    config.custom_pipeline_args = None
     return config
 
 
@@ -31,11 +32,12 @@ class TestRayDiffusionWorkerWrapper:
     """Test the Ray actor wrapper."""
 
     def test_init_worker(self, mocker: MockerFixture, mock_od_config):
-        """init_worker should create DiffusionWorker with env-based rank."""
+        """init_worker should create worker via WorkerWrapperBase."""
         mocker.patch("vllm_omni.plugins.load_omni_general_plugins")
-        mock_worker_cls = mocker.patch(
-            "vllm_omni.diffusion.worker.DiffusionWorker",
+        mock_wrapper_base = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.WorkerWrapperBase",
         )
+        mock_wrapper_base.return_value.worker = mocker.Mock()
 
         os.environ["RANK"] = "3"
         os.environ["LOCAL_RANK"] = "0"
@@ -46,8 +48,12 @@ class TestRayDiffusionWorkerWrapper:
             assert wrapper.rpc_rank == 3
             assert wrapper.worker is not None
             assert wrapper.od_config is mock_od_config
-            mock_worker_cls.assert_called_once_with(
-                local_rank=0, rank=3, od_config=mock_od_config,
+            mock_wrapper_base.assert_called_once_with(
+                gpu_id=0,
+                od_config=mock_od_config,
+                worker_extension_cls=mock_od_config.worker_extension_cls,
+                custom_pipeline_args=None,
+                rank=3,
             )
         finally:
             del os.environ["RANK"]
