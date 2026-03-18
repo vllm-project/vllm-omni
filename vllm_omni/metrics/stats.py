@@ -5,6 +5,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
+from numbers import Real
 from typing import Any
 
 from vllm.logger import init_logger
@@ -12,6 +13,16 @@ from vllm.logger import init_logger
 from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
 
 logger = init_logger(__name__)
+
+
+def _normalize_diffusion_metric_value(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Real):
+        return float(value)
+    return None
 
 
 @dataclass
@@ -39,7 +50,7 @@ class StageRequestStats:
     final_output_type: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, int] = None
+    diffusion_metrics: dict[str, int | float] = None
     audio_generated_frames: int = 0
 
     @property
@@ -329,7 +340,11 @@ class OrchestratorAggregator:
         stats.request_id = req_id
         stats.final_output_type = final_output_type
         stats.diffusion_metrics = (
-            {k: int(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
+            {
+                k: normalized_value
+                for k, v in self.diffusion_metrics.pop(req_id, {}).items()
+                if (normalized_value := _normalize_diffusion_metric_value(v)) is not None
+            }
             if req_id in self.diffusion_metrics
             else None
         )
@@ -395,7 +410,9 @@ class OrchestratorAggregator:
             diffusion_metrics = diffusion_metrics[0]
         if diffusion_metrics:
             for key, value in diffusion_metrics.items():
-                self.diffusion_metrics[req_id][key] += value
+                normalized_value = _normalize_diffusion_metric_value(value)
+                if normalized_value is not None:
+                    self.diffusion_metrics[req_id][key] += normalized_value
 
     def on_forward(
         self,

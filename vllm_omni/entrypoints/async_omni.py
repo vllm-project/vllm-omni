@@ -23,7 +23,7 @@ from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import OmniBase
-from vllm_omni.entrypoints.omni_stage import OmniStage
+from vllm_omni.entrypoints.omni_stage import OmniStage, make_request_stats
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
@@ -517,6 +517,7 @@ class AsyncOmni(OmniBase):
 
         try:
             loop = asyncio.get_running_loop()
+            gen_start_time = time.perf_counter()
             results = await loop.run_in_executor(
                 None,
                 self._inline_engine.generate,
@@ -524,6 +525,7 @@ class AsyncOmni(OmniBase):
                 sp0,
                 [request_id],
             )
+            gen_total_ms = (time.perf_counter() - gen_start_time) * 1000.0
 
             for result in results:
                 images = getattr(result, "images", None) or []
@@ -538,6 +540,25 @@ class AsyncOmni(OmniBase):
                 )
 
                 metrics.stage_last_ts[0] = time.time()
+                inline_stage_metrics = make_request_stats(
+                    [result],
+                    gen_total_ms,
+                    batch_id=0,
+                    batch_size=max(len(results), 1),
+                    rx_decode_time_ms=0.0,
+                    rx_transfer_bytes=0,
+                    rx_in_flight_time_ms=0.0,
+                )
+                metrics.process_stage_metrics(
+                    result={"metrics": inline_stage_metrics},
+                    stage_type=stage.stage_type,
+                    stage_id=0,
+                    req_id=request_id,
+                    engine_outputs=result,
+                    finished=finished,
+                    final_output_type=stage.final_output_type,
+                    output_to_yield=output_to_yield,
+                )
                 yield output_to_yield
 
             try:
