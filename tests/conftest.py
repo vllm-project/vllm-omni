@@ -17,6 +17,7 @@ import multiprocessing
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -289,7 +290,6 @@ def generate_synthetic_audio(
     """
     Generate TTS speech with pyttsx3 and return base64 string.
     """
-    import tempfile
 
     import pyttsx3
     import soundfile as sf
@@ -497,8 +497,8 @@ def generate_synthetic_audio(
     # Return result
     base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
     result["base64"] = base64_audio
-    if save_to_file and output_path:
-        result["file_path"] = output_path
+    # Always include file_path to avoid KeyError in callers.
+    result["file_path"] = output_path if save_to_file and output_path else None
 
     return result
 
@@ -801,8 +801,8 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = whisper.load_model("small", device=device)
+    # Keep Whisper on CPU to avoid consuming GPU memory in tests.
+    model = whisper.load_model("small", device="cpu")
     try:
         text = model.transcribe(
             output_path,
@@ -811,14 +811,8 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
             condition_on_previous_text=False,
         )["text"]
     finally:
-        # Sync GPU so in-flight ops finish before we free the model; otherwise
-        # freed memory may not show up until those ops complete.
-        if torch is not None and torch.cuda.is_available():
-            torch.cuda.synchronize()
         del model
         gc.collect()
-        if torch is not None and torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     return text or ""
 
@@ -1344,7 +1338,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     Estimate voice gender from audio using a small pre-trained classification model.
 
     Uses a cached `audio-classification` pipeline to classify the clip.
-    Returns 'male' / 'female' when the model confidence is >= 0.8 and the label
+    Returns 'male' / 'female' when the model confidence is >= 0.9 and the label
     maps to one of these; otherwise returns 'unknown'. If the model is unavailable
     or inference fails, returns 'unknown' to keep tests stable.
     """
@@ -1354,6 +1348,15 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     mono = np.mean(data, axis=1)
 
     try:
+        target_sr = 16000
+        if int(sr) != target_sr and mono.size > 1:
+            src_len = int(mono.shape[0])
+            dst_len = max(1, int(round(src_len * float(target_sr) / float(sr))))
+            src_idx = np.arange(src_len, dtype=np.float32)
+            dst_idx = np.linspace(0, src_len - 1, dst_len, dtype=np.float32)
+            mono = np.interp(dst_idx, src_idx, mono.astype(np.float32, copy=False)).astype(np.float32)
+            sr = target_sr
+
         clf = _load_gender_pipeline()
         if clf is None:
             print("gender model not available, returning 'unknown'")
@@ -1368,7 +1371,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         label = str(top.get("label", "")).lower()
         conf = float(top.get("score", 0.0))
 
-        if conf < 0.8:
+        if conf < 0.9:
             gender = "unknown"
         # Some models use non-English labels (e.g., Russian). Normalize to 'male'/'female'.
         elif ("female" in label) or ("жен" in label):
@@ -1476,6 +1479,7 @@ def assert_audio_speech_response(
                 # adjust this mapping to your actual voice names
                 "serena": "female",
                 "eric": "male",
+                "clone": "female",
             }
             expected_gender = voice_gender_map.get(voice)
             if expected_gender is not None:

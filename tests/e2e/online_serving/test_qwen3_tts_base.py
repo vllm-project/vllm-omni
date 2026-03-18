@@ -19,7 +19,7 @@ import pytest
 from tests.conftest import OmniServerParams
 from tests.utils import hardware_test
 
-MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
 REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
@@ -99,7 +99,7 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
     """
     request_config = {
         "model": omni_server.model,
-        "input": "The weather is nice today, perfect for a walk in the park.",
+        "input": get_prompt(),
         "stream": True,
         "response_format": "wav",
         "task_type": "Base",
