@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
@@ -136,10 +137,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
 
         # Align to target seq_len (may include SP padding)
         if vace_embeds.size(1) < seq_len:
-            padding = vace_embeds.new_zeros(vace_embeds.size(0), seq_len - vace_embeds.size(1), vace_embeds.size(2))
-            vace_embeds = torch.cat([vace_embeds, padding], dim=1)
-        elif vace_embeds.size(1) > seq_len:
-            vace_embeds = vace_embeds[:, vace_embeds.size(1) - seq_len :]
+            vace_embeds = F.pad(vace_embeds, (0, 0, 0, seq_len - vace_embeds.size(1)))
 
         if sp_size > 1:
             vace_embeds = sp_shard(vace_embeds, dim=1)

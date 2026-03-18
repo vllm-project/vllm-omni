@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-VACE (Video Creation and Editing) Pipeline for Wan2.1.
+VACE (Video Creation and Editing) Pipeline for WAN models.
 
 VACE is an all-in-one model for video creation and editing. The mode is
 determined by which inputs are provided (no explicit mode flag):
@@ -160,6 +160,47 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                 vace_in_channels=vace_in_channels,
             )
             self.transformer_config = self.transformer.config
+
+    def check_inputs(
+        self,
+        prompt,
+        negative_prompt,
+        height,
+        width,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        video=None,
+        mask=None,
+        reference_images=None,
+    ):
+        super().check_inputs(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+        )
+
+        # VACE-specific: validate video/mask/reference_images consistency
+        if video is not None:
+            if mask is not None and len(video) != len(mask):
+                raise ValueError(
+                    f"Length of `video` ({len(video)}) and `mask` ({len(mask)}) do not match. "
+                    "Please make sure that they have the same length."
+                )
+            if reference_images is not None:
+                is_pil_image = isinstance(reference_images, PIL.Image.Image)
+                is_list_of_pil_images = isinstance(reference_images, list) and all(
+                    isinstance(img, PIL.Image.Image) for img in reference_images
+                )
+                if not (is_pil_image or is_list_of_pil_images):
+                    raise ValueError(
+                        "`reference_images` has to be of type `PIL.Image.Image` or `list` of `PIL.Image.Image`, "
+                        f"but is {type(reference_images)}"
+                    )
+        elif mask is not None:
+            raise ValueError("`mask` can only be passed if `video` is passed as well.")
 
     def preprocess_conditions(
         self,
@@ -432,6 +473,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             width=width,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
+            video=source_video,
+            mask=source_mask,
+            reference_images=reference_images,
         )
 
         device = self.device
@@ -490,14 +534,15 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         else:
             vace_context = None
 
-        # Prepare noise latents
+        # Prepare noise latents (extra frames for reference images)
         num_channels_latents = self.transformer_config.in_channels
+        noise_num_frames = num_frames + num_reference_images * self.vae_scale_factor_temporal
         latents = self.prepare_latents(
-            batch_size=1,
+            batch_size=prompt_embeds.shape[0],
             num_channels_latents=num_channels_latents,
             height=height,
             width=width,
-            num_frames=num_frames,
+            num_frames=noise_num_frames,
             dtype=torch.float32,
             device=device,
             generator=generator,
