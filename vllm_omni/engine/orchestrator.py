@@ -122,6 +122,7 @@ class Orchestrator:
         stage_vllm_configs: list[Any],
         *,
         async_chunk: bool = False,
+        pd_config: dict[str, Any] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -133,6 +134,14 @@ class Orchestrator:
         self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
         self.stage_vllm_configs: list[Any] = stage_vllm_configs
+
+        # PD disaggregation state
+        self._pd_pair: tuple[int, int] | None = None
+        self._pd_bootstrap_addr: str | None = None
+        self._pd_kv_params: dict[str, Any] = {}
+        if pd_config is not None:
+            self._pd_pair = pd_config.get("pd_pair")
+            self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
 
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
@@ -358,6 +367,23 @@ class Orchestrator:
                 }
             )
 
+        # PD disaggregation: extract KV transfer params from prefill stage output
+        if self._pd_pair is not None and finished and stage_id == self._pd_pair[0]:
+            kv_params = getattr(output, "kv_transfer_params", None)
+            if kv_params is not None:
+                self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
+                logger.debug(
+                    "[Orchestrator][PD] stored kv_transfer_params for req=%s (keys=%s)",
+                    req_id,
+                    list(self._pd_kv_params[req_id].keys()),
+                )
+            else:
+                logger.warning(
+                    "[Orchestrator][PD] prefill stage output for req=%s has no kv_transfer_params; "
+                    "KV transfer may fail. Ensure apply_mooncake_connector_patch() was called.",
+                    req_id,
+                )
+
         if finished and stage_id < req_state.final_stage_id and not self.async_chunk:
             # If this parent has CFG companions, defer forwarding until all done
             if req_id in self._companion_map and not self._all_companions_done(req_id):
@@ -373,6 +399,8 @@ class Orchestrator:
                 await self._forward_to_next_stage(req_id, stage_id, output, req_state)
 
         if finished and stage_id == req_state.final_stage_id:
+            # PD: clean up any lingering KV params for this request
+            self._pd_kv_params.pop(req_id, None)
             self._cleanup_companion_state(req_id)
             self.request_states.pop(req_id, None)
 
@@ -392,6 +420,54 @@ class Orchestrator:
             return True
         done_set = self._companion_done.get(parent_id, set())
         return all(cid in done_set for cid in role_map.values())
+
+    def _build_pd_decode_params(self, req_id: str, sp: Any) -> Any:
+        """Build decode-side sampling params with KV transfer params for PD routing.
+
+        Clones the sampling params and injects kv_transfer_params that tell the
+        decode engine where to pull the KV cache from (prefill engine's bootstrap addr).
+        """
+        sp = sp.clone()
+        if sp.extra_args is None:
+            sp.extra_args = {}
+
+        # Get KV params captured from the prefill output (contains remote_request_id)
+        kv_prefill_params = self._pd_kv_params.pop(req_id, None)
+
+        decode_kv_params: dict[str, Any] = {
+            "do_remote_decode": False,
+            "do_remote_prefill": True,
+            "transfer_id": f"xfer-{req_id}",
+        }
+
+        if self._pd_bootstrap_addr:
+            decode_kv_params["remote_bootstrap_addr"] = self._pd_bootstrap_addr
+
+        # Overlay any params from the prefill side (includes remote_request_id set by monkey patch)
+        if kv_prefill_params:
+            decode_kv_params.update(kv_prefill_params)
+
+        # Ensure these flags are set correctly after any overlay
+        decode_kv_params["do_remote_prefill"] = True
+        decode_kv_params["do_remote_decode"] = False
+        if not decode_kv_params.get("transfer_id"):
+            decode_kv_params["transfer_id"] = f"xfer-{req_id}"
+
+        sp.extra_args["kv_transfer_params"] = decode_kv_params
+
+        if "remote_request_id" not in decode_kv_params:
+            logger.warning(
+                "[Orchestrator][PD] remote_request_id NOT SET for req %s. "
+                "Apply mooncake_connector patch to fix KV lookup.",
+                req_id,
+            )
+
+        logger.debug(
+            "[Orchestrator][PD] decode kv_transfer_params for req=%s: %s",
+            req_id,
+            decode_kv_params,
+        )
+        return sp
 
     def _build_stage_metrics(
         self,
@@ -486,6 +562,35 @@ class Orchestrator:
                     )
 
             await next_client.add_request_async(req_id, diffusion_prompt, params)
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
+            return
+
+        # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
+        if self._pd_pair is not None and (stage_id, next_stage_id) == self._pd_pair:
+            params = self._build_pd_decode_params(req_id, params)
+
+            # Use the original user prompt for the decode stage (not processed embeddings)
+            original_prompt = req_state.prompt
+            decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
+
+            for decode_input in decode_inputs:
+                request = build_engine_core_request_from_tokens(
+                    request_id=req_id,
+                    prompt=decode_input,
+                    params=params,
+                    model_config=self.stage_vllm_configs[next_stage_id].model_config,
+                )
+                request.external_req_id = request.request_id
+
+                self.output_processors[next_stage_id].add_request(
+                    request=request,
+                    prompt=None,
+                    parent_req=None,
+                    request_index=0,
+                    queue=None,
+                )
+                await next_client.add_request_async(request)
+
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 

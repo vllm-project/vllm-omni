@@ -468,6 +468,7 @@ class AsyncOmniEngine:
             self._initialize_janus_queues()
 
             self._initialize_stages(stage_init_timeout)
+            pd_config = self._detect_pd_config()
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self.output_queue.async_q,
@@ -476,6 +477,7 @@ class AsyncOmniEngine:
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
+                pd_config=pd_config,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -761,6 +763,64 @@ class AsyncOmniEngine:
         if cache_config is None and cache_backend not in (None, "", "none"):
             cache_config = AsyncOmniEngine._get_default_cache_config(cache_backend)
         return cache_config
+
+    def _detect_pd_config(self) -> dict[str, Any] | None:
+        """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
+
+        Scans stage_configs for is_prefill_only / is_decode_only flags,
+        extracts the bootstrap address, and applies the MooncakeConnector
+        monkey patch if a PD pair is found.
+
+        Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
+        """
+        prefill_idx: int | None = None
+        decode_idx: int | None = None
+
+        for i, stage_cfg in enumerate(self.stage_configs):
+            if getattr(stage_cfg, "is_prefill_only", False):
+                prefill_idx = i
+            if getattr(stage_cfg, "is_decode_only", False):
+                decode_idx = i
+
+        if prefill_idx is None or decode_idx is None:
+            return None
+
+        # Apply MooncakeConnector monkey patch before vLLM internals load it
+        try:
+            from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+
+            apply_mooncake_connector_patch()
+            logger.info("[AsyncOmniEngine] MooncakeConnector monkey patch applied for PD disaggregation")
+        except Exception as exc:
+            logger.warning("[AsyncOmniEngine] Failed to apply MooncakeConnector patch: %s", exc)
+
+        # Extract bootstrap address from prefill stage engine_args
+        bootstrap_addr: str | None = None
+        try:
+            prefill_cfg = self.stage_configs[prefill_idx]
+            ea = getattr(prefill_cfg, "engine_args", None)
+            kv_cfg = getattr(ea, "kv_transfer_config", None) if ea is not None else None
+            if kv_cfg is not None:
+                extra = getattr(kv_cfg, "kv_connector_extra_config", {}) or {}
+                if hasattr(extra, "get"):
+                    port = extra.get("mooncake_bootstrap_port", 25201)
+                else:
+                    port = getattr(extra, "mooncake_bootstrap_port", 25201)
+                kv_ip = getattr(kv_cfg, "kv_ip", None) or "127.0.0.1"
+                bootstrap_addr = f"{kv_ip}:{port}"
+        except Exception as exc:
+            logger.warning("[AsyncOmniEngine] Could not extract PD bootstrap address: %s", exc)
+
+        logger.info(
+            "[AsyncOmniEngine] PD disaggregation detected: prefill=stage-%d, decode=stage-%d, bootstrap=%s",
+            prefill_idx,
+            decode_idx,
+            bootstrap_addr,
+        )
+        return {
+            "pd_pair": (prefill_idx, decode_idx),
+            "bootstrap_addr": bootstrap_addr,
+        }
 
     @staticmethod
     def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list:
