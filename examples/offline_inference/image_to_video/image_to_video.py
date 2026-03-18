@@ -176,6 +176,11 @@ def parse_args() -> argparse.Namespace:
             "Default 1 means pure sharding (no replication). "
         ),
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -281,6 +286,7 @@ def main():
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     if profiler_enabled:

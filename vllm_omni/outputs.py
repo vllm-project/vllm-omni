@@ -278,6 +278,7 @@ class OmniRequestOutput:
             f"metrics={self.metrics}",
             f"multimodal_output={self._multimodal_output}",
             f"custom_output={self._custom_output}",
+            f"stage_durations={self.stage_durations}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
