@@ -30,14 +30,20 @@ from tests.utils import hardware_test
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 # Official Qwen3-TTS reference audio/text from examples/offline_inference/qwen3_tts/end2end.py
-REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+REF_AUDIO_URL = (
+    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+)
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 SYN_TEXT = "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."
 
 
 def get_stage_config():
     return str(
-        Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "qwen3_tts.yaml"
+        Path(__file__).parent.parent.parent.parent
+        / "vllm_omni"
+        / "model_executor"
+        / "stage_configs"
+        / "qwen3_tts.yaml"
     )
 
 
@@ -145,7 +151,9 @@ class TestQwen3TTSBaseVoiceClone:
         )
 
         assert response.status_code == 200, f"Request failed: {response.text}"
-        assert len(response.content) > MIN_AUDIO_BYTES, f"Audio too small: {len(response.content)} bytes"
+        assert (
+            len(response.content) > MIN_AUDIO_BYTES
+        ), f"Audio too small: {len(response.content)} bytes"
         assert_not_silence(response.content)
 
     @pytest.mark.core_model
@@ -170,12 +178,14 @@ class TestQwen3TTSBaseVoiceClone:
         try:
             transcript = convert_audio_file_to_text(wav_path)
             print(f"Whisper transcript: {transcript}")
-            assert len(transcript.strip()) > 0, "Whisper returned empty transcript — audio is likely silence"
+            assert (
+                len(transcript.strip()) > 0
+            ), "Whisper returned empty transcript — audio is likely silence"
             similarity = cosine_similarity_text(transcript.lower(), SYN_TEXT.lower())
             print(f"Cosine similarity: {similarity:.3f}")
-            assert similarity > 0.9, (
-                f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
-            )
+            assert (
+                similarity > 0.9
+            ), f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
         finally:
             os.unlink(wav_path)
 
@@ -214,7 +224,9 @@ class TestQwen3TTSBaseVoiceClone:
         assert response.status_code == 200, f"Request failed: {response.text}"
         assert len(response.content) > MIN_AUDIO_BYTES
 
-        pcm_samples = np.frombuffer(response.content, dtype=np.int16).astype(np.float32) / 32768.0
+        pcm_samples = (
+            np.frombuffer(response.content, dtype=np.int16).astype(np.float32) / 32768.0
+        )
         hnr = compute_hnr_db(pcm_samples)
         print(f"Voice clone HNR: {hnr:.2f} dB (threshold: {MIN_HNR_DB} dB)")
         assert hnr >= MIN_HNR_DB, (

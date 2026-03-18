@@ -144,7 +144,9 @@ def test_preserves_yaml_defaults_when_no_request_params(serving_chat, mock_reque
     assert comprehension_params.top_k == 1  # YAML custom param preserved
     assert comprehension_params.max_tokens == 2048
     assert comprehension_params.seed == 42
-    assert comprehension_params.repetition_penalty == 1.05  # YAML custom param preserved
+    assert (
+        comprehension_params.repetition_penalty == 1.05
+    )  # YAML custom param preserved
 
 
 def test_request_temperature_overrides_yaml_default(serving_chat, mock_request):
@@ -254,16 +256,24 @@ def test_multiple_params_override_together(serving_chat, mock_request):
 # =============================================================================
 
 
-def test_apply_request_overrides_clones_params(serving_chat, mock_request, default_comprehension_params):
+def test_apply_request_overrides_clones_params(
+    serving_chat, mock_request, default_comprehension_params
+):
     """Test that _apply_request_overrides returns a cloned object."""
-    result = serving_chat._apply_request_overrides(default_comprehension_params, mock_request)
+    result = serving_chat._apply_request_overrides(
+        default_comprehension_params, mock_request
+    )
 
     assert result is not default_comprehension_params  # Different object
 
 
-def test_apply_request_overrides_preserves_defaults(serving_chat, mock_request, default_comprehension_params):
+def test_apply_request_overrides_preserves_defaults(
+    serving_chat, mock_request, default_comprehension_params
+):
     """Test that _apply_request_overrides preserves defaults when request has None."""
-    result = serving_chat._apply_request_overrides(default_comprehension_params, mock_request)
+    result = serving_chat._apply_request_overrides(
+        default_comprehension_params, mock_request
+    )
 
     assert result.temperature == 0.4
     assert result.top_p == 0.9
@@ -271,12 +281,16 @@ def test_apply_request_overrides_preserves_defaults(serving_chat, mock_request, 
     assert result.top_k == 1  # YAML custom param
 
 
-def test_apply_request_overrides_applies_values(serving_chat, mock_request, default_comprehension_params):
+def test_apply_request_overrides_applies_values(
+    serving_chat, mock_request, default_comprehension_params
+):
     """Test that _apply_request_overrides applies non-None request values."""
     mock_request.temperature = 0.8
     mock_request.seed = 123
 
-    result = serving_chat._apply_request_overrides(default_comprehension_params, mock_request)
+    result = serving_chat._apply_request_overrides(
+        default_comprehension_params, mock_request
+    )
 
     assert result.temperature == 0.8  # Overridden
     assert result.seed == 123  # Overridden

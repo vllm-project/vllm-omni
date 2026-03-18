@@ -33,8 +33,18 @@ def test_get_vae_spatial_scale_factor_uses_block_out_channels_len_minus_1():
 
 
 def test_get_vae_spatial_scale_factor_defaults_to_8_on_missing_or_empty():
-    assert vae_patch_parallel._get_vae_spatial_scale_factor(_DummyVae(config=_DummyConfig())) == 8
-    assert vae_patch_parallel._get_vae_spatial_scale_factor(_DummyVae(config=_DummyConfig(block_out_channels=[]))) == 8
+    assert (
+        vae_patch_parallel._get_vae_spatial_scale_factor(
+            _DummyVae(config=_DummyConfig())
+        )
+        == 8
+    )
+    assert (
+        vae_patch_parallel._get_vae_spatial_scale_factor(
+            _DummyVae(config=_DummyConfig(block_out_channels=[]))
+        )
+        == 8
+    )
     assert vae_patch_parallel._get_vae_spatial_scale_factor(_DummyVae(config=None)) == 8
 
 
@@ -44,7 +54,12 @@ def test_get_vae_spatial_scale_factor_defaults_to_8_on_exception():
         def block_out_channels(self):
             raise RuntimeError("boom")
 
-    assert vae_patch_parallel._get_vae_spatial_scale_factor(_DummyVae(config=_BrokenConfig())) == 8
+    assert (
+        vae_patch_parallel._get_vae_spatial_scale_factor(
+            _DummyVae(config=_BrokenConfig())
+        )
+        == 8
+    )
 
 
 @pytest.mark.parametrize(
@@ -78,20 +93,38 @@ def test_get_world_rank_pp_size(monkeypatch):
 
 def test_get_vae_out_channels_defaults_to_3():
     assert vae_patch_parallel._get_vae_out_channels(_DummyVae(config=None)) == 3
-    assert vae_patch_parallel._get_vae_out_channels(_DummyVae(config=_DummyConfig())) == 3
+    assert (
+        vae_patch_parallel._get_vae_out_channels(_DummyVae(config=_DummyConfig())) == 3
+    )
 
 
 def test_get_vae_out_channels_reads_config():
-    assert vae_patch_parallel._get_vae_out_channels(_DummyVae(config=_DummyConfig(out_channels=4))) == 4
-    assert vae_patch_parallel._get_vae_out_channels(_DummyVae(config=_DummyConfig(out_channels="5"))) == 5
+    assert (
+        vae_patch_parallel._get_vae_out_channels(
+            _DummyVae(config=_DummyConfig(out_channels=4))
+        )
+        == 4
+    )
+    assert (
+        vae_patch_parallel._get_vae_out_channels(
+            _DummyVae(config=_DummyConfig(out_channels="5"))
+        )
+        == 5
+    )
 
 
 def test_get_vae_tile_params_returns_none_if_missing():
     assert (
-        vae_patch_parallel._get_vae_tile_params(_DummyVae(tile_latent_min_size=None, tile_overlap_factor=0.25)) is None
+        vae_patch_parallel._get_vae_tile_params(
+            _DummyVae(tile_latent_min_size=None, tile_overlap_factor=0.25)
+        )
+        is None
     )
     assert (
-        vae_patch_parallel._get_vae_tile_params(_DummyVae(tile_latent_min_size=128, tile_overlap_factor=None)) is None
+        vae_patch_parallel._get_vae_tile_params(
+            _DummyVae(tile_latent_min_size=128, tile_overlap_factor=None)
+        )
+        is None
     )
 
 
@@ -101,15 +134,23 @@ def test_get_vae_tile_params_parses_types():
 
 
 def test_get_vae_tiling_params_returns_none_if_missing():
-    vae = _DummyVae(tile_latent_min_size=128, tile_overlap_factor=0.25, tile_sample_min_size=None)
+    vae = _DummyVae(
+        tile_latent_min_size=128, tile_overlap_factor=0.25, tile_sample_min_size=None
+    )
     assert vae_patch_parallel._get_vae_tiling_params(vae) is None
 
-    vae = _DummyVae(tile_latent_min_size=None, tile_overlap_factor=0.25, tile_sample_min_size=1024)
+    vae = _DummyVae(
+        tile_latent_min_size=None, tile_overlap_factor=0.25, tile_sample_min_size=1024
+    )
     assert vae_patch_parallel._get_vae_tiling_params(vae) is None
 
 
 def test_get_vae_tiling_params_parses_types():
-    vae = _DummyVae(tile_latent_min_size="128", tile_overlap_factor="0.25", tile_sample_min_size="1024")
+    vae = _DummyVae(
+        tile_latent_min_size="128",
+        tile_overlap_factor="0.25",
+        tile_sample_min_size="1024",
+    )
     assert vae_patch_parallel._get_vae_tiling_params(vae) == (128, 0.25, 1024)
 
 
@@ -129,10 +170,14 @@ def test_distributed_tiled_decode_stitches_tiles(monkeypatch):
         def decoder(self, x: torch.Tensor) -> torch.Tensor:
             return x
 
-        def blend_v(self, _a: torch.Tensor, b: torch.Tensor, _blend_extent: int) -> torch.Tensor:
+        def blend_v(
+            self, _a: torch.Tensor, b: torch.Tensor, _blend_extent: int
+        ) -> torch.Tensor:
             return b
 
-        def blend_h(self, _a: torch.Tensor, b: torch.Tensor, _blend_extent: int) -> torch.Tensor:
+        def blend_h(
+            self, _a: torch.Tensor, b: torch.Tensor, _blend_extent: int
+        ) -> torch.Tensor:
             return b
 
     def _collect_local_tiles(
@@ -154,10 +199,14 @@ def test_distributed_tiled_decode_stitches_tiles(monkeypatch):
             for j in w_starts:
                 tile_rank = (tile_id + 1) % pp_size
                 if tile_rank == rank:
-                    tile = z[:, :, i : i + tile_latent_min_size, j : j + tile_latent_min_size]
+                    tile = z[
+                        :, :, i : i + tile_latent_min_size, j : j + tile_latent_min_size
+                    ]
                     decoded = vae.decoder(tile)
                     local_tiles.append(decoded)
-                    local_meta.append((tile_id, int(decoded.shape[-2]), int(decoded.shape[-1])))
+                    local_meta.append(
+                        (tile_id, int(decoded.shape[-2]), int(decoded.shape[-1]))
+                    )
                 tile_id += 1
         return local_tiles, local_meta
 
@@ -175,7 +224,13 @@ def test_distributed_tiled_decode_stitches_tiles(monkeypatch):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         meta_tensor = torch.full((max_count, 3), -1, dtype=torch.int64)
         tile_tensor = torch.zeros(
-            (max_count, z.shape[0], vae.config.out_channels, vae.tile_sample_min_size, vae.tile_sample_min_size),
+            (
+                max_count,
+                z.shape[0],
+                vae.config.out_channels,
+                vae.tile_sample_min_size,
+                vae.tile_sample_min_size,
+            ),
             dtype=z.dtype,
         )
         for idx, (tile_id, h, w) in enumerate(meta):
@@ -185,7 +240,9 @@ def test_distributed_tiled_decode_stitches_tiles(monkeypatch):
             tile_tensor[idx, :, :, :h, :w] = tiles[idx]
         return meta_tensor, tile_tensor
 
-    rank1_meta_tensor, rank1_tile_tensor = _pack_meta_and_tiles(rank1_tiles, rank1_meta, max_count)
+    rank1_meta_tensor, rank1_tile_tensor = _pack_meta_and_tiles(
+        rank1_tiles, rank1_meta, max_count
+    )
     rank1_count_tensor = torch.tensor([len(rank1_tiles)], dtype=torch.int64)
 
     def _fake_gather(tensor, gather_list=None, dst=0, group=None):

@@ -30,7 +30,9 @@ def get_transformer_config_kwargs(
     tf_config_params = tf_model_config.to_dict()
 
     # Filter out internal diffusers metadata keys that start with '_'
-    filtered_params = {k: v for k, v in tf_config_params.items() if not k.startswith("_")}
+    filtered_params = {
+        k: v for k, v in tf_config_params.items() if not k.startswith("_")
+    }
 
     # If model_class is provided, use inspect.signature to get accepted parameters
     if model_class is not None:
@@ -41,11 +43,14 @@ def get_transformer_config_kwargs(
             accepted_params = {
                 name
                 for name, param in sig.parameters.items()
-                if name != "self" and param.kind != inspect.Parameter.VAR_KEYWORD  # Exclude **kwargs
+                if name != "self"
+                and param.kind != inspect.Parameter.VAR_KEYWORD  # Exclude **kwargs
             }
 
             # Filter to only include parameters that are in the model's signature
-            filtered_params = {k: v for k, v in filtered_params.items() if k in accepted_params}
+            filtered_params = {
+                k: v for k, v in filtered_params.items() if k in accepted_params
+            }
         except (TypeError, AttributeError):
             # If inspection fails, fall back to returning all non-internal params
             # This maintains backward compatibility

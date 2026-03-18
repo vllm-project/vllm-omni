@@ -18,7 +18,10 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 
 logger = init_logger(__name__)
 
@@ -117,7 +120,9 @@ class Attention(nn.Module):
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
-        query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+        query, key, value, attn_metadata, ctx = strategy.pre_attention(
+            query, key, value, attn_metadata
+        )
 
         # 2. Kernel Execution (Computation)
         if self.use_ring and strategy is not self._no_parallel_strategy:
@@ -146,7 +151,14 @@ class Attention(nn.Module):
         # Delegate to RingParallelAttention strategy if available
         if self.ring_runner is not None:
             return self.ring_runner.run_attention(
-                query, key, value, attn_metadata, softmax_scale=self.softmax_scale, causal=self.causal
+                query,
+                key,
+                value,
+                attn_metadata,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
             )
 
-        raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
+        raise RuntimeError(
+            "Ring attention is enabled but strategy is not RingParallelAttention"
+        )

@@ -13,7 +13,9 @@ import PIL.Image
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
+    retrieve_timesteps,
+)
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
@@ -33,7 +35,9 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
     LongCatImageTransformer2DModel,
 )
-from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
+from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import (
+    calculate_shift,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -55,7 +59,11 @@ def get_longcat_image_edit_pre_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+        vae_scale_factor = (
+            2 ** (len(vae_config["block_out_channels"]) - 1)
+            if "block_out_channels" in vae_config
+            else 8
+        )
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
     latent_channels = vae_config.get("latent_channels", 16)
@@ -65,15 +73,25 @@ def get_longcat_image_edit_pre_process_func(
     ):
         """Pre-process requests for LongCatImageEditPipeline."""
         for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            multi_modal_data = (
+                prompt.get("multi_modal_data", {})
+                if not isinstance(prompt, str)
+                else None
+            )
+            raw_image = (
+                multi_modal_data.get("image", None)
+                if multi_modal_data is not None
+                else None
+            )
             if isinstance(prompt, str):
                 prompt = OmniTextPrompt(prompt=prompt)
             if "additional_information" not in prompt:
                 prompt["additional_information"] = {}
 
             if not raw_image:  # None or empty list
-                raise ValueError("""Received no input image. This model requires one input image to run.""")
+                raise ValueError(
+                    """Received no input image. This model requires one input image to run."""
+                )
             elif isinstance(raw_image, list):
                 if len(raw_image) > 1:
                     raise ValueError(
@@ -88,7 +106,9 @@ def get_longcat_image_edit_pre_process_func(
                 image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
 
             image_size = image.size
-            calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] * 1.0 / image_size[1])
+            calculated_width, calculated_height = calculate_dimensions(
+                1024 * 1024, image_size[0] * 1.0 / image_size[1]
+            )
             height = request.sampling_params.height or calculated_height
             width = request.sampling_params.width or calculated_width
 
@@ -99,10 +119,18 @@ def get_longcat_image_edit_pre_process_func(
             request.sampling_params.width = width
 
             # Preprocess image
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
-                image = image_processor.resize(image, calculated_height, calculated_width)
-                prompt_image = image_processor.resize(image, calculated_height // 2, calculated_width // 2)
-                image = image_processor.preprocess(image, calculated_height, calculated_width)
+            if image is not None and not (
+                isinstance(image, torch.Tensor) and image.size(1) == latent_channels
+            ):
+                image = image_processor.resize(
+                    image, calculated_height, calculated_width
+                )
+                prompt_image = image_processor.resize(
+                    image, calculated_height // 2, calculated_width // 2
+                )
+                image = image_processor.preprocess(
+                    image, calculated_height, calculated_width
+                )
 
                 # Store preprocessed image and prompt image in request
                 prompt["additional_information"]["preprocessed_image"] = image
@@ -124,7 +152,11 @@ def get_longcat_image_post_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+        vae_scale_factor = (
+            2 ** (len(vae_config["block_out_channels"]) - 1)
+            if "block_out_channels" in vae_config
+            else 8
+        )
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -138,7 +170,9 @@ def get_longcat_image_post_process_func(
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
 def retrieve_latents(
-    encoder_output: torch.Tensor, generator: torch.Generator | None = None, sample_mode: str = "sample"
+    encoder_output: torch.Tensor,
+    generator: torch.Generator | None = None,
+    sample_mode: str = "sample",
 ):
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
@@ -163,11 +197,15 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
-def prepare_pos_ids(modality_id=0, type="text", start=(0, 0), num_token=None, height=None, width=None):
+def prepare_pos_ids(
+    modality_id=0, type="text", start=(0, 0), num_token=None, height=None, width=None
+):
     if type == "text":
         assert num_token
         if height or width:
-            logger.warning('The parameters of height and width will be ignored in "text" type.')
+            logger.warning(
+                'The parameters of height and width will be ignored in "text" type.'
+            )
         pos_ids = torch.zeros(num_token, 3)
         pos_ids[..., 0] = modality_id
         pos_ids[..., 1] = torch.arange(num_token) + start[0]
@@ -175,7 +213,9 @@ def prepare_pos_ids(modality_id=0, type="text", start=(0, 0), num_token=None, he
     elif type == "image":
         assert height and width
         if num_token:
-            logger.warning('The parameter of num_token will be ignored in "image" type.')
+            logger.warning(
+                'The parameter of num_token will be ignored in "image" type.'
+            )
         pos_ids = torch.zeros(height, width, 3)
         pos_ids[..., 0] = modality_id
         pos_ids[..., 1] = pos_ids[..., 1] + torch.arange(height)[:, None] + start[0]
@@ -204,7 +244,12 @@ def split_quotation(prompt, quote_pairs=None):
 
     if quote_pairs is None:
         quote_pairs = [("'", "'"), ('"', '"'), ("‘", "’"), ("“", "”")]
-    pattern = "|".join([re.escape(q1) + r"[^" + re.escape(q1 + q2) + r"]*?" + re.escape(q2) for q1, q2 in quote_pairs])
+    pattern = "|".join(
+        [
+            re.escape(q1) + r"[^" + re.escape(q1 + q2) + r"]*?" + re.escape(q2)
+            for q1, q2 in quote_pairs
+        ]
+    )
     parts = re.split(f"({pattern})", prompt)
 
     result = []
@@ -253,14 +298,22 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             model, subfolder="text_processor", local_files_only=local_files_only
         )
 
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = AutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
         self.transformer = LongCatImageTransformer2DModel(od_config=od_config)
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model, subfolder="tokenizer", local_files_only=local_files_only
+        )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.vae_scale_factor = (
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if getattr(self, "vae", None)
+            else 8
+        )
+        self.image_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor * 2
+        )
         self.image_processor_vl = self.text_processor.image_processor
         self.latent_channels = self.vae.config.get("latent_channels", 16)
 
@@ -288,10 +341,14 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         for clean_prompt_sub, matched in split_quotation(prompt[0]):
             if matched:
                 for sub_word in clean_prompt_sub:
-                    tokens = self.tokenizer(sub_word, add_special_tokens=False)["input_ids"]
+                    tokens = self.tokenizer(sub_word, add_special_tokens=False)[
+                        "input_ids"
+                    ]
                     all_tokens.extend(tokens)
             else:
-                tokens = self.tokenizer(clean_prompt_sub, add_special_tokens=False)["input_ids"]
+                tokens = self.tokenizer(clean_prompt_sub, add_special_tokens=False)[
+                    "input_ids"
+                ]
                 all_tokens.extend(tokens)
 
         if len(all_tokens) > self.tokenizer_max_length:
@@ -314,25 +371,44 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         merge_length = self.image_processor_vl.merge_size**2
         while self.image_token in text:
             num_image_tokens = image_grid_thw.prod() // merge_length
-            text = text.replace(self.image_token, "<|placeholder|>" * num_image_tokens, 1)
+            text = text.replace(
+                self.image_token, "<|placeholder|>" * num_image_tokens, 1
+            )
         text = text.replace("<|placeholder|>", self.image_token)
 
         prefix_tokens = self.tokenizer(text, add_special_tokens=False)["input_ids"]
-        suffix_tokens = self.tokenizer(self.prompt_template_encode_suffix, add_special_tokens=False)["input_ids"]
+        suffix_tokens = self.tokenizer(
+            self.prompt_template_encode_suffix, add_special_tokens=False
+        )["input_ids"]
 
         vision_start_token_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
         prefix_len = prefix_tokens.index(vision_start_token_id)
         suffix_len = len(suffix_tokens)
 
-        prefix_tokens_mask = torch.tensor([1] * len(prefix_tokens), dtype=text_tokens_and_mask.attention_mask[0].dtype)
-        suffix_tokens_mask = torch.tensor([1] * len(suffix_tokens), dtype=text_tokens_and_mask.attention_mask[0].dtype)
+        prefix_tokens_mask = torch.tensor(
+            [1] * len(prefix_tokens), dtype=text_tokens_and_mask.attention_mask[0].dtype
+        )
+        suffix_tokens_mask = torch.tensor(
+            [1] * len(suffix_tokens), dtype=text_tokens_and_mask.attention_mask[0].dtype
+        )
 
-        prefix_tokens = torch.tensor(prefix_tokens, dtype=text_tokens_and_mask.input_ids.dtype)
-        suffix_tokens = torch.tensor(suffix_tokens, dtype=text_tokens_and_mask.input_ids.dtype)
+        prefix_tokens = torch.tensor(
+            prefix_tokens, dtype=text_tokens_and_mask.input_ids.dtype
+        )
+        suffix_tokens = torch.tensor(
+            suffix_tokens, dtype=text_tokens_and_mask.input_ids.dtype
+        )
 
-        input_ids = torch.cat((prefix_tokens, text_tokens_and_mask.input_ids[0], suffix_tokens), dim=-1)
+        input_ids = torch.cat(
+            (prefix_tokens, text_tokens_and_mask.input_ids[0], suffix_tokens), dim=-1
+        )
         attention_mask = torch.cat(
-            (prefix_tokens_mask, text_tokens_and_mask.attention_mask[0], suffix_tokens_mask), dim=-1
+            (
+                prefix_tokens_mask,
+                text_tokens_and_mask.attention_mask[0],
+                suffix_tokens_mask,
+            ),
+            dim=-1,
         )
 
         input_ids = input_ids.unsqueeze(0).to(self.device)
@@ -370,18 +446,24 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         _, seq_len, _ = prompt_embeds.shape
         # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-
-        text_ids = prepare_pos_ids(modality_id=0, type="text", start=(0, 0), num_token=prompt_embeds.shape[1]).to(
-            self.device
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
         )
+
+        text_ids = prepare_pos_ids(
+            modality_id=0, type="text", start=(0, 0), num_token=prompt_embeds.shape[1]
+        ).to(self.device)
         return prompt_embeds, text_ids
 
     @staticmethod
     def _pack_latents(latents, batch_size, num_channels_latents, height, width):
-        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.view(
+            batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+        )
         latents = latents.permute(0, 2, 4, 1, 3, 5)
-        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+        latents = latents.reshape(
+            batch_size, (height // 2) * (width // 2), num_channels_latents * 4
+        )
 
         return latents
 
@@ -404,13 +486,21 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
         if isinstance(generator, list):
             image_latents = [
-                retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i], sample_mode="argmax")
+                retrieve_latents(
+                    self.vae.encode(image[i : i + 1]),
+                    generator=generator[i],
+                    sample_mode="argmax",
+                )
                 for i in range(image.shape[0])
             ]
             image_latents = torch.cat(image_latents, dim=0)
         else:
-            image_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
-        image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+            image_latents = retrieve_latents(
+                self.vae.encode(image), generator=generator, sample_mode="argmax"
+            )
+        image_latents = (
+            image_latents - self.vae.config.shift_factor
+        ) * self.vae.config.scaling_factor
 
         return image_latents
 
@@ -441,17 +531,27 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 image_latents = self._encode_vae_image(image=image, generator=generator)
             else:
                 image_latents = image
-            if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
+            if (
+                batch_size > image_latents.shape[0]
+                and batch_size % image_latents.shape[0] == 0
+            ):
                 additional_image_per_prompt = batch_size // image_latents.shape[0]
-                image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
-            elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
+                image_latents = torch.cat(
+                    [image_latents] * additional_image_per_prompt, dim=0
+                )
+            elif (
+                batch_size > image_latents.shape[0]
+                and batch_size % image_latents.shape[0] != 0
+            ):
                 raise ValueError(
                     f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
                 )
             else:
                 image_latents = torch.cat([image_latents], dim=0)
 
-            image_latents = self._pack_latents(image_latents, batch_size, num_channels_latents, height, width)
+            image_latents = self._pack_latents(
+                image_latents, batch_size, num_channels_latents, height, width
+            )
 
             image_latents_ids = prepare_pos_ids(
                 modality_id=2,
@@ -477,17 +577,30 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-            latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
+            latents = randn_tensor(
+                shape, generator=generator, device=device, dtype=dtype
+            )
+            latents = self._pack_latents(
+                latents, batch_size, num_channels_latents, height, width
+            )
         else:
             latents = latents.to(device=device, dtype=dtype)
 
         return latents, image_latents, latents_ids, image_latents_ids
 
     def check_inputs(
-        self, prompt, height, width, negative_prompt=None, prompt_embeds=None, negative_prompt_embeds=None
+        self,
+        prompt,
+        height,
+        width,
+        negative_prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
     ):
-        if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
+        if (
+            height % (self.vae_scale_factor * 2) != 0
+            or width % (self.vae_scale_factor * 2) != 0
+        ):
             logger.warning(
                 "`height` and `width` have to be divisible by "
                 f"{self.vae_scale_factor * 2} but are {height} and {width}. "
@@ -545,24 +658,44 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 """Taking only the first image for now.""",
             )
         first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-        negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
-        prompt_embeds = None if isinstance(first_prompt, str) else first_prompt.get("prompt_embeds")
+        prompt = (
+            first_prompt
+            if isinstance(first_prompt, str)
+            else (first_prompt.get("prompt") or "")
+        )
+        negative_prompt = (
+            None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("negative_prompt")
+        )
+        prompt_embeds = (
+            None if isinstance(first_prompt, str) else first_prompt.get("prompt_embeds")
+        )
         negative_prompt_embeds = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt_embeds")  # type: ignore # Why it is list[torch.Tensor] in OmniTokenInputs or OmniEmbedsPrompt? Doesn't make sense
 
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+            req.sampling_params.guidance_scale
+            if req.sampling_params.guidance_scale is not None
+            else guidance_scale
         )
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt is not None
             else num_images_per_prompt
         )
         generator = req.sampling_params.generator or generator
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        height = (
+            req.sampling_params.height
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        width = (
+            req.sampling_params.width
+            or self.default_sample_size * self.vae_scale_factor
+        )
 
         if prompt is not None:
             batch_size = 1 if isinstance(prompt, str) else len(prompt)
@@ -578,12 +711,23 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             calculated_width = additional_information.get("calculated_width", width)
         else:
             image_size = image[0].size if isinstance(image, list) else image.size
-            calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] * 1.0 / image_size[1])
+            calculated_width, calculated_height = calculate_dimensions(
+                1024 * 1024, image_size[0] * 1.0 / image_size[1]
+            )
 
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
-                image = self.image_processor.resize(image, calculated_height, calculated_width)
-                prompt_image = self.image_processor.resize(image, calculated_height // 2, calculated_width // 2)
-                image = self.image_processor.preprocess(image, calculated_height, calculated_width)
+            if image is not None and not (
+                isinstance(image, torch.Tensor)
+                and image.size(1) == self.latent_channels
+            ):
+                image = self.image_processor.resize(
+                    image, calculated_height, calculated_width
+                )
+                prompt_image = self.image_processor.resize(
+                    image, calculated_height // 2, calculated_width // 2
+                )
+                image = self.image_processor.preprocess(
+                    image, calculated_height, calculated_width
+                )
 
         self.check_inputs(
             prompt,
@@ -594,12 +738,15 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             negative_prompt_embeds=negative_prompt_embeds,
         )
 
-        (prompt_embeds, text_ids) = self.encode_prompt(
-            prompt=prompt, image=prompt_image, prompt_embeds=prompt_embeds, num_images_per_prompt=num_images_per_prompt
+        prompt_embeds, text_ids = self.encode_prompt(
+            prompt=prompt,
+            image=prompt_image,
+            prompt_embeds=prompt_embeds,
+            num_images_per_prompt=num_images_per_prompt,
         )
 
         if guidance_scale > 1:
-            (negative_prompt_embeds, negative_text_ids) = self.encode_prompt(
+            negative_prompt_embeds, negative_text_ids = self.encode_prompt(
                 prompt=negative_prompt,
                 image=prompt_image,
                 prompt_embeds=negative_prompt_embeds,
@@ -624,7 +771,11 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         )
 
         # Prepare timesteps
-        sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        sigmas = (
+            np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
+            if sigmas is None
+            else sigmas
+        )
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
@@ -689,15 +840,21 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 output_slice=image_seq_len,
             )
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+            latents = self.scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, do_true_cfg
+            )
 
         self._current_timestep = None
 
         if output_type == "latent":
             image = latents
         else:
-            latents = self._unpack_latents(latents, calculated_height, calculated_width, self.vae_scale_factor)
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            latents = self._unpack_latents(
+                latents, calculated_height, calculated_width, self.vae_scale_factor
+            )
+            latents = (
+                latents / self.vae.config.scaling_factor
+            ) + self.vae.config.shift_factor
 
             if latents.dtype != self.vae.dtype:
                 latents = latents.to(dtype=self.vae.dtype)

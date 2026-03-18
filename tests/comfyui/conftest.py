@@ -54,7 +54,9 @@ def _setup_comfyui_test_environment():
         def save_to(self, file: str | BinaryIO):
             """Save video data to file or file-like object."""
             if isinstance(file, str):
-                print("Called VideoInput.save_to with file path. Saving to a path is no-op in tests.")
+                print(
+                    "Called VideoInput.save_to with file path. Saving to a path is no-op in tests."
+                )
             else:
                 file.write(self._data)
 
@@ -64,7 +66,9 @@ def _setup_comfyui_test_environment():
     mock_comfy_api_input.VideoInput = VideoInput
     mock_comfy_api.input = mock_comfy_api_input
     mock_comfy_api_latest = MagicMock()
-    mock_comfy_api_latest.Types.VideoComponents = MagicMock(side_effect=lambda **kwargs: kwargs)
+    mock_comfy_api_latest.Types.VideoComponents = MagicMock(
+        side_effect=lambda **kwargs: kwargs
+    )
     mock_comfy_api_latest.InputImpl.VideoFromComponents = MagicMock(
         side_effect=lambda _: VideoInput(b"mock_video_from_components")
     )

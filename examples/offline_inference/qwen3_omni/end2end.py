@@ -59,7 +59,9 @@ def get_text_query(question: str = None) -> QueryResult:
     )
 
 
-def get_video_query(question: str = None, video_path: str | None = None, num_frames: int = 16) -> QueryResult:
+def get_video_query(
+    question: str = None, video_path: str | None = None, num_frames: int = 16
+) -> QueryResult:
     if question is None:
         question = "Why is this video funny?"
     prompt = (
@@ -74,7 +76,9 @@ def get_video_query(question: str = None, video_path: str | None = None, num_fra
             raise FileNotFoundError(f"Video file not found: {video_path}")
         video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
     else:
-        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+        video_frames = VideoAsset(
+            name="baby_reading", num_frames=num_frames
+        ).np_ndarrays
 
     return QueryResult(
         inputs={
@@ -116,7 +120,9 @@ def get_image_query(question: str = None, image_path: str | None = None) -> Quer
     )
 
 
-def get_audio_query(question: str = None, audio_path: str | None = None, sampling_rate: int = 16000) -> QueryResult:
+def get_audio_query(
+    question: str = None, audio_path: str | None = None, sampling_rate: int = 16000
+) -> QueryResult:
     if question is None:
         question = "What is the content of this audio?"
     prompt = (
@@ -168,7 +174,9 @@ def get_mixed_modalities_query(
             raise FileNotFoundError(f"Video file not found: {video_path}")
         video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
     else:
-        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+        video_frames = VideoAsset(
+            name="baby_reading", num_frames=num_frames
+        ).np_ndarrays
 
     # Load image
     if image_path:
@@ -274,11 +282,15 @@ def main(args):
     # Get the query function and call it with appropriate parameters
     query_func = query_map[args.query_type]
     if args.query_type == "use_video":
-        query_result = query_func(video_path=video_path, num_frames=getattr(args, "num_frames", 16))
+        query_result = query_func(
+            video_path=video_path, num_frames=getattr(args, "num_frames", 16)
+        )
     elif args.query_type == "use_image":
         query_result = query_func(image_path=image_path)
     elif args.query_type == "use_audio":
-        query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
+        query_result = query_func(
+            audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000)
+        )
     elif args.query_type == "mixed_modalities":
         query_result = query_func(
             video_path=video_path,
@@ -341,7 +353,9 @@ def main(args):
     if args.txt_prompts is None:
         prompts = [query_result.inputs for _ in range(args.num_prompts)]
     else:
-        assert args.query_type == "text", "txt-prompts is only supported for text query type"
+        assert (
+            args.query_type == "text"
+        ), "txt-prompts is only supported for text query type"
         with open(args.txt_prompts, encoding="utf-8") as f:
             lines = [ln.strip() for ln in f.readlines()]
             prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
@@ -355,9 +369,13 @@ def main(args):
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
     if profiler_enabled:
         omni_llm.start_profile(stages=[0])
-    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
+    omni_generator = omni_llm.generate(
+        prompts, sampling_params_list, py_generator=args.py_generator
+    )
     # Determine output directory: prefer --output-dir; fallback to --output-wav
-    output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    output_dir = (
+        args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    )
     os.makedirs(output_dir, exist_ok=True)
 
     total_requests = len(prompts)
@@ -403,7 +421,9 @@ def main(args):
 
         processed_count += len(stage_outputs.request_output)
         if profiler_enabled and processed_count >= total_requests:
-            print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
+            print(
+                f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop..."
+            )
             # Stop the profiler while workers are still alive
             omni_llm.stop_profile()
 
@@ -414,7 +434,9 @@ def main(args):
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = FlexibleArgumentParser(
+        description="Demo on using vLLM for offline inference with audio language models"
+    )
     parser.add_argument(
         "--query-type",
         "-q",

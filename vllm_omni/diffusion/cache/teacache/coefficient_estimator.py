@@ -55,7 +55,9 @@ class BagelAdapter:
     """Adapter for Bagel model."""
 
     @staticmethod
-    def load_pipeline(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> BagelPipeline:
+    def load_pipeline(
+        model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16
+    ) -> BagelPipeline:
         od_config = OmniDiffusionConfig.from_kwargs(model=model_path, dtype=dtype)
         od_config.model_class_name = "BagelPipeline"
 
@@ -131,8 +133,12 @@ def estimate_teacache_coefficients(
 
     print("Data statistics:")
     print(f"  Count: {len(x)}")
-    print(f"  Input Diffs (x): min={x.min():.4e}, max={x.max():.4e}, mean={x.mean():.4e}")
-    print(f"  Output Diffs (y): min={y.min():.4e}, max={y.max():.4e}, mean={y.mean():.4e}")
+    print(
+        f"  Input Diffs (x): min={x.min():.4e}, max={x.max():.4e}, mean={x.mean():.4e}"
+    )
+    print(
+        f"  Output Diffs (y): min={y.min():.4e}, max={y.max():.4e}, mean={y.mean():.4e}"
+    )
 
     return np.polyfit(x, y, poly_order).tolist()
 

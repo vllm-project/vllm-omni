@@ -5,10 +5,16 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention, ParallelAttentionStrategy
+from vllm_omni.diffusion.attention.parallel.base import (
+    NoParallelAttention,
+    ParallelAttentionStrategy,
+)
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
-from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
@@ -31,7 +37,9 @@ def build_parallel_attention_strategy(
         cfg = get_forward_context().omni_diffusion_config
         p = cfg.parallel_config
     except Exception as e:
-        logger.debug(f"No forward context available for parallel attention strategy: {e}")
+        logger.debug(
+            f"No forward context available for parallel attention strategy: {e}"
+        )
         return NoParallelAttention()
 
     ulysses_degree = getattr(p, "ulysses_degree", 1)
@@ -53,7 +61,9 @@ def build_parallel_attention_strategy(
 
     # Ulysses (or Hybrid Ulysses+Ring)
     if ulysses_degree > 1:
-        logger.debug(f"Using UlyssesParallelAttention (ulysses_degree={ulysses_degree})")
+        logger.debug(
+            f"Using UlyssesParallelAttention (ulysses_degree={ulysses_degree})"
+        )
         return UlyssesParallelAttention(
             sp_group=sp_group,
             scatter_idx=scatter_idx,

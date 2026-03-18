@@ -14,7 +14,11 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
 )
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+)
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerProcessingInfo,
@@ -33,13 +37,18 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
-from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerDummyInputsBuilder,
     Qwen2_5OmniThinkerMultiModalProcessor,
 )
-from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
+from vllm_omni.model_executor.models.utils import (
+    add_prefix_to_loaded_weights,
+    split_list_into_ranges,
+)
 from vllm_omni.platforms import current_omni_platform
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
@@ -55,7 +64,12 @@ logger = init_logger(__name__)
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 class Qwen2_5OmniForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE, Qwen2_5OmniConditionalGenerationMixin, CustomProcessMixin
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsMRoPE,
+    Qwen2_5OmniConditionalGenerationMixin,
+    CustomProcessMixin,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -107,7 +121,9 @@ class Qwen2_5OmniForConditionalGeneration(
             self.token2wav = None
             # set suppress start id according to token2wav
             t2w_token_end_id = getattr(
-                getattr(getattr(config, "token2wav_config", None), "dit_config", None), "num_embeds", None
+                getattr(getattr(config, "token2wav_config", None), "dit_config", None),
+                "num_embeds",
+                None,
             )
             if t2w_token_end_id:
                 self.model.set_suppress_start_id(t2w_token_end_id + 1)
@@ -136,7 +152,9 @@ class Qwen2_5OmniForConditionalGeneration(
 
         # Set up intermediate tensors
         self.make_empty_intermediate_tensors = (
-            (self.thinker.make_empty_intermediate_tensors) if self.model_stage == "thinker" else lambda: None
+            (self.thinker.make_empty_intermediate_tensors)
+            if self.model_stage == "thinker"
+            else lambda: None
         )
 
     # -------------------- Device utilities --------------------
@@ -186,9 +204,15 @@ class Qwen2_5OmniForConditionalGeneration(
         is_multimodal=None,
     ) -> torch.Tensor:
         if self.model_stage == "code2wav":
-            return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
+            return (
+                torch.zeros_like(input_ids)
+                .reshape(-1, 1)
+                .repeat(1, self.vllm_config.model_config.get_hidden_size())
+            )
         return self.model.embed_input_ids(
-            input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
+            input_ids=input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
         )
 
     def embed_multimodal(self, **kwargs):
@@ -238,7 +262,9 @@ class Qwen2_5OmniForConditionalGeneration(
             # if input_ids is None, set it to a zero tensor, in the length of the
             # same as the embedding seq length
             if input_ids is None:
-                input_ids = torch.zeros(inputs_embeds.shape[1], dtype=torch.long, device=thinker_dev).unsqueeze(
+                input_ids = torch.zeros(
+                    inputs_embeds.shape[1], dtype=torch.long, device=thinker_dev
+                ).unsqueeze(
                     0
                 )  # (1, 0)
                 added_batch_dim = True
@@ -253,18 +279,30 @@ class Qwen2_5OmniForConditionalGeneration(
 
             if current_omni_platform.is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
-                thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+                thinker_input_ids = (
+                    input_ids[0]
+                    if input_ids is not None and added_batch_dim
+                    else input_ids
+                )
                 # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
                 if positions.ndim == 2 and positions.shape[0] == 3:
                     thinker_positions = positions  # MRoPE positions, keep as is
                 else:
-                    thinker_positions = positions[0] if positions.ndim > 1 else positions
+                    thinker_positions = (
+                        positions[0] if positions.ndim > 1 else positions
+                    )
                 thinker_inputs_embeds = (
-                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                    inputs_embeds[0]
+                    if inputs_embeds is not None and added_batch_dim
+                    else inputs_embeds
                 )
             else:
                 # Squeeze back if we added batch dim earlier
-                thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+                thinker_input_ids = (
+                    input_ids[0]
+                    if input_ids is not None and added_batch_dim
+                    else input_ids
+                )
                 # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
                 if positions.ndim == 2 and positions.shape[0] == 3:
                     thinker_positions = positions  # MRoPE positions, keep as is
@@ -273,7 +311,9 @@ class Qwen2_5OmniForConditionalGeneration(
                 else:
                     thinker_positions = positions
                 thinker_inputs_embeds = (
-                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                    inputs_embeds[0]
+                    if inputs_embeds is not None and added_batch_dim
+                    else inputs_embeds
                 )
 
             # Run thinker
@@ -292,7 +332,9 @@ class Qwen2_5OmniForConditionalGeneration(
 
             # Text-only path
             return OmniOutput(
-                text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
+                text_hidden_states=(
+                    text_hidden_states.reshape(-1, text_hidden_states.shape[-1])
+                ),
                 multimodal_outputs=None,
             )
 
@@ -300,7 +342,11 @@ class Qwen2_5OmniForConditionalGeneration(
         if self.model_stage == "talker":
             # mock data for profile
             if input_ids is None:
-                input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
+                input_ids = torch.zeros(
+                    inputs_embeds.shape[0],
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
+                )
                 self.thinker_reply_part = torch.zeros_like(inputs_embeds)
 
             # TODO(Peiqi): temporal hack here to support voice_type.
@@ -323,7 +369,9 @@ class Qwen2_5OmniForConditionalGeneration(
             if sampling_metadata is not None:
                 # the padding token id is set to text model's pad token id,
                 # which do not match with the talker model's word embedding size
-                sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448
+                sampling_metadata.prompt_token_ids[
+                    sampling_metadata.prompt_token_ids == 152064
+                ] = 8448
 
             return OmniOutput(
                 text_hidden_states=talker_hidden,
@@ -345,7 +393,10 @@ class Qwen2_5OmniForConditionalGeneration(
             code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
 
             audio_tensor = self.generate_audio(code, voice_type)
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": audio_tensor},
+            )
 
         return OmniOutput(
             text_hidden_states=torch.cat(
@@ -356,7 +407,9 @@ class Qwen2_5OmniForConditionalGeneration(
                     ).to(self._module_device(self.model)),
                     self.talker.thinker_to_talker_proj(
                         self.talker.embed_input_ids(
-                            torch.tensor([TALKER_CODEC_BOS_TOKEN_ID, TALKER_CODEC_EOS_TOKEN_ID])
+                            torch.tensor(
+                                [TALKER_CODEC_BOS_TOKEN_ID, TALKER_CODEC_EOS_TOKEN_ID]
+                            )
                             .to(torch.bfloat16)
                             .to(self._module_device(self.model))
                         )
@@ -410,7 +463,9 @@ class Qwen2_5OmniForConditionalGeneration(
         vision_end_token_id = thinker_config.vision_end_token_id
         seconds_per_chunk = thinker_config.seconds_per_chunk
         spatial_merge_size = thinker_config.vision_config.spatial_merge_size
-        tokens_per_second = getattr(thinker_config.vision_config, "tokens_per_second", 25)
+        tokens_per_second = getattr(
+            thinker_config.vision_config, "tokens_per_second", 25
+        )
 
         if isinstance(image_grid_thw, list):
             image_grid_thw = torch.tensor(image_grid_thw)
@@ -430,13 +485,21 @@ class Qwen2_5OmniForConditionalGeneration(
         idx = 0
         while idx < len(src_item):
             new_src_item_len = len(new_src_item)
-            start_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+            start_idx = (
+                llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+            )
             if src_item[idx] not in [audio_token_id, video_token_id, image_token_id]:
                 if use_audio_in_video and idx > 0:
-                    if src_item[idx] == vision_end_token_id and src_item[idx - 1] == audio_end_token_id:
+                    if (
+                        src_item[idx] == vision_end_token_id
+                        and src_item[idx - 1] == audio_end_token_id
+                    ):
                         # processing the <|audio_eos|> before <|vision_eos|>
                         start_idx -= 1
-                    elif src_item[idx] == audio_start_token_id and src_item[idx - 1] == vision_start_token_id:
+                    elif (
+                        src_item[idx] == audio_start_token_id
+                        and src_item[idx - 1] == vision_start_token_id
+                    ):
                         # processing the <|audio_bos|> after <|vision_eos|>
                         start_idx -= 1
                 new_src_item.append(src_item[idx])
@@ -459,40 +522,58 @@ class Qwen2_5OmniForConditionalGeneration(
                     start_idx, image_idx, spatial_merge_size, t_index, grid_hs, grid_ws
                 )
                 llm_pos_ids_list.append(llm_pos_ids)
-                vision_seqlen = image_grid_thw[image_idx].prod() // (spatial_merge_size**2)
+                vision_seqlen = image_grid_thw[image_idx].prod() // (
+                    spatial_merge_size**2
+                )
                 new_src_item.extend([image_token_id] * vision_seqlen)
                 image_idx += 1
             elif src_item[idx] == video_token_id and not use_audio_in_video:
                 grid_t = video_grid_thw[video_idx][0]
                 grid_hs = video_grid_thw[:, 1]
                 grid_ws = video_grid_thw[:, 2]
-                t_index = (torch.arange(grid_t) * second_per_grid_ts[video_idx] * tokens_per_second).long()
+                t_index = (
+                    torch.arange(grid_t)
+                    * second_per_grid_ts[video_idx]
+                    * tokens_per_second
+                ).long()
                 llm_pos_ids = get_llm_pos_ids_for_vision(
                     start_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
                 )
                 llm_pos_ids_list.append(llm_pos_ids)
-                vision_seqlen = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
+                vision_seqlen = video_grid_thw[video_idx].prod() // (
+                    spatial_merge_size**2
+                )
                 new_src_item.extend([video_token_id] * vision_seqlen)
                 video_idx += 1
             else:
                 # read audio from video
                 assert audio_seqlens is not None
                 audio_seqlen = audio_seqlens[audio_idx]
-                vision_seqlen = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
+                vision_seqlen = video_grid_thw[video_idx].prod() // (
+                    spatial_merge_size**2
+                )
                 grid_t = video_grid_thw[video_idx][0]
                 grid_h = video_grid_thw[video_idx][1]
                 grid_w = video_grid_thw[video_idx][2]
                 grid_hs = video_grid_thw[:, 1]
                 grid_ws = video_grid_thw[:, 2]
                 t_ntoken_per_chunk = int(tokens_per_second * seconds_per_chunk)
-                t_index = (torch.arange(grid_t) * second_per_grid_ts[video_idx] * tokens_per_second).long()
-                t_index_split_chunk = split_list_into_ranges(t_index, t_ntoken_per_chunk)
+                t_index = (
+                    torch.arange(grid_t)
+                    * second_per_grid_ts[video_idx]
+                    * tokens_per_second
+                ).long()
+                t_index_split_chunk = split_list_into_ranges(
+                    t_index, t_ntoken_per_chunk
+                )
                 place_num = (((audio_seqlen - 1) // 2 + 1 - 2) // 2 + 1) + 2
                 pure_audio_len = place_num - 2
                 added_audio_len = 0
                 audio_llm_pos_ids_list: list[torch.Tensor] = []
                 for t_chunk in t_index_split_chunk:
-                    vision_ntoken_per_chunk = len(t_chunk) * grid_h * grid_w // (spatial_merge_size**2)
+                    vision_ntoken_per_chunk = (
+                        len(t_chunk) * grid_h * grid_w // (spatial_merge_size**2)
+                    )
                     new_src_item.extend([video_token_id] * vision_ntoken_per_chunk)
                     vision_llm_pos_ids_list = get_llm_pos_ids_for_vision(
                         start_idx,
@@ -503,23 +584,38 @@ class Qwen2_5OmniForConditionalGeneration(
                         grid_ws,
                     ).split(1, dim=1)
                     llm_pos_ids_list.extend(vision_llm_pos_ids_list)
-                    new_src_item.extend(min(t_ntoken_per_chunk, pure_audio_len - added_audio_len) * [audio_token_id])
+                    new_src_item.extend(
+                        min(t_ntoken_per_chunk, pure_audio_len - added_audio_len)
+                        * [audio_token_id]
+                    )
                     audio_start_idx = (
-                        start_idx if len(audio_llm_pos_ids_list) == 0 else audio_llm_pos_ids_list[-1][0].item() + 1
+                        start_idx
+                        if len(audio_llm_pos_ids_list) == 0
+                        else audio_llm_pos_ids_list[-1][0].item() + 1
                     )
                     if min(t_ntoken_per_chunk, pure_audio_len - added_audio_len) > 0:
                         audio_llm_pos_ids_list = (
-                            torch.arange(min(t_ntoken_per_chunk, pure_audio_len - added_audio_len)).expand(3, -1)
+                            torch.arange(
+                                min(
+                                    t_ntoken_per_chunk, pure_audio_len - added_audio_len
+                                )
+                            ).expand(3, -1)
                             + audio_start_idx
                         ).split(1, dim=1)
                     else:
                         audio_llm_pos_ids_list = []
-                    added_audio_len += min(t_ntoken_per_chunk, pure_audio_len - added_audio_len)
+                    added_audio_len += min(
+                        t_ntoken_per_chunk, pure_audio_len - added_audio_len
+                    )
                     llm_pos_ids_list.extend(audio_llm_pos_ids_list)
                 if added_audio_len < pure_audio_len:
-                    new_src_item.extend((pure_audio_len - added_audio_len) * [audio_token_id])
+                    new_src_item.extend(
+                        (pure_audio_len - added_audio_len) * [audio_token_id]
+                    )
                     audio_llm_pos_ids_list = (
-                        torch.arange(pure_audio_len - added_audio_len).expand(3, -1) + llm_pos_ids_list[-1].max() + 1
+                        torch.arange(pure_audio_len - added_audio_len).expand(3, -1)
+                        + llm_pos_ids_list[-1].max()
+                        + 1
                     ).split(1, dim=1)
                     llm_pos_ids_list.extend(audio_llm_pos_ids_list)
                 audio_idx += 1
@@ -528,7 +624,9 @@ class Qwen2_5OmniForConditionalGeneration(
             idx += len(new_src_item) - new_src_item_len
 
         llm_positions = torch.cat(llm_pos_ids_list, dim=1)
-        mrope_position_delta = torch.cat(llm_pos_ids_list, dim=1).max() + 1 - len(src_item)
+        mrope_position_delta = (
+            torch.cat(llm_pos_ids_list, dim=1).max() + 1 - len(src_item)
+        )
         llm_positions = llm_positions[:, context_len:seq_len]
 
         return llm_positions, mrope_position_delta
@@ -628,7 +726,10 @@ class Qwen2_5OmniForConditionalGeneration(
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 
     def _get_embed_text_spk_token(self, voice_type: str):
-        if not hasattr(self, "embed_text_spk_tokens") or voice_type not in self.embed_text_spk_tokens:
+        if (
+            not hasattr(self, "embed_text_spk_tokens")
+            or voice_type not in self.embed_text_spk_tokens
+        ):
             return self.embed_text_bos_token
         return self.embed_text_spk_tokens[voice_type]
 
@@ -667,7 +768,9 @@ class Qwen2_5OmniForConditionalGeneration(
             return self.thinker_to_talker_process(input_ids, input_embeds, **info_dict)
         else:
             # decode
-            return self.thinker_to_talker_decode_one_step(input_ids, input_embeds, **info_dict)
+            return self.thinker_to_talker_decode_one_step(
+                input_ids, input_embeds, **info_dict
+            )
 
     def thinker_to_talker_process(
         self,
@@ -680,15 +783,23 @@ class Qwen2_5OmniForConditionalGeneration(
         prompt_embeds = info_dict.get("prompt_embeds")  # Tensor [P,H]
         thinker_result = info_dict.get("thinker_result")  # Tensor [K,H]
         prompt_token_ids = info_dict.get("prompt_token_ids")  # list[int]
-        thinker_output_token_ids = info_dict.get("thinker_output_token_ids")  # list[int]
+        thinker_output_token_ids = info_dict.get(
+            "thinker_output_token_ids"
+        )  # list[int]
 
         if not isinstance(prompt_embeds, torch.Tensor):
             prompt_embeds = torch.zeros(
-                0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)
+                0,
+                self.talker.config.hidden_size,
+                dtype=input_embeds.dtype,
+                device=self._module_device(self.model),
             )
         if not isinstance(thinker_result, torch.Tensor):
             thinker_result = torch.zeros(
-                0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)
+                0,
+                self.talker.config.hidden_size,
+                dtype=input_embeds.dtype,
+                device=self._module_device(self.model),
             )
         if not isinstance(prompt_token_ids, (list, torch.Tensor)):
             prompt_token_ids = []
@@ -698,14 +809,20 @@ class Qwen2_5OmniForConditionalGeneration(
         # TODO(Peiqi): add voice_type support
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
             voice_type=self.voice_type,
-            output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
+            output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(
+                self._module_device(self.model)
+            ),
             output_token_ids=thinker_output_token_ids,
-            thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
+            thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(
+                self._module_device(self.model)
+            ),
             prompt_token_ids=prompt_token_ids,
         )
 
         if thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
-            update_dict["thinker_reply_part"] = thinker_result[1:].detach().to("cpu").contiguous()
+            update_dict["thinker_reply_part"] = (
+                thinker_result[1:].detach().to("cpu").contiguous()
+            )
 
         return req_input_ids, req_embeds, update_dict
 
@@ -739,7 +856,9 @@ class Qwen2_5OmniForConditionalGeneration(
         input_tokens_len = len(prompt_token_ids_processed)
         # the code below is from model runner in Qwen, may need to further discuss later
         if input_tokens_len > 2:
-            prompt_token_ids_processed = [self.talker_config.tts_codec_mask_token_id] * (input_tokens_len - 2) + [
+            prompt_token_ids_processed = [
+                self.talker_config.tts_codec_mask_token_id
+            ] * (input_tokens_len - 2) + [
                 self.talker_config.tts_codec_pad_token_id,
                 self.talker_config.tts_codec_start_token_id,
             ]
@@ -750,7 +869,9 @@ class Qwen2_5OmniForConditionalGeneration(
             ][-input_tokens_len:]
         if isinstance(prompt_token_ids_processed, list):
             prompt_token_ids_processed = (
-                torch.Tensor(prompt_token_ids_processed).to(torch.int64).to(self._module_device(self.talker))
+                torch.Tensor(prompt_token_ids_processed)
+                .to(torch.int64)
+                .to(self._module_device(self.talker))
             )
         return prompt_token_ids_processed, prompt_embeds
 
@@ -765,7 +886,11 @@ class Qwen2_5OmniForConditionalGeneration(
             update_dict["thinker_reply_part"] = new_q
         else:
             # B) per-request provided decode vector (optional)
-            dv = info_dict.get("decode_output_prompt_embeds") if isinstance(info_dict, dict) else None
+            dv = (
+                info_dict.get("decode_output_prompt_embeds")
+                if isinstance(info_dict, dict)
+                else None
+            )
             if isinstance(dv, torch.Tensor) and dv.numel() > 0:
                 step_vec = dv[0:1] if dv.ndim == 2 else dv.view(1, -1)
             elif (
@@ -780,7 +905,9 @@ class Qwen2_5OmniForConditionalGeneration(
         if isinstance(step_vec, torch.Tensor) and step_vec.numel() > 0:
             one_id = input_ids[0:1]
             _, one_embed = self._thinker_to_talker_decode_one_step(
-                output_prompt_embeds=step_vec.to(input_embeds.dtype).to(self._module_device(self.model)),
+                output_prompt_embeds=step_vec.to(input_embeds.dtype).to(
+                    self._module_device(self.model)
+                ),
                 output_token_ids=one_id,
             )
             input_embeds[0] = one_embed[0]
@@ -791,12 +918,14 @@ class Qwen2_5OmniForConditionalGeneration(
         output_prompt_embeds,
         output_token_ids,
     ):
-        processed_output_token_embeds = output_prompt_embeds + self.talker.embed_input_ids(
-            output_token_ids
+        processed_output_token_embeds = (
+            output_prompt_embeds + self.talker.embed_input_ids(output_token_ids)
         )  # for decode
         return output_token_ids, processed_output_token_embeds
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object) -> torch.Tensor | None:
+    def compute_logits(
+        self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object
+    ) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
@@ -812,7 +941,9 @@ class Qwen2_5OmniForConditionalGeneration(
         # Use thinker model for sampling
         return self.model.sample(logits, sampling_metadata)
 
-    def generate_speech(self, text_tokens: torch.Tensor, voice_type: str = "default") -> torch.Tensor:
+    def generate_speech(
+        self, text_tokens: torch.Tensor, voice_type: str = "default"
+    ) -> torch.Tensor:
         """
         Generate speech from text tokens using the talker and token2wav models.
         This method is kept for backward compatibility and direct speech generation.
@@ -825,7 +956,9 @@ class Qwen2_5OmniForConditionalGeneration(
             Audio tensor
         """
         # Generate codec tokens using talker model
-        talker_output = self.talker(input_ids=None, positions=None, inputs_embeds=text_tokens)
+        talker_output = self.talker(
+            input_ids=None, positions=None, inputs_embeds=text_tokens
+        )
 
         # Convert talker output to codec tokens
         codec_tokens = self._convert_to_codec_tokens(talker_output)
@@ -852,7 +985,9 @@ class Qwen2_5OmniForConditionalGeneration(
             # Suppress only codec_bos, consistent with HF generate's
             # suppress_tokens behavior
             bos_id = None
-            if hasattr(self, "talker_config") and hasattr(self.talker_config, "tts_codec_start_token_id"):
+            if hasattr(self, "talker_config") and hasattr(
+                self.talker_config, "tts_codec_start_token_id"
+            ):
                 bos_id = int(getattr(self.talker_config, "tts_codec_start_token_id"))
             if bos_id is not None:
                 logits[..., bos_id] = -1e9
@@ -871,8 +1006,12 @@ class Qwen2_5OmniForConditionalGeneration(
         conds = getattr(self.token2wav_config, "conds", None)
         ref_mels = getattr(self.token2wav_config, "ref_mels", None)
         if isinstance(conds, dict) and isinstance(ref_mels, dict):
-            self._token2wav_conds = {k: torch.as_tensor(v, device=device) for k, v in conds.items()}
-            self._token2wav_ref_mels = {k: torch.as_tensor(v, device=device) for k, v in ref_mels.items()}
+            self._token2wav_conds = {
+                k: torch.as_tensor(v, device=device) for k, v in conds.items()
+            }
+            self._token2wav_ref_mels = {
+                k: torch.as_tensor(v, device=device) for k, v in ref_mels.items()
+            }
         # legacy: load from directory if provided
         model_path = hf_model_folder
         if isinstance(model_path, str) and os.path.isdir(model_path):
@@ -884,14 +1023,24 @@ class Qwen2_5OmniForConditionalGeneration(
                     self._token2wav_ref_mels[key] = value["ref_mel"].to(device)
             else:
                 # legacy npy inputs
-                for f in sorted(glob.glob(os.path.join(model_path, "inputs", "*spk_emb.npy"))):
+                for f in sorted(
+                    glob.glob(os.path.join(model_path, "inputs", "*spk_emb.npy"))
+                ):
                     key = os.path.basename(f).split("_")[0].lower()
-                    self._token2wav_conds[key] = torch.as_tensor(np.load(f), device=device)
-                for f in sorted(glob.glob(os.path.join(model_path, "inputs", "*ref_mel.npy"))):
+                    self._token2wav_conds[key] = torch.as_tensor(
+                        np.load(f), device=device
+                    )
+                for f in sorted(
+                    glob.glob(os.path.join(model_path, "inputs", "*ref_mel.npy"))
+                ):
                     key = os.path.basename(f).split("_")[0].lower()
-                    self._token2wav_ref_mels[key] = torch.as_tensor(np.load(f), device=device)
+                    self._token2wav_ref_mels[key] = torch.as_tensor(
+                        np.load(f), device=device
+                    )
 
-    def _codec_to_audio(self, codec_tokens: torch.Tensor, voice_type: str = "default") -> torch.Tensor | None:
+    def _codec_to_audio(
+        self, codec_tokens: torch.Tensor, voice_type: str = "default"
+    ) -> torch.Tensor | None:
         if self.token2wav is None:
             self._init_token2wav_model()
         if self.token2wav is None:
@@ -925,7 +1074,9 @@ class Qwen2_5OmniForConditionalGeneration(
             if codec.ndim == 1:
                 codec = codec.unsqueeze(0)
         else:
-            codec = torch.as_tensor(codec_tokens, dtype=torch.long, device=token2wav_dev).unsqueeze(0)
+            codec = torch.as_tensor(
+                codec_tokens, dtype=torch.long, device=token2wav_dev
+            ).unsqueeze(0)
 
         # Streaming with chunked process and boundary alignment
         # (rely on token2wav.process_chunk)
@@ -940,7 +1091,9 @@ class Qwen2_5OmniForConditionalGeneration(
         steps = 10
 
         # Prepare initial noise for the whole sequence
-        y_all = torch.randn((1, total_mel, mel_dim), dtype=ref_mel.dtype, device=token2wav_dev)
+        y_all = torch.randn(
+            (1, total_mel, mel_dim), dtype=ref_mel.dtype, device=token2wav_dev
+        )
 
         logger.info(
             "Currently, we do not use the chunked process, we only use the "
@@ -952,7 +1105,9 @@ class Qwen2_5OmniForConditionalGeneration(
         for i in range(codec.shape[1]):
             chunk_code_length = i * 2 - 24
             finished = i == (codec.shape[1] - 1)
-            if (chunk_code_length > 0 and chunk_code_length % chunk_size == 0) or finished:
+            if (
+                chunk_code_length > 0 and chunk_code_length % chunk_size == 0
+            ) or finished:
                 chunk_ends.append(i)
 
         # Number of chunks in mel domain
@@ -1010,14 +1165,20 @@ class Qwen2_5OmniForConditionalGeneration(
         if talker_weights and self.talker is not None:
             # Map talker weights to appropriate components
             if self.thinker is None:
-                thinker_embedding_weights = [w for n, w in thinker_weights if n == "thinker.model.embed_tokens.weight"]
+                thinker_embedding_weights = [
+                    w
+                    for n, w in thinker_weights
+                    if n == "thinker.model.embed_tokens.weight"
+                ]
                 if thinker_embedding_weights:
                     self.thinker_embedding = nn.Embedding(
                         thinker_embedding_weights[0].shape[0],
                         thinker_embedding_weights[0].shape[1],
                     )
                     self.thinker_embedding.weight = nn.Parameter(
-                        thinker_embedding_weights[0].to(self._module_device(self.talker))
+                        thinker_embedding_weights[0].to(
+                            self._module_device(self.talker)
+                        )
                     )
             talker_loaded = self.talker.load_weights(talker_weights)
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
@@ -1038,7 +1199,9 @@ class Qwen2_5OmniForConditionalGeneration(
                     allow_patterns=["*.pt"],
                 )
             self._init_token2wav_model(hf_model_folder)
-            t2w_loaded = self.token2wav.load_weights(token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt"))
+            t2w_loaded = self.token2wav.load_weights(
+                token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt")
+            )
             t2w_loaded = add_prefix_to_loaded_weights(t2w_loaded, "token2wav")
             loaded_weights.update(t2w_loaded)
 

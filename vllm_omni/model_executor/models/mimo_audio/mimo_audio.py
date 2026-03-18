@@ -25,7 +25,11 @@ from vllm.multimodal.inputs import (
     MultiModalFieldElem,
     MultiModalKwargsItem,
 )
-from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems, MultiModalDataParser
+from vllm.multimodal.parse import (
+    AudioProcessorItems,
+    MultiModalDataItems,
+    MultiModalDataParser,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -53,7 +57,9 @@ from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
     TEXT_GROUP_SIZE,
     MiMoAudioConfig,
 )
-from vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav import get_tokenizer_worker
+from vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav import (
+    get_tokenizer_worker,
+)
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import OmniOutput
 
 logger = init_logger(__name__)
@@ -222,7 +228,9 @@ class MiMoAudioLLMProcessingInfo(
         return {"audio": 1}
 
 
-class MiMoAudioLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiMoAudioLLMProcessingInfo]):
+class MiMoAudioLLMDummyInputsBuilder(
+    BaseDummyInputsBuilder[MiMoAudioLLMProcessingInfo]
+):
     _processor_inputs_cache: LRUCache = LRUCache(capacity=1024)
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -230,7 +238,10 @@ class MiMoAudioLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiMoAudioLLMProcessi
         return (" <|empty|>" * num_audios).strip()
 
     def get_dummy_mm_data(
-        self, seq_len: int, mm_counts: Mapping[str, int], mm_options: Mapping[str, BaseDummyOptions] | None = None
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio", 0)
         if num_audios == 0:
@@ -238,7 +249,9 @@ class MiMoAudioLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiMoAudioLLMProcessi
         # Return dummy raw audio data (not encoded codes)
         # This will be processed by _parse_audio_data like real audio
         # Use 1 second of audio at target_sr (24000 Hz)
-        dummy_audio_length = mm_options.get("audio").length if mm_options else 24000  # 1 second at 24kHz
+        dummy_audio_length = (
+            mm_options.get("audio").length if mm_options else 24000
+        )  # 1 second at 24kHz
         dummy_audio = np.zeros((dummy_audio_length,), dtype=np.float32)
         return {"audio": [(dummy_audio, 24000)] * num_audios}
 
@@ -277,7 +290,11 @@ class MiMoAudioDataParser(MultiModalDataParser):
                 self.device = torch.device(tokenizer_device)
         else:
             # Default to cuda (will use current GPU)
-            self.device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device(
+                f"cuda:{torch.cuda.current_device()}"
+                if torch.cuda.is_available()
+                else "cpu"
+            )
 
         self.audio_tokenizer_path = os.environ.get("MIMO_AUDIO_TOKENIZER_PATH", None)
         if not self.audio_tokenizer_path:
@@ -323,7 +340,9 @@ class MiMoAudioDataParser(MultiModalDataParser):
 
         new_audios = list[np.ndarray]()
         for data_item in data_items:
-            if not isinstance(data_item, tuple) or not isinstance(data_item[0], np.ndarray):
+            if not isinstance(data_item, tuple) or not isinstance(
+                data_item[0], np.ndarray
+            ):
                 new_audios.append(data_item)
                 continue
 
@@ -347,7 +366,9 @@ class MiMoAudioDataParser(MultiModalDataParser):
         return AudioProcessorItems(new_audios)
 
 
-class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProcessingInfo]):
+class MiMoAudioLLMMultiModalProcessor(
+    BaseMultiModalProcessor[MiMoAudioLLMProcessingInfo]
+):
     def _call_hf_processor(
         self,
         prompt: str,
@@ -444,7 +465,9 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
                     audios = mm_items.get_items("audio", AudioProcessorItems)
                     if audios is not None:
                         num_audios = audios.get_count()
-                        audio_output_lengths = [audios.get_audio_length(i) for i in range(num_audios)]
+                        audio_output_lengths = [
+                            audios.get_audio_length(i) for i in range(num_audios)
+                        ]
                 except Exception as e:
                     logger.error(f"_get_prompt_updates failed: {e}")
 
@@ -461,7 +484,9 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
                 try:
                     audios = mm_items.get_items("audio", AudioProcessorItems)
                     audio_len = audios.get_audio_length(item_idx)
-                    raise ValueError(f"The audio (len={audio_len}) is too short to be represented inside the model")
+                    raise ValueError(
+                        f"The audio (len={audio_len}) is too short to be represented inside the model"
+                    )
                 except (AttributeError, KeyError):
                     # If AudioProcessorItems is not available, use default
                     num_features = 1
@@ -537,7 +562,11 @@ class MiMoAudioForConditionalGeneration(
         self.have_multimodal_outputs = True
         self.requires_raw_input_tokens = True
         config = vllm_config.model_config.hf_config
-        config = MiMoAudioConfig(**vars(config)) if isinstance(config, Qwen2Config) else config
+        config = (
+            MiMoAudioConfig(**vars(config))
+            if isinstance(config, Qwen2Config)
+            else config
+        )
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
 
@@ -593,7 +622,9 @@ class MiMoAudioForConditionalGeneration(
             else lambda: None
         )
 
-    def fused_thinker_talker_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
+    def fused_thinker_talker_preprocess(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict
+    ):
         # Mixed-mode support: In a single step, both Prefill*n and Decode*n are supported.
 
         # Ensure we have base embeddings when only ids are provided
@@ -604,12 +635,16 @@ class MiMoAudioForConditionalGeneration(
 
         if span_len > 1:
             # prefill
-            return self.fused_thinker_talker_prefill(input_ids, input_embeds, **info_dict)
+            return self.fused_thinker_talker_prefill(
+                input_ids, input_embeds, **info_dict
+            )
         else:
             # decode
             return input_ids, input_embeds, info_dict
 
-    def fused_thinker_talker_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
+    def fused_thinker_talker_prefill(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict
+    ):
         empty_token_id = self.fused_thinker_talker.empty_token_id
 
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
@@ -642,10 +677,14 @@ class MiMoAudioForConditionalGeneration(
             mm_kwargs_group["mm_offset"] = torch.tensor(
                 mm_kwargs_group["mm_offset"], dtype=torch.long, device=self.device
             )
-            mm_embeddings = self.fused_thinker_talker.embed_multimodal(**mm_kwargs_group)
+            mm_embeddings = self.fused_thinker_talker.embed_multimodal(
+                **mm_kwargs_group
+            )
 
         input_embeds = self.fused_thinker_talker.embed_input_ids(
-            prompt_ids, multimodal_embeddings=mm_embeddings, is_multimodal=(prompt_ids == empty_token_id)
+            prompt_ids,
+            multimodal_embeddings=mm_embeddings,
+            is_multimodal=(prompt_ids == empty_token_id),
         )
 
         return prompt_ids, input_embeds, info_dict
@@ -693,8 +732,14 @@ class MiMoAudioForConditionalGeneration(
         is_multimodal: bool = False,
     ) -> torch.Tensor:
         if self.model_stage == "code2wav":
-            return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
-        return self.model.embed_input_ids(input_ids, multimodal_embeddings, is_multimodal=is_multimodal)
+            return (
+                torch.zeros_like(input_ids)
+                .reshape(-1, 1)
+                .repeat(1, self.vllm_config.model_config.get_hidden_size())
+            )
+        return self.model.embed_input_ids(
+            input_ids, multimodal_embeddings, is_multimodal=is_multimodal
+        )
 
     def embed_multimodal(self, **kwargs):
         # Delegate to thinker model for multimodal processing
@@ -763,7 +808,9 @@ class MiMoAudioForConditionalGeneration(
         out = input_ids.new_full((new_len,), value)
 
         # Place original elements at the first position of each block: 0, group_size+1, 2*(group_size+1), ...
-        positions = torch.arange(L, dtype=torch.long, device=input_ids.device) * (group_size + 1)
+        positions = torch.arange(L, dtype=torch.long, device=input_ids.device) * (
+            group_size + 1
+        )
         out[positions] = input_ids
 
         return out
@@ -799,7 +846,9 @@ class MiMoAudioForConditionalGeneration(
             )
 
             return OmniOutput(
-                text_hidden_states=text_hidden_states.reshape(-1, text_hidden_states.shape[-1]),
+                text_hidden_states=text_hidden_states.reshape(
+                    -1, text_hidden_states.shape[-1]
+                ),
                 multimodal_outputs={"code_predictor_codes": next_speech_tokens},
             )
 
@@ -818,7 +867,11 @@ class MiMoAudioForConditionalGeneration(
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
-                    "model_outputs": audio_tensor.reshape(1, -1) if audio_tensor is not None else audio_tensor
+                    "model_outputs": (
+                        audio_tensor.reshape(1, -1)
+                        if audio_tensor is not None
+                        else audio_tensor
+                    )
                 },
             )
 
@@ -835,7 +888,11 @@ class MiMoAudioForConditionalGeneration(
         # if input_ids is None, set it to a zero tensor, in the length of the
         # same as the embedding seq length
         if input_ids is None:
-            input_ids = torch.zeros(inputs_embeds.shape[1], dtype=torch.long, device=llm_dev).unsqueeze(0)  # (1, 0)
+            input_ids = torch.zeros(
+                inputs_embeds.shape[1], dtype=torch.long, device=llm_dev
+            ).unsqueeze(
+                0
+            )  # (1, 0)
 
         # 1) Thinker (ensure inputs on thinker's device)
         if input_ids is not None and input_ids.device != llm_dev:
@@ -886,12 +943,16 @@ class MiMoAudioForConditionalGeneration(
                 # But this case should theoretically not happen
                 code_tensor = torch.as_tensor(code, dtype=torch.long)
             else:
-                code_tensor = torch.as_tensor(code, dtype=torch.long, device=token2wav_dev)
+                code_tensor = torch.as_tensor(
+                    code, dtype=torch.long, device=token2wav_dev
+                )
         if code_tensor.ndim == 2 and code_tensor.shape[0] == 1:
             code_tensor = code_tensor.squeeze(0)
 
         with torch.inference_mode():
-            audio_tensor = self.token2wav(codes=code_tensor)  # code_tensor tensor [seq_len]
+            audio_tensor = self.token2wav(
+                codes=code_tensor
+            )  # code_tensor tensor [seq_len]
 
         return audio_tensor
 

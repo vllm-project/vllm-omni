@@ -111,7 +111,9 @@ def fork_new_process_for_each_test(func: Callable[_P, None]) -> Callable[_P, Non
                             exc_info = cloudpickle.load(f)
 
                     original_exception = exc_info.get("pickled_exception")
-                    if original_exception is not None and isinstance(original_exception, Exception):
+                    if original_exception is not None and isinstance(
+                        original_exception, Exception
+                    ):
                         # Re-raise the actual exception object if it was
                         # successfully pickled.
                         raise original_exception
@@ -169,14 +171,18 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
 
             cmd = [sys.executable, "-m", f"{module_name}"]
 
-            returned = subprocess.run(cmd, input=input_bytes, capture_output=True, env=env)
+            returned = subprocess.run(
+                cmd, input=input_bytes, capture_output=True, env=env
+            )
 
             # check if the subprocess is successful
             try:
                 returned.check_returncode()
             except Exception as e:
                 # wrap raised exception to provide more information
-                raise RuntimeError(f"Error raised in subprocess:\n{returned.stderr.decode()}") from e
+                raise RuntimeError(
+                    f"Error raised in subprocess:\n{returned.stderr.decode()}"
+                ) from e
 
     return wrapper
 

@@ -46,12 +46,14 @@ def ar2dit(
             )
         full_hidden_states = mm_output["latent"]
         hidden_total = int(full_hidden_states.shape[0])
-        assert hidden_total == len(prompt_token_ids) + len(gen_token_ids), (
-            f"Hidden states length mismatch: expected {len(prompt_token_ids) + len(gen_token_ids)}, got {hidden_total}"
-        )
+        assert hidden_total == len(prompt_token_ids) + len(
+            gen_token_ids
+        ), f"Hidden states length mismatch: expected {len(prompt_token_ids) + len(gen_token_ids)}, got {hidden_total}"
 
         mask_device = full_hidden_states.device
-        full_token_ids_t = torch.tensor(full_token_ids, dtype=torch.long, device=mask_device)
+        full_token_ids_t = torch.tensor(
+            full_token_ids, dtype=torch.long, device=mask_device
+        )
         attention_mask = torch.ones_like(full_token_ids_t, dtype=torch.bool)
 
         pos = torch.arange(full_token_ids_t.shape[0], device=mask_device)
@@ -66,7 +68,9 @@ def ar2dit(
             torch.tensor(visual_ids, dtype=torch.long, device=mask_device),
         )
 
-        text_condition_token_mask = questions_mask & ~(visual_token_mask | gen_token_mask) & attention_mask
+        text_condition_token_mask = (
+            questions_mask & ~(visual_token_mask | gen_token_mask) & attention_mask
+        )
         image_condition_token_mask = answers_mask & gen_token_mask & attention_mask
 
         text_condition = full_hidden_states[text_condition_token_mask]

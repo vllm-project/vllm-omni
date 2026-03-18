@@ -44,8 +44,12 @@ def try_send_via_connector(
         # payload and never uses "original_prompt", so stripping these fields
         # only affects debug metadata and is safe.
         _MM_FEATURE_KEYS = frozenset({"mm_kwargs", "mm_placeholders", "mm_hashes"})
-        if isinstance(original_prompt, dict) and any(k in original_prompt for k in _MM_FEATURE_KEYS):
-            safe_prompt = {k: v for k, v in original_prompt.items() if k not in _MM_FEATURE_KEYS}
+        if isinstance(original_prompt, dict) and any(
+            k in original_prompt for k in _MM_FEATURE_KEYS
+        ):
+            safe_prompt = {
+                k: v for k, v in original_prompt.items() if k not in _MM_FEATURE_KEYS
+            }
         else:
             safe_prompt = original_prompt
 
@@ -61,7 +65,9 @@ def try_send_via_connector(
         }
 
         # Send data via connector
-        success, serialized_size, metadata = connector.put(str(stage_id), str(next_stage_id), str(req_id), payload_data)
+        success, serialized_size, metadata = connector.put(
+            str(stage_id), str(next_stage_id), str(req_id), payload_data
+        )
 
         if success:
             # Send lightweight notification via queue
@@ -122,7 +128,9 @@ def try_recv_via_connector(
 
         if not from_stage:
             logger.error(
-                "[Stage-%s] 'from_connector' is true but 'from_stage' is missing for request %s", stage_id, rid
+                "[Stage-%s] 'from_connector' is true but 'from_stage' is missing for request %s",
+                stage_id,
+                rid,
             )
             return None, None
 
@@ -135,7 +143,9 @@ def try_recv_via_connector(
                 # Get data from connector with timeout
                 _t_start = time.time()
                 connector_metadata = task.get("connector_metadata")
-                payload = connector.get(from_stage, to_stage, str(rid), metadata=connector_metadata)
+                payload = connector.get(
+                    from_stage, to_stage, str(rid), metadata=connector_metadata
+                )
                 _t_end = time.time()
 
                 if payload:
@@ -152,19 +162,33 @@ def try_recv_via_connector(
                     ein = payload_data.get("engine_inputs")
                     decode_ms = (_t_end - _t_start) * 1000.0
 
-                    rx_metrics = {"rx_decode_time_ms": decode_ms, "rx_transfer_bytes": serialized_size}
+                    rx_metrics = {
+                        "rx_decode_time_ms": decode_ms,
+                        "rx_transfer_bytes": serialized_size,
+                    }
                     return ein, rx_metrics
                 else:
                     logger.error(
-                        "[Stage-%s] Failed to get data from connector for request %s or payload is empty", stage_id, rid
+                        "[Stage-%s] Failed to get data from connector for request %s or payload is empty",
+                        stage_id,
+                        rid,
                     )
                     return None, None
             except Exception as e:
-                logger.error("[Stage-%s] Error retrieving data from connector for request %s: %s", stage_id, rid, e)
+                logger.error(
+                    "[Stage-%s] Error retrieving data from connector for request %s: %s",
+                    stage_id,
+                    rid,
+                    e,
+                )
                 return None, None
         else:
             logger.error(
-                "[Stage-%s] No connector found for edge %s -> %s for request %s", stage_id, from_stage, to_stage, rid
+                "[Stage-%s] No connector found for edge %s -> %s for request %s",
+                stage_id,
+                from_stage,
+                to_stage,
+                rid,
             )
             return None, None
     else:
@@ -177,7 +201,9 @@ def try_recv_via_connector(
         from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc_with_metrics
 
         try:
-            ein, metrics = maybe_load_from_ipc_with_metrics(task, "engine_inputs", "engine_inputs_shm")
+            ein, metrics = maybe_load_from_ipc_with_metrics(
+                task, "engine_inputs", "engine_inputs_shm"
+            )
             # If metrics are empty or zero, we might want to populate dummy metrics
             return ein, metrics
         except Exception:
@@ -200,7 +226,9 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     system_token_id = 8948
     user_token_id = 872
     assistant_token_id = 77091
-    im_start_indexes = [i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id]
+    im_start_indexes = [
+        i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id
+    ]
     im_start_indexes.append(len(prompt_ids))
     sum_user_len = 0
     assistant_len = 0

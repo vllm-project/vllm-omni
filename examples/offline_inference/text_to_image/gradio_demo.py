@@ -22,8 +22,12 @@ ASPECT_RATIO_CHOICES = [f"{ratio} ({w}x{h})" for ratio, (w, h) in ASPECT_RATIOS.
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Gradio demo for Qwen-Image offline inference.")
-    parser.add_argument("--model", default="Qwen/Qwen-Image", help="Diffusion model name or local path.")
+    parser = argparse.ArgumentParser(
+        description="Gradio demo for Qwen-Image offline inference."
+    )
+    parser.add_argument(
+        "--model", default="Qwen/Qwen-Image", help="Diffusion model name or local path."
+    )
     parser.add_argument(
         "--height",
         type=int,
@@ -36,26 +40,51 @@ def parse_args() -> argparse.Namespace:
         default=1328,
         help="Default image width (must match one of the supported presets).",
     )
-    parser.add_argument("--default-prompt", default="a cup of coffee on the table", help="Initial prompt shown in UI.")
-    parser.add_argument("--default-seed", type=int, default=42, help="Initial seed shown in UI.")
-    parser.add_argument("--default-cfg-scale", type=float, default=4.0, help="Initial CFG scale shown in UI.")
+    parser.add_argument(
+        "--default-prompt",
+        default="a cup of coffee on the table",
+        help="Initial prompt shown in UI.",
+    )
+    parser.add_argument(
+        "--default-seed", type=int, default=42, help="Initial seed shown in UI."
+    )
+    parser.add_argument(
+        "--default-cfg-scale",
+        type=float,
+        default=4.0,
+        help="Initial CFG scale shown in UI.",
+    )
     parser.add_argument(
         "--num-inference-steps",
         type=int,
         default=50,
         help="Default number of denoising steps shown in the UI.",
     )
-    parser.add_argument("--ip", default="127.0.0.1", help="Host/IP for Gradio `launch`.")
-    parser.add_argument("--port", type=int, default=7862, help="Port for Gradio `launch`.")
-    parser.add_argument("--share", action="store_true", help="Share the Gradio demo publicly.")
+    parser.add_argument(
+        "--ip", default="127.0.0.1", help="Host/IP for Gradio `launch`."
+    )
+    parser.add_argument(
+        "--port", type=int, default=7862, help="Port for Gradio `launch`."
+    )
+    parser.add_argument(
+        "--share", action="store_true", help="Share the Gradio demo publicly."
+    )
     args = parser.parse_args()
     args.aspect_ratio_label = next(
-        (ratio for ratio, dims in ASPECT_RATIOS.items() if dims == (args.width, args.height)),
+        (
+            ratio
+            for ratio, dims in ASPECT_RATIOS.items()
+            if dims == (args.width, args.height)
+        ),
         None,
     )
     if args.aspect_ratio_label is None:
-        supported = ", ".join(f"{ratio} ({w}x{h})" for ratio, (w, h) in ASPECT_RATIOS.items())
-        parser.error(f"Unsupported resolution {args.width}x{args.height}. Please pick one of: {supported}.")
+        supported = ", ".join(
+            f"{ratio} ({w}x{h})" for ratio, (w, h) in ASPECT_RATIOS.items()
+        )
+        parser.error(
+            f"Unsupported resolution {args.width}x{args.height}. Please pick one of: {supported}."
+        )
     return args
 
 
@@ -93,12 +122,16 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
             num_steps = int(num_steps_value)
             num_images = int(num_images_choice)
         except (TypeError, ValueError) as exc:
-            raise gr.Error("Seed, inference steps, and number of images must be valid integers.") from exc
+            raise gr.Error(
+                "Seed, inference steps, and number of images must be valid integers."
+            ) from exc
         if num_steps <= 0:
             raise gr.Error("Inference steps must be a positive integer.")
         if num_images not in {1, 2, 3, 4}:
             raise gr.Error("Number of images must be 1, 2, 3, or 4.")
-        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
+        generator = torch.Generator(
+            device=current_omni_platform.device_type
+        ).manual_seed(seed)
         outputs = omni.generate(
             prompt.strip(),
             OmniDiffusionSamplingParams(
@@ -113,8 +146,12 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         images_outputs = []
         for output in outputs:
             req_out = output.request_output[0]
-            if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-                raise ValueError("Invalid request_output structure or missing 'images' key")
+            if not isinstance(req_out, OmniRequestOutput) or not hasattr(
+                req_out, "images"
+            ):
+                raise ValueError(
+                    "Invalid request_output structure or missing 'images' key"
+                )
             images = req_out.images
             if not images:
                 raise ValueError("No images found in request_output")
@@ -188,7 +225,9 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                     placeholder="Describe the image you want to generate...",
                     lines=5,
                 )
-                seed_input = gr.Number(label="Seed", value=args.default_seed, precision=0)
+                seed_input = gr.Number(
+                    label="Seed", value=args.default_seed, precision=0
+                )
                 cfg_input = gr.Number(label="CFG Scale", value=args.default_cfg_scale)
                 steps_input = gr.Number(
                     label="Inference Steps",
@@ -220,7 +259,14 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
 
         generate_btn.click(
             fn=run_inference,
-            inputs=[prompt_input, seed_input, cfg_input, aspect_dropdown, steps_input, num_images],
+            inputs=[
+                prompt_input,
+                seed_input,
+                cfg_input,
+                aspect_dropdown,
+                steps_input,
+                num_images,
+            ],
             outputs=gallery,
         )
 

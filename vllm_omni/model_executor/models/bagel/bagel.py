@@ -110,7 +110,9 @@ class OmniBagelProcessingInfo(BaseProcessingInfo):
             else:
                 from huggingface_hub import hf_hub_download
 
-                index_path = Path(hf_hub_download(model_name, "model.safetensors.index.json"))
+                index_path = Path(
+                    hf_hub_download(model_name, "model.safetensors.index.json")
+                )
 
             if not index_path.exists():
                 return
@@ -238,7 +240,9 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
                 del img_data["pixel_values_img2img"]
             kwargs_img = dict(mm_kwargs)
             kwargs_img["is_img2img"] = False
-            out_img = super()._call_hf_processor(prompt, img_data, kwargs_img, tok_kwargs)
+            out_img = super()._call_hf_processor(
+                prompt, img_data, kwargs_img, tok_kwargs
+            )
             if "pixel_values" in out_img:
                 outputs["pixel_values"] = out_img["pixel_values"]
             for k, v in out_img.items():
@@ -251,7 +255,9 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             img2img_data["images"] = img2img_data.pop("pixel_values_img2img")
             kwargs_img2img = dict(mm_kwargs)
             kwargs_img2img["is_img2img"] = True
-            out_img2img = super()._call_hf_processor(prompt, img2img_data, kwargs_img2img, tok_kwargs)
+            out_img2img = super()._call_hf_processor(
+                prompt, img2img_data, kwargs_img2img, tok_kwargs
+            )
             if "pixel_values" in out_img2img:
                 outputs["pixel_values_img2img"] = out_img2img["pixel_values"]
             for k, v in out_img2img.items():
@@ -320,7 +326,9 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             def get_img2img_replacement(item_idx: int):
                 h, w = image_size, image_size
                 if "img2img" in mm_items:
-                    item = mm_items.get_items("img2img", (Img2ImgProcessorItems, ImageEmbeddingItems))
+                    item = mm_items.get_items(
+                        "img2img", (Img2ImgProcessorItems, ImageEmbeddingItems)
+                    )
                     if hasattr(item, "get_image_size"):
                         size = item.get_image_size(item_idx)
                         h, w = size.height, size.width
@@ -336,7 +344,9 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
                 new_h = min(new_h, max_img_size)
                 new_w = min(new_w, max_img_size)
 
-                num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
+                num_vae_patches = (new_h // latent_downsample) * (
+                    new_w // latent_downsample
+                )
                 num_vae_total = num_vae_patches + 2
                 num_vit_total = num_vit_patches + 2
                 # +1 separator between VAE and ViT blocks so that
@@ -348,7 +358,9 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
                 embed_mask = [True] * num_vae_total + [False] + [True] * num_vit_total
                 return PromptUpdateDetails(
                     full=tokens,
-                    is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
+                    is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(
+                        _m, dtype=torch.bool
+                    ),
                 )
 
             replacements.append(
@@ -426,11 +438,16 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self._pending_img2img_info: list[tuple[int, int, int, int]] = []
         self._ropes_pending: list[dict[str, Any]] = []
         self._ropes_metadata: dict[str, dict[str, Any]] = {}
-        self._cfg_companion_queue: deque[tuple[tuple[int, int, int, int], int]] = deque()
+        self._cfg_companion_queue: deque[tuple[tuple[int, int, int, int], int]] = (
+            deque()
+        )
 
         from transformers import AutoTokenizer
 
-        tok_name = getattr(vllm_config.model_config, "tokenizer", None) or vllm_config.model_config.model
+        tok_name = (
+            getattr(vllm_config.model_config, "tokenizer", None)
+            or vllm_config.model_config.model
+        )
         _tok = AutoTokenizer.from_pretrained(tok_name, trust_remote_code=True)
         for t in ["<|vision_start|>", "<|vision_end|>"]:
             if t not in _tok.get_vocab():
@@ -488,7 +505,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 hidden_act=llm_cfg.hidden_act,
             )
             layer.input_layernorm_moe_gen = VllmRMSNorm(hidden_size, eps=rms_eps)
-            layer.post_attention_layernorm_moe_gen = VllmRMSNorm(hidden_size, eps=rms_eps)
+            layer.post_attention_layernorm_moe_gen = VllmRMSNorm(
+                hidden_size, eps=rms_eps
+            )
 
     def _resize_to_stride(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Resize pixel values to stride-aligned dimensions
@@ -534,15 +553,24 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         mm_input_by_modality = {}
 
         if any(k in kwargs for k in ("pixel_values", "image_embeds")):
-            mm_input_by_modality["img2text"] = self._parse_and_validate_image_input(**kwargs)
+            mm_input_by_modality["img2text"] = self._parse_and_validate_image_input(
+                **kwargs
+            )
 
-        img2img_keys = {"pixel_values_img2img": "pixel_values", "image_embeds_img2img": "image_embeds"}
-        img2img_kwargs = {img2img_keys[k]: v for k, v in kwargs.items() if k in img2img_keys}
+        img2img_keys = {
+            "pixel_values_img2img": "pixel_values",
+            "image_embeds_img2img": "image_embeds",
+        }
+        img2img_kwargs = {
+            img2img_keys[k]: v for k, v in kwargs.items() if k in img2img_keys
+        }
 
         if img2img_kwargs:
             combined_kwargs = kwargs.copy()
             combined_kwargs.update(img2img_kwargs)
-            mm_input_by_modality["img2img"] = self._parse_and_validate_image_input(**combined_kwargs)
+            mm_input_by_modality["img2img"] = self._parse_and_validate_image_input(
+                **combined_kwargs
+            )
 
         return mm_input_by_modality
 
@@ -562,7 +590,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 multimodal_embeddings += tuple(img2img_embeddings)
         return multimodal_embeddings
 
-    def get_flattened_position_ids(self, img_h, img_w, patch_size, max_num_patches_per_side):
+    def get_flattened_position_ids(
+        self, img_h, img_w, patch_size, max_num_patches_per_side
+    ):
         num_patches_h, num_patches_w = img_h // patch_size, img_w // patch_size
         coords_h = torch.arange(0, num_patches_h)
         coords_w = torch.arange(0, num_patches_w)
@@ -593,7 +623,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             align_corners=False,
         )
 
-        vit_embeddings_tuple = self._process_image_input({"pixel_values": vit_pixel_values})
+        vit_embeddings_tuple = self._process_image_input(
+            {"pixel_values": vit_pixel_values}
+        )
 
         marker_ids = torch.tensor(
             [self._start_of_image_id, self._end_of_image_id],
@@ -617,7 +649,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
             latent = padded_latent[0][:, : h * p, : w * p]
             latent = latent.reshape(self.latent_channel, h, p, w, p)
-            latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
+            latent = torch.einsum("chpwq->hwpqc", latent).reshape(
+                -1, p * p * self.latent_channel
+            )
 
             vae_position_ids = self.get_flattened_position_ids(
                 H,
@@ -631,7 +665,11 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
             vae_embeds = self.vae2llm(latent) + timestep_embeds + pos_embed
 
-            vit_emb = vit_embeddings_tuple[i] if i < len(vit_embeddings_tuple) else vit_embeddings_tuple[0]
+            vit_emb = (
+                vit_embeddings_tuple[i]
+                if i < len(vit_embeddings_tuple)
+                else vit_embeddings_tuple[0]
+            )
 
             se = start_embed.to(vae_embeds.dtype)
             ee = end_embed.to(vae_embeds.dtype)
@@ -655,7 +693,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         **kwargs: object,
     ) -> torch.Tensor:
         use_mot = False
-        seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
+        seq_len = (
+            inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
+        )
 
         if self._pending_img2img_info:
             positions = self._adjust_positions_for_img2img(positions)
@@ -666,7 +706,11 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             remaining -= 1
             num_vae, num_vit, img_H, img_W = cached
             num_img2img = num_vae + 1 + num_vit  # +1 separator
-            seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
+            seq_len = (
+                inputs_embeds.shape[0]
+                if inputs_embeds is not None
+                else positions.shape[0]
+            )
 
             if inputs_embeds is not None and seq_len >= num_img2img:
                 self._pending_img2img_info = [cached]
@@ -682,8 +726,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 self._cfg_companion_queue[0] = (cached, remaining)
 
         if use_mot:
-            return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
-        return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+            return self._mot_forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+            )
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+        )
 
     def _adjust_positions_for_img2img(self, positions: torch.Tensor) -> torch.Tensor:
         """Rewrite position IDs to match the single-stage DiT scheme:
@@ -710,7 +758,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         num_requests = len(boundaries) - 1
         new_positions = positions.clone()
-        vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
+        vae_mask = torch.zeros(
+            len(positions), dtype=torch.bool, device=positions.device
+        )
 
         img2img_idx = 0
         for req_idx in range(num_requests):
@@ -731,7 +781,10 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                     if num_text > 0:
                         text_start = start + num_img2img
                         new_positions[text_start:end] = torch.arange(
-                            2, 2 + num_text, device=positions.device, dtype=positions.dtype
+                            2,
+                            2 + num_text,
+                            device=positions.device,
+                            dtype=positions.dtype,
                         )
 
                     # VAE gen-mode mask: only actual VAE patches (not markers)
@@ -836,7 +889,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         hidden_states = normed
 
         # ---- attention (split QKV / O projections) ----
-        hidden_states = self._mot_attn_forward(layer.self_attn, positions, hidden_states, vae_mask)
+        hidden_states = self._mot_attn_forward(
+            layer.self_attn, positions, hidden_states, vae_mask
+        )
 
         # ---- post-attention layernorm (split) ----
         hidden_states = hidden_states + residual
@@ -844,7 +899,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         normed = torch.empty_like(hidden_states)
         if non_vae.any():
             normed[non_vae] = layer.post_attention_layernorm(hidden_states[non_vae])
-        normed[vae_mask] = layer.post_attention_layernorm_moe_gen(hidden_states[vae_mask])
+        normed[vae_mask] = layer.post_attention_layernorm_moe_gen(
+            hidden_states[vae_mask]
+        )
         hidden_states = normed
 
         # ---- MLP (split) ----
@@ -954,7 +1011,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 patch_size = self.config.vit_config.patch_size
                 in_channels = self.config.vit_config.num_channels
                 if in_features == in_channels * patch_size * patch_size:
-                    tensor = tensor.reshape(out_channels, patch_size, patch_size, in_channels)
+                    tensor = tensor.reshape(
+                        out_channels, patch_size, patch_size, in_channels
+                    )
                     tensor = tensor.permute(0, 3, 1, 2).contiguous()
 
             if "latent_pos_embed.pos_embed" in mapped_name and tensor.ndim == 2:
@@ -974,7 +1033,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["vit_pos_embed.pos_embed"],
-            ignore_unexpected_prefixes=["vae.", "latent_pos_embed.", "time_embedder.", "vae2llm."],
+            ignore_unexpected_prefixes=[
+                "vae.",
+                "latent_pos_embed.",
+                "time_embedder.",
+                "vae2llm.",
+            ],
         )
         loaded = loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)
 
@@ -982,7 +1046,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         return loaded
 
-    def _load_moe_gen_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
+    def _load_moe_gen_weights(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> set[str]:
         """Load generation-mode MoT weights with proper stacked-param mapping."""
         stacked_params = [
             ("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
@@ -1012,7 +1078,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 mapped = mapped.replace(weight_name, param_name)
                 if mapped in params_dict:
                     param = params_dict[mapped]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, tensor, shard_id)
                     loaded.add(mapped)
                 found_stacked = True
@@ -1021,7 +1089,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             if not found_stacked:
                 if mapped in params_dict:
                     param = params_dict[mapped]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, tensor)
                     loaded.add(mapped)
 

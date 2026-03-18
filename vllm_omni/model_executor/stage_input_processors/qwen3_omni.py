@@ -19,14 +19,26 @@ def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda")
     user_token_id = 872
     assistant_token_id = 77091
 
-    thinker_sequences = torch.tensor(info["thinker_sequences"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+    thinker_sequences = torch.tensor(
+        info["thinker_sequences"], dtype=torch.long, device=device
+    ).unsqueeze(
+        0
+    )  # [1, T]
 
-    input_ids = torch.tensor(info["thinker_input_ids"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+    input_ids = torch.tensor(
+        info["thinker_input_ids"], dtype=torch.long, device=device
+    ).unsqueeze(
+        0
+    )  # [1, T]
 
     im_start_indexes = torch.cat(
         [
             torch.nonzero(input_ids[0] == im_start_token_id).squeeze(1),
-            torch.tensor([thinker_sequences.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
+            torch.tensor(
+                [thinker_sequences.shape[-1]],
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            ),
         ],
         dim=0,
     )
@@ -129,7 +141,10 @@ def thinker2talker_async_chunk(
                 dim=0,
             )
             talker_additional_info["thinker_hidden_states"] = torch.cat(
-                (save_payload.get("thinker_hidden_states"), talker_additional_info.get("thinker_hidden_states")),
+                (
+                    save_payload.get("thinker_hidden_states"),
+                    talker_additional_info.get("thinker_hidden_states"),
+                ),
                 dim=0,
             )
     else:
@@ -141,13 +156,22 @@ def thinker2talker_async_chunk(
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
         if output_token_ids:
-            talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
-            talker_additional_info["thinker_decode_embeddings"] = pooling_output.get("0").detach().cpu()
+            talker_additional_info["override_keys"] = [
+                "thinker_decode_embeddings",
+                "thinker_output_token_ids",
+            ]
+            talker_additional_info["thinker_decode_embeddings"] = (
+                pooling_output.get("0").detach().cpu()
+            )
             talker_additional_info["thinker_output_token_ids"] = output_token_ids
         else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
-            talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
+            talker_additional_info["thinker_prefill_embeddings"] = (
+                pooling_output.get("0").detach().cpu()
+            )
+            talker_additional_info["thinker_hidden_states"] = (
+                pooling_output.get("24").detach().cpu()
+            )
     return talker_additional_info
 
 
@@ -184,16 +208,26 @@ def thinker2talker(
         output = thinker_output.outputs[0]
 
         info = {
-            "thinker_prefill_embeddings": output.multimodal_output["0"].detach().to(device=device, dtype=torch.float),
-            "thinker_hidden_states": output.multimodal_output["24"].detach().to(device=device, dtype=torch.float),
+            "thinker_prefill_embeddings": output.multimodal_output["0"]
+            .detach()
+            .to(device=device, dtype=torch.float),
+            "thinker_hidden_states": output.multimodal_output["24"]
+            .detach()
+            .to(device=device, dtype=torch.float),
             "thinker_sequences": (
                 thinker_output.prompt_token_ids + output.token_ids
             ),  # the thinker_sequences is the whole ids
             "thinker_input_ids": thinker_output.prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
-            "tts_bos_embed": output.multimodal_output["tts_bos_embed"].detach().to(device=device, dtype=torch.float),
-            "tts_eos_embed": output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
-            "tts_pad_embed": output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
+            "tts_bos_embed": output.multimodal_output["tts_bos_embed"]
+            .detach()
+            .to(device=device, dtype=torch.float),
+            "tts_eos_embed": output.multimodal_output["tts_eos_embed"]
+            .detach()
+            .to(device=device, dtype=torch.float),
+            "tts_pad_embed": output.multimodal_output["tts_pad_embed"]
+            .detach()
+            .to(device=device, dtype=torch.float),
         }
 
         prompt_len = _compute_talker_prompt_ids_length(info, device=device)
@@ -252,7 +286,14 @@ def talker2code2wav_async_chunk(
         if not code_tensor.any():
             return None
 
-    codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
+    codec_codes = (
+        code_predictor_codes.to(torch.long)
+        .transpose(0, 1)
+        .cpu()
+        .to(torch.long)
+        .reshape(-1)
+        .tolist()
+    )
     if sum(codec_codes) == 0:
         return None
 

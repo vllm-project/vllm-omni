@@ -138,15 +138,22 @@ class TeaCacheHook(ModelHook):
         state = self.state_manager.get_state()
 
         # Decide whether to compute or cache based on modulated input similarity
-        should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
+        should_compute = self._should_compute_full_transformer(
+            state, ctx.modulated_input
+        )
 
         if not should_compute and state.previous_residual is not None:
             # ============================================================================
             # FAST PATH: Reuse cached residuals
             # ============================================================================
             ctx.hidden_states = ctx.hidden_states + state.previous_residual
-            if state.previous_residual_encoder is not None and ctx.encoder_hidden_states is not None:
-                ctx.encoder_hidden_states = ctx.encoder_hidden_states + state.previous_residual_encoder
+            if (
+                state.previous_residual_encoder is not None
+                and ctx.encoder_hidden_states is not None
+            ):
+                ctx.encoder_hidden_states = (
+                    ctx.encoder_hidden_states + state.previous_residual_encoder
+                )
             output = ctx.hidden_states
         else:
             # ============================================================================
@@ -154,7 +161,9 @@ class TeaCacheHook(ModelHook):
             # ============================================================================
             ori_hidden_states = ctx.hidden_states.clone()
             ori_encoder_hidden_states = (
-                ctx.encoder_hidden_states.clone() if ctx.encoder_hidden_states is not None else None
+                ctx.encoder_hidden_states.clone()
+                if ctx.encoder_hidden_states is not None
+                else None
             )
 
             # Run transformer blocks using model-specific callable
@@ -168,7 +177,9 @@ class TeaCacheHook(ModelHook):
             # Cache residuals for next timestep
             state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
             if ori_encoder_hidden_states is not None:
-                state.previous_residual_encoder = (ctx.encoder_hidden_states - ori_encoder_hidden_states).detach()
+                state.previous_residual_encoder = (
+                    ctx.encoder_hidden_states - ori_encoder_hidden_states
+                ).detach()
 
             output = ctx.hidden_states
 
@@ -182,7 +193,9 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         return ctx.postprocess(output)
 
-    def _should_compute_full_transformer(self, state: TeaCacheState, modulated_inp: torch.Tensor) -> bool:
+    def _should_compute_full_transformer(
+        self, state: TeaCacheState, modulated_inp: torch.Tensor
+    ) -> bool:
         """
         Determine whether to compute full transformer or reuse cached residual.
 

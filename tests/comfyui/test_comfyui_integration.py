@@ -25,7 +25,11 @@ from comfyui_vllm_omni.nodes import (
     VLLMOmniUnderstanding,
     VLLMOmniVoiceClone,
 )
-from comfyui_vllm_omni.utils.types import AutoregressionSamplingParams, DiffusionSamplingParams, WanModelSpecificParams
+from comfyui_vllm_omni.utils.types import (
+    AutoregressionSamplingParams,
+    DiffusionSamplingParams,
+    WanModelSpecificParams,
+)
 from PIL import Image
 from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -121,12 +125,21 @@ AR_LIST_SAMPLING_PARAMS = [
     ),
 ]
 
-VIDEO_MODEL_PARAMS = WanModelSpecificParams({"guidance_scale_2": 5.0, "boundary_ratio": 0.98, "flow_shift": 12.0})
+VIDEO_MODEL_PARAMS = WanModelSpecificParams(
+    {"guidance_scale_2": 5.0, "boundary_ratio": 0.98, "flow_shift": 12.0}
+)
 
-LORA_PARAMS = {"local_path": "test_lora_path", "name": "test_name", "scale": 0.7, "int_id": 10}
+LORA_PARAMS = {
+    "local_path": "test_lora_path",
+    "name": "test_name",
+    "scale": 0.7,
+    "int_id": 10,
+}
 
 
-def _build_image_output(size: tuple[int, int] = (IMAGE_WIDTH, IMAGE_HEIGHT), color: str = "red") -> Image.Image:
+def _build_image_output(
+    size: tuple[int, int] = (IMAGE_WIDTH, IMAGE_HEIGHT), color: str = "red"
+) -> Image.Image:
     return Image.new("RGB", size, color=color)
 
 
@@ -206,7 +219,9 @@ def _build_diffusion_image_output_for_images_endpoint() -> OmniRequestOutput:
 
 def _build_diffusion_video_output() -> OmniRequestOutput:
     # Small video: VIDEO_NUM_FRAMES frames of (VIDEO_HEIGHT x VIDEO_WIDTH) RGB, shape (F, H, W, C)
-    video_frames = torch.zeros((VIDEO_NUM_FRAMES, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32)
+    video_frames = torch.zeros(
+        (VIDEO_NUM_FRAMES, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32
+    )
     return OmniRequestOutput.from_diffusion(
         request_id="test_req_video",
         images=[video_frames],
@@ -227,26 +242,28 @@ def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
 
 
 def _assert_sampling_param_values(
-    received: OmniSamplingParams, expected: dict[str, Any], expected_lora: dict | None = None
+    received: OmniSamplingParams,
+    expected: dict[str, Any],
+    expected_lora: dict | None = None,
 ):
     for key, expected_value in expected.items():
         actual_value = getattr(received, key)
-        assert actual_value == expected_value, (
-            f"Expected sampling param '{key}'={expected_value}, got {actual_value}. The received sampling params: {received}"
-        )
+        assert (
+            actual_value == expected_value
+        ), f"Expected sampling param '{key}'={expected_value}, got {actual_value}. The received sampling params: {received}"
     if expected_lora:
-        assert received.lora_request.lora_name == expected_lora["name"], (
-            f"Expected lora name={(expected_lora['name'])}, got {received.lora_request.lora_name}. The received sampling params: {received}"
-        )
-        assert received.lora_request.lora_int_id == expected_lora["int_id"], (
-            f"Expected lora int_id={expected_lora['int_id']}, got {received.lora_request.lora_int_id}. The received sampling params: {received}"
-        )
-        assert received.lora_request.lora_path == expected_lora["local_path"], (
-            f"Expected lora path={expected_lora['local_path']}, got {received.lora_request.lora_path}. The received sampling params: {received}"
-        )
-        assert received.lora_scale == expected_lora["scale"], (
-            f"Expected lora scale={expected_lora['scale']}, got {received.lora_scale}. The received sampling params: {received}"
-        )
+        assert (
+            received.lora_request.lora_name == expected_lora["name"]
+        ), f"Expected lora name={(expected_lora['name'])}, got {received.lora_request.lora_name}. The received sampling params: {received}"
+        assert (
+            received.lora_request.lora_int_id == expected_lora["int_id"]
+        ), f"Expected lora int_id={expected_lora['int_id']}, got {received.lora_request.lora_int_id}. The received sampling params: {received}"
+        assert (
+            received.lora_request.lora_path == expected_lora["local_path"]
+        ), f"Expected lora path={expected_lora['local_path']}, got {received.lora_request.lora_path}. The received sampling params: {received}"
+        assert (
+            received.lora_scale == expected_lora["scale"]
+        ), f"Expected lora scale={expected_lora['scale']}, got {received.lora_scale}. The received sampling params: {received}"
 
 
 def _assert_model_param_values(received: OmniSamplingParams, expected: dict):
@@ -257,12 +274,16 @@ def _assert_model_param_values(received: OmniSamplingParams, expected: dict):
         except AttributeError:
             actual_value = received.extra_args.get(key, None)
             expected_param_name = f'extra_args["{key}"]'
-        assert actual_value == expected_value, (
-            f"Expected model param '{expected_param_name}'={expected_value}, got {actual_value}. The received sampling params: {received}"
-        )
+        assert (
+            actual_value == expected_value
+        ), f"Expected model param '{expected_param_name}'={expected_value}, got {actual_value}. The received sampling params: {received}"
 
 
-def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: SamplingCase, server_case: ServerCase):
+def _build_mock_outputs(
+    outputs: Iterable[OmniRequestOutput],
+    sampling_case: SamplingCase,
+    server_case: ServerCase,
+):
     async def _mock_generate(*args, **kwargs):
         received_sampling_params_list: Sequence[OmniSamplingParams] | None = (
             args[2] if len(args) > 2 else kwargs.get("sampling_params_list")
@@ -274,7 +295,9 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
             "If this assertion fails, it means the API layer has changed and this test needs to be updated accordingly."
             "It does not necessarily mean there is a bug, because `AsyncOmni.generate` does allow sampling_params_list to be None."
         )
-        assert isinstance(received_sampling_params_list, Sequence), "sampling_params_list should be a Sequence"
+        assert isinstance(
+            received_sampling_params_list, Sequence
+        ), "sampling_params_list should be a Sequence"
 
         if sampling_case.kind is SamplingKind.IMAGE_NONE:
             assert len(received_sampling_params_list) == 1
@@ -288,7 +311,9 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
         elif sampling_case.kind is SamplingKind.IMAGE_DIFFUSION_SINGLE:
             assert len(received_sampling_params_list) == 1
             expected = DIFFUSION_SINGLE_SAMPLING_PARAMS.copy()
-            expected["num_outputs_per_prompt"] = expected.pop("n")  # convert from n to num_outputs_per_prompt
+            expected["num_outputs_per_prompt"] = expected.pop(
+                "n"
+            )  # convert from n to num_outputs_per_prompt
             _assert_sampling_param_values(
                 received_sampling_params_list[0],
                 {
@@ -303,8 +328,13 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
         elif sampling_case.kind is SamplingKind.UNDERSTANDING_AR_LIST:
             assert len(received_sampling_params_list) == 3
             for i, expected in enumerate(AR_LIST_SAMPLING_PARAMS):
-                _assert_sampling_param_values(received_sampling_params_list[i], expected)
-        elif sampling_case.kind in {SamplingKind.TTS_NONE, SamplingKind.TTS_DIFFUSION_SINGLE}:
+                _assert_sampling_param_values(
+                    received_sampling_params_list[i], expected
+                )
+        elif sampling_case.kind in {
+            SamplingKind.TTS_NONE,
+            SamplingKind.TTS_DIFFUSION_SINGLE,
+        }:
             assert len(received_sampling_params_list) == 1
         elif sampling_case.kind is SamplingKind.VIDEO_NONE:
             assert len(received_sampling_params_list) == 1
@@ -332,7 +362,9 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                 },
                 LORA_PARAMS,
             )
-            _assert_model_param_values(received_sampling_params_list[0], VIDEO_MODEL_PARAMS)
+            _assert_model_param_values(
+                received_sampling_params_list[0], VIDEO_MODEL_PARAMS
+            )
         else:
             raise AssertionError(f"Unknown sampling case: {sampling_case.kind}")
 
@@ -368,7 +400,9 @@ def mock_async_omni(server_case: ServerCase, sampling_case: SamplingCase):
         ),
     ):
         mock_instance = AsyncMock()
-        mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
+        mock_instance.generate = _build_mock_outputs(
+            server_case.outputs, sampling_case, server_case
+        )
 
         mock_instance.stage_list = server_case.stage_list
         mock_instance.stage_configs = server_case.stage_configs
@@ -378,7 +412,9 @@ def mock_async_omni(server_case: ServerCase, sampling_case: SamplingCase):
         ]
         mock_instance.errored = False
         mock_instance.dead_error = RuntimeError("Mock engine error")
-        mock_instance.model_config = MagicMock(max_model_len=4096, io_processor_plugin=None)
+        mock_instance.model_config = MagicMock(
+            max_model_len=4096, io_processor_plugin=None
+        )
         mock_instance.io_processor = MagicMock()
         mock_instance.input_processor = MagicMock()
         mock_instance.shutdown = MagicMock()
@@ -399,7 +435,9 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
     cmd.subparser_init(subparsers)
 
     port = unused_tcp_port_factory()
-    args = parser.parse_args(["serve", server_case.served_model, "--omni", "--port", str(port)])
+    args = parser.parse_args(
+        ["serve", server_case.served_model, "--omni", "--port", str(port)]
+    )
 
     def run_server():
         try:
@@ -491,7 +529,8 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
     "sampling_case",
     [
         pytest.param(
-            SamplingCase(kind=SamplingKind.IMAGE_NONE, sampling_params=None, lora=None), id="no-sampling-params"
+            SamplingCase(kind=SamplingKind.IMAGE_NONE, sampling_params=None, lora=None),
+            id="no-sampling-params",
         ),
         pytest.param(
             SamplingCase(
@@ -504,7 +543,9 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
     ],
     indirect=["sampling_case"],
 )
-async def test_image_generation_node(api_server: str, model: str, image_input: bool, sampling_case: SamplingCase):
+async def test_image_generation_node(
+    api_server: str, model: str, image_input: bool, sampling_case: SamplingCase
+):
     node = VLLMOmniGenerateImage()
 
     kwargs = {
@@ -515,7 +556,9 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
         "height": IMAGE_HEIGHT,
     }
     if image_input:
-        kwargs["image"] = torch.zeros((1, IMAGE_WIDTH, IMAGE_HEIGHT, 3), dtype=torch.float32)
+        kwargs["image"] = torch.zeros(
+            (1, IMAGE_WIDTH, IMAGE_HEIGHT, 3), dtype=torch.float32
+        )
     if sampling_case.sampling_params is not None:
         kwargs["sampling_params"] = sampling_case.sampling_params
     if sampling_case.lora:
@@ -546,7 +589,10 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
                     {"stage_type": "llm"},
                     {"stage_type": "llm"},
                 ],
-                outputs=[_build_audio_chat_output(), _build_text_output("Understanding response")],
+                outputs=[
+                    _build_audio_chat_output(),
+                    _build_text_output("Understanding response"),
+                ],
             ),
             id="multimodal-understanding",
         )
@@ -556,9 +602,15 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
 @pytest.mark.parametrize(
     "sampling_case",
     [
-        pytest.param(SamplingCase(kind=SamplingKind.UNDERSTANDING_NONE, sampling_params=None), id="no-sampling-params"),
         pytest.param(
-            SamplingCase(kind=SamplingKind.UNDERSTANDING_AR_LIST, sampling_params=AR_LIST_SAMPLING_PARAMS),
+            SamplingCase(kind=SamplingKind.UNDERSTANDING_NONE, sampling_params=None),
+            id="no-sampling-params",
+        ),
+        pytest.param(
+            SamplingCase(
+                kind=SamplingKind.UNDERSTANDING_AR_LIST,
+                sampling_params=AR_LIST_SAMPLING_PARAMS,
+            ),
             id="ar-sampling-params-list",
         ),
     ],
@@ -569,7 +621,10 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
 
     image = torch.zeros((1, IMAGE_WIDTH, IMAGE_HEIGHT, 3), dtype=torch.float32)
     video = VideoInput(b"mock_video_for_test")  # type: ignore[reportAbstractUsage]
-    audio: AudioInput = {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000}
+    audio: AudioInput = {
+        "waveform": torch.zeros((1, 1, 24000), dtype=torch.float32),
+        "sample_rate": 24000,
+    }
 
     text_response, audio_response = await node.generate(
         url=api_server,
@@ -627,7 +682,10 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
                 "voice": "Vivian",
                 "response_format": "wav",
                 "speed": 1.0,
-                "ref_audio": {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000},
+                "ref_audio": {
+                    "waveform": torch.zeros((1, 1, 24000), dtype=torch.float32),
+                    "sample_rate": 24000,
+                },
                 "ref_text": "Reference transcript",
                 "x_vector_only_mode": False,
                 "model_specific_params": None,
@@ -640,15 +698,23 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
 @pytest.mark.parametrize(
     "sampling_case",
     [
-        pytest.param(SamplingCase(kind=SamplingKind.TTS_NONE, sampling_params=None), id="no-sampling-params"),
         pytest.param(
-            SamplingCase(kind=SamplingKind.TTS_DIFFUSION_SINGLE, sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS),
+            SamplingCase(kind=SamplingKind.TTS_NONE, sampling_params=None),
+            id="no-sampling-params",
+        ),
+        pytest.param(
+            SamplingCase(
+                kind=SamplingKind.TTS_DIFFUSION_SINGLE,
+                sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS,
+            ),
             id="single-diffusion-sampling-params",
         ),
     ],
     indirect=["sampling_case"],
 )
-async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_case: SamplingCase):
+async def test_tts_nodes(
+    api_server: str, node_cls, call_kwargs: dict, sampling_case: SamplingCase
+):
     node = node_cls()
     actual_kwargs = dict(call_kwargs)
     if sampling_case.sampling_params is not None:
@@ -695,7 +761,10 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
 @pytest.mark.parametrize(
     "sampling_case",
     [
-        pytest.param(SamplingCase(kind=SamplingKind.VIDEO_NONE, sampling_params=None), id="no-sampling-params"),
+        pytest.param(
+            SamplingCase(kind=SamplingKind.VIDEO_NONE, sampling_params=None),
+            id="no-sampling-params",
+        ),
         pytest.param(
             SamplingCase(
                 kind=SamplingKind.VIDEO_DIFFUSION_SINGLE,
@@ -707,7 +776,9 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
     ],
     indirect=["sampling_case"],
 )
-async def test_video_generation_node(api_server: str, model: str, image_input: bool, sampling_case: SamplingCase):
+async def test_video_generation_node(
+    api_server: str, model: str, image_input: bool, sampling_case: SamplingCase
+):
     node = VLLMOmniGenerateVideo()
 
     kwargs = {
@@ -722,7 +793,9 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
         "model_params": VIDEO_MODEL_PARAMS,
     }
     if image_input:
-        kwargs["image"] = torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32)
+        kwargs["image"] = torch.zeros(
+            (1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32
+        )
     if sampling_case.sampling_params is not None:
         kwargs["sampling_params"] = sampling_case.sampling_params
     if sampling_case.lora:

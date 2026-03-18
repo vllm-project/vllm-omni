@@ -36,7 +36,10 @@ elif current_omni_platform.is_rocm():
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 1, "rocm": 2, "xpu": 2})
+@hardware_test(
+    res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"},
+    num_cards={"cuda": 1, "rocm": 2, "xpu": 2},
+)
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str, run_level):
     if run_level == "core_model" and model_name != "riverclouds/qwen_image_random":
@@ -58,14 +61,19 @@ def test_diffusion_model(model_name: str, run_level):
                 width=width,
                 num_inference_steps=2,
                 guidance_scale=0.0,
-                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+                generator=torch.Generator(
+                    current_omni_platform.device_type
+                ).manual_seed(42),
                 num_outputs_per_prompt=2,
             ),
         )
         # Extract images from request_output[0]['images']
         first_output = outputs[0]
         assert first_output.final_output_type == "image"
-        if not hasattr(first_output, "request_output") or not first_output.request_output:
+        if (
+            not hasattr(first_output, "request_output")
+            or not first_output.request_output
+        ):
             raise ValueError("No request_output found in OmniRequestOutput")
 
         req_out = first_output.request_output[0]

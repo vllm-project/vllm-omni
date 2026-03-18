@@ -10,11 +10,21 @@ from torch import Tensor
 
 from vllm_omni.platforms import current_omni_platform
 
-__all__ = ["all_to_all_4D", "all_to_all_5D", "SeqAllToAll4D", "SeqAllToAll5D", "RingComm"]
+__all__ = [
+    "all_to_all_4D",
+    "all_to_all_5D",
+    "SeqAllToAll4D",
+    "SeqAllToAll5D",
+    "RingComm",
+]
 
 
 def all_to_all_4D(
-    input: torch.tensor, scatter_idx: int = 2, gather_idx: int = 1, group=None, use_sync: bool = False
+    input: torch.tensor,
+    scatter_idx: int = 2,
+    gather_idx: int = 1,
+    group=None,
+    use_sync: bool = False,
 ) -> torch.tensor:
     """
     all-to-all for QKV
@@ -29,7 +39,9 @@ def all_to_all_4D(
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, hc, hs)
     """
-    assert input.dim() == 4, f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
+    assert (
+        input.dim() == 4
+    ), f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
 
     seq_world_size = dist.get_world_size(group)
 
@@ -41,7 +53,11 @@ def all_to_all_4D(
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen/P, hc, hs) -reshape-> (bs, seq_len/P, P, hc/P, hs) -transpose(0,2)-> (P, seq_len/P, bs, hc/P, hs)
-        input_t = input.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs).transpose(0, 2).contiguous()
+        input_t = (
+            input.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs)
+            .transpose(0, 2)
+            .contiguous()
+        )
 
         output = torch.empty_like(input_t)
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
@@ -114,11 +130,17 @@ class SeqAllToAll4D(torch.autograd.Function):
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
         ctx.use_sync = use_sync
-        return all_to_all_4D(input, scatter_idx, gather_idx, group=group, use_sync=use_sync)
+        return all_to_all_4D(
+            input, scatter_idx, gather_idx, group=group, use_sync=use_sync
+        )
 
 
 def all_to_all_5D(
-    input: torch.tensor, scatter_idx: int = 3, gather_idx: int = 1, group=None, use_sync: bool = False
+    input: torch.tensor,
+    scatter_idx: int = 3,
+    gather_idx: int = 1,
+    group=None,
+    use_sync: bool = False,
 ) -> torch.tensor:
     """
     all-to-all for QKV
@@ -134,7 +156,9 @@ def all_to_all_5D(
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, 3, hc, hs)
     """
-    assert input.dim() == 5, f"input must be 5D tensor, got {input.dim()} and shape {input.shape}"
+    assert (
+        input.dim() == 5
+    ), f"input must be 5D tensor, got {input.dim()} and shape {input.shape}"
 
     seq_world_size = dist.get_world_size(group)
 
@@ -149,7 +173,11 @@ def all_to_all_5D(
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen/P, 3, hc, hs) -reshape-> (bs, seq_len/P, 3, P, hc/P, hs) -transpose(0,3)->
         #  (P, seq_len/P, 3, bs, hc/P, hs)
-        input_t = input.reshape(bs, shard_seqlen, 3, seq_world_size, shard_hc, hs).transpose(0, 3).contiguous()
+        input_t = (
+            input.reshape(bs, shard_seqlen, 3, seq_world_size, shard_hc, hs)
+            .transpose(0, 3)
+            .contiguous()
+        )
 
         output = torch.empty_like(input_t)
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
@@ -222,7 +250,9 @@ class SeqAllToAll5D(torch.autograd.Function):
         ctx.gather_idx = gather_idx
         ctx.use_sync = use_sync
 
-        return all_to_all_5D(input, scatter_idx, gather_idx, group=group, use_sync=use_sync)
+        return all_to_all_5D(
+            input, scatter_idx, gather_idx, group=group, use_sync=use_sync
+        )
 
 
 class RingComm:
@@ -242,7 +272,9 @@ class RingComm:
             self.send_rank = dist.get_global_rank(self._process_group, self.send_rank)
             self.recv_rank = dist.get_global_rank(self._process_group, self.recv_rank)
 
-    def send_recv(self, to_send: torch.Tensor, recv_tensor: torch.Tensor | None = None) -> torch.Tensor:
+    def send_recv(
+        self, to_send: torch.Tensor, recv_tensor: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # Ensure to_send is contiguous for P2P
         if not to_send.is_contiguous():
             to_send = to_send.contiguous()
@@ -256,7 +288,9 @@ class RingComm:
             if not res.is_contiguous():
                 res = res.contiguous()
 
-        send_op = dist.P2POp(dist.isend, to_send, self.send_rank, group=self._process_group)
+        send_op = dist.P2POp(
+            dist.isend, to_send, self.send_rank, group=self._process_group
+        )
         recv_op = dist.P2POp(dist.irecv, res, self.recv_rank, group=self._process_group)
         self._ops.append(send_op)
         self._ops.append(recv_op)

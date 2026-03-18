@@ -110,9 +110,13 @@ def _get_diffusion_feature_cases(model: str):
 )
 def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHandler):
     """Test all diffusion features with Qwen-Image-Edit in regular end-user scenarios."""
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
+    image_data_url = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
+    )
 
-    messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=EDIT_PROMPT)
+    messages = dummy_messages_from_mix_data(
+        image_data_url=image_data_url, content_text=EDIT_PROMPT
+    )
 
     # CFG parallel is only activated when a negative prompt and true_cfg_scale > 1.0 are both present
     request_config = {
@@ -138,13 +142,20 @@ def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHan
     _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2509"),
     indirect=True,
 )
-def test_qwen_image_edit_2509(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_qwen_image_edit_2509(
+    omni_server: OmniServer, openai_client: OpenAIClientHandler
+):
     """Test all diffusion features with Qwen-Image-Edit-2509 in regular end-user scenarios."""
-    image_data_url_1 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
-    image_data_url_2 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
+    image_data_url_1 = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
+    )
+    image_data_url_2 = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
+    )
 
     messages = dummy_messages_from_mix_data(
-        image_data_url=[image_data_url_1, image_data_url_2], content_text=MULTI_EDIT_PROMPT
+        image_data_url=[image_data_url_1, image_data_url_2],
+        content_text=MULTI_EDIT_PROMPT,
     )
 
     # CFG parallel is only activated when a negative prompt and true_cfg_scale > 1.0 are both present

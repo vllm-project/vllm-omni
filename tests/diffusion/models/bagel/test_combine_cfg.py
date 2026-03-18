@@ -38,7 +38,9 @@ class TestCombineCfg:
         # Result norm per token should be <= original v_t norm (clamp max=1.0)
         result_norm = torch.norm(result, dim=-1)
         v_t_norm = torch.norm(v_t, dim=-1)
-        assert torch.all(result_norm <= v_t_norm + 1e-6), "text_channel renorm should not increase per-token norm"
+        assert torch.all(
+            result_norm <= v_t_norm + 1e-6
+        ), "text_channel renorm should not increase per-token norm"
 
     def test_scale_1_returns_v_t(self):
         """cfg_text_scale=1.0 means no CFG: result should equal v_t."""
@@ -82,9 +84,9 @@ class TestCombineCfg:
             cfg_renorm_min=0.0,
         )
 
-        assert not torch.allclose(text_only, with_img, atol=1e-6), (
-            "Image CFG should produce different result from text-only CFG"
-        )
+        assert not torch.allclose(
+            text_only, with_img, atol=1e-6
+        ), "Image CFG should produce different result from text-only CFG"
 
     def test_img_cfg_none_ignored(self):
         """cfg_img_v_t=None should be equivalent to cfg_img_scale <= 1.0."""
@@ -110,9 +112,9 @@ class TestCombineCfg:
             cfg_renorm_min=0.0,
         )
 
-        assert torch.allclose(result_none, result_low_scale, atol=1e-6), (
-            "cfg_img_v_t=None and cfg_img_scale<=1.0 should give same result"
-        )
+        assert torch.allclose(
+            result_none, result_low_scale, atol=1e-6
+        ), "cfg_img_v_t=None and cfg_img_scale<=1.0 should give same result"
 
     def test_global_renorm(self):
         """global renorm should produce valid output without error."""
@@ -193,7 +195,9 @@ class TestCombineCfg:
         # (scale is clamped to at least 0.5 instead of going near 0)
         norm_no_min = torch.norm(result_no_min)
         norm_with_min = torch.norm(result_with_min)
-        assert norm_with_min >= norm_no_min - 1e-6, "Higher cfg_renorm_min should preserve more magnitude"
+        assert (
+            norm_with_min >= norm_no_min - 1e-6
+        ), "Higher cfg_renorm_min should preserve more magnitude"
 
     def test_global_renorm_with_img_cfg(self):
         """global renorm + img CFG should produce valid, different output."""
@@ -219,9 +223,9 @@ class TestCombineCfg:
             cfg_renorm_min=0.0,
         )
 
-        assert not torch.allclose(text_only, with_img, atol=1e-6), (
-            "global renorm + img CFG should differ from text-only"
-        )
+        assert not torch.allclose(
+            text_only, with_img, atol=1e-6
+        ), "global renorm + img CFG should differ from text-only"
         assert not torch.any(torch.isnan(with_img))
 
     def test_channel_renorm_with_img_cfg(self):
@@ -248,9 +252,9 @@ class TestCombineCfg:
             cfg_renorm_min=0.0,
         )
 
-        assert not torch.allclose(text_only, with_img, atol=1e-6), (
-            "channel renorm + img CFG should differ from text-only"
-        )
+        assert not torch.allclose(
+            text_only, with_img, atol=1e-6
+        ), "channel renorm + img CFG should differ from text-only"
         assert not torch.any(torch.isnan(with_img))
 
     def test_global_channel_renorm_constrains_norm(self):
@@ -268,7 +272,9 @@ class TestCombineCfg:
                 cfg_renorm_min=0.0,
             )
             # Global norm of result should be <= global norm of v_t (clamp max=1.0)
-            assert torch.norm(result) <= torch.norm(v_t) + 1e-5, f"{renorm_type} renorm should not increase global norm"
+            assert (
+                torch.norm(result) <= torch.norm(v_t) + 1e-5
+            ), f"{renorm_type} renorm should not increase global norm"
 
     def test_text_channel_img_cfg_no_second_renorm(self):
         """text_channel mode: img CFG is applied AFTER renorm, without a second renorm.
@@ -309,7 +315,9 @@ class TestCombineCfg:
         # All results should have positive cosine similarity with each other
         for a_name, a in results.items():
             for b_name, b in results.items():
-                cos_sim = torch.nn.functional.cosine_similarity(a.flatten().unsqueeze(0), b.flatten().unsqueeze(0))
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    a.flatten().unsqueeze(0), b.flatten().unsqueeze(0)
+                )
                 assert cos_sim > 0.5, (
                     f"{a_name} and {b_name} should point in similar direction, "
                     f"but cosine similarity = {cos_sim.item():.4f}"

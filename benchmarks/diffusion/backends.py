@@ -167,13 +167,17 @@ async def async_request_openai_images(
     }
 
     try:
-        async with session.post(input.api_url, json=payload, headers=headers) as response:
+        async with session.post(
+            input.api_url, json=payload, headers=headers
+        ) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 output.response_body = resp_json
                 output.success = True
                 # Check for usage/memory info if available
-                if "usage" in resp_json and "peak_memory_mb" in resp_json.get("usage", {}):
+                if "usage" in resp_json and "peak_memory_mb" in resp_json.get(
+                    "usage", {}
+                ):
                     output.peak_memory_mb = resp_json["usage"]["peak_memory_mb"]
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"

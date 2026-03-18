@@ -82,8 +82,22 @@ def plot_ttfp_comparison(
     x = np.arange(len(concurrencies))
     width = 0.3
 
-    ax.bar(x - width / 2, off_vals, width, label="async_chunk off", color="#87CEEB", edgecolor="none")
-    ax.bar(x + width / 2, on_vals, width, label="async_chunk on", color="#FFF8DC", edgecolor="#DDD8B8")
+    ax.bar(
+        x - width / 2,
+        off_vals,
+        width,
+        label="async_chunk off",
+        color="#87CEEB",
+        edgecolor="none",
+    )
+    ax.bar(
+        x + width / 2,
+        on_vals,
+        width,
+        label="async_chunk on",
+        color="#FFF8DC",
+        edgecolor="#DDD8B8",
+    )
 
     # Draw improvement arrows and labels
     for i in range(len(concurrencies)):
@@ -167,7 +181,14 @@ def plot_all_metrics(off_results: list[dict], on_results: list[dict], output_pat
         x = np.arange(len(concurrencies))
         width = 0.3
         ax.bar(x - width / 2, off_vals, width, label="async_chunk off", color="#87CEEB")
-        ax.bar(x + width / 2, on_vals, width, label="async_chunk on", color="#FFF8DC", edgecolor="#DDD8B8")
+        ax.bar(
+            x + width / 2,
+            on_vals,
+            width,
+            label="async_chunk on",
+            color="#FFF8DC",
+            edgecolor="#DDD8B8",
+        )
 
         for i in range(len(concurrencies)):
             if on_vals[i] > 0:
@@ -179,7 +200,15 @@ def plot_all_metrics(off_results: list[dict], on_results: list[dict], output_pat
                     arrowprops=dict(arrowstyle="->", color="red", lw=1.5),
                 )
                 label_y = off_vals[i] * 0.85
-                ax.text(x[i], label_y, f"{improvement:.1f}x", ha="center", fontsize=10, color="red", fontweight="bold")
+                ax.text(
+                    x[i],
+                    label_y,
+                    f"{improvement:.1f}x",
+                    ha="center",
+                    fontsize=10,
+                    color="red",
+                    fontweight="bold",
+                )
 
         ax.set_title(cfg["title"].split(" - ")[0], fontsize=12, fontweight="bold")
         ax.set_ylabel(cfg["ylabel"], fontsize=11)
@@ -227,11 +256,21 @@ def print_table(off_results: list[dict], on_results: list[dict]):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Plot async_chunk comparison for Qwen3-TTS")
-    parser.add_argument("--off", type=str, required=True, help="JSON results for async_chunk off")
-    parser.add_argument("--on", type=str, required=True, help="JSON results for async_chunk on")
-    parser.add_argument("--metric", type=str, default="ttfp", choices=["ttfp", "e2e", "rtf", "all"])
-    parser.add_argument("--output", type=str, default="results/qwen3_tts_async_chunk.png")
+    parser = argparse.ArgumentParser(
+        description="Plot async_chunk comparison for Qwen3-TTS"
+    )
+    parser.add_argument(
+        "--off", type=str, required=True, help="JSON results for async_chunk off"
+    )
+    parser.add_argument(
+        "--on", type=str, required=True, help="JSON results for async_chunk on"
+    )
+    parser.add_argument(
+        "--metric", type=str, default="ttfp", choices=["ttfp", "e2e", "rtf", "all"]
+    )
+    parser.add_argument(
+        "--output", type=str, default="results/qwen3_tts_async_chunk.png"
+    )
     parser.add_argument("--title", type=str, default=None, help="Custom title override")
     return parser.parse_args()
 
@@ -246,4 +285,6 @@ if __name__ == "__main__":
     if args.metric == "all":
         plot_all_metrics(off_results, on_results, args.output)
     else:
-        plot_ttfp_comparison(off_results, on_results, args.metric, args.output, args.title)
+        plot_ttfp_comparison(
+            off_results, on_results, args.metric, args.output, args.title
+        )

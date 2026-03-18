@@ -145,7 +145,11 @@ class Example:
         def is_other_file(file: Path) -> bool:
             if any(part in excluded_dirs for part in file.parts):
                 return False
-            return file.is_file() and file != self.main_file and file.suffix.lower() not in binary_extensions
+            return (
+                file.is_file()
+                and file != self.main_file
+                and file.suffix.lower() not in binary_extensions
+            )
 
         return [file for file in self.path.rglob("*") if is_other_file(file)]
 
@@ -264,7 +268,9 @@ def update_nav_file(examples: list[Example]):
         return
 
     # Get existing Examples section to preserve non-example items (like README.md)
-    existing_examples_content = nav_list[user_guide_idx]["User Guide"][examples_idx]["Examples"]
+    existing_examples_content = nav_list[user_guide_idx]["User Guide"][examples_idx][
+        "Examples"
+    ]
 
     # Preserve string items (like "examples/README.md") that are not example categories
     preserved_items = [
@@ -286,7 +292,9 @@ def update_nav_file(examples: list[Example]):
 
     # Add examples grouped by category, sorted by category name
     for category in sorted(examples_by_category.keys()):
-        category_examples = sorted(examples_by_category[category], key=lambda e: e.path.stem)
+        category_examples = sorted(
+            examples_by_category[category], key=lambda e: e.path.stem
+        )
         category_items = []
         for example in category_examples:
             doc_path = EXAMPLE_DOC_DIR / example.category / f"{example.path.stem}.md"
@@ -304,7 +312,9 @@ def update_nav_file(examples: list[Example]):
     # Write back to file
     nav_data["nav"] = nav_list
     with open(NAV_FILE, "w", encoding="utf-8") as f:
-        yaml.dump(nav_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        yaml.dump(
+            nav_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True
+        )
     logger.info("Updated navigation file: %s", NAV_FILE.relative_to(ROOT_DIR))
 
 

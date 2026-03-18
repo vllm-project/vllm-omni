@@ -63,7 +63,9 @@ def base64_to_image_tensor(base64_str: str, mode: str = "RGB") -> torch.Tensor:
     return image_tensor
 
 
-def image_tensor_to_png_bytes(tensor: torch.Tensor, filename: str = "image.png") -> BytesIO:
+def image_tensor_to_png_bytes(
+    tensor: torch.Tensor, filename: str = "image.png"
+) -> BytesIO:
     """
     Convert ComfyUI image tensor to PNG BytesIO for multipart upload.
 
@@ -82,7 +84,9 @@ def image_tensor_to_png_bytes(tensor: torch.Tensor, filename: str = "image.png")
         ValueError: If tensor format is invalid (not 4D, wrong dtype, etc.)
     """
     if tensor.ndim != 4:
-        raise ValueError(f"Expected 4D tensor with shape (B, H, W, C), got {tensor.ndim}D tensor")
+        raise ValueError(
+            f"Expected 4D tensor with shape (B, H, W, C), got {tensor.ndim}D tensor"
+        )
 
     image_tensor = tensor[0]  # Shape: (H, W, C)
     image_np = (image_tensor.cpu().numpy() * 255.0).astype(np.uint8)
@@ -148,7 +152,9 @@ def bytes_to_video(video_bytes: bytes) -> VideoInput:
 
     try:
         with av.open(video_buffer, mode="r") as container:
-            video_stream = next((s for s in container.streams if s.type == "video"), None)
+            video_stream = next(
+                (s for s in container.streams if s.type == "video"), None
+            )
             if video_stream is None:
                 raise ValueError("No video stream found in decoded payload.")
 
@@ -163,7 +169,11 @@ def bytes_to_video(video_bytes: bytes) -> VideoInput:
                 raise ValueError("No video frames found in decoded payload.")
 
             images = torch.stack(frames, dim=0)
-            frame_rate = Fraction(video_stream.average_rate) if video_stream.average_rate else Fraction(1)
+            frame_rate = (
+                Fraction(video_stream.average_rate)
+                if video_stream.average_rate
+                else Fraction(1)
+            )
 
             audio: AudioInput | None = None
             if len(container.streams.audio):
@@ -182,7 +192,9 @@ def bytes_to_video(video_bytes: bytes) -> VideoInput:
 
                 if len(audio_frames) > 0:
                     audio_data = np.concatenate(audio_frames, axis=1)
-                    sample_rate = int(audio_stream.sample_rate) if audio_stream.sample_rate else 1
+                    sample_rate = (
+                        int(audio_stream.sample_rate) if audio_stream.sample_rate else 1
+                    )
                     audio = {
                         "waveform": torch.from_numpy(audio_data).unsqueeze(0),
                         "sample_rate": sample_rate,
@@ -212,7 +224,9 @@ def base64_to_video(base64_str: str) -> VideoInput:
     return bytes_to_video(video_bytes)
 
 
-def audio_to_bytes(audio: AudioInput, filename: str = "audio.mp3", quality: str = "128k") -> BytesIO:
+def audio_to_bytes(
+    audio: AudioInput, filename: str = "audio.mp3", quality: str = "128k"
+) -> BytesIO:
     waveform = audio["waveform"][0]  # Shape: (C, T)
     sample_rate = audio["sample_rate"]
     format = filename.rsplit(".", maxsplit=1)[1]
@@ -222,7 +236,9 @@ def audio_to_bytes(audio: AudioInput, filename: str = "audio.mp3", quality: str 
     output_buffer.name = filename
     output_container = av.open(output_buffer, mode="w", format=format)
     if format == "opus":
-        out_stream = output_container.add_stream("libopus", rate=sample_rate, layout=layout)
+        out_stream = output_container.add_stream(
+            "libopus", rate=sample_rate, layout=layout
+        )
         if quality == "64k":
             out_stream.bit_rate = 64000  # type: ignore # copy from ComfyUI comfy_api/latest/_ui.py
         elif quality == "96k":
@@ -234,7 +250,9 @@ def audio_to_bytes(audio: AudioInput, filename: str = "audio.mp3", quality: str 
         elif quality == "320k":
             out_stream.bit_rate = 320000  # type: ignore # copy from ComfyUI comfy_api/latest/_ui.py
     elif format == "mp3":
-        out_stream = output_container.add_stream("libmp3lame", rate=sample_rate, layout=layout)
+        out_stream = output_container.add_stream(
+            "libmp3lame", rate=sample_rate, layout=layout
+        )
         if quality == "V0":
             out_stream.codec_context.qscale = 1  # type: ignore # copy from ComfyUI comfy_api/latest/_ui.py
         elif quality == "128k":
@@ -242,7 +260,9 @@ def audio_to_bytes(audio: AudioInput, filename: str = "audio.mp3", quality: str 
         elif quality == "320k":
             out_stream.bit_rate = 320000  # type: ignore # copy from ComfyUI comfy_api/latest/_ui.py
     else:  # format == "flac":
-        out_stream = output_container.add_stream("flac", rate=sample_rate, layout=layout)
+        out_stream = output_container.add_stream(
+            "flac", rate=sample_rate, layout=layout
+        )
 
     frame = av.AudioFrame.from_ndarray(
         waveform.movedim(0, 1).reshape(1, -1).float().numpy(),
@@ -260,7 +280,9 @@ def audio_to_bytes(audio: AudioInput, filename: str = "audio.mp3", quality: str 
     return output_buffer
 
 
-def audio_to_base64(audio: AudioInput, filename: str = "audio.mp3", quality: str = "128k") -> str:
+def audio_to_base64(
+    audio: AudioInput, filename: str = "audio.mp3", quality: str = "128k"
+) -> str:
     audio_buffer = audio_to_bytes(audio, filename, quality)
     audio_buffer.seek(0)
     byte_data = audio_buffer.read()

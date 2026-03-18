@@ -47,7 +47,11 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
 )
 from vllm_omni.entrypoints.zmq_utils import ZmqQueue
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniPromptType,
+    OmniSamplingParams,
+)
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.metrics import OrchestratorAggregator, StageRequestStats
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -76,7 +80,9 @@ def _weak_close_cleanup(
             try:
                 q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
-                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+                logger.warning(
+                    f"Failed to send shutdown signal to stage input queue: {e}"
+                )
             close_fn = getattr(q, "close", None)
             if callable(close_fn):
                 close_fn()
@@ -97,7 +103,9 @@ def _weak_close_cleanup(
     if handshake_thread is not None:
         handshake_thread.join(timeout=2.0)
         if handshake_thread.is_alive():
-            logger.warning("Handshake server thread did not terminate gracefully within timeout")
+            logger.warning(
+                "Handshake server thread did not terminate gracefully within timeout"
+            )
 
     # Close ZMQ resources after thread has exited
     if zmq_handshake_socket is not None:
@@ -179,8 +187,12 @@ class OmniBase:
         self._handshake_thread: threading.Thread | None = None
         self._handshake_stop: threading.Event | None = None
         self._handshake_endpoints: dict[int, tuple[str, str]] = {}
-        self._handshake_seen: set[int] = set()  # Track which stage IDs have completed ZMQ handshake
-        self._single_stage_id: int | None = None  # Optional: deploy only a specific stage ID
+        self._handshake_seen: set[int] = (
+            set()
+        )  # Track which stage IDs have completed ZMQ handshake
+        self._single_stage_id: int | None = (
+            None  # Optional: deploy only a specific stage ID
+        )
 
         # Sleep mode tracking
         self._is_sleeping: bool = False
@@ -195,7 +207,9 @@ class OmniBase:
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
 
-    def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
+    def _get_default_cache_config(
+        self, cache_backend: str | None
+    ) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
             return {
                 "Fn_compute_blocks": 1,
@@ -214,7 +228,9 @@ class OmniBase:
             }
         return None
 
-    def _normalize_cache_config(self, cache_backend: str | None, cache_config: Any | None) -> Any | None:
+    def _normalize_cache_config(
+        self, cache_backend: str | None, cache_config: Any | None
+    ) -> Any | None:
         if isinstance(cache_config, str):
             try:
                 cache_config = json.loads(cache_config)
@@ -225,7 +241,9 @@ class OmniBase:
             cache_config = self._get_default_cache_config(cache_backend)
         return cache_config
 
-    def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+    def _create_default_diffusion_stage_cfg(
+        self, kwargs: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         """Create default diffusion stage configuration.
 
         Uses StageConfigFactory for typed configuration creation while
@@ -240,12 +258,16 @@ class OmniBase:
         # Normalize dtype
         if "dtype" in kwargs and not isinstance(kwargs["dtype"], str):
             if not isinstance(kwargs["dtype"], torch.dtype):
-                raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(kwargs['dtype']).__name__}")
+                raise TypeError(
+                    f"Provided dtype must be a string or torch.dtype, got {type(kwargs['dtype']).__name__}"
+                )
             kwargs["dtype"] = str(kwargs["dtype"]).removeprefix("torch.")
 
         # Normalize cache config before passing to factory
         cache_backend = kwargs.get("cache_backend", "none")
-        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
+        cache_config = self._normalize_cache_config(
+            cache_backend, kwargs.get("cache_config", None)
+        )
 
         # Update kwargs with normalized values
         kwargs_copy = dict(kwargs)
@@ -255,7 +277,9 @@ class OmniBase:
         # Use the factory to create default diffusion config
         return StageConfigFactory.create_default_diffusion(kwargs_copy)
 
-    def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
+    def _resolve_stage_configs(
+        self, model: str, kwargs: dict[str, Any]
+    ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
         # TODO(wuhang):
         # Remove kwargs as parameters in the future.
@@ -264,14 +288,18 @@ class OmniBase:
         stage_configs_path = kwargs.get("stage_configs_path", None)
 
         # TTS-specific CLI overrides
-        self.tts_max_instructions_length: int | None = kwargs.get("tts_max_instructions_length", None)
+        self.tts_max_instructions_length: int | None = kwargs.get(
+            "tts_max_instructions_length", None
+        )
 
         # Load stage configurations from YAML
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
             kwargs,
-            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(
+                kwargs
+            ),
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
@@ -282,14 +310,20 @@ class OmniBase:
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
                     cfg.engine_args = create_config({})
                 if kwargs.get("lora_path") is not None:
-                    if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
+                    if (
+                        not hasattr(cfg.engine_args, "lora_path")
+                        or cfg.engine_args.lora_path is None
+                    ):
                         cfg.engine_args.lora_path = kwargs["lora_path"]
                 lora_scale = kwargs.get("lora_scale")
                 if lora_scale is None:
                     # Backwards compatibility for older callers.
                     lora_scale = kwargs.get("static_lora_scale")
                 if lora_scale is not None:
-                    if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
+                    if (
+                        not hasattr(cfg.engine_args, "lora_scale")
+                        or cfg.engine_args.lora_scale is None
+                    ):
                         cfg.engine_args.lora_scale = lora_scale
                 quantization_config = kwargs.get("quantization_config")
                 if quantization_config is not None:
@@ -319,15 +353,21 @@ class OmniBase:
         self._zmq_master_address = kwargs.get("omni_master_address", None)
         if self._zmq_master_address is None:
             self._zmq_master_address = "127.0.0.1"
-            logger.info("No omni_master_address provided, defaulting to localhost (127.0.0.1)")
+            logger.info(
+                "No omni_master_address provided, defaulting to localhost (127.0.0.1)"
+            )
         self._zmq_master_port = kwargs.get("omni_master_port", None)
 
         # Resolve stage configs shared by orchestrator/headless paths.
-        self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
+        self.config_path, self.stage_configs = self._resolve_stage_configs(
+            model, kwargs
+        )
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=worker_backend, shm_threshold_bytes=shm_threshold_bytes
+            self.config_path,
+            worker_backend=worker_backend,
+            shm_threshold_bytes=shm_threshold_bytes,
         )
 
         # Initialize stats paths
@@ -344,21 +384,32 @@ class OmniBase:
             idx, cfg = idx_cfg
             return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
 
-        with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
-            futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
+        with ThreadPoolExecutor(
+            max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
+        ) as executor:
+            futures = [
+                executor.submit(_build_stage, (idx, cfg))
+                for idx, cfg in enumerate(self.stage_configs)
+            ]
             results: list[tuple[int, OmniStage]] = []
             for fut in as_completed(futures):
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
-        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
+        self.default_sampling_params_list = [
+            st.default_sampling_params for st in self.stage_list
+        ]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.info(f"[{self._name}] Loaded {len(self.stage_list)} stages")
 
         # Phase 1 optimization: for a single diffusion stage in async mode,
         # run the engine directly in the orchestrator process to eliminate
         # the stage worker subprocess and its IPC serialization overhead.
-        if len(self.stage_list) == 1 and self.stage_list[0].stage_type == "diffusion" and self.is_async:
+        if (
+            len(self.stage_list) == 1
+            and self.stage_list[0].stage_type == "diffusion"
+            and self.is_async
+        ):
             self._init_inline_diffusion_engine(model, self.stage_configs[0], kwargs)
             return
 
@@ -408,7 +459,9 @@ class OmniBase:
             from vllm_omni.platforms import current_omni_platform
 
             device_type = current_omni_platform.device_type
-            set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
+            set_stage_devices(
+                stage_id, runtime_cfg.get("devices"), device_type=device_type
+            )
         except Exception as e:
             logger.warning("Device setup for inline diffusion failed: %s", e)
 
@@ -416,7 +469,9 @@ class OmniBase:
         engine_args.pop("model_stage", None)
         engine_args.pop("model", None)
 
-        cfg_kv_collect_func = load_func_from_config(getattr(stage_config, "cfg_kv_collect_func", None))
+        cfg_kv_collect_func = load_func_from_config(
+            getattr(stage_config, "cfg_kv_collect_func", None)
+        )
 
         self._inline_engine = OmniDiffusion(
             model=model,
@@ -449,7 +504,9 @@ class OmniBase:
         if self.worker_backend == "ray":
             # Initialize Ray Cluster
             self._ray_pg = create_placement_group(
-                number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
+                number_of_stages=len(self.stage_list),
+                address=self.ray_address,
+                strategy="PACK",
             )
         else:
             # Initialize ZMQ context
@@ -464,8 +521,12 @@ class OmniBase:
             local_only = self._single_stage_id is None
 
             for sid in range(total_stages):
-                in_endpoint = get_engine_client_zmq_addr(local_only=local_only, host=self._zmq_master_address)
-                out_endpoint = get_engine_client_zmq_addr(local_only=local_only, host=self._zmq_master_address)
+                in_endpoint = get_engine_client_zmq_addr(
+                    local_only=local_only, host=self._zmq_master_address
+                )
+                out_endpoint = get_engine_client_zmq_addr(
+                    local_only=local_only, host=self._zmq_master_address
+                )
                 self._handshake_endpoints[sid] = (in_endpoint, out_endpoint)
                 logger.debug(
                     f"[{self._name}] Allocated endpoints for stage-{sid}: in={in_endpoint}, out={out_endpoint}"
@@ -502,9 +563,15 @@ class OmniBase:
                     inject_omni_kv_config(stage, omni_conn_cfg, omni_from, omni_to)  # type: ignore
 
             except Exception as e:
-                logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
+                logger.debug(
+                    "[Omni] Failed to inject omni connector config into stage-%s: %s",
+                    stage_id,
+                    e,
+                )
 
-            if self._single_stage_id is not None and stage_id != int(self._single_stage_id):
+            if self._single_stage_id is not None and stage_id != int(
+                self._single_stage_id
+            ):
                 logger.info(
                     f"[{self._name}] Skipping initialization of stage-{stage_id} worker due to single_stage_id setting"
                 )
@@ -519,12 +586,16 @@ class OmniBase:
                 connectors_config=stage_connectors_config,
                 worker_backend=self.worker_backend,
                 ray_placement_group=self._ray_pg,
-                ignore_runtime_config=True if self._single_stage_id is not None else False,
+                ignore_runtime_config=(
+                    True if self._single_stage_id is not None else False
+                ),
             )
 
             logger.debug(f"[{self._name}] Stage-{stage_id} process started")
 
-    def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
+    def _process_stage_ready(
+        self, stage: OmniStage, stage_id: int, result: dict[str, Any]
+    ) -> None:
         self._stages_ready.add(stage_id)
         logger.info(f"[{self._name}] Stage-{stage_id} reported ready")
 
@@ -536,7 +607,9 @@ class OmniBase:
         num_stages = len(self.stage_list)
         deadline = time.time() + max(0, int(timeout))
 
-        logger.info(f"[{self._name}] Waiting for {num_stages} stages to initialize (timeout: {timeout}s)")
+        logger.info(
+            f"[{self._name}] Waiting for {num_stages} stages to initialize (timeout: {timeout}s)"
+        )
 
         while len(self._stages_ready) < num_stages and time.time() < deadline:
             progressed = False
@@ -573,9 +646,13 @@ class OmniBase:
             "Increase initialization wait time (stage_init_timeout or call-site timeout).",
         ]
 
-        formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
+        formatted_suggestions = "\n".join(
+            f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions)
+        )
 
-        logger.warning(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
+        logger.warning(
+            f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}"
+        )
 
     def _is_profiler_enabled(self, stage_id: int) -> bool:
         """Check if profiler config is set for a given stage."""
@@ -615,19 +692,29 @@ class OmniBase:
                     if _self is None:
                         return None
                     # First check the shared dict
-                    if stage_id in _self._rpc_results and rpc_id in _self._rpc_results[stage_id]:
+                    if (
+                        stage_id in _self._rpc_results
+                        and rpc_id in _self._rpc_results[stage_id]
+                    ):
                         return _self._rpc_results[stage_id].pop(rpc_id)
                     # In the sync path there is no background output handler,
                     # so drain the output queue ourselves and stash any
                     # non-RPC results back.
-                    out_q = _self._stage_out_queues[stage_id] if stage_id < len(_self._stage_out_queues) else None
+                    out_q = (
+                        _self._stage_out_queues[stage_id]
+                        if stage_id < len(_self._stage_out_queues)
+                        else None
+                    )
                     if out_q is not None:
                         import queue as _queue
 
                         try:
                             while True:
                                 item = out_q.get_nowait()
-                                if isinstance(item, dict) and item.get("type") == "collective_rpc_result":
+                                if (
+                                    isinstance(item, dict)
+                                    and item.get("type") == "collective_rpc_result"
+                                ):
                                     item_rpc_id = item.get("rpc_id")
                                     if item_rpc_id == rpc_id:
                                         return item
@@ -736,8 +823,12 @@ class OmniBase:
                     )
                     continue
                 try:
-                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_START})
-                    logger.info("[%s] Sent start_profile to stage-%s", self._name, stage_id)
+                    self.stage_list[stage_id].submit(
+                        {"type": OmniStageTaskType.PROFILER_START}
+                    )
+                    logger.info(
+                        "[%s] Sent start_profile to stage-%s", self._name, stage_id
+                    )
                 except Exception as e:
                     logger.warning(
                         "[%s] Failed to send start_profile to stage-%s: %s",
@@ -769,7 +860,11 @@ class OmniBase:
 
                 # Check if the stage object has our new bridge method
                 if hasattr(stage, "stop_profile"):
-                    logger.info("[%s] Requesting profile data collection from stage-%s", self._name, stage_id)
+                    logger.info(
+                        "[%s] Requesting profile data collection from stage-%s",
+                        self._name,
+                        stage_id,
+                    )
 
                     # This is the blocking call that triggers the RPC chain
                     stage_data = stage.stop_profile()
@@ -780,11 +875,17 @@ class OmniBase:
                         tables = stage_data.get("table") or stage_data.get("tables")
 
                         # Debug logging
-                        logger.debug(f"[{self._name}] Stage-{stage_id} returned: {stage_data.keys()}")
+                        logger.debug(
+                            f"[{self._name}] Stage-{stage_id} returned: {stage_data.keys()}"
+                        )
                         if traces:
-                            logger.debug(f"[{self._name}] Stage-{stage_id} traces type: {type(traces)}")
+                            logger.debug(
+                                f"[{self._name}] Stage-{stage_id} traces type: {type(traces)}"
+                            )
                         if tables:
-                            logger.debug(f"[{self._name}] Stage-{stage_id} tables type: {type(tables)}")
+                            logger.debug(
+                                f"[{self._name}] Stage-{stage_id} tables type: {type(tables)}"
+                            )
 
                         # Handle single strings
                         if traces:
@@ -800,9 +901,13 @@ class OmniBase:
                             elif isinstance(tables, list):
                                 all_results["tables"].extend(tables)
                         else:
-                            logger.warning(f"[{self._name}] Stage-{stage_id} returned no table data")
+                            logger.warning(
+                                f"[{self._name}] Stage-{stage_id} returned no table data"
+                            )
                     else:
-                        logger.warning(f"[{self._name}] Stage-{stage_id} returned non-dict data: {type(stage_data)}")
+                        logger.warning(
+                            f"[{self._name}] Stage-{stage_id} returned non-dict data: {type(stage_data)}"
+                        )
                 else:
                     # Fallback for non-diffusion stages
                     logger.warning(
@@ -869,7 +974,10 @@ class OmniBase:
         try:
             while not self._handshake_stop.is_set():
                 events = poller.poll(1000)
-                has_message = any(sock == self._zmq_handshake_socket and event == zmq.POLLIN for sock, event in events)
+                has_message = any(
+                    sock == self._zmq_handshake_socket and event == zmq.POLLIN
+                    for sock, event in events
+                )
                 if not has_message:
                     continue
 
@@ -896,15 +1004,21 @@ class OmniBase:
 
         # Create server endpoint and socket
         endpoint = get_engine_client_zmq_addr(
-            local_only=False, host=self._zmq_master_address, port=int(self._zmq_master_port)
+            local_only=False,
+            host=self._zmq_master_address,
+            port=int(self._zmq_master_port),
         )
 
         self._handshake_stop = threading.Event()
-        self._zmq_handshake_socket = make_zmq_socket(self._zmq_ctx, endpoint, zmq.REP, bind=True, linger=5000)
+        self._zmq_handshake_socket = make_zmq_socket(
+            self._zmq_ctx, endpoint, zmq.REP, bind=True, linger=5000
+        )
 
         # Start server thread
         self._handshake_thread = threading.Thread(
-            target=self._run_handshake_server_loop, daemon=True, name="zmq-handshake-server"
+            target=self._run_handshake_server_loop,
+            daemon=True,
+            name="zmq-handshake-server",
         )
         self._handshake_thread.start()
 
@@ -923,7 +1037,9 @@ class OmniBase:
             return timeout
 
         deadline = time.time() + max(0, int(timeout))
-        logger.info(f"[{self._name}] Waiting for handshakes from stages: {expected} (timeout: {timeout}s)")
+        logger.info(
+            f"[{self._name}] Waiting for handshakes from stages: {expected} (timeout: {timeout}s)"
+        )
 
         # NOTE: _handshake_seen may be updated from the handshake server thread.
         # It is intentionally used here without additional locking because:
@@ -1004,7 +1120,9 @@ class Omni(OmniBase):
     def generate(
         self,
         prompts: OmniPromptType | Sequence[OmniPromptType],
-        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        sampling_params_list: (
+            OmniSamplingParams | Sequence[OmniSamplingParams] | None
+        ) = None,
         *,
         py_generator: Literal[True],
     ) -> Generator[OmniRequestOutput, None, None]: ...
@@ -1013,7 +1131,9 @@ class Omni(OmniBase):
     def generate(
         self,
         prompts: OmniPromptType | Sequence[OmniPromptType],
-        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        sampling_params_list: (
+            OmniSamplingParams | Sequence[OmniSamplingParams] | None
+        ) = None,
         *,
         py_generator: Literal[False] = False,
     ) -> list[OmniRequestOutput]: ...
@@ -1021,7 +1141,9 @@ class Omni(OmniBase):
     def generate(
         self,
         prompts: OmniPromptType | Sequence[OmniPromptType],
-        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        sampling_params_list: (
+            OmniSamplingParams | Sequence[OmniSamplingParams] | None
+        ) = None,
         *,
         py_generator: bool = False,
         use_tqdm: bool | Callable[..., tqdm] = True,
@@ -1062,9 +1184,13 @@ class Omni(OmniBase):
 
         try:
             if py_generator:
-                return self._run_generation_with_generator(prompts, sampling_params_list)
+                return self._run_generation_with_generator(
+                    prompts, sampling_params_list
+                )
             else:
-                outputs = list(self._run_generation(prompts, sampling_params_list, use_tqdm))
+                outputs = list(
+                    self._run_generation(prompts, sampling_params_list, use_tqdm)
+                )
                 return outputs
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)
@@ -1097,13 +1223,21 @@ class Omni(OmniBase):
         """Run generation through all stages in the pipeline."""
         logger.debug(f"[{self._name}] generate() called")
         if sampling_params_list is None:
-            raise ValueError("sampling_params_list is required for pipelined generation")
+            raise ValueError(
+                "sampling_params_list is required for pipelined generation"
+            )
 
         if len(sampling_params_list) != len(self.stage_list):
-            raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
+            raise ValueError(
+                f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}"
+            )
 
         for i, (stage, sp) in enumerate(zip(self.stage_list, sampling_params_list)):
-            ExpectedSPType = OmniDiffusionSamplingParams if stage.stage_type == "diffusion" else SamplingParams
+            ExpectedSPType = (
+                OmniDiffusionSamplingParams
+                if stage.stage_type == "diffusion"
+                else SamplingParams
+            )
             if not isinstance(sp, ExpectedSPType):
                 raise ValueError(
                     f"Expected sampling parameters with type {ExpectedSPType} in stage {i}, got {sp.__class__}"
@@ -1160,7 +1294,9 @@ class Omni(OmniBase):
             it = tqdm_func(it, desc="Adding requests")
 
         # Seed stage-0 queue with all requests
-        logger.debug(f"[{self._name}] Seeding {len(request_prompts)} requests into stage-0")
+        logger.debug(
+            f"[{self._name}] Seeding {len(request_prompts)} requests into stage-0"
+        )
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
@@ -1185,7 +1321,9 @@ class Omni(OmniBase):
                 }
                 self.stage_list[0].submit(task)
                 _req_start_ts[companion_id] = time.time()
-                logger.debug(f"[{self._name}] Enqueued CFG companion {companion_id} to stage-0")
+                logger.debug(
+                    f"[{self._name}] Enqueued CFG companion {companion_id} to stage-0"
+                )
 
         pbar = None
         if use_tqdm:
@@ -1198,7 +1336,9 @@ class Omni(OmniBase):
             )
         # For each stage, forward results to next stage; collect finals at the end
         # We pipeline by continually polling output queues in stage order
-        remaining_by_stage: list[int] = [len(request_prompts) + cfg.num_companions] + [0] * (num_stages - 1)
+        remaining_by_stage: list[int] = [len(request_prompts) + cfg.num_companions] + [
+            0
+        ] * (num_stages - 1)
         completed_requests = 0
         total_requests = len(request_prompts)
 
@@ -1258,19 +1398,29 @@ class Omni(OmniBase):
                             )
                     continue
 
-                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+                engine_outputs = _load(
+                    result, obj_key="engine_outputs", shm_key="engine_outputs_shm"
+                )
                 # Mark last output time for this stage whenever we receive outputs
-                metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
+                metrics.stage_last_ts[stage_id] = max(
+                    metrics.stage_last_ts[stage_id] or 0.0, time.time()
+                )
                 try:
                     _m: StageRequestStats = result.get("metrics")
                     if _m is not None:
                         # Accumulate generation time
-                        metrics.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
+                        metrics.accumulated_gen_time_ms[req_id][
+                            stage_id
+                        ] += _m.stage_gen_time_ms
 
                         # For diffusion stages, we also accumulate diffusion time
-                        metrics.accumulate_diffusion_metrics(stage.stage_type, req_id, engine_outputs)
+                        metrics.accumulate_diffusion_metrics(
+                            stage.stage_type, req_id, engine_outputs
+                        )
 
-                        metrics.on_stage_metrics(stage_id, req_id, _m, stage.final_output_type)
+                        metrics.on_stage_metrics(
+                            stage_id, req_id, _m, stage.final_output_type
+                        )
                         if pbar:
                             elapsed = pbar.format_dict["elapsed"] or 1e-6
                             # Aggregate total tokens/images across all stages
@@ -1287,9 +1437,7 @@ class Omni(OmniBase):
                                 avg_lat = 0
 
                             # Align with vLLM's wording "est. speed" using multi-line parentheses
-                            pbar.postfix = (
-                                f"est. speed stage-{stage_id} {unit}/s: {out_spd:.2f}, avg e2e_lat: {avg_lat:.1f}ms"
-                            )
+                            pbar.postfix = f"est. speed stage-{stage_id} {unit}/s: {out_spd:.2f}, avg e2e_lat: {avg_lat:.1f}ms"
                 except Exception as e:
                     logger.exception(
                         f"[{self._name}] Failed to process metrics for stage {stage_id}, req {req_id}: {e}",
@@ -1337,7 +1485,9 @@ class Omni(OmniBase):
                             )
                         )
                         if finished:
-                            metrics.record_audio_generated_frames(output_to_yield, stage_id, req_id)
+                            metrics.record_audio_generated_frames(
+                                output_to_yield, stage_id, req_id
+                            )
                     except Exception as e:
                         logger.exception(
                             f"[{self._name}] Failed to record audio metrics for req {req_id} at stage {stage_id}: {e}",
@@ -1361,7 +1511,10 @@ class Omni(OmniBase):
                         if cfg.all_companions_done(req_id):
                             success = cfg.forward_parent_with_cfg(
                                 req_id,
-                                {"engine_outputs": engine_outputs, "stage_id": stage_id},
+                                {
+                                    "engine_outputs": engine_outputs,
+                                    "stage_id": stage_id,
+                                },
                                 self.stage_list,
                                 self.connectors,
                                 sampling_params_list,
@@ -1410,7 +1563,9 @@ class Omni(OmniBase):
                             next_inputs=next_inputs,
                             sampling_params=sp_next,
                             original_prompt=request_id_to_prompt[req_id],
-                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
+                            next_stage_queue_submit_fn=self.stage_list[
+                                next_stage_id
+                            ].submit,
                             metrics=metrics,
                         )
 
@@ -1427,7 +1582,9 @@ class Omni(OmniBase):
                 else:
                     completed_requests += 1
                     if pbar:
-                        final_mod = self.output_modalities[final_stage_id_to_prompt[req_id]]
+                        final_mod = self.output_modalities[
+                            final_stage_id_to_prompt[req_id]
+                        ]
                         pbar.unit = "img" if final_mod == "image" else "req"
                         pbar.update(1)
                     logger.debug(

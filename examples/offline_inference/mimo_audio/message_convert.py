@@ -162,7 +162,9 @@ def create_assistant_start_with_think() -> InputSegment:
 # ============================================
 
 
-def create_user_turn_with_audio(audio_tokenized, extra_text: str = None) -> list[InputSegment]:
+def create_user_turn_with_audio(
+    audio_tokenized, extra_text: str = None
+) -> list[InputSegment]:
     """Create a user turn containing audio"""
     segments = [
         create_user_start(),
@@ -183,7 +185,9 @@ def create_user_turn_with_text(text: str) -> list[InputSegment]:
     ]
 
 
-def create_system_turn_with_voice_prompt(prompt_text: str, audio_token) -> list[InputSegment]:
+def create_system_turn_with_voice_prompt(
+    prompt_text: str, audio_token
+) -> list[InputSegment]:
     """Create a system turn with voice prompt"""
     return [
         create_system_start(),
@@ -318,7 +322,9 @@ def wav2mel(wav, device="cpu"):
 
 def group_by_length(features: torch.Tensor, lengths: torch.Tensor, max_length: int):
     if features.size(0) != lengths.sum().item():
-        raise ValueError(f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}")
+        raise ValueError(
+            f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}"
+        )
 
     split_points = []
     current_sum = 0
@@ -346,22 +352,33 @@ def group_by_length(features: torch.Tensor, lengths: torch.Tensor, max_length: i
     return feature_groups, len_groups
 
 
-def encode_batch(input_features: torch.Tensor, input_lens: torch.Tensor, max_length: int = 256000):
+def encode_batch(
+    input_features: torch.Tensor, input_lens: torch.Tensor, max_length: int = 256000
+):
     feature_groups, len_groups = group_by_length(input_features, input_lens, max_length)
 
     encoded_parts = []
     for features, lengths in zip(feature_groups, len_groups):
         with torch.no_grad():
             codes, _ = mimo_audio_tokenizer.encoder.encode(
-                input_features=features.to(device), input_lens=lengths.to(device), return_codes_only=True
+                input_features=features.to(device),
+                input_lens=lengths.to(device),
+                return_codes_only=True,
             )
             encoded_parts.append(codes)
 
     return torch.cat(encoded_parts, dim=-1)
 
 
-def preprocess_input(input: None | str | torch.Tensor = None, device="cpu", audio_channels=4, group_size=8):
-    if isinstance(input, torch.Tensor) or (isinstance(input, str) and os.path.isfile(input)):
+def preprocess_input(
+    input: None | str | torch.Tensor = None,
+    device="cpu",
+    audio_channels=4,
+    group_size=8,
+):
+    if isinstance(input, torch.Tensor) or (
+        isinstance(input, str) and os.path.isfile(input)
+    ):
         return "<|sosp|><|empty|><|eosp|>"
 
     else:
@@ -373,7 +390,9 @@ def preprocess_input(input: None | str | torch.Tensor = None, device="cpu", audi
         return text
 
 
-def _build_tts_system_prompt(has_voice_prompt: bool, voice_audio_token=None) -> list[InputSegment]:
+def _build_tts_system_prompt(
+    has_voice_prompt: bool, voice_audio_token=None
+) -> list[InputSegment]:
     """Build system prompt for TTS task"""
     if has_voice_prompt and voice_audio_token is not None:
         return [
@@ -386,13 +405,17 @@ def _build_tts_system_prompt(has_voice_prompt: bool, voice_audio_token=None) -> 
             create_user_end(),
         ]
     else:
-        return create_system_turn_text_only("你需要根据指定的风格指令和文本内容来生成语音。")
+        return create_system_turn_text_only(
+            "你需要根据指定的风格指令和文本内容来生成语音。"
+        )
         # return create_system_turn_text_only(
         #     "You need to generate speech based on the specified style instructions and text content."
         # )
 
 
-def _build_tts_system_prompt_no_instruct(has_voice_prompt: bool, voice_audio_token=None) -> list[InputSegment]:
+def _build_tts_system_prompt_no_instruct(
+    has_voice_prompt: bool, voice_audio_token=None
+) -> list[InputSegment]:
     """Build system prompt for TTS task"""
     if has_voice_prompt and voice_audio_token is not None:
         return [
@@ -423,7 +446,9 @@ def get_tts_sft_prompt(
         read_text_only: Whether to read only plain text (False means text contains template)
         prompt_speech: Reference audio (for voice cloning)
     """
-    assistant_prompt_audio_token = preprocess_input(prompt_speech) if prompt_speech is not None else None
+    assistant_prompt_audio_token = (
+        preprocess_input(prompt_speech) if prompt_speech is not None else None
+    )
 
     if not read_text_only:
         # Not just reading text, text contains template (template:text format)
@@ -437,7 +462,9 @@ def get_tts_sft_prompt(
     else:
         # Plain text (no instruction inside)
         language = detect_language(input)
-        template = random.choice(tts_zh_templates if language == "zh" else tts_en_templates)
+        template = random.choice(
+            tts_zh_templates if language == "zh" else tts_en_templates
+        )
         text = preprocess_input(input)
 
         if instruct is None:
@@ -448,7 +475,9 @@ def get_tts_sft_prompt(
             )
             lm_prompt.extend(
                 [
-                    create_segment(text=f"<|im_start|>user\n{template}: {text}<|im_end|>\n"),
+                    create_segment(
+                        text=f"<|im_start|>user\n{template}: {text}<|im_end|>\n"
+                    ),
                     create_assistant_start_with_sostm(),
                 ]
             )
@@ -458,7 +487,11 @@ def get_tts_sft_prompt(
                 has_voice_prompt=assistant_prompt_audio_token is not None,
                 voice_audio_token=assistant_prompt_audio_token,
             )
-            lm_prompt.append(create_segment(text=f"<|im_start|>user\n{template}: {text}({instruct})<|im_end|>\n"))
+            lm_prompt.append(
+                create_segment(
+                    text=f"<|im_start|>user\n{template}: {text}({instruct})<|im_end|>\n"
+                )
+            )
             lm_prompt.append(create_assistant_start_with_think())
 
     return lm_prompt
@@ -474,14 +507,17 @@ def get_audio_understanding_sft_prompt(
     audio_tokenized = preprocess_input(input_speech)
 
     lm_prompt = create_user_turn_with_audio(audio_tokenized, extra_text=input_text)
-    lm_prompt = append_assistant_ending(lm_prompt, thinking=thinking, use_sostm=use_sostm)
+    lm_prompt = append_assistant_ending(
+        lm_prompt, thinking=thinking, use_sostm=use_sostm
+    )
     return lm_prompt
 
 
 def _build_voice_prompt_system(prompt_speech) -> list[InputSegment]:
     """Build system prompt with voice prompt"""
     return create_system_turn_with_voice_prompt(
-        prompt_text="Your voice should be：", audio_token=preprocess_input(prompt_speech)
+        prompt_text="Your voice should be：",
+        audio_token=preprocess_input(prompt_speech),
     )
 
 
@@ -550,7 +586,8 @@ def get_spoken_dialogue_sft_multiturn_prompt(
     if prompt_speech:
         lm_prompt.extend(
             create_system_turn_with_voice_prompt(
-                prompt_text="Your voice should be:", audio_token=preprocess_input(prompt_speech)
+                prompt_text="Your voice should be:",
+                audio_token=preprocess_input(prompt_speech),
             )
         )
 
@@ -577,7 +614,9 @@ def get_spoken_dialogue_sft_multiturn_prompt(
         ]
 
     # Process message list
-    lm_prompt.extend(process_multiturn_messages(message_list, user_processor, assistant_processor))
+    lm_prompt.extend(
+        process_multiturn_messages(message_list, user_processor, assistant_processor)
+    )
     lm_prompt.append(create_assistant_start_with_sostm())
 
     return lm_prompt
@@ -598,7 +637,9 @@ def get_s2t_dialogue_sft_prompt(
 def get_s2t_dialogue_sft_multiturn_prompt(message_list, thinking=False):
     """Build prompt for multi-turn speech-to-text dialogue task"""
     lm_prompt = process_multiturn_messages(
-        message_list, user_processor=create_audio_user_message, assistant_processor=create_text_assistant_message
+        message_list,
+        user_processor=create_audio_user_message,
+        assistant_processor=create_text_assistant_message,
     )
     lm_prompt = append_assistant_ending(lm_prompt, thinking=thinking)
     return lm_prompt
@@ -620,7 +661,9 @@ def get_text_dialogue_sft_multiturn_prompt(
 ):
     """Build prompt for multi-turn text-only dialogue task"""
     lm_prompt = process_multiturn_messages(
-        message_list, user_processor=create_text_user_message, assistant_processor=create_text_assistant_message
+        message_list,
+        user_processor=create_text_user_message,
+        assistant_processor=create_text_assistant_message,
     )
     lm_prompt = append_assistant_ending(lm_prompt, thinking=thinking)
     return lm_prompt

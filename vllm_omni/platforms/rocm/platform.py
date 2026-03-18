@@ -5,7 +5,9 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms.rocm import RocmPlatform
 
-from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.attention.backends.registry import (
+    DiffusionAttentionBackendEnum,
+)
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)

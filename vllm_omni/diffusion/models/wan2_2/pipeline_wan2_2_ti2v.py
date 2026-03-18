@@ -77,8 +77,16 @@ def get_wan22_ti2v_pre_process_func(
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            multi_modal_data = (
+                prompt.get("multi_modal_data", {})
+                if not isinstance(prompt, str)
+                else None
+            )
+            raw_image = (
+                multi_modal_data.get("image", None)
+                if multi_modal_data is not None
+                else None
+            )
             if isinstance(prompt, str):
                 prompt = OmniTextPrompt(prompt=prompt)
             if "additional_information" not in prompt:
@@ -94,17 +102,26 @@ def get_wan22_ti2v_pre_process_func(
                     f"""Unsupported image format {raw_image.__class__}.""",
                     """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
                 )
-            image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
+            image = (
+                PIL.Image.open(raw_image).convert("RGB")
+                if isinstance(raw_image, str)
+                else raw_image
+            )
 
             # Calculate dimensions based on aspect ratio if not provided
-            if request.sampling_params.height is None or request.sampling_params.width is None:
+            if (
+                request.sampling_params.height is None
+                or request.sampling_params.width is None
+            ):
                 # Default max area for 720P (TI2V-5B default)
                 max_area = 720 * 1280
                 aspect_ratio = image.height / image.width
 
                 # Calculate dimensions maintaining aspect ratio
                 mod_value = 16  # Must be divisible by 16
-                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                height = (
+                    round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                )
                 width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
                 if request.sampling_params.height is None:
@@ -120,8 +137,12 @@ def get_wan22_ti2v_pre_process_func(
             prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
 
             # Preprocess for VAE
-            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                image, height=request.sampling_params.height, width=request.sampling_params.width
+            prompt["additional_information"]["preprocessed_image"] = (
+                video_processor.preprocess(
+                    image,
+                    height=request.sampling_params.height,
+                    width=request.sampling_params.width,
+                )
             )
             request.prompts[i] = prompt
         return request
@@ -129,7 +150,9 @@ def get_wan22_ti2v_pre_process_func(
     return pre_process_func
 
 
-class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin):
+class Wan22TI2VPipeline(
+    nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin
+):
     """
     Wan2.2 Text-Image-to-Video (TI2V) Pipeline.
 
@@ -168,23 +191,35 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         ]
 
         # Text encoder
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model, subfolder="tokenizer", local_files_only=local_files_only
+        )
         self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            model,
+            subfolder="text_encoder",
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
         ).to(self.device)
 
         # VAE
         self.vae = AutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            model,
+            subfolder="vae",
+            torch_dtype=torch.float32,
+            local_files_only=local_files_only,
         ).to(self.device)
 
         # Single transformer (TI2V uses dense 5B model, not MoE)
         # Load config from model to get correct dimensions
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        transformer_config = load_transformer_config(
+            model, "transformer", local_files_only
+        )
         self.transformer = create_transformer_from_config(transformer_config)
 
         # Initialize UniPC scheduler
-        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
+        flow_shift = (
+            od_config.flow_shift if od_config.flow_shift is not None else 5.0
+        )  # default for 720p
         self.scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
             shift=flow_shift,
@@ -192,8 +227,12 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         )
 
         # VAE scale factors
-        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
-        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if hasattr(self.vae, "config") else 8
+        self.vae_scale_factor_temporal = (
+            self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
+        )
+        self.vae_scale_factor_spatial = (
+            self.vae.config.scale_factor_spatial if hasattr(self.vae, "config") else 8
+        )
 
         # TI2V always uses expand_timesteps mode
         self.expand_timesteps = True
@@ -242,18 +281,36 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 """This model only supports a single prompt, not a batched request.""",
                 """Please pass in a single prompt object or string, or a single-item list.""",
             )
-        if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
-            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
-            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+        if (
+            len(req.prompts) == 1
+        ):  # If req.prompt is empty, default to prompt & neg_prompt in param list
+            prompt = (
+                req.prompts[0]
+                if isinstance(req.prompts[0], str)
+                else req.prompts[0].get("prompt")
+            )
+            negative_prompt = (
+                None
+                if isinstance(req.prompts[0], str)
+                else req.prompts[0].get("negative_prompt")
+            )
         if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
+            raise ValueError(
+                "Prompt or prompt_embeds is required for Wan2.2 generation."
+            )
 
         # Get image from request (optional for TI2V)
         if image is None:
             multi_modal_data = (
-                req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
+                req.prompts[0].get("multi_modal_data", {})
+                if not isinstance(req.prompts[0], str)
+                else None
             )
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            raw_image = (
+                multi_modal_data.get("image", None)
+                if multi_modal_data is not None
+                else None
+            )
             if isinstance(raw_image, list):
                 if len(raw_image) > 1:
                     logger.warning(
@@ -271,7 +328,11 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         # Default dimensions for TI2V-5B (720P)
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
+        num_frames = (
+            req.sampling_params.num_frames
+            if req.sampling_params.num_frames
+            else frame_num
+        )
         num_steps = req.sampling_params.num_inference_steps or num_inference_steps
 
         # Respect per-request guidance_scale when explicitly provided.
@@ -293,7 +354,12 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
 
         # Adjust num_frames to be compatible with VAE temporal scaling
         if num_frames % self.vae_scale_factor_temporal != 1:
-            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+            num_frames = (
+                num_frames
+                // self.vae_scale_factor_temporal
+                * self.vae_scale_factor_temporal
+                + 1
+            )
         num_frames = max(num_frames, 1)
 
         device = self.device
@@ -303,7 +369,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         if generator is None:
             generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
+            generator = torch.Generator(device=device).manual_seed(
+                req.sampling_params.seed
+            )
 
         # Encode prompts
         if prompt_embeds is None:
@@ -319,7 +387,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         else:
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
             if negative_prompt_embeds is not None:
-                negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
+                negative_prompt_embeds = negative_prompt_embeds.to(
+                    device=device, dtype=dtype
+                )
 
         batch_size = prompt_embeds.shape[0]
 
@@ -339,10 +409,14 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
             # I2V mode: prepare latents with image condition
             from diffusers.video_processor import VideoProcessor
 
-            video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+            video_processor = VideoProcessor(
+                vae_scale_factor=self.vae_scale_factor_spatial
+            )
 
             if isinstance(image, PIL.Image.Image):
-                image_tensor = video_processor.preprocess(image, height=height, width=width)
+                image_tensor = video_processor.preprocess(
+                    image, height=height, width=width
+                )
             else:
                 image_tensor = image
             image_tensor = image_tensor.to(device=device, dtype=torch.float32)
@@ -374,7 +448,13 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
             )
             latent_condition = None
             first_frame_mask = torch.ones(
-                1, 1, num_latent_frames, latent_height, latent_width, dtype=torch.float32, device=device
+                1,
+                1,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+                dtype=torch.float32,
+                device=device,
             )
 
         if attention_kwargs is None:
@@ -388,7 +468,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 # Prepare latent input
                 if latent_condition is not None:
                     # I2V mode: blend condition with latents using mask
-                    latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
+                    latent_model_input = (
+                        1 - first_frame_mask
+                    ) * latent_condition + first_frame_mask * latents
                     latent_model_input = latent_model_input.to(dtype)
 
                     # Expand timesteps for each patch (TI2V style)
@@ -399,11 +481,20 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                     latent_model_input = latents.to(dtype)
 
                     # Expand timesteps for TI2V model architecture
-                    mask = torch.ones(1, 1, num_latent_frames, latent_height, latent_width, device=device)
+                    mask = torch.ones(
+                        1,
+                        1,
+                        num_latent_frames,
+                        latent_height,
+                        latent_width,
+                        device=device,
+                    )
                     temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
 
-                do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+                do_true_cfg = (
+                    guidance_scale > 1.0 and negative_prompt_embeds is not None
+                )
                 # Prepare kwargs for positive and negative predictions
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
@@ -435,7 +526,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 )
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                latents = self.scheduler_step_maybe_with_cfg(
+                    noise_pred, t, latents, do_true_cfg
+                )
 
                 pbar.update()
 
@@ -447,7 +540,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
 
         # For I2V mode, blend final latents with condition
         if latent_condition is not None:
-            latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
+            latents = (
+                1 - first_frame_mask
+            ) * latent_condition + first_frame_mask * latents
 
         # Decode
         if output_type == "latent":
@@ -459,15 +554,17 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 .view(1, self.vae.config.z_dim, 1, 1, 1)
                 .to(latents.device, latents.dtype)
             )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.z_dim, 1, 1, 1
+            ).to(latents.device, latents.dtype)
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=output)
 
-    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+    def predict_noise(
+        self, current_model: nn.Module | None = None, **kwargs: Any
+    ) -> torch.Tensor:
         """
         Forward pass through transformer to predict noise.
 
@@ -512,21 +609,33 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        prompt_embeds = self.text_encoder(ids.to(device), mask.to(device)).last_hidden_state
+        prompt_embeds = self.text_encoder(
+            ids.to(device), mask.to(device)
+        ).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
+            [
+                torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
+                for u in prompt_embeds
+            ],
+            dim=0,
         )
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_videos_per_prompt, seq_len, -1
+        )
 
         negative_prompt_embeds = None
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
-            negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt = (
+                batch_size * [negative_prompt]
+                if isinstance(negative_prompt, str)
+                else negative_prompt
+            )
             neg_text_inputs = self.tokenizer(
                 [self._prompt_clean(p) for p in negative_prompt],
                 padding="max_length",
@@ -536,20 +645,35 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 return_attention_mask=True,
                 return_tensors="pt",
             )
-            ids_neg, mask_neg = neg_text_inputs.input_ids, neg_text_inputs.attention_mask
+            ids_neg, mask_neg = (
+                neg_text_inputs.input_ids,
+                neg_text_inputs.attention_mask,
+            )
             seq_lens_neg = mask_neg.gt(0).sum(dim=1).long()
-            negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device)).last_hidden_state
-            negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype, device=device)
-            negative_prompt_embeds = [u[:v] for u, v in zip(negative_prompt_embeds, seq_lens_neg)]
+            negative_prompt_embeds = self.text_encoder(
+                ids_neg.to(device), mask_neg.to(device)
+            ).last_hidden_state
+            negative_prompt_embeds = negative_prompt_embeds.to(
+                dtype=dtype, device=device
+            )
+            negative_prompt_embeds = [
+                u[:v] for u, v in zip(negative_prompt_embeds, seq_lens_neg)
+            ]
             negative_prompt_embeds = torch.stack(
                 [
-                    torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
+                    torch.cat(
+                        [u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]
+                    )
                     for u in negative_prompt_embeds
                 ],
                 dim=0,
             )
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+            negative_prompt_embeds = negative_prompt_embeds.repeat(
+                1, num_videos_per_prompt, 1
+            )
+            negative_prompt_embeds = negative_prompt_embeds.view(
+                batch_size * num_videos_per_prompt, seq_len, -1
+            )
 
         return prompt_embeds, negative_prompt_embeds
 
@@ -582,7 +706,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
             int(width) // self.vae_scale_factor_spatial,
         )
         if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(f"Generator list length {len(generator)} does not match batch size {batch_size}.")
+            raise ValueError(
+                f"Generator list length {len(generator)} does not match batch size {batch_size}."
+            )
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
@@ -611,10 +737,18 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial
 
-        shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
+        shape = (
+            batch_size,
+            num_channels_latents,
+            num_latent_frames,
+            latent_height,
+            latent_width,
+        )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = randn_tensor(
+                shape, generator=generator, device=device, dtype=dtype
+            )
         else:
             latents = latents.to(device=device, dtype=dtype)
 
@@ -623,7 +757,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         image = image.to(device=device, dtype=self.vae.dtype)
 
         # Encode through VAE
-        latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax")
+        latent_condition = retrieve_latents(
+            self.vae.encode(image), sample_mode="argmax"
+        )
         latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
         # Normalize latents
@@ -632,14 +768,22 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
             .view(1, self.vae.config.z_dim, 1, 1, 1)
             .to(latent_condition.device, latent_condition.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latent_condition.device, latent_condition.dtype
-        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+            1, self.vae.config.z_dim, 1, 1, 1
+        ).to(latent_condition.device, latent_condition.dtype)
         latent_condition = (latent_condition - latents_mean) * latents_std
         latent_condition = latent_condition.to(dtype)
 
         # Create mask: 0 for first frame (condition), 1 for rest (to denoise)
-        first_frame_mask = torch.ones(1, 1, num_latent_frames, latent_height, latent_width, dtype=dtype, device=device)
+        first_frame_mask = torch.ones(
+            1,
+            1,
+            num_latent_frames,
+            latent_height,
+            latent_width,
+            dtype=dtype,
+            device=device,
+        )
         first_frame_mask[:, :, 0] = 0
 
         return latents, latent_condition, first_frame_mask
@@ -655,10 +799,14 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         negative_prompt_embeds=None,
     ):
         if height % 16 != 0 or width % 16 != 0:
-            raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
+            raise ValueError(
+                f"`height` and `width` have to be divisible by 16 but are {height} and {width}."
+            )
 
         if prompt is not None and prompt_embeds is not None:
-            raise ValueError("Cannot forward both `prompt` and `prompt_embeds`. Please provide only one.")
+            raise ValueError(
+                "Cannot forward both `prompt` and `prompt_embeds`. Please provide only one."
+            )
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(

@@ -55,7 +55,9 @@ class TokenizerWrapper:
         self.img_token_id = self.tokenizer.convert_tokens_to_ids("<img>")
         self.cfg_token_id = self.tokenizer.convert_tokens_to_ids("<cfg>")
         self.end_answer_token_id = self.tokenizer.convert_tokens_to_ids("</answer>")
-        self.end_recaption_token_id = self.tokenizer.convert_tokens_to_ids("</recaption>")
+        self.end_recaption_token_id = self.tokenizer.convert_tokens_to_ids(
+            "</recaption>"
+        )
         self.ratio_token_offset = self.tokenizer.convert_tokens_to_ids("<img_ratio_0>")
         self.special_token_map = self.tokenizer.added_tokens_encoder
 
@@ -114,7 +116,9 @@ class TokenizerWrapper:
                 If `return_lengths` is False, returns only the encoded_tokens.
         """
         if pad is not None:
-            assert max_length is not None, "max_length should be provided when pad is not None."
+            assert (
+                max_length is not None
+            ), "max_length should be provided when pad is not None."
 
         if uncond_enabled is None:
             uncond_enabled = [True] * len(texts)
@@ -171,9 +175,9 @@ class TokenizerWrapper:
     @staticmethod
     def _check_key_number_matched(keys, data):
         # Assert keys and token_source are matched
-        assert set(keys) == set(data.keys()), (
-            f"Keys in the template and token source should be matched, but got {set(keys)} and {list(data.keys())}."
-        )
+        assert set(keys) == set(
+            data.keys()
+        ), f"Keys in the template and token source should be matched, but got {set(keys)} and {list(data.keys())}."
         key_counts = {k: 0 for k in keys}
         for key in keys:
             key_counts[key] += 1
@@ -197,7 +201,10 @@ class TokenizerWrapper:
     ):
         if add_image_shape_token:
             token_seq.extend(
-                [self.special_token_map[f"<img_size_{base_size}>"], self.special_token_map[f"<img_ratio_{ratio_idx}>"]]
+                [
+                    self.special_token_map[f"<img_size_{base_size}>"],
+                    self.special_token_map[f"<img_ratio_{ratio_idx}>"],
+                ]
             )
             token_count += 2
         if add_timestep_token:
@@ -277,7 +284,9 @@ class TokenizerWrapper:
                 - extra_token_pos (`dict`): Positions of extra tokens.
         """
         if last_key_only_prefix:
-            assert add_eos is not True, "add_eos should not be True when last_key_only_prefix is True."
+            assert (
+                add_eos is not True
+            ), "add_eos should not be True when last_key_only_prefix is True."
         if drop_last is True and total_length is None:
             raise ValueError("total_length should be provided when drop_last is True.")
 
@@ -285,9 +294,9 @@ class TokenizerWrapper:
         modal_length = len(keys)
         index_indicator = {k: 0 for k in token_source}
         for k, v in token_source.items():
-            assert isinstance(v, (list, tuple)), (
-                f"Value of `{k}` in the token source should be a list or tuple, but got {type(v)}."
-            )
+            assert isinstance(
+                v, (list, tuple)
+            ), f"Value of `{k}` in the token source should be a list or tuple, but got {type(v)}."
         self._check_key_number_matched(keys, token_source)
 
         token_seq = []
@@ -319,7 +328,10 @@ class TokenizerWrapper:
                     + (1 if source.get("guidance", add_guidance_token) else 0)
                     + (2 if source.get("image_shape", add_image_shape_token) else 0)
                 )
-                if drop_last is True and token_count + extra_count + source["length"] > total_length:
+                if (
+                    drop_last is True
+                    and token_count + extra_count + source["length"] > total_length
+                ):
                     drop_last_break = True
                     break
                 if source.get("front_boi", use_front_boi_token):
@@ -332,7 +344,9 @@ class TokenizerWrapper:
                     extra_token_pos=extra_token_pos,
                     add_timestep_token=source.get("timestep", add_timestep_token),
                     add_guidance_token=source.get("guidance", add_guidance_token),
-                    add_image_shape_token=source.get("image_shape", add_image_shape_token),
+                    add_image_shape_token=source.get(
+                        "image_shape", add_image_shape_token
+                    ),
                     base_size=source.get("base_size"),
                     ratio_idx=source.get("ratio_idx"),
                     image_type=key,
@@ -357,9 +371,9 @@ class TokenizerWrapper:
                     token_count += 1  # <eoi>
 
             elif key == "joint_image":
-                assert isinstance(source["length"], list) and len(source["length"]) == 2, (
-                    "joint_image length should be a list of two integers"
-                )
+                assert (
+                    isinstance(source["length"], list) and len(source["length"]) == 2
+                ), "joint_image length should be a list of two integers"
                 extra_count = (
                     2
                     + 1
@@ -368,11 +382,16 @@ class TokenizerWrapper:
                     )
                     + (2 if source.get("image_shape", add_image_shape_token) else 0)
                 )
-                if drop_last is True and token_count + extra_count + sum(source["length"]) > total_length:
+                if (
+                    drop_last is True
+                    and token_count + extra_count + sum(source["length"]) > total_length
+                ):
                     drop_last_break = True
                     break
                 if source.get("front_boi", use_front_boi_token):
-                    token_seq.append(self.boi_token_id)  # Use patched boi for Janus, otherwise useing default <boi>
+                    token_seq.append(
+                        self.boi_token_id
+                    )  # Use patched boi for Janus, otherwise useing default <boi>
                     extra_token_pos["boi"].append(token_count)
                     token_count += 1
                 token_count = self._add_image_meta_info_token(
@@ -380,7 +399,9 @@ class TokenizerWrapper:
                     token_count=token_count,
                     extra_token_pos=extra_token_pos,
                     add_timestep_token=source.get("timestep", add_timestep_token),
-                    add_image_shape_token=source.get("image_shape", add_image_shape_token),
+                    add_image_shape_token=source.get(
+                        "image_shape", add_image_shape_token
+                    ),
                     base_size=source.get("base_size"),
                     ratio_idx=source.get("ratio_idx"),
                     image_type=key,
@@ -427,7 +448,9 @@ class TokenizerWrapper:
             token_count += 1
         elif add_eos == "auto" and not drop_last_break:
             # Typically used for lm and mmu task.
-            if token_seq[-1] != self.eos_token_id and (total_length is None or token_count < total_length):
+            if token_seq[-1] != self.eos_token_id and (
+                total_length is None or token_count < total_length
+            ):
                 token_seq.append(self.eos_token_id)
                 extra_token_pos["eos"].append(token_count)
                 token_count += 1
@@ -445,7 +468,9 @@ class TokenizerWrapper:
                     if start_key in extra_token_pos and end_key in extra_token_pos:
                         assert all(
                             (start > total_length or end + 1 < total_length)
-                            for start, end in zip(extra_token_pos[start_key], extra_token_pos[end_key])
+                            for start, end in zip(
+                                extra_token_pos[start_key], extra_token_pos[end_key]
+                            )
                         ), (
                             "Clip position should not be in the middle of the image tokens.\n"
                             f"Below is the text:\n{self._shorten_text(self.tokenizer.decode(token_seq))}"
@@ -498,7 +523,9 @@ class TokenizerWrapper:
         uncond_results_list = None
         output_type_list = []
 
-        for prompt_idx, (prompt, infer_fn_kwargs) in enumerate(zip(prompt_list, infer_fn_kwargs_list)):
+        for prompt_idx, (prompt, infer_fn_kwargs) in enumerate(
+            zip(prompt_list, infer_fn_kwargs_list)
+        ):
             if not isinstance(prompt, (list, tuple)):
                 prompt = [prompt]
             cond_kwargs = {"uncond_p": 0.0} if do_classifier_free_guidance else {}
@@ -507,9 +534,16 @@ class TokenizerWrapper:
                 **infer_fn_kwargs,
                 **cond_kwargs,
             )
-            output_type_list.append((type(results), len(results) if isinstance(results, (list, tuple)) else 1))
+            output_type_list.append(
+                (
+                    type(results),
+                    len(results) if isinstance(results, (list, tuple)) else 1,
+                )
+            )
             if isinstance(results, dict):
-                raise ValueError("Make batch on dict is not supported. Please return list or tuple for infer_fn.")
+                raise ValueError(
+                    "Make batch on dict is not supported. Please return list or tuple for infer_fn."
+                )
             if not isinstance(results, (list, tuple)):
                 results = (results,)
             if cond_results_list is None:
@@ -540,9 +574,9 @@ class TokenizerWrapper:
                     for i, result in enumerate(uncond_results):
                         uncond_results_list[i].append(result)
 
-        assert all(output_type_list[0] == n for n in output_type_list), (
-            f"Number of outputs should be equal for all samples, but got {output_type_list}."
-        )
+        assert all(
+            output_type_list[0] == n for n in output_type_list
+        ), f"Number of outputs should be equal for all samples, but got {output_type_list}."
         output_type, output_num = output_type_list[0]
 
         def make_batch(batch_cond_item, batch_uncond_item):
@@ -551,12 +585,15 @@ class TokenizerWrapper:
             if isinstance(first, torch.Tensor):
                 stacked_item = torch.stack(
                     self.pad(
-                        batch_cond_item * condition_repeat_times + batch_uncond_item * uncondition_repeat_times,
+                        batch_cond_item * condition_repeat_times
+                        + batch_uncond_item * uncondition_repeat_times,
                     )
                 )
 
             elif first is None:
-                assert all(item is None for item in batch_cond_item + batch_uncond_item), (
+                assert all(
+                    item is None for item in batch_cond_item + batch_uncond_item
+                ), (
                     f"The first cond item is None, but some items are not None:\n\n"
                     f"condition: {batch_cond_item}\n\n"
                     f"uncondition: {batch_uncond_item}"
@@ -565,13 +602,18 @@ class TokenizerWrapper:
 
             elif isinstance(first, (list, tuple)):
                 # If the output item is a list or tuple, we treat it as a whole, and won't make nested batch any more.
-                stacked_item = batch_cond_item * condition_repeat_times + batch_uncond_item * uncondition_repeat_times
+                stacked_item = (
+                    batch_cond_item * condition_repeat_times
+                    + batch_uncond_item * uncondition_repeat_times
+                )
 
             elif isinstance(first, TokenizerEncodeOutput):
                 stacked_item = {}
                 # Traverse not-None attributes
                 for key in list(first.keys()):
-                    merged_list = [cond_item[key] for cond_item in batch_cond_item] * condition_repeat_times + [
+                    merged_list = [
+                        cond_item[key] for cond_item in batch_cond_item
+                    ] * condition_repeat_times + [
                         uncond_item[key] for uncond_item in batch_uncond_item
                     ] * uncondition_repeat_times
                     if isinstance(first[key], torch.Tensor):
@@ -581,13 +623,17 @@ class TokenizerWrapper:
                             pad_val = self.special_token_map["<pad>"]
                         else:
                             pad_val = False  # Should not pad for other tensors
-                        stacked_item[key] = torch.stack(self.pad(merged_list, pad_val=pad_val), dim=0)
+                        stacked_item[key] = torch.stack(
+                            self.pad(merged_list, pad_val=pad_val), dim=0
+                        )
                     elif isinstance(first[key], list):
                         stacked_item[key] = merged_list
                     elif first[key] is None:
                         pass
                     else:
-                        raise ValueError(f"Unsupported type of {key}: {type(first[key])}.")
+                        raise ValueError(
+                            f"Unsupported type of {key}: {type(first[key])}."
+                        )
                 stacked_item = TokenizerEncodeOutput(stacked_item)
 
             else:
@@ -616,10 +662,12 @@ class TokenizerWrapper:
             [
                 slice(start, end + 1)
                 for start, end in zip(
-                    extra_token_pos[f"<{prefix}>_start"][rng], extra_token_pos[f"<{prefix}>_end"][rng]
+                    extra_token_pos[f"<{prefix}>_start"][rng],
+                    extra_token_pos[f"<{prefix}>_end"][rng],
                 )
             ]
-            if f"<{prefix}>_start" in extra_token_pos and f"<{prefix}>_end" in extra_token_pos
+            if f"<{prefix}>_start" in extra_token_pos
+            and f"<{prefix}>_end" in extra_token_pos
             else []
         )
         if image_slices:
@@ -760,10 +808,14 @@ class TokenizerWrapper:
         full_seq_token_tensor = torch.tensor(full_token_seq, dtype=torch.long)
 
         timestep_scatter_index = (
-            torch.tensor(extra_token_pos["timestep"], dtype=torch.long) if "timestep" in extra_token_pos else None
+            torch.tensor(extra_token_pos["timestep"], dtype=torch.long)
+            if "timestep" in extra_token_pos
+            else None
         )
         guidance_scatter_index = (
-            torch.tensor(extra_token_pos["guidance"], dtype=torch.long) if "guidance" in extra_token_pos else None
+            torch.tensor(extra_token_pos["guidance"], dtype=torch.long)
+            if "guidance" in extra_token_pos
+            else None
         )
         cond_timestep_scatter_index = (
             torch.tensor(extra_token_pos["cond_timestep"], dtype=torch.long)
@@ -777,9 +829,13 @@ class TokenizerWrapper:
         )
 
         # Gen image mask
-        gen_image_slices, gen_image_mask = self.parse_extra_token_pos(extra_token_pos, "img", full_seq_token_tensor)
+        gen_image_slices, gen_image_mask = self.parse_extra_token_pos(
+            extra_token_pos, "img", full_seq_token_tensor
+        )
         # Joint image
-        joint_image_slices, _ = self.parse_extra_token_pos(extra_token_pos, "joint_img", full_seq_token_tensor)
+        joint_image_slices, _ = self.parse_extra_token_pos(
+            extra_token_pos, "joint_img", full_seq_token_tensor
+        )
         # Conditional vae image
         cond_vae_image_slices, cond_vae_image_mask = self.parse_extra_token_pos(
             extra_token_pos, "vae_img", full_seq_token_tensor
@@ -792,9 +848,12 @@ class TokenizerWrapper:
         all_image_slices = (
             [
                 slice(start, end + 1)
-                for start, end in zip(extra_token_pos["<all_img>_start"], extra_token_pos["<all_img>_end"])
+                for start, end in zip(
+                    extra_token_pos["<all_img>_start"], extra_token_pos["<all_img>_end"]
+                )
             ]
-            if "<all_img>_start" in extra_token_pos and "<all_img>_end" in extra_token_pos
+            if "<all_img>_start" in extra_token_pos
+            and "<all_img>_end" in extra_token_pos
             else []
         )
 
@@ -802,7 +861,9 @@ class TokenizerWrapper:
         text_slices = (
             [
                 slice(start, end + 1)
-                for start, end in zip(extra_token_pos["<text>_start"], extra_token_pos["<text>_end"])
+                for start, end in zip(
+                    extra_token_pos["<text>_start"], extra_token_pos["<text>_end"]
+                )
             ]
             if "<text>_start" in extra_token_pos and "<text>_end" in extra_token_pos
             else []
@@ -816,14 +877,18 @@ class TokenizerWrapper:
             for text_slice, mask_spec in zip(text_slices, text_mask_specs):
                 if not mask_spec["ignore"]:
                     real_slice = slice(
-                        text_slice.start + mask_spec["start_offset"], text_slice.stop + mask_spec["end_offset"]
+                        text_slice.start + mask_spec["start_offset"],
+                        text_slice.stop + mask_spec["end_offset"],
                     )
                     text_mask[real_slice] = 1.0
         else:
             text_mask = None
 
         # real_pos is the first position of the <pad> token
-        real_pos = torch.tensor(extra_token_pos.get("first_pad", [full_seq_token_tensor.shape[0]]), dtype=torch.long)
+        real_pos = torch.tensor(
+            extra_token_pos.get("first_pad", [full_seq_token_tensor.shape[0]]),
+            dtype=torch.long,
+        )
 
         return TokenizerEncodeOutput(
             tokens=full_seq_token_tensor,
@@ -844,7 +909,9 @@ class TokenizerWrapper:
             gen_timestep_scatter_index=gen_timestep_scatter_index,
         )
 
-    def get_cot_sections(self, cot_text, uncond_kwargs, cot_max_length=None, drop_think=False):
+    def get_cot_sections(
+        self, cot_text, uncond_kwargs, cot_max_length=None, drop_think=False
+    ):
         if not cot_text:  # None or empty
             return []
         if "<think>" in cot_text and "</think>" in cot_text:
@@ -852,17 +919,26 @@ class TokenizerWrapper:
             after_think_sec = cot_text.split("</think>")[1]
             think_sec = cot_text.split("<think>")[1].split("</think>")[0]
             return (
-                self.get_cot_sections(before_think_sec, uncond_kwargs, drop_think=drop_think)
+                self.get_cot_sections(
+                    before_think_sec, uncond_kwargs, drop_think=drop_think
+                )
                 + (
                     [
                         dict(type="text", text="<think>"),
-                        dict(type="text", text=think_sec, max_length=cot_max_length, **uncond_kwargs),
+                        dict(
+                            type="text",
+                            text=think_sec,
+                            max_length=cot_max_length,
+                            **uncond_kwargs,
+                        ),
                         dict(type="text", text="</think>"),
                     ]
                     if not drop_think
                     else []
                 )
-                + self.get_cot_sections(after_think_sec, uncond_kwargs, drop_think=drop_think)
+                + self.get_cot_sections(
+                    after_think_sec, uncond_kwargs, drop_think=drop_think
+                )
             )
 
         if "<recaption>" in cot_text and "</recaption>" in cot_text:
@@ -870,13 +946,22 @@ class TokenizerWrapper:
             after_recaption_sec = cot_text.split("</recaption>")[1]
             recaption_sec = cot_text.split("<recaption>")[1].split("</recaption>")[0]
             return (
-                self.get_cot_sections(before_recaption_sec, uncond_kwargs, drop_think=drop_think)
+                self.get_cot_sections(
+                    before_recaption_sec, uncond_kwargs, drop_think=drop_think
+                )
                 + [
                     dict(type="text", text="<recaption>"),
-                    dict(type="text", text=recaption_sec, max_length=cot_max_length, **uncond_kwargs),
+                    dict(
+                        type="text",
+                        text=recaption_sec,
+                        max_length=cot_max_length,
+                        **uncond_kwargs,
+                    ),
                     dict(type="text", text="</recaption>"),
                 ]
-                + self.get_cot_sections(after_recaption_sec, uncond_kwargs, drop_think=drop_think)
+                + self.get_cot_sections(
+                    after_recaption_sec, uncond_kwargs, drop_think=drop_think
+                )
             )
 
         return [
@@ -899,9 +984,9 @@ class TokenizerWrapper:
     ):
         # If cfg_factor > 1, we need to repeat the unconditioned part
         if batchify:
-            assert isinstance(message_list[0], list), (
-                f"When batchify is True, message_list should be a list of list, but got [{type(message_list[0])}, ...]."
-            )
+            assert isinstance(
+                message_list[0], list
+            ), f"When batchify is True, message_list should be a list of list, but got [{type(message_list[0])}, ...]."
             return self.batch_gen_infer(
                 infer_fn=self.apply_general_template,
                 prompt_list=[[]],
@@ -927,10 +1012,19 @@ class TokenizerWrapper:
         uncond_kwargs = dict(uncond_enabled=uncond_p == 1.0, uncond_p=uncond_p)
 
         def process_successive_message(
-            _message_list, _cur_message_idx, role, prefix, suffix, answer_prefix="", answer_suffix=""
+            _message_list,
+            _cur_message_idx,
+            role,
+            prefix,
+            suffix,
+            answer_prefix="",
+            answer_suffix="",
         ):
             _sub_sections = []
-            while _cur_message_idx < len(message_list) and _message_list[_cur_message_idx]["role"] == role:
+            while (
+                _cur_message_idx < len(message_list)
+                and _message_list[_cur_message_idx]["role"] == role
+            ):
                 message = _message_list[_cur_message_idx]
                 if message["type"] == "text":
                     text = message["content"]
@@ -940,16 +1034,28 @@ class TokenizerWrapper:
                         if ("<recaption>" in text and "</recaption>" in text) or (
                             "<think>" in text and "</think>" in text
                         ):
-                            _sub_sections.extend(self.get_cot_sections(text, uncond_kwargs, drop_think=drop_think))
+                            _sub_sections.extend(
+                                self.get_cot_sections(
+                                    text, uncond_kwargs, drop_think=drop_think
+                                )
+                            )
                         else:
-                            _sub_sections.append(dict(type="text", text=text, **uncond_kwargs))
+                            _sub_sections.append(
+                                dict(type="text", text=text, **uncond_kwargs)
+                            )
                     else:
                         _sub_sections.append(
-                            dict(type="text", text=f"{answer_prefix}{text}{answer_suffix}", **uncond_kwargs)
+                            dict(
+                                type="text",
+                                text=f"{answer_prefix}{text}{answer_suffix}",
+                                **uncond_kwargs,
+                            )
                         )
                 elif message["type"] == "gen_image":
                     info = message["content"]
-                    assert isinstance(info, ImageInfo), f"Expected ImageInfo, but got {type(info)}"
+                    assert isinstance(
+                        info, ImageInfo
+                    ), f"Expected ImageInfo, but got {type(info)}"
                     if role == "assistant":
                         _sub_sections.append(dict(type="text", text=answer_prefix))
                     _sub_sections.append(dict(type=message["type"], **info.meta_info))
@@ -957,7 +1063,9 @@ class TokenizerWrapper:
                         _sub_sections.append(dict(type="text", text=answer_suffix))
                 elif message["type"] == "joint_image":
                     info = message["content"]
-                    assert isinstance(info, JointImageInfo), f"Expected JointImageInfo, but got {type(info)}"
+                    assert isinstance(
+                        info, JointImageInfo
+                    ), f"Expected JointImageInfo, but got {type(info)}"
                     _sub_sections.append(dict(type=message["type"], **info.meta_info))
                 else:
                     raise ValueError(f"Unknown message type: {message['type']}")
@@ -993,7 +1101,11 @@ class TokenizerWrapper:
         while cur_message_idx < len(message_list):
             # Process successive system messages
             sub_sections, cur_message_idx = process_successive_message(
-                message_list, cur_message_idx, role="system", prefix="", suffix=system_suffix
+                message_list,
+                cur_message_idx,
+                role="system",
+                prefix="",
+                suffix=system_suffix,
             )
             # Add to the template and sections
             sections.extend(sub_sections)
@@ -1002,7 +1114,11 @@ class TokenizerWrapper:
 
             # Process successive user messages
             sub_sections, cur_message_idx = process_successive_message(
-                message_list, cur_message_idx, role="user", prefix=user_prefix, suffix=user_suffix
+                message_list,
+                cur_message_idx,
+                role="user",
+                prefix=user_prefix,
+                suffix=user_suffix,
             )
             # Add to the template and sections
             sections.extend(sub_sections)
@@ -1029,7 +1145,11 @@ class TokenizerWrapper:
                 # Avoid adding prefix twice
                 _bot_prefix = ""
                 # Remove the final bot_suffix
-                if len(sections) > 0 and sections[-1]["type"] == "text" and sections[-1]["text"] == bot_suffix:
+                if (
+                    len(sections) > 0
+                    and sections[-1]["type"] == "text"
+                    and sections[-1]["text"] == bot_suffix
+                ):
                     sections = sections[:-1]
             else:
                 _bot_prefix = bot_prefix
@@ -1065,7 +1185,9 @@ class TokenizerWrapper:
         batch_message_list: list[list[dict[str, Any]]] | None = None,
         mode: str = "gen_text",
         batch_gen_image_info: list[ImageInfo] | None = None,
-        batch_cond_image_info: list[JointImageInfo] | list[list[JointImageInfo]] | None = None,
+        batch_cond_image_info: (
+            list[JointImageInfo] | list[list[JointImageInfo]] | None
+        ) = None,
         batch_system_prompt: list[str] | None = None,
         batch_cot_text: list[str] | None = None,
         max_length: int | None = None,
@@ -1076,9 +1198,13 @@ class TokenizerWrapper:
         add_assistant_prefix: bool | None = None,
         drop_think: bool = False,
     ) -> dict[str, Any]:
-        assert bot_task in ["image", "auto", "think", "recaption", "img_ratio"], (
-            f"bot_task should be one of ['image', 'auto', 'think', 'recaption', 'img_ratio'], but got {bot_task}."
-        )
+        assert bot_task in [
+            "image",
+            "auto",
+            "think",
+            "recaption",
+            "img_ratio",
+        ], f"bot_task should be one of ['image', 'auto', 'think', 'recaption', 'img_ratio'], but got {bot_task}."
 
         if batch_message_list is None:
             # Simple text-to-image or text-cot-to-image task
@@ -1102,7 +1228,11 @@ class TokenizerWrapper:
                     f"but got {len(batch_cond_image_info)}."
                 )
                 batch_cond_image_info = [
-                    cond_image_info if isinstance(cond_image_info, list) else [cond_image_info]
+                    (
+                        cond_image_info
+                        if isinstance(cond_image_info, list)
+                        else [cond_image_info]
+                    )
                     for cond_image_info in batch_cond_image_info
                 ]
             else:
@@ -1110,7 +1240,13 @@ class TokenizerWrapper:
 
             # Convert single round materials into standard message list
             batch_message_list = []
-            for prompt, system_prompt, cot_text, gen_image_info, cond_image_info_list in zip(
+            for (
+                prompt,
+                system_prompt,
+                cot_text,
+                gen_image_info,
+                cond_image_info_list,
+            ) in zip(
                 batch_prompt,
                 batch_system_prompt,
                 batch_cot_text,
@@ -1120,24 +1256,50 @@ class TokenizerWrapper:
                 message_list = []
                 # 1. system prompt section
                 if system_prompt:
-                    message_list.append(dict(role="system", type="text", content=system_prompt, context_type="str"))
+                    message_list.append(
+                        dict(
+                            role="system",
+                            type="text",
+                            content=system_prompt,
+                            context_type="str",
+                        )
+                    )
                 # 2. user inputs sections
                 #   2.1 image inputs
                 if len(cond_image_info_list) > 0:
                     message_list.extend(
                         [
-                            dict(role="user", type="joint_image", content=cond_image_info, context_type="image_info")
+                            dict(
+                                role="user",
+                                type="joint_image",
+                                content=cond_image_info,
+                                context_type="image_info",
+                            )
                             for cond_image_info in cond_image_info_list
                         ]
                     )
                 #   2.2 text inputs
-                message_list.append(dict(role="user", type="text", content=prompt, context_type="str"))
+                message_list.append(
+                    dict(role="user", type="text", content=prompt, context_type="str")
+                )
                 # 3. assistant answer sections
                 if cot_text is not None:
-                    message_list.append(dict(role="assistant", type="text", content=cot_text, context_type="str"))
+                    message_list.append(
+                        dict(
+                            role="assistant",
+                            type="text",
+                            content=cot_text,
+                            context_type="str",
+                        )
+                    )
                 if mode == "gen_image":
                     message_list.append(
-                        dict(role="assistant", type="gen_image", content=gen_image_info, context_type="image_info")
+                        dict(
+                            role="assistant",
+                            type="gen_image",
+                            content=gen_image_info,
+                            context_type="image_info",
+                        )
                     )
                 batch_message_list.append(message_list)
 

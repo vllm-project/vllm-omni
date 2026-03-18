@@ -80,9 +80,11 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
-        assert self.cfg_parallel_size in [1, 2, 3], (
-            f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
-        )
+        assert self.cfg_parallel_size in [
+            1,
+            2,
+            3,
+        ], f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
@@ -92,7 +94,9 @@ class DiffusionParallelConfig:
         # Validate HSDP configuration
         if self.use_hsdp:
             assert self.hsdp_replicate_size > 0, "HSDP replicate size must be > 0"
-            assert self.hsdp_shard_size > 0, "HSDP shard size must be > 0 (should be set in __post_init__)"
+            assert (
+                self.hsdp_shard_size > 0
+            ), "HSDP shard size must be > 0 (should be set in __post_init__)"
         return self
 
     def __post_init__(self) -> None:
@@ -135,7 +139,9 @@ class DiffusionParallelConfig:
                         f"Invalid HSDP configuration: replicate_size ({self.hsdp_replicate_size}) "
                         f"must evenly divide world_size ({other_parallel_world_size}) when shard_size is -1."
                     )
-                self.hsdp_shard_size = other_parallel_world_size // self.hsdp_replicate_size
+                self.hsdp_shard_size = (
+                    other_parallel_world_size // self.hsdp_replicate_size
+                )
                 self.world_size = other_parallel_world_size
             else:
                 # Explicit shard_size: HSDP can work standalone or combined
@@ -286,7 +292,9 @@ class DiffusionCacheConfig:
         field_names = {f.name for f in fields(cls)}
 
         # Extract parameters that match dataclass fields (excluding private fields)
-        known_params = {k: v for k, v in data.items() if k in field_names and not k.startswith("_")}
+        known_params = {
+            k: v for k, v in data.items() if k in field_names and not k.startswith("_")
+        }
 
         # Store extra parameters
         extra_params = {k: v for k, v in data.items() if k not in field_names}
@@ -310,7 +318,9 @@ class DiffusionCacheConfig:
         if item in extra:
             return extra[item]
 
-        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
+        raise AttributeError(
+            f"'{self.__class__.__name__}' object has no attribute '{item}'"
+        )
 
 
 @dataclass
@@ -336,7 +346,9 @@ class OmniDiffusionConfig:
 
     # Cache strategy (legacy)
     cache_strategy: str = "none"
-    parallel_config: DiffusionParallelConfig = field(default_factory=DiffusionParallelConfig)
+    parallel_config: DiffusionParallelConfig = field(
+        default_factory=DiffusionParallelConfig
+    )
 
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
@@ -372,7 +384,9 @@ class OmniDiffusionConfig:
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
 
-    pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
+    pin_cpu_memory: bool = (
+        True  # Use pinned memory for faster transfers when offloading
+    )
 
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
@@ -474,7 +488,9 @@ class OmniDiffusionConfig:
 
         return False
 
-    def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
+    def settle_port(
+        self, port: int, port_inc: int = 42, max_attempts: int = 100
+    ) -> int:
         """
         Find an available port with retry logic.
 
@@ -495,7 +511,9 @@ class OmniDiffusionConfig:
         while attempts < max_attempts:
             if is_port_available(port):
                 if attempts > 0:
-                    logger.info(f"Port {original_port} was unavailable, using port {port} instead")
+                    logger.info(
+                        f"Port {original_port} was unavailable, using port {port} instead"
+                    )
                 return port
 
             attempts += 1
@@ -517,7 +535,9 @@ class OmniDiffusionConfig:
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig
         if isinstance(self.parallel_config, Mapping):
-            self.parallel_config = DiffusionParallelConfig.from_dict(dict(self.parallel_config))
+            self.parallel_config = DiffusionParallelConfig.from_dict(
+                dict(self.parallel_config)
+            )
         elif not isinstance(self.parallel_config, DiffusionParallelConfig):
             self.parallel_config = DiffusionParallelConfig()
 
@@ -549,7 +569,9 @@ class OmniDiffusionConfig:
             if dtype_lower in dtype_map:
                 self.dtype = dtype_map[dtype_lower]
             else:
-                logger.warning(f"Unknown dtype string '{self.dtype}', defaulting to bfloat16")
+                logger.warning(
+                    f"Unknown dtype string '{self.dtype}', defaulting to bfloat16"
+                )
                 self.dtype = torch.bfloat16
 
         # Convert cache_config dict to DiffusionCacheConfig if needed
@@ -575,13 +597,19 @@ class OmniDiffusionConfig:
                 quant_kwargs = {k: v for k, v in config_dict.items() if k != "method"}
 
                 # Validate conflicting methods
-                if self.quantization is not None and quant_method is not None and quant_method != self.quantization:
+                if (
+                    self.quantization is not None
+                    and quant_method is not None
+                    and quant_method != self.quantization
+                ):
                     logger.warning(
                         f"Conflicting quantization methods: quantization={self.quantization!r}, "
                         f"quantization_config['method']={quant_method!r}. Using quantization_config['method']."
                     )
 
-                self.quantization_config = get_diffusion_quant_config(quant_method, **quant_kwargs)
+                self.quantization_config = get_diffusion_quant_config(
+                    quant_method, **quant_kwargs
+                )
             elif self.quantization_config is None and self.quantization is not None:
                 self.quantization_config = get_diffusion_quant_config(self.quantization)
             elif not isinstance(self.quantization_config, DiffusionQuantizationConfig):
@@ -596,7 +624,9 @@ class OmniDiffusionConfig:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
 
     def update_multimodal_support(self) -> None:
-        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
+        self.supports_multimodal_inputs = self.model_class_name in {
+            "QwenImageEditPlusPipeline"
+        }
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
@@ -611,7 +641,9 @@ class OmniDiffusionConfig:
         # Check environment variable as fallback for cache_backend
         # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
         if "cache_backend" not in kwargs:
-            cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
+            cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get(
+                "DIFFUSION_CACHE_ADAPTER"
+            )
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
 
         # Filter kwargs to only include valid fields

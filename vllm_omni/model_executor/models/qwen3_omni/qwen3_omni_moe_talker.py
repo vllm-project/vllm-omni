@@ -99,8 +99,12 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
-        talker_config.text_config.rope_parameters = talker_config.text_config.rope_scaling
-        talker_config.text_config.rope_parameters["rope_theta"] = talker_config.text_config.rope_theta
+        talker_config.text_config.rope_parameters = (
+            talker_config.text_config.rope_scaling
+        )
+        talker_config.text_config.rope_parameters["rope_theta"] = (
+            talker_config.text_config.rope_theta
+        )
         self.quant_config = vllm_config.quant_config
         self.prefix = prefix
         self.vllm_config = vllm_config
@@ -112,7 +116,11 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         # thinker projection components for talker
         self.text_projection = Qwen3OmniMoeTalkerResizeMLP(self.config)
         self.hidden_projection = Qwen3OmniMoeTalkerResizeMLP(self.config)
-        self.codec_head = nn.Linear(self.config.text_config.hidden_size, self.config.text_config.vocab_size, bias=False)
+        self.codec_head = nn.Linear(
+            self.config.text_config.hidden_size,
+            self.config.text_config.vocab_size,
+            bias=False,
+        )
 
         self.rope_deltas = None
         self.spatial_merge_size = self.config.spatial_merge_size
@@ -244,7 +252,9 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             projected_embeds: [batch, seq, talker_hidden]
         """
         if thinker_embeds is None and thinker_hidden_states is None:
-            raise ValueError("Either thinker_embeds or thinker_hidden_states must be provided")
+            raise ValueError(
+                "Either thinker_embeds or thinker_hidden_states must be provided"
+            )
 
         # If only embeddings provided, project all as text
         if thinker_hidden_states is None or is_multimodal_mask is None:
@@ -312,7 +322,9 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
         """Create empty intermediate tensors for pipeline parallelism."""
-        return self.language_model.make_empty_intermediate_tensors(batch_size, dtype, device)
+        return self.language_model.make_empty_intermediate_tensors(
+            batch_size, dtype, device
+        )
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         mm_input_by_modality = {}
@@ -320,12 +332,27 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         # Preserve the order of modalities if there are multiple of them
         # from the order of kwargs.
         for input_key in kwargs:
-            if input_key in ("pixel_values", "image_embeds") and "image" not in mm_input_by_modality:
-                mm_input_by_modality["image"] = self._parse_and_validate_image_input(**kwargs)
-            if input_key in ("pixel_values_videos", "video_embeds") and "video" not in mm_input_by_modality:
-                mm_input_by_modality["video"] = self._parse_and_validate_video_input(**kwargs)
-            if input_key in ("input_audio_features") and "audio" not in mm_input_by_modality:
-                mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(**kwargs)
+            if (
+                input_key in ("pixel_values", "image_embeds")
+                and "image" not in mm_input_by_modality
+            ):
+                mm_input_by_modality["image"] = self._parse_and_validate_image_input(
+                    **kwargs
+                )
+            if (
+                input_key in ("pixel_values_videos", "video_embeds")
+                and "video" not in mm_input_by_modality
+            ):
+                mm_input_by_modality["video"] = self._parse_and_validate_video_input(
+                    **kwargs
+                )
+            if (
+                input_key in ("input_audio_features")
+                and "audio" not in mm_input_by_modality
+            ):
+                mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(
+                    **kwargs
+                )
         return mm_input_by_modality
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
@@ -457,8 +484,14 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
 
     def __init__(self, config: Qwen3OmniMoeTalkerConfig):
         super().__init__()
-        self.linear_fc1 = nn.Linear(config.thinker_hidden_size, config.text_config.intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(config.text_config.intermediate_size, config.text_config.hidden_size, bias=True)
+        self.linear_fc1 = nn.Linear(
+            config.thinker_hidden_size, config.text_config.intermediate_size, bias=True
+        )
+        self.linear_fc2 = nn.Linear(
+            config.text_config.intermediate_size,
+            config.text_config.hidden_size,
+            bias=True,
+        )
         self.act_fn = _ACTIVATION_REGISTRY[config.text_config.hidden_act]  # silu
 
     def forward(self, hidden_state):
@@ -475,12 +508,19 @@ class Qwen3OmniMoeModel(Qwen3MoeLLMForCausalLM):
     of text tokens.
     """
 
-    def __init__(self, vllm_config: VllmConfig, talker_config: Qwen3OmniMoeTalkerConfig, prefix: str):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        talker_config: Qwen3OmniMoeTalkerConfig,
+        prefix: str,
+    ):
         # Create a vllm_config for the talker's text model
         talker_vllm_config = vllm_config.with_hf_config(
             talker_config.text_config, architectures=["Qwen3MoeForCausalLM"]
         )
-        talker_vllm_config.model_config.hf_text_config = talker_vllm_config.model_config.hf_config
+        talker_vllm_config.model_config.hf_text_config = (
+            talker_vllm_config.model_config.hf_config
+        )
 
         super().__init__(
             vllm_config=talker_vllm_config,

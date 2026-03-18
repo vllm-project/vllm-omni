@@ -79,8 +79,13 @@ from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
-from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
+from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import (
+    AutoencoderKLConv3D,
+)
+from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import (
+    LightProjector,
+    Siglip2VisionTransformer,
+)
 
 logger = init_logger(__name__)
 
@@ -89,7 +94,9 @@ logger = init_logger(__name__)
 class HunyuanModel(HunYuanModel):
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
-        num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
+        num_kv_heads = getattr(
+            self.config, "num_key_value_heads", self.config.num_attention_heads
+        )
         num_key_value_groups = num_attention_heads // num_kv_heads
         hidden_size = self.config.hidden_size
 
@@ -100,14 +107,18 @@ class HunyuanModel(HunYuanModel):
         else:
             attention_head_dim = self.config.hidden_size // num_attention_heads
 
-        qkv = qkv.reshape(num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size)
+        qkv = qkv.reshape(
+            num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size
+        )
         q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
         q = q.reshape(-1, hidden_size)
         k = k.reshape(-1, hidden_size)
         v = v.reshape(-1, hidden_size)
         return torch.concat((q, k, v))
 
-    def get_expert_mapping(self) -> tuple[list[tuple[str, str, int, str]], dict[str, tuple[str, int, int]]]:
+    def get_expert_mapping(
+        self,
+    ) -> tuple[list[tuple[str, str, int, str]], dict[str, tuple[str, int, int]]]:
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
@@ -139,7 +150,9 @@ class HunyuanModel(HunYuanModel):
         ]
 
         num_attention_heads = self.config.num_attention_heads
-        num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
+        num_kv_heads = getattr(
+            self.config, "num_key_value_heads", self.config.num_attention_heads
+        )
         split_params_mapping = [
             (".gate_up_proj", ".gate_and_up_proj", 2, [(1, 1), (0, 1)], None),
             (
@@ -198,7 +211,9 @@ class HunyuanModel(HunYuanModel):
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
+            if self.quant_config is not None and (
+                scale_name := self.quant_config.get_cache_scale(name)
+            ):
                 # Loading kv cache scales for compressed-tensors quantization
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -270,7 +285,9 @@ class HunyuanModel(HunYuanModel):
                 for shard_id, num in split_param:
                     new_offset = offset + num * units
                     if func:
-                        weight_loader(param, func(loaded_weight)[offset:new_offset], shard_id)
+                        weight_loader(
+                            param, func(loaded_weight)[offset:new_offset], shard_id
+                        )
                     else:
                         weight_loader(param, loaded_weight[offset:new_offset], shard_id)
                     offset = new_offset
@@ -295,7 +312,9 @@ class HunyuanModel(HunYuanModel):
                     ) in expert_weights_remapping.items():
                         if mapped_weight_substr in weight_name:
                             origin_weight_name, offset, den = origin_weight_info
-                            weight_name = weight_name.replace(mapped_weight_substr, origin_weight_name)
+                            weight_name = weight_name.replace(
+                                mapped_weight_substr, origin_weight_name
+                            )
                             break
 
                     if weight_name not in name:
@@ -317,7 +336,9 @@ class HunyuanModel(HunYuanModel):
                     # We should ask the weight loader to return success or not
                     # here since otherwise we may skip experts with other
                     # available replicas.
-                    weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
+                    )
                     assert loaded_weight.shape[0] % den == 0
                     units = loaded_weight.shape[0] // den
 
@@ -424,7 +445,9 @@ class Downsample(nn.Module):
                  downsampling occurs in the inner-two dimensions.
     """
 
-    def __init__(self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None):
+    def __init__(
+        self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None
+    ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.channels = channels
@@ -433,7 +456,15 @@ class Downsample(nn.Module):
         self.dims = dims
         stride = 2 if dims != 3 else (1, 2, 2)
         if use_conv:
-            self.op = conv_nd(dims, self.channels, self.out_channels, 3, stride=stride, padding=1, **factory_kwargs)
+            self.op = conv_nd(
+                dims,
+                self.channels,
+                self.out_channels,
+                3,
+                stride=stride,
+                padding=1,
+                **factory_kwargs,
+            )
         else:
             assert self.channels == self.out_channels
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
@@ -480,7 +511,14 @@ class ResBlock(nn.Module):
         self.in_layers = nn.Sequential(
             normalization(self.in_channels, **factory_kwargs),
             nn.SiLU(),
-            conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs),
+            conv_nd(
+                dims,
+                self.in_channels,
+                self.out_channels,
+                3,
+                padding=1,
+                **factory_kwargs,
+            ),
         )
 
         self.down = down
@@ -491,21 +529,41 @@ class ResBlock(nn.Module):
         else:
             self.h_upd = self.x_upd = nn.Identity()
 
-        self.emb_layers = nn.Sequential(nn.SiLU(), linear(emb_channels, 2 * self.out_channels, **factory_kwargs))
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(), linear(emb_channels, 2 * self.out_channels, **factory_kwargs)
+        )
 
         self.out_layers = nn.Sequential(
             normalization(self.out_channels, **factory_kwargs),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, **factory_kwargs)),
+            zero_module(
+                conv_nd(
+                    dims,
+                    self.out_channels,
+                    self.out_channels,
+                    3,
+                    padding=1,
+                    **factory_kwargs,
+                )
+            ),
         )
 
         if self.out_channels == self.in_channels:
             self.skip_connection = nn.Identity()
         elif use_conv:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs)
+            self.skip_connection = conv_nd(
+                dims,
+                self.in_channels,
+                self.out_channels,
+                3,
+                padding=1,
+                **factory_kwargs,
+            )
         else:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 1, **factory_kwargs)
+            self.skip_connection = conv_nd(
+                dims, self.in_channels, self.out_channels, 1, **factory_kwargs
+            )
 
     def forward(self, x, emb):
         if self.down:
@@ -539,7 +597,15 @@ class UNetDown(nn.Module):
     """
 
     def __init__(
-        self, patch_size, in_channels, emb_channels, hidden_channels, out_channels, dropout=0.0, device=None, dtype=None
+        self,
+        patch_size,
+        in_channels,
+        emb_channels,
+        hidden_channels,
+        out_channels,
+        dropout=0.0,
+        device=None,
+        dtype=None,
     ):
         factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
@@ -550,7 +616,11 @@ class UNetDown(nn.Module):
         self.model = nn.ModuleList(
             [
                 nn.Conv2d(
-                    in_channels=in_channels, out_channels=hidden_channels, kernel_size=3, padding=1, **factory_kwargs
+                    in_channels=in_channels,
+                    out_channels=hidden_channels,
+                    kernel_size=3,
+                    padding=1,
+                    **factory_kwargs,
                 )
             ]
         )
@@ -571,7 +641,11 @@ class UNetDown(nn.Module):
                     ResBlock(
                         in_channels=hidden_channels,
                         emb_channels=emb_channels,
-                        out_channels=hidden_channels if (i + 1) * 2 != self.patch_size else out_channels,
+                        out_channels=(
+                            hidden_channels
+                            if (i + 1) * 2 != self.patch_size
+                            else out_channels
+                        ),
                         dropout=dropout,
                         down=True,
                         **factory_kwargs,
@@ -613,10 +687,20 @@ class TimestepEmbedder(nn.Module):
 
         self.mlp = nn.Sequential(
             ColumnParallelLinear(
-                frequency_embedding_size, hidden_size, bias=True, gather_output=False, return_bias=False
+                frequency_embedding_size,
+                hidden_size,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
             ),
             act_layer(),
-            RowParallelLinear(hidden_size, out_size, bias=True, input_is_parallel=True, return_bias=False),
+            RowParallelLinear(
+                hidden_size,
+                out_size,
+                bias=True,
+                input_is_parallel=True,
+                return_bias=False,
+            ),
         )
 
         nn.init.normal_(self.mlp[0].weight, std=0.02)
@@ -642,7 +726,9 @@ class TimestepEmbedder(nn.Module):
 
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=device) / half
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=device)
+            / half
         )
         # Ensure t is 2D: (N, 1) for broadcasting
         if t.ndim == 0:
@@ -652,13 +738,15 @@ class TimestepEmbedder(nn.Module):
         args = t.float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
         return embedding
 
     def forward(self, t):
-        t_freq = self._timestep_embedding(t, self.frequency_embedding_size, self.max_period).type(
-            self.mlp[0].weight.dtype
-        )
+        t_freq = self._timestep_embedding(
+            t, self.frequency_embedding_size, self.max_period
+        ).type(self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -706,13 +794,19 @@ class HunyuanImage3Processor:
         def __init__(self, base_size=None, step=None, align=1):
             self.align = align
             self.base_size = base_size
-            assert base_size % align == 0, f"base_size {base_size} is not divisible by align {align}"
+            assert (
+                base_size % align == 0
+            ), f"base_size {base_size} is not divisible by align {align}"
             if base_size is not None and not isinstance(base_size, int):
-                raise ValueError(f"base_size must be None or int, but got {type(base_size)}")
+                raise ValueError(
+                    f"base_size must be None or int, but got {type(base_size)}"
+                )
             if step is None:
                 step = base_size // 16
             if step is not None and step > base_size // 2:
-                raise ValueError(f"step must be smaller than base_size // 2, but got {step} > {base_size // 2}")
+                raise ValueError(
+                    f"step must be smaller than base_size // 2, but got {step} > {base_size // 2}"
+                )
 
             self.step = step
             self.data = self._calc_by_step()
@@ -728,14 +822,18 @@ class HunyuanImage3Processor:
             return self.data[idx]
 
         def _calc_by_step(self):
-            assert self.align <= self.step, f"align {self.align} must be smaller than step {self.step}"
+            assert (
+                self.align <= self.step
+            ), f"align {self.align} must be smaller than step {self.step}"
 
             min_height = self.base_size // 2
             min_width = self.base_size // 2
             max_height = self.base_size * 2
             max_width = self.base_size * 2
 
-            resolutions = [HunyuanImage3Processor.Resolution(self.base_size, self.base_size)]
+            resolutions = [
+                HunyuanImage3Processor.Resolution(self.base_size, self.base_size)
+            ]
 
             cur_height, cur_width = self.base_size, self.base_size
             while True:
@@ -746,7 +844,8 @@ class HunyuanImage3Processor:
                 cur_width = max(cur_width - self.step, min_width)
                 resolutions.append(
                     HunyuanImage3Processor.Resolution(
-                        cur_height // self.align * self.align, cur_width // self.align * self.align
+                        cur_height // self.align * self.align,
+                        cur_width // self.align * self.align,
                     )
                 )
 
@@ -759,7 +858,8 @@ class HunyuanImage3Processor:
                 cur_width = min(cur_width + self.step, max_width)
                 resolutions.append(
                     HunyuanImage3Processor.Resolution(
-                        cur_height // self.align * self.align, cur_width // self.align * self.align
+                        cur_height // self.align * self.align,
+                        cur_width // self.align * self.align,
                     )
                 )
 
@@ -782,7 +882,9 @@ class HunyuanImage3Processor:
         self.tokenizer = tokenizer
         self.hf_config = hf_config
         self.reso_group = self.ResolutionGroup(base_size=hf_config.image_base_size)
-        self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(hf_config.vit_processor)
+        self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(
+            hf_config.vit_processor
+        )
         self.vae_processor = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -804,7 +906,11 @@ class HunyuanImage3Processor:
         else:
             image_infors = None
 
-        text_inputs = self.tokenizer(text, return_tensors="pt", **kwargs) if text is not None else None
+        text_inputs = (
+            self.tokenizer(text, return_tensors="pt", **kwargs)
+            if text is not None
+            else None
+        )
 
         if image_infors and text_inputs is not None:
             # Combine text and image inputs into BatchFeature
@@ -838,23 +944,41 @@ class HunyuanImage3Processor:
             # VIT processing
             vit_pixel_values = self.vision_encoder_processor(image)
             # shape: (seq_len, num_channels * patch_size * patch_size)
-            current_info["vit_pixel_values"] = vit_pixel_values["pixel_values"].squeeze(0)
+            current_info["vit_pixel_values"] = vit_pixel_values["pixel_values"].squeeze(
+                0
+            )
             # shape: (seq_len, )
-            current_info["vit_pixel_attention_mask"] = vit_pixel_values["pixel_attention_mask"].squeeze(0)
+            current_info["vit_pixel_attention_mask"] = vit_pixel_values[
+                "pixel_attention_mask"
+            ].squeeze(0)
             # shape: (2, )
-            current_info["vit_spatial_shapes"] = vit_pixel_values["spatial_shapes"].squeeze(0)
+            current_info["vit_spatial_shapes"] = vit_pixel_values[
+                "spatial_shapes"
+            ].squeeze(0)
 
             # VAE processing
-            image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
+            image_width, image_height = self.reso_group.get_target_size(
+                image.width, image.height
+            )
             resized_image = self._resize_and_crop(image, (image_width, image_height))
             vae_pixel_values = self.vae_processor(resized_image)
-            token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
-            token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
-            current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0).to(dtype=torch_dtype)
-            current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
+            token_height = image_height // (
+                self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size
+            )
+            token_width = image_width // (
+                self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size
+            )
+            current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0).to(
+                dtype=torch_dtype
+            )
+            current_info["vae_token_grid_hw"] = torch.tensor(
+                [token_height, token_width]
+            )
 
             # size
-            base_size, ratio_index = self.reso_group.get_base_size_and_ratio_index(image_width, image_height)
+            base_size, ratio_index = self.reso_group.get_base_size_and_ratio_index(
+                image_width, image_height
+            )
             current_info["base_size"] = torch.tensor(base_size)
             current_info["ratio_index"] = torch.tensor(ratio_index)
 
@@ -868,11 +992,15 @@ class HunyuanImage3Processor:
 
         if final_image_info:
             shapes_info = {k: tuple(v.shape) for k, v in final_image_info.items()}
-            logger.info(f"Successfully processed {len(images)} image(s). Final tensor shapes: {shapes_info}")
+            logger.info(
+                f"Successfully processed {len(images)} image(s). Final tensor shapes: {shapes_info}"
+            )
 
         return final_image_info
 
-    def _resize_and_crop(self, image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    def _resize_and_crop(
+        self, image: Image.Image, target_size: tuple[int, int]
+    ) -> Image.Image:
         tw, th = target_size
         w, h = image.size
 
@@ -887,7 +1015,9 @@ class HunyuanImage3Processor:
             resize_width = tw
             resize_height = int(round(tw / w * h))
 
-        image = image.resize((resize_width, resize_height), resample=Image.Resampling.LANCZOS)
+        image = image.resize(
+            (resize_width, resize_height), resample=Image.Resampling.LANCZOS
+        )
 
         # center crop
         crop_top = int(round((resize_height - th) / 2.0))
@@ -914,7 +1044,9 @@ class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
         return {"image": None}
 
 
-class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3ProcessingInfo]):
+class HunyuanImage3DummyInputsBuilder(
+    BaseDummyInputsBuilder[HunyuanImage3ProcessingInfo]
+):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         """Generate dummy text with image placeholders."""
         num_images = mm_counts.get("image", 0)
@@ -942,7 +1074,9 @@ class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3Proces
         }
 
 
-class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3ProcessingInfo]):
+class HunyuanImage3MultiModalProcessor(
+    BaseMultiModalProcessor[HunyuanImage3ProcessingInfo]
+):
     """Multimodal processor for HunyuanImage3 model."""
 
     def _call_hf_processor(
@@ -1004,13 +1138,19 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             raise ValueError("Image token '<img>' not found in tokenizer vocabulary")
         joint_img_sep_token_id = tokenizer.convert_tokens_to_ids("<joint_img_sep>")
         if joint_img_sep_token_id is None:
-            raise ValueError("Joint image separator token '<joint_img_sep>' not found in tokenizer vocabulary")
+            raise ValueError(
+                "Joint image separator token '<joint_img_sep>' not found in tokenizer vocabulary"
+            )
         boi_token_id = tokenizer.convert_tokens_to_ids("<boi>")
         if boi_token_id is None:
-            raise ValueError("Beginning of image token '<boi>' not found in tokenizer vocabulary")
+            raise ValueError(
+                "Beginning of image token '<boi>' not found in tokenizer vocabulary"
+            )
         eoi_token_id = tokenizer.convert_tokens_to_ids("<eoi>")
         if eoi_token_id is None:
-            raise ValueError("End of image token '<eoi>' not found in tokenizer vocabulary")
+            raise ValueError(
+                "End of image token '<eoi>' not found in tokenizer vocabulary"
+            )
 
         out_mm_data = out_mm_kwargs.get_data()
         vit_spatial_shapes = out_mm_data.get("vit_spatial_shapes")
@@ -1029,12 +1169,20 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             hf_config = self.info.get_hf_config()
             vit_token_num = hf_config.vit_processor.get("max_num_patches", 729)
 
-            base_size_token_id = tokenizer.convert_tokens_to_ids(f"<img_size_{_base_size}>")
+            base_size_token_id = tokenizer.convert_tokens_to_ids(
+                f"<img_size_{_base_size}>"
+            )
             if base_size_token_id is None:
-                raise ValueError(f"Base size token '<img_size_{_base_size}>' not found in tokenizer vocabulary")
-            ratio_token_id = tokenizer.convert_tokens_to_ids(f"<img_ratio_{_ratio_index}>")
+                raise ValueError(
+                    f"Base size token '<img_size_{_base_size}>' not found in tokenizer vocabulary"
+                )
+            ratio_token_id = tokenizer.convert_tokens_to_ids(
+                f"<img_ratio_{_ratio_index}>"
+            )
             if ratio_token_id is None:
-                raise ValueError(f"Ratio token '<img_ratio_{_ratio_index}>' not found in tokenizer vocabulary")
+                raise ValueError(
+                    f"Ratio token '<img_ratio_{_ratio_index}>' not found in tokenizer vocabulary"
+                )
 
             replacement = (
                 [boi_token_id]
@@ -1046,11 +1194,19 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
                 + [img_token_id] * vit_token_num
                 + [eoi_token_id]
             )
-            logger.debug(f"actual replacement token count: {timestep_token_num + vae_token_num + vit_token_num}")
-            return PromptUpdateDetails.select_token_id(replacement, embed_token_id=img_token_id)
+            logger.debug(
+                f"actual replacement token count: {timestep_token_num + vae_token_num + vit_token_num}"
+            )
+            return PromptUpdateDetails.select_token_id(
+                replacement, embed_token_id=img_token_id
+            )
 
         return [
-            PromptReplacement(modality="image", target=[img_token_id], replacement=get_replacement_image),
+            PromptReplacement(
+                modality="image",
+                target=[img_token_id],
+                replacement=get_replacement_image,
+            ),
         ]
 
 
@@ -1076,7 +1232,9 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_dim = head_dim
         assert head_dim % 4 == 0, f"head_dim must be divisible by 4, got {head_dim}"
-        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
@@ -1132,7 +1290,9 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
     info=HunyuanImage3ProcessingInfo,
     dummy_inputs=HunyuanImage3DummyInputsBuilder,
 )
-class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA, SupportsPP, SupportsMRoPE):
+class HunyuanImage3ForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsLoRA, SupportsPP, SupportsMRoPE
+):
     """
     HunyuanImage3.0 model for conditional image generation.
 
@@ -1173,7 +1333,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             head_dim = getattr(
                 config,
                 "head_dim",
-                getattr(config, "attention_head_dim", config.hidden_size // config.num_attention_heads),
+                getattr(
+                    config,
+                    "attention_head_dim",
+                    config.hidden_size // config.num_attention_heads,
+                ),
             )
             config.rope_parameters["mrope_section"] = [0, head_dim // 4, head_dim // 4]
 
@@ -1195,7 +1359,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 self.lm_head.weight = self.model.embed_tokens.weight
 
             logit_scale = getattr(config, "logit_scale", 1.0)
-            self.logits_processor = LogitsProcessor(self.unpadded_vocab_size, config.vocab_size, logit_scale)
+            self.logits_processor = LogitsProcessor(
+                self.unpadded_vocab_size, config.vocab_size, logit_scale
+            )
         else:
             self.lm_head = PPMissingLayer()
 
@@ -1223,7 +1389,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._mrope_img_token_id = tokenizer.convert_tokens_to_ids("<img>")
         self._mrope_boi_token_id = tokenizer.convert_tokens_to_ids("<boi>")
         self._mrope_eoi_token_id = tokenizer.convert_tokens_to_ids("<eoi>")
-        self._mrope_joint_img_sep_token_id = tokenizer.convert_tokens_to_ids("<joint_img_sep>")
+        self._mrope_joint_img_sep_token_id = tokenizer.convert_tokens_to_ids(
+            "<joint_img_sep>"
+        )
         self._mrope_max_num_patches = config.vit_processor.get("max_num_patches", 729)
 
         self._replace_rotary_embeddings()
@@ -1313,7 +1481,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 latents = latents.squeeze(2)
             else:
                 # If T > 1, take the first frame (shouldn't happen for conditional images)
-                logger.warning(f"T({latents.shape[2]}) > 1, should not happen for conditional images")
+                logger.warning(
+                    f"T({latents.shape[2]}) > 1, should not happen for conditional images"
+                )
                 latents = latents[:, :, 0, :, :]
 
         # Always use t=0 to declare it is a clean conditional image
@@ -1340,7 +1510,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             return None
 
         vision_output = self.vision_model(
-            pixel_values, attention_mask=vit_attention_mask, spatial_shapes=vit_spatial_shapes
+            pixel_values,
+            attention_mask=vit_attention_mask,
+            spatial_shapes=vit_spatial_shapes,
         )
         image_embed = vision_output.last_hidden_state
         image_embed = self.vision_aligner(image_embed)
@@ -1378,7 +1550,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vae_pixel_values = pixel_values["vae_pixel_values"]
 
         # Perform ViT encoding
-        vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
+        vit_embeddings = self._vit_encode(
+            vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes
+        )
 
         # Perform VAE encoding
         t, latents = self._vae_encode(vae_pixel_values, vae_cfg_factor)
@@ -1399,7 +1573,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)
 
-        assert vit_embeddings is not None and vit_embeddings.shape[0] == len(vae_token_embeddings), (
+        assert vit_embeddings is not None and vit_embeddings.shape[0] == len(
+            vae_token_embeddings
+        ), (
             f"Number of ViT embeddings ({vit_embeddings.shape[0]}) does not match "
             f"number of VAE token embeddings ({len(vae_token_embeddings)}). "
             "Each image should have both VAE and ViT embeddings."
@@ -1410,7 +1586,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         num_images = len(vae_token_embeddings)
         for img_idx in range(num_images):
             # 1. Timestep embedding
-            timestep = torch.zeros((1,)).to(vit_embeddings.device).to(vit_embeddings.dtype)
+            timestep = (
+                torch.zeros((1,)).to(vit_embeddings.device).to(vit_embeddings.dtype)
+            )
             timestep_emb = self._timestep_encode(timestep)
 
             # 2. VAE image token embeddings
@@ -1463,7 +1641,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         model_input_ids = None if inputs_embeds is not None else input_ids
-        model_output = self.model(model_input_ids, positions, intermediate_tensors, inputs_embeds)
+        model_output = self.model(
+            model_input_ids, positions, intermediate_tensors, inputs_embeds
+        )
         return model_output
 
     def compute_logits(
@@ -1478,8 +1658,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     ) -> IntermediateTensors:
         return IntermediateTensors(
             {
-                "hidden_states": torch.zeros((batch_size, self.config.hidden_size), dtype=dtype, device=device),
-                "residual": torch.zeros((batch_size, self.config.hidden_size), dtype=dtype, device=device),
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+                "residual": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
             }
         )
 

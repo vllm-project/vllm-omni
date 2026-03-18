@@ -23,21 +23,42 @@ def parse_args() -> argparse.Namespace:
         default="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         help="Diffusers Wan2.2 model ID or local path.",
     )
-    parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
+    parser.add_argument(
+        "--prompt",
+        default="A serene lakeside sunrise with mist over the water.",
+        help="Text prompt.",
+    )
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--guidance-scale", type=float, default=4.0, help="CFG scale (applied to low/high).")
-    parser.add_argument("--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise.")
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=4.0,
+        help="CFG scale (applied to low/high).",
+    )
+    parser.add_argument(
+        "--guidance-scale-high",
+        type=float,
+        default=None,
+        help="Optional separate CFG for high-noise.",
+    )
     parser.add_argument("--height", type=int, default=720, help="Video height.")
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
-    parser.add_argument("--num-frames", type=int, default=81, help="Number of frames (Wan default is 81).")
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=81,
+        help="Number of frames (Wan default is 81).",
+    )
     parser.add_argument(
         "--frame-rate",
         type=float,
         default=None,
         help="Optional generation frame rate (used by models like LTX2). Defaults to --fps.",
     )
-    parser.add_argument("--num-inference-steps", type=int, default=40, help="Sampling steps.")
+    parser.add_argument(
+        "--num-inference-steps", type=int, default=40, help="Sampling steps."
+    )
     parser.add_argument(
         "--boundary-ratio",
         type=float,
@@ -45,7 +66,10 @@ def parse_args() -> argparse.Namespace:
         help="Boundary split ratio for low/high DiT. Default 0.875 uses both transformers for best quality. Set to 1.0 to load only the low-noise transformer (saves noticeable memory with good quality, recommended if memory is limited).",
     )
     parser.add_argument(
-        "--flow-shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
+        "--flow-shift",
+        type=float,
+        default=5.0,
+        help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p).",
     )
     parser.add_argument(
         "--cache-backend",
@@ -63,8 +87,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
-    parser.add_argument("--output", type=str, default="wan22_output.mp4", help="Path to save the video (mp4).")
-    parser.add_argument("--fps", type=int, default=24, help="Frames per second for the output video.")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="wan22_output.mp4",
+        help="Path to save the video (mp4).",
+    )
+    parser.add_argument(
+        "--fps", type=int, default=24, help="Frames per second for the output video."
+    )
     parser.add_argument(
         "--vae-use-slicing",
         action="store_true",
@@ -137,7 +168,9 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(
+        args.seed
+    )
     frame_rate = args.frame_rate if args.frame_rate is not None else float(args.fps)
 
     # Wan2.2 cache-dit tuning (from cache-dit examples and cache_alignment).
@@ -225,7 +258,9 @@ def main():
     generation_time = generation_end - generation_start
 
     # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+    print(
+        f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)"
+    )
 
     audio = None
     if isinstance(frames, list):
@@ -243,16 +278,25 @@ def main():
             if isinstance(inner_output, list):
                 inner_output = inner_output[0] if inner_output else None
             if isinstance(inner_output, OmniRequestOutput):
-                if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
+                if (
+                    inner_output.multimodal_output
+                    and "audio" in inner_output.multimodal_output
+                ):
                     audio = inner_output.multimodal_output["audio"]
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
-                if len(frames.images) == 1 and isinstance(frames.images[0], tuple) and len(frames.images[0]) == 2:
+                if (
+                    len(frames.images) == 1
+                    and isinstance(frames.images[0], tuple)
+                    and len(frames.images[0]) == 2
+                ):
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
-                    frames = frames.images[0].get("frames") or frames.images[0].get("video")
+                    frames = frames.images[0].get("frames") or frames.images[0].get(
+                        "video"
+                    )
                 else:
                     frames = frames.images
             else:

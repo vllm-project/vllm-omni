@@ -40,11 +40,15 @@ class FlowMatchEulerDiscreteSchedulerOutput:
 class FlowMatchEulerDiscreteScheduler:
     order = 1
 
-    def __init__(self, num_train_timesteps: int = 1000, dynamic_time_shift: bool = True):
+    def __init__(
+        self, num_train_timesteps: int = 1000, dynamic_time_shift: bool = True
+    ):
         self.num_train_timesteps = int(num_train_timesteps)
         self.dynamic_time_shift = bool(dynamic_time_shift)
 
-        timesteps = torch.linspace(0, 1, self.num_train_timesteps + 1, dtype=torch.float32)[:-1]
+        timesteps = torch.linspace(
+            0, 1, self.num_train_timesteps + 1, dtype=torch.float32
+        )[:-1]
         self.timesteps = timesteps
         self._timesteps = torch.cat([timesteps, torch.ones(1, dtype=timesteps.dtype)])
 
@@ -62,8 +66,12 @@ class FlowMatchEulerDiscreteScheduler:
     def set_begin_index(self, begin_index: int = 0) -> None:
         self._begin_index = int(begin_index)
 
-    def index_for_timestep(self, timestep: torch.Tensor, schedule_timesteps: torch.Tensor | None = None) -> int:
-        schedule_timesteps = self._timesteps if schedule_timesteps is None else schedule_timesteps
+    def index_for_timestep(
+        self, timestep: torch.Tensor, schedule_timesteps: torch.Tensor | None = None
+    ) -> int:
+        schedule_timesteps = (
+            self._timesteps if schedule_timesteps is None else schedule_timesteps
+        )
         indices = (schedule_timesteps == timestep).nonzero()
         pos = 1 if len(indices) > 1 else 0
         return int(indices[pos].item())
@@ -77,17 +85,28 @@ class FlowMatchEulerDiscreteScheduler:
     ) -> None:
         if timesteps is None:
             if num_inference_steps is None:
-                raise ValueError("`num_inference_steps` must be provided when `timesteps` is None.")
-            timesteps_np = np.linspace(0, 1, num_inference_steps + 1, dtype=np.float32)[:-1]
+                raise ValueError(
+                    "`num_inference_steps` must be provided when `timesteps` is None."
+                )
+            timesteps_np = np.linspace(0, 1, num_inference_steps + 1, dtype=np.float32)[
+                :-1
+            ]
             if self.dynamic_time_shift and num_tokens is not None:
                 m = np.sqrt(float(num_tokens)) / 40.0
                 timesteps_np = timesteps_np / (m - m * timesteps_np + timesteps_np)
         else:
             timesteps_np = np.asarray(timesteps, dtype=np.float32)
 
-        timesteps_t = torch.from_numpy(timesteps_np).to(dtype=torch.float32, device=device)
+        timesteps_t = torch.from_numpy(timesteps_np).to(
+            dtype=torch.float32, device=device
+        )
         self.timesteps = timesteps_t
-        self._timesteps = torch.cat([timesteps_t, torch.ones(1, device=timesteps_t.device, dtype=timesteps_t.dtype)])
+        self._timesteps = torch.cat(
+            [
+                timesteps_t,
+                torch.ones(1, device=timesteps_t.device, dtype=timesteps_t.dtype),
+            ]
+        )
 
         self._step_index = None
         self._begin_index = None
@@ -97,7 +116,9 @@ class FlowMatchEulerDiscreteScheduler:
             if isinstance(timestep, torch.Tensor):
                 timestep = timestep.to(self.timesteps.device)
             else:
-                timestep = torch.tensor(timestep, device=self.timesteps.device, dtype=self.timesteps.dtype)
+                timestep = torch.tensor(
+                    timestep, device=self.timesteps.device, dtype=self.timesteps.dtype
+                )
             self._step_index = self.index_for_timestep(timestep)
         else:
             self._step_index = self._begin_index
@@ -107,7 +128,9 @@ class FlowMatchEulerDiscreteScheduler:
         model_output: torch.FloatTensor,
         timestep: float | torch.FloatTensor,
         sample: torch.FloatTensor,
-        generator: torch.Generator | None = None,  # noqa: ARG002 - kept for API compatibility
+        generator: (
+            torch.Generator | None
+        ) = None,  # noqa: ARG002 - kept for API compatibility
         return_dict: bool = True,
     ) -> FlowMatchEulerDiscreteSchedulerOutput | tuple[torch.FloatTensor]:
         if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):

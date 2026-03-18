@@ -35,7 +35,11 @@ def _update_out_and_lse(
         elif block_lse.shape[1] == H and block_lse.shape[2] >= S:  # Padding case
             block_lse = block_lse[:, :, :S, :].transpose(1, 2)
         # If shape is (B, H, S, 1) but expected (B, S, H, 1) because out is (B, S, H, D)
-        elif block_lse.shape[1] == H and block_lse.shape[2] == S and block_lse.shape[3] == 1:
+        elif (
+            block_lse.shape[1] == H
+            and block_lse.shape[2] == S
+            and block_lse.shape[3] == 1
+        ):
             block_lse = block_lse.transpose(1, 2)
 
     # Case 1: block_lse is 3D (B, H, S) or (B, S, H) or (B, ?, ?)
@@ -65,7 +69,11 @@ def _update_out_and_lse(
     # Ensure lse matches block_lse's corrected shape (B, S, H, 1)
     if lse.shape != block_lse.shape:
         # If lse was initialized with wrong shape, try to fix it
-        if lse.dim() == 4 and lse.shape[1] == block_lse.shape[2] and lse.shape[2] == block_lse.shape[1]:
+        if (
+            lse.dim() == 4
+            and lse.shape[1] == block_lse.shape[2]
+            and lse.shape[2] == block_lse.shape[1]
+        ):
             lse = lse.transpose(1, 2)
         elif lse.shape[1] >= S:  # slice if lse was initialized with padding
             lse = lse[:, :S, :, :]
@@ -112,15 +120,21 @@ def update_out_and_lse(
                 lse = block_lse.transpose(1, 2).unsqueeze(-1)
             elif block_lse.shape[1] == S_guess and block_lse.shape[2] == H_guess:
                 lse = block_lse.unsqueeze(-1)
-            elif block_lse.shape[1] == H_guess and block_lse.shape[2] >= S_guess:  # Padding
+            elif (
+                block_lse.shape[1] == H_guess and block_lse.shape[2] >= S_guess
+            ):  # Padding
                 lse = block_lse[:, :, :S_guess].transpose(1, 2).unsqueeze(-1)
-            elif block_lse.shape[1] == S_guess and block_lse.shape[2] >= H_guess:  # Padding/Weird
+            elif (
+                block_lse.shape[1] == S_guess and block_lse.shape[2] >= H_guess
+            ):  # Padding/Weird
                 lse = block_lse[:, :, :H_guess].unsqueeze(-1)
             elif block_lse.shape[1] >= S_guess and block_lse.shape[2] == H_guess:
                 lse = block_lse[:, :S_guess, :].unsqueeze(-1)
 
             # Reverse case: What if out is (B, H, S, D) so S=D2, H=D1?
-            elif block_lse.shape[1] == D1 and block_lse.shape[2] >= D2:  # Matches (H, S)
+            elif (
+                block_lse.shape[1] == D1 and block_lse.shape[2] >= D2
+            ):  # Matches (H, S)
                 # Then out is (B, H, S, D). We should transpose out!
                 out = out.transpose(1, 2)
                 lse = block_lse[:, :, :D2].transpose(1, 2).unsqueeze(-1)  # (B, S, H, 1)
@@ -135,9 +149,13 @@ def update_out_and_lse(
                     lse = block_lse
                 elif block_lse.shape[1] == H_guess and block_lse.shape[2] == S_guess:
                     lse = block_lse.transpose(1, 2)
-                elif block_lse.shape[1] == H_guess and block_lse.shape[2] >= S_guess:  # Padding case
+                elif (
+                    block_lse.shape[1] == H_guess and block_lse.shape[2] >= S_guess
+                ):  # Padding case
                     lse = block_lse[:, :, :S_guess, :].transpose(1, 2)
-                elif block_lse.shape[1] == D1 and block_lse.shape[2] >= D2:  # Matches (H, S)
+                elif (
+                    block_lse.shape[1] == D1 and block_lse.shape[2] >= D2
+                ):  # Matches (H, S)
                     # Then out is (B, H, S, D). We should transpose out!
                     out = out.transpose(1, 2)
                     lse = block_lse[:, :, :D2].transpose(1, 2)  # (B, S, H, 1)
@@ -148,7 +166,9 @@ def update_out_and_lse(
 
     elif slice_ is not None:
         slice_out, slice_lse = out[slice_], lse[slice_]
-        slice_out, slice_lse = _update_out_and_lse(slice_out, slice_lse, block_out, block_lse)
+        slice_out, slice_lse = _update_out_and_lse(
+            slice_out, slice_lse, block_out, block_lse
+        )
         out[slice_], lse[slice_] = slice_out, slice_lse
     else:
         out, lse = _update_out_and_lse(out, lse, block_out, block_lse)
@@ -166,7 +186,9 @@ def flatten_varlen_lse(lse, cu_seqlens):
 def unflatten_varlen_lse(lse, cu_seqlens, max_seqlen: int):
     num_seq = len(cu_seqlens) - 1
     num_head = lse.shape[-2]
-    new_lse = torch.empty((num_seq, max_seqlen, num_head, 1), dtype=torch.float32, device=lse.device)
+    new_lse = torch.empty(
+        (num_seq, max_seqlen, num_head, 1), dtype=torch.float32, device=lse.device
+    )
     for i in range(num_seq):
         start, end = cu_seqlens[i], cu_seqlens[i + 1]
         new_lse[i, : end - start] = lse[start:end]

@@ -68,7 +68,9 @@ class ModelHook:
         """
         return module
 
-    def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
+    def pre_forward(
+        self, module: nn.Module, *args: Any, **kwargs: Any
+    ) -> tuple[tuple, dict]:
         """Called before the module's forward pass.
 
         Args:

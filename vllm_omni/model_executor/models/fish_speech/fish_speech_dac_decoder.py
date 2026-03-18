@@ -103,9 +103,13 @@ class FishSpeechDACDecoder(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         if input_ids.numel() == 0:
             return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
-        return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
+        return torch.zeros(
+            (input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32
+        )
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
+    def compute_logits(
+        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
+    ) -> None:
         return None
 
     def _split_request_ids(
@@ -118,14 +122,24 @@ class FishSpeechDACDecoder(nn.Module):
             for count in seq_token_counts:
                 boundaries.append(boundaries[-1] + count)
             n = ids.numel()
-            return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
+            return [
+                ids[boundaries[i] : min(boundaries[i + 1], n)]
+                for i in range(len(seq_token_counts))
+            ]
         if is_forward_context_available():
             slices = get_forward_context().ubatch_slices
-            if slices is not None and len(slices) > 1 and not any(hasattr(s, "token_slice") for s in slices):
+            if (
+                slices is not None
+                and len(slices) > 1
+                and not any(hasattr(s, "token_slice") for s in slices)
+            ):
                 boundaries = [0]
                 for s in slices:
                     boundaries.append(boundaries[-1] + s)
-                return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
+                return [
+                    ids[boundaries[i] : boundaries[i + 1]]
+                    for i in range(len(boundaries) - 1)
+                ]
         return [ids]
 
     @torch.no_grad()
@@ -256,11 +270,15 @@ class FishSpeechDACDecoder(nn.Module):
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
 
-    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+    def make_omni_output(
+        self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any
+    ) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         if not (isinstance(model_outputs, tuple) and len(model_outputs) == 2):
-            raise TypeError(f"FishSpeechDACDecoder expected (audio_tensor, sr), got {type(model_outputs)}")
+            raise TypeError(
+                f"FishSpeechDACDecoder expected (audio_tensor, sr), got {type(model_outputs)}"
+            )
         audio_tensor, sr = model_outputs
         return OmniOutput(
             text_hidden_states=None,

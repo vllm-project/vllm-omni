@@ -20,7 +20,9 @@ from vllm_omni.platforms import current_omni_platform
 is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 
 
-def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
+def create_attention_mask(
+    batch_size: int, seq_len: int, valid_len: int, device: torch.device
+) -> torch.Tensor:
     """
     Create attention mask where first valid_len tokens are valid (1) and rest are padding (0).
 
@@ -37,7 +39,9 @@ def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device:
     return mask
 
 
-def pad_tensor(tensor: torch.Tensor, target_seq_len: int, pad_value: float = 0.0) -> torch.Tensor:
+def pad_tensor(
+    tensor: torch.Tensor, target_seq_len: int, pad_value: float = 0.0
+) -> torch.Tensor:
     """
     Pad tensor along sequence dimension (dim=1).
 
@@ -54,7 +58,10 @@ def pad_tensor(tensor: torch.Tensor, target_seq_len: int, pad_value: float = 0.0
         return tensor
 
     padding = torch.full(
-        (batch_size, target_seq_len - seq_len, num_heads, head_dim), pad_value, dtype=tensor.dtype, device=tensor.device
+        (batch_size, target_seq_len - seq_len, num_heads, head_dim),
+        pad_value,
+        dtype=tensor.dtype,
+        device=tensor.device,
     )
     return torch.cat([tensor, padding], dim=1)
 
@@ -84,12 +91,17 @@ def test_padding_equivalence():
 
     # Initialize FlashAttention
     fa_impl = FlashAttentionImpl(
-        num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False
+        num_heads=num_heads,
+        head_size=head_dim,
+        softmax_scale=1.0 / (head_dim**0.5),
+        causal=False,
     )
 
     # Create base tensors with random values (same for both A and B)
     torch.manual_seed(42)
-    hidden_states_base = torch.randn(batch_size, hidden_seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    hidden_states_base = torch.randn(
+        batch_size, hidden_seq_len, num_heads, head_dim, device=device, dtype=dtype
+    )
     encoder_hidden_states_base = torch.randn(
         batch_size, encoder_seq_len, num_heads, head_dim, device=device, dtype=dtype
     )
@@ -101,11 +113,15 @@ def test_padding_equivalence():
 
     attn_metadata_a = AttentionMetadata(attn_mask=None)
 
-    output_a = fa_impl.forward(query=query_a, key=key_a, value=value_a, attn_metadata=attn_metadata_a)
+    output_a = fa_impl.forward(
+        query=query_a, key=key_a, value=value_a, attn_metadata=attn_metadata_a
+    )
 
     # ========== Input B: Padded with attention mask ==========
     hidden_states_padded = pad_tensor(hidden_states_base, hidden_seq_len + pad_length)
-    encoder_hidden_states_padded = pad_tensor(encoder_hidden_states_base, encoder_seq_len + pad_length)
+    encoder_hidden_states_padded = pad_tensor(
+        encoder_hidden_states_base, encoder_seq_len + pad_length
+    )
 
     query_b = torch.cat([hidden_states_padded, encoder_hidden_states_padded], dim=1)
     key_b = query_b.clone()
@@ -114,21 +130,35 @@ def test_padding_equivalence():
     # Create attention mask
     attn_mask_b = torch.cat(
         [
-            create_attention_mask(batch_size, hidden_seq_len + pad_length, hidden_seq_len, device),
-            create_attention_mask(batch_size, encoder_seq_len + pad_length, encoder_seq_len, device),
+            create_attention_mask(
+                batch_size, hidden_seq_len + pad_length, hidden_seq_len, device
+            ),
+            create_attention_mask(
+                batch_size, encoder_seq_len + pad_length, encoder_seq_len, device
+            ),
         ],
         dim=1,
     )
 
     attn_metadata_b = AttentionMetadata(attn_mask=attn_mask_b)
 
-    output_b = fa_impl.forward(query=query_b, key=key_b, value=value_b, attn_metadata=attn_metadata_b)
+    output_b = fa_impl.forward(
+        query=query_b, key=key_b, value=value_b, attn_metadata=attn_metadata_b
+    )
 
     # Extract non-padded portion from output_b
     output_b_unpadded = torch.cat(
         [
             output_b[:, :hidden_seq_len, :, :],
-            output_b[:, hidden_seq_len + pad_length : hidden_seq_len + pad_length + encoder_seq_len, :, :],
+            output_b[
+                :,
+                hidden_seq_len
+                + pad_length : hidden_seq_len
+                + pad_length
+                + encoder_seq_len,
+                :,
+                :,
+            ],
         ],
         dim=1,
     )
@@ -178,21 +208,33 @@ def test_fa_vs_sdpa():
 
     # Initialize both backends
     fa_impl = FlashAttentionImpl(
-        num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False
+        num_heads=num_heads,
+        head_size=head_dim,
+        softmax_scale=1.0 / (head_dim**0.5),
+        causal=False,
     )
 
-    sdpa_impl = SDPAImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False)
+    sdpa_impl = SDPAImpl(
+        num_heads=num_heads,
+        head_size=head_dim,
+        softmax_scale=1.0 / (head_dim**0.5),
+        causal=False,
+    )
 
     # Create base tensors
     torch.manual_seed(123)
-    hidden_states_base = torch.randn(batch_size, hidden_seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    hidden_states_base = torch.randn(
+        batch_size, hidden_seq_len, num_heads, head_dim, device=device, dtype=dtype
+    )
     encoder_hidden_states_base = torch.randn(
         batch_size, encoder_seq_len, num_heads, head_dim, device=device, dtype=dtype
     )
 
     # Pad tensors
     hidden_states_padded = pad_tensor(hidden_states_base, hidden_seq_len + pad_length)
-    encoder_hidden_states_padded = pad_tensor(encoder_hidden_states_base, encoder_seq_len + pad_length)
+    encoder_hidden_states_padded = pad_tensor(
+        encoder_hidden_states_base, encoder_seq_len + pad_length
+    )
 
     # Concatenate
     query = torch.cat([hidden_states_padded, encoder_hidden_states_padded], dim=1)
@@ -202,8 +244,12 @@ def test_fa_vs_sdpa():
     # Create attention mask
     attn_mask = torch.cat(
         [
-            create_attention_mask(batch_size, hidden_seq_len + pad_length, hidden_seq_len, device),
-            create_attention_mask(batch_size, encoder_seq_len + pad_length, encoder_seq_len, device),
+            create_attention_mask(
+                batch_size, hidden_seq_len + pad_length, hidden_seq_len, device
+            ),
+            create_attention_mask(
+                batch_size, encoder_seq_len + pad_length, encoder_seq_len, device
+            ),
         ],
         dim=1,
     )
@@ -211,7 +257,12 @@ def test_fa_vs_sdpa():
     attn_metadata = AttentionMetadata(attn_mask=attn_mask)
 
     # Run FlashAttention
-    output_fa = fa_impl.forward(query=query.clone(), key=key.clone(), value=value.clone(), attn_metadata=attn_metadata)
+    output_fa = fa_impl.forward(
+        query=query.clone(),
+        key=key.clone(),
+        value=value.clone(),
+        attn_metadata=attn_metadata,
+    )
 
     # Run SDPA
     # SDPA expects 4D attention mask: (batch_size, 1, seq_len, seq_len) or (batch_size, seq_len)
@@ -227,21 +278,40 @@ def test_fa_vs_sdpa():
         attn_metadata_sdpa = AttentionMetadata(attn_mask=None)
 
     output_sdpa = sdpa_impl.forward(
-        query=query.clone(), key=key.clone(), value=value.clone(), attn_metadata=attn_metadata_sdpa
+        query=query.clone(),
+        key=key.clone(),
+        value=value.clone(),
+        attn_metadata=attn_metadata_sdpa,
     )
 
     # Compare outputs (only compare valid regions)
     output_fa_valid = torch.cat(
         [
             output_fa[:, :hidden_seq_len, :, :],
-            output_fa[:, hidden_seq_len + pad_length : hidden_seq_len + pad_length + encoder_seq_len, :, :],
+            output_fa[
+                :,
+                hidden_seq_len
+                + pad_length : hidden_seq_len
+                + pad_length
+                + encoder_seq_len,
+                :,
+                :,
+            ],
         ],
         dim=1,
     )
     output_sdpa_valid = torch.cat(
         [
             output_sdpa[:, :hidden_seq_len, :, :],
-            output_sdpa[:, hidden_seq_len + pad_length : hidden_seq_len + pad_length + encoder_seq_len, :, :],
+            output_sdpa[
+                :,
+                hidden_seq_len
+                + pad_length : hidden_seq_len
+                + pad_length
+                + encoder_seq_len,
+                :,
+                :,
+            ],
         ],
         dim=1,
     )

@@ -11,7 +11,12 @@ import torch.nn as nn
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu, pytest.mark.core_model]
+pytestmark = [
+    pytest.mark.diffusion,
+    pytest.mark.parallel,
+    pytest.mark.cpu,
+    pytest.mark.core_model,
+]
 
 
 class TestHSDPInferenceConfig:
@@ -127,7 +132,9 @@ class TestDiffusionParallelConfigHSDP:
 
     def test_hsdp_replicate_size_exceeds_world_size(self):
         """Test that replicate_size > world_size raises an error."""
-        with pytest.raises(ValueError, match="replicate_size.*must evenly divide world_size"):
+        with pytest.raises(
+            ValueError, match="replicate_size.*must evenly divide world_size"
+        ):
             DiffusionParallelConfig(
                 ulysses_degree=4,  # world_size=4
                 use_hsdp=True,
@@ -226,7 +233,11 @@ class TestStandaloneHSDPDetection:
         else:
             effective_dit_parallel_size = dit_parallel_size
 
-        effective_dp_size = (fully_shard_degree * hsdp_replicate_size) if is_standalone_hsdp else data_parallel_size
+        effective_dp_size = (
+            (fully_shard_degree * hsdp_replicate_size)
+            if is_standalone_hsdp
+            else data_parallel_size
+        )
 
         return {
             "original_dit_parallel_size": dit_parallel_size,

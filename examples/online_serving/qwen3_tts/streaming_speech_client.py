@@ -102,7 +102,9 @@ async def stream_tts(
 
                 if isinstance(message, bytes):
                     current_chunks.append(message)
-                    print(f"  Received audio chunk for sentence {current_sentence_index}: {len(message)} bytes")
+                    print(
+                        f"  Received audio chunk for sentence {current_sentence_index}: {len(message)} bytes"
+                    )
                 else:
                     # JSON frame
                     msg = json.loads(message)
@@ -111,7 +113,9 @@ async def stream_tts(
                     if msg_type == "audio.start":
                         current_sentence_index = msg["sentence_index"]
                         current_chunks = []
-                        print(f"  [sentence {msg['sentence_index']}] Generating: {msg['sentence_text']!r}")
+                        print(
+                            f"  [sentence {msg['sentence_index']}] Generating: {msg['sentence_text']!r}"
+                        )
                     elif msg_type == "audio.done":
                         filename = os.path.join(
                             output_dir,
@@ -127,7 +131,9 @@ async def stream_tts(
                         )
                         current_chunks = []
                     elif msg_type == "session.done":
-                        print(f"\nSession complete: {msg['total_sentences']} sentence(s) generated")
+                        print(
+                            f"\nSession complete: {msg['total_sentences']} sentence(s) generated"
+                        )
                         break
                     elif msg_type == "error":
                         print(f"  ERROR: {msg['message']}")
@@ -183,7 +189,9 @@ def main():
         action="store_true",
         help="Receive one or more PCM chunks per sentence (requires --response-format pcm)",
     )
-    parser.add_argument("--speed", type=float, default=1.0, help="Playback speed (0.25-4.0)")
+    parser.add_argument(
+        "--speed", type=float, default=1.0, help="Playback speed (0.25-4.0)"
+    )
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Max tokens")
 
     # Base task options

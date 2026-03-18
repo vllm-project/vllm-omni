@@ -47,15 +47,31 @@ def get_chunk_config():
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
 if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
+    stage_configs = [
+        str(
+            Path(__file__).parent.parent
+            / "stage_configs"
+            / "rocm"
+            / "qwen3_omni_ci.yaml"
+        )
+    ]
 elif current_omni_platform.is_xpu():
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
+    stage_configs = [
+        str(
+            Path(__file__).parent.parent
+            / "stage_configs"
+            / "xpu"
+            / "qwen3_omni_ci.yaml"
+        )
+    ]
 else:
     stage_configs = [get_chunk_config()]
 
 # Create parameter combinations for model and stage config
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    OmniServerParams(model=model, stage_config_path=stage_config)
+    for model in models
+    for stage_config in stage_configs
 ]
 
 
@@ -103,8 +119,12 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     Datasets: single request
     """
 
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    video_data_url = (
+        f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    )
+    image_data_url = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    )
     audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
@@ -140,7 +160,9 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     Output Modal: text
     Datasets: few requests
     """
-    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(), content_text=get_prompt()
+    )
 
     request_config = {
         "model": omni_server.model,

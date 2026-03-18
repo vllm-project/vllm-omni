@@ -33,7 +33,10 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
             raise ValueError("Empty outputs from Omni.generate()")
         first_output = outputs[0]
         assert first_output.final_output_type == "image"
-        if not hasattr(first_output, "request_output") or not first_output.request_output:
+        if (
+            not hasattr(first_output, "request_output")
+            or not first_output.request_output
+        ):
             raise ValueError("No request_output found in OmniRequestOutput")
 
         req_out = first_output.request_output[0]
@@ -90,7 +93,9 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
                 width=width,
                 num_inference_steps=2,
                 guidance_scale=0.0,
-                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+                generator=torch.Generator(
+                    current_omni_platform.device_type
+                ).manual_seed(42),
                 num_outputs_per_prompt=1,
             ),
         )
@@ -120,7 +125,9 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
                     width=width,
                     num_inference_steps=2,
                     guidance_scale=0.0,
-                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+                    generator=torch.Generator(
+                        current_omni_platform.device_type
+                    ).manual_seed(42),
                     num_outputs_per_prompt=1,
                     lora_request=lora_request,
                     lora_scale=2.0,
@@ -133,7 +140,10 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
 
             import numpy as np
 
-            diff = np.abs(np.array(images[0], dtype=np.int16) - np.array(images_lora[0], dtype=np.int16)).mean()
+            diff = np.abs(
+                np.array(images[0], dtype=np.int16)
+                - np.array(images_lora[0], dtype=np.int16)
+            ).mean()
             assert diff > 0.0
     finally:
         m.close()

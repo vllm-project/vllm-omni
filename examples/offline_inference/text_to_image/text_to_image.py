@@ -32,20 +32,28 @@ def is_nextstep_model(model_name: str) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate an image with supported diffusion models.")
+    parser = argparse.ArgumentParser(
+        description="Generate an image with supported diffusion models."
+    )
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image",
         help="Diffusion model name or local path. Supported models: "
         "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, stepfun-ai/NextStep-1.1",
     )
-    parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
+    parser.add_argument(
+        "--prompt",
+        default="a cup of coffee on the table",
+        help="Text prompt for image generation.",
+    )
     parser.add_argument(
         "--negative-prompt",
         default=None,
         help="negative prompt for classifier-free conditional guidance.",
     )
-    parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
+    parser.add_argument(
+        "--seed", type=int, default=142, help="Random seed for deterministic results."
+    )
     parser.add_argument(
         "--cfg-scale",
         type=float,
@@ -58,8 +66,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Classifier-free guidance scale.",
     )
-    parser.add_argument("--height", type=int, default=1024, help="Height of generated image.")
-    parser.add_argument("--width", type=int, default=1024, help="Width of generated image.")
+    parser.add_argument(
+        "--height", type=int, default=1024, help="Height of generated image."
+    )
+    parser.add_argument(
+        "--width", type=int, default=1024, help="Width of generated image."
+    )
     parser.add_argument(
         "--output",
         type=str,
@@ -143,7 +155,9 @@ def parse_args() -> argparse.Namespace:
         "--gguf-model",
         type=str,
         default=None,
-        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
+        help=(
+            "GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."
+        ),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -223,7 +237,9 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(
+        args.seed
+    )
     use_nextstep = is_nextstep_model(args.model)
 
     cache_config = None
@@ -278,10 +294,16 @@ def main():
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
-    ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
+    ignored_layers = (
+        [s.strip() for s in args.ignored_layers.split(",") if s.strip()]
+        if args.ignored_layers
+        else None
+    )
     if args.quantization == "gguf":
         if not args.gguf_model:
-            raise ValueError("--gguf-model is required when --quantization gguf is set.")
+            raise ValueError(
+                "--gguf-model is required when --quantization gguf is set."
+            )
         quant_kwargs["quantization_config"] = {
             "method": "gguf",
             "gguf_model": args.gguf_model,
@@ -322,8 +344,12 @@ def main():
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Cache backend: {cache_backend if cache_backend else 'None (no acceleration)'}")
-    print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
+    print(
+        f"  Cache backend: {cache_backend if cache_backend else 'None (no acceleration)'}"
+    )
+    print(
+        f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}"
+    )
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
     print(
@@ -381,7 +407,9 @@ def main():
     generation_time = generation_end - generation_start
 
     # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+    print(
+        f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)"
+    )
 
     if profiler_enabled:
         print("\n[Profiler] Stopping profiler and collecting results...")

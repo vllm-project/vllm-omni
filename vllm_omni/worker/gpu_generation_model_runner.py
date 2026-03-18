@@ -22,7 +22,10 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -85,7 +88,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors:
         if self.execute_model_state is not None:
-            raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+            raise RuntimeError(
+                "State error: sample_tokens() must be called after execute_model() returns None."
+            )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -95,7 +100,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 logger.error("RoutedExpertsCapturer not initialized.")
 
         if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(scheduler_output.preempted_req_ids)
+            get_kv_transfer_group().handle_preemptions(
+                scheduler_output.preempted_req_ids
+            )
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -118,7 +125,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
             if not num_scheduled_tokens:
                 if (
-                    self.parallel_config.distributed_executor_backend == "external_launcher"
+                    self.parallel_config.distributed_executor_backend
+                    == "external_launcher"
                     and self.parallel_config.data_parallel_size > 1
                 ):
                     # this is a corner case when both external launcher
@@ -187,7 +195,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             )
 
             num_tokens_padded = batch_desc.num_tokens
-            num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+            num_reqs_padded = (
+                batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+            )
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
                 num_scheduled_tokens_np,
@@ -213,30 +223,41 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
 
             has_separate_kv_update = not all(
-                all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+                all(
+                    g.backend.forward_includes_kv_cache_update
+                    for g in self.attn_groups[id]
+                )
                 for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
             )
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
-                num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
+                num_tokens_padded=(
+                    num_tokens_padded
+                    if pad_attn or has_separate_kv_update
+                    else num_tokens_unpadded
+                ),
+                num_reqs_padded=(
+                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
+                ),
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded if pad_attn else None,
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded if pad_attn else None,
-                max_query_len=max_num_scheduled_tokens,
-                ubatch_slices=ubatch_slices_attn,
-                logits_indices=logits_indices,
-                use_spec_decode=use_spec_decode,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                slot_mappings=slot_mappings_by_group,
+            attn_metadata, spec_decode_common_attn_metadata = (
+                self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    use_spec_decode=use_spec_decode,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    slot_mappings=slot_mappings_by_group,
+                )
             )
 
             (
@@ -357,19 +378,32 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
-            )
+            assert (
+                multimodal_outputs.shape[0] == 1
+            ), "model should return a single tensor, to return multiple tensors, use a dict"
             assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
+                pooler_output.append(
+                    {
+                        "model_outputs": multimodal_outputs[i]
+                        .detach()
+                        .to("cpu")
+                        .contiguous()
+                    }
+                )
         elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
-            )
+            assert (
+                len(multimodal_outputs) == 1
+            ), "model should return a single list, to return multiple lists, use a dict"
             for out in multimodal_outputs:
                 pooler_output.append(
-                    {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
+                    {
+                        "model_outputs": (
+                            out.detach().to("cpu").contiguous()
+                            if out is not None
+                            else None
+                        )
+                    }
                 )
         elif isinstance(multimodal_outputs, dict):
             num_reqs = self.input_batch.num_reqs
@@ -386,7 +420,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:
-                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
+                        logger.warning(
+                            f"Unsupported multimodal output type for key '{key}': {type(out)}"
+                        )
                 pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
@@ -403,7 +439,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
-            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            ec_connector_output=(
+                ec_connector_output if self.supports_mm_inputs else None
+            ),
         )
 
         if not self.use_async_scheduling:
@@ -507,7 +545,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
 
-        assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
+        assert (
+            cudagraph_runtime_mode is None
+            or cudagraph_runtime_mode.valid_runtime_modes()
+        )
 
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
@@ -568,7 +609,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 max_num_scheduled_tokens=max_query_len,
                 use_cascade_attn=False,
                 allow_microbatching=allow_microbatching,
-                force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
+                force_eager=is_profile
+                or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
                 # `force_uniform_decode` is used for cudagraph capture; because for
                 # capturing mixed prefill-decode batches, we sometimes use
                 # num_tokens == num_reqs which looks like a uniform decode batch to the
@@ -593,7 +635,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             )
 
         num_tokens_padded = batch_desc.num_tokens
-        num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        num_reqs_padded = (
+            batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        )
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
             num_scheduled_tokens,
@@ -680,7 +724,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # provides placeholder values of the correct shape so that the profiling
             # run does not raise an error due to missing inputs.
             if hasattr(self.model, "get_dummy_runtime_additional_information"):
-                runtime_addi = self.model.get_dummy_runtime_additional_information(num_reqs)
+                runtime_addi = self.model.get_dummy_runtime_additional_information(
+                    num_reqs
+                )
                 model_kwargs["runtime_additional_information"] = runtime_addi
 
             if self.uses_mrope:
@@ -694,13 +740,17 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 intermediate_tensors = None
             else:
                 if self.intermediate_tensors is None:
-                    self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                        batch_size=self.max_num_tokens,
-                        dtype=self.model_config.dtype,
-                        device=self.device,
+                    self.intermediate_tensors = (
+                        self.model.make_empty_intermediate_tensors(
+                            batch_size=self.max_num_tokens,
+                            dtype=self.model_config.dtype,
+                            device=self.device,
+                        )
                     )
 
-                intermediate_tensors = self.sync_and_slice_intermediate_tensors(num_tokens_padded, None, False)
+                intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                    num_tokens_padded, None, False
+                )
 
             if ubatch_slices_padded is not None:
                 # Adjust values to reflect a single ubatch.
@@ -735,7 +785,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
+                hidden_states
+            )
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
@@ -750,15 +802,24 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 # Therefore only use cudagraphs if the main model uses PIECEWISE
                 # NOTE(lucas): this is a hack, need to clean up.
                 use_cudagraphs = (
-                    (is_graph_capturing and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE)
-                    or (not is_graph_capturing and cudagraph_runtime_mode != CUDAGraphMode.NONE)
+                    (
+                        is_graph_capturing
+                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+                    )
+                    or (
+                        not is_graph_capturing
+                        and cudagraph_runtime_mode != CUDAGraphMode.NONE
+                    )
                 ) and not self.speculative_config.enforce_eager
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
                 # short term mitigation for issue mentioned in
                 # https://github.com/vllm-project/vllm/issues/28334
-                if self.compilation_config.cudagraph_specialize_lora and num_active_loras > 0:
+                if (
+                    self.compilation_config.cudagraph_specialize_lora
+                    and num_active_loras > 0
+                ):
                     use_cudagraphs = False
 
                 self.drafter.dummy_run(
@@ -796,7 +857,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and mm_config.skip_mm_profiling:
-                logger.info("Skipping memory profiling for multimodal encoder and encoder cache.")
+                logger.info(
+                    "Skipping memory profiling for multimodal encoder and encoder cache."
+                )
             else:
                 mm_budget = self.mm_budget
                 assert mm_budget is not None
@@ -816,7 +879,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                         # modality with the max possible input tokens even when
                         # it supports multiple.
                         dummy_modality = mm_budget.get_modality_with_max_tokens()
-                        max_mm_items_per_batch = mm_budget.mm_max_items_per_batch[dummy_modality]
+                        max_mm_items_per_batch = mm_budget.mm_max_items_per_batch[
+                            dummy_modality
+                        ]
 
                         logger.info(
                             "Encoder cache will be initialized with a budget of "
@@ -834,7 +899,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                         )
 
                         # Run multimodal encoder.
-                        dummy_encoder_outputs = self.model.embed_multimodal(**batched_dummy_mm_inputs)
+                        dummy_encoder_outputs = self.model.embed_multimodal(
+                            **batched_dummy_mm_inputs
+                        )
 
                         sanity_check_mm_encoder_outputs(
                             dummy_encoder_outputs,

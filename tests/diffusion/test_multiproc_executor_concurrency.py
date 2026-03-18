@@ -47,7 +47,9 @@ def _make_scheduler():
     mock_mq.enqueue = req_q.put
 
     mock_rmq = Mock()
-    mock_rmq.dequeue = lambda timeout=None: res_q.get(timeout=timeout if timeout else 10)
+    mock_rmq.dequeue = lambda timeout=None: res_q.get(
+        timeout=timeout if timeout else 10
+    )
 
     sched.mq = mock_mq
     sched.result_mq = mock_rmq

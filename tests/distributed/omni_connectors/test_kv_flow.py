@@ -85,7 +85,9 @@ def test_manager_extraction(kv_config, mock_connector, common_constants):
     # Mock the connector factory or injection
     manager._connector = mock_connector
 
-    processed = manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, block_size, "float32")
+    processed = manager.handle_finished_requests_kv_transfer(
+        finished_reqs, kv_caches, block_size, "float32"
+    )
 
     assert req_id in processed
 
@@ -128,7 +130,9 @@ def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_const
     manager = OmniKVTransferManager(kv_config)
     manager._connector = mock_connector
 
-    processed = manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, block_size, "float32")
+    processed = manager.handle_finished_requests_kv_transfer(
+        finished_reqs, kv_caches, block_size, "float32"
+    )
     assert req_id in processed
 
     full_request_id = f"omni_stage1_to_stage2_kv_cache_{req_id}"
@@ -142,7 +146,9 @@ def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_const
         assert data["layer_blocks"]["value_cache"][idx].shape == expected_shape
 
 
-def test_manager_extraction_mismatched_kv_block_counts(kv_config, mock_connector, common_constants):
+def test_manager_extraction_mismatched_kv_block_counts(
+    kv_config, mock_connector, common_constants
+):
     """Mismatched key/value block counts should not crash extraction."""
     block_size = common_constants["block_size"]
     num_heads = common_constants["num_heads"]
@@ -158,7 +164,9 @@ def test_manager_extraction_mismatched_kv_block_counts(kv_config, mock_connector
     manager = OmniKVTransferManager(kv_config)
     manager._connector = mock_connector
 
-    processed = manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, block_size, "float32")
+    processed = manager.handle_finished_requests_kv_transfer(
+        finished_reqs, kv_caches, block_size, "float32"
+    )
     assert req_id in processed
 
     full_request_id = f"omni_stage1_to_stage2_kv_cache_{req_id}"
@@ -175,7 +183,9 @@ def test_manager_extraction_mismatched_kv_block_counts(kv_config, mock_connector
     "invalid_case",
     ["invalid_stacked_shape", "invalid_tuple_length", "non_tensor_entries"],
 )
-def test_normalize_layer_kv_rejects_invalid_inputs(kv_config, common_constants, invalid_case):
+def test_normalize_layer_kv_rejects_invalid_inputs(
+    kv_config, common_constants, invalid_case
+):
     """_normalize_layer_kv should reject malformed KV representations."""
     block_size = common_constants["block_size"]
     num_heads = common_constants["num_heads"]
@@ -263,7 +273,10 @@ def test_integration_flow(common_constants):
     req_id = common_constants["req_id"]
 
     sender_config = OmniKVCacheConfig(
-        connector_config={"type": "mock"}, from_stage="sender", to_stage="receiver", need_send_cache=True
+        connector_config={"type": "mock"},
+        from_stage="sender",
+        to_stage="receiver",
+        need_send_cache=True,
     )
     sender_manager = OmniKVTransferManager(sender_config)
     connector = MockConnector()
@@ -279,7 +292,9 @@ def test_integration_flow(common_constants):
     finished_reqs = {req_id: {"block_ids": [0, 1], "seq_len": 10}}
 
     # Send
-    sender_manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, block_size, "float32")
+    sender_manager.handle_finished_requests_kv_transfer(
+        finished_reqs, kv_caches, block_size, "float32"
+    )
 
     receiver_config = OmniKVCacheConfig(
         connector_config={"type": "mock"},

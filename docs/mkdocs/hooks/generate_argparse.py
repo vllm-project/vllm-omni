@@ -114,7 +114,9 @@ def extract_omni_serve_subparser_init():
                     dummy_subparsers = DummySubparsers()
                     # Provide globals for exec
                     # Extract DESCRIPTION from the source file (assume it's a triple-quoted string at the top)
-                    m = re.search(r'DESCRIPTION\s*=\s*([ru]?""".*?""")', source, re.DOTALL)
+                    m = re.search(
+                        r'DESCRIPTION\s*=\s*([ru]?""".*?""")', source, re.DOTALL
+                    )
                     DESCRIPTION = m.group(1)[3:-3] if m else ""
                     exec_globals = {
                         "_FlexibleArgumentParser": _FlexibleArgumentParser,
@@ -142,7 +144,11 @@ def extract_omni_serve_subparser_init():
     raise RuntimeError("Could not statically extract OmniServeCommand.subparser_init")
 
 
-OmniServeCommand = type("OmniServeCommand", (), {"subparser_init": staticmethod(extract_omni_serve_subparser_init())})
+OmniServeCommand = type(
+    "OmniServeCommand",
+    (),
+    {"subparser_init": staticmethod(extract_omni_serve_subparser_init())},
+)
 
 
 class MarkdownFormatter(HelpFormatter):

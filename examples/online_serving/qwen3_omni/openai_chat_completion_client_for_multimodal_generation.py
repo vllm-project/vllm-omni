@@ -167,7 +167,8 @@ def get_system_prompt():
 
 def get_text_query(custom_prompt: str | None = None):
     question = (
-        custom_prompt or "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words."
+        custom_prompt
+        or "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words."
     )
     prompt = {
         "role": "user",
@@ -257,7 +258,8 @@ def get_mixed_modalities_query(
     - Returns the OpenAI-style message dict directly (not the offline QueryResult).
     """
     question = (
-        custom_prompt or "What is recited in the audio? What is the content of this image? Why is this video funny?"
+        custom_prompt
+        or "What is recited in the audio? What is the content of this image? Why is this video funny?"
     )
 
     audio_url = get_audio_url_from_path(audio_path)
@@ -412,7 +414,9 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
     # Test multiple concurrent completions
     num_concurrent_requests = args.num_concurrent_requests
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=num_concurrent_requests
+    ) as executor:
         # Submit multiple completion requests concurrently
         futures = [
             executor.submit(
@@ -430,7 +434,9 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
         ]
 
         # Wait for all requests to complete and collect results
-        chat_completions = [future.result() for future in concurrent.futures.as_completed(futures)]
+        chat_completions = [
+            future.result() for future in concurrent.futures.as_completed(futures)
+        ]
 
     assert len(chat_completions) == num_concurrent_requests
     count = 0
@@ -473,7 +479,9 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = FlexibleArgumentParser(
+        description="Demo on using vLLM for offline inference with audio language models"
+    )
     parser.add_argument(
         "--query-type",
         "-q",

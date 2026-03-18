@@ -116,7 +116,10 @@ class FakeAsyncOmni:
 
     def __init__(self):
         self.stage_list = ["llm", "diffusion"]
-        self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
+        self.default_sampling_params_list = [
+            SamplingParams(temperature=0.1),
+            OmniDiffusionSamplingParams(),
+        ]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
 
@@ -353,9 +356,9 @@ def test_with_seed_zero(test_client):
     engine = test_client.app.state.engine_client
     captured = engine.captured_sampling_params_list[0]
     # Verify that seed=0 is correctly passed
-    assert captured.seed == 0, (
-        f"Expected seed=0, but got seed={captured.seed}. This indicates the bug where seed=0 is treated as falsy."
-    )
+    assert (
+        captured.seed == 0
+    ), f"Expected seed=0, but got seed={captured.seed}. This indicates the bug where seed=0 is treated as falsy."
 
 
 def test_with_custom_parameters(test_client):
@@ -754,7 +757,11 @@ def test_image_edit_compression_jpeg(test_client):
     response = test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes_1)],
-        data={"prompt": "hello world.", "output_format": "jpeg", "output_compression": 100},
+        data={
+            "prompt": "hello world.",
+            "output_format": "jpeg",
+            "output_compression": 100,
+        },
     )
     assert response.status_code == 200
     data = response.json()
@@ -798,7 +805,11 @@ def test_image_edit_compression_png(async_omni_test_client):
     response = async_omni_test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes_1)],
-        data={"prompt": "hello world.", "output_format": "PNG", "output_compression": 100},
+        data={
+            "prompt": "hello world.",
+            "output_format": "PNG",
+            "output_compression": 100,
+        },
     )
     assert response.status_code == 200
     data = response.json()

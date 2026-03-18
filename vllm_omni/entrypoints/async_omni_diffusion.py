@@ -79,7 +79,9 @@ class AsyncOmniDiffusion:
         if stage_id is not None:
             self.od_config.omni_kv_config.setdefault("stage_id", stage_id)
         if engine_input_source is not None:
-            self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
+            self.od_config.omni_kv_config.setdefault(
+                "engine_input_source", engine_input_source
+            )
 
         # Diffusers-style models expose `model_index.json` with `_class_name`.
         # Non-diffusers models (e.g. Bagel, NextStep) only have `config.json`,
@@ -91,20 +93,27 @@ class AsyncOmniDiffusion:
                     od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
 
-                tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
+                tf_config_dict = get_hf_file_to_dict(
+                    "transformer/config.json", od_config.model
+                )
                 od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             cfg = get_hf_file_to_dict("config.json", od_config.model)
             if cfg is None:
-                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+                raise ValueError(
+                    f"Could not find config.json or model_index.json for model {od_config.model}"
+                )
 
             od_config.tf_model_config = TransformerConfig.from_dict(cfg)
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
             # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
-            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+            if (
+                model_type == "bagel"
+                or "BagelForConditionalGeneration" in architectures
+            ):
                 od_config.model_class_name = "BagelPipeline"
                 od_config.tf_model_config = TransformerConfig()
                 od_config.update_multimodal_support()

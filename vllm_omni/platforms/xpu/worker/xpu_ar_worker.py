@@ -12,4 +12,6 @@ class XPUARWorker(OmniWorkerMixin, XPUWorker):
 
     def init_device(self):
         super().init_device()
-        self.model_runner: XPUARModelRunner = XPUARModelRunner(self.vllm_config, self.device)
+        self.model_runner: XPUARModelRunner = XPUARModelRunner(
+            self.vllm_config, self.device
+        )

@@ -48,7 +48,12 @@ import zmq
 
 # Add parent path for imports
 sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+    0,
+    os.path.dirname(
+        os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+    ),
 )
 
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
@@ -111,7 +116,9 @@ class TransferStats:
     def print_summary(self, role: str):
         print(f"\n{'=' * 60}")
         print(f" {role.upper()} SUMMARY")
-        print(f"  Successful: {self.success_count}/{self.success_count + self.fail_count}")
+        print(
+            f"  Successful: {self.success_count}/{self.success_count + self.fail_count}"
+        )
         print(f"  Failed:     {self.fail_count}/{self.success_count + self.fail_count}")
         print(f"  Total:      {self.total_bytes / (1024 * 1024):.2f} MB")
         print(f"  Time:       {self.elapsed_time:.2f} s")
@@ -161,7 +168,9 @@ class CrossNodeTester(ABC):
         conn_config = self.get_connector_config()
         self.connector = MooncakeTransferEngineConnector(conn_config)
         self.zmq_ctx = zmq.Context()
-        print(f"[{self.role}] Ready at {self.config.local_host}:{self.config.local_port}")
+        print(
+            f"[{self.role}] Ready at {self.config.local_host}:{self.config.local_port}"
+        )
 
     def cleanup(self):
         """Cleanup resources."""
@@ -232,14 +241,18 @@ class Producer(CrossNodeTester):
         if self.config.mode == "zerocopy":
             # Zero-Copy Path: Allocate directly from connector's pool
             offset = self.connector.allocator.alloc(data_size)
-            managed_buf = ManagedBuffer(self.connector.allocator, offset, data_size, self.connector.pool)
+            managed_buf = ManagedBuffer(
+                self.connector.allocator, offset, data_size, self.connector.pool
+            )
 
             if self.config.benchmark:
                 # In benchmark mode, skip random data generation (use uninitialized memory)
                 return managed_buf, "", data_size
             else:
                 # Fill buffer with random data using tensor view
-                tensor_view = managed_buf.as_tensor(dtype=torch.float32, shape=(num_elements,))
+                tensor_view = managed_buf.as_tensor(
+                    dtype=torch.float32, shape=(num_elements,)
+                )
                 random_data = torch.randn(num_elements, dtype=torch.float32)
                 if tensor_view.is_cuda:
                     tensor_view.copy_(random_data.to(tensor_view.device))
@@ -253,7 +266,9 @@ class Producer(CrossNodeTester):
             device = f"cuda:{self.config.gpu_id}"
             if self.config.benchmark:
                 # In benchmark mode, use empty tensor (no random generation)
-                gpu_tensor = torch.empty(num_elements, dtype=torch.float32, device=device)
+                gpu_tensor = torch.empty(
+                    num_elements, dtype=torch.float32, device=device
+                )
                 return gpu_tensor, "", data_size
             else:
                 cpu_tensor = torch.randn(num_elements, dtype=torch.float32)
@@ -277,7 +292,9 @@ class Producer(CrossNodeTester):
         req_id = f"cross_node_transfer_{transfer_idx}"
 
         if not self.config.benchmark:
-            print(f"\n[PRODUCER] Transfer {transfer_idx + 1}/{self.config.num_transfers}")
+            print(
+                f"\n[PRODUCER] Transfer {transfer_idx + 1}/{self.config.num_transfers}"
+            )
 
         # Create test data
         t0 = time.time()
@@ -293,7 +310,9 @@ class Producer(CrossNodeTester):
 
         # Put data
         t1 = time.time()
-        success, size, metadata = self.connector.put("producer", "consumer", req_id, data)
+        success, size, metadata = self.connector.put(
+            "producer", "consumer", req_id, data
+        )
         t_put = time.time() - t1
 
         if not success:
@@ -366,8 +385,12 @@ class Producer(CrossNodeTester):
                 self.do_transfer(i)
                 if self.config.benchmark and (i + 1) % 10 == 0:
                     elapsed = time.time() - start_time
-                    current_throughput = (self.stats.total_bytes / (1024 * 1024)) / elapsed
-                    print(f"  Progress: {i + 1}/{self.config.num_transfers}, Throughput: {current_throughput:.2f} MB/s")
+                    current_throughput = (
+                        self.stats.total_bytes / (1024 * 1024)
+                    ) / elapsed
+                    print(
+                        f"  Progress: {i + 1}/{self.config.num_transfers}, Throughput: {current_throughput:.2f} MB/s"
+                    )
 
             self.stats.elapsed_time = time.time() - start_time
             self.stats.print_summary("PRODUCER")
@@ -419,7 +442,9 @@ class Consumer(CrossNodeTester):
     def do_transfer(self, transfer_idx: int) -> bool:
         """Perform a single transfer."""
         if not self.config.benchmark:
-            print(f"\n[CONSUMER] Transfer {transfer_idx + 1}/{self.config.num_transfers}")
+            print(
+                f"\n[CONSUMER] Transfer {transfer_idx + 1}/{self.config.num_transfers}"
+            )
 
         # Request next transfer info
         self.ctrl_socket.send(msgspec.msgpack.encode(CtrlMsg(msg_type="READY")))
@@ -457,7 +482,9 @@ class Consumer(CrossNodeTester):
         }
 
         if not self.config.benchmark:
-            print(f"  [INFO] Requesting from {self.config.remote_host}:{self.config.remote_port}")
+            print(
+                f"  [INFO] Requesting from {self.config.remote_host}:{self.config.remote_port}"
+            )
 
         # Get data with timing
         t0 = time.time()
@@ -469,7 +496,9 @@ class Consumer(CrossNodeTester):
         if result is not None:
             recv_buffer, recv_size = result
             if not self.config.benchmark:
-                print(f"  [OK] Get successful, {recv_size} bytes ({t_get * 1000:.1f} ms)")
+                print(
+                    f"  [OK] Get successful, {recv_size} bytes ({t_get * 1000:.1f} ms)"
+                )
 
             if isinstance(recv_buffer, ManagedBuffer):
                 # In benchmark mode, skip MD5 verification
@@ -480,7 +509,9 @@ class Consumer(CrossNodeTester):
                 else:
                     # Verify data
                     t1 = time.time()
-                    reconstructed = recv_buffer.as_tensor(dtype=torch.float32, shape=(num_elements,))
+                    reconstructed = recv_buffer.as_tensor(
+                        dtype=torch.float32, shape=(num_elements,)
+                    )
                     recv_md5 = compute_md5(reconstructed)
                     t_md5 = time.time() - t1
                     print(f"  MD5: {recv_md5[:16]}... ({t_md5 * 1000:.1f} ms)")
@@ -534,8 +565,12 @@ class Consumer(CrossNodeTester):
                     break
                 if self.config.benchmark and (i + 1) % 10 == 0:
                     elapsed = time.time() - start_time
-                    current_throughput = (self.stats.total_bytes / (1024 * 1024)) / elapsed
-                    print(f"  Progress: {i + 1}/{self.config.num_transfers}, Throughput: {current_throughput:.2f} MB/s")
+                    current_throughput = (
+                        self.stats.total_bytes / (1024 * 1024)
+                    ) / elapsed
+                    print(
+                        f"  Progress: {i + 1}/{self.config.num_transfers}, Throughput: {current_throughput:.2f} MB/s"
+                    )
 
             self.stats.elapsed_time = time.time() - start_time
             self.stats.print_summary("CONSUMER")
@@ -581,24 +616,60 @@ Examples:
     )
 
     parser.add_argument(
-        "--role", required=True, choices=["producer", "consumer"], help="Role: producer (sends) or consumer (receives)"
+        "--role",
+        required=True,
+        choices=["producer", "consumer"],
+        help="Role: producer (sends) or consumer (receives)",
     )
-    parser.add_argument("--local-host", required=True, help="Local hostname or IP address")
-    parser.add_argument("--remote-host", required=True, help="Remote hostname or IP address")
-    parser.add_argument("--local-port", type=int, default=15500, help="Local ZMQ port for RDMA data (default: 15500)")
-    parser.add_argument("--remote-port", type=int, default=15500, help="Remote ZMQ port for RDMA data (default: 15500)")
-    parser.add_argument("--ctrl-port", type=int, default=15501, help="Control channel port (default: 15501)")
-    parser.add_argument("--num-transfers", type=int, default=20, help="Number of transfers to perform (default: 3)")
-    parser.add_argument("--tensor-size-mb", type=int, default=100, help="Tensor size in MB (default: 100)")
+    parser.add_argument(
+        "--local-host", required=True, help="Local hostname or IP address"
+    )
+    parser.add_argument(
+        "--remote-host", required=True, help="Remote hostname or IP address"
+    )
+    parser.add_argument(
+        "--local-port",
+        type=int,
+        default=15500,
+        help="Local ZMQ port for RDMA data (default: 15500)",
+    )
+    parser.add_argument(
+        "--remote-port",
+        type=int,
+        default=15500,
+        help="Remote ZMQ port for RDMA data (default: 15500)",
+    )
+    parser.add_argument(
+        "--ctrl-port",
+        type=int,
+        default=15501,
+        help="Control channel port (default: 15501)",
+    )
+    parser.add_argument(
+        "--num-transfers",
+        type=int,
+        default=20,
+        help="Number of transfers to perform (default: 3)",
+    )
+    parser.add_argument(
+        "--tensor-size-mb",
+        type=int,
+        default=100,
+        help="Tensor size in MB (default: 100)",
+    )
     parser.add_argument(
         "--mode",
         choices=["copy", "zerocopy", "gpu"],
         default="copy",
         help="Transfer mode: copy, zerocopy, or gpu (default: copy)",
     )
-    parser.add_argument("--gpu-id", type=int, default=0, help="GPU ID for GPU mode (default: 0)")
     parser.add_argument(
-        "--benchmark", action="store_true", help="Benchmark mode: skip MD5 verification for pure performance test"
+        "--gpu-id", type=int, default=0, help="GPU ID for GPU mode (default: 0)"
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Benchmark mode: skip MD5 verification for pure performance test",
     )
 
     args = parser.parse_args()
@@ -615,9 +686,13 @@ Examples:
             print("[ERROR] CUDA is not available but GPU mode was requested.")
             sys.exit(1)
         if args.gpu_id >= torch.cuda.device_count():
-            print(f"[ERROR] GPU {args.gpu_id} not available. Found {torch.cuda.device_count()} GPUs.")
+            print(
+                f"[ERROR] GPU {args.gpu_id} not available. Found {torch.cuda.device_count()} GPUs."
+            )
             sys.exit(1)
-        print(f"[INFO] Using GPU {args.gpu_id}: {torch.cuda.get_device_name(args.gpu_id)}")
+        print(
+            f"[INFO] Using GPU {args.gpu_id}: {torch.cuda.get_device_name(args.gpu_id)}"
+        )
 
     config = TransferConfig(
         local_host=args.local_host,

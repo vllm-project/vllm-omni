@@ -31,7 +31,9 @@ from transformers import AutoModel, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import (
+    DistributedAutoencoderKL,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
@@ -57,7 +59,11 @@ def get_post_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+        vae_scale_factor = (
+            2 ** (len(vae_config["block_out_channels"]) - 1)
+            if "block_out_channels" in vae_config
+            else 8
+        )
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -116,9 +122,13 @@ def retrieve_timesteps(
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+        raise ValueError(
+            "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
+        )
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accepts_timesteps = "timesteps" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -128,7 +138,9 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accept_sigmas = "sigmas" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -177,13 +189,17 @@ class ZImagePipeline(nn.Module):
         # Get vLLM quantization config for linear layers
         quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
         self.transformer = ZImageTransformer2DModel(quant_config=quant_config)
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model, subfolder="tokenizer", local_files_only=local_files_only
+        )
 
         # Note: Context parallelism is applied centrally in registry.initialize_model()
         # following diffusers' pattern of enable_parallelism() at model loading time
 
         self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if hasattr(self, "vae") and self.vae is not None
+            else 8
         )
 
     def encode_prompt(
@@ -208,7 +224,11 @@ class ZImagePipeline(nn.Module):
             if negative_prompt is None:
                 negative_prompt = ["" for _ in prompt]
             else:
-                negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+                negative_prompt = (
+                    [negative_prompt]
+                    if isinstance(negative_prompt, str)
+                    else negative_prompt
+                )
             assert len(prompt) == len(negative_prompt)
             negative_prompt_embeds = self._encode_prompt(
                 prompt=negative_prompt,
@@ -288,10 +308,14 @@ class ZImagePipeline(nn.Module):
         shape = (batch_size, num_channels_latents, height, width)
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = randn_tensor(
+                shape, generator=generator, device=device, dtype=dtype
+            )
         else:
             if latents.shape != shape:
-                raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {shape}")
+                raise ValueError(
+                    f"Unexpected latents shape, got {latents.shape}, expected {shape}"
+                )
             latents = latents.to(device)
         return latents
 
@@ -418,20 +442,33 @@ class ZImagePipeline(nn.Module):
         """
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+        prompt = [
+            p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts
+        ] or prompt
+        if all(
+            isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts
+        ):
             negative_prompt = None
         elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+            negative_prompt = [
+                "" if isinstance(p, str) else (p.get("negative_prompt") or "")
+                for p in req.prompts
+            ]
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         generator = req.sampling_params.generator
         sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        max_sequence_length = (
+            req.sampling_params.max_sequence_length or max_sequence_length
+        )
         guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_rescale is not None else guidance_scale
+            req.sampling_params.guidance_scale
+            if req.sampling_params.guidance_rescale is not None
+            else guidance_scale
         )
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
@@ -503,9 +540,15 @@ class ZImagePipeline(nn.Module):
 
         # Repeat prompt_embeds for num_images_per_prompt
         if num_images_per_prompt > 1:
-            prompt_embeds = [pe for pe in prompt_embeds for _ in range(num_images_per_prompt)]
+            prompt_embeds = [
+                pe for pe in prompt_embeds for _ in range(num_images_per_prompt)
+            ]
             if self.do_classifier_free_guidance and negative_prompt_embeds:
-                negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
+                negative_prompt_embeds = [
+                    npe
+                    for npe in negative_prompt_embeds
+                    for _ in range(num_images_per_prompt)
+                ]
 
         actual_batch_size = batch_size * num_images_per_prompt
         image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
@@ -527,14 +570,18 @@ class ZImagePipeline(nn.Module):
             sigmas=sigmas,
             **scheduler_kwargs,
         )
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        num_warmup_steps = max(
+            len(timesteps) - num_inference_steps * self.scheduler.order, 0
+        )
         self._num_timesteps = len(timesteps)
 
         # Precompute normalized timesteps once to avoid per-step GPU->CPU sync (.item() causes cudaStreamSynchronize)
         if isinstance(timesteps, torch.Tensor):
             timesteps_tensor = timesteps.to(device=device, dtype=torch.float32)
         else:
-            timesteps_tensor = torch.as_tensor(timesteps, device=device, dtype=torch.float32)
+            timesteps_tensor = torch.as_tensor(
+                timesteps, device=device, dtype=torch.float32
+            )
         norm_timesteps = (1000 - timesteps_tensor) / 1000
         t_norm_list = norm_timesteps.cpu().tolist()
         if not isinstance(t_norm_list, list):
@@ -603,7 +650,9 @@ class ZImagePipeline(nn.Module):
                         max_new_norm = ori_pos_norm * float(self._cfg_normalization)
                         scale = torch.where(
                             new_pos_norm > max_new_norm,
-                            (max_new_norm / new_pos_norm.clamp(min=1e-12)).to(pred.dtype),
+                            (max_new_norm / new_pos_norm.clamp(min=1e-12)).to(
+                                pred.dtype
+                            ),
                             pred.new_tensor(1.0),
                         )
                         pred = pred * scale
@@ -618,7 +667,9 @@ class ZImagePipeline(nn.Module):
             noise_pred = -noise_pred
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
+            latents = self.scheduler.step(
+                noise_pred.to(torch.float32), t, latents, return_dict=False
+            )[0]
             assert latents.dtype == torch.float32
 
             if callback_on_step_end is not None:
@@ -629,13 +680,17 @@ class ZImagePipeline(nn.Module):
 
                 latents = callback_outputs.pop("latents", latents)
                 prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                negative_prompt_embeds = callback_outputs.pop(
+                    "negative_prompt_embeds", negative_prompt_embeds
+                )
 
         if output_type == "latent":
             image = latents
         else:
             latents = latents.to(self.vae.dtype)
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            latents = (
+                latents / self.vae.config.scaling_factor
+            ) + self.vae.config.shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
             # image = self.image_processor.postprocess(image, output_type=output_type)
@@ -647,5 +702,7 @@ class ZImagePipeline(nn.Module):
         loaded_weights = loader.load_weights(weights)
         # Record components loaded by diffusers submodules to satisfy strict checks.
         loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
-        loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
+        loaded_weights |= {
+            f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()
+        }
         return loaded_weights

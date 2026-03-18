@@ -22,7 +22,9 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
         return frame.to(torch.long).reshape(-1)
     if audio_codes.ndim == 1:
         return audio_codes.to(torch.long).reshape(-1)
-    raise ValueError(f"Invalid audio_codes shape for Fish Speech async_chunk: {tuple(audio_codes.shape)}")
+    raise ValueError(
+        f"Invalid audio_codes shape for Fish Speech async_chunk: {tuple(audio_codes.shape)}"
+    )
 
 
 def slow_ar_to_dac_decoder(
@@ -33,7 +35,9 @@ def slow_ar_to_dac_decoder(
 ) -> list[Any]:
     """Non-async processor: wait for Slow AR to finish, then pass all codes to DAC decoder."""
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
+    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+        _validate_stage_inputs,
+    )
 
     slow_ar_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     dac_inputs: list[OmniTokensPrompt] = []
@@ -131,7 +135,11 @@ def slow_ar_to_dac_decoder_async_chunk(
         left_context_size = max(0, length - context_length)
         window_frames = transfer_manager.code_prompt_token_ids[request_id][:length]
     else:
-        initial_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size if initial_chunk_size > 0 else 0
+        initial_coverage = (
+            (chunk_size // initial_chunk_size) * initial_chunk_size
+            if initial_chunk_size > 0
+            else 0
+        )
         adjusted = length - initial_coverage
         chunk_length = adjusted % chunk_size
         if chunk_length != 0 and not finished:
@@ -142,7 +150,9 @@ def slow_ar_to_dac_decoder_async_chunk(
         window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack into codebook-major flat codes.
-    code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    code_predictor_codes = (
+        torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    )
 
     return {
         "code_predictor_codes": code_predictor_codes,

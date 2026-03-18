@@ -92,7 +92,9 @@ def load_video_as_tensor(video_path: str, height: int, width: int) -> torch.Tens
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video with Helios (T2V / I2V / V2V).")
+    parser = argparse.ArgumentParser(
+        description="Generate a video with Helios (T2V / I2V / V2V)."
+    )
     parser.add_argument(
         "--model",
         default="BestWishYsh/Helios-Base",
@@ -104,7 +106,11 @@ def parse_args() -> argparse.Namespace:
         default="t2v",
         help="Generation mode: t2v (text-to-video), i2v (image-to-video), v2v (video-to-video).",
     )
-    parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
+    parser.add_argument(
+        "--prompt",
+        default="A serene lakeside sunrise with mist over the water.",
+        help="Text prompt.",
+    )
     parser.add_argument(
         "--negative-prompt",
         default=(
@@ -120,14 +126,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG scale.")
     parser.add_argument("--height", type=int, default=384, help="Video height.")
     parser.add_argument("--width", type=int, default=640, help="Video width.")
-    parser.add_argument("--num-frames", type=int, default=99, help="Number of video frames.")
-    parser.add_argument("--num-inference-steps", type=int, default=50, help="Sampling steps (Stage 1 only).")
-    parser.add_argument("--output", type=str, default="helios_output.mp4", help="Output video path.")
-    parser.add_argument("--fps", type=int, default=16, help="Frames per second for the output video.")
+    parser.add_argument(
+        "--num-frames", type=int, default=99, help="Number of video frames."
+    )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=50,
+        help="Sampling steps (Stage 1 only).",
+    )
+    parser.add_argument(
+        "--output", type=str, default="helios_output.mp4", help="Output video path."
+    )
+    parser.add_argument(
+        "--fps", type=int, default=16, help="Frames per second for the output video."
+    )
 
     # I2V / V2V
-    parser.add_argument("--image-path", type=str, default=None, help="Input image path for I2V mode.")
-    parser.add_argument("--video-path", type=str, default=None, help="Input video path for V2V mode.")
+    parser.add_argument(
+        "--image-path", type=str, default=None, help="Input image path for I2V mode."
+    )
+    parser.add_argument(
+        "--video-path", type=str, default=None, help="Input video path for V2V mode."
+    )
 
     # Stage 2 (pyramid multi-stage denoising)
     parser.add_argument(
@@ -175,22 +196,46 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Memory & parallelism
-    parser.add_argument("--vae-use-slicing", action="store_true", help="Enable VAE slicing.")
-    parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
-    parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
-    parser.add_argument("--enable-cpu-offload", action="store_true", help="Enable CPU offloading.")
-    parser.add_argument("--enable-layerwise-offload", action="store_true", help="Enable layerwise offloading.")
-    parser.add_argument("--ulysses-degree", type=int, default=1, help="Ulysses SP degree.")
+    parser.add_argument(
+        "--vae-use-slicing", action="store_true", help="Enable VAE slicing."
+    )
+    parser.add_argument(
+        "--vae-use-tiling", action="store_true", help="Enable VAE tiling."
+    )
+    parser.add_argument(
+        "--enforce-eager", action="store_true", help="Disable torch.compile."
+    )
+    parser.add_argument(
+        "--enable-cpu-offload", action="store_true", help="Enable CPU offloading."
+    )
+    parser.add_argument(
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Enable layerwise offloading.",
+    )
+    parser.add_argument(
+        "--ulysses-degree", type=int, default=1, help="Ulysses SP degree."
+    )
     parser.add_argument("--ring-degree", type=int, default=1, help="Ring SP degree.")
-    parser.add_argument("--cfg-parallel-size", type=int, default=1, choices=[1, 2], help="CFG parallel size.")
-    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="Tensor parallelism size.")
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="CFG parallel size.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, default=1, help="Tensor parallelism size."
+    )
 
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(
+        args.seed
+    )
 
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
@@ -220,7 +265,9 @@ def main():
     if args.is_enable_stage2:
         extra_args["is_enable_stage2"] = True
         extra_args["pyramid_num_stages"] = args.pyramid_num_stages
-        extra_args["pyramid_num_inference_steps_list"] = args.pyramid_num_inference_steps_list
+        extra_args["pyramid_num_inference_steps_list"] = (
+            args.pyramid_num_inference_steps_list
+        )
     if args.is_amplify_first_chunk:
         extra_args["is_amplify_first_chunk"] = True
     if args.use_cfg_zero_star:
@@ -250,14 +297,20 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
     if args.is_enable_stage2:
-        print(f"  Stage 2: enabled (stages={args.pyramid_num_stages}, steps={args.pyramid_num_inference_steps_list})")
+        print(
+            f"  Stage 2: enabled (stages={args.pyramid_num_stages}, steps={args.pyramid_num_inference_steps_list})"
+        )
         if args.is_amplify_first_chunk:
             print("  DMD amplify first chunk: enabled")
         if args.use_cfg_zero_star:
-            print(f"  CFG Zero Star: enabled (zero_init={args.use_zero_init}, zero_steps={args.zero_steps})")
+            print(
+                f"  CFG Zero Star: enabled (zero_init={args.use_zero_init}, zero_steps={args.zero_steps})"
+            )
     else:
         if args.use_cfg_zero_star:
-            print(f"  CFG Zero Star: enabled (zero_init={args.use_zero_init}, zero_steps={args.zero_steps})")
+            print(
+                f"  CFG Zero Star: enabled (zero_init={args.use_zero_init}, zero_steps={args.zero_steps})"
+            )
         print("  Stage 2: disabled (Stage 1 only)")
     print(f"{'=' * 60}\n")
 
@@ -280,7 +333,9 @@ def main():
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+    print(
+        f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)"
+    )
 
     # Extract video frames from OmniRequestOutput
     if isinstance(frames, list) and len(frames) > 0:
@@ -292,10 +347,18 @@ def main():
                     f"Unexpected output type '{first_item.final_output_type}', expected 'image' for video generation."
                 )
 
-            if hasattr(first_item, "is_pipeline_output") and first_item.is_pipeline_output:
-                if isinstance(first_item.request_output, list) and len(first_item.request_output) > 0:
+            if (
+                hasattr(first_item, "is_pipeline_output")
+                and first_item.is_pipeline_output
+            ):
+                if (
+                    isinstance(first_item.request_output, list)
+                    and len(first_item.request_output) > 0
+                ):
                     inner_output = first_item.request_output[0]
-                    if isinstance(inner_output, OmniRequestOutput) and hasattr(inner_output, "images"):
+                    if isinstance(inner_output, OmniRequestOutput) and hasattr(
+                        inner_output, "images"
+                    ):
                         frames = inner_output.images[0] if inner_output.images else None
                         if frames is None:
                             raise ValueError("No video frames found in output.")
@@ -305,7 +368,11 @@ def main():
                 raise ValueError("No video frames found in OmniRequestOutput.")
 
     # Unwrap batch list from postprocess_video: [numpy(T,H,W,C)] -> numpy(T,H,W,C)
-    if isinstance(frames, list) and len(frames) > 0 and isinstance(frames[0], np.ndarray):
+    if (
+        isinstance(frames, list)
+        and len(frames) > 0
+        and isinstance(frames[0], np.ndarray)
+    ):
         frames = frames[0]
 
     output_path = Path(args.output)

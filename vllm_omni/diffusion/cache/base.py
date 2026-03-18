@@ -73,7 +73,9 @@ class CacheBackend(ABC):
         raise NotImplementedError("Subclasses must implement enable()")
 
     @abstractmethod
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(
+        self, pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """
         Refresh cache state for new generation.
 

@@ -43,11 +43,15 @@ def test_4d_identity(
     # Skip if not enough GPUs available
     available_gpus = current_omni_platform.get_device_count()
     if available_gpus < world_size:
-        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+        pytest.skip(
+            f"Test requires {world_size} GPUs but only {available_gpus} available"
+        )
 
     # Ensure num_heads is divisible by world_size
     if num_heads % world_size != 0:
-        pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
+        pytest.skip(
+            f"num_heads ({num_heads}) not divisible by world_size ({world_size})"
+        )
 
     # Run test with multiprocessing spawn
     torch.multiprocessing.spawn(
@@ -126,9 +130,9 @@ def _test_4d_identity_worker(
         num_heads // world_size,
         head_size,
     )
-    assert intermediate.shape == expected_shape, (
-        f"Intermediate shape mismatch: expected {expected_shape}, got {intermediate.shape}"
-    )
+    assert (
+        intermediate.shape == expected_shape
+    ), f"Intermediate shape mismatch: expected {expected_shape}, got {intermediate.shape}"
 
     # Second all-to-all: (bs, seqlen, hc/P, hs) -> (bs, seqlen/P, hc, hs)
     output = SeqAllToAll4D.apply(
@@ -140,9 +144,9 @@ def _test_4d_identity_worker(
     )
 
     # Verify output shape matches input
-    assert output.shape == original_input.shape, (
-        f"Output shape mismatch: expected {original_input.shape}, got {output.shape}"
-    )
+    assert (
+        output.shape == original_input.shape
+    ), f"Output shape mismatch: expected {original_input.shape}, got {output.shape}"
 
     # Verify output matches original input
     torch.testing.assert_close(
@@ -177,11 +181,15 @@ def test_5d_identity(
     # Skip if not enough GPUs available
     available_gpus = current_omni_platform.get_device_count()
     if available_gpus < world_size:
-        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+        pytest.skip(
+            f"Test requires {world_size} GPUs but only {available_gpus} available"
+        )
 
     # Ensure num_heads is divisible by world_size
     if num_heads % world_size != 0:
-        pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
+        pytest.skip(
+            f"num_heads ({num_heads}) not divisible by world_size ({world_size})"
+        )
 
     # Run test with multiprocessing spawn
     torch.multiprocessing.spawn(
@@ -263,9 +271,9 @@ def _test_5d_identity_worker(
         num_heads // world_size,
         head_size,
     )
-    assert intermediate.shape == expected_shape, (
-        f"Intermediate shape mismatch: expected {expected_shape}, got {intermediate.shape}"
-    )
+    assert (
+        intermediate.shape == expected_shape
+    ), f"Intermediate shape mismatch: expected {expected_shape}, got {intermediate.shape}"
 
     # Second all-to-all: (bs, seqlen, 3, hc/P, hs) -> (bs, seqlen/P, 3, hc, hs)
     output = SeqAllToAll5D.apply(
@@ -277,9 +285,9 @@ def _test_5d_identity_worker(
     )
 
     # Verify output shape matches input
-    assert output.shape == original_input.shape, (
-        f"Output shape mismatch: expected {original_input.shape}, got {output.shape}"
-    )
+    assert (
+        output.shape == original_input.shape
+    ), f"Output shape mismatch: expected {original_input.shape}, got {output.shape}"
 
     # Verify output matches original input
     torch.testing.assert_close(
@@ -310,7 +318,9 @@ def test_ring_p2p(
     # Skip if not enough GPUs available
     available_gpus = current_omni_platform.get_device_count()
     if available_gpus < world_size:
-        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+        pytest.skip(
+            f"Test requires {world_size} GPUs but only {available_gpus} available"
+        )
 
     torch.multiprocessing.spawn(
         _test_ring_p2p_worker,
@@ -353,7 +363,9 @@ def _test_ring_p2p_worker(
         initialize_model_parallel(ring_degree=world_size)
         sp_group = get_sp_group()
 
-        print(f"[Rank {local_rank}] Initialized. Ring group size: {sp_group.ring_group.size()}")
+        print(
+            f"[Rank {local_rank}] Initialized. Ring group size: {sp_group.ring_group.size()}"
+        )
         sys.stdout.flush()
 
         # Create RingComm
@@ -363,7 +375,10 @@ def _test_ring_p2p_worker(
         # (batch, num_heads, head_size)
         # Fill with rank value + 1 to avoid 0 and make verification easy
         input_tensor = torch.full(
-            (batch_size, num_heads, head_size), fill_value=float(local_rank + 1), dtype=dtype, device=device
+            (batch_size, num_heads, head_size),
+            fill_value=float(local_rank + 1),
+            dtype=dtype,
+            device=device,
         )
 
         print(f"[Rank {local_rank}] Input sum: {input_tensor.sum().item()}")
@@ -385,14 +400,20 @@ def _test_ring_p2p_worker(
         expected_value = float(prev_rank + 1)
 
         recv_sum = recv_tensor.sum().item()
-        print(f"[Rank {local_rank}] Received sum: {recv_sum}, Expected value: {expected_value}")
+        print(
+            f"[Rank {local_rank}] Received sum: {recv_sum}, Expected value: {expected_value}"
+        )
         sys.stdout.flush()
 
         expected_tensor = torch.full_like(recv_tensor, fill_value=expected_value)
 
         # Use a slightly loose tolerance for bfloat16
         torch.testing.assert_close(
-            recv_tensor, expected_tensor, rtol=1e-3, atol=1e-3, msg=f"[Rank {local_rank}] Data mismatch!"
+            recv_tensor,
+            expected_tensor,
+            rtol=1e-3,
+            atol=1e-3,
+            msg=f"[Rank {local_rank}] Data mismatch!",
         )
         print(f"[Rank {local_rank}] Verification PASSED")
 

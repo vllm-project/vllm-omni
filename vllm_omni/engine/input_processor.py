@@ -166,7 +166,9 @@ class OmniInputProcessor(InputProcessor):
         dp_local_size = parallel_config.data_parallel_size_local
         num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
         if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):
-            raise ValueError(f"data_parallel_rank {data_parallel_rank} is out of range [0, {num_ranks}).")
+            raise ValueError(
+                f"data_parallel_rank {data_parallel_rank} is out of range [0, {num_ranks})."
+            )
 
         # Short-circuit for prompts already processed by the renderer
         # (they carry a "type" key).  Raw prompts must still go through the
@@ -204,7 +206,9 @@ class OmniInputProcessor(InputProcessor):
             sampling_params = params.clone()
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
-                seq_len = length_from_prompt_token_ids_or_embeds(prompt_token_ids, prompt_embeds)
+                seq_len = length_from_prompt_token_ids_or_embeds(
+                    prompt_token_ids, prompt_embeds
+                )
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
             sampling_params.update_from_generation_config(
                 self.generation_config_fields,
@@ -223,7 +227,9 @@ class OmniInputProcessor(InputProcessor):
             decoder_mm_positions = decoder_inputs["mm_placeholders"]
             decoder_mm_hashes = decoder_inputs["mm_hashes"]
 
-            if not all(isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)):
+            if not all(
+                isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)
+            ):
                 raise ValueError(
                     f"mm_hashes must contain only strings, got: {decoder_mm_hashes}. "
                     "This is likely due to an incorrect custom implementation of "
@@ -253,7 +259,9 @@ class OmniInputProcessor(InputProcessor):
             prompt_embeds = self._decode_prompt_embeds(prompt_embeds)
 
         additional_information_payload: AdditionalInformationPayload | None = None
-        raw_info: dict[str, Any] | AdditionalInformationPayload | None = decoder_inputs.get("additional_information")
+        raw_info: dict[str, Any] | AdditionalInformationPayload | None = (
+            decoder_inputs.get("additional_information")
+        )
         if isinstance(raw_info, AdditionalInformationPayload):
             additional_information_payload = raw_info
         elif raw_info is not None:
@@ -271,9 +279,13 @@ class OmniInputProcessor(InputProcessor):
                 elif isinstance(value, list):
                     entry = AdditionalInformationEntry(list_data=value)
                 else:
-                    raise ValueError("additional_information values must be Tensor or list")
+                    raise ValueError(
+                        "additional_information values must be Tensor or list"
+                    )
                 entries[key] = entry
-            additional_information_payload = AdditionalInformationPayload(entries=entries)
+            additional_information_payload = AdditionalInformationPayload(
+                entries=entries
+            )
 
         return OmniEngineCoreRequest(
             request_id=request_id,

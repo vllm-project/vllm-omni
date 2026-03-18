@@ -23,7 +23,9 @@ The tencent/HunyuanImage-3.0-Instruct base model is built on the Hunyuan v1 arch
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate text from image using HunyuanImage-3.0-Instruct.")
+    parser = argparse.ArgumentParser(
+        description="Generate text from image using HunyuanImage-3.0-Instruct."
+    )
     parser.add_argument(
         "--model",
         default="tencent/HunyuanImage-3.0-Instruct",

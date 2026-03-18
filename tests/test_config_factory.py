@@ -140,7 +140,9 @@ class TestModelPipeline:
         """Test that missing stage reference is detected."""
         stages = [
             StageConfig(stage_id=0, model_stage="input", input_sources=[]),
-            StageConfig(stage_id=1, model_stage="output", input_sources=[99]),  # Invalid
+            StageConfig(
+                stage_id=1, model_stage="output", input_sources=[99]
+            ),  # Invalid
         ]
         pipeline = ModelPipeline(model_type="test", stages=stages)
         errors = pipeline.validate_pipeline()
@@ -150,7 +152,9 @@ class TestModelPipeline:
         """Test that duplicate stage IDs are detected."""
         stages = [
             StageConfig(stage_id=0, model_stage="stage_a", input_sources=[]),
-            StageConfig(stage_id=0, model_stage="stage_b", input_sources=[]),  # Duplicate
+            StageConfig(
+                stage_id=0, model_stage="stage_b", input_sources=[]
+            ),  # Duplicate
         ]
         pipeline = ModelPipeline(model_type="test", stages=stages)
         errors = pipeline.validate_pipeline()
@@ -560,10 +564,19 @@ class TestArchitectureFallback:
 
     def test_architecture_models_mapping_exists(self):
         """Test that _ARCHITECTURE_MODELS contains expected entries."""
-        assert "MiMoAudioForConditionalGeneration" in StageConfigFactory._ARCHITECTURE_MODELS
-        assert StageConfigFactory._ARCHITECTURE_MODELS["MiMoAudioForConditionalGeneration"] == "mimo_audio"
+        assert (
+            "MiMoAudioForConditionalGeneration"
+            in StageConfigFactory._ARCHITECTURE_MODELS
+        )
+        assert (
+            StageConfigFactory._ARCHITECTURE_MODELS["MiMoAudioForConditionalGeneration"]
+            == "mimo_audio"
+        )
         assert "HunyuanImage3ForCausalMM" in StageConfigFactory._ARCHITECTURE_MODELS
-        assert StageConfigFactory._ARCHITECTURE_MODELS["HunyuanImage3ForCausalMM"] == "hunyuan_image3"
+        assert (
+            StageConfigFactory._ARCHITECTURE_MODELS["HunyuanImage3ForCausalMM"]
+            == "hunyuan_image3"
+        )
 
     def test_mimo_audio_in_pipeline_models(self):
         """Test that mimo_audio is registered in PIPELINE_MODELS."""

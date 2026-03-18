@@ -47,7 +47,9 @@ def plot_comparison(
     n_configs = len(all_results)
 
     # Collect concurrency levels present in ALL configs (skip missing data)
-    all_concurrencies = [set(r["concurrency"] for r in results) for results in all_results]
+    all_concurrencies = [
+        set(r["concurrency"] for r in results) for results in all_results
+    ]
     concurrencies = sorted(set.union(*all_concurrencies))
 
     # Build data arrays, using None for missing concurrency levels
@@ -66,12 +68,16 @@ def plot_comparison(
             throughput_data[label].append(r["audio_throughput"] if r else None)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f"{title_prefix} Performance Benchmark", fontsize=16, fontweight="bold")
+    fig.suptitle(
+        f"{title_prefix} Performance Benchmark", fontsize=16, fontweight="bold"
+    )
 
     x = np.arange(len(concurrencies))
     width = 0.35 if n_configs == 2 else 0.5
     if n_configs > 1:
-        offsets = np.linspace(-width / 2 * (n_configs - 1), width / 2 * (n_configs - 1), n_configs)
+        offsets = np.linspace(
+            -width / 2 * (n_configs - 1), width / 2 * (n_configs - 1), n_configs
+        )
     else:
         offsets = [0]
 
@@ -83,7 +89,9 @@ def plot_comparison(
             # Replace None with 0 for plotting, but track which are missing
             plot_values = [v if v is not None else 0 for v in values]
             color = colors[i % len(colors)]
-            bar = ax.bar(x + offsets[i], plot_values, width, label=label, color=color, alpha=0.85)
+            bar = ax.bar(
+                x + offsets[i], plot_values, width, label=label, color=color, alpha=0.85
+            )
             bars.append(bar)
             # Add value labels on bars (skip None/missing data)
             max_val = max((v for v in values if v is not None), default=1)
@@ -110,7 +118,13 @@ def plot_comparison(
     plot_metric(axes[0, 0], ttfp_data, "TTFP (ms)", "Time to First Audio Packet (TTFP)")
     plot_metric(axes[0, 1], e2e_data, "E2E Latency (ms)", "End-to-End Latency (E2E)")
     plot_metric(axes[1, 0], rtf_data, "RTF", "Real-Time Factor (RTF)", fmt=".3f")
-    plot_metric(axes[1, 1], throughput_data, "Audio-sec / Wall-sec", "Audio Throughput", fmt=".2f")
+    plot_metric(
+        axes[1, 1],
+        throughput_data,
+        "Audio-sec / Wall-sec",
+        "Audio Throughput",
+        fmt=".2f",
+    )
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -215,7 +229,11 @@ def print_comparison_table(all_results: list[list[dict]], labels: list[str]):
         print(f"\n## Improvement ({labels[0]} vs {labels[1]})\n")
         print("| Metric | Concurrency | Improvement |")
         print("| --- | --- | --- |")
-        for metric, key in [("TTFP", "mean_ttfp_ms"), ("E2E", "mean_e2e_ms"), ("RTF", "mean_rtf")]:
+        for metric, key in [
+            ("TTFP", "mean_ttfp_ms"),
+            ("E2E", "mean_e2e_ms"),
+            ("RTF", "mean_rtf"),
+        ]:
             for c in concurrencies:
                 m0 = {r["concurrency"]: r for r in all_results[0]}
                 m1 = {r["concurrency"]: r for r in all_results[1]}
@@ -229,19 +247,36 @@ def print_comparison_table(all_results: list[list[dict]], labels: list[str]):
 def parse_args():
     parser = argparse.ArgumentParser(description="Plot Qwen3-TTS benchmark results")
     parser.add_argument(
-        "--results", type=str, nargs="+", required=True, help="Path(s) to result JSON files (one per config)"
+        "--results",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Path(s) to result JSON files (one per config)",
     )
     parser.add_argument(
-        "--labels", type=str, nargs="+", required=True, help="Labels for each config (must match --results count)"
+        "--labels",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Labels for each config (must match --results count)",
     )
-    parser.add_argument("--output", type=str, default="results/qwen3_tts_benchmark.png", help="Output image path")
-    parser.add_argument("--title", type=str, default="Qwen3-TTS", help="Title prefix for the plot")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="results/qwen3_tts_benchmark.png",
+        help="Output image path",
+    )
+    parser.add_argument(
+        "--title", type=str, default="Qwen3-TTS", help="Title prefix for the plot"
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    assert len(args.results) == len(args.labels), "--results and --labels must have the same count"
+    assert len(args.results) == len(
+        args.labels
+    ), "--results and --labels must have the same count"
 
     all_results = load_results(args.results)
     print_comparison_table(all_results, args.labels)

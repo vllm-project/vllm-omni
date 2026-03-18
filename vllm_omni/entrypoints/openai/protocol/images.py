@@ -41,7 +41,9 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Image dimensions in WIDTHxHEIGHT format (e.g., '1024x1024', uses model defaults if omitted)",
     )
-    response_format: ResponseFormat = Field(default=ResponseFormat.B64_JSON, description="Format of the returned image")
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.B64_JSON, description="Format of the returned image"
+    )
     user: str | None = Field(default=None, description="User identifier for tracking")
 
     @field_validator("size")
@@ -56,7 +58,9 @@ class ImageGenerationRequest(BaseModel):
             return None
         # Validate string format
         if not isinstance(v, str) or "x" not in v:
-            raise ValueError("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')")
+            raise ValueError(
+                "size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')"
+            )
         return v
 
     @field_validator("response_format")
@@ -68,7 +72,9 @@ class ImageGenerationRequest(BaseModel):
         return v
 
     # vllm-omni extensions for diffusion control
-    negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
+    negative_prompt: str | None = Field(
+        default=None, description="Text describing what to avoid in the image"
+    )
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,
@@ -87,7 +93,9 @@ class ImageGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
-    seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    seed: int | None = Field(
+        default=None, description="Random seed for reproducibility"
+    )
     generator_device: str | None = Field(
         default=None,
         description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",
@@ -106,7 +114,9 @@ class ImageGenerationRequest(BaseModel):
     )
 
     # VAE memory optimizations (set at model init, included for completeness)
-    vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
+    vae_use_slicing: bool | None = Field(
+        default=False, description="Enable VAE slicing"
+    )
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")
 
 
@@ -115,7 +125,9 @@ class ImageData(BaseModel):
 
     b64_json: str | None = Field(default=None, description="Base64-encoded PNG image")
     url: str | None = Field(default=None, description="Image URL (not implemented)")
-    revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
+    revised_prompt: str | None = Field(
+        default=None, description="Revised prompt (OpenAI compatibility, always null)"
+    )
 
 
 class ImageGenerationResponse(BaseModel):
@@ -125,7 +137,11 @@ class ImageGenerationResponse(BaseModel):
     Returns generated images with metadata.
     """
 
-    created: int = Field(..., description="Unix timestamp of when the generation completed")
+    created: int = Field(
+        ..., description="Unix timestamp of when the generation completed"
+    )
     data: list[ImageData] = Field(..., description="Array of generated images")
-    output_format: str = Field(None, description="The output format of the image generation")
+    output_format: str = Field(
+        None, description="The output format of the image generation"
+    )
     size: str = Field(None, description="The size of the image generated")

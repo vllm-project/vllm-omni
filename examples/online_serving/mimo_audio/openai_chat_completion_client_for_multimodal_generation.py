@@ -319,7 +319,11 @@ def run_multimodal_generation(args) -> None:
     # Get the query function and call it with appropriate parameters
     query_func = query_map[args.query_type]
     if args.query_type == "multi_audios":
-        prompt = query_func(audio_path=audio_path, custom_prompt=custom_prompt, message_json_path=message_json_path)
+        prompt = query_func(
+            audio_path=audio_path,
+            custom_prompt=custom_prompt,
+            message_json_path=message_json_path,
+        )
     elif args.query_type == "text":
         prompt = query_func(custom_prompt=custom_prompt)
     else:
@@ -349,8 +353,13 @@ def run_multimodal_generation(args) -> None:
             stream=args.stream,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
-        futures = [executor.submit(run_one_request, req_id) for req_id in range(num_concurrent_requests)]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=num_concurrent_requests
+    ) as executor:
+        futures = [
+            executor.submit(run_one_request, req_id)
+            for req_id in range(num_concurrent_requests)
+        ]
 
         if not args.stream:
             # Collect by req_id so chat_completions[i] = response for request i
@@ -367,11 +376,15 @@ def run_multimodal_generation(args) -> None:
                 for choice in chat_completion.choices:
                     if choice.message.audio:
                         audio_data = base64.b64decode(choice.message.audio.data)
-                        audio_file_path = f"{output_audio_path}/{args.query_type}/audio_{count}.wav"
+                        audio_file_path = (
+                            f"{output_audio_path}/{args.query_type}/audio_{count}.wav"
+                        )
                         os.makedirs(os.path.dirname(audio_file_path), exist_ok=True)
                         with open(audio_file_path, "wb") as f:
                             f.write(audio_data)
-                        print(f"[req {req_id}_{chat_completion_id}] Audio saved to {audio_file_path}")
+                        print(
+                            f"[req {req_id}_{chat_completion_id}] Audio saved to {audio_file_path}"
+                        )
                         count += 1
                     elif choice.message.content:
                         print(
@@ -394,16 +407,24 @@ def run_multimodal_generation(args) -> None:
                         chunk_queue.put((req_id, time.perf_counter(), chunk))
                     chunk_queue.put((req_id, time.perf_counter(), None))
                 except Exception as e:
-                    print(f"\n[Request {req_id}] stream error: {e}", file=sys.stderr, flush=True)
+                    print(
+                        f"\n[Request {req_id}] stream error: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     chunk_queue.put((req_id, time.time(), None))
 
             # Kick off a reader thread per request
             reader_threads = []
             for req_id, future in enumerate(futures):
                 req_id_from_future, stream = future.result()
-                assert req_id == req_id_from_future, f"Request ID mismatch: {req_id} != {req_id_from_future}"
+                assert (
+                    req_id == req_id_from_future
+                ), f"Request ID mismatch: {req_id} != {req_id_from_future}"
                 audio_counters[req_id] = 0
-                t = threading.Thread(target=_stream_reader, args=(req_id, stream), daemon=True)
+                t = threading.Thread(
+                    target=_stream_reader, args=(req_id, stream), daemon=True
+                )
                 t.start()
                 reader_threads.append(t)
 
@@ -421,7 +442,9 @@ def run_multimodal_generation(args) -> None:
                     elapsed = ts - start_time
                     print(f"  ({elapsed:.2f}s)", flush=True)
                     with chat_completion_id_lock:
-                        chat_completion_id = chat_completion_id_by_req.get(request_id, "")
+                        chat_completion_id = chat_completion_id_by_req.get(
+                            request_id, ""
+                        )
                     print(
                         f" [req {request_id}_{chat_completion_id}] Time finished for streaming: ",
                         datetime.datetime.now(),
@@ -439,15 +462,19 @@ def run_multimodal_generation(args) -> None:
                 modality = getattr(chunk, "modality", None)
                 elapsed = ts - start_time
                 for choice in chunk.choices:
-                    content = getattr(choice.delta, "content", None) if hasattr(choice, "delta") else None
+                    content = (
+                        getattr(choice.delta, "content", None)
+                        if hasattr(choice, "delta")
+                        else None
+                    )
 
                     if modality == "audio" and content:
                         audio_data = base64.b64decode(content)
-                        audio_dir = (
-                            f"{output_audio_path}/{args.query_type}/{num_concurrent_requests}/{chat_completion_id}"
-                        )
+                        audio_dir = f"{output_audio_path}/{args.query_type}/{num_concurrent_requests}/{chat_completion_id}"
                         os.makedirs(audio_dir, exist_ok=True)
-                        audio_file_path = f"{audio_dir}/audio_{audio_counters[request_id]}.wav"
+                        audio_file_path = (
+                            f"{audio_dir}/audio_{audio_counters[request_id]}.wav"
+                        )
                         with open(audio_file_path, "wb") as f:
                             f.write(audio_data)
                         print(
@@ -468,7 +495,9 @@ def run_multimodal_generation(args) -> None:
                             )
                             last_text_req_id = request_id
                         print(
-                            f"\n[{elapsed:7.2f}s][req {request_id}_{chat_completion_id}] {content}", end="", flush=True
+                            f"\n[{elapsed:7.2f}s][req {request_id}_{chat_completion_id}] {content}",
+                            end="",
+                            flush=True,
                         )
 
             # Final newline if the last output was streaming text
@@ -485,15 +514,21 @@ def run_multimodal_generation(args) -> None:
                 file=sys.stderr,
                 flush=True,
             )
-            timing_audio_folder = f"{output_audio_path}/{args.query_type}/{num_concurrent_requests}"
+            timing_audio_folder = (
+                f"{output_audio_path}/{args.query_type}/{num_concurrent_requests}"
+            )
             os.makedirs(timing_audio_folder, exist_ok=True)
             timing_file = os.path.join(timing_audio_folder, "streaming_finish_time.txt")
             with open(timing_file, "w") as f:
-                f.write(f"num_concurrent_requests_{num_concurrent_requests} elapsed_seconds: {elapsed}\n")
+                f.write(
+                    f"num_concurrent_requests_{num_concurrent_requests} elapsed_seconds: {elapsed}\n"
+                )
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = FlexibleArgumentParser(
+        description="Demo on using vLLM for offline inference with audio language models"
+    )
     parser.add_argument(
         "--query-type",
         "-q",

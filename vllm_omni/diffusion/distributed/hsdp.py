@@ -156,7 +156,9 @@ def apply_hsdp_to_model(
 
     hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)
     if not hsdp_shard_conditions or len(hsdp_shard_conditions) == 0:
-        raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
+        raise ValueError(
+            f"Model {type(model).__name__} has no _hsdp_shard_conditions defined"
+        )
 
     # Apply HSDP sharding, this will automatically handle weight distribution
     shard_model(

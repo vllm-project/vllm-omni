@@ -54,7 +54,9 @@ def generate_image(
             return None
         b64_data = base64.b64encode(img_path.read_bytes()).decode("utf-8")
         suffix = img_path.suffix.lstrip(".").lower()
-        mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}.get(suffix, "png")
+        mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}.get(
+            suffix, "png"
+        )
         content.append(
             {
                 "type": "image_url",
@@ -119,8 +121,12 @@ def main():
         default="A beautiful sunset over the ocean with sailing boats",
         help="Text prompt",
     )
-    parser.add_argument("--output", "-o", default="glm_image_output.png", help="Output file")
-    parser.add_argument("--server", "-s", default="http://localhost:8091", help="Server URL")
+    parser.add_argument(
+        "--output", "-o", default="glm_image_output.png", help="Output file"
+    )
+    parser.add_argument(
+        "--server", "-s", default="http://localhost:8091", help="Server URL"
+    )
 
     # Image-to-image
     parser.add_argument(
@@ -134,7 +140,9 @@ def main():
     parser.add_argument("--height", type=int, default=1024, help="Image height")
     parser.add_argument("--width", type=int, default=1024, help="Image width")
     parser.add_argument("--steps", type=int, default=50, help="Inference steps")
-    parser.add_argument("--guidance-scale", type=float, default=1.5, help="CFG guidance scale")
+    parser.add_argument(
+        "--guidance-scale", type=float, default=1.5, help="CFG guidance scale"
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 

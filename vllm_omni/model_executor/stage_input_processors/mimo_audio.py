@@ -5,12 +5,16 @@ from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID
+from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
+    TALKER_CODEC_PAD_TOKEN_ID,
+)
 
 logger = init_logger(__name__)
 
 
-def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torch.Tensor:
+def prepend_and_flatten_colmajor(
+    x: torch.Tensor, pad_vec: torch.Tensor
+) -> torch.Tensor:
     """
     Prepend a padding vector to the input tensor and flatten in column-major order.
 
@@ -32,7 +36,9 @@ def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torc
 
     # Expand pad_row to the front of x, keeping other batch dimensions consistent
     # Example: x shape = (B,1,R,C) → pad shape = (B,1,1,C)
-    pad_expand = pad_row.view(*([1] * (x.dim() - 2)), 1, x.size(-1)).expand(*x.shape[:-2], 1, x.size(-1))
+    pad_expand = pad_row.view(*([1] * (x.dim() - 2)), 1, x.size(-1)).expand(
+        *x.shape[:-2], 1, x.size(-1)
+    )
 
     # Prepend to the row dimension
     y = torch.cat([pad_expand, x], dim=-2)  # (..., R+1, C)
@@ -47,7 +53,10 @@ def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torc
 
 def _make_finished_sentinel() -> dict[str, Any]:
     """Return a minimal payload with finished=True so Stage-1 can end the request."""
-    return {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
+    return {
+        "code_predictor_codes": [],
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
 
 
 def llm2code2wav_async_chunk(
@@ -100,7 +109,11 @@ def llm2code2wav_async_chunk(
     if code_tensor.ndim != 4 or code_tensor.shape[-2:] != (8, 4):
         return None
 
-    pad_vec = torch.tensor([TALKER_CODEC_PAD_TOKEN_ID] * 4, device=code_tensor.device, dtype=code_tensor.dtype)
+    pad_vec = torch.tensor(
+        [TALKER_CODEC_PAD_TOKEN_ID] * 4,
+        device=code_tensor.device,
+        dtype=code_tensor.dtype,
+    )
     code_final = prepend_and_flatten_colmajor(code_tensor, pad_vec)
     code_list = code_final.tolist()
     if sum(code_list) == 0:
@@ -124,7 +137,11 @@ def llm2code2wav_async_chunk(
 
     info = {
         "code_predictor_codes": (
-            torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:]).reshape(-1).tolist()
+            torch.tensor(
+                transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+            )
+            .reshape(-1)
+            .tolist()
         ),
         "finished": torch.tensor(is_finished, dtype=torch.bool),
     }
@@ -174,7 +191,9 @@ def llm2code2wav(
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
         if "code_predictor_codes" in output.multimodal_output:
-            codec_codes = output.multimodal_output["code_predictor_codes"].to(torch.long)  # [seq_batch_size, 1, 8, 4]
+            codec_codes = output.multimodal_output["code_predictor_codes"].to(
+                torch.long
+            )  # [seq_batch_size, 1, 8, 4]
             is_all_zero = (codec_codes == 0).all(dim=(1, 2, 3))
             non_zero_indices = (~is_all_zero).nonzero(as_tuple=True)[0]
             if len(non_zero_indices) == 0:
@@ -188,7 +207,10 @@ def llm2code2wav(
             else:
                 if len(non_zero_indices) < codec_codes.shape[0]:
                     codec_codes = codec_codes[non_zero_indices]
-        elif "latent" in output.multimodal_output and "code_predictor_codes" not in output.multimodal_output:
+        elif (
+            "latent" in output.multimodal_output
+            and "code_predictor_codes" not in output.multimodal_output
+        ):
             codec_codes = torch.zeros(1, 1, 8, 4, dtype=torch.long)
         else:
             raise ValueError(f"Invalid multimodal_output: {output.multimodal_output}")

@@ -7,7 +7,11 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 import torch
-from vllm.benchmarks.datasets import RandomMultiModalDataset, process_image, process_video
+from vllm.benchmarks.datasets import (
+    RandomMultiModalDataset,
+    process_image,
+    process_video,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +40,11 @@ def process_audio(audio: Any) -> Mapping[str, Any]:
             "audio_url": {"url": f"data:audio/mpeg;base64,{audio_base64}"},
         }
     if isinstance(audio, str):
-        audio_url = audio if audio.startswith(("http://", "https://", "file://")) else f"file://{audio}"
+        audio_url = (
+            audio
+            if audio.startswith(("http://", "https://", "file://"))
+            else f"file://{audio}"
+        )
         return {"type": "audio_url", "audio_url": {"url": audio_url}}
 
     raise ValueError(
@@ -90,11 +98,19 @@ class OmniRandomMultiModalDataset(RandomMultiModalDataset):
         """
 
         if self.map_config_to_modality(mm_item_config) == "image":
-            return process_image(self.generate_synthetic_image(mm_item_config[1], mm_item_config[0]))
+            return process_image(
+                self.generate_synthetic_image(mm_item_config[1], mm_item_config[0])
+            )
         elif self.map_config_to_modality(mm_item_config) == "video":
-            return process_video(self.generate_synthetic_video(mm_item_config[1], mm_item_config[0], mm_item_config[2]))
+            return process_video(
+                self.generate_synthetic_video(
+                    mm_item_config[1], mm_item_config[0], mm_item_config[2]
+                )
+            )
         elif self.map_config_to_modality(mm_item_config) == "audio":
-            return process_audio(self.generate_synthetic_audio(mm_item_config[1], mm_item_config[2]))
+            return process_audio(
+                self.generate_synthetic_audio(mm_item_config[1], mm_item_config[2])
+            )
         else:
             raise ValueError(f"Invalid multimodal item configuration: {mm_item_config}")
 

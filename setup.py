@@ -57,10 +57,14 @@ def detect_target_device() -> str:
     if target_device:
         valid_devices = ["cuda", "rocm", "npu", "xpu", "cpu"]
         if target_device.lower() in valid_devices:
-            print(f"Using target device from VLLM_OMNI_TARGET_DEVICE: {target_device.lower()}")
+            print(
+                f"Using target device from VLLM_OMNI_TARGET_DEVICE: {target_device.lower()}"
+            )
             return target_device.lower()
         else:
-            print(f"Warning: Invalid VLLM_OMNI_TARGET_DEVICE '{target_device}', falling back to auto-detection")
+            print(
+                f"Warning: Invalid VLLM_OMNI_TARGET_DEVICE '{target_device}', falling back to auto-detection"
+            )
 
     # Priority 2: Torch backend detection
     # This is a code path for when user is using
@@ -124,7 +128,9 @@ def get_vllm_omni_version() -> str:
     """
     # Allow complete version override via environment variable
     if env_version := os.getenv("VLLM_OMNI_VERSION_OVERRIDE"):
-        print(f"Overriding vLLM-Omni version with {env_version} from VLLM_OMNI_VERSION_OVERRIDE")
+        print(
+            f"Overriding vLLM-Omni version with {env_version} from VLLM_OMNI_VERSION_OVERRIDE"
+        )
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         # Get version without device suffix for override case
         version = get_version(write_to="vllm_omni/_version.py")

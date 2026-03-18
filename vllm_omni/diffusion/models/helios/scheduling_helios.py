@@ -62,7 +62,9 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             if solver_type in ["midpoint", "heun", "logrho"]:
                 self.register_to_config(solver_type="bh2")
             else:
-                raise NotImplementedError(f"{solver_type} is not implemented for {self.__class__}")
+                raise NotImplementedError(
+                    f"{solver_type} is not implemented for {self.__class__}"
+                )
 
         self.predict_x0 = predict_x0
         self.model_outputs = [None] * solver_order
@@ -78,7 +80,9 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
         num_train_timesteps = self.config.num_train_timesteps
         shift = self.config.shift
 
-        alphas = np.linspace(1, 1 / num_train_timesteps, num_train_timesteps + 1, dtype=np.float32)
+        alphas = np.linspace(
+            1, 1 / num_train_timesteps, num_train_timesteps + 1, dtype=np.float32
+        )
         sigmas = 1.0 - alphas
         sigmas = np.flip(shift * sigmas / (1 + (shift - 1) * sigmas))[:-1].copy()
         sigmas = torch.from_numpy(sigmas)
@@ -103,13 +107,17 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             end_indice = int(stage_range[i_s + 1] * training_steps)
             end_indice = min(end_indice, training_steps)
             start_sigma = self.sigmas[start_indice].item()
-            end_sigma = self.sigmas[end_indice].item() if end_indice < training_steps else 0.0
+            end_sigma = (
+                self.sigmas[end_indice].item() if end_indice < training_steps else 0.0
+            )
             self.ori_start_sigmas[i_s] = start_sigma
 
             if i_s != 0:
                 ori_sigma = 1 - start_sigma
                 gamma = self.config.gamma
-                corrected_sigma = (1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)) * ori_sigma
+                corrected_sigma = (
+                    1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
+                ) * ori_sigma
                 start_sigma = 1 - corrected_sigma
 
             stage_distance.append(start_sigma - end_sigma)
@@ -131,11 +139,19 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
 
         for i_s in range(stages):
             timestep_ratio = self.timestep_ratios[i_s]
-            timestep_max = min(self.timesteps[int(timestep_ratio[0] * training_steps)], 999)
-            timestep_min = self.timesteps[min(int(timestep_ratio[1] * training_steps), training_steps - 1)]
-            timesteps = np.linspace(timestep_max, timestep_min, training_steps + 1, dtype=np.float32)
+            timestep_max = min(
+                self.timesteps[int(timestep_ratio[0] * training_steps)], 999
+            )
+            timestep_min = self.timesteps[
+                min(int(timestep_ratio[1] * training_steps), training_steps - 1)
+            ]
+            timesteps = np.linspace(
+                timestep_max, timestep_min, training_steps + 1, dtype=np.float32
+            )
             self.timesteps_per_stage[i_s] = (
-                timesteps[:-1] if isinstance(timesteps, torch.Tensor) else torch.from_numpy(timesteps[:-1])
+                timesteps[:-1]
+                if isinstance(timesteps, torch.Tensor)
+                else torch.from_numpy(timesteps[:-1])
             )
             stage_sigmas = np.linspace(0.999, 0, training_steps + 1, dtype=np.float32)
             self.sigmas_per_stage[i_s] = torch.from_numpy(stage_sigmas[:-1])
@@ -174,9 +190,9 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
 
         if self.config.stages == 1 or stage_index is None:
             if sigmas is None:
-                sigmas = np.linspace(1, 1 / self.config.num_train_timesteps, num_inference_steps + 1)[:-1].astype(
-                    np.float32
-                )
+                sigmas = np.linspace(
+                    1, 1 / self.config.num_train_timesteps, num_inference_steps + 1
+                )[:-1].astype(np.float32)
                 if self.config.shift != 1.0:
                     assert not self.config.use_dynamic_shifting
                     sigmas = self.time_shift(self.config.shift, 1.0, sigmas)
@@ -192,7 +208,12 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             )
 
             stage_sigmas = self.sigmas_per_stage[stage_index]
-            ratios = np.linspace(stage_sigmas[0].item(), stage_sigmas[-1].item(), num_inference_steps, dtype=np.float32)
+            ratios = np.linspace(
+                stage_sigmas[0].item(),
+                stage_sigmas[-1].item(),
+                num_inference_steps,
+                dtype=np.float32,
+            )
             sigmas = torch.from_numpy(ratios)
 
         self.timesteps = torch.from_numpy(timesteps).to(device=device)
@@ -211,8 +232,11 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             if self.config.stages == 1 or stage_index is None:
                 self.timesteps = self.sigmas[:-1] * self.config.num_train_timesteps
             else:
-                self.timesteps = self.timesteps_per_stage[stage_index].min() + self.sigmas[:-1] * (
-                    self.timesteps_per_stage[stage_index].max() - self.timesteps_per_stage[stage_index].min()
+                self.timesteps = self.timesteps_per_stage[
+                    stage_index
+                ].min() + self.sigmas[:-1] * (
+                    self.timesteps_per_stage[stage_index].max()
+                    - self.timesteps_per_stage[stage_index].min()
                 )
 
     def time_shift(self, mu: float, sigma: float, t: torch.Tensor):
@@ -387,7 +411,10 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             return x_t
 
         if sigma_next is None and sigma is None:
-            sigma_t, sigma_s0 = self.sigmas[self.step_index + 1], self.sigmas[self.step_index]
+            sigma_t, sigma_s0 = (
+                self.sigmas[self.step_index + 1],
+                self.sigmas[self.step_index],
+            )
         else:
             sigma_t, sigma_s0 = sigma_next, sigma
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
@@ -501,7 +528,10 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
         model_t = this_model_output
 
         if sigma_before is None and sigma is None:
-            sigma_t, sigma_s0 = self.sigmas[self.step_index], self.sigmas[self.step_index - 1]
+            sigma_t, sigma_s0 = (
+                self.sigmas[self.step_index],
+                self.sigmas[self.step_index - 1],
+            )
         else:
             sigma_t, sigma_s0 = sigma, sigma_before
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
@@ -619,10 +649,14 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             self.last_sample = cus_last_sample
 
         use_corrector = (
-            self.step_index > 0 and self.step_index - 1 not in self.disable_corrector and self.last_sample is not None
+            self.step_index > 0
+            and self.step_index - 1 not in self.disable_corrector
+            and self.last_sample is not None
         )
 
-        model_output_convert = self.convert_model_output(model_output, sample=sample, sigma=sigma)
+        model_output_convert = self.convert_model_output(
+            model_output, sample=sample, sigma=sigma
+        )
 
         if model_outputs is not None and timestep_list is not None:
             self.model_outputs = model_outputs[:-1]
@@ -650,7 +684,9 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
             self.timestep_list[-1] = timestep
 
         if self.config.lower_order_final:
-            this_order = min(self.config.solver_order, len(self.timesteps) - self.step_index)
+            this_order = min(
+                self.config.solver_order, len(self.timesteps) - self.step_index
+            )
         else:
             this_order = self.config.solver_order
         self.this_order = min(this_order, self.lower_order_nums + 1)
@@ -686,7 +722,9 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
     def add_noise(self, original_samples, noise, timestep, sigmas, timesteps):
         sigmas = sigmas.to(noise.device)
         timesteps = timesteps.to(noise.device)
-        timestep_id = torch.argmin((timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+        timestep_id = torch.argmin(
+            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
+        )
         sigma = sigmas[timestep_id].reshape(-1, 1, 1, 1, 1)
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample.type_as(noise)
@@ -694,9 +732,13 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
     def convert_flow_pred_to_x0(self, flow_pred, xt, timestep, sigmas, timesteps):
         original_dtype = flow_pred.dtype
         device = flow_pred.device
-        flow_pred, xt, sigmas, timesteps = (x.double().to(device) for x in (flow_pred, xt, sigmas, timesteps))
+        flow_pred, xt, sigmas, timesteps = (
+            x.double().to(device) for x in (flow_pred, xt, sigmas, timesteps)
+        )
 
-        timestep_id = torch.argmin((timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+        timestep_id = torch.argmin(
+            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
+        )
         sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1, 1)
         x0_pred = xt - sigma_t * flow_pred
         return x0_pred.to(original_dtype)
@@ -717,7 +759,12 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
         pred_image_or_video = self.convert_flow_pred_to_x0(
             flow_pred=model_output,
             xt=sample,
-            timestep=torch.full((model_output.shape[0],), timestep, dtype=torch.long, device=model_output.device),
+            timestep=torch.full(
+                (model_output.shape[0],),
+                timestep,
+                dtype=torch.long,
+                device=model_output.device,
+            ),
             sigmas=dmd_sigmas,
             timesteps=dmd_timesteps,
         )

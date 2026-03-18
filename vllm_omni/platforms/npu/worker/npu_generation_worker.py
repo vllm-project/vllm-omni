@@ -4,7 +4,9 @@
 from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_ascend.worker.worker import NPUWorker
 
-from vllm_omni.platforms.npu.worker.npu_generation_model_runner import NPUGenerationModelRunner
+from vllm_omni.platforms.npu.worker.npu_generation_model_runner import (
+    NPUGenerationModelRunner,
+)
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 

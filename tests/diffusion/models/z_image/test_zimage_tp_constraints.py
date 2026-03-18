@@ -1,6 +1,8 @@
 import pytest
 
-from vllm_omni.diffusion.models.z_image.z_image_transformer import validate_zimage_tp_constraints
+from vllm_omni.diffusion.models.z_image.z_image_transformer import (
+    validate_zimage_tp_constraints,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

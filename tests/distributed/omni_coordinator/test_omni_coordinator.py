@@ -68,9 +68,15 @@ def test_omni_coordinator_registration_broadcast():
 
     # Create 3 stage clients; each auto-registers on init.
     clients = [
-        OmniCoordClientForStage(router_addr, "tcp://stage:10001", "tcp://stage:10001-out", 0),
-        OmniCoordClientForStage(router_addr, "tcp://stage:10002", "tcp://stage:10002-out", 0),
-        OmniCoordClientForStage(router_addr, "tcp://stage:10003", "tcp://stage:10003-out", 1),
+        OmniCoordClientForStage(
+            router_addr, "tcp://stage:10001", "tcp://stage:10001-out", 0
+        ),
+        OmniCoordClientForStage(
+            router_addr, "tcp://stage:10002", "tcp://stage:10002-out", 0
+        ),
+        OmniCoordClientForStage(
+            router_addr, "tcp://stage:10003", "tcp://stage:10003-out", 1
+        ),
     ]
 
     msg = _wait_for_instance_list(sub, expected_count=3)
@@ -118,8 +124,12 @@ def test_omni_coordinator_heartbeat_timeout_handling():
     time.sleep(0.3)
 
     # A and B: real clients that send heartbeats every 5s.
-    client_a = OmniCoordClientForStage(router_addr, "tcp://stage:a", "tcp://stage:a-out", 0)
-    client_b = OmniCoordClientForStage(router_addr, "tcp://stage:b", "tcp://stage:b-out", 0)
+    client_a = OmniCoordClientForStage(
+        router_addr, "tcp://stage:a", "tcp://stage:a-out", 0
+    )
+    client_b = OmniCoordClientForStage(
+        router_addr, "tcp://stage:b", "tcp://stage:b-out", 0
+    )
 
     # C: raw DEALER that sends only registration, no heartbeat.
     dealer_ctx = zmq.Context.instance()
@@ -144,7 +154,9 @@ def test_omni_coordinator_heartbeat_timeout_handling():
 
     # Receive the update (C should be ERROR and excluded from active list).
     msg_after_timeout = _wait_for_instance_list(sub, expected_count=2, timeout=5.0)
-    assert msg_after_timeout is not None, "Expected InstanceList with 2 instances after timeout"
+    assert (
+        msg_after_timeout is not None
+    ), "Expected InstanceList with 2 instances after timeout"
     instances = msg_after_timeout.get("instances", [])
     input_addrs = {inst["input_addr"] for inst in instances}
 
@@ -188,7 +200,9 @@ def test_omni_coordinator_instance_shutdown_handling():
 
     time.sleep(0.3)  # PUB/SUB slow-joiner
 
-    client = OmniCoordClientForStage(router_addr, "tcp://stage:shutdown", "tcp://stage:shutdown-out", 0)
+    client = OmniCoordClientForStage(
+        router_addr, "tcp://stage:shutdown", "tcp://stage:shutdown-out", 0
+    )
 
     msg = _wait_for_instance_list(sub, expected_count=1)
     assert msg is not None

@@ -41,7 +41,13 @@ def omni_server():
         yield server
 
 
-def _write_zimage_lora(adapter_dir: Path, *, q_scale: float = 0.0, k_scale: float = 0.0, v_scale: float = 0.0):
+def _write_zimage_lora(
+    adapter_dir: Path,
+    *,
+    q_scale: float = 0.0,
+    k_scale: float = 0.0,
+    v_scale: float = 0.0,
+):
     adapter_dir.mkdir(parents=True, exist_ok=True)
 
     # Z-Image transformer uses dim=3840 by default.
@@ -82,7 +88,9 @@ def _write_zimage_lora(adapter_dir: Path, *, q_scale: float = 0.0, k_scale: floa
 
 def _post_images(server: OmniServer, payload: dict) -> Image.Image:
     url = f"http://{server.host}:{server.port}/v1/images/generations"
-    resp = requests.post(url, json=payload, headers={"Authorization": "Bearer EMPTY"}, timeout=900)
+    resp = requests.post(
+        url, json=payload, headers={"Authorization": "Bearer EMPTY"}, timeout=900
+    )
     resp.raise_for_status()
     data = resp.json()
     b64 = data["data"][0]["b64_json"]
@@ -131,7 +139,9 @@ def _assert_slice_diff(actual: np.ndarray, baseline: np.ndarray, *, label: str) 
     assert actual.shape == (3, 3)
     assert baseline.shape == (3, 3)
     diff = np.abs(actual - baseline).mean()
-    assert diff > 0.1, f"{label} slice diff too small: {diff} ({actual.tolist()} vs {baseline.tolist()})"
+    assert (
+        diff > 0.1
+    ), f"{label} slice diff too small: {diff} ({actual.tolist()} vs {baseline.tolist()})"
 
 
 def _basic_payload() -> dict:
@@ -148,7 +158,9 @@ def _basic_payload() -> dict:
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
-def test_images_generations_per_request_lora_switching(omni_server: OmniServer, tmp_path: Path) -> None:
+def test_images_generations_per_request_lora_switching(
+    omni_server: OmniServer, tmp_path: Path
+) -> None:
     # Base generation.
     base_img = _post_images(omni_server, _basic_payload())
     base_slice = _image_blue_tail_slice(base_img)
@@ -192,6 +204,12 @@ def test_images_generations_per_request_lora_switching(omni_server: OmniServer, 
 
     # Ensure LoRA effects are clearly above the baseline drift.
     min_delta = max(base_reset_mean + 1.0, 1.5)
-    assert a_vs_base > min_delta, f"lora_a_vs_base drift too small: {a_vs_base} <= {min_delta}"
-    assert b_vs_base > min_delta, f"lora_b_vs_base drift too small: {b_vs_base} <= {min_delta}"
-    assert b_vs_a > min_delta, f"lora_b_vs_lora_a drift too small: {b_vs_a} <= {min_delta}"
+    assert (
+        a_vs_base > min_delta
+    ), f"lora_a_vs_base drift too small: {a_vs_base} <= {min_delta}"
+    assert (
+        b_vs_base > min_delta
+    ), f"lora_b_vs_base drift too small: {b_vs_base} <= {min_delta}"
+    assert (
+        b_vs_a > min_delta
+    ), f"lora_b_vs_lora_a drift too small: {b_vs_a} <= {min_delta}"

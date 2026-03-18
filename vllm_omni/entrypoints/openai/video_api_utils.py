@@ -30,7 +30,9 @@ def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
         return Image.open(BytesIO(image_bytes)).convert("RGB")
     except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
+        raise InvalidInputReferenceError(
+            f"Invalid {source}: provided content is not a valid image."
+        ) from exc
 
 
 def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
@@ -42,8 +44,13 @@ def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
 
         try:
             image_bytes = base64.b64decode(b64_data)
-        except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
-            raise InvalidInputReferenceError(f"Invalid {source}: image data is not valid base64.") from exc
+        except (
+            binascii.Error,
+            ValueError,
+        ) as exc:  # pragma: no cover - malformed base64
+            raise InvalidInputReferenceError(
+                f"Invalid {source}: image data is not valid base64."
+            ) from exc
         return _decode_image_bytes(image_bytes, source=source)
     raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
 
@@ -63,7 +70,9 @@ async def decode_image_url(image_url: str) -> Image.Image:
                 ) from exc
         return _decode_image_bytes(response.content, source="image_reference.image_url")
 
-    raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
+    raise InvalidInputReferenceError(
+        "Invalid image_reference.image_url: must be an http(s) URL or data URL."
+    )
 
 
 async def decode_input_reference(
@@ -73,7 +82,9 @@ async def decode_input_reference(
     """Decode image input from multipart bytes, base64/data URL, or image_reference."""
 
     if input_reference_bytes is not None and image_reference is not None:
-        raise InvalidInputReferenceError("Provide either input_reference or image_reference, not both.")
+        raise InvalidInputReferenceError(
+            "Provide either input_reference or image_reference, not both."
+        )
 
     if isinstance(input_reference_bytes, bytes):
         return _decode_image_bytes(input_reference_bytes, source="input_reference")
@@ -81,7 +92,9 @@ async def decode_input_reference(
     if isinstance(image_reference, UrlImageReference):
         return await decode_image_url(image_reference.image_url)
     elif isinstance(image_reference, FileImageReference):
-        raise InvalidInputReferenceError("Invalid image_reference: file_id is not supported yet.")
+        raise InvalidInputReferenceError(
+            "Invalid image_reference: file_id is not supported yet."
+        )
 
     return None
 
@@ -90,7 +103,9 @@ def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
     """Normalize a torch video tensor into a numpy array of frames (F, H, W, C)."""
     video_tensor = video_tensor.detach().cpu()
     if video_tensor.dim() == 5:
-        raise ValueError("Batched video tensors are not supported for single-video encoding.")
+        raise ValueError(
+            "Batched video tensors are not supported for single-video encoding."
+        )
     elif video_tensor.dim() == 4 and video_tensor.shape[0] in (3, 4):
         # [C, F, H, W] -> [F, H, W, C]
         video_tensor = video_tensor.permute(1, 2, 3, 0)
@@ -106,7 +121,9 @@ def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
 def _normalize_single_video_array(video_array: np.ndarray) -> np.ndarray:
     """Normalize a single video array into shape (F, H, W, C)."""
     if video_array.ndim == 5:
-        raise ValueError("Batched video arrays are not supported for single-video encoding.")
+        raise ValueError(
+            "Batched video arrays are not supported for single-video encoding."
+        )
 
     if video_array.ndim == 4:
         # Convert channel-first layouts to channel-last
@@ -129,7 +146,10 @@ def _normalize_video_array(video_array: np.ndarray) -> list[np.ndarray] | np.nda
     If a batch dimension is present, returns a list of per-video arrays.
     """
     if video_array.ndim == 5:
-        return [_normalize_single_video_array(video_array[i]) for i in range(video_array.shape[0])]
+        return [
+            _normalize_single_video_array(video_array[i])
+            for i in range(video_array.shape[0])
+        ]
     return _normalize_single_video_array(video_array)
 
 
@@ -146,7 +166,11 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
         else:
             raise ValueError(f"Unsupported frame type: {type(frame)}")
 
-        if frame_array.ndim == 3 and frame_array.shape[0] in (3, 4) and frame_array.shape[-1] not in (3, 4):
+        if (
+            frame_array.ndim == 3
+            and frame_array.shape[0] in (3, 4)
+            and frame_array.shape[-1] not in (3, 4)
+        ):
             frame_array = np.transpose(frame_array, (1, 2, 0))
 
         if np.issubdtype(frame_array.dtype, np.floating):
@@ -177,10 +201,14 @@ def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
         if not video:
             return []
         # If this looks like a list of frames, normalize directly.
-        if all(isinstance(item, (np.ndarray, torch.Tensor, Image.Image)) for item in video):
+        if all(
+            isinstance(item, (np.ndarray, torch.Tensor, Image.Image)) for item in video
+        ):
             # If each item is itself a video (ndim==4), handle elsewhere.
             if all(hasattr(item, "ndim") and item.ndim >= 4 for item in video):
-                raise ValueError("Expected a single video, got a list of video tensors/arrays.")
+                raise ValueError(
+                    "Expected a single video, got a list of video tensors/arrays."
+                )
             return _normalize_frames(video)
         raise ValueError("Unsupported list contents for video payload.")
     raise ValueError(f"Unsupported video payload type: {type(video)}")
@@ -210,19 +238,25 @@ def _coerce_audio_to_waveform(audio: Any) -> torch.Tensor:
         elif waveform.shape[1] in (1, 2):
             waveform = waveform.transpose(0, 1)
         else:
-            raise ValueError(f"Unsupported audio payload shape: {tuple(waveform.shape)}")
+            raise ValueError(
+                f"Unsupported audio payload shape: {tuple(waveform.shape)}"
+            )
     else:
         raise ValueError(f"Unsupported audio payload rank: {waveform.ndim}")
 
     if waveform.shape[0] == 1:
         waveform = waveform.repeat(2, 1)
     elif waveform.shape[0] != 2:
-        raise ValueError(f"Expected mono or stereo audio, got shape {tuple(waveform.shape)}")
+        raise ValueError(
+            f"Expected mono or stereo audio, got shape {tuple(waveform.shape)}"
+        )
 
     return waveform.float().contiguous()
 
 
-def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None) -> bytes:
+def _encode_video_bytes(
+    video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None
+) -> bytes:
     """Encode a video payload into MP4 bytes, optionally muxing audio."""
     try:
         from diffusers.utils import export_to_video
@@ -237,7 +271,9 @@ def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sa
     tmp_file.close()
     try:
         if audio is not None:
-            from diffusers.pipelines.ltx2.export_utils import encode_video as encode_ltx2_video
+            from diffusers.pipelines.ltx2.export_utils import (
+                encode_video as encode_ltx2_video,
+            )
 
             frames_np = np.stack(frames, axis=0)
             if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
@@ -263,7 +299,11 @@ def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sa
             pass
 
 
-def encode_video_base64(video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None) -> str:
+def encode_video_base64(
+    video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None
+) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
-    video_bytes = _encode_video_bytes(video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate)
+    video_bytes = _encode_video_bytes(
+        video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate
+    )
     return base64.b64encode(video_bytes).decode("utf-8")

@@ -98,10 +98,14 @@ class SimpleTransformer(torch.nn.Module):
 
         # Scaled dot-product attention
         scale = self.head_dim**-0.5
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, num_heads, H*W, H*W)
+        attn_scores = (
+            torch.matmul(q, k.transpose(-2, -1)) * scale
+        )  # (B, num_heads, H*W, H*W)
         attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
         attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, seq_len, self.hidden_dim)
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(B, seq_len, self.hidden_dim)
+        )
 
         attn_output = self.out_proj(attn_output)
 
@@ -187,13 +191,17 @@ def _test_cfg_parallel_worker(
     width = test_config["width"]
 
     # Positive input
-    positive_input = torch.randn(batch_size, channels, height, width, dtype=dtype, device=device)
+    positive_input = torch.randn(
+        batch_size, channels, height, width, dtype=dtype, device=device
+    )
 
     # Negative input with different seed
     torch.manual_seed(test_config["input_seed"] + 1)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(test_config["input_seed"] + 1)
-    negative_input = torch.randn(batch_size, channels, height, width, dtype=dtype, device=device)
+    negative_input = torch.randn(
+        batch_size, channels, height, width, dtype=dtype, device=device
+    )
 
     # Prepare kwargs for predict_noise_maybe_with_cfg
     positive_kwargs = {"x": positive_input}
@@ -268,13 +276,17 @@ def _test_cfg_sequential_worker(
     width = test_config["width"]
 
     # Positive input
-    positive_input = torch.randn(batch_size, channels, height, width, dtype=dtype, device=device)
+    positive_input = torch.randn(
+        batch_size, channels, height, width, dtype=dtype, device=device
+    )
 
     # Negative input with different seed
     torch.manual_seed(test_config["input_seed"] + 1)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(test_config["input_seed"] + 1)
-    negative_input = torch.randn(batch_size, channels, height, width, dtype=dtype, device=device)
+    negative_input = torch.randn(
+        batch_size, channels, height, width, dtype=dtype, device=device
+    )
 
     positive_kwargs = {"x": positive_input}
     negative_kwargs = {"x": negative_input}
@@ -299,7 +311,9 @@ def _test_cfg_sequential_worker(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype, batch_size: int, cfg_normalize: bool):
+def test_predict_noise_maybe_with_cfg(
+    cfg_parallel_size: int, dtype: torch.dtype, batch_size: int, cfg_normalize: bool
+):
     """
     Test that predict_noise_maybe_with_cfg produces identical results
     with and without CFG parallel.
@@ -312,7 +326,9 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
     """
     available_gpus = current_omni_platform.get_device_count()
     if available_gpus < cfg_parallel_size:
-        pytest.skip(f"Test requires {cfg_parallel_size} GPUs but only {available_gpus} available")
+        pytest.skip(
+            f"Test requires {cfg_parallel_size} GPUs but only {available_gpus} available"
+        )
 
     test_config = {
         "batch_size": batch_size,
@@ -342,7 +358,13 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
     # Run CFG parallel on multiple GPUs
     torch.multiprocessing.spawn(
         _test_cfg_parallel_worker,
-        args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
+        args=(
+            cfg_parallel_size,
+            cfg_parallel_size,
+            dtype,
+            test_config,
+            cfg_parallel_queue,
+        ),
         nprocs=cfg_parallel_size,
     )
 
@@ -351,9 +373,9 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
     cfg_parallel_output = cfg_parallel_queue.get()
 
     # Verify shapes match
-    assert baseline_output.shape == cfg_parallel_output.shape, (
-        f"Shape mismatch: baseline {baseline_output.shape} vs CFG parallel {cfg_parallel_output.shape}"
-    )
+    assert (
+        baseline_output.shape == cfg_parallel_output.shape
+    ), f"Shape mismatch: baseline {baseline_output.shape} vs CFG parallel {cfg_parallel_output.shape}"
 
     # Verify numerical equivalence with appropriate tolerances
     if dtype == torch.float32:

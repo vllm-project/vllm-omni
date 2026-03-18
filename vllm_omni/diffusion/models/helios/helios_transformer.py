@@ -10,7 +10,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
+from diffusers.models.embeddings import (
+    PixArtAlphaTextProjection,
+    TimestepEmbedding,
+    Timesteps,
+)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
 from vllm.distributed import (
@@ -20,7 +24,11 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -96,7 +104,9 @@ class DistributedRMSNorm(nn.Module):
 class ColumnParallelGELU(nn.Module):
     """Column parallel linear with GELU activation."""
 
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str = "tanh", bias: bool = True):
+    def __init__(
+        self, dim_in: int, dim_out: int, *, approximate: str = "tanh", bias: bool = True
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -149,12 +159,21 @@ class HeliosRotaryPosEmbed(nn.Module):
         super().__init__()
         self.DT, self.DY, self.DX = rope_dim
         self.theta = theta
-        self.register_buffer("freqs_base_t", self._get_freqs_base(self.DT), persistent=False)
-        self.register_buffer("freqs_base_y", self._get_freqs_base(self.DY), persistent=False)
-        self.register_buffer("freqs_base_x", self._get_freqs_base(self.DX), persistent=False)
+        self.register_buffer(
+            "freqs_base_t", self._get_freqs_base(self.DT), persistent=False
+        )
+        self.register_buffer(
+            "freqs_base_y", self._get_freqs_base(self.DY), persistent=False
+        )
+        self.register_buffer(
+            "freqs_base_x", self._get_freqs_base(self.DX), persistent=False
+        )
 
     def _get_freqs_base(self, dim):
-        return 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim))
+        return 1.0 / (
+            self.theta
+            ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim)
+        )
 
     @torch.no_grad()
     def get_frequency_batched(self, freqs_base, pos):
@@ -179,16 +198,29 @@ class HeliosRotaryPosEmbed(nn.Module):
         frame_indices = frame_indices.to(device=device, dtype=torch.float32)
         grid_y, grid_x = self._get_spatial_meshgrid(height, width, str(device))
 
-        grid_t = frame_indices[:, :, None, None].expand(batch_size, num_frames, height, width)
+        grid_t = frame_indices[:, :, None, None].expand(
+            batch_size, num_frames, height, width
+        )
         grid_y_batch = grid_y[None, None, :, :].expand(batch_size, num_frames, -1, -1)
         grid_x_batch = grid_x[None, None, :, :].expand(batch_size, num_frames, -1, -1)
 
         freqs_cos_t, freqs_sin_t = self.get_frequency_batched(self.freqs_base_t, grid_t)
-        freqs_cos_y, freqs_sin_y = self.get_frequency_batched(self.freqs_base_y, grid_y_batch)
-        freqs_cos_x, freqs_sin_x = self.get_frequency_batched(self.freqs_base_x, grid_x_batch)
+        freqs_cos_y, freqs_sin_y = self.get_frequency_batched(
+            self.freqs_base_y, grid_y_batch
+        )
+        freqs_cos_x, freqs_sin_x = self.get_frequency_batched(
+            self.freqs_base_x, grid_x_batch
+        )
 
         result = torch.cat(
-            [freqs_cos_t, freqs_cos_y, freqs_cos_x, freqs_sin_t, freqs_sin_y, freqs_sin_x],
+            [
+                freqs_cos_t,
+                freqs_cos_y,
+                freqs_cos_x,
+                freqs_sin_t,
+                freqs_sin_y,
+                freqs_sin_x,
+            ],
             dim=0,
         )
 
@@ -207,11 +239,17 @@ class HeliosTimeTextEmbedding(nn.Module):
     ):
         super().__init__()
 
-        self.timesteps_proj = Timesteps(num_channels=time_freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.time_embedder = TimestepEmbedding(in_channels=time_freq_dim, time_embed_dim=dim)
+        self.timesteps_proj = Timesteps(
+            num_channels=time_freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        self.time_embedder = TimestepEmbedding(
+            in_channels=time_freq_dim, time_embed_dim=dim
+        )
         self.act_fn = nn.SiLU()
         self.time_proj = nn.Linear(dim, time_proj_dim)
-        self.text_embedder = PixArtAlphaTextProjection(text_embed_dim, dim, act_fn="gelu_tanh")
+        self.text_embedder = PixArtAlphaTextProjection(
+            text_embed_dim, dim, act_fn="gelu_tanh"
+        )
 
     def forward(
         self,
@@ -241,12 +279,23 @@ class HeliosOutputNorm(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
         self.norm = FP32LayerNorm(dim, eps, elementwise_affine=False)
 
-    def forward(self, hidden_states: torch.Tensor, temb: torch.Tensor, original_context_length: int):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        original_context_length: int,
+    ):
         temb = temb[:, -original_context_length:, :]
-        shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
-        shift, scale = shift.squeeze(2).to(hidden_states.device), scale.squeeze(2).to(hidden_states.device)
+        shift, scale = (
+            self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)
+        ).chunk(2, dim=2)
+        shift, scale = shift.squeeze(2).to(hidden_states.device), scale.squeeze(2).to(
+            hidden_states.device
+        )
         hidden_states = hidden_states[:, -original_context_length:, :]
-        hidden_states = (self.norm(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = (
+            self.norm(hidden_states.float()) * (1 + scale) + shift
+        ).type_as(hidden_states)
         return hidden_states
 
 
@@ -340,7 +389,9 @@ class HeliosSelfAttention(nn.Module):
         if self.is_amplify_history and original_context_length is not None:
             history_seq_len = hidden_states.shape[1] - original_context_length
             if history_seq_len > 0:
-                scale_key = 1.0 + torch.sigmoid(self.history_key_scale) * (self.max_scale - 1.0)
+                scale_key = 1.0 + torch.sigmoid(self.history_key_scale) * (
+                    self.max_scale - 1.0
+                )
                 if self.history_scale_mode == "per_head":
                     scale_key = scale_key.view(1, 1, -1, 1)
                 key = torch.cat(
@@ -484,7 +535,11 @@ class HeliosTransformerBlock(nn.Module):
             head_dim=head_dim,
             eps=eps,
         )
-        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.norm2 = (
+            FP32LayerNorm(dim, eps, elementwise_affine=True)
+            if cross_attn_norm
+            else nn.Identity()
+        )
 
         # 3. Feed-forward
         self.ffn = HeliosFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
@@ -519,9 +574,15 @@ class HeliosTransformerBlock(nn.Module):
             ).chunk(6, dim=1)
 
         # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, rotary_emb, original_context_length)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+        norm_hidden_states = (
+            self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
+        ).type_as(hidden_states)
+        attn_output = self.attn1(
+            norm_hidden_states, rotary_emb, original_context_length
+        )
+        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(
+            hidden_states
+        )
 
         # 2. Cross-attention (with optional guidance: only current chunk attends to text)
         if self.guidance_cross_attn and original_context_length is not None:
@@ -531,21 +592,29 @@ class HeliosTransformerBlock(nn.Module):
                 hidden_states[:, :history_seq_len],
                 hidden_states[:, history_seq_len:],
             )
-            norm_hidden_states = self.norm2(current_hidden_states.float()).type_as(current_hidden_states)
+            norm_hidden_states = self.norm2(current_hidden_states.float()).type_as(
+                current_hidden_states
+            )
             attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
             current_hidden_states = current_hidden_states + attn_output
-            hidden_states = torch.cat([history_hidden_states, current_hidden_states], dim=1)
+            hidden_states = torch.cat(
+                [history_hidden_states, current_hidden_states], dim=1
+            )
         else:
-            norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+            norm_hidden_states = self.norm2(hidden_states.float()).type_as(
+                hidden_states
+            )
             attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
             hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
-            hidden_states
-        )
+        norm_hidden_states = (
+            self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa
+        ).type_as(hidden_states)
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        hidden_states = (
+            hidden_states.float() + ff_output.float() * c_gate_msa
+        ).type_as(hidden_states)
 
         return hidden_states
 
@@ -571,11 +640,17 @@ class HeliosTransformer3DModel(nn.Module):
 
     _sp_plan = {
         "rope": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
+            0: SequenceParallelInput(
+                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+            ),
+            1: SequenceParallelInput(
+                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+            ),
         },
         "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+            "hidden_states": SequenceParallelInput(
+                split_dim=1, expected_dims=3, auto_pad=True
+            ),
         },
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -722,10 +797,16 @@ class HeliosTransformer3DModel(nn.Module):
 
         # 1. Process noisy latents
         hidden_states = self.patch_embedding(hidden_states)
-        _, _, post_patch_num_frames, post_patch_height, post_patch_width = hidden_states.shape
+        _, _, post_patch_num_frames, post_patch_height, post_patch_width = (
+            hidden_states.shape
+        )
 
         if indices_hidden_states is None:
-            indices_hidden_states = torch.arange(0, post_patch_num_frames).unsqueeze(0).expand(batch_size, -1)
+            indices_hidden_states = (
+                torch.arange(0, post_patch_num_frames)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
 
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
         rotary_emb = self.rope(
@@ -738,7 +819,10 @@ class HeliosTransformer3DModel(nn.Module):
         original_context_length = hidden_states.shape[1]
 
         # 2. Process short history latents
-        if latents_history_short is not None and indices_latents_history_short is not None:
+        if (
+            latents_history_short is not None
+            and indices_latents_history_short is not None
+        ):
             latents_history_short = latents_history_short.to(hidden_states)
             latents_history_short = self.patch_short(latents_history_short)
             _, _, _, H1, W1 = latents_history_short.shape
@@ -750,7 +834,9 @@ class HeliosTransformer3DModel(nn.Module):
                 width=W1,
                 device=latents_history_short.device,
             )
-            rotary_emb_history_short = rotary_emb_history_short.flatten(2).transpose(1, 2)
+            rotary_emb_history_short = rotary_emb_history_short.flatten(2).transpose(
+                1, 2
+            )
 
             hidden_states = torch.cat([latents_history_short, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_short, rotary_emb], dim=1)
@@ -769,14 +855,19 @@ class HeliosTransformer3DModel(nn.Module):
                 device=latents_history_mid.device,
             )
             rotary_emb_history_mid = pad_for_3d_conv(rotary_emb_history_mid, (2, 2, 2))
-            rotary_emb_history_mid = center_down_sample_3d(rotary_emb_history_mid, (2, 2, 2))
+            rotary_emb_history_mid = center_down_sample_3d(
+                rotary_emb_history_mid, (2, 2, 2)
+            )
             rotary_emb_history_mid = rotary_emb_history_mid.flatten(2).transpose(1, 2)
 
             hidden_states = torch.cat([latents_history_mid, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_mid, rotary_emb], dim=1)
 
         # 4. Process long history latents
-        if latents_history_long is not None and indices_latents_history_long is not None:
+        if (
+            latents_history_long is not None
+            and indices_latents_history_long is not None
+        ):
             latents_history_long = latents_history_long.to(hidden_states)
             latents_history_long = pad_for_3d_conv(latents_history_long, (4, 8, 8))
             latents_history_long = self.patch_long(latents_history_long)
@@ -788,8 +879,12 @@ class HeliosTransformer3DModel(nn.Module):
                 width=W1,
                 device=latents_history_long.device,
             )
-            rotary_emb_history_long = pad_for_3d_conv(rotary_emb_history_long, (4, 4, 4))
-            rotary_emb_history_long = center_down_sample_3d(rotary_emb_history_long, (4, 4, 4))
+            rotary_emb_history_long = pad_for_3d_conv(
+                rotary_emb_history_long, (4, 4, 4)
+            )
+            rotary_emb_history_long = center_down_sample_3d(
+                rotary_emb_history_long, (4, 4, 4)
+            )
             rotary_emb_history_long = rotary_emb_history_long.flatten(2).transpose(1, 2)
 
             hidden_states = torch.cat([latents_history_long, hidden_states], dim=1)
@@ -801,16 +896,22 @@ class HeliosTransformer3DModel(nn.Module):
         if indices_hidden_states is not None and self.zero_history_timestep:
             timestep_t0 = torch.zeros((1), dtype=timestep.dtype, device=timestep.device)
             temb_t0, timestep_proj_t0, _ = self.condition_embedder(
-                timestep_t0, encoder_hidden_states, is_return_encoder_hidden_states=False
+                timestep_t0,
+                encoder_hidden_states,
+                is_return_encoder_hidden_states=False,
             )
-            temb_t0 = temb_t0.unsqueeze(1).expand(batch_size, history_context_length, -1)
+            temb_t0 = temb_t0.unsqueeze(1).expand(
+                batch_size, history_context_length, -1
+            )
             timestep_proj_t0 = (
                 timestep_proj_t0.unflatten(-1, (6, -1))
                 .view(1, 6, 1, -1)
                 .expand(batch_size, -1, history_context_length, -1)
             )
 
-        temb, timestep_proj, encoder_hidden_states = self.condition_embedder(timestep, encoder_hidden_states)
+        temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
+            timestep, encoder_hidden_states
+        )
         timestep_proj = timestep_proj.unflatten(-1, (6, -1))
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
@@ -818,7 +919,9 @@ class HeliosTransformer3DModel(nn.Module):
         else:
             main_repeat_size = original_context_length
         temb = temb.view(batch_size, 1, -1).expand(batch_size, main_repeat_size, -1)
-        timestep_proj = timestep_proj.view(batch_size, 6, 1, -1).expand(batch_size, 6, main_repeat_size, -1)
+        timestep_proj = timestep_proj.view(batch_size, 6, 1, -1).expand(
+            batch_size, 6, main_repeat_size, -1
+        )
 
         if indices_hidden_states is not None and self.zero_history_timestep:
             temb = torch.cat([temb_t0, temb], dim=1)
@@ -847,7 +950,14 @@ class HeliosTransformer3DModel(nn.Module):
 
         # 8. Unpatchify
         hidden_states = hidden_states.reshape(
-            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+            batch_size,
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            p_t,
+            p_h,
+            p_w,
+            -1,
         )
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
@@ -912,13 +1022,21 @@ class HeliosTransformer3DModel(nn.Module):
                     ]
                 ):
                     shard_size = loaded_weight.shape[0] // tp_size
-                    loaded_weight = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+                    loaded_weight = loaded_weight[
+                        tp_rank * shard_size : (tp_rank + 1) * shard_size
+                    ]
 
                 # TP sharding for history_key_scale (per_head mode)
-                if tp_size > 1 and ".history_key_scale" in lookup_name and loaded_weight.dim() == 1:
+                if (
+                    tp_size > 1
+                    and ".history_key_scale" in lookup_name
+                    and loaded_weight.dim() == 1
+                ):
                     shard_size = loaded_weight.shape[0] // tp_size
                     if shard_size > 0:
-                        loaded_weight = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+                        loaded_weight = loaded_weight[
+                            tp_rank * shard_size : (tp_rank + 1) * shard_size
+                        ]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

@@ -9,9 +9,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.distributed.parallel_state import RankGenerator, set_seq_parallel_pg
+from vllm_omni.diffusion.distributed.parallel_state import (
+    RankGenerator,
+    set_seq_parallel_pg,
+)
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [
+    pytest.mark.diffusion,
+    pytest.mark.parallel,
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+]
 
 
 def _fake_new_group_factory(created_groups: list[SimpleNamespace]):
@@ -33,9 +41,13 @@ def _fake_new_group_factory(created_groups: list[SimpleNamespace]):
         (3, [1, 3], [3]),
     ],
 )
-def test_set_seq_parallel_pg_uses_explicit_sp_groups(rank, expected_ulysses, expected_ring, monkeypatch):
+def test_set_seq_parallel_pg_uses_explicit_sp_groups(
+    rank, expected_ulysses, expected_ring, monkeypatch
+):
     created_groups: list[SimpleNamespace] = []
-    monkeypatch.setattr(torch.distributed, "new_group", _fake_new_group_factory(created_groups))
+    monkeypatch.setattr(
+        torch.distributed, "new_group", _fake_new_group_factory(created_groups)
+    )
 
     # tp=2, sp=2 -> SP groups are non-contiguous: [0,2] and [1,3]
     sp_group_ranks = RankGenerator(2, 2, 1, 1, 1, "tp-sp-pp-cfg-dp").get_ranks("sp")
@@ -55,7 +67,9 @@ def test_set_seq_parallel_pg_uses_explicit_sp_groups(rank, expected_ulysses, exp
 @pytest.mark.cpu
 def test_set_seq_parallel_pg_validates_sp_group_ranks(monkeypatch):
     created_groups: list[SimpleNamespace] = []
-    monkeypatch.setattr(torch.distributed, "new_group", _fake_new_group_factory(created_groups))
+    monkeypatch.setattr(
+        torch.distributed, "new_group", _fake_new_group_factory(created_groups)
+    )
 
     # world_size=4, sp_size=2 -> expect 2 groups, provide 1 to trigger validation
     with pytest.raises(ValueError, match="Invalid sp_group_ranks"):

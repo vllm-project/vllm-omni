@@ -24,12 +24,16 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
 
-from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
+from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2Config,
+)
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2EncoderOutput,
     Qwen3TTSTokenizerV2Model,
 )
-from .tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Config
+from .tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1 import (
+    Qwen3TTSTokenizerV1Config,
+)
 from .tokenizer_25hz.modeling_qwen3_tts_tokenizer_v1 import (
     Qwen3TTSTokenizerV1EncoderOutput,
     Qwen3TTSTokenizerV1Model,
@@ -63,7 +67,9 @@ class Qwen3TTSTokenizer:
         self.device = None
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs) -> "Qwen3TTSTokenizer":
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str, **kwargs
+    ) -> "Qwen3TTSTokenizer":
         """
         Initialize tokenizer with HuggingFace `from_pretrained` style.
 
@@ -92,7 +98,9 @@ class Qwen3TTSTokenizer:
         inst.config = inst.model.config
 
         inst.feature_extractor = (
-            AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path) if load_feature_extractor else None
+            AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
+            if load_feature_extractor
+            else None
         )
 
         inst.device = getattr(inst.model, "device", None)
@@ -199,16 +207,22 @@ class Qwen3TTSTokenizer:
 
         # numpy list
         if sr is None:
-            raise ValueError("For numpy waveform input, you must provide `sr` (original sampling rate).")
+            raise ValueError(
+                "For numpy waveform input, you must provide `sr` (original sampling rate)."
+            )
 
         out: list[np.ndarray] = []
         for a in audios:  # type: ignore[assignment]
             if not isinstance(a, np.ndarray):
-                raise TypeError("Mixed input types are not supported. Use all paths/base64 or all numpy arrays.")
+                raise TypeError(
+                    "Mixed input types are not supported. Use all paths/base64 or all numpy arrays."
+                )
             if a.ndim > 1:
                 a = np.mean(a, axis=-1)
             if int(sr) != target_sr:
-                a = librosa.resample(y=a.astype(np.float32), orig_sr=int(sr), target_sr=target_sr)
+                a = librosa.resample(
+                    y=a.astype(np.float32), orig_sr=int(sr), target_sr=target_sr
+                )
             out.append(a.astype(np.float32))
         return out
 
@@ -309,10 +323,16 @@ class Qwen3TTSTokenizer:
         elif isinstance(encoded, list):
             # list of dicts
             audio_codes_list = [e["audio_codes"] for e in encoded]
-            xvectors_list = [e["xvectors"] for e in encoded] if ("xvectors" in encoded[0]) else None
-            ref_mels_list = [e["ref_mels"] for e in encoded] if ("ref_mels" in encoded[0]) else None
+            xvectors_list = (
+                [e["xvectors"] for e in encoded] if ("xvectors" in encoded[0]) else None
+            )
+            ref_mels_list = (
+                [e["ref_mels"] for e in encoded] if ("ref_mels" in encoded[0]) else None
+            )
         else:
-            raise TypeError("`encoded` must be an encode output, a dict, or a list of dicts.")
+            raise TypeError(
+                "`encoded` must be an encode output, a dict, or a list of dicts."
+            )
 
         # Ensure list form for per-sample tensors
         if isinstance(audio_codes_list, torch.Tensor):
@@ -327,8 +347,12 @@ class Qwen3TTSTokenizer:
             audio_codes_padded = t.to(self.device)
         else:
             # List[Tensor/np]
-            audio_codes_list = [_to_tensor(c, dtype=torch.long) for c in audio_codes_list]
-            audio_codes_padded = pad_sequence(audio_codes_list, batch_first=True, padding_value=-1).to(self.device)
+            audio_codes_list = [
+                _to_tensor(c, dtype=torch.long) for c in audio_codes_list
+            ]
+            audio_codes_padded = pad_sequence(
+                audio_codes_list, batch_first=True, padding_value=-1
+            ).to(self.device)
 
         with torch.inference_mode():
             if model_type == "qwen3_tts_tokenizer_25hz":
@@ -341,23 +365,38 @@ class Qwen3TTSTokenizer:
                         xvectors_batch = xvectors_batch.unsqueeze(0)
                     xvectors_batch = xvectors_batch.to(self.device).to(self.model.dtype)
                 else:
-                    xvectors_list = [_to_tensor(x, dtype=torch.float32) for x in xvectors_list]
-                    xvectors_batch = torch.stack(xvectors_list, dim=0).to(self.device).to(self.model.dtype)
+                    xvectors_list = [
+                        _to_tensor(x, dtype=torch.float32) for x in xvectors_list
+                    ]
+                    xvectors_batch = (
+                        torch.stack(xvectors_list, dim=0)
+                        .to(self.device)
+                        .to(self.model.dtype)
+                    )
 
                 if isinstance(ref_mels_list, torch.Tensor):
                     ref_mels_padded = ref_mels_list
                     if ref_mels_padded.dim() == 2:  # (T, M) -> (1, T, M)
                         ref_mels_padded = ref_mels_padded.unsqueeze(0)
-                    ref_mels_padded = ref_mels_padded.to(self.device).to(self.model.dtype)
+                    ref_mels_padded = ref_mels_padded.to(self.device).to(
+                        self.model.dtype
+                    )
                 else:
-                    ref_mels_list = [_to_tensor(m, dtype=torch.float32) for m in ref_mels_list]
+                    ref_mels_list = [
+                        _to_tensor(m, dtype=torch.float32) for m in ref_mels_list
+                    ]
                     ref_mels_padded = (
                         pad_sequence(ref_mels_list, batch_first=True, padding_value=0)
                         .to(self.device)
                         .to(self.model.dtype)
                     )
 
-                dec = self.model.decode(audio_codes_padded, xvectors_batch, ref_mels_padded, return_dict=True)
+                dec = self.model.decode(
+                    audio_codes_padded,
+                    xvectors_batch,
+                    ref_mels_padded,
+                    return_dict=True,
+                )
                 wav_tensors = dec.audio_values
 
             elif model_type == "qwen3_tts_tokenizer_12hz":

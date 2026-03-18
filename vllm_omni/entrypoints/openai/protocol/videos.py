@@ -50,7 +50,9 @@ class VideoParams(BaseModel):
     width: int | None = Field(default=None, ge=1, description="Video width in pixels")
     height: int | None = Field(default=None, ge=1, description="Video height in pixels")
     num_frames: int | None = Field(default=None, ge=1, description="Number of frames")
-    fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
+    fps: int | None = Field(
+        default=None, ge=1, description="Frames per second for output video"
+    )
 
     @property
     def size(self) -> str | None:
@@ -101,7 +103,9 @@ class VideoGenerationRequest(BaseModel):
     )
 
     # Video params block for extensibility
-    video_params: VideoParams | None = Field(default=None, description="Optional video-specific parameters")
+    video_params: VideoParams | None = Field(
+        default=None, description="Optional video-specific parameters"
+    )
 
     # User specific tracking field
     user: str | None = Field(default=None, description="User identifier for tracking")
@@ -109,11 +113,17 @@ class VideoGenerationRequest(BaseModel):
     # Video-specific fields (top-level for OpenAI-style compatibility)
     width: int | None = Field(default=None, ge=1, description="Video width in pixels")
     height: int | None = Field(default=None, ge=1, description="Video height in pixels")
-    fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
-    num_frames: int | None = Field(default=None, ge=1, description="Number of frames to generate")
+    fps: int | None = Field(
+        default=None, ge=1, description="Frames per second for output video"
+    )
+    num_frames: int | None = Field(
+        default=None, ge=1, description="Number of frames to generate"
+    )
 
     # vllm-omni extensions for diffusion control
-    negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
+    negative_prompt: str | None = Field(
+        default=None, description="Text describing what to avoid in the video"
+    )
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,
@@ -148,7 +158,9 @@ class VideoGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
-    seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    seed: int | None = Field(
+        default=None, description="Random seed for reproducibility"
+    )
 
     # vllm-omni extension for per-request LoRA.
     lora: dict[str, Any] | None = Field(
@@ -162,7 +174,12 @@ class VideoGenerationRequest(BaseModel):
     )
 
     def resolve_video_params(self) -> VideoParams:
-        vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
+        vp = VideoParams(
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            num_frames=self.num_frames,
+        )
 
         if self.video_params is not None:
             vp.width = vp.width or self.video_params.width
@@ -187,19 +204,27 @@ class VideoData(BaseModel):
 
     b64_json: str | None = Field(default=None, description="Base64-encoded MP4 video")
     url: str | None = Field(default=None, description="Video URL (not implemented)")
-    revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
+    revised_prompt: str | None = Field(
+        default=None, description="Revised prompt (OpenAI compatibility, always null)"
+    )
 
 
 class VideoGenerationResponse(BaseModel):
     """OpenAI-style video generation response."""
 
-    created: int = Field(..., description="Unix timestamp of when the generation completed")
+    created: int = Field(
+        ..., description="Unix timestamp of when the generation completed"
+    )
     data: list[VideoData] = Field(..., description="Array of generated videos")
 
 
 class VideoError(BaseModel):
-    code: str = Field(..., description="A machine-readable error code that was returned.")
-    message: str = Field(..., description="A human-readable description of the error that was returned.")
+    code: str = Field(
+        ..., description="A machine-readable error code that was returned."
+    )
+    message: str = Field(
+        ..., description="A human-readable description of the error that was returned."
+    )
 
 
 class VideoResponse(BaseModel):
@@ -207,20 +232,35 @@ class VideoResponse(BaseModel):
 
     # OpenAI standard fields
     model: str = Field(..., description="Model name used for video generation.")
-    prompt: str = Field(..., description="The prompt that was used to generate the video.")
+    prompt: str = Field(
+        ..., description="The prompt that was used to generate the video."
+    )
     id: str = Field(
-        default_factory=lambda: f"video_gen_{uuid.uuid4().hex}", description="Unique id for a video request"
+        default_factory=lambda: f"video_gen_{uuid.uuid4().hex}",
+        description="Unique id for a video request",
     )
-    object: Literal["video"] = Field(default="video", description="Object type identifier.")
+    object: Literal["video"] = Field(
+        default="video", description="Object type identifier."
+    )
     status: VideoGenerationStatus = Field(
-        default=VideoGenerationStatus.QUEUED, description="Current lifecycle status of the video job."
+        default=VideoGenerationStatus.QUEUED,
+        description="Current lifecycle status of the video job.",
     )
-    size: SizeStr | None = Field(default=None, description="Requested output size in WIDTHxHEIGHT format.")
-    progress: int = Field(default=0, description="Best-effort progress indicator from 0 to 100.")
-    seconds: SecondStr = Field(default="4", description="Requested clip length in seconds.")
-    quality: str = Field(default="default", description="Requested quality level for generation.")
+    size: SizeStr | None = Field(
+        default=None, description="Requested output size in WIDTHxHEIGHT format."
+    )
+    progress: int = Field(
+        default=0, description="Best-effort progress indicator from 0 to 100."
+    )
+    seconds: SecondStr = Field(
+        default="4", description="Requested clip length in seconds."
+    )
+    quality: str = Field(
+        default="default", description="Requested quality level for generation."
+    )
     completed_at: int | None = Field(
-        default=None, description="Unix timestamp (seconds) for when the job completed, if finished."
+        default=None,
+        description="Unix timestamp (seconds) for when the job completed, if finished.",
     )
     created_at: int = Field(
         default_factory=lambda: int(time.time()),
@@ -236,14 +276,21 @@ class VideoResponse(BaseModel):
     )
 
     # vLLM specific fields
-    media_type: Literal["video/mp4"] = Field(default="video/mp4", description="MIME type of the generated artifact.")
+    media_type: Literal["video/mp4"] = Field(
+        default="video/mp4", description="MIME type of the generated artifact."
+    )
 
-    expires_at: int | None = Field(default=None, description="Unix timestamp when this record is considered expired.")
+    expires_at: int | None = Field(
+        default=None,
+        description="Unix timestamp when this record is considered expired.",
+    )
     file_name: str | None = Field(
         default=None,
         description="Filename of the saved output video files for this job.",
     )
-    inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
+    inference_time_s: float | None = Field(
+        default=None, description="End-to-end inference time in seconds."
+    )
 
     @property
     def file_extension(self) -> str:
@@ -254,15 +301,20 @@ class VideoDeleteResponse(BaseModel):
     id: str = Field(description="Identifier of the deleted video.")
     deleted: bool = Field(description="Indicates that the video resource was deleted.")
     object: Literal["video.deleted"] = Field(
-        default="video.deleted", description="The object type that signals the deletion response."
+        default="video.deleted",
+        description="The object type that signals the deletion response.",
     )
 
 
 class VideoListResponse(BaseModel):
     """Paginated-style wrapper for listing stored video jobs."""
 
-    first_id: str | None = Field(..., description="The ID of the first item in the list.")
+    first_id: str | None = Field(
+        ..., description="The ID of the first item in the list."
+    )
     last_id: str | None = Field(..., description="The ID of the last item in the list.")
     has_more: bool = Field(..., description="Whether there are more items available.")
     data: list[VideoResponse] = Field(..., description="Array of video job records.")
-    object: Literal["list"] = Field(default="list", description="Object type identifier for list responses.")
+    object: Literal["list"] = Field(
+        default="list", description="Object type identifier for list responses."
+    )

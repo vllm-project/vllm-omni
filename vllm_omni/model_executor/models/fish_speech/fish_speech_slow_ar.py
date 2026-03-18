@@ -32,7 +32,11 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .configuration_fish_speech import FishSpeechConfig, FishSpeechFastARConfig, FishSpeechSlowARConfig
+from .configuration_fish_speech import (
+    FishSpeechConfig,
+    FishSpeechFastARConfig,
+    FishSpeechSlowARConfig,
+)
 from .fish_speech_fast_ar import FishSpeechFastAR
 
 logger = init_logger(__name__)
@@ -93,13 +97,19 @@ def _remap_fish_speech_weights(
 
                 new_suffix = suffix
                 new_suffix = new_suffix.replace(".attention.wo.", ".self_attn.o_proj.")
-                new_suffix = new_suffix.replace(".attention.q_norm.", ".self_attn.q_norm.")
-                new_suffix = new_suffix.replace(".attention.k_norm.", ".self_attn.k_norm.")
+                new_suffix = new_suffix.replace(
+                    ".attention.q_norm.", ".self_attn.q_norm."
+                )
+                new_suffix = new_suffix.replace(
+                    ".attention.k_norm.", ".self_attn.k_norm."
+                )
                 new_suffix = new_suffix.replace(".attention_norm.", ".input_layernorm.")
                 new_suffix = new_suffix.replace(".feed_forward.w1.", ".mlp.gate_proj.")
                 new_suffix = new_suffix.replace(".feed_forward.w3.", ".mlp.up_proj.")
                 new_suffix = new_suffix.replace(".feed_forward.w2.", ".mlp.down_proj.")
-                new_suffix = new_suffix.replace(".ffn_norm.", ".post_attention_layernorm.")
+                new_suffix = new_suffix.replace(
+                    ".ffn_norm.", ".post_attention_layernorm."
+                )
                 yield f"model.{new_suffix}", tensor
                 continue
 
@@ -146,13 +156,19 @@ def _remap_fish_speech_weights(
 
                 new_suffix = suffix
                 new_suffix = new_suffix.replace(".attention.wo.", ".self_attn.o_proj.")
-                new_suffix = new_suffix.replace(".attention.q_norm.", ".self_attn.q_norm.")
-                new_suffix = new_suffix.replace(".attention.k_norm.", ".self_attn.k_norm.")
+                new_suffix = new_suffix.replace(
+                    ".attention.q_norm.", ".self_attn.q_norm."
+                )
+                new_suffix = new_suffix.replace(
+                    ".attention.k_norm.", ".self_attn.k_norm."
+                )
                 new_suffix = new_suffix.replace(".attention_norm.", ".input_layernorm.")
                 new_suffix = new_suffix.replace(".feed_forward.w1.", ".mlp.gate_proj.")
                 new_suffix = new_suffix.replace(".feed_forward.w3.", ".mlp.up_proj.")
                 new_suffix = new_suffix.replace(".feed_forward.w2.", ".mlp.down_proj.")
-                new_suffix = new_suffix.replace(".ffn_norm.", ".post_attention_layernorm.")
+                new_suffix = new_suffix.replace(
+                    ".ffn_norm.", ".post_attention_layernorm."
+                )
                 yield f"fast_ar.model.{new_suffix}", tensor
                 continue
 
@@ -192,7 +208,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         self.talker_mtp_output_key = "audio_codes"
 
         # Qwen3 transformer backbone.
-        self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = Qwen3Model(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
 
         # Fish Speech uses interleaved (GPT-J) RoPE, not NeoX style.
         # vLLM's Qwen3Attention defaults to NeoX (is_neox_style=True).
@@ -210,7 +228,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(self.text_config.vocab_size)
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
         # Multi-codebook embedding table: codebook_size * num_codebooks entries.
         self.codebook_embeddings = nn.Embedding(
@@ -221,7 +241,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         # Fast AR (residual codebook predictor).
         predictor_compilation = dataclasses.replace(vllm_config.compilation_config)
         predictor_compilation.static_forward_context = {}
-        self._fast_ar_vllm_config = dataclasses.replace(vllm_config, compilation_config=predictor_compilation)
+        self._fast_ar_vllm_config = dataclasses.replace(
+            vllm_config, compilation_config=predictor_compilation
+        )
         from vllm.config.vllm import set_current_vllm_config as _set_cfg
 
         with _set_cfg(self._fast_ar_vllm_config):
@@ -263,14 +285,19 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             head_dim = attn.head_dim
             max_position = self.text_config.max_position_embeddings
             rope_params = getattr(self.text_config, "rope_scaling", None) or {}
-            rope_params.setdefault("rope_theta", getattr(self.text_config, "rope_theta", 1000000.0))
+            rope_params.setdefault(
+                "rope_theta", getattr(self.text_config, "rope_theta", 1000000.0)
+            )
             attn.rotary_emb = get_rope(
                 head_size=head_dim,
                 max_position=max_position,
                 is_neox_style=False,
                 rope_parameters=rope_params,
             )
-        logger.info("Fixed RoPE style to interleaved (GPT-J) for %d layers", len(self.model.layers))
+        logger.info(
+            "Fixed RoPE style to interleaved (GPT-J) for %d layers",
+            len(self.model.layers),
+        )
 
     # -------------------- vLLM required hooks --------------------
 
@@ -306,7 +333,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
     # -------------------- Omni multimodal output plumbing --------------------
 
-    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+    def make_omni_output(
+        self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any
+    ) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
@@ -324,7 +353,10 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 audio_codes_list.append(ac)
 
         if not audio_codes_list:
-            logger.debug("make_omni_output: no audio_codes found in info_dicts (len=%d)", len(info_dicts))
+            logger.debug(
+                "make_omni_output: no audio_codes found in info_dicts (len=%d)",
+                len(info_dicts),
+            )
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
         audio_codes = torch.cat(audio_codes_list, dim=0)
@@ -343,19 +375,32 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         additional_information = info_dict.get("additional_information")
         if isinstance(additional_information, dict):
-            merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
+            merged: dict[str, Any] = {
+                k: v for k, v in info_dict.items() if k != "additional_information"
+            }
             for k, v in additional_information.items():
                 merged.setdefault(k, v)
             info_dict = merged
 
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
-            return input_ids, input_embeds if input_embeds is not None else self.embed_input_ids(input_ids), {}
+            return (
+                input_ids,
+                (
+                    input_embeds
+                    if input_embeds is not None
+                    else self.embed_input_ids(input_ids)
+                ),
+                {},
+            )
 
         if span_len > 1:
             # --- Prefill ---
             prompt_embeds_cpu = info_dict.get("slow_ar_prompt_embeds")
-            is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
+            is_first_prefill = (
+                not isinstance(prompt_embeds_cpu, torch.Tensor)
+                or prompt_embeds_cpu.ndim != 2
+            )
             dev = input_ids.device
 
             if is_first_prefill:
@@ -371,9 +416,13 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 if int(take.shape[0]) < span_len:
                     pad_n = span_len - int(take.shape[0])
                     pad_embed = self.embed_input_ids(
-                        torch.tensor([self._audio_pad_token_id], device=dev, dtype=torch.long)
+                        torch.tensor(
+                            [self._audio_pad_token_id], device=dev, dtype=torch.long
+                        )
                     ).reshape(1, -1)
-                    take = torch.cat([take, pad_embed.detach().cpu().expand(pad_n, -1)], dim=0)
+                    take = torch.cat(
+                        [take, pad_embed.detach().cpu().expand(pad_n, -1)], dim=0
+                    )
                 prompt_embeds = take.to(device=dev, dtype=torch.bfloat16)
                 info_update["prefill_offset"] = span_len
 
@@ -397,12 +446,20 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 if int(take.shape[0]) < span_len:
                     pad_n = span_len - int(take.shape[0])
                     pad_embed = self.embed_input_ids(
-                        torch.tensor([self._audio_pad_token_id], device=dev, dtype=torch.long)
+                        torch.tensor(
+                            [self._audio_pad_token_id], device=dev, dtype=torch.long
+                        )
                     ).reshape(1, -1)
-                    take = torch.cat([take, pad_embed.detach().cpu().expand(pad_n, -1)], dim=0)
+                    take = torch.cat(
+                        [take, pad_embed.detach().cpu().expand(pad_n, -1)], dim=0
+                    )
                 prompt_embeds = take.to(device=dev, dtype=torch.bfloat16)
 
-                zeros = torch.zeros((prompt_embeds.shape[0], self._num_codebooks), device=dev, dtype=torch.long)
+                zeros = torch.zeros(
+                    (prompt_embeds.shape[0], self._num_codebooks),
+                    device=dev,
+                    dtype=torch.long,
+                )
                 return (
                     input_ids.clone().fill_(self._audio_pad_token_id),
                     prompt_embeds,
@@ -423,7 +480,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 "returning plain embed (mtp_inputs will NOT be set)",
                 list(info_dict.keys()),
             )
-            embeds = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).reshape(1, -1)
+            embeds = self.embed_input_ids(
+                input_ids.reshape(1, 1).to(torch.long)
+            ).reshape(1, -1)
             return input_ids, embeds.to(dtype=torch.bfloat16), {}
 
         token_embed = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
@@ -438,7 +497,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         info_update = {
             "mtp_inputs": (
                 last_hidden_cpu.to(device=dev, dtype=torch.bfloat16).reshape(1, -1),
-                torch.zeros(1, self.text_config.hidden_size, device=dev, dtype=torch.bfloat16),
+                torch.zeros(
+                    1, self.text_config.hidden_size, device=dev, dtype=torch.bfloat16
+                ),
             ),
         }
         return input_ids, inputs_embeds_out, info_update
@@ -448,14 +509,18 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             logger.debug("postprocess: empty hidden_states")
             return {}
         last = hidden_states[-1, :].detach().to("cpu").contiguous()
-        logger.debug("postprocess: saved last_slow_ar_hidden shape=%s", tuple(last.shape))
+        logger.debug(
+            "postprocess: saved last_slow_ar_hidden shape=%s", tuple(last.shape)
+        )
         return {"last_slow_ar_hidden": last}
 
     # -------------------- prompt construction --------------------
 
     def _get_tokenizer(self):
         if self._tokenizer is None:
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path, trust_remote_code=True
+            )
         return self._tokenizer
 
     def _build_prefill_embeds(
@@ -470,7 +535,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         """
         dev = input_ids.device
         # Basic text embeddings.
-        base_embeds = self.embed_input_ids(input_ids.reshape(1, -1).to(torch.long))  # [1, T, H]
+        base_embeds = self.embed_input_ids(
+            input_ids.reshape(1, -1).to(torch.long)
+        )  # [1, T, H]
 
         # Check for reference codebook codes (for voice cloning).
         ref_codes = info_dict.get("ref_codes")
@@ -526,7 +593,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         dev = input_embeds.device
 
         input_ids = input_ids.reshape(bsz, 1).to(dtype=torch.long, device=dev)
-        past_hidden = last_talker_hidden.reshape(bsz, -1).to(dtype=torch.bfloat16, device=dev)
+        past_hidden = last_talker_hidden.reshape(bsz, -1).to(
+            dtype=torch.bfloat16, device=dev
+        )
 
         # Run Fast AR to predict all num_codebooks codes.
         audio_codes = self.fast_ar(
@@ -547,7 +616,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             is_semantic = self._semantic_begin_id <= token_id <= self._semantic_end_id
             if is_semantic:
                 codes = audio_codes[b]  # [num_codebooks]
-                codebook_sum = torch.zeros(self.text_config.hidden_size, device=dev, dtype=torch.bfloat16)
+                codebook_sum = torch.zeros(
+                    self.text_config.hidden_size, device=dev, dtype=torch.bfloat16
+                )
                 for i in range(self._num_codebooks):
                     code_with_offset = codes[i].clamp(min=0) + i * self._codebook_size
                     emb = self.codebook_embeddings(code_with_offset.unsqueeze(0))
@@ -555,7 +626,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
                 # Normalize by sqrt(num_codebooks + 1) as in the reference model
                 # (scale_codebook_embeddings=True for fish_qwen3_omni).
-                inputs_embeds_out[b] = (inputs_embeds_out[b] + codebook_sum) / math.sqrt(self._num_codebooks + 1)
+                inputs_embeds_out[b] = (
+                    inputs_embeds_out[b] + codebook_sum
+                ) / math.sqrt(self._num_codebooks + 1)
 
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)
 
@@ -568,7 +641,11 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
     ) -> int:
         """Estimate prompt length for placeholder allocation."""
         info = additional_information or {}
-        text = info.get("text", [""])[0] if isinstance(info.get("text"), list) else info.get("text", "")
+        text = (
+            info.get("text", [""])[0]
+            if isinstance(info.get("text"), list)
+            else info.get("text", "")
+        )
         # Conservative estimate: tokenize text length + overhead.
         return max(2, len(str(text)) // 2 + 64)
 
@@ -616,7 +693,10 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 continue
 
             # Handle tied embeddings → lm_head.
-            if name == "model.embed_tokens.weight" and self.text_config.tie_word_embeddings:
+            if (
+                name == "model.embed_tokens.weight"
+                and self.text_config.tie_word_embeddings
+            ):
                 # Also load into lm_head if present.
                 lm_key = "lm_head.weight"
                 if lm_key in params_dict:
@@ -653,17 +733,24 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        logger.info("Loaded %d weights for FishSpeechSlowARForConditionalGeneration", len(loaded_params))
+        logger.info(
+            "Loaded %d weights for FishSpeechSlowARForConditionalGeneration",
+            len(loaded_params),
+        )
 
         # Truncate RoPE cos/sin caches to bf16 precision to match training.
         # Without this, f32 RoPE values cause logit divergence and premature EOS.
         truncated = 0
         for module in self.modules():
-            if hasattr(module, "cos_sin_cache") and isinstance(module.cos_sin_cache, torch.Tensor):
+            if hasattr(module, "cos_sin_cache") and isinstance(
+                module.cos_sin_cache, torch.Tensor
+            ):
                 cache = module.cos_sin_cache
                 module.cos_sin_cache = cache.to(torch.bfloat16).to(cache.dtype)
                 truncated += 1
         if truncated:
-            logger.info("Truncated %d RoPE cos_sin_cache buffers to bf16 precision", truncated)
+            logger.info(
+                "Truncated %d RoPE cos_sin_cache buffers to bf16 precision", truncated
+            )
 
         return loaded_params

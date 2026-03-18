@@ -29,9 +29,13 @@ def randn_tensor(
 ) -> torch.Tensor:
     bsz = shape[0]
     if bsz % noise_repeat != 0:
-        raise ValueError(f"Batch size ({bsz}) must be divisible by noise repeat ({noise_repeat})")
+        raise ValueError(
+            f"Batch size ({bsz}) must be divisible by noise repeat ({noise_repeat})"
+        )
     _shape = (noise_repeat,) + shape[1:]
-    _tensor = torch.randn(_shape, device=device, dtype=dtype).repeat(bsz // noise_repeat, 1)
+    _tensor = torch.randn(_shape, device=device, dtype=dtype).repeat(
+        bsz // noise_repeat, 1
+    )
     return _tensor
 
 
@@ -66,7 +70,9 @@ class ResBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(self.intermediate_size, self.channels),
         )
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(channels, 3 * channels, bias=True))
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(channels, 3 * channels, bias=True)
+        )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
@@ -83,9 +89,13 @@ class ResBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, model_channels: int, out_channels: int):
         super().__init__()
-        self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
+        self.norm_final = nn.LayerNorm(
+            model_channels, elementwise_affine=False, eps=1e-6
+        )
         self.linear = nn.Linear(model_channels, out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(model_channels, 2 * model_channels, bias=True))
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(model_channels, 2 * model_channels, bias=True)
+        )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
@@ -110,15 +120,21 @@ class TimestepEmbedder(nn.Module):
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
-    def timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
+    def timestep_embedding(
+        t: torch.Tensor, dim: int, max_period: float = 10000.0
+    ) -> torch.Tensor:
         half = dim // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
-            device=t.device
-        )
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32)
+            / half
+        ).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
         return embedding
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
@@ -149,7 +165,9 @@ class SimpleMLPAdaLN(nn.Module):
         self.cond_embed = nn.Linear(cond_dim, dim)
         self.input_proj = nn.Linear(input_dim, dim)
 
-        self.res_blocks = nn.ModuleList([ResBlock(dim, mlp_ratio) for _ in range(layers)])
+        self.res_blocks = nn.ModuleList(
+            [ResBlock(dim, mlp_ratio) for _ in range(layers)]
+        )
         self.final_layer = FinalLayer(dim, input_dim)
 
         self.initialize_weights()
@@ -175,7 +193,9 @@ class SimpleMLPAdaLN(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor
+    ) -> torch.Tensor:
         x = self.input_proj(x)
         t = self.time_embed(t)
         c = self.cond_embed(c)
@@ -246,7 +266,11 @@ class FlowMatchingHead(nn.Module):
             velocity = uncond_v + cfg * (cond_v - uncond_v)
         elif cfg_mult == 3:
             cond_v, uncond_v1, uncond_v2 = torch.chunk(velocity, 3, dim=0)
-            velocity = uncond_v2 + cfg_img * (uncond_v1 - uncond_v2) + cfg * (cond_v - uncond_v1)
+            velocity = (
+                uncond_v2
+                + cfg_img * (uncond_v1 - uncond_v2)
+                + cfg * (cond_v - uncond_v1)
+            )
         return velocity
 
     @torch.no_grad()
@@ -275,7 +299,9 @@ class FlowMatchingHead(nn.Module):
                 f"Invalid CFG layout: condition batch size {c.shape[0]} is not divisible by cfg_mult={cfg_mult}."
             )
 
-        noise = randn_tensor((c.shape[0] // cfg_mult, self.input_dim), noise_repeat, self.device)
+        noise = randn_tensor(
+            (c.shape[0] // cfg_mult, self.input_dim), noise_repeat, self.device
+        )
 
         x = noise
         xs = []
@@ -293,17 +319,26 @@ class FlowMatchingHead(nn.Module):
             velocity = velocity.to(torch.float32)
 
             velocity = self.get_velocity_from_cfg(velocity, cfg, cfg_img, cfg_mult)
-            score = self.get_score_from_velocity(velocity, x, ti.expand(x.shape[0]).to(x))
+            score = self.get_score_from_velocity(
+                velocity, x, ti.expand(x.shape[0]).to(x)
+            )
             drift = velocity + (1 - expand_t(ti.expand(x.shape[0]).to(x), x)) * score
 
-            w_cur = randn_tensor((c.shape[0] // cfg_mult, self.input_dim), noise_repeat, self.device)
+            w_cur = randn_tensor(
+                (c.shape[0] // cfg_mult, self.input_dim), noise_repeat, self.device
+            )
             dw = w_cur * torch.sqrt(dt)
 
             mean_x = x + drift * dt
-            x = mean_x + torch.sqrt(2 * (1 - expand_t(ti.expand(x.shape[0]).to(x), x))) * dw
+            x = (
+                mean_x
+                + torch.sqrt(2 * (1 - expand_t(ti.expand(x.shape[0]).to(x), x))) * dw
+            )
             xs.append(x)
 
         if len(xs) != num_sampling_steps:
-            raise ValueError(f"Samples ({len(xs)}) does not match the number of steps ({num_sampling_steps})")
+            raise ValueError(
+                f"Samples ({len(xs)}) does not match the number of steps ({num_sampling_steps})"
+            )
 
         return xs[-1].to(c.dtype)

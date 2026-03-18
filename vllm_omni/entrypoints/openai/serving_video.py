@@ -20,7 +20,11 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationResponse,
 )
 from vllm_omni.entrypoints.openai.video_api_utils import encode_video_base64
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniSamplingParams,
+    OmniTextPrompt,
+)
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -168,7 +172,11 @@ class OmniOpenAIServingVideo:
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail="Invalid lora field: expected an object.",
             )
-        lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
+        lora_name = (
+            lora_body.get("name")
+            or lora_body.get("lora_name")
+            or lora_body.get("adapter")
+        )
         lora_path = (
             lora_body.get("local_path")
             or lora_body.get("path")
@@ -190,7 +198,9 @@ class OmniOpenAIServingVideo:
                 detail="Invalid lora object: both name and path are required.",
             )
 
-        gen_params.lora_request = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+        gen_params.lora_request = LoRARequest(
+            str(lora_name), int(lora_int_id), str(lora_path)
+        )
         if lora_scale is not None:
             gen_params.lora_scale = float(lora_scale)
 
@@ -207,7 +217,9 @@ class OmniOpenAIServingVideo:
             has_stage_list,
             type(self._engine_client).__name__,
         )
-        stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
+        stage_configs = self._stage_configs or getattr(
+            self._engine_client, "stage_configs", None
+        )
 
         if not stage_configs:
             if not hasattr(self._engine_client, "stage_list"):
@@ -235,7 +247,9 @@ class OmniOpenAIServingVideo:
         engine_client = cast(AsyncOmni, self._engine_client)
         stage_list = getattr(engine_client, "stage_list", None)
         if isinstance(stage_list, list):
-            sampling_params_list: list[OmniSamplingParams] = [gen_params for _ in stage_list]
+            sampling_params_list: list[OmniSamplingParams] = [
+                gen_params for _ in stage_list
+            ]
         else:
             sampling_params_list = [gen_params]
 
@@ -291,9 +305,16 @@ class OmniOpenAIServingVideo:
                 videos = request_output["images"]
             elif hasattr(request_output, "images") and request_output.images:
                 videos = request_output.images
-            elif hasattr(request_output, "multimodal_output") and request_output.multimodal_output:
+            elif (
+                hasattr(request_output, "multimodal_output")
+                and request_output.multimodal_output
+            ):
                 videos = request_output.multimodal_output.get("video")
-        if videos is None and hasattr(result, "multimodal_output") and result.multimodal_output:
+        if (
+            videos is None
+            and hasattr(result, "multimodal_output")
+            and result.multimodal_output
+        ):
             videos = result.multimodal_output.get("video")
 
         normalized = self._normalize_video_outputs(videos)
@@ -311,22 +332,33 @@ class OmniOpenAIServingVideo:
             audio = result.multimodal_output.get("audio")
         elif hasattr(result, "request_output"):
             request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("multimodal_output"):
+            if isinstance(request_output, dict) and request_output.get(
+                "multimodal_output"
+            ):
                 mm_output = request_output.get("multimodal_output") or {}
                 audio = mm_output.get("audio")
-            elif hasattr(request_output, "multimodal_output") and request_output.multimodal_output:
+            elif (
+                hasattr(request_output, "multimodal_output")
+                and request_output.multimodal_output
+            ):
                 audio = request_output.multimodal_output.get("audio")
 
         if audio is None:
             return [None] * expected_count
 
         if isinstance(audio, (list, tuple)):
-            if len(audio) == expected_count and any(hasattr(item, "shape") or hasattr(item, "ndim") for item in audio):
+            if len(audio) == expected_count and any(
+                hasattr(item, "shape") or hasattr(item, "ndim") for item in audio
+            ):
                 return list(audio)
             if expected_count == 1:
                 return [audio]
 
-        if hasattr(audio, "ndim") and getattr(audio, "ndim", None) is not None and audio.ndim > 1:
+        if (
+            hasattr(audio, "ndim")
+            and getattr(audio, "ndim", None) is not None
+            and audio.ndim > 1
+        ):
             first_dim = getattr(audio, "shape", [0])[0]
             if first_dim == expected_count:
                 return [audio[i] for i in range(expected_count)]
@@ -389,15 +421,26 @@ class OmniOpenAIServingVideo:
         if config is None:
             return None
 
-        for attr_name in ("output_sampling_rate", "audio_sample_rate", "sample_rate", "sampling_rate"):
-            raw_value = config.get(attr_name) if isinstance(config, dict) else getattr(config, attr_name, None)
+        for attr_name in (
+            "output_sampling_rate",
+            "audio_sample_rate",
+            "sample_rate",
+            "sampling_rate",
+        ):
+            raw_value = (
+                config.get(attr_name)
+                if isinstance(config, dict)
+                else getattr(config, attr_name, None)
+            )
             sample_rate = cls._coerce_audio_sample_rate(raw_value)
             if sample_rate is not None:
                 return sample_rate
 
         for component_name in ("vocoder", "audio_vae"):
             component = (
-                config.get(component_name) if isinstance(config, dict) else getattr(config, component_name, None)
+                config.get(component_name)
+                if isinstance(config, dict)
+                else getattr(config, component_name, None)
             )
             if component is None:
                 continue
@@ -407,7 +450,9 @@ class OmniOpenAIServingVideo:
                 return sample_rate
 
             component_config = (
-                component.get("config") if isinstance(component, dict) else getattr(component, "config", None)
+                component.get("config")
+                if isinstance(component, dict)
+                else getattr(component, "config", None)
             )
             sample_rate = cls._extract_audio_sample_rate_from_config(component_config)
             if sample_rate is not None:

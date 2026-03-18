@@ -122,7 +122,9 @@ class TeaCacheBackend(CacheBackend):
         # Mark as enabled
         self.enabled = True
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(
+        self, pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """
         Refresh TeaCache state for new generation.
 
@@ -143,10 +145,14 @@ class TeaCacheBackend(CacheBackend):
             if hook is not None:
                 transformer._hook_registry.reset_hook(TeaCacheHook._HOOK_NAME)
                 if verbose:
-                    logger.debug(f"TeaCache state refreshed (num_inference_steps={num_inference_steps})")
+                    logger.debug(
+                        f"TeaCache state refreshed (num_inference_steps={num_inference_steps})"
+                    )
             else:
                 if verbose:
                     logger.warning("TeaCache hook not found, nothing to refresh")
         else:
             if verbose:
-                logger.warning("Transformer has no hook registry, TeaCache may not be applied")
+                logger.warning(
+                    "Transformer has no hook registry, TeaCache may not be applied"
+                )

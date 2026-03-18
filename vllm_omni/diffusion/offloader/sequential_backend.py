@@ -185,7 +185,9 @@ class ModelLevelOffloadBackend(OffloadBackend):
 
         modules = ModuleDiscovery.discover(pipeline)
         if not modules.dits:
-            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
+            logger.warning(
+                "No DiT/transformer modules found, skipping model-level offloading"
+            )
             return
         if not modules.encoders:
             logger.warning("No encoder modules found, skipping model-level offloading")

@@ -64,14 +64,22 @@ def normalize_layer_kv(
             return None
     elif isinstance(layer_kv, tuple):
         if len(layer_kv) != 2:
-            logger.warning(f"Layer {layer_idx} for request {req_id} has KV pair length {len(layer_kv)} (expected 2)")
+            logger.warning(
+                f"Layer {layer_idx} for request {req_id} has KV pair length {len(layer_kv)} (expected 2)"
+            )
             return None
         key_blocks, value_blocks = layer_kv
-        if not isinstance(key_blocks, torch.Tensor) or not isinstance(value_blocks, torch.Tensor):
-            logger.warning(f"Layer {layer_idx} for request {req_id} has non-tensor KV pair entries")
+        if not isinstance(key_blocks, torch.Tensor) or not isinstance(
+            value_blocks, torch.Tensor
+        ):
+            logger.warning(
+                f"Layer {layer_idx} for request {req_id} has non-tensor KV pair entries"
+            )
             return None
     else:
-        logger.warning(f"Layer {layer_idx} for request {req_id} has unsupported KV type {type(layer_kv).__name__}")
+        logger.warning(
+            f"Layer {layer_idx} for request {req_id} has unsupported KV type {type(layer_kv).__name__}"
+        )
         return None
 
     # ensure key/value blocks are at least 2D for block indexing

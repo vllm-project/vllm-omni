@@ -69,7 +69,9 @@ def _get_required_env() -> dict[str, str]:
     }
     missing = [k for k, v in required.items() if not (v and str(v).strip())]
     if missing:
-        raise SystemExit(f"Missing required env vars: {', '.join(missing)}. Set them (e.g. in Buildkite secrets).")
+        raise SystemExit(
+            f"Missing required env vars: {', '.join(missing)}. Set them (e.g. in Buildkite secrets)."
+        )
     return {k: _strip_quoted(str(v)) for k, v in required.items()}
 
 
@@ -90,7 +92,9 @@ def _get_latest_file(path: str) -> str | list[str]:
     import glob
 
     # Support comma-/semicolon-separated list: e.g. "*.xlsx, *.html; reports/foo.xlsx"
-    parts = [p.strip() for p in path.split(";") for p in p.split(",") if p and p.strip()]
+    parts = [
+        p.strip() for p in path.split(";") for p in p.split(",") if p and p.strip()
+    ]
     if len(parts) > 1:
         files: list[str] = []
         for part in parts:
@@ -108,7 +112,11 @@ def _get_latest_file(path: str) -> str | list[str]:
 
     # Directory: return all files inside
     if os.path.isdir(path):
-        files = [os.path.join(path, f) for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+        files = [
+            os.path.join(path, f)
+            for f in os.listdir(path)
+            if os.path.isfile(os.path.join(path, f))
+        ]
         if not files:
             raise SystemExit(f"No files found in {path}")
         return sorted(files)
@@ -139,7 +147,9 @@ def _get_latest_file(path: str) -> str | list[str]:
 
 def _recipients_list(comma_separated: str) -> list[str]:
     """Parse DAILY_EMAIL_LIST into a list of addresses."""
-    return [_strip_quoted(a.strip()) for a in comma_separated.split(",") if a and a.strip()]
+    return [
+        _strip_quoted(a.strip()) for a in comma_separated.split(",") if a and a.strip()
+    ]
 
 
 def _build_body(
@@ -227,9 +237,15 @@ def _send_mail(
     raw_prefix = os.environ.get(ENV_EMAIL_SUBJECT_PREFIX)
     prefix = _strip_quoted(raw_prefix) if raw_prefix else None
 
-    attachment_skipped = any(os.path.isfile(p) and os.path.getsize(p) >= MAX_ATTACHMENT_BYTES for p in report_files)
+    attachment_skipped = any(
+        os.path.isfile(p) and os.path.getsize(p) >= MAX_ATTACHMENT_BYTES
+        for p in report_files
+    )
     body = _build_body(
-        commit_sha=commit_sha, build_url=build_url, date_str=date_str, attachment_skipped=attachment_skipped
+        commit_sha=commit_sha,
+        build_url=build_url,
+        date_str=date_str,
+        attachment_skipped=attachment_skipped,
     )
     subject = _build_subject(prefix=prefix, date_str=date_str)
 
@@ -241,7 +257,10 @@ def _send_mail(
 
     attached_count = 0
     for file_path in report_files:
-        if os.path.isfile(file_path) and os.path.getsize(file_path) >= MAX_ATTACHMENT_BYTES:
+        if (
+            os.path.isfile(file_path)
+            and os.path.getsize(file_path) >= MAX_ATTACHMENT_BYTES
+        ):
             attachment_skipped = True
         else:
             if _attach_file(msg, file_path, MAX_ATTACHMENT_BYTES):
@@ -253,8 +272,19 @@ def _send_mail(
         LOGGER.info("dry-run: not sending mail")
         print("To:", recipients, file=sys.stderr)
         print("Subject:", subject, file=sys.stderr)
-        print("Attachments:", attached_count, "(skipped large:", attachment_skipped, ")", file=sys.stderr)
-        print("Body preview:", body[:300] + ("..." if len(body) > 300 else ""), file=sys.stderr)
+        print(
+            "Attachments:",
+            attached_count,
+            "(skipped large:",
+            attachment_skipped,
+            ")",
+            file=sys.stderr,
+        )
+        print(
+            "Body preview:",
+            body[:300] + ("..." if len(body) > 300 else ""),
+            file=sys.stderr,
+        )
         return
 
     host = cfg[ENV_SMTP_HOST]
@@ -276,7 +306,9 @@ def _send_mail(
             return
         except Exception as e:
             last_err = e
-            LOGGER.warning("SMTP attempt %d/%d failed: %s", attempt + 1, SMTP_RETRIES, e)
+            LOGGER.warning(
+                "SMTP attempt %d/%d failed: %s", attempt + 1, SMTP_RETRIES, e
+            )
             if attempt < SMTP_RETRIES - 1:
                 import time
 
@@ -284,7 +316,9 @@ def _send_mail(
     hint = ""
     if last_err and "getaddrinfo" in str(last_err).lower():
         hint = f" (check SMTP_HOST={host!r} is correct and reachable, e.g. nslookup {host})"
-    raise SystemExit(f"Failed to send email after {SMTP_RETRIES} attempts.{hint}") from last_err
+    raise SystemExit(
+        f"Failed to send email after {SMTP_RETRIES} attempts.{hint}"
+    ) from last_err
 
 
 def _vllm_omni_root() -> str:
@@ -294,13 +328,19 @@ def _vllm_omni_root() -> str:
         if os.path.isdir(os.path.join(path, "tests")):
             return path
         path = os.path.dirname(path)
-    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    return os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    )
 
 
 def _default_output_dir() -> str:
     """Default: vllm-omni root / DEFAULT_OUTPUT_DIR (where nightly report files live)."""
     root = _vllm_omni_root()
-    subdir = DEFAULT_OUTPUT_DIR if (DEFAULT_OUTPUT_DIR and DEFAULT_OUTPUT_DIR.strip()) else "."
+    subdir = (
+        DEFAULT_OUTPUT_DIR
+        if (DEFAULT_OUTPUT_DIR and DEFAULT_OUTPUT_DIR.strip())
+        else "."
+    )
     return os.path.join(root, subdir)
 
 

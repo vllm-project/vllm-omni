@@ -18,7 +18,9 @@ class Scheduler:
     def initialize(self, od_config: OmniDiffusionConfig):
         existing_mq = getattr(self, "mq", None)
         if existing_mq is not None and not existing_mq.closed:
-            logger.warning("SyncSchedulerClient is already initialized. Re-initializing.")
+            logger.warning(
+                "SyncSchedulerClient is already initialized. Re-initializing."
+            )
             self.close()
 
         self.num_workers = od_config.num_gpus
@@ -70,7 +72,9 @@ class Scheduler:
                 try:
                     unpack_diffusion_output_shm(output)
                 except Exception as e:
-                    logger.warning("SHM unpack failed (data may already be inline): %s", e)
+                    logger.warning(
+                        "SHM unpack failed (data may already be inline): %s", e
+                    )
 
                 # {"status": "error", "error": str(e)}
                 if isinstance(output, dict) and output.get("status") == "error":

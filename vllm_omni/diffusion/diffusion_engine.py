@@ -97,7 +97,9 @@ class DiffusionEngine:
             logger.warning("Output is None, returning empty OmniRequestOutput")
             return [
                 OmniRequestOutput.from_diffusion(
-                    request_id=request.request_ids[i] if i < len(request.request_ids) else "",
+                    request_id=(
+                        request.request_ids[i] if i < len(request.request_ids) else ""
+                    ),
                     images=[],
                     prompt=prompt,
                     metrics={},
@@ -107,7 +109,11 @@ class DiffusionEngine:
             ]
 
         postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+        outputs = (
+            self.post_process_func(output.output)
+            if self.post_process_func is not None
+            else output.output
+        )
         audio_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
@@ -132,7 +138,10 @@ class DiffusionEngine:
 
         metrics = {
             "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
+            "diffusion_engine_exec_time_ms": (
+                time.perf_counter() - diffusion_engine_start_time
+            )
+            * 1000,
             "diffusion_engine_total_time_ms": exec_total_time * 1000,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
@@ -182,17 +191,25 @@ class DiffusionEngine:
             output_idx = 0
 
             for i, prompt in enumerate(request.prompts):
-                request_id = request.request_ids[i] if i < len(request.request_ids) else ""
+                request_id = (
+                    request.request_ids[i] if i < len(request.request_ids) else ""
+                )
 
                 # Get images for this request
                 num_outputs = request.sampling_params.num_outputs_per_prompt
                 start_idx = output_idx
                 end_idx = start_idx + num_outputs
-                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
+                request_outputs = (
+                    outputs[start_idx:end_idx] if output_idx < len(outputs) else []
+                )
                 output_idx = end_idx
 
                 if supports_audio_output(self.od_config.model_class_name):
-                    request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
+                    request_audio_payload = (
+                        request_outputs[0]
+                        if len(request_outputs) == 1
+                        else request_outputs
+                    )
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -212,8 +229,14 @@ class DiffusionEngine:
                             sliced_audio = audio_payload[start_idx:end_idx]
                             if len(sliced_audio) == 1:
                                 sliced_audio = sliced_audio[0]
-                        elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
-                            if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
+                        elif (
+                            hasattr(audio_payload, "shape")
+                            and getattr(audio_payload, "shape", None) is not None
+                        ):
+                            if (
+                                len(audio_payload.shape) > 0
+                                and audio_payload.shape[0] >= end_idx
+                            ):
                                 sliced_audio = audio_payload[start_idx:end_idx]
                                 if num_outputs == 1:
                                     sliced_audio = sliced_audio[0]
@@ -333,7 +356,9 @@ class DiffusionEngine:
 
                 # Optional: warn if path looks suspicious (e.g. still .json)
                 if not trace_path.endswith((".json.gz", ".json")):
-                    logger.warning(f"Rank {rank}: unusual trace path extension: {trace_path}")
+                    logger.warning(
+                        f"Rank {rank}: unusual trace path extension: {trace_path}"
+                    )
 
             # 2. Table file — plain text
             table = res.get("table")
@@ -359,7 +384,9 @@ class DiffusionEngine:
                 f"{' ...' if len(output_files['traces']) > 3 else ''}"
             )
         else:
-            logger.info("Profiling stopped — no trace files were collected from any rank.")
+            logger.info(
+                "Profiling stopped — no trace files were collected from any rank."
+            )
 
         if output_files["tables"]:
             logger.debug(f"Collected {len(output_files['tables'])} profiling table(s)")
@@ -381,7 +408,9 @@ class DiffusionEngine:
         if supports_audio_input(self.od_config.model_class_name):
             audio_sr = 16000
             audio_duration_sec = 4
-            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(
+                np.float32
+            )
             dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
         else:
             dummy_audio = None
@@ -407,7 +436,9 @@ class DiffusionEngine:
             ),
         )
         logger.info("dummy run to warm up the model")
-        request = self.pre_process_func(req) if self.pre_process_func is not None else req
+        request = (
+            self.pre_process_func(req) if self.pre_process_func is not None else req
+        )
         self.add_req_and_wait_for_response(request)
 
     def collective_rpc(

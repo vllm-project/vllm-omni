@@ -57,7 +57,10 @@ except Exception as e:
     # flashinfer may raise RuntimeError at import-time for version/binary mismatches.
     # Treat it as unavailable so the runtime can gracefully fall back to other backends.
     HAS_FLASHINFER = False
-    logger.warning("FlashInfer is unavailable; falling back to other attention backends. Reason: %s", e)
+    logger.warning(
+        "FlashInfer is unavailable; falling back to other attention backends. Reason: %s",
+        e,
+    )
 
 try:
     import aiter  # noqa: F401

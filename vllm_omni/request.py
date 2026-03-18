@@ -8,7 +8,11 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PromptEmbedsPayload,
+)
 
 
 class OmniRequest(Request):
@@ -43,7 +47,9 @@ class OmniRequest(Request):
         # Optional external request ID for tracking
         self.external_req_id: str | None = external_req_id
         # Serialized additional information payload (optional)
-        self.additional_information: AdditionalInformationPayload | None = additional_information
+        self.additional_information: AdditionalInformationPayload | None = (
+            additional_information
+        )
 
     @staticmethod
     def _maybe_decode_prompt_embeds(

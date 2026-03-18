@@ -8,8 +8,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
-from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
+    DistributedVaeMixin,
+)
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelConfig,
+    get_sp_plan_from_model,
+)
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
@@ -186,7 +191,9 @@ def initialize_model(
         model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
-        is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
+        is_distributed_vae = hasattr(model, "vae") and isinstance(
+            model.vae, DistributedVaeMixin
+        )
         if vae_pp_size > 1 and not is_distributed_vae:
             logger.warning(
                 "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
@@ -216,7 +223,9 @@ def initialize_model(
 
         return model
     else:
-        raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
+        raise ValueError(
+            f"Model class {od_config.model_class_name} not found in diffusion model registry."
+        )
 
 
 def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
@@ -278,7 +287,9 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
         # update forward context sp_plan_hooks_applied
         ctx = get_forward_context()
         ctx.sp_plan_hooks_applied = applied_count > 0
-        logger.debug(f"Setting sp_plan_hooks_applied={ctx.sp_plan_hooks_applied} in ``ForwardContext``!")
+        logger.debug(
+            f"Setting sp_plan_hooks_applied={ctx.sp_plan_hooks_applied} in ``ForwardContext``!"
+        )
 
         if applied_count == 0:
             logger.warning(
@@ -287,7 +298,9 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             )
 
     except Exception as e:
-        logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
+        logger.warning(
+            f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks."
+        )
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

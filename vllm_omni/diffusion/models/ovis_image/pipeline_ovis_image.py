@@ -38,9 +38,13 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
+from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import (
+    OvisImageTransformer2DModel,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 
 logger = init_logger(__name__)
 
@@ -57,7 +61,11 @@ def get_ovis_image_post_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+        vae_scale_factor = (
+            2 ** (len(vae_config["block_out_channels"]) - 1)
+            if "block_out_channels" in vae_config
+            else 8
+        )
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -113,9 +121,13 @@ def retrieve_timesteps(
     """
 
     if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+        raise ValueError(
+            "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
+        )
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accepts_timesteps = "timesteps" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accepts_timesteps:
             raise ValueError(
                 f"the current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -125,7 +137,9 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
-        accepts_timesteps = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accepts_timesteps = "sigmas" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accepts_timesteps:
             raise ValueError(
                 f"the current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -170,9 +184,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
 
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self._execution_device
-        )
+        self.vae = AutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self._execution_device)
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
@@ -180,7 +194,11 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
 
         self.transformer = OvisImageTransformer2DModel(od_config=od_config)
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = (
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if getattr(self, "vae", None)
+            else 8
+        )
 
         self.tokenizer_max_length = 1024
         self.system_prompt = """Describe the image by detailing the color, quantity, text, shape, size, texture, spatial
@@ -251,7 +269,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
+        )
 
         return prompt_embeds
 
@@ -285,10 +305,18 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
                 num_images_per_prompt=num_images_per_prompt,
             )
 
-        dtype = self.text_encoder.dtype if self.text_encoder is not None else self.transformer.dtype
+        dtype = (
+            self.text_encoder.dtype
+            if self.text_encoder is not None
+            else self.transformer.dtype
+        )
         text_ids = torch.zeros(prompt_embeds.shape[1], 3)
-        text_ids[..., 1] = text_ids[..., 1] + torch.arange(prompt_embeds.shape[1])[None, :]
-        text_ids[..., 2] = text_ids[..., 2] + torch.arange(prompt_embeds.shape[1])[None, :]
+        text_ids[..., 1] = (
+            text_ids[..., 1] + torch.arange(prompt_embeds.shape[1])[None, :]
+        )
+        text_ids[..., 2] = (
+            text_ids[..., 2] + torch.arange(prompt_embeds.shape[1])[None, :]
+        )
         text_ids = text_ids.to(device=device, dtype=dtype)
         return prompt_embeds, text_ids
 
@@ -303,7 +331,10 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
         callback_on_step_end_tensor_inputs=None,
         max_sequence_length=None,
     ):
-        if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
+        if (
+            height % (self.vae_scale_factor * 2) != 0
+            or width % (self.vae_scale_factor * 2) != 0
+        ):
             logger.warning(
                 f"""`height` and `width` have to be divisible by {self.vae_scale_factor * 2} but are
                 {height} and {width}. Dimension will be resized accordingly"""
@@ -326,8 +357,12 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list[str]` but is {type(prompt)}")
+        elif prompt is not None and (
+            not isinstance(prompt, str) and not isinstance(prompt, list)
+        ):
+            raise ValueError(
+                f"`prompt` has to be of type `str` or `list[str]` but is {type(prompt)}"
+            )
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(
@@ -336,15 +371,23 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
             )
 
         if max_sequence_length is not None and max_sequence_length > 256:
-            raise ValueError(f"`max_sequence_length` has to be less than or equal to 256 but is {max_sequence_length}")
+            raise ValueError(
+                f"`max_sequence_length` has to be less than or equal to 256 but is {max_sequence_length}"
+            )
 
     @staticmethod
     def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
         latent_image_ids = torch.zeros(height, width, 3)
-        latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
-        latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
+        latent_image_ids[..., 1] = (
+            latent_image_ids[..., 1] + torch.arange(height)[:, None]
+        )
+        latent_image_ids[..., 2] = (
+            latent_image_ids[..., 2] + torch.arange(width)[None, :]
+        )
 
-        latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
+        latent_image_id_height, latent_image_id_width, latent_image_id_channels = (
+            latent_image_ids.shape
+        )
 
         latent_image_ids = latent_image_ids.reshape(
             latent_image_id_height * latent_image_id_width, latent_image_id_channels
@@ -354,9 +397,13 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
 
     @staticmethod
     def _pack_latents(latents, batch_size, num_channel_latents, height, width):
-        latents = latents.view(batch_size, num_channel_latents, height // 2, 2, width // 2, 2)
+        latents = latents.view(
+            batch_size, num_channel_latents, height // 2, 2, width // 2, 2
+        )
         latents = latents.permute(0, 2, 4, 1, 3, 5)
-        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channel_latents * 4)
+        latents = latents.reshape(
+            batch_size, (height // 2) * (width // 2), num_channel_latents * 4
+        )
         return latents
 
     @staticmethod
@@ -393,7 +440,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
         shape = (batch_size, num_channel_latents, height, width)
 
         if latents is not None:
-            latent_image_ids = self._prepare_latent_image_ids(batch_size, height // 2, width // 2, device, dtype)
+            latent_image_ids = self._prepare_latent_image_ids(
+                batch_size, height // 2, width // 2, device, dtype
+            )
             return latents.to(device=device, dtype=dtype), latent_image_ids
 
         if isinstance(generator, list) and len(generator) != batch_size:
@@ -402,15 +451,26 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        latents = self._pack_latents(latents, batch_size, num_channel_latents, height, width)
+        latents = self._pack_latents(
+            latents, batch_size, num_channel_latents, height, width
+        )
 
-        latent_image_ids = self._prepare_latent_image_ids(batch_size, height // 2, width // 2, device, dtype)
+        latent_image_ids = self._prepare_latent_image_ids(
+            batch_size, height // 2, width // 2, device, dtype
+        )
 
         return latents, latent_image_ids
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+        sigmas = (
+            np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+            if sigmas is None
+            else sigmas
+        )
+        if (
+            hasattr(self.scheduler.config, "use_flow_sigmas")
+            and self.scheduler.config.use_flow_sigmas
+        ):
             sigmas = None
 
         mu = calculate_shift(
@@ -500,7 +560,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
             )
 
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+            latents = self.scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, do_true_cfg
+            )
 
         return latents
 
@@ -616,18 +678,35 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
         """
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+        prompt = [
+            p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts
+        ] or prompt
+        if all(
+            isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts
+        ):
             negative_prompt = None
         elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+            negative_prompt = [
+                "" if isinstance(p, str) else (p.get("negative_prompt") or "")
+                for p in req.prompts
+            ]
 
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        height = (
+            req.sampling_params.height
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        width = (
+            req.sampling_params.width
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+            req.sampling_params.guidance_scale
+            if req.sampling_params.guidance_scale is not None
+            else guidance_scale
         )
         generator = req.sampling_params.generator or generator
         num_images_per_prompt = (
@@ -704,7 +783,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
         # 5. Prepare timesteps
 
         image_seq_len = latents.shape[1]
-        timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, image_seq_len)
+        timesteps, num_inference_steps = self.prepare_timesteps(
+            num_inference_steps, sigmas, image_seq_len
+        )
 
         # num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
@@ -717,9 +798,13 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
             latents=latents,
             timesteps=timesteps,
             prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
+            negative_prompt_embeds=(
+                negative_prompt_embeds if do_classifier_free_guidance else None
+            ),
             text_ids=text_ids,
-            negative_text_ids=negative_text_ids if do_classifier_free_guidance else None,
+            negative_text_ids=(
+                negative_text_ids if do_classifier_free_guidance else None
+            ),
             latent_image_ids=latent_image_ids,
             do_true_cfg=do_classifier_free_guidance,
             guidance_scale=guidance_scale,
@@ -730,8 +815,12 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
         if output_type == "latent":
             image = latents
         else:
-            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            latents = self._unpack_latents(
+                latents, height, width, self.vae_scale_factor
+            )
+            latents = (
+                latents / self.vae.config.scaling_factor
+            ) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=image)

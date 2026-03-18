@@ -32,7 +32,9 @@ def cuda_omni_platform_plugin() -> str | None:
                 is_cuda = True
                 logger.debug("Confirmed CUDA OmniPlatform is available.")
             else:
-                logger.debug("CUDA OmniPlatform is not available because no GPU is found.")
+                logger.debug(
+                    "CUDA OmniPlatform is not available because no GPU is found."
+                )
         finally:
             pynvml.nvmlShutdown()
     except Exception as e:
@@ -54,7 +56,9 @@ def rocm_omni_platform_plugin() -> str | None:
                 is_rocm = True
                 logger.debug("Confirmed ROCm OmniPlatform is available.")
             else:
-                logger.debug("ROCm OmniPlatform is not available because no GPU is found.")
+                logger.debug(
+                    "ROCm OmniPlatform is not available because no GPU is found."
+                )
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
@@ -97,7 +101,9 @@ def xpu_omni_platform_plugin() -> str | None:
             from vllm_omni.platforms.xpu import XPUOmniPlatform
 
             XPUOmniPlatform.dist_backend = dist_backend
-            logger.debug("Confirmed %s backend is available.", XPUOmniPlatform.dist_backend)
+            logger.debug(
+                "Confirmed %s backend is available.", XPUOmniPlatform.dist_backend
+            )
             logger.debug("Confirmed XPU platform is available.")
     except Exception as e:
         logger.debug("XPU omni platform is not available because: %s", str(e))
@@ -119,7 +125,9 @@ def resolve_current_omni_platform_cls_qualname() -> str:
 
     activated_plugins = []
 
-    for name, func in chain(builtin_omni_platform_plugins.items(), platform_plugins.items()):
+    for name, func in chain(
+        builtin_omni_platform_plugins.items(), platform_plugins.items()
+    ):
         try:
             assert callable(func)
             platform_cls_qualname = func()
@@ -128,22 +136,34 @@ def resolve_current_omni_platform_cls_qualname() -> str:
         except Exception:
             pass
 
-    activated_builtin_plugins = list(set(activated_plugins) & set(builtin_omni_platform_plugins.keys()))
+    activated_builtin_plugins = list(
+        set(activated_plugins) & set(builtin_omni_platform_plugins.keys())
+    )
     activated_oot_plugins = list(set(activated_plugins) & set(platform_plugins.keys()))
 
     if len(activated_oot_plugins) >= 2:
-        raise RuntimeError(f"Only one OmniPlatform plugin can be activated, but got: {activated_oot_plugins}")
+        raise RuntimeError(
+            f"Only one OmniPlatform plugin can be activated, but got: {activated_oot_plugins}"
+        )
     elif len(activated_oot_plugins) == 1:
         platform_cls_qualname = platform_plugins[activated_oot_plugins[0]]()
         logger.info("OmniPlatform plugin %s is activated", activated_oot_plugins[0])
     elif len(activated_builtin_plugins) >= 2:
-        raise RuntimeError(f"Only one OmniPlatform plugin can be activated, but got: {activated_builtin_plugins}")
+        raise RuntimeError(
+            f"Only one OmniPlatform plugin can be activated, but got: {activated_builtin_plugins}"
+        )
     elif len(activated_builtin_plugins) == 1:
-        platform_cls_qualname = builtin_omni_platform_plugins[activated_builtin_plugins[0]]()
-        logger.debug("Automatically detected OmniPlatform %s.", activated_builtin_plugins[0])
+        platform_cls_qualname = builtin_omni_platform_plugins[
+            activated_builtin_plugins[0]
+        ]()
+        logger.debug(
+            "Automatically detected OmniPlatform %s.", activated_builtin_plugins[0]
+        )
     else:
         platform_cls_qualname = "vllm_omni.platforms.interface.UnspecifiedOmniPlatform"
-        logger.debug("No platform detected, vLLM-Omni is running on UnspecifiedOmniPlatform")
+        logger.debug(
+            "No platform detected, vLLM-Omni is running on UnspecifiedOmniPlatform"
+        )
 
     return platform_cls_qualname
 

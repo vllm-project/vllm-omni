@@ -16,7 +16,9 @@ from collections.abc import Iterable
 import torch
 from diffusers import AutoencoderOobleck
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
-from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioProjectionModel
+from diffusers.pipelines.stable_audio.modeling_stable_audio import (
+    StableAudioProjectionModel,
+)
 from diffusers.schedulers import CosineDPMSolverMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
@@ -28,7 +30,9 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
-from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
+from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
+    StableAudioDiTModel,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
@@ -129,8 +133,12 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         ).to(self.device)
 
         # Initialize transformer from HF config to keep architecture aligned with checkpoint.
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, StableAudioDiTModel)
-        self.transformer = StableAudioDiTModel(od_config=od_config, **transformer_kwargs)
+        transformer_kwargs = get_transformer_config_kwargs(
+            od_config.tf_model_config, StableAudioDiTModel
+        )
+        self.transformer = StableAudioDiTModel(
+            od_config=od_config, **transformer_kwargs
+        )
 
         # Load scheduler
         self.scheduler = CosineDPMSolverMultistepScheduler.from_pretrained(
@@ -185,16 +193,24 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         max_val = self.projection_model.config.max_value
 
         if audio_start_in_s < min_val or audio_start_in_s > max_val:
-            raise ValueError(f"`audio_start_in_s` must be between {min_val} and {max_val}, got {audio_start_in_s}")
+            raise ValueError(
+                f"`audio_start_in_s` must be between {min_val} and {max_val}, got {audio_start_in_s}"
+            )
 
         if audio_end_in_s < min_val or audio_end_in_s > max_val:
-            raise ValueError(f"`audio_end_in_s` must be between {min_val} and {max_val}, got {audio_end_in_s}")
+            raise ValueError(
+                f"`audio_end_in_s` must be between {min_val} and {max_val}, got {audio_end_in_s}"
+            )
 
         if prompt is None and prompt_embeds is None:
-            raise ValueError("Provide either `prompt` or `prompt_embeds`. Cannot leave both undefined.")
+            raise ValueError(
+                "Provide either `prompt` or `prompt_embeds`. Cannot leave both undefined."
+            )
 
         if prompt is not None and prompt_embeds is not None:
-            raise ValueError("Cannot forward both `prompt` and `prompt_embeds`. Please provide only one.")
+            raise ValueError(
+                "Cannot forward both `prompt` and `prompt_embeds`. Please provide only one."
+            )
 
     def encode_prompt(
         self,
@@ -290,7 +306,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         ).text_hidden_states
 
         if attention_mask is not None:
-            prompt_embeds = prompt_embeds * attention_mask.unsqueeze(-1).to(prompt_embeds.dtype)
+            prompt_embeds = prompt_embeds * attention_mask.unsqueeze(-1).to(
+                prompt_embeds.dtype
+            )
 
         return prompt_embeds
 
@@ -303,8 +321,16 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode audio duration to conditioning tensors."""
-        audio_start_in_s = [audio_start_in_s] if isinstance(audio_start_in_s, (int, float)) else audio_start_in_s
-        audio_end_in_s = [audio_end_in_s] if isinstance(audio_end_in_s, (int, float)) else audio_end_in_s
+        audio_start_in_s = (
+            [audio_start_in_s]
+            if isinstance(audio_start_in_s, (int, float))
+            else audio_start_in_s
+        )
+        audio_end_in_s = (
+            [audio_end_in_s]
+            if isinstance(audio_end_in_s, (int, float))
+            else audio_end_in_s
+        )
 
         if len(audio_start_in_s) == 1:
             audio_start_in_s = audio_start_in_s * batch_size
@@ -322,8 +348,12 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         seconds_end_hidden_states = projection_output.seconds_end_hidden_states
 
         if do_classifier_free_guidance:
-            seconds_start_hidden_states = torch.cat([seconds_start_hidden_states, seconds_start_hidden_states], dim=0)
-            seconds_end_hidden_states = torch.cat([seconds_end_hidden_states, seconds_end_hidden_states], dim=0)
+            seconds_start_hidden_states = torch.cat(
+                [seconds_start_hidden_states, seconds_start_hidden_states], dim=0
+            )
+            seconds_end_hidden_states = torch.cat(
+                [seconds_end_hidden_states, seconds_end_hidden_states], dim=0
+            )
 
         return seconds_start_hidden_states, seconds_end_hidden_states
 
@@ -341,7 +371,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         shape = (batch_size, num_channels_vae, sample_size)
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = randn_tensor(
+                shape, generator=generator, device=device, dtype=dtype
+            )
         else:
             latents = latents.to(device)
 
@@ -389,28 +421,47 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         # Extract from request
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+        prompt = [
+            p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts
+        ] or prompt
+        if all(
+            isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts
+        ):
             negative_prompt = None
         elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+            negative_prompt = [
+                "" if isinstance(p, str) else (p.get("negative_prompt") or "")
+                for p in req.prompts
+            ]
 
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
 
         if generator is None:
             generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            generator = torch.Generator(device=self.device).manual_seed(
+                req.sampling_params.seed
+            )
 
         # Get audio duration from request extra params or defaults
-        audio_start_in_s = req.sampling_params.extra_args.get("audio_start_in_s", audio_start_in_s)
-        audio_end_in_s = req.sampling_params.extra_args.get("audio_end_in_s", audio_end_in_s)
+        audio_start_in_s = req.sampling_params.extra_args.get(
+            "audio_start_in_s", audio_start_in_s
+        )
+        audio_end_in_s = req.sampling_params.extra_args.get(
+            "audio_end_in_s", audio_end_in_s
+        )
 
         # Calculate audio length
         downsample_ratio = self.vae.hop_length
-        max_audio_length_in_s = self.transformer.config.sample_size * downsample_ratio / self.vae.config.sampling_rate
+        max_audio_length_in_s = (
+            self.transformer.config.sample_size
+            * downsample_ratio
+            / self.vae.config.sampling_rate
+        )
 
         if audio_end_in_s is None:
             audio_end_in_s = max_audio_length_in_s
@@ -462,7 +513,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             audio_start_in_s,
             audio_end_in_s,
             device,
-            do_classifier_free_guidance and (negative_prompt is not None or negative_prompt_embeds is not None),
+            do_classifier_free_guidance
+            and (negative_prompt is not None or negative_prompt_embeds is not None),
             batch_size,
         )
 
@@ -477,8 +529,14 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         )
 
         # Handle CFG without negative prompt
-        if do_classifier_free_guidance and negative_prompt_embeds is None and negative_prompt is None:
-            negative_text_audio_duration_embeds = torch.zeros_like(text_audio_duration_embeds)
+        if (
+            do_classifier_free_guidance
+            and negative_prompt_embeds is None
+            and negative_prompt is None
+        ):
+            negative_text_audio_duration_embeds = torch.zeros_like(
+                text_audio_duration_embeds
+            )
             text_audio_duration_embeds = torch.cat(
                 [negative_text_audio_duration_embeds, text_audio_duration_embeds],
                 dim=0,
@@ -490,12 +548,16 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
 
         # Duplicate for multiple waveforms per prompt
         bs_embed, seq_len, hidden_size = text_audio_duration_embeds.shape
-        text_audio_duration_embeds = text_audio_duration_embeds.repeat(1, num_waveforms_per_prompt, 1)
+        text_audio_duration_embeds = text_audio_duration_embeds.repeat(
+            1, num_waveforms_per_prompt, 1
+        )
         text_audio_duration_embeds = text_audio_duration_embeds.view(
             bs_embed * num_waveforms_per_prompt, seq_len, hidden_size
         )
 
-        audio_duration_embeds = audio_duration_embeds.repeat(1, num_waveforms_per_prompt, 1)
+        audio_duration_embeds = audio_duration_embeds.repeat(
+            1, num_waveforms_per_prompt, 1
+        )
         audio_duration_embeds = audio_duration_embeds.view(
             bs_embed * num_waveforms_per_prompt, -1, audio_duration_embeds.shape[-1]
         )
@@ -535,7 +597,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             self._current_timestep = t
 
             # Expand latents for CFG
-            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = (
+                torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            )
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
             # Predict noise
@@ -551,7 +615,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             # Perform CFG
             if do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
 
             # Scheduler step
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample

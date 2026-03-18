@@ -96,7 +96,9 @@ class TestDynamicRangeCompression:
 
     def test_basic_compression(self):
         """Test basic compression with default parameters."""
-        from vllm_omni.model_executor.models.cosyvoice3.utils import dynamic_range_compression_torch
+        from vllm_omni.model_executor.models.cosyvoice3.utils import (
+            dynamic_range_compression_torch,
+        )
 
         x = torch.tensor([1.0, 10.0, 100.0])
         result = dynamic_range_compression_torch(x)
@@ -107,7 +109,9 @@ class TestDynamicRangeCompression:
 
     def test_clipping_small_values(self):
         """Test that small values are clipped."""
-        from vllm_omni.model_executor.models.cosyvoice3.utils import dynamic_range_compression_torch
+        from vllm_omni.model_executor.models.cosyvoice3.utils import (
+            dynamic_range_compression_torch,
+        )
 
         x = torch.tensor([0.0, 1e-10, 1e-6])
         clip_val = 1e-5
@@ -119,7 +123,9 @@ class TestDynamicRangeCompression:
 
     def test_scaling_factor(self):
         """Test with different scaling factor c."""
-        from vllm_omni.model_executor.models.cosyvoice3.utils import dynamic_range_compression_torch
+        from vllm_omni.model_executor.models.cosyvoice3.utils import (
+            dynamic_range_compression_torch,
+        )
 
         x = torch.tensor([1.0, 10.0])
         c = 2.0
@@ -173,56 +179,72 @@ class TestConcatTextWithPromptIds:
 
     def test_basic_concat(self):
         """Test basic concatenation."""
-        from vllm_omni.model_executor.models.cosyvoice3.utils import concat_text_with_prompt_ids
+        from vllm_omni.model_executor.models.cosyvoice3.utils import (
+            concat_text_with_prompt_ids,
+        )
 
         text = torch.tensor([[5, 6, 7]], dtype=torch.int64)
         text_len = torch.tensor([3], dtype=torch.int32)
         prompt_text = torch.tensor([[1, 2]], dtype=torch.int64)
         prompt_text_len = torch.tensor([2], dtype=torch.int32)
 
-        result, result_len = concat_text_with_prompt_ids(text, text_len, prompt_text, prompt_text_len)
+        result, result_len = concat_text_with_prompt_ids(
+            text, text_len, prompt_text, prompt_text_len
+        )
 
         assert result.tolist() == [[1, 2, 5, 6, 7]]
         assert result_len.item() == 5
 
     def test_empty_prompt(self):
         """Test with empty prompt."""
-        from vllm_omni.model_executor.models.cosyvoice3.utils import concat_text_with_prompt_ids
+        from vllm_omni.model_executor.models.cosyvoice3.utils import (
+            concat_text_with_prompt_ids,
+        )
 
         text = torch.tensor([[1, 2, 3]], dtype=torch.int64)
         text_len = torch.tensor([3], dtype=torch.int32)
         prompt_text = torch.tensor([[]], dtype=torch.int64).reshape(1, 0)
         prompt_text_len = torch.tensor([0], dtype=torch.int32)
 
-        result, result_len = concat_text_with_prompt_ids(text, text_len, prompt_text, prompt_text_len)
+        result, result_len = concat_text_with_prompt_ids(
+            text, text_len, prompt_text, prompt_text_len
+        )
 
         assert result.tolist() == [[1, 2, 3]]
         assert result_len.item() == 3
 
     def test_batch_concat(self):
         """Test batched concatenation."""
-        from vllm_omni.model_executor.models.cosyvoice3.utils import concat_text_with_prompt_ids
+        from vllm_omni.model_executor.models.cosyvoice3.utils import (
+            concat_text_with_prompt_ids,
+        )
 
         text = torch.tensor([[5, 6], [7, 8]], dtype=torch.int64)
         text_len = torch.tensor([2, 2], dtype=torch.int32)
         prompt_text = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
         prompt_text_len = torch.tensor([2, 2], dtype=torch.int32)
 
-        result, result_len = concat_text_with_prompt_ids(text, text_len, prompt_text, prompt_text_len)
+        result, result_len = concat_text_with_prompt_ids(
+            text, text_len, prompt_text, prompt_text_len
+        )
 
         assert result.tolist() == [[1, 2, 5, 6], [3, 4, 7, 8]]
         assert result_len.tolist() == [4, 4]
 
     def test_prompt_comes_first(self):
         """Test that prompt tokens come before text tokens."""
-        from vllm_omni.model_executor.models.cosyvoice3.utils import concat_text_with_prompt_ids
+        from vllm_omni.model_executor.models.cosyvoice3.utils import (
+            concat_text_with_prompt_ids,
+        )
 
         text = torch.tensor([[100, 200]], dtype=torch.int64)
         text_len = torch.tensor([2], dtype=torch.int32)
         prompt_text = torch.tensor([[1, 2, 3]], dtype=torch.int64)
         prompt_text_len = torch.tensor([3], dtype=torch.int32)
 
-        result, _ = concat_text_with_prompt_ids(text, text_len, prompt_text, prompt_text_len)
+        result, _ = concat_text_with_prompt_ids(
+            text, text_len, prompt_text, prompt_text_len
+        )
 
         # First 3 tokens should be prompt
         assert result[0, :3].tolist() == [1, 2, 3]

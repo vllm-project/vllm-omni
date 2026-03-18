@@ -23,7 +23,11 @@ MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
 def get_stage_config() -> str:
     return str(
-        Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "qwen3_tts.yaml"
+        Path(__file__).parent.parent.parent.parent
+        / "vllm_omni"
+        / "model_executor"
+        / "stage_configs"
+        / "qwen3_tts.yaml"
     )
 
 
@@ -142,5 +146,7 @@ class TestQwen3TTSWebSocket:
             total_bytes = done["total_bytes"]
             assert done["error"] is False
             assert total_bytes > 0
-            assert chunk_lengths[sentence_index], f"Expected binary PCM frames for sentence {sentence_index}"
+            assert chunk_lengths[
+                sentence_index
+            ], f"Expected binary PCM frames for sentence {sentence_index}"
             assert sum(chunk_lengths[sentence_index]) == total_bytes

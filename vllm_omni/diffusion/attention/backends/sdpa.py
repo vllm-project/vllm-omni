@@ -46,7 +46,9 @@ def _maybe_reshape_attn_mask(
         attn_mask = attn_mask.to(torch.bool)
         if mask_mode == "full_qk":
             # NPU path requires explicit [B, 1, Q, K] mask layout.
-            attn_mask = attn_mask.unsqueeze(1).expand(B, Sq, Skv).unsqueeze(1).contiguous()
+            attn_mask = (
+                attn_mask.unsqueeze(1).expand(B, Sq, Skv).unsqueeze(1).contiguous()
+            )
         elif mask_mode == "broadcast_k":
             # CUDA-like backends prefer [B, 1, 1, K] and rely on SDPA broadcast.
             attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
@@ -101,7 +103,9 @@ class SDPAImpl(AttentionImpl):
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
         attention_mask = None
         if attn_metadata:
-            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
+            attention_mask = _maybe_reshape_attn_mask(
+                query, key, attn_metadata.attn_mask, mask_mode=mask_mode
+            )
 
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         output = torch.nn.functional.scaled_dot_product_attention(
@@ -123,7 +127,9 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+        return self._forward_impl(
+            query, key, value, attn_metadata, mask_mode="broadcast_k"
+        )
 
     def forward_xpu(
         self,
@@ -132,7 +138,9 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+        return self._forward_impl(
+            query, key, value, attn_metadata, mask_mode="broadcast_k"
+        )
 
     def forward_hip(
         self,
@@ -141,7 +149,9 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+        return self._forward_impl(
+            query, key, value, attn_metadata, mask_mode="broadcast_k"
+        )
 
     def forward_npu(
         self,

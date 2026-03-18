@@ -74,7 +74,9 @@ class OmniServer:
         self.proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
+            cwd=os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            ),  # Set working directory to vllm-omni root
             start_new_session=True,
         )
 

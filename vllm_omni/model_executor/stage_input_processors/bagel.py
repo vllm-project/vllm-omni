@@ -135,7 +135,9 @@ def collect_cfg_kv_caches(
 
     for role, companion_rid in cfg_request_ids.items():
         try:
-            data, size = kv_transfer_manager.receive_kv_cache_for_request(companion_rid, target_device)
+            data, size = kv_transfer_manager.receive_kv_cache_for_request(
+                companion_rid, target_device
+            )
             if data and "layer_blocks" in data:
                 layer_blocks = data["layer_blocks"]
                 kv_obj = SimpleNamespace(**layer_blocks)

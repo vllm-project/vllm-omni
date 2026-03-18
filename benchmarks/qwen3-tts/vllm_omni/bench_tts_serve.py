@@ -87,7 +87,9 @@ class BenchmarkResult:
     per_request: list = field(default_factory=list)
 
 
-def pcm_bytes_to_duration(num_bytes: int, sample_rate: int = 24000, sample_width: int = 2) -> float:
+def pcm_bytes_to_duration(
+    num_bytes: int, sample_rate: int = 24000, sample_width: int = 2
+) -> float:
     """Convert raw PCM byte count to duration in seconds."""
     num_samples = num_bytes / sample_width
     return num_samples / sample_rate
@@ -175,7 +177,9 @@ async def run_benchmark(
         warmup_tasks = []
         for i in range(num_warmups):
             prompt = PROMPTS[i % len(PROMPTS)]
-            warmup_tasks.append(send_tts_request(session, api_url, prompt, voice, language))
+            warmup_tasks.append(
+                send_tts_request(session, api_url, prompt, voice, language)
+            )
         await asyncio.gather(*warmup_tasks)
         print("  Warmup done.")
 
@@ -189,7 +193,9 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, voice, language, pbar)
+            return await send_tts_request(
+                session, api_url, prompt, voice, language, pbar
+            )
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -272,8 +278,12 @@ async def run_benchmark(
     print(f"{'=' * W}")
     print(f"{'Audio Result':^{W}}")
     print(f"{'=' * W}")
-    print(f"{'Total audio duration generated (s):':<40}{bench.total_audio_duration_s:<10.2f}")
-    print(f"{'Audio throughput (audio duration/s):':<40}{bench.audio_throughput:<10.2f}")
+    print(
+        f"{'Total audio duration generated (s):':<40}{bench.total_audio_duration_s:<10.2f}"
+    )
+    print(
+        f"{'Audio throughput (audio duration/s):':<40}{bench.audio_throughput:<10.2f}"
+    )
     print(f"{'-' * W}")
     print(f"{'Time to First Packet':^{W}}")
     print(f"{'-' * W}")
@@ -329,15 +339,27 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3-TTS Benchmark Client")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--num-prompts", type=int, default=50, help="Number of prompts per concurrency level")
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=50,
+        help="Number of prompts per concurrency level",
+    )
     parser.add_argument(  # noqa: E501
-        "--max-concurrency", type=int, nargs="+", default=[1, 4, 10], help="Concurrency levels to test"
+        "--max-concurrency",
+        type=int,
+        nargs="+",
+        default=[1, 4, 10],
+        help="Concurrency levels to test",
     )
     parser.add_argument("--num-warmups", type=int, default=3)
     parser.add_argument("--voice", type=str, default="vivian")
     parser.add_argument("--language", type=str, default="English")
     parser.add_argument(
-        "--config-name", type=str, default="async_chunk", help="Label for this config (used in filenames)"
+        "--config-name",
+        type=str,
+        default="async_chunk",
+        help="Label for this config (used in filenames)",
     )
     parser.add_argument("--result-dir", type=str, default="results")
     return parser.parse_args()

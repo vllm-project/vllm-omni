@@ -9,13 +9,21 @@ from typing import Any
 import numpy as np
 import PIL.Image
 import torch
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg, retrieve_timesteps
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
+    rescale_noise_cfg,
+    retrieve_timesteps,
+)
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
+    retrieve_latents,
+)
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_classifier_free_guidance_rank
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .pipeline_ltx2 import (
@@ -42,13 +50,20 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         prefix: str = "",
     ):
         super().__init__(od_config=od_config, prefix=prefix)
-        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_spatial_compression_ratio, resample="bilinear")
+        self.video_processor = VideoProcessor(
+            vae_scale_factor=self.vae_spatial_compression_ratio, resample="bilinear"
+        )
 
     @staticmethod
     def _normalize_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
+        latents: torch.Tensor,
+        latents_mean: torch.Tensor,
+        latents_std: torch.Tensor,
+        scaling_factor: float = 1.0,
     ) -> torch.Tensor:
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
         latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
         latents = (latents - latents_mean) * scaling_factor / latents_std
         return latents
@@ -77,7 +92,9 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             conditioning_mask = latents.new_zeros(mask_shape)
             conditioning_mask[:, :, 0] = 1.0
             conditioning_mask = self._pack_latents(
-                conditioning_mask, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+                conditioning_mask,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
             ).squeeze(-1)
             if latents.ndim != 3 or latents.shape[:2] != conditioning_mask.shape:
                 raise ValueError(
@@ -106,20 +123,31 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
                     f" batch size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
-            image_generators = [generator[i * num_videos_per_prompt] for i in range(image_batch_size)]
+            image_generators = [
+                generator[i * num_videos_per_prompt] for i in range(image_batch_size)
+            ]
             init_latents = [
-                retrieve_latents(self.vae.encode(image[i].unsqueeze(0).unsqueeze(2)), image_generators[i], "argmax")
+                retrieve_latents(
+                    self.vae.encode(image[i].unsqueeze(0).unsqueeze(2)),
+                    image_generators[i],
+                    "argmax",
+                )
                 for i in range(image_batch_size)
             ]
         else:
             init_latents = [
-                retrieve_latents(self.vae.encode(img.unsqueeze(0).unsqueeze(2)), generator, "argmax") for img in image
+                retrieve_latents(
+                    self.vae.encode(img.unsqueeze(0).unsqueeze(2)), generator, "argmax"
+                )
+                for img in image
             ]
 
         init_latents = torch.cat(init_latents, dim=0).to(dtype)
         if num_videos_per_prompt > 1:
             init_latents = init_latents.repeat_interleave(num_videos_per_prompt, dim=0)
-        init_latents = self._normalize_latents(init_latents, self.vae.latents_mean, self.vae.latents_std)
+        init_latents = self._normalize_latents(
+            init_latents, self.vae.latents_mean, self.vae.latents_std
+        )
         init_latents = init_latents.repeat(1, 1, num_frames, 1, 1)
 
         conditioning_mask = torch.zeros(mask_shape, device=device, dtype=dtype)
@@ -129,9 +157,15 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         latents = init_latents * conditioning_mask + noise * (1 - conditioning_mask)
 
         conditioning_mask = self._pack_latents(
-            conditioning_mask, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+            conditioning_mask,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
         ).squeeze(-1)
-        latents = self._pack_latents(latents, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size)
+        latents = self._pack_latents(
+            latents,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
+        )
 
         return latents, conditioning_mask
 
@@ -148,10 +182,14 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         negative_prompt_attention_mask=None,
     ):
         if height % 32 != 0 or width % 32 != 0:
-            raise ValueError(f"`height` and `width` have to be divisible by 32 but are {height} and {width}.")
+            raise ValueError(
+                f"`height` and `width` have to be divisible by 32 but are {height} and {width}."
+            )
 
         if image is None and latents is None:
-            raise ValueError("Provide either `image` or `latents`. Cannot leave both undefined.")
+            raise ValueError(
+                "Provide either `image` or `latents`. Cannot leave both undefined."
+            )
 
         if prompt is not None and prompt_embeds is not None:
             raise ValueError(
@@ -162,14 +200,25 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
-        if prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+        if prompt is not None and (
+            not isinstance(prompt, str) and not isinstance(prompt, list)
+        ):
+            raise ValueError(
+                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
+            )
 
         if prompt_embeds is not None and prompt_attention_mask is None:
-            raise ValueError("Must provide `prompt_attention_mask` when specifying `prompt_embeds`.")
+            raise ValueError(
+                "Must provide `prompt_attention_mask` when specifying `prompt_embeds`."
+            )
 
-        if negative_prompt_embeds is not None and negative_prompt_attention_mask is None:
-            raise ValueError("Must provide `negative_prompt_attention_mask` when specifying `negative_prompt_embeds`.")
+        if (
+            negative_prompt_embeds is not None
+            and negative_prompt_attention_mask is None
+        ):
+            raise ValueError(
+                "Must provide `negative_prompt_attention_mask` when specifying `negative_prompt_embeds`."
+            )
 
         if prompt_embeds is not None and negative_prompt_embeds is not None:
             if prompt_embeds.shape != negative_prompt_embeds.shape:
@@ -214,11 +263,15 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
 
         noise_pred_video = noise_pred_video[:, :, 1:]
         noise_latents = latents_unpacked[:, :, 1:]
-        pred_latents = self.scheduler.step(noise_pred_video, t, noise_latents, return_dict=False)[0]
+        pred_latents = self.scheduler.step(
+            noise_pred_video, t, noise_latents, return_dict=False
+        )[0]
 
         latents_unpacked = torch.cat([latents_unpacked[:, :, :1], pred_latents], dim=2)
         latents = self._pack_latents(
-            latents_unpacked, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+            latents_unpacked,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
         )
         return latents
 
@@ -252,28 +305,41 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
     ) -> DiffusionOutput:
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+        prompt = [
+            p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts
+        ] or prompt
+        if all(
+            isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts
+        ):
             negative_prompt = None
         elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+            negative_prompt = [
+                "" if isinstance(p, str) else (p.get("negative_prompt") or "")
+                for p in req.prompts
+            ]
 
         height = req.sampling_params.height or height or 512
         width = req.sampling_params.width or width or 768
         num_frames = req.sampling_params.num_frames or num_frames or 121
         frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or 24.0
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps or 40
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps or 40
+        )
         if timesteps is None:
             num_inference_steps = max(int(num_inference_steps), 2)
         elif len(timesteps) < 2:
-            raise ValueError("`timesteps` must contain at least 2 values for FlowMatchEulerDiscreteScheduler.")
+            raise ValueError(
+                "`timesteps` must contain at least 2 values for FlowMatchEulerDiscreteScheduler."
+            )
         num_videos_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_videos_per_prompt or 1
         )
         max_sequence_length = (
-            req.sampling_params.max_sequence_length or max_sequence_length or self.tokenizer_max_length
+            req.sampling_params.max_sequence_length
+            or max_sequence_length
+            or self.tokenizer_max_length
         )
 
         if req.sampling_params.guidance_scale_provided:
@@ -284,9 +350,15 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         if generator is None:
             generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            generator = torch.Generator(device=self.device).manual_seed(
+                req.sampling_params.seed
+            )
 
-        latents = req.sampling_params.latents if req.sampling_params.latents is not None else latents
+        latents = (
+            req.sampling_params.latents
+            if req.sampling_params.latents is not None
+            else latents
+        )
         audio_latents = (
             req.sampling_params.audio_latents
             if req.sampling_params.audio_latents is not None
@@ -297,18 +369,23 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         if any(p is not None for p in req_prompt_embeds):
             prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore[arg-type]
 
-        req_negative_prompt_embeds = [_get_prompt_field(p, "negative_prompt_embeds") for p in req.prompts]
+        req_negative_prompt_embeds = [
+            _get_prompt_field(p, "negative_prompt_embeds") for p in req.prompts
+        ]
         if any(p is not None for p in req_negative_prompt_embeds):
             negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore[arg-type]
 
         req_prompt_attention_masks = [
-            _get_prompt_field(p, "prompt_attention_mask") or _get_prompt_field(p, "attention_mask") for p in req.prompts
+            _get_prompt_field(p, "prompt_attention_mask")
+            or _get_prompt_field(p, "attention_mask")
+            for p in req.prompts
         ]
         if any(m is not None for m in req_prompt_attention_masks):
             prompt_attention_mask = torch.stack(req_prompt_attention_masks)  # type: ignore[arg-type]
 
         req_negative_attention_masks = [
-            _get_prompt_field(p, "negative_prompt_attention_mask") or _get_prompt_field(p, "negative_attention_mask")
+            _get_prompt_field(p, "negative_prompt_attention_mask")
+            or _get_prompt_field(p, "negative_attention_mask")
             for p in req.prompts
         ]
         if any(m is not None for m in req_negative_attention_masks):
@@ -394,15 +471,23 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             max_sequence_length=max_sequence_length,
             device=device,
         )
-        cfg_parallel_ready = self._is_cfg_parallel_enabled(self.do_classifier_free_guidance)
+        cfg_parallel_ready = self._is_cfg_parallel_enabled(
+            self.do_classifier_free_guidance
+        )
         if self.do_classifier_free_guidance and not cfg_parallel_ready:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+            prompt_attention_mask = torch.cat(
+                [negative_prompt_attention_mask, prompt_attention_mask], dim=0
+            )
 
-        additive_attention_mask = (1 - prompt_attention_mask.to(prompt_embeds.dtype)) * -1000000.0
-        connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
-            prompt_embeds, additive_attention_mask, additive_mask=True
-        )
+        additive_attention_mask = (
+            1 - prompt_attention_mask.to(prompt_embeds.dtype)
+        ) * -1000000.0
+        (
+            connector_prompt_embeds,
+            connector_audio_prompt_embeds,
+            connector_attention_mask,
+        ) = self.connectors(prompt_embeds, additive_attention_mask, additive_mask=True)
 
         negative_connector_prompt_embeds = None
         negative_connector_audio_prompt_embeds = None
@@ -425,10 +510,14 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             if isinstance(image, torch.Tensor):
                 if image.ndim == 3:
                     image = image.unsqueeze(0)
-            elif isinstance(image, list) and image and isinstance(image[0], torch.Tensor):
+            elif (
+                isinstance(image, list) and image and isinstance(image[0], torch.Tensor)
+            ):
                 image = torch.stack(image, dim=0)
             else:
-                image = self.video_processor.preprocess(image, height=height, width=width)
+                image = self.video_processor.preprocess(
+                    image, height=height, width=width
+                )
             image = image.to(device=device, dtype=prompt_embeds.dtype)
 
         num_channels_latents = self.transformer.config.in_channels
@@ -447,11 +536,17 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         if self.do_classifier_free_guidance and not cfg_parallel_ready:
             conditioning_mask = torch.cat([conditioning_mask, conditioning_mask])
 
-        num_mel_bins = self.audio_vae.config.mel_bins if getattr(self, "audio_vae", None) is not None else 64
+        num_mel_bins = (
+            self.audio_vae.config.mel_bins
+            if getattr(self, "audio_vae", None) is not None
+            else 64
+        )
         latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
 
         num_channels_latents_audio = (
-            self.audio_vae.config.latent_channels if getattr(self, "audio_vae", None) is not None else 8
+            self.audio_vae.config.latent_channels
+            if getattr(self, "audio_vae", None) is not None
+            else 8
         )
         audio_latents, audio_num_frames = self.prepare_audio_latents(
             batch_size * num_videos_per_prompt,
@@ -497,11 +592,18 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             sigmas=sigmas,
             mu=mu,
         )
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        num_warmup_steps = max(
+            len(timesteps) - num_inference_steps * self.scheduler.order, 0
+        )
         self._num_timesteps = len(timesteps)
 
         video_coords = self.transformer.rope.prepare_video_coords(
-            latents.shape[0], latent_num_frames, latent_height, latent_width, latents.device, fps=frame_rate
+            latents.shape[0],
+            latent_num_frames,
+            latent_height,
+            latent_width,
+            latents.device,
+            fps=frame_rate,
         )
         audio_coords = self.transformer.audio_rope.prepare_audio_coords(
             audio_latents.shape[0], audio_num_frames, audio_latents.device
@@ -559,13 +661,15 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
                     "return_dict": False,
                 }
 
-                noise_pred_video, noise_pred_audio = self.predict_noise_av_maybe_with_cfg(
-                    do_true_cfg=True,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    guidance_rescale=guidance_rescale,
-                    cfg_normalize=False,
+                noise_pred_video, noise_pred_audio = (
+                    self.predict_noise_av_maybe_with_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale=guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        guidance_rescale=guidance_rescale,
+                        cfg_normalize=False,
+                    )
                 )
 
                 if get_classifier_free_guidance_rank() == 0:
@@ -577,7 +681,9 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
                         latent_height,
                         latent_width,
                     )
-                    audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
+                    audio_latents = audio_scheduler.step(
+                        noise_pred_audio, t, audio_latents, return_dict=False
+                    )[0]
 
                 cfg_group = get_cfg_group()
                 latents = latents.contiguous()
@@ -585,12 +691,20 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
                 cfg_group.broadcast(latents, src=0)
                 cfg_group.broadcast(audio_latents, src=0)
             else:
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                latent_model_input = (
+                    torch.cat([latents] * 2)
+                    if self.do_classifier_free_guidance
+                    else latents
+                )
                 latent_model_input = latent_model_input.to(prompt_embeds.dtype)
                 audio_latent_model_input = (
-                    torch.cat([audio_latents] * 2) if self.do_classifier_free_guidance else audio_latents
+                    torch.cat([audio_latents] * 2)
+                    if self.do_classifier_free_guidance
+                    else audio_latents
                 )
-                audio_latent_model_input = audio_latent_model_input.to(prompt_embeds.dtype)
+                audio_latent_model_input = audio_latent_model_input.to(
+                    prompt_embeds.dtype
+                )
 
                 timestep = t.expand(latent_model_input.shape[0])
                 video_timestep = timestep.unsqueeze(-1) * (1 - conditioning_mask)
@@ -619,22 +733,30 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
                 noise_pred_audio = noise_pred_audio.float()
 
                 if self.do_classifier_free_guidance:
-                    noise_pred_video_uncond, noise_pred_video_text = noise_pred_video.chunk(2)
+                    noise_pred_video_uncond, noise_pred_video_text = (
+                        noise_pred_video.chunk(2)
+                    )
                     noise_pred_video = noise_pred_video_uncond + guidance_scale * (
                         noise_pred_video_text - noise_pred_video_uncond
                     )
 
-                    noise_pred_audio_uncond, noise_pred_audio_text = noise_pred_audio.chunk(2)
+                    noise_pred_audio_uncond, noise_pred_audio_text = (
+                        noise_pred_audio.chunk(2)
+                    )
                     noise_pred_audio = noise_pred_audio_uncond + guidance_scale * (
                         noise_pred_audio_text - noise_pred_audio_uncond
                     )
 
                     if guidance_rescale > 0:
                         noise_pred_video = rescale_noise_cfg(
-                            noise_pred_video, noise_pred_video_text, guidance_rescale=guidance_rescale
+                            noise_pred_video,
+                            noise_pred_video_text,
+                            guidance_rescale=guidance_rescale,
                         )
                         noise_pred_audio = rescale_noise_cfg(
-                            noise_pred_audio, noise_pred_audio_text, guidance_rescale=guidance_rescale
+                            noise_pred_audio,
+                            noise_pred_audio_text,
+                            guidance_rescale=guidance_rescale,
                         )
 
                 latents = self._step_video_latents_i2v(
@@ -646,9 +768,13 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
                     latent_width,
                 )
 
-                audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
+                audio_latents = audio_scheduler.step(
+                    noise_pred_audio, t, audio_latents, return_dict=False
+                )[0]
 
-            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+            if i == len(timesteps) - 1 or (
+                (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+            ):
                 pass
 
         latents = self._unpack_latents(
@@ -660,13 +786,18 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             self.transformer_temporal_patch_size,
         )
         latents = self._denormalize_latents(
-            latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
+            latents,
+            self.vae.latents_mean,
+            self.vae.latents_std,
+            self.vae.config.scaling_factor,
         )
 
         audio_latents = self._denormalize_audio_latents(
             audio_latents, self.audio_vae.latents_mean, self.audio_vae.latents_std
         )
-        audio_latents = self._unpack_audio_latents(audio_latents, audio_num_frames, num_mel_bins=latent_mel_bins)
+        audio_latents = self._unpack_audio_latents(
+            audio_latents, audio_num_frames, num_mel_bins=latent_mel_bins
+        )
 
         if output_type == "latent":
             video = latents
@@ -677,7 +808,12 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             if not self.vae.config.timestep_conditioning:
                 timestep = None
             else:
-                noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+                noise = randn_tensor(
+                    latents.shape,
+                    generator=generator,
+                    device=device,
+                    dtype=latents.dtype,
+                )
                 if not isinstance(decode_timestep, list):
                     decode_timestep = [decode_timestep] * batch_size
                 if decode_noise_scale is None:
@@ -685,18 +821,26 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
                 elif not isinstance(decode_noise_scale, list):
                     decode_noise_scale = [decode_noise_scale] * batch_size
 
-                timestep = torch.tensor(decode_timestep, device=device, dtype=latents.dtype)
-                decode_noise_scale = torch.tensor(decode_noise_scale, device=device, dtype=latents.dtype)[
-                    :, None, None, None, None
-                ]
-                latents = (1 - decode_noise_scale) * latents + decode_noise_scale * noise
+                timestep = torch.tensor(
+                    decode_timestep, device=device, dtype=latents.dtype
+                )
+                decode_noise_scale = torch.tensor(
+                    decode_noise_scale, device=device, dtype=latents.dtype
+                )[:, None, None, None, None]
+                latents = (
+                    1 - decode_noise_scale
+                ) * latents + decode_noise_scale * noise
 
             latents = latents.to(self.vae.dtype)
             video = self.vae.decode(latents, timestep, return_dict=False)[0]
-            video = self.video_processor.postprocess_video(video, output_type=output_type)
+            video = self.video_processor.postprocess_video(
+                video, output_type=output_type
+            )
 
             audio_latents = audio_latents.to(self.audio_vae.dtype)
-            generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
+            generated_mel_spectrograms = self.audio_vae.decode(
+                audio_latents, return_dict=False
+            )[0]
             audio = self.vocoder(generated_mel_spectrograms)
 
         if not return_dict:

@@ -15,7 +15,9 @@ def rotate_half(x, interleaved=False):
         return torch.cat((-x2, x1), dim=-1)
     else:
         x1, x2 = x[..., ::2], x[..., 1::2]
-        return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
+        return rearrange(
+            torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2
+        )
 
 
 def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
@@ -25,8 +27,12 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
     """
     ro_dim = cos.shape[-1] * 2
     assert ro_dim <= x.shape[-1]
-    cos = repeat(cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
-    sin = repeat(sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
+    cos = repeat(
+        cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
+    )
+    sin = repeat(
+        sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
+    )
     return torch.cat(
         [
             x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin,
@@ -54,15 +60,36 @@ def apply_rotary_emb_mindiesd(
         # if last dim of sin and cos is D/2, expand to (S, D) to adapt to mindiesd operators
         if half_head_dim:
             seqlen = cos.shape[0]
-            sin = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-            cos = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+            sin = (
+                sin.unsqueeze(0)
+                .unsqueeze(2)
+                .unsqueeze(-1)
+                .expand(-1, -1, -1, -1, 2)
+                .reshape(1, seqlen, 1, -1)
+            )
+            cos = (
+                cos.unsqueeze(0)
+                .unsqueeze(2)
+                .unsqueeze(-1)
+                .expand(-1, -1, -1, -1, 2)
+                .reshape(1, seqlen, 1, -1)
+            )
+        return rotary_position_embedding(
+            x,
+            cos,
+            sin,
+            rotated_mode="rotated_interleaved",
+            head_first=False,
+            fused=True,
+        )
     else:
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
             cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+        return rotary_position_embedding(
+            x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True
+        )
 
 
 class RotaryEmbedding(CustomOp):

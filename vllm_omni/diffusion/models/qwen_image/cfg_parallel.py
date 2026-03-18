@@ -14,7 +14,9 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 
 logger = logging.getLogger(__name__)
@@ -77,7 +79,9 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 self._current_timestep = t
 
                 # Broadcast timestep to match batch size
-                timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+                timestep = t.expand(latents.shape[0]).to(
+                    device=latents.device, dtype=latents.dtype
+                )
 
                 # Concatenate image latents with noise latents if available (for editing pipelines)
                 latent_model_input = latents
@@ -122,7 +126,9 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 )
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                latents = self.scheduler_step_maybe_with_cfg(
+                    noise_pred, t, latents, do_true_cfg
+                )
 
                 pbar.update()
 
@@ -153,7 +159,9 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             return True
 
         if true_cfg_scale <= 1:
-            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
+            logger.warning(
+                "CFG parallel is NOT working correctly when true_cfg_scale <= 1."
+            )
             return False
 
         if not has_neg_prompt:

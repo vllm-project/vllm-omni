@@ -33,7 +33,9 @@ TEXT_TOKEN_ID = 0
 # ---------------------------------------------------------------------------
 
 
-def make_token_seq(audio_n: int, image_n: int, video_n: int, text_prefix: int = 3, text_sep: int = 2):
+def make_token_seq(
+    audio_n: int, image_n: int, video_n: int, text_prefix: int = 3, text_sep: int = 2
+):
     """
     Build a flat token sequence:
       [text_prefix] [AUDIO * audio_n] [text_sep] [IMAGE * image_n]
@@ -50,11 +52,17 @@ def make_token_seq(audio_n: int, image_n: int, video_n: int, text_prefix: int = 
         + [TEXT_TOKEN_ID] * text_sep
     )
     input_ids = torch.tensor(tokens)
-    is_multimodal = (input_ids == AUDIO_TOKEN_ID) | (input_ids == IMAGE_TOKEN_ID) | (input_ids == VIDEO_TOKEN_ID)
+    is_multimodal = (
+        (input_ids == AUDIO_TOKEN_ID)
+        | (input_ids == IMAGE_TOKEN_ID)
+        | (input_ids == VIDEO_TOKEN_ID)
+    )
     return input_ids, is_multimodal
 
 
-def make_interleaved_seq(video_chunks: list[int], audio_chunks: list[int], text_prefix: int = 2):
+def make_interleaved_seq(
+    video_chunks: list[int], audio_chunks: list[int], text_prefix: int = 2
+):
     """
     Build an interleaved sequence like use_audio_in_video:
       [text] [V*v0] [A*a0] [V*v1] [A*a1] ...
@@ -78,28 +86,36 @@ class TestCheckInterleavedAudioVideo:
         input_ids, is_multimodal = make_token_seq(5, 0, 4)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(
+            is_video, is_audio, is_video.sum().item(), is_audio.sum().item()
+        )
 
     def test_non_interleaved_with_image(self):
         """Audio + image + video (the mixed_modalities case) -> not interleaved."""
         input_ids, is_multimodal = make_token_seq(5, 4, 6)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(
+            is_video, is_audio, is_video.sum().item(), is_audio.sum().item()
+        )
 
     def test_no_audio(self):
         """Video only -> not interleaved."""
         input_ids, is_multimodal = make_token_seq(0, 0, 6)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(
+            is_video, is_audio, is_video.sum().item(), is_audio.sum().item()
+        )
 
     def test_interleaved(self):
         """V A V A interleaved -> True."""
         input_ids, is_multimodal = make_interleaved_seq([4, 4], [3, 3])
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert check_interleaved_audio_video(
+            is_video, is_audio, is_video.sum().item(), is_audio.sum().item()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +151,13 @@ def make_mock_model(hidden: int = 8):
 
     from vllm.model_executor.models.interfaces import SupportsMultiModal
 
-    model._embed_text_input_ids = lambda *a, **kw: SupportsMultiModal._embed_text_input_ids(model, *a, **kw)
+    model._embed_text_input_ids = (
+        lambda *a, **kw: SupportsMultiModal._embed_text_input_ids(model, *a, **kw)
+    )
 
-    def fake_super_embed(ids, mm_embs=None, *, is_multimodal=None, handle_oov_mm_token=False):
+    def fake_super_embed(
+        ids, mm_embs=None, *, is_multimodal=None, handle_oov_mm_token=False
+    ):
         return SupportsMultiModal.embed_input_ids(
             model,
             ids,
@@ -146,14 +166,20 @@ def make_mock_model(hidden: int = 8):
             handle_oov_mm_token=handle_oov_mm_token,
         )
 
-    model.embed_input_ids = lambda *a, **kw: Qwen2_5OmniThinkerForConditionalGeneration.embed_input_ids(model, *a, **kw)
+    model.embed_input_ids = (
+        lambda *a, **kw: Qwen2_5OmniThinkerForConditionalGeneration.embed_input_ids(
+            model, *a, **kw
+        )
+    )
 
     model._super_embed_input_ids = fake_super_embed
 
     return model, hidden
 
 
-def build_mm_embeds(audio_n, image_n, video_n, hidden, audio_val=10.0, image_val=20.0, video_val=30.0):
+def build_mm_embeds(
+    audio_n, image_n, video_n, hidden, audio_val=10.0, image_val=20.0, video_val=30.0
+):
     """
     Build multimodal_embeddings list in position order (audio, image, video).
     Each embedding is filled with a distinct constant so we can verify placement.
@@ -178,7 +204,9 @@ class TestEmbedInputIds:
         mm_embeds = build_mm_embeds(audio_n, image_n, video_n, hidden)
 
         model, _ = make_mock_model(hidden)
-        result = model.embed_input_ids(input_ids, mm_embeds, is_multimodal=is_multimodal)
+        result = model.embed_input_ids(
+            input_ids, mm_embeds, is_multimodal=is_multimodal
+        )
         return result, input_ids, is_multimodal
 
     def test_audio_only(self):
@@ -188,9 +216,9 @@ class TestEmbedInputIds:
         result, input_ids, is_multimodal = self._run(audio_n, 0, 0, hidden)
 
         audio_pos = (input_ids == AUDIO_TOKEN_ID).nonzero(as_tuple=True)[0]
-        assert result[audio_pos].allclose(torch.full((audio_n, hidden), audio_val)), (
-            "Audio positions should get audio embeddings"
-        )
+        assert result[audio_pos].allclose(
+            torch.full((audio_n, hidden), audio_val)
+        ), "Audio positions should get audio embeddings"
 
     def test_video_only(self):
         """Video-only: video positions get video embeddings."""
@@ -199,9 +227,9 @@ class TestEmbedInputIds:
         result, input_ids, is_multimodal = self._run(0, 0, video_n, hidden)
 
         video_pos = (input_ids == VIDEO_TOKEN_ID).nonzero(as_tuple=True)[0]
-        assert result[video_pos].allclose(torch.full((video_n, hidden), video_val)), (
-            "Video positions should get video embeddings"
-        )
+        assert result[video_pos].allclose(
+            torch.full((video_n, hidden), video_val)
+        ), "Video positions should get video embeddings"
 
     def test_mixed_modalities_audio_goes_to_audio_pos(self):
         """
@@ -219,19 +247,19 @@ class TestEmbedInputIds:
         video_pos = (input_ids == VIDEO_TOKEN_ID).nonzero(as_tuple=True)[0]
 
         mean_a = result[audio_pos].mean().item()
-        assert result[audio_pos].allclose(torch.full((audio_n, hidden), audio_val)), (
-            f"Audio emb wrong: expected {audio_val}, got mean={mean_a:.1f}"
-        )
+        assert result[audio_pos].allclose(
+            torch.full((audio_n, hidden), audio_val)
+        ), f"Audio emb wrong: expected {audio_val}, got mean={mean_a:.1f}"
 
         mean_i = result[image_pos].mean().item()
-        assert result[image_pos].allclose(torch.full((image_n, hidden), image_val)), (
-            f"Image emb wrong: expected {image_val}, got mean={mean_i:.1f}"
-        )
+        assert result[image_pos].allclose(
+            torch.full((image_n, hidden), image_val)
+        ), f"Image emb wrong: expected {image_val}, got mean={mean_i:.1f}"
 
         mean_v = result[video_pos].mean().item()
-        assert result[video_pos].allclose(torch.full((video_n, hidden), video_val)), (
-            f"Video emb wrong: expected {video_val}, got mean={mean_v:.1f}"
-        )
+        assert result[video_pos].allclose(
+            torch.full((video_n, hidden), video_val)
+        ), f"Video emb wrong: expected {video_val}, got mean={mean_v:.1f}"
 
     def test_text_positions_unchanged(self):
         """Text positions should keep their text embeddings."""
@@ -240,9 +268,9 @@ class TestEmbedInputIds:
 
         text_pos = (~is_multimodal).nonzero(as_tuple=True)[0]
         # Text tokens have value TEXT_TOKEN_ID=0, so embed -> 0.0
-        assert result[text_pos].allclose(torch.zeros(len(text_pos), hidden)), (
-            "Text positions should keep text embeddings"
-        )
+        assert result[text_pos].allclose(
+            torch.zeros(len(text_pos), hidden)
+        ), "Text positions should keep text embeddings"
 
     def test_interleaved_use_audio_in_video(self):
         """
@@ -264,18 +292,20 @@ class TestEmbedInputIds:
         ]
 
         model, _ = make_mock_model(hidden)
-        result = model.embed_input_ids(input_ids, mm_embeds, is_multimodal=is_multimodal)
+        result = model.embed_input_ids(
+            input_ids, mm_embeds, is_multimodal=is_multimodal
+        )
 
         video_pos = (input_ids == VIDEO_TOKEN_ID).nonzero(as_tuple=True)[0]
         audio_pos = (input_ids == AUDIO_TOKEN_ID).nonzero(as_tuple=True)[0]
 
-        assert result[video_pos].allclose(torch.full((video_n, hidden), video_val)), (
-            "Interleaved: video positions should get video embeddings"
-        )
+        assert result[video_pos].allclose(
+            torch.full((video_n, hidden), video_val)
+        ), "Interleaved: video positions should get video embeddings"
 
-        assert result[audio_pos].allclose(torch.full((audio_n, hidden), audio_val)), (
-            "Interleaved: audio positions should get audio embeddings"
-        )
+        assert result[audio_pos].allclose(
+            torch.full((audio_n, hidden), audio_val)
+        ), "Interleaved: audio positions should get audio embeddings"
 
 
 # ---------------------------------------------------------------------------

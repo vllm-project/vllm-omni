@@ -5,7 +5,10 @@
 
 import torch
 
-from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType, select_flash_attn_impl
+from vllm_omni.diffusion.attention.backends.ring.ring_selector import (
+    AttnType,
+    select_flash_attn_impl,
+)
 from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_and_lse
 from vllm_omni.diffusion.distributed.comm import RingComm
 
@@ -76,7 +79,9 @@ def ring_flash_attn_forward(
                     step_k = torch.cat([step_k, joint_tensor_key], dim=1)
                     step_v = torch.cat([step_v, joint_tensor_value], dim=1)
 
-            fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
+            fn = select_flash_attn_impl(
+                attn_type, stage="fwd-only", attn_processor=attn_processor
+            )
             block_out, block_lse = fn(
                 q,
                 step_k,

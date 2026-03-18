@@ -65,7 +65,9 @@ class OpenAICreateSpeechRequest(BaseModel):
     @classmethod
     def validate_stream_format(cls, v: str) -> str:
         if v == "sse":
-            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
+            raise ValueError(
+                "'sse' is not a supported stream_format yet. Please use 'audio'."
+            )
         return v
 
     @model_validator(mode="after")
@@ -147,5 +149,7 @@ class StreamingSpeechSessionConfig(BaseModel):
             if self.speed is None:
                 self.speed = 1.0
             elif self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported when stream_audio=true. Set speed=1.0 or omit it.")
+                raise ValueError(
+                    "Speed adjustment is not supported when stream_audio=true. Set speed=1.0 or omit it."
+                )
         return self

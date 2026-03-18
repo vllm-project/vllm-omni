@@ -68,27 +68,38 @@ def build_payload(
 
     if "ref_audio" in payload:
         if not ref_text or not ref_text.strip():
-            raise gr.Error("Voice cloning requires a transcript of the reference audio.")
+            raise gr.Error(
+                "Voice cloning requires a transcript of the reference audio."
+            )
         payload["ref_text"] = ref_text.strip()
 
     return payload
 
 
-def generate_speech(api_base: str, text: str, ref_audio, ref_audio_url, ref_text, response_format):
+def generate_speech(
+    api_base: str, text: str, ref_audio, ref_audio_url, ref_text, response_format
+):
     """Non-streaming: call /v1/audio/speech and return full audio."""
-    payload = build_payload(text, ref_audio, ref_audio_url, ref_text, response_format, stream=False)
+    payload = build_payload(
+        text, ref_audio, ref_audio_url, ref_text, response_format, stream=False
+    )
 
     try:
         with httpx.Client(timeout=300.0) as client:
             resp = client.post(
                 f"{api_base}/v1/audio/speech",
                 json=payload,
-                headers={"Content-Type": "application/json", "Authorization": "Bearer EMPTY"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer EMPTY",
+                },
             )
     except httpx.TimeoutException:
         raise gr.Error("Request timed out. The server may be busy.")
     except httpx.ConnectError:
-        raise gr.Error(f"Cannot connect to server at {api_base}. Is the server running?")
+        raise gr.Error(
+            f"Cannot connect to server at {api_base}. Is the server running?"
+        )
 
     if resp.status_code != 200:
         raise gr.Error(f"Server error ({resp.status_code}): {resp.text}")
@@ -102,7 +113,9 @@ def generate_speech(api_base: str, text: str, ref_audio, ref_audio_url, ref_text
 
     try:
         if response_format == "pcm":
-            audio_np = np.frombuffer(resp.content, dtype=np.int16).astype(np.float32) / 32767.0
+            audio_np = (
+                np.frombuffer(resp.content, dtype=np.int16).astype(np.float32) / 32767.0
+            )
             return (PCM_SAMPLE_RATE, audio_np)
         audio_np, sample_rate = sf.read(io.BytesIO(resp.content))
         if audio_np.ndim > 1:
@@ -112,9 +125,19 @@ def generate_speech(api_base: str, text: str, ref_audio, ref_audio_url, ref_text
         raise gr.Error(f"Failed to decode audio: {e}")
 
 
-def generate_speech_stream(api_base, text, ref_audio, ref_audio_url, ref_text, response_format, chunk_seconds=0.5):
+def generate_speech_stream(
+    api_base,
+    text,
+    ref_audio,
+    ref_audio_url,
+    ref_text,
+    response_format,
+    chunk_seconds=0.5,
+):
     """Streaming: yield PCM chunks for progressive playback."""
-    payload = build_payload(text, ref_audio, ref_audio_url, ref_text, response_format, stream=True)
+    payload = build_payload(
+        text, ref_audio, ref_audio_url, ref_text, response_format, stream=True
+    )
 
     min_chunk_samples = int(PCM_SAMPLE_RATE * chunk_seconds)
     prebuffer_chunks = 2
@@ -130,7 +153,10 @@ def generate_speech_stream(api_base, text, ref_audio, ref_audio_url, ref_text, r
                 "POST",
                 f"{api_base}/v1/audio/speech",
                 json=payload,
-                headers={"Content-Type": "application/json", "Authorization": "Bearer EMPTY"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer EMPTY",
+                },
             ) as resp:
                 if resp.status_code != 200:
                     resp.read()
@@ -143,7 +169,12 @@ def generate_speech_stream(api_base, text, ref_audio, ref_audio_url, ref_text, r
                     leftover = raw[usable:]
                     if usable == 0:
                         continue
-                    float_samples = np.frombuffer(raw[:usable], dtype=np.int16).copy().astype(np.float32) / 32767.0
+                    float_samples = (
+                        np.frombuffer(raw[:usable], dtype=np.int16)
+                        .copy()
+                        .astype(np.float32)
+                        / 32767.0
+                    )
                     pending.append(float_samples)
                     pending_len += len(float_samples)
                     if pending_len >= min_chunk_samples:
@@ -164,7 +195,9 @@ def generate_speech_stream(api_base, text, ref_audio, ref_audio_url, ref_text, r
     except httpx.TimeoutException:
         raise gr.Error("Request timed out. The server may be busy.")
     except httpx.ConnectError:
-        raise gr.Error(f"Cannot connect to server at {api_base}. Is the server running?")
+        raise gr.Error(
+            f"Cannot connect to server at {api_base}. Is the server running?"
+        )
 
 
 def on_stream_change(stream: bool):
@@ -178,7 +211,9 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.5):
     """Build the Gradio interface."""
     with gr.Blocks(title="Fish Speech S2 Pro Demo") as demo:
         gr.Markdown("# Fish Speech S2 Pro - Text to Speech")
-        gr.Markdown(f"**Server:** `{api_base}` | **Model:** fishaudio/s2-pro | **Output:** 44.1kHz")
+        gr.Markdown(
+            f"**Server:** `{api_base}` | **Model:** fishaudio/s2-pro | **Output:** 44.1kHz"
+        )
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -222,7 +257,9 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.5):
                         scale=1,
                     )
 
-                generate_btn = gr.Button("Generate Speech", variant="primary", size="lg")
+                generate_btn = gr.Button(
+                    "Generate Speech", variant="primary", size="lg"
+                )
 
             with gr.Column(scale=2):
                 audio_output = gr.Audio(
@@ -239,32 +276,53 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.5):
                     "- **44.1kHz** output via DAC codec"
                 )
 
-        stream_checkbox.change(fn=on_stream_change, inputs=[stream_checkbox], outputs=[response_format])
+        stream_checkbox.change(
+            fn=on_stream_change, inputs=[stream_checkbox], outputs=[response_format]
+        )
 
         all_inputs = [text_input, ref_audio, ref_audio_url, ref_text, response_format]
 
         def dispatch(stream_enabled, *args):
             if stream_enabled:
-                yield from generate_speech_stream(api_base, *args, chunk_seconds=stream_chunk_seconds)
+                yield from generate_speech_stream(
+                    api_base, *args, chunk_seconds=stream_chunk_seconds
+                )
             else:
                 yield generate_speech(api_base, *args)
 
-        generate_btn.click(fn=dispatch, inputs=[stream_checkbox] + all_inputs, outputs=[audio_output])
+        generate_btn.click(
+            fn=dispatch, inputs=[stream_checkbox] + all_inputs, outputs=[audio_output]
+        )
         demo.queue()
     return demo
 
 
 def main():
     parser = argparse.ArgumentParser(description="Gradio demo for Fish Speech S2 Pro")
-    parser.add_argument("--api-base", default=DEFAULT_API_BASE, help=f"API base URL (default: {DEFAULT_API_BASE})")
-    parser.add_argument("--host", default="0.0.0.0", help="Gradio host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=7860, help="Gradio port (default: 7860)")
+    parser.add_argument(
+        "--api-base",
+        default=DEFAULT_API_BASE,
+        help=f"API base URL (default: {DEFAULT_API_BASE})",
+    )
+    parser.add_argument(
+        "--host", default="0.0.0.0", help="Gradio host (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=7860, help="Gradio port (default: 7860)"
+    )
     parser.add_argument("--share", action="store_true", help="Share publicly")
-    parser.add_argument("--stream-chunk-seconds", type=float, default=0.5, help="Seconds per streaming chunk")
+    parser.add_argument(
+        "--stream-chunk-seconds",
+        type=float,
+        default=0.5,
+        help="Seconds per streaming chunk",
+    )
     args = parser.parse_args()
 
     print(f"Connecting to vLLM server at: {args.api_base}")
-    demo = build_interface(args.api_base, stream_chunk_seconds=args.stream_chunk_seconds)
+    demo = build_interface(
+        args.api_base, stream_chunk_seconds=args.stream_chunk_seconds
+    )
     demo.launch(server_name=args.host, server_port=args.port, share=args.share)
 
 

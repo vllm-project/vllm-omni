@@ -62,7 +62,12 @@ from vllm_omni.entrypoints.zmq_utils import (
     ZmqQueue,
     create_zmq_queue,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams, OmniTokensPrompt
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniPromptType,
+    OmniSamplingParams,
+    OmniTokensPrompt,
+)
 from vllm_omni.metrics import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -101,14 +106,18 @@ def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int =
         tensor_parallel_size = parallel_config.get("tensor_parallel_size", 1)
         pipeline_parallel_size = parallel_config.get("pipeline_parallel_size", 1)
         data_parallel_size = parallel_config.get("data_parallel_size", 1)
-        prefill_context_parallel_size = parallel_config.get("prefill_context_parallel_size", 1)
+        prefill_context_parallel_size = parallel_config.get(
+            "prefill_context_parallel_size", 1
+        )
         sequence_parallel_size = parallel_config.get("sequence_parallel_size", 1)
         cfg_parallel_size = parallel_config.get("cfg_parallel_size", 1)
     else:
         tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
         pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
         data_parallel_size = engine_args.get("data_parallel_size", 1)
-        prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
+        prefill_context_parallel_size = engine_args.get(
+            "prefill_context_parallel_size", 1
+        )
         sequence_parallel_size = 1
         cfg_parallel_size = 1
 
@@ -128,7 +137,9 @@ def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int =
 
     if visible_devices_str:
         try:
-            physical_devices = [int(x.strip()) for x in visible_devices_str.split(",") if x.strip()]
+            physical_devices = [
+                int(x.strip()) for x in visible_devices_str.split(",") if x.strip()
+            ]
         except (ValueError, IndexError):
             pass
 
@@ -227,7 +238,9 @@ def _resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     if worker_type == "ar":
         engine_args["worker_cls"] = current_omni_platform.get_omni_ar_worker_cls()
     elif worker_type == "generation":
-        engine_args["worker_cls"] = current_omni_platform.get_omni_generation_worker_cls()
+        engine_args["worker_cls"] = (
+            current_omni_platform.get_omni_generation_worker_cls()
+        )
     else:
         raise ValueError(f"Unknown worker_type: {worker_type}")
 
@@ -268,16 +281,24 @@ class OmniStage:
         self.stage_id = stage_config.stage_id
         self.engine_args = stage_config.engine_args
         self.model_stage = stage_config.engine_args.model_stage
-        self.requires_multimodal_data = getattr(stage_config.runtime, "requires_multimodal_data", False)
+        self.requires_multimodal_data = getattr(
+            stage_config.runtime, "requires_multimodal_data", False
+        )
         # Support both 'input_sources' (new format) and 'engine_input_source' (legacy)
         self.engine_input_source = (
-            getattr(stage_config, "input_sources", None) or getattr(stage_config, "engine_input_source", []) or []
+            getattr(stage_config, "input_sources", None)
+            or getattr(stage_config, "engine_input_source", [])
+            or []
         )
-        self.engine_output_type = getattr(stage_config.engine_args, "engine_output_type", None)
+        self.engine_output_type = getattr(
+            stage_config.engine_args, "engine_output_type", None
+        )
         self.engine_outputs = None
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
-        self.stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
+        self.stage_type: Literal["llm", "diffusion"] = getattr(
+            stage_config, "stage_type", "llm"
+        )
         if (
             "stage_id" in stage_config.engine_args
             and stage_config.engine_args.stage_id != self.stage_id
@@ -286,13 +307,17 @@ class OmniStage:
             stage_config.engine_args.stage_id = self.stage_id
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
-            module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
+            module_path, func_name = stage_config.custom_process_input_func.rsplit(
+                ".", 1
+            )
             module = importlib.import_module(module_path)
             self.custom_process_input_func = getattr(module, func_name)
         else:
             self.custom_process_input_func = None
 
-        self.prompt_expand_func = load_func_from_config(getattr(stage_config, "prompt_expand_func", None))
+        self.prompt_expand_func = load_func_from_config(
+            getattr(stage_config, "prompt_expand_func", None)
+        )
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
         self.tts_args = _to_dict(getattr(stage_config, "tts_args", {}))
@@ -303,10 +328,14 @@ class OmniStage:
         # Further convert it to dataclass to check fields
         try:
             self.default_sampling_params = (
-                SamplingParams if self.stage_type == "llm" else OmniDiffusionSamplingParams
+                SamplingParams
+                if self.stage_type == "llm"
+                else OmniDiffusionSamplingParams
             )(**default_sampling_params)
         except TypeError as error:
-            raise TypeError(f"Invalid default_sampling_params for stage {self.stage_id}: {error}") from error
+            raise TypeError(
+                f"Invalid default_sampling_params for stage {self.stage_id}: {error}"
+            ) from error
         # Runtime orchestration state (added)
         self._in_q: mp.queues.Queue | ZmqQueue | str | None = None
         self._out_q: mp.queues.Queue | ZmqQueue | str | None = None
@@ -394,7 +423,9 @@ class OmniStage:
     def stop_profile(self) -> dict:
         """Stop profiling by sending a signal to worker and waiting for response."""
         if self._in_q is None or self._out_q is None:
-            logger.warning(f"[Stage-{self.stage_id}] Queues not initialized, cannot stop profile.")
+            logger.warning(
+                f"[Stage-{self.stage_id}] Queues not initialized, cannot stop profile."
+            )
             return {}
 
         logger.info(f"[Stage-{self.stage_id}] Sending PROFILER_STOP to worker...")
@@ -409,7 +440,9 @@ class OmniStage:
                 if response.get("type") == "profiler_result":
                     return response.get("data", {})
                 elif "error" in response:
-                    logger.error(f"[Stage-{self.stage_id}] Profiler error: {response['error']}")
+                    logger.error(
+                        f"[Stage-{self.stage_id}] Profiler error: {response['error']}"
+                    )
                     return {}
 
             # If we got something else (e.g. late generation result), we might lose it here,
@@ -420,7 +453,9 @@ class OmniStage:
             return {}
 
         except queue.Empty:
-            logger.error(f"[Stage-{self.stage_id}] Timeout waiting for profiler results.")
+            logger.error(
+                f"[Stage-{self.stage_id}] Timeout waiting for profiler results."
+            )
             return {}
 
     def collective_rpc(
@@ -453,7 +488,9 @@ class OmniStage:
             It is recommended to use this API to only pass control messages,
             and set up data-plane communication to pass data.
         """
-        assert self._in_q is not None and self._out_q is not None, "Queues must be attached before collective_rpc"
+        assert (
+            self._in_q is not None and self._out_q is not None
+        ), "Queues must be attached before collective_rpc"
 
         # Submit collective_rpc task to worker
         rpc_id = str(uuid.uuid4())
@@ -483,7 +520,9 @@ class OmniStage:
                 if result.get("type") == "collective_rpc_result":
                     if result.get("rpc_id") == rpc_id:
                         if "error" in result:
-                            raise RuntimeError(f"collective_rpc failed: {result['error']}")
+                            raise RuntimeError(
+                                f"collective_rpc failed: {result['error']}"
+                            )
                         return result["result"]
 
             time.sleep(0.001)  # Small sleep to avoid busy waiting
@@ -520,11 +559,15 @@ class OmniStage:
         Raises:
             AssertionError: If queues are not attached before calling this method
         """
-        assert self._in_q is not None and self._out_q is not None, "Queues must be attached before start_process"
+        assert (
+            self._in_q is not None and self._out_q is not None
+        ), "Queues must be attached before start_process"
 
         if worker_backend == "ray":
             ray_placement_group = kwargs.get("ray_placement_group", None)
-            assert ray_placement_group is not None, "Ray placement group must be provided"
+            assert (
+                ray_placement_group is not None
+            ), "Ray placement group must be provided"
             self._shm_threshold_bytes = sys.maxsize
         else:
             self._shm_threshold_bytes = shm_threshold_bytes
@@ -544,7 +587,9 @@ class OmniStage:
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
             "engine_input_source": self.engine_input_source,
-            "cfg_kv_collect_func": getattr(self.stage_config, "cfg_kv_collect_func", None),
+            "cfg_kv_collect_func": getattr(
+                self.stage_config, "cfg_kv_collect_func", None
+            ),
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
         }
@@ -584,8 +629,16 @@ class OmniStage:
                         args=(
                             model,
                             stage_payload,
-                            self._in_q.endpoint if isinstance(self._in_q, ZmqQueue) else self._in_q,
-                            self._out_q.endpoint if isinstance(self._out_q, ZmqQueue) else self._out_q,
+                            (
+                                self._in_q.endpoint
+                                if isinstance(self._in_q, ZmqQueue)
+                                else self._in_q
+                            ),
+                            (
+                                self._out_q.endpoint
+                                if isinstance(self._out_q, ZmqQueue)
+                                else self._out_q
+                            ),
                             batch_timeout,
                             self._stage_init_timeout,
                         ),
@@ -596,8 +649,16 @@ class OmniStage:
                         args=(
                             model,
                             stage_payload,
-                            self._in_q.endpoint if isinstance(self._in_q, ZmqQueue) else self._in_q,
-                            self._out_q.endpoint if isinstance(self._out_q, ZmqQueue) else self._out_q,
+                            (
+                                self._in_q.endpoint
+                                if isinstance(self._in_q, ZmqQueue)
+                                else self._in_q
+                            ),
+                            (
+                                self._out_q.endpoint
+                                if isinstance(self._out_q, ZmqQueue)
+                                else self._out_q
+                            ),
                             batch_timeout,
                             self._stage_init_timeout,
                         ),
@@ -684,7 +745,9 @@ class OmniStage:
 
                     if isinstance(target_ein["additional_information"], dict):
                         # Wrap in list because OmniInputProcessor requires Tensor or list values
-                        target_ein["additional_information"]["global_request_id"] = [str(req_id)]
+                        target_ein["additional_information"]["global_request_id"] = [
+                            str(req_id)
+                        ]
 
             if isinstance(ein, list):
                 for item in ein:
@@ -707,12 +770,18 @@ class OmniStage:
         except queue.Empty:
             pass
         except Exception as e:
-            logger.error("Unexpected error when collecting OmniStage output queue:", exc_info=e)
+            logger.error(
+                "Unexpected error when collecting OmniStage output queue:", exc_info=e
+            )
             self.stop_stage_worker()
             raise
         if self._proc is not None and not self._proc.is_alive():
-            raise RuntimeError(f"OmniStage Worker process died unexpectedly with exit code {self._proc.exitcode}")
-        if self._ray_task_ref is not None and not is_ray_task_alive(self._ray_task_ref, timeout=0):
+            raise RuntimeError(
+                f"OmniStage Worker process died unexpectedly with exit code {self._proc.exitcode}"
+            )
+        if self._ray_task_ref is not None and not is_ray_task_alive(
+            self._ray_task_ref, timeout=0
+        ):
             e = get_ray_task_error(self._ray_task_ref, timeout=0)
             raise RuntimeError("OmniStage Ray actor died unexpectedly") from e
 
@@ -780,7 +849,10 @@ class OmniStage:
                 stage_list[_source_id].engine_outputs = source_outputs_override
                 try:
                     return self.custom_process_input_func(
-                        stage_list, engine_input_source, prompt, self.requires_multimodal_data
+                        stage_list,
+                        engine_input_source,
+                        prompt,
+                        self.requires_multimodal_data,
                     )
                 finally:
                     stage_list[_source_id].engine_outputs = _orig_outputs
@@ -829,7 +901,9 @@ def _stage_worker(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
 
-    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
+    cfg_kv_collect_func = load_func_from_config(
+        stage_payload.get("cfg_kv_collect_func")
+    )
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
@@ -872,10 +946,15 @@ def _stage_worker(
     with _sequential_init_lock(engine_args, stage_init_timeout):
         # Init engine based on stage_type
         logger.debug(
-            "[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys())
+            "[Stage-%s] Initializing %s engine with args keys=%s",
+            stage_id,
+            stage_type,
+            list(engine_args.keys()),
         )
         if engine_args.get("async_chunk", False):
-            logger.debug("[Stage-%s] Async chunk enabled, injecting connectors config", stage_id)
+            logger.debug(
+                "[Stage-%s] Async chunk enabled, injecting connectors config", stage_id
+            )
             stage_connector_spec = {}
             for v in connectors_config.values():
                 stage_connector_spec = dict(v.get("spec", {}))
@@ -924,19 +1003,25 @@ def _stage_worker(
         if task_type == OmniStageTaskType.PROFILER_START:
             if stage_type == "diffusion":
                 try:
-                    profile_dir = _os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
+                    profile_dir = _os.environ.get(
+                        "VLLM_TORCH_PROFILER_DIR", "./profiles"
+                    )
                     _os.makedirs(profile_dir, exist_ok=True)
                     trace_filename = f"stage_{stage_id}_diffusion_{int(_time.time())}"
                     stage_engine.start_profile(trace_filename=trace_filename)
                     logger.info("[Stage-%s] Diffusion Torch profiler started", stage_id)
                 except Exception as e:
-                    logger.warning("[Stage-%s] Failed to start diffusion profiler: %s", stage_id, e)
+                    logger.warning(
+                        "[Stage-%s] Failed to start diffusion profiler: %s", stage_id, e
+                    )
             else:
                 try:
                     stage_engine.start_profile()
                     logger.info("[Stage-%s] vLLM profiler started", stage_id)
                 except Exception as e:
-                    logger.warning("[Stage-%s] Failed to start vLLM profiler: %s", stage_id, e)
+                    logger.warning(
+                        "[Stage-%s] Failed to start vLLM profiler: %s", stage_id, e
+                    )
             return {}
 
         elif task_type == OmniStageTaskType.PROFILER_STOP:
@@ -947,14 +1032,18 @@ def _stage_worker(
                     logger.info("[Stage-%s] Diffusion Torch profiler stopped", stage_id)
                     return result_data
                 except Exception as e:
-                    logger.warning("[Stage-%s] Failed to stop diffusion profiler: %s", stage_id, e)
+                    logger.warning(
+                        "[Stage-%s] Failed to stop diffusion profiler: %s", stage_id, e
+                    )
                     return {}
             else:
                 try:
                     stage_engine.stop_profile()
                     logger.info("[Stage-%s] vLLM profiler stopped", stage_id)
                 except Exception as e:
-                    logger.warning("[Stage-%s] Failed to stop vLLM profiler: %s", stage_id, e)
+                    logger.warning(
+                        "[Stage-%s] Failed to stop vLLM profiler: %s", stage_id, e
+                    )
                 return {}
         return {}
 
@@ -1058,7 +1147,9 @@ def _stage_worker(
         for task_to_readd in tasks_failed_to_add_to_batch:
             in_q.put(task_to_readd)
         # Ensure that the popped tasks are with identical sampling params. Take one of them.
-        batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0]["sampling_params"]
+        batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0][
+            "sampling_params"
+        ]
 
         batch_request_ids: list[Any] = []
         batch_engine_inputs: list[OmniPromptType] = []
@@ -1070,7 +1161,9 @@ def _stage_worker(
             try:
                 sent_ts = float(t.get("sent_ts", None)) if isinstance(t, dict) else None
                 if sent_ts is not None:
-                    _in_flight_ms_by_rid[rid] = max(0.0, (_recv_dequeue_ts - sent_ts) * 1000.0)
+                    _in_flight_ms_by_rid[rid] = max(
+                        0.0, (_recv_dequeue_ts - sent_ts) * 1000.0
+                    )
                 else:
                     _in_flight_ms_by_rid[rid] = 0.0
             except Exception:
@@ -1117,7 +1210,9 @@ def _stage_worker(
             _gen_t0 = _time.time()
             if stage_type == "diffusion":
                 stage_engine = cast(OmniDiffusion, stage_engine)
-                batch_engine_sampling_params = cast(OmniDiffusionSamplingParams, batch_engine_sampling_params)
+                batch_engine_sampling_params = cast(
+                    OmniDiffusionSamplingParams, batch_engine_sampling_params
+                )
                 # Diffusion generate returns results directly, not an iterator
                 diffusion_results = stage_engine.generate(
                     batch_engine_inputs, batch_engine_sampling_params, batch_request_ids
@@ -1130,7 +1225,9 @@ def _stage_worker(
                             result.request_id = batch_request_ids[idx]
             else:
                 stage_engine = cast(OmniLLM, stage_engine)
-                batch_engine_sampling_params = cast(SamplingParams, batch_engine_sampling_params)
+                batch_engine_sampling_params = cast(
+                    SamplingParams, batch_engine_sampling_params
+                )
                 results = stage_engine.generate(
                     batch_engine_inputs,  # type: ignore # silent complaints about list of subclassed TypedDict
                     batch_engine_sampling_params,
@@ -1141,7 +1238,9 @@ def _stage_worker(
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
 
             # Group outputs per request id with fallback
-            req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
+            req_to_outputs: dict[Any, list[Any]] = {
+                rid: [] for rid in batch_request_ids
+            }
             unmapped: list[Any] = []
             for ro in gen_outputs:
                 rid = ro.request_id
@@ -1173,7 +1272,9 @@ def _stage_worker(
                 )
                 _agg_total_tokens += _metrics.num_tokens_out
                 if i == len(batch_request_ids) - 1:
-                    _metrics.stage_stats = make_stage_stats(_agg_total_tokens, _agg_total_gen_time_ms)
+                    _metrics.stage_stats = make_stage_stats(
+                        _agg_total_tokens, _agg_total_gen_time_ms
+                    )
                 else:
                     _metrics.stage_stats = None
                 try:
@@ -1231,7 +1332,11 @@ def _stage_worker_async_entry(
     batch_timeout: int = 10,
     stage_init_timeout: int = 300,
 ) -> None:
-    asyncio.run(_stage_worker_async(model, stage_payload, in_q, out_q, batch_timeout, stage_init_timeout))
+    asyncio.run(
+        _stage_worker_async(
+            model, stage_payload, in_q, out_q, batch_timeout, stage_init_timeout
+        )
+    )
 
 
 async def _stage_worker_async(
@@ -1272,7 +1377,9 @@ async def _stage_worker_async(
     final_output = stage_payload.get("final_output", False)
     final_output_type = stage_payload.get("final_output_type", None)
 
-    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
+    cfg_kv_collect_func = load_func_from_config(
+        stage_payload.get("cfg_kv_collect_func")
+    )
     # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
     model = _resolve_model_tokenizer_paths(model, engine_args)
 
@@ -1332,7 +1439,9 @@ async def _stage_worker_async(
             list(engine_args.keys()),
         )
         if engine_args.get("async_chunk", False):
-            logger.debug("[Stage-%s] Async chunk enabled, injecting connectors config", stage_id)
+            logger.debug(
+                "[Stage-%s] Async chunk enabled, injecting connectors config", stage_id
+            )
             stage_connector_spec = {}
             for v in connectors_config.values():
                 stage_connector_spec = dict(v.get("spec", {}))
@@ -1348,10 +1457,17 @@ async def _stage_worker_async(
             if "omni_kv_config" not in od_config:
                 od_config["omni_kv_config"] = {}
             od_config["omni_kv_config"]["stage_id"] = stage_id
-            od_config["omni_kv_config"]["engine_input_source"] = stage_payload.get("engine_input_source", [])
+            od_config["omni_kv_config"]["engine_input_source"] = stage_payload.get(
+                "engine_input_source", []
+            )
 
-            logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
-            _diffusion_kwargs = {k: v for k, v in engine_args.items() if k not in {"od_config", "model"}}
+            logger.debug(
+                f"[Stage-%s] Initializing diffusion engine with config: {od_config}",
+                stage_id,
+            )
+            _diffusion_kwargs = {
+                k: v for k, v in engine_args.items() if k not in {"od_config", "model"}
+            }
             if cfg_kv_collect_func is not None:
                 _diffusion_kwargs["cfg_kv_collect_func"] = cfg_kv_collect_func
             stage_engine = AsyncOmniDiffusion(
@@ -1365,13 +1481,16 @@ async def _stage_worker_async(
             engine_args.pop("model", None)
             omni_engine_args = AsyncOmniEngineArgs(model=model, **engine_args)
             usage_context = UsageContext.OPENAI_API_SERVER
-            vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
+            vllm_config = omni_engine_args.create_engine_config(
+                usage_context=usage_context
+            )
             stage_engine = AsyncOmniLLM.from_vllm_config(
                 vllm_config=vllm_config,
                 usage_context=usage_context,
                 engine_args=omni_engine_args,
                 disable_log_stats=bool(
-                    engine_args.get("disable_log_stats", False) or getattr(omni_engine_args, "disable_log_stats", False)
+                    engine_args.get("disable_log_stats", False)
+                    or getattr(omni_engine_args, "disable_log_stats", False)
                 ),
             )
     if hasattr(stage_engine, "log_stats") and stage_engine.log_stats:
@@ -1398,19 +1517,25 @@ async def _stage_worker_async(
         if task_type == OmniStageTaskType.PROFILER_START:
             if stage_type == "diffusion":
                 try:
-                    profile_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
+                    profile_dir = os.environ.get(
+                        "VLLM_TORCH_PROFILER_DIR", "./profiles"
+                    )
                     os.makedirs(profile_dir, exist_ok=True)
                     trace_filename = f"stage_{stage_id}_diffusion_{int(time.time())}"
                     await stage_engine.start_profile(trace_filename=trace_filename)
                     logger.info("[Stage-%s] Diffusion Torch profiler started", stage_id)
                 except Exception as e:
-                    logger.warning("[Stage-%s] Failed to start diffusion profiler: %s", stage_id, e)
+                    logger.warning(
+                        "[Stage-%s] Failed to start diffusion profiler: %s", stage_id, e
+                    )
             else:
                 try:
                     await stage_engine.start_profile()
                     logger.info("[Stage-%s] vLLM profiler started", stage_id)
                 except Exception as e:
-                    logger.warning("[Stage-%s] Failed to start vLLM profiler: %s", stage_id, e)
+                    logger.warning(
+                        "[Stage-%s] Failed to start vLLM profiler: %s", stage_id, e
+                    )
             return {}
 
         elif task_type == OmniStageTaskType.PROFILER_STOP:
@@ -1423,13 +1548,17 @@ async def _stage_worker_async(
                         logger.info("Diffusion trace files: %s", trace_files)
                         result_data = trace_files
                 except Exception as e:
-                    logger.warning("[Stage-%s] Failed to stop diffusion profiler: %s", stage_id, e)
+                    logger.warning(
+                        "[Stage-%s] Failed to stop diffusion profiler: %s", stage_id, e
+                    )
             else:
                 try:
                     await stage_engine.stop_profile()
                     logger.info("[Stage-%s] vLLM profiler stopped", stage_id)
                 except Exception as e:
-                    logger.warning("[Stage-%s] Failed to stop vLLM profiler: %s", stage_id, e)
+                    logger.warning(
+                        "[Stage-%s] Failed to stop vLLM profiler: %s", stage_id, e
+                    )
             return result_data
         return {}
 
@@ -1448,7 +1577,9 @@ async def _stage_worker_async(
         }
         # Only add is_tracing_enabled for LLM engines
         if stage_type != "diffusion":
-            stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
+            stage_ready_payload["is_tracing_enabled"] = (
+                await stage_engine.is_tracing_enabled()
+            )
         out_q.put(stage_ready_payload)
     except Exception as e:
         logger.warning("Failed to send stage ready signal: %s", e)
@@ -1463,9 +1594,13 @@ async def _stage_worker_async(
         _recv_dequeue_ts = _time.time()
         rid = task["request_id"]
         try:
-            sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
+            sent_ts = (
+                float(task.get("sent_ts", None)) if isinstance(task, dict) else None
+            )
             if sent_ts is not None:
-                _in_flight_ms_by_rid[rid] = max(0.0, (_recv_dequeue_ts - sent_ts) * 1000.0)
+                _in_flight_ms_by_rid[rid] = max(
+                    0.0, (_recv_dequeue_ts - sent_ts) * 1000.0
+                )
             else:
                 _in_flight_ms_by_rid[rid] = 0.0
         except Exception:
@@ -1494,9 +1629,13 @@ async def _stage_worker_async(
                 ein = ein[0]
 
             if stage_type == "diffusion":
-                diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
+                diffusion_sampling_params = cast(
+                    OmniDiffusionSamplingParams, task["sampling_params"]
+                )
                 # AsyncOmniDiffusion.generate returns a single result, not an async generator
-                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(ein, diffusion_sampling_params, rid)
+                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(
+                    ein, diffusion_sampling_params, rid
+                )
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                 await generation_out_q.put((rid, gen_output, _gen_ms))
@@ -1504,7 +1643,9 @@ async def _stage_worker_async(
                 ein = cast(PromptType, ein)
                 llm_sampling_params: SamplingParams = task["sampling_params"]
                 gen_output = None
-                async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
+                async for res in cast(AsyncLLM, stage_engine).generate(
+                    ein, llm_sampling_params, rid
+                ):
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
@@ -1625,7 +1766,9 @@ async def _stage_worker_async(
         for idx, metrics in enumerate(batch_metrics):
             metrics.batch_size = len(batch_metrics)
             if idx == len(batch_metrics) - 1:
-                metrics.stage_stats = make_stage_stats(_agg_total_tokens, _agg_total_gen_time_ms)
+                metrics.stage_stats = make_stage_stats(
+                    _agg_total_tokens, _agg_total_gen_time_ms
+                )
 
         logger.debug("Sending outputs to main process")
         for rid, output, _gen_ms, _metrics in zip(
@@ -1652,7 +1795,9 @@ async def _stage_worker_async(
                             "metrics": _metrics,
                         }
                     )
-                    logger.debug(f"Enqueued req={rid}, use_shm={use_shm}, tokens_out={_metrics.num_tokens_out}")
+                    logger.debug(
+                        f"Enqueued req={rid}, use_shm={use_shm}, tokens_out={_metrics.num_tokens_out}"
+                    )
             except Exception as e:
                 logger.exception(
                     "Failed to enqueue result for request %s: %s",
@@ -1715,10 +1860,16 @@ def make_request_stats(
 def make_stage_stats(_agg_total_tokens: int, _agg_total_gen_time_ms: float):
     from vllm_omni.metrics import StageStats
 
-    return StageStats(total_token=_agg_total_tokens, total_gen_time_ms=_agg_total_gen_time_ms)
+    return StageStats(
+        total_token=_agg_total_tokens, total_gen_time_ms=_agg_total_gen_time_ms
+    )
 
 
-def output_strip(r_output: RequestOutput | OmniRequestOutput, final_output: bool, final_output_type: str | None):
+def output_strip(
+    r_output: RequestOutput | OmniRequestOutput,
+    final_output: bool,
+    final_output_type: str | None,
+):
     """
     Strip unnecessary multimodal outputs from stages results,
     in order to:

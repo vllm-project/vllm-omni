@@ -47,7 +47,9 @@ class CosyVoice2Tokenizer:
 
     def decode(self, tokens):
         tokens = torch.tensor(tokens, dtype=torch.int64)
-        text = self.tokenizer.batch_decode([tokens], skip_special_tokens=self.skip_special_tokens)[0]
+        text = self.tokenizer.batch_decode(
+            [tokens], skip_special_tokens=self.skip_special_tokens
+        )[0]
         return text
 
 
@@ -347,10 +349,16 @@ class CosyVoice3Tokenizer(CosyVoice2Tokenizer):
 
 
 @cache
-def get_qwen_tokenizer(token_path: str, skip_special_tokens: bool, version: str = "cosyvoice3"):
+def get_qwen_tokenizer(
+    token_path: str, skip_special_tokens: bool, version: str = "cosyvoice3"
+):
     if version == "cosyvoice2":
-        return CosyVoice2Tokenizer(token_path=token_path, skip_special_tokens=skip_special_tokens)
+        return CosyVoice2Tokenizer(
+            token_path=token_path, skip_special_tokens=skip_special_tokens
+        )
     elif version == "cosyvoice3":
-        return CosyVoice3Tokenizer(token_path=token_path, skip_special_tokens=skip_special_tokens)
+        return CosyVoice3Tokenizer(
+            token_path=token_path, skip_special_tokens=skip_special_tokens
+        )
     else:
         raise ValueError

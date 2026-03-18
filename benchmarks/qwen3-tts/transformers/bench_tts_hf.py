@@ -228,8 +228,12 @@ def run_benchmark(args):
     print(f"{'=' * W}")
     print(f"{'Audio Result':^{W}}")
     print(f"{'=' * W}")
-    print(f"{'Total audio duration generated (s):':<40}{result.total_audio_duration_s:<10.2f}")
-    print(f"{'Audio throughput (audio duration/s):':<40}{result.audio_throughput:<10.2f}")
+    print(
+        f"{'Total audio duration generated (s):':<40}{result.total_audio_duration_s:<10.2f}"
+    )
+    print(
+        f"{'Audio throughput (audio duration/s):':<40}{result.audio_throughput:<10.2f}"
+    )
     print(f"{'-' * W}")
     print(f"{'Time to First Packet':^{W}}")
     print(f"{'-' * W}")
@@ -261,7 +265,10 @@ def run_benchmark(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3-TTS HuggingFace Benchmark")
     parser.add_argument(
-        "--model", type=str, default="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", help="HuggingFace model name or path"
+        "--model",
+        type=str,
+        default="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        help="HuggingFace model name or path",
     )
     parser.add_argument("--num-prompts", type=int, default=50)
     parser.add_argument("--num-warmups", type=int, default=3)
@@ -269,10 +276,15 @@ def parse_args():
     parser.add_argument("--voice", type=str, default="Vivian")
     parser.add_argument("--language", type=str, default="English")
     parser.add_argument(
-        "--config-name", type=str, default="hf_transformers", help="Label for this config (used in filenames)"
+        "--config-name",
+        type=str,
+        default="hf_transformers",
+        help="Label for this config (used in filenames)",
     )
     parser.add_argument("--result-dir", type=str, default="results")
-    parser.add_argument("--save-audio", action="store_true", help="Save generated audio files")
+    parser.add_argument(
+        "--save-audio", action="store_true", help="Save generated audio files"
+    )
     return parser.parse_args()
 
 

@@ -97,9 +97,16 @@ def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
     sr_raw = mm["sr"]
     sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
     sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-    audio_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+    audio_tensor = (
+        torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+    )
     out_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-    sf.write(out_wav, audio_tensor.float().cpu().numpy().flatten(), samplerate=sr, format="WAV")
+    sf.write(
+        out_wav,
+        audio_tensor.float().cpu().numpy().flatten(),
+        samplerate=sr,
+        format="WAV",
+    )
     logger.info("Request %s: saved audio to %s (sr=%d)", request_id, out_wav, sr)
 
 
@@ -130,7 +137,9 @@ def main(args):
     t_start = time.perf_counter()
     for stage_outputs in omni.generate(inputs):
         for output in stage_outputs.request_output:
-            _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+            _save_wav(
+                output_dir, output.request_id, output.outputs[0].multimodal_output
+            )
     t_end = time.perf_counter()
     logger.info("Total inference time: %.1f ms", (t_end - t_start) * 1000)
 
@@ -171,15 +180,32 @@ async def main_streaming(args):
             dt_ms = (t_now - t_prev) * 1000
             ttfa_ms = (t_now - t_start) * 1000
             if chunk_idx == 0:
-                logger.info("Request %s: chunk %d samples=%d TTFA=%.1fms", request_id, chunk_idx, n, ttfa_ms)
+                logger.info(
+                    "Request %s: chunk %d samples=%d TTFA=%.1fms",
+                    request_id,
+                    chunk_idx,
+                    n,
+                    ttfa_ms,
+                )
             else:
-                logger.info("Request %s: chunk %d samples=%d inter_chunk=%.1fms", request_id, chunk_idx, n, dt_ms)
+                logger.info(
+                    "Request %s: chunk %d samples=%d inter_chunk=%.1fms",
+                    request_id,
+                    chunk_idx,
+                    n,
+                    dt_ms,
+                )
             t_prev = t_now
             chunk_idx += 1
         else:
             t_end = time.perf_counter()
             total_ms = (t_end - t_start) * 1000
-            logger.info("Request %s: done total=%.1fms chunks=%d", request_id, total_ms, chunk_idx)
+            logger.info(
+                "Request %s: done total=%.1fms chunks=%d",
+                request_id,
+                total_ms,
+                chunk_idx,
+            )
             _save_wav(output_dir, request_id, mm)
 
 

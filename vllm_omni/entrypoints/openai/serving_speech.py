@@ -49,7 +49,9 @@ _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
 
 
-def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+def _create_wav_header(
+    sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16
+) -> bytes:
     """Create a WAV header with placeholder size values for streaming.
 
     Uses 0xFFFFFFFF as placeholder for data size fields, which is accepted
@@ -120,7 +122,10 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
         file_path_resolved = file_path.resolve()
         directory_resolved = directory.resolve()
         # Check if file_path is within directory
-        return directory_resolved in file_path_resolved.parents or directory_resolved == file_path_resolved
+        return (
+            directory_resolved in file_path_resolved.parents
+            or directory_resolved == file_path_resolved
+        )
     except Exception:
         return False
 
@@ -129,7 +134,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Initialize uploaded speakers storage
-        speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
+        speech_voice_samples_dir = os.environ.get(
+            "SPEECH_VOICE_SAMPLES", "/tmp/voice_samples"
+        )
         self.uploaded_speakers_dir = Path(speech_voice_samples_dir)
         self.uploaded_speakers_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.uploaded_speakers_dir / "metadata.json"
@@ -141,7 +148,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._tts_stage = self._find_tts_stage()
         self._is_tts = self._tts_stage is not None
         self._is_fish_speech = (
-            self._tts_stage is not None and getattr(self._tts_stage, "model_stage", None) == "fish_speech_slow_ar"
+            self._tts_stage is not None
+            and getattr(self._tts_stage, "model_stage", None) == "fish_speech_slow_ar"
         )
         self._fish_speech_tokenizer = None
 
@@ -157,7 +165,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.supported_speakers.update(self.uploaded_speakers.keys())
         self._tts_tokenizer = None
 
-        logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
+        logger.info(
+            f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}"
+        )
         logger.info(f"Loaded {len(self.uploaded_speakers)} uploaded speakers")
 
         # Load speech tokenizer codec parameters for prompt length estimation
@@ -183,7 +193,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     return rate
         except Exception as e:
-            logger.warning(f"Failed to load codec frame rate from speech tokenizer config: {e}")
+            logger.warning(
+                f"Failed to load codec frame rate from speech tokenizer config: {e}"
+            )
 
         # Fallback: try codec_frame_rate_hz from hf_config
         try:
@@ -237,7 +249,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     # Normalize to lowercase for case-insensitive matching
                     return {speaker.lower() for speaker in speakers_dict.keys()}
 
-            logger.warning("No speakers found in talker_config (checked spk_id and speaker_id)")
+            logger.warning(
+                "No speakers found in talker_config (checked spk_id and speaker_id)"
+            )
         except Exception as e:
             logger.warning(f"Could not load speakers from model config: {e}")
 
@@ -300,13 +314,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
-                tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
+                tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)[
+                    "input_ids"
+                ],
                 codec_language_id=getattr(talker_config, "codec_language_id", None),
                 spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
                 estimate_ref_code_len=self._estimate_ref_code_len,
             )
         except Exception as e:
-            logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
+            logger.warning(
+                "Failed to estimate TTS prompt length, using fallback 2048: %s", e
+            )
             return 2048
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
@@ -339,7 +357,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error(f"Could not read audio file for voice {voice_name}: {e}")
             return None
 
-    async def upload_voice(self, audio_file: UploadFile, consent: str, name: str) -> dict:
+    async def upload_voice(
+        self, audio_file: UploadFile, consent: str, name: str
+    ) -> dict:
         """Upload a new voice sample."""
         # Validate file size (max 10MB)
         MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
@@ -348,7 +368,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         audio_file.file.seek(0)  # Reset to beginning
 
         if file_size > MAX_FILE_SIZE:
-            raise ValueError(f"File size exceeds maximum limit of 10MB. Got {file_size} bytes.")
+            raise ValueError(
+                f"File size exceeds maximum limit of 10MB. Got {file_size} bytes."
+            )
 
         # Detect MIME type from filename if content_type is generic
         mime_type = audio_file.content_type
@@ -385,7 +407,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
 
         if mime_type not in allowed_mime_types:
-            raise ValueError(f"Unsupported MIME type: {mime_type}. Allowed: {allowed_mime_types}")
+            raise ValueError(
+                f"Unsupported MIME type: {mime_type}. Allowed: {allowed_mime_types}"
+            )
 
         # Normalize voice name
         voice_name_lower = name.lower()
@@ -412,7 +436,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Double-check that the path is within the upload directory
         if not _validate_path_within_directory(file_path, self.uploaded_speakers_dir):
-            raise ValueError("Invalid file path: potential path traversal attack detected")
+            raise ValueError(
+                "Invalid file path: potential path traversal attack detected"
+            )
 
         # Save audio file
         try:
@@ -444,7 +470,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 file_path.unlink()
             except Exception:
                 pass
-            raise ValueError(f"Failed to create metadata for voice '{name}' (possibly already exists)")
+            raise ValueError(
+                f"Failed to create metadata for voice '{name}' (possibly already exists)"
+            )
 
         # Update in-memory cache
         self.uploaded_speakers[voice_name_lower] = speaker_data
@@ -507,7 +535,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
         # Infer Base task when ref_audio or ref_text is provided without explicit task_type.
-        if request.task_type is None and (request.ref_audio is not None or request.ref_text is not None):
+        if request.task_type is None and (
+            request.ref_audio is not None or request.ref_text is not None
+        ):
             request.task_type = "Base"
         task_type = request.task_type or "CustomVoice"
 
@@ -531,7 +561,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
                     "or use a CustomVoice model."
                 )
-            if request.voice is not None and request.voice not in self.supported_speakers:
+            if (
+                request.voice is not None
+                and request.voice not in self.supported_speakers
+            ):
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate Base task requirements
@@ -566,18 +599,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 else:
                     # need ref_audio for built-in speaker
                     if request.ref_audio is None:
-                        return (
-                            f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
-                        )
+                        return f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
                     # Validate ref_audio format for built-in speaker
                     if not (
                         request.ref_audio.startswith(("http://", "https://"))
                         or request.ref_audio.startswith("data:")
                         or request.ref_audio.startswith("file://")
                     ):
-                        return (
-                            "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
-                        )
+                        return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
@@ -591,7 +620,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "VoiceDesign task requires 'instructions' to describe the voice"
 
         # Validate instructions length (using cached value from initialization)
-        if request.instructions and len(request.instructions) > self._max_instructions_length:
+        if (
+            request.instructions
+            and len(request.instructions) > self._max_instructions_length
+        ):
             return f"Instructions too long (max {self._max_instructions_length} characters)"
 
         # Validate max_new_tokens range
@@ -621,7 +653,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             wav_np = np.mean(wav_np, axis=-1)
         return wav_np.tolist(), int(sr)
 
-    async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
+    async def _generate_audio_chunks(
+        self, generator, request_id: str, response_format: str = "pcm"
+    ):
         """Generate audio chunks for streaming response.
 
         Handles two audio output modes from the engine:
@@ -650,8 +684,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 sr_raw = audio_output.get("sr")
                 if sr_raw is not None:
-                    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-                    sample_rate_val = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                    sr_val = (
+                        sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                    )
+                    sample_rate_val = (
+                        sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                    )
 
                 audio_val = audio_output[audio_key]
                 if isinstance(audio_val, list):
@@ -668,7 +706,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 for chunk_tensor in new_chunks:
                     chunk_np = (
-                        chunk_tensor.float().detach().cpu().numpy() if hasattr(chunk_tensor, "float") else chunk_tensor
+                        chunk_tensor.float().detach().cpu().numpy()
+                        if hasattr(chunk_tensor, "float")
+                        else chunk_tensor
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
@@ -676,10 +716,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if response_format == "wav" and first_chunk:
                         # Assert that sample rate has been set from chunk metadata (not just default)
                         # This ensures the WAV header contains the correct sample rate
-                        assert sr_raw is not None, (
-                            "First audio chunk must include sample rate metadata for WAV streaming"
+                        assert (
+                            sr_raw is not None
+                        ), "First audio chunk must include sample rate metadata for WAV streaming"
+                        wav_header = _create_wav_header(
+                            sample_rate=sample_rate_val,
+                            num_channels=1,
+                            bits_per_sample=16,
                         )
-                        wav_header = _create_wav_header(sample_rate=sample_rate_val, num_channels=1, bits_per_sample=16)
                         yield wav_header
                         first_chunk = False
 
@@ -697,7 +741,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
         except Exception as e:
-            logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
+            logger.exception(
+                "Streaming speech generation failed for %s: %s", request_id, e
+            )
             raise
 
     @staticmethod
@@ -713,7 +759,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             mm = getattr(ro, "multimodal_output", None) if ro else None
         if not mm:
             return None, None
-        key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
+        key = (
+            "audio"
+            if "audio" in mm
+            else ("model_outputs" if "model_outputs" in mm else None)
+        )
         return mm, key
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -744,14 +794,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["speaker"] = [request.voice]
 
             # If voice is an uploaded speaker and no ref_audio provided, auto-set it
-            if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
+            if (
+                request.voice.lower() in self.uploaded_speakers
+                and request.ref_audio is None
+            ):
                 audio_data = self._get_uploaded_audio_data(request.voice)
                 if audio_data:
                     params["ref_audio"] = [audio_data]
                     params["x_vector_only_mode"] = [True]
-                    logger.info(f"Auto-set ref_audio for uploaded voice: {request.voice}")
+                    logger.info(
+                        f"Auto-set ref_audio for uploaded voice: {request.voice}"
+                    )
                 else:
-                    raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
+                    raise ValueError(
+                        f"Audio file for uploaded voice '{request.voice}' is missing or corrupted"
+                    )
 
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice
@@ -802,7 +859,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if self._fish_speech_tokenizer is None:
             model_name = self.engine_client.model_config.model
-            self._fish_speech_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            self._fish_speech_tokenizer = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True
+            )
 
         tokenizer = self._fish_speech_tokenizer
         model_name = self.engine_client.model_config.model
@@ -817,13 +876,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             semantic_token_ids = encode_reference_audio(model_name, wav_samples, sr)
 
             # Build system message with ref text + audio tokens.
-            audio_start_id = tokenizer.encode("<|audio_start|>", add_special_tokens=False)
+            audio_start_id = tokenizer.encode(
+                "<|audio_start|>", add_special_tokens=False
+            )
             audio_end_id = tokenizer.encode("<|audio_end|>", add_special_tokens=False)
 
             # System content: <|speaker:0|>{ref_text}<|audio_start|>{codes}<|audio_end|>
             prefix_text = f"<|speaker:0|>{request.ref_text}"
             prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
-            system_content_ids = prefix_ids + audio_start_id + semantic_token_ids + audio_end_id
+            system_content_ids = (
+                prefix_ids + audio_start_id + semantic_token_ids + audio_end_id
+            )
 
             # Manually build system turn: <|im_start|>system\n{content}<|im_end|>\n
             im_start = tokenizer.encode("<|im_start|>", add_special_tokens=False)
@@ -835,13 +898,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # User turn via chat template.
             user_text = f"<|speaker:0|>{request.input}"
             user_messages = [{"role": "user", "content": user_text}]
-            user_ids = tokenizer.apply_chat_template(user_messages, tokenize=True, add_generation_prompt=True)
+            user_ids = tokenizer.apply_chat_template(
+                user_messages, tokenize=True, add_generation_prompt=True
+            )
             prompt_ids = system_ids + user_ids
         else:
             # No voice cloning: simple user message.
             user_text = f"<|speaker:0|>{request.input}"
             messages = [{"role": "user", "content": user_text}]
-            prompt_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+            prompt_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True
+            )
 
         # Append <|voice|> token to signal voice generation.
         voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
@@ -870,10 +937,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ref_audio_data = None
             if request.ref_audio is not None:
                 if not request.ref_text or not request.ref_text.strip():
-                    raise ValueError("Voice cloning requires 'ref_text' (transcript of the reference audio)")
+                    raise ValueError(
+                        "Voice cloning requires 'ref_text' (transcript of the reference audio)"
+                    )
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 ref_audio_data = (wav_list, sr)
-            prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
+            prompt = self._build_fish_speech_prompt(
+                request, ref_audio_data=ref_audio_data
+            )
             tts_params = {}
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
@@ -886,7 +957,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params["ref_audio"] = [[wav_list, sr]]
 
             ph_len = self._estimate_prompt_len(tts_params)
-            prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
+            prompt = {
+                "prompt_token_ids": [1] * ph_len,
+                "additional_information": tts_params,
+            }
         else:
             tts_params = {}
             prompt = {"prompt": request.input}
@@ -895,9 +969,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         model_type = (
             "fish_speech"
             if self._is_fish_speech
-            else tts_params.get("task_type", ["unknown"])[0]
-            if self._is_tts
-            else "generic"
+            else (
+                tts_params.get("task_type", ["unknown"])[0]
+                if self._is_tts
+                else "generic"
+            )
         )
         logger.info(
             "TTS speech request %s: text=%r, model=%s",
@@ -909,7 +985,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sampling_params_list = self.engine_client.default_sampling_params_list
 
         # Override Stage-0 max_tokens if caller specified max_new_tokens (Fish Speech).
-        if self._is_fish_speech and request.max_new_tokens is not None and sampling_params_list:
+        if (
+            self._is_fish_speech
+            and request.max_new_tokens is not None
+            and sampling_params_list
+        ):
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
@@ -1022,7 +1102,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
-                request_id, generator, _ = await self._prepare_speech_generation(request)
+                request_id, generator, _ = await self._prepare_speech_generation(
+                    request
+                )
                 return StreamingResponse(
                     self._generate_audio_chunks(generator, request_id, response_format),
                     media_type=media_type,

@@ -13,7 +13,9 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 logger = init_logger(__name__)
 
 
-def _upsample_token_ids(token_ids: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:
+def _upsample_token_ids(
+    token_ids: torch.Tensor, token_h: int, token_w: int
+) -> torch.Tensor:
     """Upsample token IDs by 2x using nearest neighbor interpolation.
 
     GLM-Image AR model generates tokens at 32x downsampling, but DiT expects
@@ -28,7 +30,9 @@ def _upsample_token_ids(token_ids: torch.Tensor, token_h: int, token_w: int) -> 
         Upsampled token IDs of shape [num_tokens * 4]
     """
     token_ids = token_ids.view(1, 1, token_h, token_w)
-    token_ids = torch.nn.functional.interpolate(token_ids.float(), scale_factor=2, mode="nearest").to(dtype=torch.long)
+    token_ids = torch.nn.functional.interpolate(
+        token_ids.float(), scale_factor=2, mode="nearest"
+    ).to(dtype=torch.long)
     token_ids = token_ids.view(-1)
     return token_ids
 
@@ -116,14 +120,18 @@ def _parse_generated_tokens(
                 actual_h, actual_w = test_h, test_w
                 height = test_h * factor
                 width = test_w * factor
-                logger.warning(f"Adjusted grid to {test_h}x{test_w}, output will be {height}x{width}")
+                logger.warning(
+                    f"Adjusted grid to {test_h}x{test_w}, output will be {height}x{width}"
+                )
                 break
             elif actual_tokens >= test_large:
                 prior_token_ids_d32 = token_tensor[:test_large]
                 actual_h, actual_w = test_h, test_w
                 height = test_h * factor
                 width = test_w * factor
-                logger.warning(f"Adjusted grid to {test_h}x{test_w}, output will be {height}x{width}")
+                logger.warning(
+                    f"Adjusted grid to {test_h}x{test_w}, output will be {height}x{width}"
+                )
                 break
         else:
             sqrt_tokens = int(math.sqrt(actual_tokens))
@@ -132,7 +140,9 @@ def _parse_generated_tokens(
             prior_token_ids_d32 = token_tensor[:usable_tokens]
             height = sqrt_tokens * factor
             width = sqrt_tokens * factor
-            logger.error(f"Grid pattern mismatch. Using {sqrt_tokens}x{sqrt_tokens}, output: {height}x{width}")
+            logger.error(
+                f"Grid pattern mismatch. Using {sqrt_tokens}x{sqrt_tokens}, output: {height}x{width}"
+            )
 
     # Upsample from 32x to 16x
     prior_token_ids = _upsample_token_ids(prior_token_ids_d32, actual_h, actual_w)
@@ -187,11 +197,16 @@ def ar2diffusion(
         is_i2i = False
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
-            if isinstance(mm_output, dict) and mm_output.get("prior_token_image_ids") is not None:
+            if (
+                isinstance(mm_output, dict)
+                and mm_output.get("prior_token_image_ids") is not None
+            ):
                 is_i2i = True
 
         # Parse and upsample prior tokens
-        prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(generated_token_ids, height, width, is_i2i=is_i2i)
+        prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(
+            generated_token_ids, height, width, is_i2i=is_i2i
+        )
 
         # Get prior_token_image_ids from AR model output (for i2i mode)
         # This contains VQ-VAE tokens from input image, used for KV cache conditioning
@@ -212,11 +227,18 @@ def ar2diffusion(
                         prior_token_image_ids = [raw_prior_image_ids]
                     elif isinstance(raw_prior_image_ids, list):
                         # Check if elements are tensors or Python lists
-                        if raw_prior_image_ids and isinstance(raw_prior_image_ids[0], torch.Tensor):
+                        if raw_prior_image_ids and isinstance(
+                            raw_prior_image_ids[0], torch.Tensor
+                        ):
                             prior_token_image_ids = raw_prior_image_ids
-                        elif raw_prior_image_ids and isinstance(raw_prior_image_ids[0], list):
+                        elif raw_prior_image_ids and isinstance(
+                            raw_prior_image_ids[0], list
+                        ):
                             # Convert Python lists back to tensors
-                            prior_token_image_ids = [torch.tensor(ids, dtype=torch.long) for ids in raw_prior_image_ids]
+                            prior_token_image_ids = [
+                                torch.tensor(ids, dtype=torch.long)
+                                for ids in raw_prior_image_ids
+                            ]
                         else:
                             logger.warning(
                                 f"[ar2diffusion] Request {i}: unexpected prior_token_image_ids format: "
@@ -226,7 +248,9 @@ def ar2diffusion(
             # Fallback: also check output (CompletionOutput) in case of different vLLM versions
             if hasattr(output, "multimodal_output") and output.multimodal_output:
                 mm_output = output.multimodal_output
-                logger.debug(f"[ar2diffusion] Request {i}: found multimodal_output on CompletionOutput (fallback)")
+                logger.debug(
+                    f"[ar2diffusion] Request {i}: found multimodal_output on CompletionOutput (fallback)"
+                )
                 if isinstance(mm_output, dict):
                     raw_prior_image_ids = mm_output.get("prior_token_image_ids")
                     if raw_prior_image_ids is not None:

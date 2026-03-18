@@ -66,7 +66,9 @@ def select_flash_attn_impl(
             forward function for the specified implementation.
     """
     if stage != "fwd-only":
-        raise ValueError(f"Only 'fwd-only' stage is supported for inference. Got: {stage}")
+        raise ValueError(
+            f"Only 'fwd-only' stage is supported for inference. Got: {stage}"
+        )
 
     if impl_type == AttnType.AITER:
         return flash_attn_forward_aiter
@@ -135,7 +137,9 @@ def select_flash_attn_impl(
         if not HAS_SPARSE_SAGE_ATTENTION:
             raise ImportError("SparseSageAttention is not available!")
         if not isinstance(attn_processor, SparseAttentionMeansim):
-            raise ImportError("SparseSageAttention is only available with a SparseAttentionProcessor class passed in")
+            raise ImportError(
+                "SparseSageAttention is only available with a SparseAttentionProcessor class passed in"
+            )
 
         def fn(q, k, v, causal=False, softmax_scale=None, *args, **kwargs):
             return (

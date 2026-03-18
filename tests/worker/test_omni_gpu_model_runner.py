@@ -74,8 +74,12 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
 
     bsz = len(req_ids)
     runner.talker_mtp_input_ids = DummyBuffer(torch.zeros((bsz,), dtype=torch.int64))
-    runner.talker_mtp_inputs_embeds = DummyBuffer(torch.zeros((bsz, hidden_size), dtype=torch.float32))
-    runner.last_talker_hidden = DummyBuffer(torch.zeros((bsz, hidden_size), dtype=torch.float32))
+    runner.talker_mtp_inputs_embeds = DummyBuffer(
+        torch.zeros((bsz, hidden_size), dtype=torch.float32)
+    )
+    runner.last_talker_hidden = DummyBuffer(
+        torch.zeros((bsz, hidden_size), dtype=torch.float32)
+    )
     runner.text_step = DummyBuffer(torch.zeros((bsz, hidden_size), dtype=torch.float32))
 
     runner.talker_mtp = DummyTalkerMTP()
@@ -86,7 +90,9 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     def _determine_batch_execution_and_padding(**kwargs):
         return None, object(), None, None, None
 
-    runner._determine_batch_execution_and_padding = _determine_batch_execution_and_padding
+    runner._determine_batch_execution_and_padding = (
+        _determine_batch_execution_and_padding
+    )
 
     # Use the real merge method from OmniGPUModelRunner.
     return runner
@@ -125,11 +131,22 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
 
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
 
-    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+    def fake_determine(
+        self,
+        num_tokens,
+        num_reqs,
+        num_scheduled_tokens_np,
+        max_num_scheduled_tokens,
+        use_cascade_attn,
+    ):
         batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
         return (False, batch_desc, None, None, None)
 
-    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+    monkeypatch.setattr(
+        runner,
+        "_determine_batch_execution_and_padding",
+        fake_determine.__get__(runner, type(runner)),
+    )
 
     # Initialize per-request embeds (batch-major inside talker_mtp_inputs_embeds)
     runner.talker_mtp_inputs_embeds.gpu[0] = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -170,7 +187,8 @@ def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):
     """Validate that _update_intermediate_buffer writes to model_intermediate_buffer
-    (forward path) and mirrors to additional_information_cpu setattr (backward compat)."""
+    (forward path) and mirrors to additional_information_cpu setattr (backward compat).
+    """
     import vllm_omni.worker.gpu_model_runner as mod
 
     monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
@@ -196,8 +214,12 @@ def test_update_intermediate_buffer_accumulates():
     """Validate that successive merges accumulate keys in the buffer."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
 
-    OmniGPUModelRunner._update_intermediate_buffer(runner, "r1", {"a": torch.tensor([1.0])})
-    OmniGPUModelRunner._update_intermediate_buffer(runner, "r1", {"b": torch.tensor([2.0])})
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner, "r1", {"a": torch.tensor([1.0])}
+    )
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner, "r1", {"b": torch.tensor([2.0])}
+    )
 
     buf = runner.model_intermediate_buffer["r1"]
     assert "a" in buf and "b" in buf
@@ -218,7 +240,9 @@ def test_update_intermediate_buffer_skips_unknown_req_id():
     """Validate that merge is a no-op when req_id is not in self.requests."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
 
-    OmniGPUModelRunner._update_intermediate_buffer(runner, "unknown_req", {"key": torch.tensor([1.0])})
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner, "unknown_req", {"key": torch.tensor([1.0])}
+    )
 
     assert "unknown_req" not in runner.model_intermediate_buffer
 
@@ -230,7 +254,9 @@ def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
 
     # Existing req_infos should be copied and enriched, not mutated in place.
     original_req_infos = {"existing": 1}
-    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, original_req_infos, req_id)
+    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(
+        runner, req_state, original_req_infos, req_id
+    )
 
     assert enriched is not original_req_infos
     assert enriched["existing"] == 1
@@ -246,7 +272,9 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
     req_state = None
     req_infos = {"k": "v"}
 
-    result = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, req_infos, req_id)
+    result = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(
+        runner, req_state, req_infos, req_id
+    )
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos

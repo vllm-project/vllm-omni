@@ -17,7 +17,10 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length, try_send_via_connector
+from vllm_omni.distributed.omni_connectors.adapter import (
+    compute_talker_prompt_ids_length,
+    try_send_via_connector,
+)
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
@@ -29,7 +32,11 @@ from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniPromptType,
+    OmniSamplingParams,
+)
 
 # Internal imports (our code)
 from vllm_omni.lora.request import LoRARequest
@@ -42,7 +49,13 @@ logger = init_logger(__name__)
 
 
 def _weak_close_cleanup_async(
-    stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None, inline_engine=None
+    stage_list,
+    stage_in_queues,
+    stage_out_queues,
+    ray_pg,
+    output_handler,
+    zmq_ctx=None,
+    inline_engine=None,
 ):
     """Weak reference cleanup function for AsyncOmni instances."""
     if inline_engine is not None:
@@ -55,7 +68,9 @@ def _weak_close_cleanup_async(
             try:
                 q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
-                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+                logger.warning(
+                    f"Failed to send shutdown signal to stage input queue: {e}"
+                )
             close_fn = getattr(q, "close", None)
             if callable(close_fn):
                 close_fn()
@@ -147,17 +162,23 @@ class AsyncOmni(OmniBase):
     async def get_supported_tasks(self) -> set[str]:
         """Return supported tasks based on stage output modalities and capabilities."""
         tasks: set[str] = set()
-        if "text" in self.output_modalities or any(stage.is_comprehension for stage in self.stage_list):
+        if "text" in self.output_modalities or any(
+            stage.is_comprehension for stage in self.stage_list
+        ):
             tasks.add("generate")
         if "audio" in self.output_modalities:
             tasks.add("speech")
         return tasks
 
-    def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def _create_default_diffusion_stage_cfg(
+        self, kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # TODO: here is different from the Omni class. We should merge the two in the future.
         cache_backend = kwargs.get("cache_backend", "none")
-        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
+        cache_config = self._normalize_cache_config(
+            cache_backend, kwargs.get("cache_config", None)
+        )
 
         devices = "0"
         if "parallel_config" in kwargs:
@@ -180,7 +201,9 @@ class AsyncOmni(OmniBase):
                 sequence_parallel_size = ulysses_degree * ring_degree
 
             # Calculate num_devices: consider standalone HSDP
-            other_parallel_size = sequence_parallel_size * tensor_parallel_size * cfg_parallel_size
+            other_parallel_size = (
+                sequence_parallel_size * tensor_parallel_size * cfg_parallel_size
+            )
             if use_hsdp and other_parallel_size == 1 and hsdp_shard_size > 0:
                 # Standalone HSDP: num_devices is determined by HSDP dimensions
                 num_devices = hsdp_shard_size * hsdp_replicate_size
@@ -219,16 +242,24 @@ class AsyncOmni(OmniBase):
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
-                    "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
+                    "enable_cache_dit_summary": kwargs.get(
+                        "enable_cache_dit_summary", False
+                    ),
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
-                    "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+                    "enable_layerwise_offload": kwargs.get(
+                        "enable_layerwise_offload", False
+                    ),
                     "enforce_eager": kwargs.get("enforce_eager", False),
-                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+                    "diffusion_load_format": kwargs.get(
+                        "diffusion_load_format", "default"
+                    ),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                     "quantization": kwargs.get("quantization", None),
                     "worker_extension_cls": kwargs.get("worker_extension_cls", None),
                     "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
-                    "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
+                    "enable_multithread_weight_load": kwargs.get(
+                        "enable_multithread_weight_load", True
+                    ),
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
                 },
                 "final_output": True,
@@ -238,7 +269,9 @@ class AsyncOmni(OmniBase):
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
 
-    def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
+    def _process_stage_ready(
+        self, stage: OmniStage, stage_id: int, result: dict[str, Any]
+    ) -> None:
         # Store vllm_config received from worker process (may be None for diffusion stages)
         vllm_config = result.get("vllm_config")
         if vllm_config is not None:
@@ -267,7 +300,9 @@ class AsyncOmni(OmniBase):
                     self.model_config = vllm_config.model_config
                     # Initialize io_processor
                     io_processor_plugin = self.model_config.io_processor_plugin
-                    self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+                    self.io_processor = get_io_processor(
+                        vllm_config, io_processor_plugin
+                    )
 
                     logger.info(
                         f"[{self._name}] Initialized input_processor, "
@@ -300,7 +335,10 @@ class AsyncOmni(OmniBase):
 
             def make_rpc_checker(stage_id: int):
                 def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
-                    if stage_id in self._rpc_results and rpc_id in self._rpc_results[stage_id]:
+                    if (
+                        stage_id in self._rpc_results
+                        and rpc_id in self._rpc_results[stage_id]
+                    ):
                         return self._rpc_results[stage_id].pop(rpc_id)
                     return None
 
@@ -355,7 +393,9 @@ class AsyncOmni(OmniBase):
             await self._pause_cond.wait_for(lambda: not self._paused)
 
         if self._inline_diffusion:
-            async for output in self._generate_inline(prompt, request_id, sampling_params_list, output_modalities):
+            async for output in self._generate_inline(
+                prompt, request_id, sampling_params_list, output_modalities
+            ):
                 yield output
             return
 
@@ -369,7 +409,9 @@ class AsyncOmni(OmniBase):
                 sampling_params_list = self.default_sampling_params_list
 
             if len(sampling_params_list) != len(self.stage_list):
-                raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
+                raise ValueError(
+                    f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}"
+                )
 
             # Orchestrator keeps stage objects for input derivation
             num_stages = len(self.stage_list)
@@ -397,12 +439,18 @@ class AsyncOmni(OmniBase):
 
             # Ensure modalities is in the prompt dict for CFG expansion
             # (offline path includes it; online serving passes it separately)
-            if isinstance(prompt, dict) and output_modalities and "modalities" not in prompt:
+            if (
+                isinstance(prompt, dict)
+                and output_modalities
+                and "modalities" not in prompt
+            ):
                 prompt["modalities"] = output_modalities
 
             # CFG companion tracking (prompt expansion + lifecycle management)
             cfg = CfgCompanionTracker(
-                prompt_expand_func=getattr(self.stage_list[0], "prompt_expand_func", None),
+                prompt_expand_func=getattr(
+                    self.stage_list[0], "prompt_expand_func", None
+                ),
                 stage0_sampling_params=sampling_params_list[0],
             )
             expanded_companions = cfg.expand_prompts({request_id: prompt})
@@ -432,7 +480,9 @@ class AsyncOmni(OmniBase):
                 f"[{self._name}] Entering scheduling loop: stages={num_stages}, final_stage={final_stage_id_for_e2e}"
             )
             if self.async_chunk:
-                stage_queues = {stage_id: asyncio.Queue() for stage_id in range(num_stages)}
+                stage_queues = {
+                    stage_id: asyncio.Queue() for stage_id in range(num_stages)
+                }
                 req_state.stage_queues = stage_queues
                 async for output in self._process_async_results(
                     request_id,
@@ -455,7 +505,9 @@ class AsyncOmni(OmniBase):
                 ):
                     yield output
 
-            logger.debug(f"[{self._name}] Request {request_id} finalized at stage-{final_stage_id_for_e2e}")
+            logger.debug(
+                f"[{self._name}] Request {request_id} finalized at stage-{final_stage_id_for_e2e}"
+            )
             try:
                 # Finalize E2E metrics if not already done
                 metrics.on_finalize_request(
@@ -468,7 +520,9 @@ class AsyncOmni(OmniBase):
                 # Summarize and print stats
                 metrics.build_and_log_summary()
             except Exception as e:
-                logger.exception(f"[{self._name}] Request {request_id} Failed to finalized/build/log summary: {e}")
+                logger.exception(
+                    f"[{self._name}] Request {request_id} Failed to finalized/build/log summary: {e}"
+                )
             finally:
                 self.request_states.pop(request_id, None)
                 if cfg.is_active:
@@ -579,13 +633,17 @@ class AsyncOmni(OmniBase):
         metrics: OrchestratorAggregator,
         final_stage_id_for_e2e: int,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
-        all_stages_finished = {stage_id: False for stage_id in range(final_stage_id_for_e2e + 1)}
+        all_stages_finished = {
+            stage_id: False for stage_id in range(final_stage_id_for_e2e + 1)
+        }
         submit_flag = True
         _loop_iter = 0
         _last_progress_ts = time.time()
         while not all(all_stages_finished.values()):
             _loop_iter += 1
-            for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
+            for stage_id, stage in enumerate(
+                self.stage_list[: final_stage_id_for_e2e + 1]
+            ):
                 if all_stages_finished[stage_id]:
                     continue
                 try:
@@ -607,12 +665,21 @@ class AsyncOmni(OmniBase):
                         prompt_token_ids = []
                     engine_input = copy.deepcopy(prompt)
                     try:
-                        next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                        next_prompt_len = max(
+                            1, compute_talker_prompt_ids_length(prompt_token_ids)
+                        )
                     except Exception:
                         raise
                     engine_input["prompt_token_ids"] = [0] * next_prompt_len
-                    engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
-                    for _mm_key in ("mm_kwargs", "mm_hashes", "mm_placeholders", "multi_modal_uuids"):
+                    engine_input["multi_modal_data"] = engine_input[
+                        "mm_processor_kwargs"
+                    ] = None
+                    for _mm_key in (
+                        "mm_kwargs",
+                        "mm_hashes",
+                        "mm_placeholders",
+                        "multi_modal_uuids",
+                    ):
                         engine_input.pop(_mm_key, None)
                     if engine_input.get("type") == "multimodal":
                         engine_input["type"] = "token"
@@ -645,7 +712,9 @@ class AsyncOmni(OmniBase):
 
             while True:
                 if finished and (
-                    not cfg_stage0 or cfg.all_companions_done(request_id) or cfg.is_parent_failed(request_id)
+                    not cfg_stage0
+                    or cfg.all_companions_done(request_id)
+                    or cfg.is_parent_failed(request_id)
                 ):
                     break
 
@@ -677,13 +746,21 @@ class AsyncOmni(OmniBase):
                 next_stage: OmniStage = self.stage_list[next_stage_id]
                 # Derive inputs for the next stage, record postprocess time
                 with metrics.stage_postprocess_timer(stage_id, request_id):
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
+                    next_inputs = next_stage.process_engine_inputs(
+                        self.stage_list, prompt
+                    )
                 sp_next: SamplingParams = sampling_params_list[next_stage_id]
 
-                if cfg is not None and cfg.is_active and not cfg.is_parent_failed(request_id):
+                if (
+                    cfg is not None
+                    and cfg.is_active
+                    and not cfg.is_parent_failed(request_id)
+                ):
                     if isinstance(sp_next, OmniDiffusionSamplingParams):
                         sp_next = copy.deepcopy(sp_next)
-                        sp_next.cfg_kv_request_ids = cfg.get_companion_request_ids(request_id)
+                        sp_next.cfg_kv_request_ids = cfg.get_companion_request_ids(
+                            request_id
+                        )
                         logger.info(
                             "Attaching cfg_kv_request_ids=%s to request %s",
                             sp_next.cfg_kv_request_ids,
@@ -704,7 +781,9 @@ class AsyncOmni(OmniBase):
                         next_inputs=next_inputs,
                         sampling_params=sp_next,
                         original_prompt=prompt,
-                        next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
+                        next_stage_queue_submit_fn=self.stage_list[
+                            next_stage_id
+                        ].submit,
                         metrics=metrics,
                     )
 
@@ -719,7 +798,9 @@ class AsyncOmni(OmniBase):
                     )
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
-                logger.debug(f"[{self._name}] Forwarded request {request_id} to stage-{next_stage_id}")
+                logger.debug(
+                    f"[{self._name}] Forwarded request {request_id} to stage-{next_stage_id}"
+                )
             else:
                 logger.debug(f"[{self._name}] Request {request_id} fully completed")
 
@@ -744,7 +825,9 @@ class AsyncOmni(OmniBase):
             )
             raise RuntimeError(result)
 
-        engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+        engine_outputs = _load(
+            result, obj_key="engine_outputs", shm_key="engine_outputs_shm"
+        )
 
         if isinstance(engine_outputs, list):
             engine_outputs = engine_outputs[0]
@@ -757,7 +840,10 @@ class AsyncOmni(OmniBase):
             # Construct output to yield
             images = []
             if stage.final_output_type == "image":
-                if isinstance(engine_outputs, OmniRequestOutput) and engine_outputs.images:
+                if (
+                    isinstance(engine_outputs, OmniRequestOutput)
+                    and engine_outputs.images
+                ):
                     images = engine_outputs.images
                 elif hasattr(engine_outputs, "images") and engine_outputs.images:
                     images = engine_outputs.images
@@ -783,7 +869,9 @@ class AsyncOmni(OmniBase):
                     finished=finished,
                 )
         # Mark last output time
-        metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
+        metrics.stage_last_ts[stage_id] = max(
+            metrics.stage_last_ts[stage_id] or 0.0, time.time()
+        )
 
         metrics.process_stage_metrics(
             result=result,
@@ -845,7 +933,10 @@ class AsyncOmni(OmniBase):
                                 dropping output for req {req_id} at stage-{stage_id}"
                             )
                             continue
-                        if hasattr(req_state, "stage_queues") and stage_id in req_state.stage_queues:
+                        if (
+                            hasattr(req_state, "stage_queues")
+                            and stage_id in req_state.stage_queues
+                        ):
                             await req_state.stage_queues[stage_id].put(result)
                         else:
                             # Fallback to old behavior for compatibility
@@ -993,7 +1084,9 @@ class AsyncOmni(OmniBase):
             )
 
         # Run all stages concurrently
-        results = await asyncio.gather(*[run_stage_rpc(stage) for stage in self.stage_list])
+        results = await asyncio.gather(
+            *[run_stage_rpc(stage) for stage in self.stage_list]
+        )
         return list(results)
 
     async def sleep(self, level: int = 1) -> None:

@@ -113,7 +113,9 @@ def _make_test_image_data_url(size=(64, 64)) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
+def _wait_for_status(
+    client: TestClient, video_id: str, status: str, timeout_s: float = 2.0
+):
     deadline = time.time() + timeout_s
     last_payload = None
     while time.time() < deadline:
@@ -123,7 +125,9 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
         if last_payload["status"] == status:
             return last_payload
         time.sleep(0.02)
-    raise AssertionError(f"Timed out waiting for status={status}. Last payload: {last_payload}")
+    raise AssertionError(
+        f"Timed out waiting for status={status}. Last payload: {last_payload}"
+    )
 
 
 def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
@@ -197,7 +201,9 @@ def test_i2v_video_generation_form(test_client, mocker: MockerFixture):
     assert input_image.size == (48, 32)
 
 
-def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client, mocker: MockerFixture):
+def test_i2v_video_generation_resizes_input_to_requested_dimensions(
+    test_client, mocker: MockerFixture
+):
     image_bytes = _make_test_image_bytes((48, 32))
 
     mocker.patch(
@@ -225,7 +231,9 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     assert input_image.size == (96, 64)
 
 
-def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
+def test_i2v_video_generation_with_image_reference_form(
+    test_client, mocker: MockerFixture
+):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
         return_value="Zg==",
@@ -234,7 +242,9 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
         "/v1/videos",
         data={
             "prompt": "A fox running through snow.",
-            "image_reference": json.dumps({"image_url": _make_test_image_data_url((40, 24))}),
+            "image_reference": json.dumps(
+                {"image_url": _make_test_image_data_url((40, 24))}
+            ),
         },
     )
 
@@ -415,7 +425,9 @@ def test_rejects_input_reference_and_image_reference_together(test_client):
         files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
     )
     assert response.status_code == 400
-    assert "either input_reference or image_reference" in response.json()["detail"].lower()
+    assert (
+        "either input_reference or image_reference" in response.json()["detail"].lower()
+    )
 
 
 def test_invalid_seconds_returns_422(test_client):
@@ -474,7 +486,10 @@ def test_unsupported_image_reference_file_id_returns_400(test_client):
         },
     )
     assert response.status_code == 400
-    assert response.json()["detail"] == "Invalid image_reference: file_id is not supported yet."
+    assert (
+        response.json()["detail"]
+        == "Invalid image_reference: file_id is not supported yet."
+    )
 
 
 def test_invalid_uploaded_input_reference_returns_400(test_client):
@@ -484,7 +499,10 @@ def test_invalid_uploaded_input_reference_returns_400(test_client):
         files={"input_reference": ("input.png", b"not-an-image", "image/png")},
     )
     assert response.status_code == 400
-    assert response.json()["detail"] == "Invalid input_reference: provided content is not a valid image."
+    assert (
+        response.json()["detail"]
+        == "Invalid input_reference: provided content is not a valid image."
+    )
 
 
 def test_video_request_validation():
@@ -497,7 +515,10 @@ def test_video_request_validation():
         VideoGenerationRequest(prompt="test", seconds="abc")
 
     with pytest.raises(ValueError):
-        VideoGenerationRequest(prompt="test", image_reference={"file_id": "file-1", "image_url": "https://example.com"})
+        VideoGenerationRequest(
+            prompt="test",
+            image_reference={"file_id": "file-1", "image_url": "https://example.com"},
+        )
 
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
@@ -569,7 +590,9 @@ def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerF
     assert zero_limit_after_body["has_more"] is False
 
 
-def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: MockerFixture):
+def test_delete_completed_job_removes_file_and_metadata(
+    test_client, mocker: MockerFixture
+):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
         return_value="Zg==",
@@ -578,7 +601,9 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
     assert create_resp.status_code == 200
     video_id = create_resp.json()["id"]
 
-    final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    final = _wait_for_status(
+        test_client, video_id, VideoGenerationStatus.COMPLETED.value
+    )
     file_name = final["file_name"]
     assert file_name is not None
     file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, file_name)

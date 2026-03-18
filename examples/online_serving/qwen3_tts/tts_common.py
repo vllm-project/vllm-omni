@@ -114,7 +114,9 @@ def build_payload(
         elif ref_audio is not None:
             payload["ref_audio"] = encode_audio_to_base64(ref_audio)
         else:
-            raise gr.Error("Base (voice clone) task requires reference audio. Upload a file or provide a URL.")
+            raise gr.Error(
+                "Base (voice clone) task requires reference audio. Upload a file or provide a URL."
+            )
         if ref_text and ref_text.strip():
             payload["ref_text"] = ref_text.strip()
         if x_vector_only:

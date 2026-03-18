@@ -29,7 +29,9 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVTransferManager,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -107,7 +109,10 @@ class DiffusionModelRunner:
             return
 
         load_device = (
-            "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
+            "cpu"
+            if self.od_config.enable_cpu_offload
+            or self.od_config.enable_layerwise_offload
+            else str(self.device)
         )
 
         def get_memory_context():
@@ -141,7 +146,9 @@ class DiffusionModelRunner:
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(self.od_config, device=self.device)
         if self.offload_backend is not None:
-            logger.info(f" Enabling offloader backend: {self.offload_backend.__class__.__name__}")
+            logger.info(
+                f" Enabling offloader backend: {self.offload_backend.__class__.__name__}"
+            )
             self.offload_backend.enable(self.pipeline)
 
         # Apply torch.compile if not in eager mode
@@ -156,7 +163,9 @@ class DiffusionModelRunner:
                 )
 
         # Setup cache backend
-        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
+        self.cache_backend = get_cache_backend(
+            self.od_config.cache_backend, self.od_config.cache_config
+        )
 
         if self.cache_backend is not None:
             if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
@@ -203,18 +212,25 @@ class DiffusionModelRunner:
             # The manager handles the check for need_recv_cache internally
             self.kv_transfer_manager.receive_multi_kv_cache(
                 req,
-                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                cfg_kv_collect_func=getattr(
+                    self.od_config, "cfg_kv_collect_func", None
+                ),
                 target_device=getattr(self.pipeline, "device", None),
             )
 
-            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
+            if (
+                req.sampling_params.generator is None
+                and req.sampling_params.seed is not None
+            ):
                 if req.sampling_params.generator_device is not None:
                     gen_device = req.sampling_params.generator_device
                 elif self.device.type == "cpu":
                     gen_device = "cpu"
                 else:
                     gen_device = self.device
-                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+                req.sampling_params.generator = torch.Generator(
+                    device=gen_device
+                ).manual_seed(req.sampling_params.seed)
 
             # Refresh cache context if needed
             if (
@@ -222,9 +238,13 @@ class DiffusionModelRunner:
                 and self.cache_backend is not None
                 and self.cache_backend.is_enabled()
             ):
-                self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
+                self.cache_backend.refresh(
+                    self.pipeline, req.sampling_params.num_inference_steps
+                )
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+            with set_forward_context(
+                vllm_config=self.vllm_config, omni_diffusion_config=self.od_config
+            ):
                 with record_function("pipeline_forward"):
                     output = self.pipeline.forward(req)
 

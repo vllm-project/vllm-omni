@@ -141,7 +141,9 @@ class MetadataManager:
 
             return self._update_with_file_lock(_create) is not None
 
-    def update_cache_info(self, speaker_key: str, cache_file_path: Path, status: str = "ready") -> bool:
+    def update_cache_info(
+        self, speaker_key: str, cache_file_path: Path, status: str = "ready"
+    ) -> bool:
         """
         Update cache information for a speaker.
         """
@@ -178,7 +180,9 @@ class MetadataManager:
                 # Clean up associated files
                 deleted_files = self._cleanup_speaker_files(speaker_info)
                 if deleted_files:
-                    logger.info(f"Deleted {len(deleted_files)} files for speaker {speaker_key}: {deleted_files}")
+                    logger.info(
+                        f"Deleted {len(deleted_files)} files for speaker {speaker_key}: {deleted_files}"
+                    )
 
                 return speaker_info
 

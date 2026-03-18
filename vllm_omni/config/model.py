@@ -137,7 +137,10 @@ class OmniModelConfig(ModelConfig):
         )
 
         # Qwen3-TTS: infer codec frame rate from the model config for online serving.
-        if self.codec_frame_rate_hz is None and self.model_arch == "Qwen3TTSTalkerForConditionalGenerationARVLLM":
+        if (
+            self.codec_frame_rate_hz is None
+            and self.model_arch == "Qwen3TTSTalkerForConditionalGenerationARVLLM"
+        ):
             talker_cfg = getattr(self.hf_config, "talker_config", None)
             if isinstance(talker_cfg, dict):
                 pos_per_sec = talker_cfg.get("position_id_per_seconds")
@@ -157,9 +160,13 @@ class OmniModelConfig(ModelConfig):
         if new_hf_text_config is not self.hf_text_config:
             self.hf_text_config = new_hf_text_config
             # Recalculate dependent attributes
-            self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
+            self.attention_chunk_size = getattr(
+                self.hf_text_config, "attention_chunk_size", None
+            )
             # Recalculate max_model_len since it depends on hf_text_config
-            self.max_model_len = self.get_and_verify_max_len(self.original_max_model_len)
+            self.max_model_len = self.get_and_verify_max_len(
+                self.original_max_model_len
+            )
             # Reset sliding_window if needed
             if self.disable_sliding_window:
                 self.hf_text_config.sliding_window = None

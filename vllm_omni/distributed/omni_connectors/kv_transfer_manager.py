@@ -63,7 +63,9 @@ class OmniKVTransferManager:
 
         # Pre-calculate send stages (from_stage, to_stage)
         self.send_stages = (
-            (str(config.from_stage), str(config.to_stage)) if config.from_stage and config.to_stage else (None, None)
+            (str(config.from_stage), str(config.to_stage))
+            if config.from_stage and config.to_stage
+            else (None, None)
         )
 
         # Pre-calculate receive stages (from_stage, to_stage)
@@ -108,7 +110,9 @@ class OmniKVTransferManager:
         return cls._create(getattr(config, "omni_kv_config", None))
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: Any, model_config: Any) -> "OmniKVTransferManager":
+    def from_vllm_config(
+        cls, vllm_config: Any, model_config: Any
+    ) -> "OmniKVTransferManager":
         """Create from vllm config with fallback to kv_transfer_config."""
         # Primary: omni_kv_config from model_config
         omni_kv = getattr(model_config, "omni_kv_config", None)
@@ -142,7 +146,9 @@ class OmniKVTransferManager:
                 try:
                     logger.info(f"Initializing OmniConnector with config: {cfg}")
                     c_extra = {k: v for k, v in cfg.items() if k != "type"}
-                    self._connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=c_type, extra=c_extra))
+                    self._connector = OmniConnectorFactory.create_connector(
+                        ConnectorSpec(name=c_type, extra=c_extra)
+                    )
                 except Exception as e:
                     logger.error(f"Failed to initialize OmniConnector: {e}")
                     import traceback
@@ -187,7 +193,9 @@ class OmniKVTransferManager:
             return list(finished_reqs.keys())
 
         if not self.connector:
-            logger.warning("No connector available, skipping KV transfer but freeing resources")
+            logger.warning(
+                "No connector available, skipping KV transfer but freeing resources"
+            )
             return list(finished_reqs.keys())
 
         logger.debug(f"Processing KV transfer for {len(finished_reqs)} requests")
@@ -205,11 +213,19 @@ class OmniKVTransferManager:
 
                 # Extract KV cache from GPU blocks -> CPU tensors
                 kv_data = self._extract_kv_cache(
-                    req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype, custom_metadata
+                    req_id,
+                    block_ids,
+                    seq_len,
+                    kv_caches,
+                    block_size,
+                    cache_dtype,
+                    custom_metadata,
                 )
                 if kv_data:
                     # Resolve global request ID if available
-                    transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
+                    transfer_req_id = (
+                        request_id_resolver(req_id) if request_id_resolver else req_id
+                    )
 
                     # Transfer to downstream stage via connector
                     self._transfer_kv_cache(kv_data, transfer_req_id)
@@ -300,7 +316,9 @@ class OmniKVTransferManager:
             },
         )
 
-    def _transfer_kv_cache(self, kv_data: KVCacheTransferData, transfer_req_id: str) -> None:
+    def _transfer_kv_cache(
+        self, kv_data: KVCacheTransferData, transfer_req_id: str
+    ) -> None:
         """Transfer KV cache data to downstream stage via OmniConnector.
 
         Args:
@@ -309,13 +327,17 @@ class OmniKVTransferManager:
         """
         from_stage, to_stage = self.send_stages
         if not from_stage or not to_stage:
-            raise ValueError("Transfer stages (omni_from_stage, omni_to_stage) not configured")
+            raise ValueError(
+                "Transfer stages (omni_from_stage, omni_to_stage) not configured"
+            )
 
         # Prepare data and transfer with retry
         data_dict = kv_data.to_dict()
         data_dict["request_id"] = transfer_req_id
 
-        success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", data_dict)
+        success, size, _ = self._transfer_with_retry(
+            from_stage, to_stage, f"kv_cache_{transfer_req_id}", data_dict
+        )
 
         if success:
             logger.info(f"KV transfer OK: {transfer_req_id}, {size} bytes")
@@ -347,11 +369,16 @@ class OmniKVTransferManager:
                 # Build the full key for connector
                 full_request_id = f"omni_{from_stage}_to_{to_stage}_{request_id}"
                 success, size, metadata = self.connector.put(
-                    from_stage=from_stage, to_stage=to_stage, put_key=full_request_id, data=data
+                    from_stage=from_stage,
+                    to_stage=to_stage,
+                    put_key=full_request_id,
+                    data=data,
                 )
                 if success:
                     return success, size, metadata
-                logger.warning(f"Transfer attempt {attempt + 1} failed for {request_id}")
+                logger.warning(
+                    f"Transfer attempt {attempt + 1} failed for {request_id}"
+                )
             except Exception as e:
                 logger.warning(f"Transfer attempt {attempt + 1} exception: {e}")
 
@@ -388,18 +415,24 @@ class OmniKVTransferManager:
 
         # Check if we should receive KV cache based on config
         if not self.config.need_recv_cache:
-            logger.info(f"Skip receiving KV cache for {request_id} (need_recv_cache=False)")
+            logger.info(
+                f"Skip receiving KV cache for {request_id} (need_recv_cache=False)"
+            )
             return None, 0
 
         timeout = self.config.recv_timeout
         start_time = time.time()
 
-        logger.info(f"Wait for KV cache for request {request_id} from stage {from_stage} to {to_stage}...")
+        logger.info(
+            f"Wait for KV cache for request {request_id} from stage {from_stage} to {to_stage}..."
+        )
 
         try:
             while True:
                 # Build the full key for connector
-                full_request_id = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
+                full_request_id = (
+                    f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
+                )
                 result = self.connector.get(
                     from_stage=from_stage,
                     to_stage=to_stage,
@@ -407,23 +440,36 @@ class OmniKVTransferManager:
                 )
                 if result:
                     data, size = result
-                    logger.info(f"Successfully received KV cache for {request_id}, {size} bytes")
+                    logger.info(
+                        f"Successfully received KV cache for {request_id}, {size} bytes"
+                    )
 
                     # Move tensors to target device if specified
-                    if target_device is not None and isinstance(data, dict) and "layer_blocks" in data:
+                    if (
+                        target_device is not None
+                        and isinstance(data, dict)
+                        and "layer_blocks" in data
+                    ):
                         layer_blocks = data["layer_blocks"]
                         for cache_list in [
                             layer_blocks.get("key_cache", []),
                             layer_blocks.get("value_cache", []),
                         ]:
                             for i, tensor in enumerate(cache_list):
-                                if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
-                                    cache_list[i] = tensor.to(target_device).contiguous()
+                                if (
+                                    isinstance(tensor, torch.Tensor)
+                                    and tensor.device != target_device
+                                ):
+                                    cache_list[i] = tensor.to(
+                                        target_device
+                                    ).contiguous()
 
                     return data, size
 
                 if time.time() - start_time > timeout:
-                    logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
+                    logger.error(
+                        f"Timeout waiting for KV cache for request {request_id} after {timeout}s"
+                    )
                     return None, 0
 
                 time.sleep(0.5)
@@ -460,7 +506,9 @@ class OmniKVTransferManager:
                 req.sampling_params.kv_metadata = data["metadata"]
 
     # Legacy compatibility method
-    def receive_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
+    def receive_kv_cache(
+        self, req: Any, target_device: torch.device | None = None
+    ) -> bool:
         """Receive KV cache and populate request object (legacy interface).
 
         Args:
@@ -511,10 +559,14 @@ class OmniKVTransferManager:
         """
         primary_ok = self.receive_kv_cache(req, target_device)
 
-        cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
+        cfg_ids = getattr(
+            getattr(req, "sampling_params", None), "cfg_kv_request_ids", None
+        )
         if cfg_ids and cfg_kv_collect_func:
             request_id = getattr(req, "request_id", None) or (
-                req.request_ids[0] if hasattr(req, "request_ids") and req.request_ids else None
+                req.request_ids[0]
+                if hasattr(req, "request_ids") and req.request_ids
+                else None
             )
             try:
                 cfg_kvs = cfg_kv_collect_func(
@@ -523,7 +575,11 @@ class OmniKVTransferManager:
                     self,
                     target_device,
                 )
-                if cfg_kvs and hasattr(req, "sampling_params") and req.sampling_params is not None:
+                if (
+                    cfg_kvs
+                    and hasattr(req, "sampling_params")
+                    and req.sampling_params is not None
+                ):
                     for key, value in cfg_kvs.items():
                         setattr(req.sampling_params, key, value)
                     logger.info("Applied CFG KV caches: %s", list(cfg_kvs.keys()))

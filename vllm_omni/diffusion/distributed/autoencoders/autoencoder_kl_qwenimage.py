@@ -31,10 +31,18 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         sample_height = height * self.spatial_compression_ratio
         sample_width = width * self.spatial_compression_ratio
 
-        tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
-        tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
-        tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
-        tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
+        tile_latent_min_height = (
+            self.tile_sample_min_height // self.spatial_compression_ratio
+        )
+        tile_latent_min_width = (
+            self.tile_sample_min_width // self.spatial_compression_ratio
+        )
+        tile_latent_stride_height = (
+            self.tile_sample_stride_height // self.spatial_compression_ratio
+        )
+        tile_latent_stride_width = (
+            self.tile_sample_stride_width // self.spatial_compression_ratio
+        )
 
         blend_height = self.tile_sample_min_height - self.tile_sample_stride_height
         blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
@@ -47,7 +55,13 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
                 time_list = []
                 for k in range(num_frames):
                     self._conv_idx = [0]
-                    tile = z[:, :, k : k + 1, i : i + tile_latent_min_height, j : j + tile_latent_min_width]
+                    tile = z[
+                        :,
+                        :,
+                        k : k + 1,
+                        i : i + tile_latent_min_height,
+                        j : j + tile_latent_min_width,
+                    ]
                     time_list.append(tile)
                 tiletask_list.append(
                     TileTask(
@@ -65,7 +79,10 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         }
         grid_spec = GridSpec(
             split_dims=(3, 4),
-            grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
+            grid_shape=(
+                tiletask_list[-1].grid_coord[0] + 1,
+                tiletask_list[-1].grid_coord[1] + 1,
+            ),
             tile_spec=tile_spec,
             output_dtype=self.dtype,
         )
@@ -78,12 +95,16 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         for k in range(len(task.tensor)):
             self._conv_idx = [0]
             tile = self.post_quant_conv(task.tensor[k])
-            decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx)
+            decoded = self.decoder(
+                tile, feat_cache=self._feat_map, feat_idx=self._conv_idx
+            )
             time.append(decoded)
         result = torch.cat(time, dim=2)
         return result
 
-    def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
+    def tile_merge(
+        self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec
+    ) -> torch.Tensor:
         """Merge decoded tiles into a full image."""
         grid_h, grid_w = grid_spec.grid_shape
         self.clear_cache()
@@ -94,13 +115,33 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
             for j in range(grid_w):
                 tile = coord_tensor_map[(i, j)]
                 if i > 0:
-                    tile = self.blend_v(coord_tensor_map[(i - 1, j)], tile, grid_spec.tile_spec["blend_height"])
+                    tile = self.blend_v(
+                        coord_tensor_map[(i - 1, j)],
+                        tile,
+                        grid_spec.tile_spec["blend_height"],
+                    )
                 if j > 0:
-                    tile = self.blend_h(coord_tensor_map[(i, j - 1)], tile, grid_spec.tile_spec["blend_width"])
-                result_row.append(tile[:, :, :, : self.tile_sample_stride_height, : self.tile_sample_stride_width])
+                    tile = self.blend_h(
+                        coord_tensor_map[(i, j - 1)],
+                        tile,
+                        grid_spec.tile_spec["blend_width"],
+                    )
+                result_row.append(
+                    tile[
+                        :,
+                        :,
+                        :,
+                        : self.tile_sample_stride_height,
+                        : self.tile_sample_stride_width,
+                    ]
+                )
             result_rows.append(torch.cat(result_row, dim=-1))
         dec = torch.cat(result_rows, dim=3)[
-            :, :, :, : grid_spec.tile_spec["sample_height"], : grid_spec.tile_spec["sample_width"]
+            :,
+            :,
+            :,
+            : grid_spec.tile_spec["sample_height"],
+            : grid_spec.tile_spec["sample_width"],
         ]
         return dec
 
@@ -111,7 +152,9 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         logger.info("Decode run with distributed executor")
         result = self.distributed_decoder.execute(
             z,
-            DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge),
+            DistributedOperator(
+                split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge
+            ),
             broadcast_result=True,
         )
         if not return_dict:

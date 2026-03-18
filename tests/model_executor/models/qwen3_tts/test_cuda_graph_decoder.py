@@ -28,7 +28,9 @@ TOTAL_UPSAMPLE = 4
 
 # Load CUDAGraphDecoderWrapper: try package import first, fall back to direct file load
 try:
-    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
+        CUDAGraphDecoderWrapper,
+    )
 except Exception:
     _WRAPPER_PATH = os.path.join(
         os.path.dirname(__file__),
@@ -42,7 +44,9 @@ except Exception:
         "qwen3_tts",
         "cuda_graph_decoder_wrapper.py",
     )
-    _spec = importlib.util.spec_from_file_location("cuda_graph_decoder_wrapper", os.path.abspath(_WRAPPER_PATH))
+    _spec = importlib.util.spec_from_file_location(
+        "cuda_graph_decoder_wrapper", os.path.abspath(_WRAPPER_PATH)
+    )
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     CUDAGraphDecoderWrapper = _mod.CUDAGraphDecoderWrapper
@@ -62,7 +66,9 @@ class SyntheticDecoder(nn.Module):
         self.embed = nn.Conv1d(num_quantizers, hidden, kernel_size=3, padding=1)
         self.conv1 = nn.Conv1d(hidden, hidden, kernel_size=5, padding=2)
         self.conv2 = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1)
-        self.upsample = nn.ConvTranspose1d(hidden, hidden, kernel_size=total_upsample, stride=total_upsample)
+        self.upsample = nn.ConvTranspose1d(
+            hidden, hidden, kernel_size=total_upsample, stride=total_upsample
+        )
         self.out = nn.Conv1d(hidden, 1, kernel_size=1)
 
     def forward(self, codes):
@@ -95,7 +101,9 @@ def wrapper(decoder):
 
 
 def _random_codes(seq_len, device=DEVICE):
-    return torch.randint(0, 100, (1, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=device)
+    return torch.randint(
+        0, 100, (1, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=device
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -194,7 +202,9 @@ def test_chunked_decode_shape_match(decoder, wrapper, total_len):
 
     with torch.no_grad():
         eager_out = _eager_chunked(decoder, codes, chunk_size, ctx)
-        graph_out = wrapper.chunked_decode_with_cudagraph(codes, chunk_size=chunk_size, left_context_size=ctx)
+        graph_out = wrapper.chunked_decode_with_cudagraph(
+            codes, chunk_size=chunk_size, left_context_size=ctx
+        )
 
     assert eager_out.shape == graph_out.shape
 
@@ -208,7 +218,9 @@ def test_chunked_decode_exact_size_equivalence(decoder, wrapper, total_len):
 
     with torch.no_grad():
         eager_out = _eager_chunked(decoder, codes, chunk_size, ctx)
-        graph_out = wrapper.chunked_decode_with_cudagraph(codes, chunk_size=chunk_size, left_context_size=ctx)
+        graph_out = wrapper.chunked_decode_with_cudagraph(
+            codes, chunk_size=chunk_size, left_context_size=ctx
+        )
 
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
@@ -256,7 +268,9 @@ def test_disabled_wrapper_matches_eager(decoder, wrapper):
 
 def test_batch_size_gt1_falls_back(decoder, wrapper):
     """Batch size > 1 should fall back to eager (bit-identical)."""
-    codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
+    codes = torch.randint(
+        0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE
+    )
     with torch.no_grad():
         eager_out = decoder(codes)
         graph_out = wrapper.decode(codes)

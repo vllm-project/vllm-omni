@@ -252,9 +252,11 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
         layer_type_validation(self.layer_types)
@@ -438,11 +440,15 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         if code_predictor_config is None:
             code_predictor_config = {}
             self.code_predictor_config = Qwen3TTSTalkerCodePredictorConfig()
-            logger.info("code_predictor_config is None. Initializing code_predictor model with default values")
+            logger.info(
+                "code_predictor_config is None. Initializing code_predictor model with default values"
+            )
         elif isinstance(code_predictor_config, Qwen3TTSTalkerCodePredictorConfig):
             self.code_predictor_config = code_predictor_config
         else:
-            self.code_predictor_config = Qwen3TTSTalkerCodePredictorConfig(**code_predictor_config)
+            self.code_predictor_config = Qwen3TTSTalkerCodePredictorConfig(
+                **code_predictor_config
+            )
         self.num_code_groups = num_code_groups
         self.text_hidden_size = text_hidden_size
         self.codec_eos_token_id = codec_eos_token_id
@@ -486,13 +492,19 @@ class Qwen3TTSConfig(PretrainedConfig):
 
         if talker_config is None:
             talker_config = {}
-            logger.info("talker_config is None. Initializing talker model with default values")
+            logger.info(
+                "talker_config is None. Initializing talker model with default values"
+            )
         if speaker_encoder_config is None:
             speaker_encoder_config = {}
-            logger.info("speaker_encoder_config is None. Initializing talker model with default values")
+            logger.info(
+                "speaker_encoder_config is None. Initializing talker model with default values"
+            )
 
         self.talker_config = Qwen3TTSTalkerConfig(**talker_config)
-        self.speaker_encoder_config = Qwen3TTSSpeakerEncoderConfig(**speaker_encoder_config)
+        self.speaker_encoder_config = Qwen3TTSSpeakerEncoderConfig(
+            **speaker_encoder_config
+        )
 
         self.tokenizer_type = tokenizer_type
         self.tts_model_size = tts_model_size

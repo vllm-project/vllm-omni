@@ -11,7 +11,11 @@ extensible: adding a new parallelism method should not require editing the core
 Attention module, only adding a new strategy and selecting it in the factory.
 """
 
-from .base import NoParallelAttention, ParallelAttentionContext, ParallelAttentionStrategy
+from .base import (
+    NoParallelAttention,
+    ParallelAttentionContext,
+    ParallelAttentionStrategy,
+)
 from .factory import build_parallel_attention_strategy
 
 __all__ = [

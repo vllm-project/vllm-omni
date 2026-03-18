@@ -25,14 +25,28 @@ DEFAULT_QUESTION = "Please summarize the content of this image."
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MammothModa2 image summarization (offline, AR only).")
-    parser.add_argument("--model", type=str, required=True, help="Path to model directory or model id.")
+    parser = argparse.ArgumentParser(
+        description="MammothModa2 image summarization (offline, AR only)."
+    )
     parser.add_argument(
-        "--stage-config", type=str, required=True, help="Path to stage config yaml (single-stage AR->text)."
+        "--model", type=str, required=True, help="Path to model directory or model id."
+    )
+    parser.add_argument(
+        "--stage-config",
+        type=str,
+        required=True,
+        help="Path to stage config yaml (single-stage AR->text).",
     )
     parser.add_argument("--image", type=str, required=True, help="Path to input image.")
-    parser.add_argument("--question", type=str, default=DEFAULT_QUESTION, help="Question/instruction for the model.")
-    parser.add_argument("--system", type=str, default=DEFAULT_SYSTEM, help="System prompt.")
+    parser.add_argument(
+        "--question",
+        type=str,
+        default=DEFAULT_QUESTION,
+        help="Question/instruction for the model.",
+    )
+    parser.add_argument(
+        "--system", type=str, default=DEFAULT_SYSTEM, help="System prompt."
+    )
     parser.add_argument(
         "--max-tokens",
         type=int,

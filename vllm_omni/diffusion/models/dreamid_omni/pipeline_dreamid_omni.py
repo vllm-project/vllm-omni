@@ -26,7 +26,11 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 try:
     from dreamid_omni.utils.divisible_crop import DivisibleCrop
-    from dreamid_omni.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
+    from dreamid_omni.utils.fm_solvers import (
+        FlowDPMSolverMultistepScheduler,
+        get_sampling_sigmas,
+        retrieve_timesteps,
+    )
     from dreamid_omni.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
     from dreamid_omni.utils.model_loading_utils import (
         init_mmaudio_vae,
@@ -79,7 +83,9 @@ VIDEO_CONFIG = {
 }
 
 
-class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, SupportAudioInput):
+class DreamIDOmniPipeline(
+    nn.Module, CFGParallelMixin, SupportImageInput, SupportAudioInput
+):
     """DreamID-Omni pipeline for vLLM-Omni."""
 
     def __init__(
@@ -118,7 +124,9 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
 
         checkpoint_path = self.od_config.model_config.get("fusion", None)
         assert checkpoint_path is not None, "fusion checkpoint path is None"
-        load_fusion_checkpoint(Fusion_model, checkpoint_path=os.path.join(model, checkpoint_path))
+        load_fusion_checkpoint(
+            Fusion_model, checkpoint_path=os.path.join(model, checkpoint_path)
+        )
         self.model = Fusion_model
         self.transformer = self.model
 
@@ -174,7 +182,12 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
             # Create a new image with the target size and place the resized image in the center
             delta_w = video_w - img.size[0]
             delta_h = video_h - img.size[1]
-            padding = (delta_w // 2, delta_h // 2, delta_w - (delta_w // 2), delta_h - (delta_h // 2))
+            padding = (
+                delta_w // 2,
+                delta_h // 2,
+                delta_w - (delta_w // 2),
+                delta_h - (delta_h // 2),
+            )
             new_img = ImageOps.expand(img, padding, fill=(255, 255, 255))
 
             # Transform to tensor and normalize.
@@ -187,7 +200,9 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                         mode="area",
                         downsample_only=True,
                     ),
-                    DivisibleCrop((vae_stride[1] * patch_size[1], vae_stride[2] * patch_size[2])),
+                    DivisibleCrop(
+                        (vae_stride[1] * patch_size[1], vae_stride[2] * patch_size[2])
+                    ),
                     Normalize(0.5, 0.5),
                     Rearrange("t c h w -> c t h w"),
                 ]
@@ -197,7 +212,11 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
             new_img = new_img.to(self.device)
             new_img = new_img.to(self.target_dtype)
 
-            img_vae_latent = self.vae_model_video.wrapped_encode(new_img[:, :, None]).to(self.target_dtype).squeeze(0)
+            img_vae_latent = (
+                self.vae_model_video.wrapped_encode(new_img[:, :, None])
+                .to(self.target_dtype)
+                .squeeze(0)
+            )
             ref_vae_latents["image"].append(img_vae_latent)
 
         for audio_array in audios:
@@ -219,7 +238,9 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
     def load_weights(self, weights):
         pass
 
-    def get_scheduler_time_steps(self, sampling_steps, solver_name="unipc", device=0, shift=5.0):
+    def get_scheduler_time_steps(
+        self, sampling_steps, solver_name="unipc", device=0, shift=5.0
+    ):
         torch.manual_seed(4)
 
         if solver_name == "unipc":
@@ -234,7 +255,9 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                 num_train_timesteps=1000, shift=1, use_dynamic_shifting=False
             )
             sampling_sigmas = get_sampling_sigmas(sampling_steps, shift=shift)
-            timesteps, _ = retrieve_timesteps(sample_scheduler, device=device, sigmas=sampling_sigmas)
+            timesteps, _ = retrieve_timesteps(
+                sample_scheduler, device=device, sigmas=sampling_sigmas
+            )
 
         elif solver_name == "euler":
             sample_scheduler = FlowMatchEulerDiscreteScheduler(shift=shift)
@@ -276,15 +299,24 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         for i, (t_v, t_a) in tqdm(enumerate(zip(timesteps_video, timesteps_audio))):
             timestep_input = torch.full((1,), t_v, device=self.device)
 
-            model_input_video = torch.cat([video_noise[:, :-ref_ip_num], latents_ref_image], dim=1)
+            model_input_video = torch.cat(
+                [video_noise[:, :-ref_ip_num], latents_ref_image], dim=1
+            )
             model_input_video_neg = torch.cat(
-                [video_noise[:, :-ref_ip_num], torch.zeros_like(latents_ref_image)], dim=1
+                [video_noise[:, :-ref_ip_num], torch.zeros_like(latents_ref_image)],
+                dim=1,
             )
 
-            model_input_audio = torch.cat([audio_noise[:-ref_audio_length, :], latents_ref_audio], dim=0)
+            model_input_audio = torch.cat(
+                [audio_noise[:-ref_audio_length, :], latents_ref_audio], dim=0
+            )
 
             model_input_audio_neg = torch.cat(
-                [audio_noise[:-ref_audio_length, :], torch.zeros_like(latents_ref_audio)], dim=0
+                [
+                    audio_noise[:-ref_audio_length, :],
+                    torch.zeros_like(latents_ref_audio),
+                ],
+                dim=0,
             )
             ref_ip_lengths = [ref_ip_num]
 
@@ -313,10 +345,16 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
 
                 if cfg_rank == 0:
                     pred_vid, pred_audio = self.model(
-                        vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **pos_args
+                        vid=[model_input_video],
+                        audio=[model_input_audio],
+                        t=timestep_input,
+                        **pos_args,
                     )
                     pre_vid_ip_neg, _ = self.model(
-                        vid=[model_input_video_neg], audio=[model_input_audio], t=timestep_input, **pos_args
+                        vid=[model_input_video_neg],
+                        audio=[model_input_audio],
+                        t=timestep_input,
+                        **pos_args,
                     )
                     pred_vid_0 = pred_vid[0]
                     pred_audio_0 = pred_audio[0]
@@ -324,20 +362,34 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                     pred_refaudio_0 = torch.zeros_like(pred_audio_0)  # dummy tensor
                 else:
                     pred_vid, pred_audio = self.model(
-                        vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **neg_args
+                        vid=[model_input_video],
+                        audio=[model_input_audio],
+                        t=timestep_input,
+                        **neg_args,
                     )
                     _, pred_refaudio_neg = self.model(
-                        vid=[model_input_video], audio=[model_input_audio_neg], t=timestep_input, **pos_args
+                        vid=[model_input_video],
+                        audio=[model_input_audio_neg],
+                        t=timestep_input,
+                        **pos_args,
                     )
                     pred_vid_0 = pred_vid[0]
                     pred_audio_0 = pred_audio[0]
                     pre_vid_ip_0 = torch.zeros_like(pred_vid_0)  # dummy tensor
                     pred_refaudio_0 = pred_refaudio_neg[0]
 
-                pred_vid_gathered = cfg_group.all_gather(pred_vid_0, separate_tensors=True)
-                pred_audio_gathered = cfg_group.all_gather(pred_audio_0, separate_tensors=True)
-                pre_vid_ip_gathered = cfg_group.all_gather(pre_vid_ip_0, separate_tensors=True)
-                pred_refaudio_gathered = cfg_group.all_gather(pred_refaudio_0, separate_tensors=True)
+                pred_vid_gathered = cfg_group.all_gather(
+                    pred_vid_0, separate_tensors=True
+                )
+                pred_audio_gathered = cfg_group.all_gather(
+                    pred_audio_0, separate_tensors=True
+                )
+                pre_vid_ip_gathered = cfg_group.all_gather(
+                    pre_vid_ip_0, separate_tensors=True
+                )
+                pred_refaudio_gathered = cfg_group.all_gather(
+                    pred_refaudio_0, separate_tensors=True
+                )
 
                 pred_vid_pos = [pred_vid_gathered[0]]
                 pred_vid_neg = [pred_vid_gathered[1]]
@@ -347,19 +399,31 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                 pred_refaudio_neg = [pred_refaudio_gathered[1]]
             else:
                 pred_vid_pos, pred_audio_pos = self.model(
-                    vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **pos_args
+                    vid=[model_input_video],
+                    audio=[model_input_audio],
+                    t=timestep_input,
+                    **pos_args,
                 )
 
                 pred_vid_neg, pred_audio_neg = self.model(
-                    vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **neg_args
+                    vid=[model_input_video],
+                    audio=[model_input_audio],
+                    t=timestep_input,
+                    **neg_args,
                 )
 
                 pre_vid_ip_neg, _ = self.model(
-                    vid=[model_input_video_neg], audio=[model_input_audio], t=timestep_input, **pos_args
+                    vid=[model_input_video_neg],
+                    audio=[model_input_audio],
+                    t=timestep_input,
+                    **pos_args,
                 )
 
                 _, pred_refaudio_neg = self.model(
-                    vid=[model_input_video], audio=[model_input_audio_neg], t=timestep_input, **pos_args
+                    vid=[model_input_video],
+                    audio=[model_input_audio_neg],
+                    t=timestep_input,
+                    **pos_args,
                 )
 
             pred_video_guided = (
@@ -374,10 +438,16 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                 + self.audio_ref_cfg_scale * (pred_audio_pos[0] - pred_refaudio_neg[0])
             )
             video_noise = scheduler_video.step(
-                pred_video_guided.unsqueeze(0), t_v, video_noise.unsqueeze(0), return_dict=False
+                pred_video_guided.unsqueeze(0),
+                t_v,
+                video_noise.unsqueeze(0),
+                return_dict=False,
             )[0].squeeze(0)
             audio_noise = scheduler_audio.step(
-                pred_audio_guided.unsqueeze(0), t_a, audio_noise.unsqueeze(0), return_dict=False
+                pred_audio_guided.unsqueeze(0),
+                t_a,
+                audio_noise.unsqueeze(0),
+                return_dict=False,
             )[0].squeeze(0)
         return video_noise, audio_noise
 
@@ -398,9 +468,21 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
             video_negative_prompt = r_prompts.get("video_negative_prompt", "")
             audio_negative_prompt = r_prompts.get("audio_negative_prompt", "")
 
-        multi_modal_data = r_prompts.get("multi_modal_data", {}) if not isinstance(r_prompts, str) else None
-        raw_images = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-        raw_audios = multi_modal_data.get("audio", None) if multi_modal_data is not None else None
+        multi_modal_data = (
+            r_prompts.get("multi_modal_data", {})
+            if not isinstance(r_prompts, str)
+            else None
+        )
+        raw_images = (
+            multi_modal_data.get("image", None)
+            if multi_modal_data is not None
+            else None
+        )
+        raw_audios = (
+            multi_modal_data.get("audio", None)
+            if multi_modal_data is not None
+            else None
+        )
         if raw_images is None or raw_audios is None:
             raise ValueError("This model requires image and audio to run.")
         if not isinstance(raw_images, list):
@@ -415,7 +497,11 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         num_inference_steps = request.sampling_params.num_inference_steps
         shift = request.sampling_params.extra_args.get("shift", 5.0)
         solver_name = request.sampling_params.extra_args.get("solver_name", "unipc")
-        seed = request.sampling_params.seed if request.sampling_params.seed is not None else 42
+        seed = (
+            request.sampling_params.seed
+            if request.sampling_params.seed is not None
+            else 42
+        )
 
         # 1. Prepare reference latents
         ref_vae_latents, ref_audio_lengths = self.load_image_latent_ref_ip_video(
@@ -431,14 +517,22 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
 
         # 2. scheduler
         scheduler_video, timesteps_video = self.get_scheduler_time_steps(
-            sampling_steps=num_inference_steps, device=self.device, solver_name=solver_name, shift=shift
+            sampling_steps=num_inference_steps,
+            device=self.device,
+            solver_name=solver_name,
+            shift=shift,
         )
         scheduler_audio, timesteps_audio = self.get_scheduler_time_steps(
-            sampling_steps=num_inference_steps, device=self.device, solver_name=solver_name, shift=shift
+            sampling_steps=num_inference_steps,
+            device=self.device,
+            solver_name=solver_name,
+            shift=shift,
         )
 
         # 3. text embedding
-        text_embeddings = self.text_model([prompt, video_negative_prompt, audio_negative_prompt], device=self.device)
+        text_embeddings = self.text_model(
+            [prompt, video_negative_prompt, audio_negative_prompt], device=self.device
+        )
         text_embeddings = [emb.to(self.target_dtype) for emb in text_embeddings]
         text_embeddings_audio_pos = text_embeddings[0]
         text_embeddings_video_pos = text_embeddings[0]
@@ -450,11 +544,18 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         video_noise_len = self.video_latent_length + ref_ip_num
         audio_noise_len = self.audio_latent_length + ref_audio_length
         freqs_scaling_tensor = torch.tensor(
-            self.video_latent_length / self.audio_latent_length, device=self.device, dtype=self.target_dtype
+            self.video_latent_length / self.audio_latent_length,
+            device=self.device,
+            dtype=self.target_dtype,
         )
 
         video_noise = torch.randn(
-            (self.video_latent_channel, video_noise_len, video_latent_h, video_latent_w),
+            (
+                self.video_latent_channel,
+                video_noise_len,
+                video_latent_h,
+                video_latent_w,
+            ),
             device=self.device,
             dtype=self.target_dtype,
             generator=torch.Generator(device=self.device).manual_seed(seed),
@@ -466,15 +567,23 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
             generator=torch.Generator(device=self.device).manual_seed(seed),
         )
 
-        _patch_size_h, _patch_size_w = self.model.video_model.patch_size[1], self.model.video_model.patch_size[2]
+        _patch_size_h, _patch_size_w = (
+            self.model.video_model.patch_size[1],
+            self.model.video_model.patch_size[2],
+        )
 
         max_seq_len_video = (
-            video_noise.shape[1] * video_noise.shape[2] * video_noise.shape[3] // (_patch_size_h * _patch_size_w)
+            video_noise.shape[1]
+            * video_noise.shape[2]
+            * video_noise.shape[3]
+            // (_patch_size_h * _patch_size_w)
         )
 
         max_seq_len_audio = audio_noise_len
 
-        with torch.amp.autocast("cuda", enabled=self.target_dtype != torch.float32, dtype=self.target_dtype):
+        with torch.amp.autocast(
+            "cuda", enabled=self.target_dtype != torch.float32, dtype=self.target_dtype
+        ):
             video_noise, audio_noise = self.diffuse(
                 video_noise,
                 audio_noise,
@@ -500,9 +609,21 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         audio_noise_for_decode = audio_noise[:-ref_audio_length, :]
 
         audio_latents_for_vae = audio_noise_for_decode.unsqueeze(0).transpose(1, 2)
-        generated_audio = self.vae_model_audio.wrapped_decode(audio_latents_for_vae).squeeze().cpu().float().numpy()
+        generated_audio = (
+            self.vae_model_audio.wrapped_decode(audio_latents_for_vae)
+            .squeeze()
+            .cpu()
+            .float()
+            .numpy()
+        )
 
         video_latents_for_vae = video_noise_for_decode.unsqueeze(0)
-        generated_video = self.vae_model_video.wrapped_decode(video_latents_for_vae).squeeze(0).cpu().float().numpy()
+        generated_video = (
+            self.vae_model_video.wrapped_decode(video_latents_for_vae)
+            .squeeze(0)
+            .cpu()
+            .float()
+            .numpy()
+        )
 
         return DiffusionOutput(output=(generated_video, generated_audio))

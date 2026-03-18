@@ -7,13 +7,21 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _make_preprocessor(monkeypatch):
     preprocessor = object.__new__(OmniInputPreprocessor)
-    monkeypatch.setattr(preprocessor, "_truncate_inputs", lambda tokens, tokenization_kwargs=None: tokens)
+    monkeypatch.setattr(
+        preprocessor,
+        "_truncate_inputs",
+        lambda tokens, tokenization_kwargs=None: tokens,
+    )
     monkeypatch.setattr(
         preprocessor,
         "_process_multimodal",
         lambda *args, **kwargs: {"prompt_token_ids": [1, 2, 3]},
     )
-    monkeypatch.setattr(preprocessor, "_tokenize_prompt", lambda prompt_text, tokenization_kwargs=None: [9, 8, 7])
+    monkeypatch.setattr(
+        preprocessor,
+        "_tokenize_prompt",
+        lambda prompt_text, tokenization_kwargs=None: [9, 8, 7],
+    )
     return preprocessor
 
 

@@ -51,7 +51,9 @@ EXPECTED_OUTPUT_SIZE = (1024, 672)
 
 def _load_input_image() -> Image.Image:
     """Load the test input image via vllm's ImageAsset."""
-    return ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
+    return ImageAsset(
+        "2560px-Gfp-wisconsin-madison-the-nature-boardwalk"
+    ).pil_image.convert("RGB")
 
 
 def _find_free_port() -> int:
@@ -63,7 +65,9 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_steps: int = 15) -> list:
+def _configure_sampling_params(
+    omni: Omni, max_tokens: int = 1, num_inference_steps: int = 15
+) -> list:
     """Configure sampling parameters for Bagel img2img generation.
 
     Args:
@@ -123,9 +127,9 @@ def _validate_pixels(
         x, y = ref["position"]
         expected = ref["rgb"]
         actual = image.getpixel((x, y))[:3]
-        assert all(abs(a - e) <= tolerance for a, e in zip(actual, expected)), (
-            f"Pixel mismatch at ({x}, {y}): expected {expected}, got {actual}"
-        )
+        assert all(
+            abs(a - e) <= tolerance for a, e in zip(actual, expected)
+        ), f"Pixel mismatch at ({x}, {y}): expected {expected}, got {actual}"
 
 
 def _generate_bagel_img2img(
@@ -163,7 +167,9 @@ def _generate_bagel_img2img(
 
     generated_image = _extract_generated_image(omni_outputs)
     assert generated_image is not None, "No images generated"
-    assert generated_image.size == EXPECTED_OUTPUT_SIZE, f"Expected {EXPECTED_OUTPUT_SIZE}, got {generated_image.size}"
+    assert (
+        generated_image.size == EXPECTED_OUTPUT_SIZE
+    ), f"Expected {EXPECTED_OUTPUT_SIZE}, got {generated_image.size}"
 
     return generated_image
 
@@ -174,8 +180,14 @@ def _generate_bagel_img2img(
 def test_bagel_img2img_shared_memory_connector():
     """Test Bagel img2img with shared memory connector."""
     input_image = _load_input_image()
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
+    config_path = str(
+        Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml"
+    )
+    omni = Omni(
+        model="ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+        stage_init_timeout=300,
+    )
 
     try:
         generated_image = _generate_bagel_img2img(omni, input_image)

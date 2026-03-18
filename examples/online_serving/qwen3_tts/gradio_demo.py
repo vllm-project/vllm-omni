@@ -79,7 +79,9 @@ def generate_speech(
     except httpx.TimeoutException:
         raise gr.Error("Request timed out. The server may be busy.")
     except httpx.ConnectError:
-        raise gr.Error(f"Cannot connect to server at {api_base}. Make sure the vLLM server is running.")
+        raise gr.Error(
+            f"Cannot connect to server at {api_base}. Make sure the vLLM server is running."
+        )
 
     if resp.status_code != 200:
         raise gr.Error(f"Server error ({resp.status_code}): {resp.text}")
@@ -94,7 +96,9 @@ def generate_speech(
 
     try:
         if response_format == "pcm":
-            audio_np = np.frombuffer(resp.content, dtype=np.int16).astype(np.float32) / 32767.0
+            audio_np = (
+                np.frombuffer(resp.content, dtype=np.int16).astype(np.float32) / 32767.0
+            )
             return (PCM_SAMPLE_RATE, audio_np)
         audio_np, sample_rate = sf.read(io.BytesIO(resp.content))
         if audio_np.ndim > 1:
@@ -169,7 +173,9 @@ def generate_speech_stream(
     except httpx.TimeoutException:
         raise gr.Error("Request timed out. The server may be busy.")
     except httpx.ConnectError:
-        raise gr.Error(f"Cannot connect to server at {api_base}. Make sure the vLLM server is running.")
+        raise gr.Error(
+            f"Cannot connect to server at {api_base}. Make sure the vLLM server is running."
+        )
 
 
 def on_stream_change(stream: bool):
@@ -231,7 +237,9 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.25):
 
                 instructions = gr.Textbox(
                     label="Instructions",
-                    placeholder=("e.g., Speak with excitement / A warm, friendly female voice"),
+                    placeholder=(
+                        "e.g., Speak with excitement / A warm, friendly female voice"
+                    ),
                     lines=2,
                     visible=True,
                     info="Optional style/emotion instructions",
@@ -245,13 +253,17 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.25):
                 )
                 ref_audio_url = gr.Textbox(
                     label="Reference Audio URL",
-                    placeholder=("https://example.com/reference.wav (alternative to uploading)"),
+                    placeholder=(
+                        "https://example.com/reference.wav (alternative to uploading)"
+                    ),
                     lines=1,
                     visible=False,
                 )
                 ref_text = gr.Textbox(
                     label="Reference Audio Transcript",
-                    placeholder=("Transcript of the reference audio (optional, improves quality)"),
+                    placeholder=(
+                        "Transcript of the reference audio (optional, improves quality)"
+                    ),
                     lines=2,
                     visible=False,
                 )
@@ -259,7 +271,9 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.25):
                     label="Use x-vector only",
                     value=False,
                     visible=False,
-                    info=("Skip reference transcript, use speaker embedding only (lower quality)"),
+                    info=(
+                        "Skip reference transcript, use speaker embedding only (lower quality)"
+                    ),
                 )
 
                 with gr.Row():
@@ -367,7 +381,9 @@ def build_interface(api_base: str, stream_chunk_seconds: float = 0.25):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Gradio demo for Qwen3-TTS online serving.")
+    parser = argparse.ArgumentParser(
+        description="Gradio demo for Qwen3-TTS online serving."
+    )
     add_common_args(parser)
     parser.add_argument(
         "--stream-chunk-seconds",

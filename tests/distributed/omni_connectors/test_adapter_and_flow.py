@@ -4,17 +4,31 @@
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector, try_send_via_connector
-from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
-from vllm_omni.distributed.omni_connectors.utils.initialization import get_connectors_config_for_stage
+from vllm_omni.distributed.omni_connectors.adapter import (
+    try_recv_via_connector,
+    try_send_via_connector,
+)
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
+    SharedMemoryConnector,
+)
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    OmniTransferConfig,
+)
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    get_connectors_config_for_stage,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
 def mock_objects(mocker: MockerFixture):
-    return {"connector": mocker.MagicMock(), "metrics": mocker.MagicMock(), "queue_fn": mocker.MagicMock()}
+    return {
+        "connector": mocker.MagicMock(),
+        "metrics": mocker.MagicMock(),
+        "queue_fn": mocker.MagicMock(),
+    }
 
 
 def test_send_success(mock_objects):
@@ -127,7 +141,9 @@ def test_recv_success(mock_objects):
     # Verify
     assert inputs == expected_data["engine_inputs"]
     assert rx_metrics is not None
-    mock_connector.get.assert_called_once_with("0", "1", "req_recv", metadata={"handle": "xyz"})
+    mock_connector.get.assert_called_once_with(
+        "0", "1", "req_recv", metadata={"handle": "xyz"}
+    )
 
 
 def test_recv_no_connector():
@@ -188,7 +204,9 @@ def test_shm_connector_flow(mocker: MockerFixture):
     assert received_task["from_stage"] == "0"
 
     # Decode
-    decoded_inputs, _ = try_recv_via_connector(received_task, connectors_map, stage_id=1)
+    decoded_inputs, _ = try_recv_via_connector(
+        received_task, connectors_map, stage_id=1
+    )
 
     # 5. Verify Data Integrity
     assert decoded_inputs == inputs
@@ -197,7 +215,12 @@ def test_shm_connector_flow(mocker: MockerFixture):
 def test_get_connectors_for_stage():
     """Test filtering logic for stage config."""
     # Config has edges: 0->1, 1->2
-    config = OmniTransferConfig(connectors={("0", "1"): ConnectorSpec(name="C1"), ("1", "2"): ConnectorSpec(name="C2")})
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(name="C1"),
+            ("1", "2"): ConnectorSpec(name="C2"),
+        }
+    )
 
     # Get config for Stage 1
     # Stage 1 receives from 0 (input) and sends to 2 (output)

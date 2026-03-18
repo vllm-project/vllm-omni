@@ -44,7 +44,9 @@ def _make_request(skip_cache_refresh: bool = True):
     )
 
 
-def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
+def _make_runner(
+    cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True
+):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
     runner.device = torch.device("cpu")
@@ -70,7 +72,9 @@ def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypa
 
     cache_summary_calls = []
 
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(
+        model_runner_module, "set_forward_context", _noop_forward_context
+    )
     monkeypatch.setattr(
         model_runner_module,
         "cache_summary",
@@ -88,12 +92,16 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
         def is_enabled(self):
             return True
 
-    runner = _make_runner(cache_backend=_EnabledCacheBackend(), cache_backend_name="cache_dit")
+    runner = _make_runner(
+        cache_backend=_EnabledCacheBackend(), cache_backend_name="cache_dit"
+    )
     req = _make_request(skip_cache_refresh=True)
 
     cache_summary_calls = []
 
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(
+        model_runner_module, "set_forward_context", _noop_forward_context
+    )
     monkeypatch.setattr(
         model_runner_module,
         "cache_summary",
@@ -152,10 +160,16 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
 
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
-    monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
-    monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda od_config, device: None)
     monkeypatch.setattr(
-        model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
+        model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler
+    )
+    monkeypatch.setattr(
+        model_runner_module, "get_offload_backend", lambda od_config, device: None
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_cache_backend",
+        lambda cache_backend, cache_config: dummy_cache_backend,
     )
 
     DiffusionModelRunner.load_model(runner)

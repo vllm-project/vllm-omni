@@ -27,7 +27,12 @@ def encode_audio_to_base64(audio_path: str) -> str:
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     ext = audio_path.lower().rsplit(".", 1)[-1]
-    mime_map = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac", "ogg": "audio/ogg"}
+    mime_map = {
+        "wav": "audio/wav",
+        "mp3": "audio/mpeg",
+        "flac": "audio/flac",
+        "ogg": "audio/ogg",
+    }
     mime_type = mime_map.get(ext, "audio/wav")
     with open(audio_path, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -111,9 +116,17 @@ def main():
     parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key")
     parser.add_argument("--model", "-m", default="fishaudio/s2-pro", help="Model name")
     parser.add_argument("--text", required=True, help="Text to synthesize")
-    parser.add_argument("--ref-audio", default=None, help="Reference audio for voice cloning (path or URL)")
-    parser.add_argument("--ref-text", default=None, help="Transcript of reference audio")
-    parser.add_argument("--stream", action="store_true", help="Enable streaming (PCM output)")
+    parser.add_argument(
+        "--ref-audio",
+        default=None,
+        help="Reference audio for voice cloning (path or URL)",
+    )
+    parser.add_argument(
+        "--ref-text", default=None, help="Transcript of reference audio"
+    )
+    parser.add_argument(
+        "--stream", action="store_true", help="Enable streaming (PCM output)"
+    )
     parser.add_argument(
         "--response-format",
         default="wav",

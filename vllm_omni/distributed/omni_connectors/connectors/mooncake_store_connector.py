@@ -56,7 +56,13 @@ class MooncakeStoreConnector(OmniConnectorBase):
         try:
             self.store = MooncakeDistributedStore()
             rc = self.store.setup(
-                self.host, self.metadata, self.segment, self.localbuf, self.proto, self.rdma, self.master
+                self.host,
+                self.metadata,
+                self.segment,
+                self.localbuf,
+                self.proto,
+                self.rdma,
+                self.master,
             )
             if rc != 0:
                 raise RuntimeError(f"Mooncake setup failed: {rc}")
@@ -70,7 +76,9 @@ class MooncakeStoreConnector(OmniConnectorBase):
 
     # Use base class serialization methods for consistency
 
-    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+    def put(
+        self, from_stage: str, to_stage: str, put_key: str, data: Any
+    ) -> tuple[bool, int, dict[str, Any] | None]:
         if not self.store:
             logger.error("Store not initialized")
             return False, 0, None
@@ -98,7 +106,11 @@ class MooncakeStoreConnector(OmniConnectorBase):
             return False, 0, None
 
     def get(
-        self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
         if not self.store:
             logger.error("Store not initialized")
@@ -130,7 +142,11 @@ class MooncakeStoreConnector(OmniConnectorBase):
                     payload_size = len(raw_data)
 
                     _total_ms = (_t_deser_end - _t0) * 1000
-                    _mbps = (payload_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                    _mbps = (
+                        (payload_size / 1024 / 1024) / (_total_ms / 1000)
+                        if _total_ms > 0
+                        else 0
+                    )
                     logger.info(
                         f"[TCP GET] {get_key}: fetch={_fetch_ms:.1f}ms, deser={_deser_ms:.1f}ms, "
                         f"total={_total_ms:.1f}ms, {payload_size} bytes, {_mbps:.1f} MB/s"
@@ -138,7 +154,9 @@ class MooncakeStoreConnector(OmniConnectorBase):
                     return data, payload_size
 
             except Exception as e:
-                logger.debug("MooncakeStoreConnector get attempt %s failed: %s", attempt, e)
+                logger.debug(
+                    "MooncakeStoreConnector get attempt %s failed: %s", attempt, e
+                )
 
             if attempt < retries - 1:
                 time.sleep(sleep_s)
@@ -153,7 +171,9 @@ class MooncakeStoreConnector(OmniConnectorBase):
 
         # Note: Mooncake doesn't have explicit delete, data will be garbage collected
         # We could implement a cleanup mechanism by storing deletion markers
-        logger.debug("MooncakeStoreConnector: cleanup requested for %s (no-op)", request_id)
+        logger.debug(
+            "MooncakeStoreConnector: cleanup requested for %s (no-op)", request_id
+        )
 
     def health(self) -> dict[str, Any]:
         if not self.store:

@@ -305,10 +305,14 @@ class Qwen3TTSTokenizerV1Config(PretrainedConfig):
         super().__init__(**kwargs)
         if encoder_config is None:
             encoder_config = {}
-            logger.info("encoder_config is None. Initializing encoder with default values")
+            logger.info(
+                "encoder_config is None. Initializing encoder with default values"
+            )
         if decoder_config is None:
             decoder_config = {}
-            logger.info("decoder_config is None. Initializing decoder with default values")
+            logger.info(
+                "decoder_config is None. Initializing decoder with default values"
+            )
 
         self.encoder_config = Qwen3TTSTokenizerV1EncoderConfig(**encoder_config)
         self.decoder_config = Qwen3TTSTokenizerV1DecoderConfig(**decoder_config)

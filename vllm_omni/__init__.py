@@ -31,7 +31,6 @@ from .entrypoints.omni import Omni
 
 from .version import __version__, __version_tuple__  # isort:skip
 
-
 __all__ = [
     "__version__",
     "__version_tuple__",

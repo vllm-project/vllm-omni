@@ -39,7 +39,9 @@ class BackgroundResources:
                     continue
                 proc.join(30)
                 if proc.is_alive():
-                    logger.warning("Terminating diffusion worker %s after timeout", proc.name)
+                    logger.warning(
+                        "Terminating diffusion worker %s after timeout", proc.name
+                    )
                     proc.terminate()
                     proc.join(30)
 
@@ -66,7 +68,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         self._processes = processes
 
-        self.resources = BackgroundResources(scheduler=self.scheduler, processes=self._processes)
+        self.resources = BackgroundResources(
+            scheduler=self.scheduler, processes=self._processes
+        )
         self._finalizer = weakref.finalize(self, self.resources)
 
     def _launch_workers(self, broadcast_handle):
@@ -115,13 +119,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             try:
                 data = reader.recv()
             except EOFError:
-                logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
+                logger.error(
+                    f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+                )
                 processes[i].join()
                 logger.error(f"Exit code: {processes[i].exitcode}")
                 raise
 
             if data["status"] != "ready":
-                raise RuntimeError("Initialization failed. Please see the error messages above.")
+                raise RuntimeError(
+                    "Initialization failed. Please see the error messages above."
+                )
 
             if i == 0:
                 result_handle = data.get("result_handle")
@@ -163,28 +171,45 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # Acquire lock with timeout awareness so that a stalled add_req
             # (holding the lock while blocked on dequeue) does not prevent
             # this RPC from honouring its own timeout.
-            lock_timeout = None if deadline is None else max(0, deadline - time.monotonic())
-            acquired = self.scheduler._lock.acquire(timeout=lock_timeout if lock_timeout is not None else -1)
+            lock_timeout = (
+                None if deadline is None else max(0, deadline - time.monotonic())
+            )
+            acquired = self.scheduler._lock.acquire(
+                timeout=lock_timeout if lock_timeout is not None else -1
+            )
             if not acquired:
-                raise TimeoutError(f"RPC call to {method} timed out waiting for scheduler lock.")
+                raise TimeoutError(
+                    f"RPC call to {method} timed out waiting for scheduler lock."
+                )
             try:
                 # Broadcast RPC request to all workers via unified message queue
                 self.scheduler.mq.enqueue(rpc_request)
 
                 # Determine which workers we expect responses from
-                num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
+                num_responses = (
+                    1 if unique_reply_rank is not None else self.od_config.num_gpus
+                )
 
                 responses = []
                 for _ in range(num_responses):
-                    dequeue_timeout = None if deadline is None else max(0, deadline - time.monotonic())
+                    dequeue_timeout = (
+                        None
+                        if deadline is None
+                        else max(0, deadline - time.monotonic())
+                    )
                     try:
                         if self.scheduler.result_mq is None:
                             raise RuntimeError("Result queue not initialized")
 
-                        response = self.scheduler.result_mq.dequeue(timeout=dequeue_timeout)
+                        response = self.scheduler.result_mq.dequeue(
+                            timeout=dequeue_timeout
+                        )
 
                         # Check if response indicates an error
-                        if isinstance(response, dict) and response.get("status") == "error":
+                        if (
+                            isinstance(response, dict)
+                            and response.get("status") == "error"
+                        ):
                             raise RuntimeError(
                                 f"Worker failed with error '{response.get('error')}', "
                                 "please check the stack trace above for the root cause"

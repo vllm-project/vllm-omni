@@ -15,11 +15,18 @@ import numpy as np
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL
-from diffusers.pipelines.longcat_image.system_messages import SYSTEM_PROMPT_EN, SYSTEM_PROMPT_ZH
+from diffusers.pipelines.longcat_image.system_messages import (
+    SYSTEM_PROMPT_EN,
+    SYSTEM_PROMPT_ZH,
+)
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, SchedulerMixin
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, Qwen2VLProcessor
+from transformers import (
+    AutoTokenizer,
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen2VLProcessor,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -27,7 +34,9 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
+from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
+    LongCatImageTransformer2DModel,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -47,7 +56,11 @@ def get_longcat_image_post_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+        vae_scale_factor = (
+            2 ** (len(vae_config["block_out_channels"]) - 1)
+            if "block_out_channels" in vae_config
+            else 8
+        )
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -93,7 +106,12 @@ def split_quotation(prompt, quote_pairs=None):
 
     if quote_pairs is None:
         quote_pairs = [("'", "'"), ('"', '"'), ("‘", "’"), ("“", "”")]
-    pattern = "|".join([re.escape(q1) + r"[^" + re.escape(q1 + q2) + r"]*?" + re.escape(q2) for q1, q2 in quote_pairs])
+    pattern = "|".join(
+        [
+            re.escape(q1) + r"[^" + re.escape(q1 + q2) + r"]*?" + re.escape(q2)
+            for q1, q2 in quote_pairs
+        ]
+    )
     parts = re.split(f"({pattern})", prompt)
 
     result = []
@@ -109,11 +127,15 @@ def split_quotation(prompt, quote_pairs=None):
     return result
 
 
-def prepare_pos_ids(modality_id=0, type="text", start=(0, 0), num_token=None, height=None, width=None) -> torch.Tensor:
+def prepare_pos_ids(
+    modality_id=0, type="text", start=(0, 0), num_token=None, height=None, width=None
+) -> torch.Tensor:
     if type == "text":
         assert num_token
         if height or width:
-            logger.warning('Warning: The parameters of height and width will be ignored in "text" type.')
+            logger.warning(
+                'Warning: The parameters of height and width will be ignored in "text" type.'
+            )
         pos_ids = torch.zeros(num_token, 3)
         pos_ids[..., 0] = modality_id
         pos_ids[..., 1] = torch.arange(num_token) + start[0]
@@ -121,7 +143,9 @@ def prepare_pos_ids(modality_id=0, type="text", start=(0, 0), num_token=None, he
     elif type == "image":
         assert height and width
         if num_token:
-            logger.warning('Warning: The parameter of num_token will be ignored in "image" type.')
+            logger.warning(
+                'Warning: The parameter of num_token will be ignored in "image" type.'
+            )
         pos_ids = torch.zeros(height, width, 3)
         pos_ids[..., 0] = modality_id
         pos_ids[..., 1] = pos_ids[..., 1] + torch.arange(height)[:, None] + start[0]
@@ -165,9 +189,13 @@ def retrieve_timesteps(
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+        raise ValueError(
+            "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
+        )
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accepts_timesteps = "timesteps" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -177,7 +205,9 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accept_sigmas = "sigmas" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -232,13 +262,19 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
         self.text_processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = AutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
         self.transformer = LongCatImageTransformer2DModel(od_config=od_config)
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model, subfolder="tokenizer", local_files_only=local_files_only
+        )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = (
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if getattr(self, "vae", None)
+            else 8
+        )
 
         self.prompt_template_encode_prefix = (
             "<|im_start|>system\n"
@@ -257,9 +293,14 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
         for each_prompt in prompt:
             language = get_prompt_language(each_prompt)
             if language == "zh":
-                question = SYSTEM_PROMPT_ZH + f"\n用户输入为：{each_prompt}\n改写后的prompt为："
+                question = (
+                    SYSTEM_PROMPT_ZH
+                    + f"\n用户输入为：{each_prompt}\n改写后的prompt为："
+                )
             else:
-                question = SYSTEM_PROMPT_EN + f"\nUser Input: {each_prompt}\nRewritten prompt:"
+                question = (
+                    SYSTEM_PROMPT_EN + f"\nUser Input: {each_prompt}\nRewritten prompt:"
+                )
             message = [
                 {
                     "role": "user",
@@ -268,16 +309,27 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
                     ],
                 }
             ]
-            text = self.text_processor.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+            text = self.text_processor.apply_chat_template(
+                message, tokenize=False, add_generation_prompt=True
+            )
             all_text.append(text)
 
-        inputs = self.text_processor(text=all_text, padding=True, return_tensors="pt").to(device)
+        inputs = self.text_processor(
+            text=all_text, padding=True, return_tensors="pt"
+        ).to(device)
 
         self.text_encoder.to(device)
-        generated_ids = self.text_encoder.generate(**inputs, max_new_tokens=self.tokenizer_max_length)
-        generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+        generated_ids = self.text_encoder.generate(
+            **inputs, max_new_tokens=self.tokenizer_max_length
+        )
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
         output_text = self.text_processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
         )
         return output_text
 
@@ -289,10 +341,14 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
             for clean_prompt_sub, matched in split_quotation(each_prompt):
                 if matched:
                     for sub_word in clean_prompt_sub:
-                        tokens = self.tokenizer(sub_word, add_special_tokens=False)["input_ids"]
+                        tokens = self.tokenizer(sub_word, add_special_tokens=False)[
+                            "input_ids"
+                        ]
                         all_tokens.extend(tokens)
                 else:
-                    tokens = self.tokenizer(clean_prompt_sub, add_special_tokens=False)["input_ids"]
+                    tokens = self.tokenizer(clean_prompt_sub, add_special_tokens=False)[
+                        "input_ids"
+                    ]
                     all_tokens.extend(tokens)
 
             if len(all_tokens) > self.tokenizer_max_length:
@@ -311,16 +367,28 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
             return_tensors="pt",
         )
 
-        prefix_tokens = self.tokenizer(self.prompt_template_encode_prefix, add_special_tokens=False)["input_ids"]
-        suffix_tokens = self.tokenizer(self.prompt_template_encode_suffix, add_special_tokens=False)["input_ids"]
+        prefix_tokens = self.tokenizer(
+            self.prompt_template_encode_prefix, add_special_tokens=False
+        )["input_ids"]
+        suffix_tokens = self.tokenizer(
+            self.prompt_template_encode_suffix, add_special_tokens=False
+        )["input_ids"]
         prefix_len = len(prefix_tokens)
         suffix_len = len(suffix_tokens)
 
-        prefix_tokens_mask = torch.tensor([1] * len(prefix_tokens), dtype=text_tokens_and_mask.attention_mask[0].dtype)
-        suffix_tokens_mask = torch.tensor([1] * len(suffix_tokens), dtype=text_tokens_and_mask.attention_mask[0].dtype)
+        prefix_tokens_mask = torch.tensor(
+            [1] * len(prefix_tokens), dtype=text_tokens_and_mask.attention_mask[0].dtype
+        )
+        suffix_tokens_mask = torch.tensor(
+            [1] * len(suffix_tokens), dtype=text_tokens_and_mask.attention_mask[0].dtype
+        )
 
-        prefix_tokens = torch.tensor(prefix_tokens, dtype=text_tokens_and_mask.input_ids.dtype)
-        suffix_tokens = torch.tensor(suffix_tokens, dtype=text_tokens_and_mask.input_ids.dtype)
+        prefix_tokens = torch.tensor(
+            prefix_tokens, dtype=text_tokens_and_mask.input_ids.dtype
+        )
+        suffix_tokens = torch.tensor(
+            suffix_tokens, dtype=text_tokens_and_mask.input_ids.dtype
+        )
 
         batch_size = text_tokens_and_mask.input_ids.size(0)
         prefix_tokens_batch = prefix_tokens.unsqueeze(0).expand(batch_size, -1)
@@ -328,13 +396,23 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
         prefix_mask_batch = prefix_tokens_mask.unsqueeze(0).expand(batch_size, -1)
         suffix_mask_batch = suffix_tokens_mask.unsqueeze(0).expand(batch_size, -1)
 
-        input_ids = torch.cat((prefix_tokens_batch, text_tokens_and_mask.input_ids, suffix_tokens_batch), dim=-1)
-        attention_mask = torch.cat((prefix_mask_batch, text_tokens_and_mask.attention_mask, suffix_mask_batch), dim=-1)
+        input_ids = torch.cat(
+            (prefix_tokens_batch, text_tokens_and_mask.input_ids, suffix_tokens_batch),
+            dim=-1,
+        )
+        attention_mask = torch.cat(
+            (prefix_mask_batch, text_tokens_and_mask.attention_mask, suffix_mask_batch),
+            dim=-1,
+        )
 
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
 
-        text_output = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        text_output = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
         prompt_embeds = text_output.hidden_states[-1].detach()
         prompt_embeds = prompt_embeds[:, prefix_len:-suffix_len, :]
         return prompt_embeds
@@ -357,18 +435,24 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-
-        text_ids = prepare_pos_ids(modality_id=0, type="text", start=(0, 0), num_token=prompt_embeds.shape[1]).to(
-            self.device
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
         )
+
+        text_ids = prepare_pos_ids(
+            modality_id=0, type="text", start=(0, 0), num_token=prompt_embeds.shape[1]
+        ).to(self.device)
         return prompt_embeds.to(self.device), text_ids
 
     @staticmethod
     def _pack_latents(latents, batch_size, num_channels_latents, height, width):
-        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.view(
+            batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+        )
         latents = latents.permute(0, 2, 4, 1, 3, 5)
-        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+        latents = latents.reshape(
+            batch_size, (height // 2) * (width // 2), num_channels_latents * 4
+        )
 
         return latents
 
@@ -428,14 +512,25 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
 
         latents = randn_tensor(shape, generator=generator, device=device)
         latents = latents.to(dtype=dtype)
-        latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
+        latents = self._pack_latents(
+            latents, batch_size, num_channels_latents, height, width
+        )
 
         return latents, latent_image_ids
 
     def check_inputs(
-        self, prompt, height, width, negative_prompt=None, prompt_embeds=None, negative_prompt_embeds=None
+        self,
+        prompt,
+        height,
+        width,
+        negative_prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
     ):
-        if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
+        if (
+            height % (self.vae_scale_factor * 2) != 0
+            or width % (self.vae_scale_factor * 2) != 0
+        ):
             logger.warning(
                 "`height` and `width` have to be divisible by "
                 f"{self.vae_scale_factor * 2} but are {height} and {width}. "
@@ -452,7 +547,9 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
         elif prompt is not None and not isinstance(prompt, (str, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+            raise ValueError(
+                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
+            )
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(
@@ -494,30 +591,58 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
     ) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+        prompt = [
+            p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts
+        ] or prompt
+        if all(
+            isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts
+        ):
             negative_prompt = None
         elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+            negative_prompt = [
+                "" if isinstance(p, str) else (p.get("negative_prompt") or "")
+                for p in req.prompts
+            ]
 
-        height = req.sampling_params.height or height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        height = (
+            req.sampling_params.height
+            or height
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        width = (
+            req.sampling_params.width
+            or width
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         sigmas = req.sampling_params.sigmas or sigmas
         generator = req.sampling_params.generator or generator
         guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+            req.sampling_params.guidance_scale
+            if req.sampling_params.guidance_scale is not None
+            else guidance_scale
         )
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt is not None
             else num_images_per_prompt
         )
-        enable_prompt_rewrite = req.sampling_params.extra_args.get("enable_prompt_rewrite", enable_prompt_rewrite)
-        enable_cfg_renorm = req.sampling_params.extra_args.get("enable_cfg_renorm", enable_cfg_renorm)
-        cfg_renorm_min = req.sampling_params.extra_args.get("cfg_renorm_min", cfg_renorm_min)
+        enable_prompt_rewrite = req.sampling_params.extra_args.get(
+            "enable_prompt_rewrite", enable_prompt_rewrite
+        )
+        enable_cfg_renorm = req.sampling_params.extra_args.get(
+            "enable_cfg_renorm", enable_cfg_renorm
+        )
+        cfg_renorm_min = req.sampling_params.extra_args.get(
+            "cfg_renorm_min", cfg_renorm_min
+        )
 
-        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
+        req_prompt_embeds = [
+            p.get("prompt_embeds") if not isinstance(p, str) else None
+            for p in req.prompts
+        ]
         if any(p is not None for p in req_prompt_embeds):
             # If at list one prompt is provided as an embedding,
             # Then assume that the user wants to provide embeddings for all prompts, and enter this if block
@@ -526,7 +651,8 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
             prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
         req_negative_prompt_embeds = [
-            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
+            p.get("negative_prompt_embeds") if not isinstance(p, str) else None
+            for p in req.prompts
         ]
         if any(p is not None for p in req_negative_prompt_embeds):
             negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
@@ -555,17 +681,19 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
 
         device = self.device
         if enable_prompt_rewrite and prompt is not None:
-            prompt = self.rewire_prompt(prompt if isinstance(prompt, list) else [prompt], device)
+            prompt = self.rewire_prompt(
+                prompt if isinstance(prompt, list) else [prompt], device
+            )
 
         negative_prompt = "" if negative_prompt is None else negative_prompt
 
-        (prompt_embeds, text_ids) = self.encode_prompt(
+        prompt_embeds, text_ids = self.encode_prompt(
             prompt=prompt,
             prompt_embeds=prompt_embeds,
             num_images_per_prompt=num_images_per_prompt,
         )
         if self.do_classifier_free_guidance:
-            (negative_prompt_embeds, negative_text_ids) = self.encode_prompt(
+            negative_prompt_embeds, negative_text_ids = self.encode_prompt(
                 prompt=negative_prompt,
                 prompt_embeds=negative_prompt_embeds,
                 num_images_per_prompt=num_images_per_prompt,
@@ -585,7 +713,11 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
         )
 
         # 5. Prepare timesteps
-        sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        sigmas = (
+            np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
+            if sigmas is None
+            else sigmas
+        )
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
@@ -615,7 +747,9 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
             negative_prompt_embeds = negative_prompt_embeds.to(device)
 
         # custom partial function with cfg_renorm_min
-        self.cfg_normalize_function = partial(self.cfg_normalize_function, cfg_renorm_min=cfg_renorm_min)
+        self.cfg_normalize_function = partial(
+            self.cfg_normalize_function, cfg_renorm_min=cfg_renorm_min
+        )
 
         # 6. Denoising loop
         for i, t in enumerate(timesteps):
@@ -655,15 +789,21 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
             )
 
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, self.do_classifier_free_guidance)
+            latents = self.scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, self.do_classifier_free_guidance
+            )
 
         self._current_timestep = None
 
         if output_type == "latent":
             image = latents
         else:
-            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            latents = self._unpack_latents(
+                latents, height, width, self.vae_scale_factor
+            )
+            latents = (
+                latents / self.vae.config.scaling_factor
+            ) + self.vae.config.shift_factor
 
             if latents.dtype != self.vae.dtype:
                 latents = latents.to(dtype=self.vae.dtype)

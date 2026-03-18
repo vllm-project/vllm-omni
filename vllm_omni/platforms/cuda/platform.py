@@ -6,7 +6,9 @@ from vllm.logger import init_logger
 from vllm.platforms.cuda import CudaPlatformBase
 from vllm.platforms.interface import DeviceCapability
 
-from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.attention.backends.registry import (
+    DiffusionAttentionBackendEnum,
+)
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
@@ -66,7 +68,9 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "and < 10.0. Falling back to TORCH_SDPA backend."
                     )
                 elif not packages_available:
-                    logger.warning("Flash Attention packages not available. Falling back to TORCH_SDPA backend.")
+                    logger.warning(
+                        "Flash Attention packages not available. Falling back to TORCH_SDPA backend."
+                    )
                 logger.info("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]

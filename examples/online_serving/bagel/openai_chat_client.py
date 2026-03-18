@@ -125,12 +125,23 @@ def generate_image(
 
 def main():
     parser = argparse.ArgumentParser(description="Bagel multimodal chat client")
-    parser.add_argument("--prompt", "-p", default="<|im_start|>A cute cat<|im_end|>", help="Text prompt")
-    parser.add_argument("--output", "-o", default="bagel_output.png", help="Output file (for image results)")
-    parser.add_argument("--server", "-s", default="http://localhost:8091", help="Server URL")
+    parser.add_argument(
+        "--prompt", "-p", default="<|im_start|>A cute cat<|im_end|>", help="Text prompt"
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="bagel_output.png",
+        help="Output file (for image results)",
+    )
+    parser.add_argument(
+        "--server", "-s", default="http://localhost:8091", help="Server URL"
+    )
 
     # Modality Control
-    parser.add_argument("--image-url", "-i", type=str, help="Input image URL or local path")
+    parser.add_argument(
+        "--image-url", "-i", type=str, help="Input image URL or local path"
+    )
     parser.add_argument(
         "--modality",
         "-m",

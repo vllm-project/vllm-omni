@@ -34,7 +34,9 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         # `object.__getattribute__` will not find it. We stash a ref in
         # `__dict__` for robust lookups in `__getattr__`.
         modules = object.__getattribute__(self, "_modules")
-        base_layer = modules.get("base_layer") or object.__getattribute__(self, "__dict__").get("base_layer")
+        base_layer = modules.get("base_layer") or object.__getattribute__(
+            self, "__dict__"
+        ).get("base_layer")
         object.__setattr__(self, "_diffusion_base_layer_ref", base_layer)
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
@@ -103,7 +105,9 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # Fallback: infer slice sizes from the allocated tensors.
             output_slices = tuple(lora_b.shape[2] for lora_b in self.lora_b_stacked)
 
-        if len(output_slices) != len(self.lora_a_stacked) or len(output_slices) != len(self.lora_b_stacked):
+        if len(output_slices) != len(self.lora_a_stacked) or len(output_slices) != len(
+            self.lora_b_stacked
+        ):
             raise RuntimeError(
                 "LoRA slice metadata mismatch: "
                 f"output_slices={len(output_slices)}, "
@@ -113,7 +117,11 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
 
         offset = 0
         for slice_idx, slice_size in enumerate(output_slices):
-            if active_slices is not None and slice_idx < len(active_slices) and not active_slices[slice_idx]:
+            if (
+                active_slices is not None
+                and slice_idx < len(active_slices)
+                and not active_slices[slice_idx]
+            ):
                 offset += slice_size
                 continue
 
@@ -128,7 +136,9 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             #   buffer = (x @ A.T)
             #   y += buffer @ B.T
             delta = (x_flat @ A.t()) @ B.t()
-            y_flat[:, offset : offset + slice_size] = y_flat[:, offset : offset + slice_size] + delta
+            y_flat[:, offset : offset + slice_size] = (
+                y_flat[:, offset : offset + slice_size] + delta
+            )
             offset += slice_size
 
         return y_flat.view(original_shape)
@@ -141,7 +151,9 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         try:
             return super().__getattr__(name)
         except AttributeError as exc:
-            base_layer = object.__getattribute__(self, "__dict__").get("_diffusion_base_layer_ref")
+            base_layer = object.__getattribute__(self, "__dict__").get(
+                "_diffusion_base_layer_ref"
+            )
             if base_layer is None:
                 base_layer = object.__getattribute__(self, "_modules").get("base_layer")
             if base_layer is None:

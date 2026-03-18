@@ -42,7 +42,9 @@ class Snake(nn.Module):
         >>> x = a1(x)
     """
 
-    def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
+    def __init__(
+        self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False
+    ):
         """
         Initialization.
         INPUT:
@@ -125,20 +127,45 @@ class ResBlock(torch.nn.Module):
                         padding=get_padding(kernel_size, dilation),
                     )
                     if causal is False
-                    else CausalConv1d(channels, channels, kernel_size, 1, dilation=dilation, causal_type="left")
+                    else CausalConv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation,
+                        causal_type="left",
+                    )
                 )
             )
             self.convs2.append(
                 weight_norm(
-                    Conv1d(channels, channels, kernel_size, 1, dilation=1, padding=get_padding(kernel_size, 1))
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=1,
+                        padding=get_padding(kernel_size, 1),
+                    )
                     if causal is False
-                    else CausalConv1d(channels, channels, kernel_size, 1, dilation=1, causal_type="left")
+                    else CausalConv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=1,
+                        causal_type="left",
+                    )
                 )
             )
         self.convs1.apply(init_weights)
         self.convs2.apply(init_weights)
-        self.activations1 = nn.ModuleList([Snake(channels, alpha_logscale=False) for _ in range(len(self.convs1))])
-        self.activations2 = nn.ModuleList([Snake(channels, alpha_logscale=False) for _ in range(len(self.convs2))])
+        self.activations1 = nn.ModuleList(
+            [Snake(channels, alpha_logscale=False) for _ in range(len(self.convs1))]
+        )
+        self.activations2 = nn.ModuleList(
+            [Snake(channels, alpha_logscale=False) for _ in range(len(self.convs2))]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for idx in range(len(self.convs1)):
@@ -171,7 +198,14 @@ class SineGen(torch.nn.Module):
         segment is always sin(np.pi) or cos(0)
     """
 
-    def __init__(self, samp_rate, harmonic_num=0, sine_amp=0.1, noise_std=0.003, voiced_threshold=0):
+    def __init__(
+        self,
+        samp_rate,
+        harmonic_num=0,
+        sine_amp=0.1,
+        noise_std=0.003,
+        voiced_threshold=0,
+    ):
         super().__init__()
         self.sine_amp = sine_amp
         self.noise_std = noise_std
@@ -193,13 +227,17 @@ class SineGen(torch.nn.Module):
         output uv: tensor(batchsize=1, length, 1)
         """
         f0 = f0.transpose(1, 2)
-        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
+        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(
+            f0.device
+        )
         for i in range(self.harmonic_num + 1):
             F_mat[:, i : i + 1, :] = f0 * (i + 1) / self.sampling_rate
 
         theta_mat = 2 * np.pi * (torch.cumsum(F_mat, dim=-1) % 1)
         u_dist = Uniform(low=-np.pi, high=np.pi)
-        phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(F_mat.device)
+        phase_vec = u_dist.sample(
+            sample_shape=(f0.size(0), self.harmonic_num + 1, 1)
+        ).to(F_mat.device)
         phase_vec[:, 0, :] = 0
 
         # generate sine waveforms
@@ -277,16 +315,22 @@ class SineGen2(torch.nn.Module):
 
         # initial phase noise (no noise for fundamental component)
         if self.training is False and self.causal is True:
-            rad_values[:, 0, :] = rad_values[:, 0, :] + self.rand_ini.to(rad_values.device)
+            rad_values[:, 0, :] = rad_values[:, 0, :] + self.rand_ini.to(
+                rad_values.device
+            )
         else:
-            rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
+            rand_ini = torch.rand(
+                f0_values.shape[0], f0_values.shape[2], device=f0_values.device
+            )
             rand_ini[:, 0] = 0
             rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
 
         # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
         if not self.flag_for_pulse:
             rad_values = torch.nn.functional.interpolate(
-                rad_values.transpose(1, 2), scale_factor=1 / self.upsample_scale, mode="linear"
+                rad_values.transpose(1, 2),
+                scale_factor=1 / self.upsample_scale,
+                mode="linear",
             ).transpose(1, 2)
 
             phase = torch.cumsum(rad_values, dim=1) * 2 * np.pi
@@ -334,7 +378,9 @@ class SineGen2(torch.nn.Module):
         output uv: tensor(batchsize=1, length, 1)
         """
         # fundamental component
-        fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
+        fn = torch.multiply(
+            f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device)
+        )
 
         # generate sine waveforms
         sine_waves = self._f02sine(fn) * self.sine_amp
@@ -347,7 +393,9 @@ class SineGen2(torch.nn.Module):
         # .       for voiced regions is self.noise_std
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
         if self.training is False and self.causal is True:
-            noise = noise_amp * self.sine_waves[:, : sine_waves.shape[1]].to(sine_waves.device)
+            noise = noise_amp * self.sine_waves[:, : sine_waves.shape[1]].to(
+                sine_waves.device
+            )
         else:
             noise = noise_amp * torch.randn_like(sine_waves)
 
@@ -393,10 +441,18 @@ class SourceModuleHnNSF(torch.nn.Module):
 
         # to produce sine waveforms
         if sinegen_type == "1":
-            self.l_sin_gen = SineGen(sampling_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshold)
+            self.l_sin_gen = SineGen(
+                sampling_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshold
+            )
         else:
             self.l_sin_gen = SineGen2(
-                sampling_rate, upsample_scale, harmonic_num, sine_amp, add_noise_std, voiced_threshold, causal=causal
+                sampling_rate,
+                upsample_scale,
+                harmonic_num,
+                sine_amp,
+                add_noise_std,
+                voiced_threshold,
+                causal=causal,
             )
 
         # to merge source harmonics into a single excitation
@@ -474,7 +530,9 @@ class HiFTGenerator(nn.Module):
             sinegen_type="1" if self.sampling_rate == 22050 else "2",
             causal=False,
         )
-        self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(upsample_rates) * istft_params["hop_len"])
+        self.f0_upsamp = torch.nn.Upsample(
+            scale_factor=np.prod(upsample_rates) * istft_params["hop_len"]
+        )
 
         self.conv_pre = weight_norm(Conv1d(in_channels, base_channels, 7, 1, padding=3))
 
@@ -499,28 +557,50 @@ class HiFTGenerator(nn.Module):
         downsample_rates = [1] + upsample_rates[::-1][:-1]
         downsample_cum_rates = np.cumprod(downsample_rates)
         for i, (u, k, d) in enumerate(
-            zip(downsample_cum_rates[::-1], source_resblock_kernel_sizes, source_resblock_dilation_sizes)
+            zip(
+                downsample_cum_rates[::-1],
+                source_resblock_kernel_sizes,
+                source_resblock_dilation_sizes,
+            )
         ):
             if u == 1:
-                self.source_downs.append(Conv1d(istft_params["n_fft"] + 2, base_channels // (2 ** (i + 1)), 1, 1))
+                self.source_downs.append(
+                    Conv1d(
+                        istft_params["n_fft"] + 2, base_channels // (2 ** (i + 1)), 1, 1
+                    )
+                )
             else:
                 self.source_downs.append(
-                    Conv1d(istft_params["n_fft"] + 2, base_channels // (2 ** (i + 1)), u * 2, u, padding=(u // 2))
+                    Conv1d(
+                        istft_params["n_fft"] + 2,
+                        base_channels // (2 ** (i + 1)),
+                        u * 2,
+                        u,
+                        padding=(u // 2),
+                    )
                 )
 
-            self.source_resblocks.append(ResBlock(base_channels // (2 ** (i + 1)), k, d))
+            self.source_resblocks.append(
+                ResBlock(base_channels // (2 ** (i + 1)), k, d)
+            )
 
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
             ch = base_channels // (2 ** (i + 1))
-            for _, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
+            for _, (k, d) in enumerate(
+                zip(resblock_kernel_sizes, resblock_dilation_sizes)
+            ):
                 self.resblocks.append(ResBlock(ch, k, d))
 
-        self.conv_post = weight_norm(Conv1d(ch, istft_params["n_fft"] + 2, 7, 1, padding=3))
+        self.conv_post = weight_norm(
+            Conv1d(ch, istft_params["n_fft"] + 2, 7, 1, padding=3)
+        )
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        self.stft_window = torch.from_numpy(
+            get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)
+        )
         self.f0_predictor = f0_predictor
 
     def remove_weight_norm(self):
@@ -561,7 +641,9 @@ class HiFTGenerator(nn.Module):
         )
         return inverse_transform
 
-    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+    def decode(
+        self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)
+    ) -> torch.Tensor:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
 
@@ -589,7 +671,9 @@ class HiFTGenerator(nn.Module):
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         magnitude = torch.exp(x[:, : self.istft_params["n_fft"] // 2 + 1, :])
-        phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1 :, :])  # actually, sin is redundancy
+        phase = torch.sin(
+            x[:, self.istft_params["n_fft"] // 2 + 1 :, :]
+        )  # actually, sin is redundancy
 
         x = self._istft(magnitude, phase)
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
@@ -612,7 +696,11 @@ class HiFTGenerator(nn.Module):
         return generated_speech, f0
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+    def inference(
+        self,
+        speech_feat: torch.Tensor,
+        cache_source: torch.Tensor = torch.zeros(1, 1, 0),
+    ) -> torch.Tensor:
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
@@ -675,10 +763,18 @@ class CausalHiFTGenerator(HiFTGenerator):
             causal=True,
         )
         self.upsample_rates = upsample_rates
-        self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(upsample_rates) * istft_params["hop_len"])
+        self.f0_upsamp = torch.nn.Upsample(
+            scale_factor=np.prod(upsample_rates) * istft_params["hop_len"]
+        )
 
         self.conv_pre = weight_norm(
-            CausalConv1d(in_channels, base_channels, conv_pre_look_right + 1, 1, causal_type="right")
+            CausalConv1d(
+                in_channels,
+                base_channels,
+                conv_pre_look_right + 1,
+                1,
+                causal_type="right",
+            )
         )
 
         # Up
@@ -701,41 +797,76 @@ class CausalHiFTGenerator(HiFTGenerator):
         downsample_rates = [1] + upsample_rates[::-1][:-1]
         downsample_cum_rates = np.cumprod(downsample_rates)
         for i, (u, k, d) in enumerate(
-            zip(downsample_cum_rates[::-1], source_resblock_kernel_sizes, source_resblock_dilation_sizes)
+            zip(
+                downsample_cum_rates[::-1],
+                source_resblock_kernel_sizes,
+                source_resblock_dilation_sizes,
+            )
         ):
             if u == 1:
                 self.source_downs.append(
-                    CausalConv1d(istft_params["n_fft"] + 2, base_channels // (2 ** (i + 1)), 1, 1, causal_type="left")
+                    CausalConv1d(
+                        istft_params["n_fft"] + 2,
+                        base_channels // (2 ** (i + 1)),
+                        1,
+                        1,
+                        causal_type="left",
+                    )
                 )
             else:
                 self.source_downs.append(
-                    CausalConv1dDownSample(istft_params["n_fft"] + 2, base_channels // (2 ** (i + 1)), u * 2, u)
+                    CausalConv1dDownSample(
+                        istft_params["n_fft"] + 2,
+                        base_channels // (2 ** (i + 1)),
+                        u * 2,
+                        u,
+                    )
                 )
 
-            self.source_resblocks.append(ResBlock(base_channels // (2 ** (i + 1)), k, d, causal=True))
+            self.source_resblocks.append(
+                ResBlock(base_channels // (2 ** (i + 1)), k, d, causal=True)
+            )
 
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
             ch = base_channels // (2 ** (i + 1))
-            for _, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
+            for _, (k, d) in enumerate(
+                zip(resblock_kernel_sizes, resblock_dilation_sizes)
+            ):
                 self.resblocks.append(ResBlock(ch, k, d, causal=True))
 
-        self.conv_post = weight_norm(CausalConv1d(ch, istft_params["n_fft"] + 2, 7, 1, causal_type="left"))
+        self.conv_post = weight_norm(
+            CausalConv1d(ch, istft_params["n_fft"] + 2, 7, 1, causal_type="left")
+        )
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        self.stft_window = torch.from_numpy(
+            get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)
+        )
         self.conv_pre_look_right = conv_pre_look_right
         self.f0_predictor = f0_predictor
 
-    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0), finalize: bool = True) -> torch.Tensor:
+    def decode(
+        self,
+        x: torch.Tensor,
+        s: torch.Tensor = torch.zeros(1, 1, 0),
+        finalize: bool = True,
+    ) -> torch.Tensor:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         if finalize is True:
             x = self.conv_pre(x)
         else:
-            x = self.conv_pre(x[:, :, : -self.conv_pre_look_right], x[:, :, -self.conv_pre_look_right :])
-            s_stft_real = s_stft_real[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
-            s_stft_imag = s_stft_imag[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
+            x = self.conv_pre(
+                x[:, :, : -self.conv_pre_look_right],
+                x[:, :, -self.conv_pre_look_right :],
+            )
+            s_stft_real = s_stft_real[
+                :, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)
+            ]
+            s_stft_imag = s_stft_imag[
+                :, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)
+            ]
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
 
         for i in range(self.num_upsamples):
@@ -761,16 +892,22 @@ class CausalHiFTGenerator(HiFTGenerator):
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         magnitude = torch.exp(x[:, : self.istft_params["n_fft"] // 2 + 1, :])
-        phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1 :, :])  # actually, sin is redundancy
+        phase = torch.sin(
+            x[:, self.istft_params["n_fft"] // 2 + 1 :, :]
+        )  # actually, sin is redundancy
 
         x = self._istft(magnitude, phase)
         if finalize is False:
-            x = x[:, : -int(np.prod(self.upsample_rates) * self.istft_params["hop_len"])]
+            x = x[
+                :, : -int(np.prod(self.upsample_rates) * self.istft_params["hop_len"])
+            ]
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, finalize: bool = True) -> torch.Tensor:
+    def inference(
+        self, speech_feat: torch.Tensor, finalize: bool = True
+    ) -> torch.Tensor:
         # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move
         # self.f0_predictor to cpu if necessary
         self.f0_predictor.to("cpu")
@@ -783,7 +920,9 @@ class CausalHiFTGenerator(HiFTGenerator):
             generated_speech = self.decode(x=speech_feat, s=s, finalize=finalize)
         else:
             generated_speech = self.decode(
-                x=speech_feat[:, :, : -self.f0_predictor.condnet[0].causal_padding], s=s, finalize=finalize
+                x=speech_feat[:, :, : -self.f0_predictor.condnet[0].causal_padding],
+                s=s,
+                finalize=finalize,
             )
         return generated_speech, s
 
@@ -819,7 +958,9 @@ class CausalConv1dUpsample(torch.nn.Conv1d):
         self.causal_padding = kernel_size - 1
         self.upsample = torch.nn.Upsample(scale_factor=stride, mode="nearest")
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.upsample(x)
         input_timestep = x.shape[2]
         if cache.size(2) == 0:
@@ -863,7 +1004,9 @@ class CausalConv1dDownSample(torch.nn.Conv1d):
         assert kernel_size % stride == 0
         self.causal_padding = stride - 1
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if cache.size(2) == 0:
             x = F.pad(x, (self.causal_padding, 0), value=0.0)
         else:
@@ -903,11 +1046,15 @@ class CausalConv1d(torch.nn.Conv1d):
             dtype=dtype,
         )
         assert stride == 1
-        self.causal_padding = int((kernel_size * dilation - dilation) / 2) * 2 + (kernel_size + 1) % 2
+        self.causal_padding = (
+            int((kernel_size * dilation - dilation) / 2) * 2 + (kernel_size + 1) % 2
+        )
         assert causal_type in ["left", "right"]
         self.causal_type = causal_type
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)) -> tuple[torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)
+    ) -> tuple[torch.Tensor]:
         input_timestep = x.shape[2]
         if cache.size(2) == 0:
             cache = torch.zeros(x.shape[0], x.shape[1], self.causal_padding).to(x)
@@ -922,29 +1069,56 @@ class CausalConv1d(torch.nn.Conv1d):
 
 
 class CausalConvRNNF0Predictor(nn.Module):
-    def __init__(self, num_class: int = 1, in_channels: int = 80, cond_channels: int = 512):
+    def __init__(
+        self, num_class: int = 1, in_channels: int = 80, cond_channels: int = 512
+    ):
         super().__init__()
 
         self.num_class = num_class
         self.condnet = nn.Sequential(
-            weight_norm(CausalConv1d(in_channels, cond_channels, kernel_size=4, causal_type="right")),
+            weight_norm(
+                CausalConv1d(
+                    in_channels, cond_channels, kernel_size=4, causal_type="right"
+                )
+            ),
             nn.ELU(),
-            weight_norm(CausalConv1d(cond_channels, cond_channels, kernel_size=3, causal_type="left")),
+            weight_norm(
+                CausalConv1d(
+                    cond_channels, cond_channels, kernel_size=3, causal_type="left"
+                )
+            ),
             nn.ELU(),
-            weight_norm(CausalConv1d(cond_channels, cond_channels, kernel_size=3, causal_type="left")),
+            weight_norm(
+                CausalConv1d(
+                    cond_channels, cond_channels, kernel_size=3, causal_type="left"
+                )
+            ),
             nn.ELU(),
-            weight_norm(CausalConv1d(cond_channels, cond_channels, kernel_size=3, causal_type="left")),
+            weight_norm(
+                CausalConv1d(
+                    cond_channels, cond_channels, kernel_size=3, causal_type="left"
+                )
+            ),
             nn.ELU(),
-            weight_norm(CausalConv1d(cond_channels, cond_channels, kernel_size=3, causal_type="left")),
+            weight_norm(
+                CausalConv1d(
+                    cond_channels, cond_channels, kernel_size=3, causal_type="left"
+                )
+            ),
             nn.ELU(),
         )
-        self.classifier = nn.Linear(in_features=cond_channels, out_features=self.num_class)
+        self.classifier = nn.Linear(
+            in_features=cond_channels, out_features=self.num_class
+        )
 
     def forward(self, x: torch.Tensor, finalize: bool = True) -> torch.Tensor:
         if finalize is True:
             x = self.condnet[0](x)
         else:
-            x = self.condnet[0](x[:, :, : -self.condnet[0].causal_padding], x[:, :, -self.condnet[0].causal_padding :])
+            x = self.condnet[0](
+                x[:, :, : -self.condnet[0].causal_padding],
+                x[:, :, -self.condnet[0].causal_padding :],
+            )
         for i in range(1, len(self.condnet)):
             x = self.condnet[i](x)
         x = x.transpose(1, 2)

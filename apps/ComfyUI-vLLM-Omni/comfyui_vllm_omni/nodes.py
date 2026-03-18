@@ -382,7 +382,9 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
         logger.info("Got extra kwargs in TTS: %s", kwargs)
 
         is_qwen_tts = "qwen3-tts" in model.lower()
-        if not is_qwen_tts and isinstance(model_specific_params, QwenTTSModelSpecificParams):
+        if not is_qwen_tts and isinstance(
+            model_specific_params, QwenTTSModelSpecificParams
+        ):
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
                 "However, the model appears to not be a Qwen TTS model (no 'Qwen3-TTS' in model name)."
@@ -445,7 +447,9 @@ class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
         **kwargs,
     ):
         is_qwen_tts = "qwen3-tts" in model.lower()
-        if not is_qwen_tts and isinstance(model_specific_params, QwenTTSModelSpecificParams):
+        if not is_qwen_tts and isinstance(
+            model_specific_params, QwenTTSModelSpecificParams
+        ):
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
                 "However, the model appears to not be a Qwen TTS model (no 'Qwen3-TTS' in model name)."
@@ -618,7 +622,9 @@ class VLLMOmniSamplingParamsList:
     FUNCTION = "aggregate"
     CATEGORY = "vLLM-Omni/Sampling Params"
 
-    def aggregate(self, param1: dict, param2: dict | None = None, param3: dict | None = None):
+    def aggregate(
+        self, param1: dict, param2: dict | None = None, param3: dict | None = None
+    ):
         for i, p in enumerate((param1, param2, param3)):
             if isinstance(p, list):
                 raise ValueError(

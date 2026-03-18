@@ -36,7 +36,9 @@ def __getattr__(name: str):
         module = importlib.import_module(module_name)
         return getattr(module, name)
 
-    raise AttributeError(f"module 'vllm_omni.transformers_utils.configs' has no attribute '{name}'")
+    raise AttributeError(
+        f"module 'vllm_omni.transformers_utils.configs' has no attribute '{name}'"
+    )
 
 
 def __dir__():
@@ -45,5 +47,9 @@ def __dir__():
 
 # Eagerly import all config modules so their AutoConfig.register() side-effects
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
-from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
-from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import (
+    fish_speech as _fish_speech,
+)  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import (
+    mammoth_moda2 as _mammoth_moda2,
+)  # noqa: F401, E402

@@ -43,7 +43,13 @@ class ParallelAttentionStrategy(Protocol):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata | None, ParallelAttentionContext | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        AttentionMetadata | None,
+        ParallelAttentionContext | None,
+    ]:
         """Runs before the attention kernel.
 
         Returns possibly transformed Q/K/V and metadata, and an optional context
@@ -78,5 +84,7 @@ class NoParallelAttention:
     ):
         return query, key, value, attn_metadata, None
 
-    def post_attention(self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None) -> torch.Tensor:
+    def post_attention(
+        self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None
+    ) -> torch.Tensor:
         return attn_output

@@ -72,7 +72,11 @@ class CUDAGraphDecoderWrapper:
         self._device = device
         self.decoder.eval()
 
-        logger.info("Starting CUDA Graph warmup for %d sizes: %s", len(self.capture_sizes), self.capture_sizes)
+        logger.info(
+            "Starting CUDA Graph warmup for %d sizes: %s",
+            len(self.capture_sizes),
+            self.capture_sizes,
+        )
 
         # Warmup runs to ensure CUDA memory is allocated
         for size in self.capture_sizes:
@@ -93,12 +97,16 @@ class CUDAGraphDecoderWrapper:
                 self._capture_graph_for_size(size, device, dtype)
                 logger.info("  Captured CUDA Graph for size=%d", size)
             except Exception:
-                logger.warning("  Failed to capture CUDA Graph for size=%d", size, exc_info=True)
+                logger.warning(
+                    "  Failed to capture CUDA Graph for size=%d", size, exc_info=True
+                )
 
         self._warmed_up = True
         logger.info("CUDA Graph warmup complete. Captured %d graphs.", len(self.graphs))
 
-    def _capture_graph_for_size(self, size: int, device: torch.device, dtype: torch.dtype):
+    def _capture_graph_for_size(
+        self, size: int, device: torch.device, dtype: torch.dtype
+    ):
         static_input = torch.zeros(
             1,
             self.num_quantizers,
@@ -158,7 +166,11 @@ class CUDAGraphDecoderWrapper:
 
         while start_index < total_len:
             end_index = min(start_index + chunk_size, total_len)
-            context_size = left_context_size if start_index - left_context_size > 0 else start_index
+            context_size = (
+                left_context_size
+                if start_index - left_context_size > 0
+                else start_index
+            )
 
             codes_chunk = codes[..., start_index - context_size : end_index]
             wav_chunk = self.decode(codes_chunk)

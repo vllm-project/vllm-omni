@@ -8,14 +8,26 @@ from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
-stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
+stage_configs = [
+    str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")
+]
 
 if current_omni_platform.is_xpu():
-    stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")]
+    stage_configs = [
+        str(
+            Path(__file__).parent.parent
+            / "e2e"
+            / "stage_configs"
+            / "xpu"
+            / "qwen2_5_omni_ci.yaml"
+        )
+    ]
 
 # Create parameter combinations for model and stage config
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    OmniServerParams(model=model, stage_config_path=stage_config)
+    for model in models
+    for stage_config in stage_configs
 ]
 
 

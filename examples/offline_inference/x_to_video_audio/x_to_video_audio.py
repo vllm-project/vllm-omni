@@ -17,21 +17,31 @@ AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Offline inference for DreamID-Omni (video + audio).")
+    parser = argparse.ArgumentParser(
+        description="Offline inference for DreamID-Omni (video + audio)."
+    )
     parser.add_argument("--model", required=True, help="DreamID ckpt root directory.")
     parser.add_argument("--model-type", default="dreamid-omni", help="Model type.")
     parser.add_argument("--prompt", default=None, help="Text prompt.")
 
     parser.add_argument("--image-path", type=str, nargs="+", help="list of image-path")
     parser.add_argument("--audio-path", type=str, nargs="+", help="list of audio-path")
-    parser.add_argument("--prompt-file", type=str, default=None, help="Text prompt in json format.")
+    parser.add_argument(
+        "--prompt-file", type=str, default=None, help="Text prompt in json format."
+    )
 
     parser.add_argument("--height", type=int, default=704, help="Video height.")
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
-    parser.add_argument("--num-inference-steps", type=int, default=45, help="Sampling steps.")
-    parser.add_argument("--solver-name", default="unipc", help="Solver name: unipc|dpm++|euler.")
+    parser.add_argument(
+        "--num-inference-steps", type=int, default=45, help="Sampling steps."
+    )
+    parser.add_argument(
+        "--solver-name", default="unipc", help="Solver name: unipc|dpm++|euler."
+    )
     parser.add_argument("--shift", type=float, default=5.0, help="Scheduler shift.")
-    parser.add_argument("--seed", type=int, default=103, help="Random seed for reproducible generation.")
+    parser.add_argument(
+        "--seed", type=int, default=103, help="Random seed for reproducible generation."
+    )
     parser.add_argument(
         "--cfg-parallel-size",
         type=int,
@@ -49,7 +59,9 @@ def parse_args() -> argparse.Namespace:
         default="robotic, muffled, echo, distorted",
         help="Negative prompt for audio.",
     )
-    parser.add_argument("--output", default="dreamid_output.mp4", help="Output video path.")
+    parser.add_argument(
+        "--output", default="dreamid_output.mp4", help="Output video path."
+    )
     parser.add_argument(
         "--enable-cpu-offload",
         action="store_true",
@@ -87,10 +99,16 @@ def main() -> None:
         with open(args.prompt_file) as f:
             text_prompt = json.load(f)
             text_prompt = re.sub(
-                r"\[SPEAKER_TIMESTAMPS_START\].*?\[SPEAKER_TIMESTAMPS_END\]", "", text_prompt, flags=re.DOTALL
+                r"\[SPEAKER_TIMESTAMPS_START\].*?\[SPEAKER_TIMESTAMPS_END\]",
+                "",
+                text_prompt,
+                flags=re.DOTALL,
             ).strip()
             text_prompt = re.sub(
-                r"\[AUDIO_DESCRIPTION_START].*?\[AUDIO_DESCRIPTION_END]", "", text_prompt, flags=re.DOTALL
+                r"\[AUDIO_DESCRIPTION_START].*?\[AUDIO_DESCRIPTION_END]",
+                "",
+                text_prompt,
+                flags=re.DOTALL,
             ).strip()
             text_prompt = re.sub(r"\[[A-Z_]+\]", "", text_prompt)
             text_prompt = re.sub(r"\n\s*\n", "\n", text_prompt).strip()
@@ -137,7 +155,9 @@ def main() -> None:
     try:
         from dreamid_omni.utils.io_utils import save_video
     except Exception as e:
-        raise RuntimeError(f"Failed to extract video and audio from DreamID-Omni output. Error: {e}")
+        raise RuntimeError(
+            f"Failed to extract video and audio from DreamID-Omni output. Error: {e}"
+        )
     output_path = args.output
     save_video(output_path, generated_video, generated_audio, fps=24, sample_rate=16000)
     print(f"Saved generated video to {output_path}")

@@ -50,15 +50,26 @@ def get_chunk_config(default_path):
 
 
 # CI stage config for 2*H100-80G GPUs
-default_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
+default_path = str(
+    Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml"
+)
 stage_configs = [default_path, get_chunk_config(default_path)]
 
 if current_omni_platform.is_xpu():
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
+    stage_configs = [
+        str(
+            Path(__file__).parent.parent
+            / "stage_configs"
+            / "xpu"
+            / "qwen3_omni_ci.yaml"
+        )
+    ]
 
 # Create parameter combinations for model and stage config
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    OmniServerParams(model=model, stage_config_path=stage_config)
+    for model in models
+    for stage_config in stage_configs
 ]
 
 
@@ -105,7 +116,9 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=True
     Datasets: single request
     """
-    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(), content_text=get_prompt()
+    )
 
     request_config = {
         "model": omni_server.model,
@@ -129,7 +142,9 @@ def test_text_to_text_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: few requests
     """
-    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(), content_text=get_prompt()
+    )
 
     request_config = {
         "model": omni_server.model,
@@ -151,7 +166,9 @@ def test_image_to_text_001(omni_server, openai_client) -> None:
     Input Setting: stream=True
     Datasets: single request
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    image_data_url = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    )
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
 
     request_config = {
@@ -176,7 +193,9 @@ def test_image_to_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: single request
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    image_data_url = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    )
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
 
     request_config = {
@@ -200,7 +219,9 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: few requests
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+    image_data_url = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+    )
 
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
 
@@ -224,7 +245,9 @@ def test_video_to_text_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: single request
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = (
+        f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    )
     messages = dummy_messages_from_mix_data(video_data_url=video_data_url)
 
     request_config = {
@@ -248,7 +271,9 @@ def test_video_to_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: single request
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = (
+        f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    )
     messages = dummy_messages_from_mix_data(video_data_url=video_data_url)
 
     request_config = {
@@ -272,7 +297,9 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: few requests
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = (
+        f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    )
 
     messages = dummy_messages_from_mix_data(video_data_url=video_data_url)
 
@@ -298,7 +325,9 @@ def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
     audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
     messages = dummy_messages_from_mix_data(
-        audio_data_url=audio_data_url, system_prompt=get_system_prompt(), content_text=get_prompt("text_audio")
+        audio_data_url=audio_data_url,
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text_audio"),
     )
 
     request_config = {
@@ -321,10 +350,14 @@ def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: single request
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    image_data_url = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    )
 
     messages = dummy_messages_from_mix_data(
-        image_data_url=image_data_url, system_prompt=get_system_prompt(), content_text=get_prompt("text_image")
+        image_data_url=image_data_url,
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text_image"),
     )
 
     request_config = {
@@ -347,10 +380,14 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=True
     Datasets: single requests
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 30)['base64']}"
+    video_data_url = (
+        f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 30)['base64']}"
+    )
 
     messages = dummy_messages_from_mix_data(
-        video_data_url=video_data_url, system_prompt=get_system_prompt(), content_text=get_prompt("text_video")
+        video_data_url=video_data_url,
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text_video"),
     )
 
     request_config = {
@@ -375,8 +412,12 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=True
     Datasets: few requests
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    video_data_url = (
+        f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    )
+    image_data_url = (
+        f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    )
     audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),

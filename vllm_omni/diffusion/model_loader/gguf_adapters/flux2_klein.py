@@ -74,8 +74,10 @@ class Flux2KleinGGUFAdapter(GGUFAdapter):
 
     gguf_to_hf_mapper = WeightsMapper(
         # double_stream_modulation
-        orig_to_new_prefix=FLUX2_TRANSFORMER_KEYS_RENAME_DICT | FLUX2_TRANSFORMER_ADA_LAYER_NORM_KEY_MAP,
-        orig_to_new_substr=FLUX2_TRANSFORMER_DOUBLE_BLOCK_KEY_MAP | FLUX2_TRANSFORMER_SINGLE_BLOCK_KEY_MAP,
+        orig_to_new_prefix=FLUX2_TRANSFORMER_KEYS_RENAME_DICT
+        | FLUX2_TRANSFORMER_ADA_LAYER_NORM_KEY_MAP,
+        orig_to_new_substr=FLUX2_TRANSFORMER_DOUBLE_BLOCK_KEY_MAP
+        | FLUX2_TRANSFORMER_SINGLE_BLOCK_KEY_MAP,
     )
 
     def weights_iterator(self) -> Iterable[tuple[str, torch.Tensor]]:

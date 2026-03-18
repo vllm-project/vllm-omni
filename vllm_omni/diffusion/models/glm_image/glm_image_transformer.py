@@ -9,7 +9,9 @@ import torch
 import torch.nn as nn
 from diffusers.models.attention import FeedForward
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.transformers.transformer_glm_image import GlmImageCombinedTimestepSizeEmbeddings
+from diffusers.models.transformers.transformer_glm_image import (
+    GlmImageCombinedTimestepSizeEmbeddings,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -41,9 +43,16 @@ class GlmImageImageProjector(nn.Module):
 
         # Reshape: [B, C, H, W] -> [B, H', W', C*p*p] -> [B, H'*W', C*p*p]
         hidden_states = hidden_states.reshape(
-            batch_size, channel, post_patch_height, self.patch_size, post_patch_width, self.patch_size
+            batch_size,
+            channel,
+            post_patch_height,
+            self.patch_size,
+            post_patch_width,
+            self.patch_size,
         )
-        hidden_states = hidden_states.permute(0, 2, 4, 1, 3, 5).flatten(3, 5).flatten(1, 2)
+        hidden_states = (
+            hidden_states.permute(0, 2, 4, 1, 3, 5).flatten(3, 5).flatten(1, 2)
+        )
         hidden_states = self.proj(hidden_states)
         return hidden_states
 
@@ -63,10 +72,18 @@ class GlmImageRotaryPosEmbed(nn.Module):
 
         dim_h, dim_w = self.dim // 2, self.dim // 2
         h_inv_freq = 1.0 / (
-            self.theta ** (torch.arange(0, dim_h, 2, dtype=torch.float32)[: (dim_h // 2)].float() / dim_h)
+            self.theta
+            ** (
+                torch.arange(0, dim_h, 2, dtype=torch.float32)[: (dim_h // 2)].float()
+                / dim_h
+            )
         )
         w_inv_freq = 1.0 / (
-            self.theta ** (torch.arange(0, dim_w, 2, dtype=torch.float32)[: (dim_w // 2)].float() / dim_w)
+            self.theta
+            ** (
+                torch.arange(0, dim_w, 2, dtype=torch.float32)[: (dim_w // 2)].float()
+                / dim_w
+            )
         )
         h_seq = torch.arange(height, device=hidden_states.device)
         w_seq = torch.arange(width, device=hidden_states.device)
@@ -97,11 +114,16 @@ class GlmImageAdaLayerNormZero(nn.Module):
         self.linear = nn.Linear(embedding_dim, 12 * dim, bias=True)
 
     def forward(
-        self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, temb: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         dtype = hidden_states.dtype
         norm_hidden_states = self.norm(hidden_states).to(dtype=dtype)
-        norm_encoder_hidden_states = self.norm_context(encoder_hidden_states).to(dtype=dtype)
+        norm_encoder_hidden_states = self.norm_context(encoder_hidden_states).to(
+            dtype=dtype
+        )
 
         emb = self.linear(temb)
         (
@@ -119,8 +141,12 @@ class GlmImageAdaLayerNormZero(nn.Module):
             c_gate_mlp,
         ) = emb.chunk(12, dim=1)
 
-        hidden_states = norm_hidden_states * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_msa.unsqueeze(1)) + c_shift_msa.unsqueeze(1)
+        hidden_states = norm_hidden_states * (
+            1 + scale_msa.unsqueeze(1)
+        ) + shift_msa.unsqueeze(1)
+        encoder_hidden_states = norm_encoder_hidden_states * (
+            1 + c_scale_msa.unsqueeze(1)
+        ) + c_shift_msa.unsqueeze(1)
 
         return (
             hidden_states,
@@ -148,10 +174,16 @@ class GlmImageAdaLayerNormContinuous(nn.Module):
         bias: bool = True,
     ):
         super().__init__()
-        self.linear = nn.Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias)
-        self.norm = nn.LayerNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
+        self.linear = nn.Linear(
+            conditioning_embedding_dim, embedding_dim * 2, bias=bias
+        )
+        self.norm = nn.LayerNorm(
+            embedding_dim, eps=eps, elementwise_affine=elementwise_affine
+        )
 
-    def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, conditioning_embedding: torch.Tensor
+    ) -> torch.Tensor:
         # NO SiLU here
         emb = self.linear(conditioning_embedding.to(x.dtype))
         scale, shift = torch.chunk(emb, 2, dim=1)
@@ -264,7 +296,9 @@ class GlmImageKVCache:
             IndexError: If layer_idx is out of range.
         """
         if layer_idx < 0 or layer_idx >= self.num_layers:
-            raise IndexError(f"Layer index {layer_idx} out of range [0, {self.num_layers})")
+            raise IndexError(
+                f"Layer index {layer_idx} out of range [0, {self.num_layers})"
+            )
         return self.caches[layer_idx]
 
     def __len__(self) -> int:
@@ -292,7 +326,9 @@ class GlmImageKVCache:
             try:
                 self._mode = KVCacheMode(mode.lower())
             except ValueError:
-                raise ValueError(f"Invalid mode: '{mode}', must be one of 'write', 'read', 'skip'")
+                raise ValueError(
+                    f"Invalid mode: '{mode}', must be one of 'write', 'read', 'skip'"
+                )
         else:
             self._mode = mode
 
@@ -387,7 +423,9 @@ class GlmImageAttention(nn.Module):
         batch_size, text_seq_length, _ = encoder_hidden_states.shape
 
         # Concatenate text and image: [text, image]
-        hidden_states_combined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        hidden_states_combined = torch.cat(
+            [encoder_hidden_states, hidden_states], dim=1
+        )
 
         # QKV projection
         qkv, _ = self.to_qkv(hidden_states_combined)
@@ -409,8 +447,12 @@ class GlmImageAttention(nn.Module):
             key_img = key[:, text_seq_length:, :, :]
             from diffusers.models.embeddings import apply_rotary_emb
 
-            query_img = apply_rotary_emb(query_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
-            key_img = apply_rotary_emb(key_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
+            query_img = apply_rotary_emb(
+                query_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2
+            )
+            key_img = apply_rotary_emb(
+                key_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2
+            )
             query = torch.cat([query[:, :text_seq_length, :, :], query_img], dim=1)
             key = torch.cat([key[:, :text_seq_length, :, :], key_img], dim=1)
 
@@ -516,10 +558,14 @@ class GlmImageTransformerBlock(nn.Module):
             kv_cache_mode=kv_cache_mode,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa.unsqueeze(1)
-        encoder_hidden_states = encoder_hidden_states + attn_encoder_hidden_states * c_gate_msa.unsqueeze(1)
+        encoder_hidden_states = (
+            encoder_hidden_states + attn_encoder_hidden_states * c_gate_msa.unsqueeze(1)
+        )
 
         # 3. Feedforward
-        norm_hidden_states = self.norm2(hidden_states) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        norm_hidden_states = self.norm2(hidden_states) * (
+            1 + scale_mlp.unsqueeze(1)
+        ) + shift_mlp.unsqueeze(1)
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states) * (
             1 + c_scale_mlp.unsqueeze(1)
         ) + c_shift_mlp.unsqueeze(1)
@@ -527,7 +573,9 @@ class GlmImageTransformerBlock(nn.Module):
         ff_output = self.ff(norm_hidden_states)
         ff_output_context = self.ff(norm_encoder_hidden_states)
         hidden_states = hidden_states + ff_output * gate_mlp.unsqueeze(1)
-        encoder_hidden_states = encoder_hidden_states + ff_output_context * c_gate_mlp.unsqueeze(1)
+        encoder_hidden_states = (
+            encoder_hidden_states + ff_output_context * c_gate_mlp.unsqueeze(1)
+        )
 
         return hidden_states, encoder_hidden_states
 
@@ -559,7 +607,9 @@ class GlmImageTransformer2DModel(CachedTransformer):
         attention_head_dim = od_config.tf_model_config.attention_head_dim
         time_embed_dim = od_config.tf_model_config.time_embed_dim
         condition_dim = od_config.tf_model_config.condition_dim
-        prior_vq_quantizer_codebook_size = od_config.tf_model_config.prior_vq_quantizer_codebook_size
+        prior_vq_quantizer_codebook_size = (
+            od_config.tf_model_config.prior_vq_quantizer_codebook_size
+        )
         text_embed_dim = od_config.tf_model_config.text_embed_dim
 
         # Get num_layers from config if available
@@ -577,13 +627,23 @@ class GlmImageTransformer2DModel(CachedTransformer):
         inner_dim = num_attention_heads * attention_head_dim
 
         # 1. RoPE
-        self.rope = GlmImageRotaryPosEmbed(attention_head_dim, patch_size, theta=10000.0)
+        self.rope = GlmImageRotaryPosEmbed(
+            attention_head_dim, patch_size, theta=10000.0
+        )
 
         # 2. Patch & Text-timestep embedding
-        self.image_projector = GlmImageImageProjector(in_channels, inner_dim, patch_size)
-        self.glyph_projector = FeedForward(text_embed_dim, inner_dim, inner_dim=inner_dim, activation_fn="gelu")
-        self.prior_token_embedding = nn.Embedding(prior_vq_quantizer_codebook_size, inner_dim)
-        self.prior_projector = FeedForward(inner_dim, inner_dim, inner_dim=inner_dim, activation_fn="linear-silu")
+        self.image_projector = GlmImageImageProjector(
+            in_channels, inner_dim, patch_size
+        )
+        self.glyph_projector = FeedForward(
+            text_embed_dim, inner_dim, inner_dim=inner_dim, activation_fn="gelu"
+        )
+        self.prior_token_embedding = nn.Embedding(
+            prior_vq_quantizer_codebook_size, inner_dim
+        )
+        self.prior_projector = FeedForward(
+            inner_dim, inner_dim, inner_dim=inner_dim, activation_fn="linear-silu"
+        )
 
         self.time_condition_embed = GlmImageCombinedTimestepSizeEmbeddings(
             embedding_dim=time_embed_dim,
@@ -595,14 +655,20 @@ class GlmImageTransformer2DModel(CachedTransformer):
         # 3. Transformer blocks
         self.transformer_blocks = nn.ModuleList(
             [
-                GlmImageTransformerBlock(inner_dim, num_attention_heads, attention_head_dim, time_embed_dim)
+                GlmImageTransformerBlock(
+                    inner_dim, num_attention_heads, attention_head_dim, time_embed_dim
+                )
                 for _ in range(num_layers)
             ]
         )
 
         # 4. Output projection
-        self.norm_out = GlmImageAdaLayerNormContinuous(inner_dim, time_embed_dim, elementwise_affine=False)
-        self.proj_out = nn.Linear(inner_dim, patch_size * patch_size * out_channels, bias=True)
+        self.norm_out = GlmImageAdaLayerNormContinuous(
+            inner_dim, time_embed_dim, elementwise_affine=False
+        )
+        self.proj_out = nn.Linear(
+            inner_dim, patch_size * patch_size * out_channels, bias=True
+        )
 
     def forward(
         self,
@@ -672,7 +738,9 @@ class GlmImageTransformer2DModel(CachedTransformer):
         hidden_states = hidden_states + prior_hidden_states
 
         # Timestep conditioning
-        temb = self.time_condition_embed(timestep, target_size, crop_coords, hidden_states.dtype)
+        temb = self.time_condition_embed(
+            timestep, target_size, crop_coords, hidden_states.dtype
+        )
 
         # 3. Transformer blocks
         for layer_idx, block in enumerate(self.transformer_blocks):
@@ -695,7 +763,9 @@ class GlmImageTransformer2DModel(CachedTransformer):
         hidden_states = self.proj_out(hidden_states)
 
         # 5. Unpatchify: [B, H'*W', C*p*p] -> [B, C, H, W]
-        hidden_states = hidden_states.reshape(batch_size, post_patch_height, post_patch_width, -1, p, p)
+        hidden_states = hidden_states.reshape(
+            batch_size, post_patch_height, post_patch_width, -1, p, p
+        )
         output = hidden_states.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
 
         if not return_dict:

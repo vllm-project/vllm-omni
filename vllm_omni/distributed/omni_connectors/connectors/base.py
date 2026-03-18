@@ -18,7 +18,9 @@ class OmniConnectorBase(ABC):
     supports_raw_data: bool = False
 
     @abstractmethod
-    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+    def put(
+        self, from_stage: str, to_stage: str, put_key: str, data: Any
+    ) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.
 
         Args:
@@ -34,7 +36,9 @@ class OmniConnectorBase(ABC):
         pass
 
     @abstractmethod
-    def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
+    def get(
+        self, from_stage: str, to_stage: str, get_key: str, metadata=None
+    ) -> tuple[Any, int] | None:
         """Retrieve Python object and payload size (bytes).
 
         Args:
@@ -95,7 +99,9 @@ class OmniConnectorBase(ABC):
         return OmniSerializer.deserialize(data)
 
     @staticmethod
-    def _make_key(key: str, from_stage: str, to_stage: str, separator: str = "@") -> str:
+    def _make_key(
+        key: str, from_stage: str, to_stage: str, separator: str = "@"
+    ) -> str:
         """Generate internal key with stage routing info.
 
         Default format: ``{key}@{from_stage}_{to_stage}``.

@@ -81,7 +81,9 @@ class OmniARScheduler(VLLMScheduler):
                 return getattr(omni_kv_config, "kv_transfer_criteria", None)
         return None
 
-    def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
+    def _process_kv_transfer_trigger(
+        self, request: Request, new_token_ids: list[int]
+    ) -> bool:
         """
         Check triggers and process side effects (marking transfer).
         Returns True if request should be STOPPED.
@@ -101,9 +103,13 @@ class OmniARScheduler(VLLMScheduler):
 
         if criteria_type == "prefill_finished":
             if request.num_computed_tokens >= request.num_prompt_tokens:
-                logger.debug(f"[Omni] Request {request.request_id} triggered prefill_finished transfer (Non-Stop)")
+                logger.debug(
+                    f"[Omni] Request {request.request_id} triggered prefill_finished transfer (Non-Stop)"
+                )
                 self.transfer_triggered_requests.add(request.request_id)
-                self._mark_request_for_kv_transfer(request.request_id, request.num_computed_tokens)
+                self._mark_request_for_kv_transfer(
+                    request.request_id, request.num_computed_tokens
+                )
 
                 # Return False means "Do NOT stop the request" -> Continue Decoding
                 return False
@@ -111,7 +117,9 @@ class OmniARScheduler(VLLMScheduler):
         elif criteria_type == "special_token":
             target_token_id = self.kv_transfer_criteria.get("token_id")
             if target_token_id is not None and target_token_id in new_token_ids:
-                logger.debug(f"[Omni] Request {request.request_id} triggered special_token criteria (Non-Stop)")
+                logger.debug(
+                    f"[Omni] Request {request.request_id} triggered special_token criteria (Non-Stop)"
+                )
 
                 self.transfer_triggered_requests.add(request.request_id)
 
@@ -137,7 +145,9 @@ class OmniARScheduler(VLLMScheduler):
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
         if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            self.chunk_transfer_adapter.process_pending_chunks(
+                self.waiting, self.running
+            )
 
         try:
             scheduler_output = super().schedule()
@@ -158,7 +168,9 @@ class OmniARScheduler(VLLMScheduler):
                 # Build omni entry preserving all base fields
                 omni_nr = OmniNewRequestData(
                     req_id=nr.req_id,
-                    external_req_id=(getattr(request, "external_req_id", None) if request else None),
+                    external_req_id=(
+                        getattr(request, "external_req_id", None) if request else None
+                    ),
                     prompt_token_ids=nr.prompt_token_ids,
                     mm_features=nr.mm_features,
                     sampling_params=nr.sampling_params,
@@ -167,19 +179,29 @@ class OmniARScheduler(VLLMScheduler):
                     num_computed_tokens=nr.num_computed_tokens,
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
-                    prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
-                    additional_information=(getattr(request, "additional_information", None) if request else None),
+                    prompt_embeds=(
+                        getattr(request, "prompt_embeds", None) if request else None
+                    ),
+                    additional_information=(
+                        getattr(request, "additional_information", None)
+                        if request
+                        else None
+                    ),
                 )
                 new_list.append(omni_nr)
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
+                self.chunk_transfer_adapter.postprocess_scheduler_output(
+                    scheduler_output, self.requests
+                )
             # Add information about requests needing KV cache transfer
             finished_reqs = self.get_finished_requests_needing_kv_transfer()
         except Exception:
             # If anything goes wrong, leave the original output unchanged
-            init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
+            init_logger(__name__).exception(
+                "Failed to wrap scheduled_new_reqs with OmniNewRequestData"
+            )
             finished_reqs = {}
 
         # Wrap in omni scheduler output to carry transfer metadata.
@@ -223,7 +245,9 @@ class OmniARScheduler(VLLMScheduler):
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
+            failed_kv_load_req_ids = self._handle_invalid_blocks(
+                kv_connector_output.invalid_block_ids
+            )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -243,9 +267,13 @@ class OmniARScheduler(VLLMScheduler):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
-            generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            generated_token_ids = (
+                sampled_token_ids[req_index] if sampled_token_ids else []
+            )
 
-            scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            scheduled_spec_token_ids = (
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            )
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -280,7 +308,9 @@ class OmniARScheduler(VLLMScheduler):
 
             # Check for stop and update request status.
             if new_token_ids:
-                new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                new_token_ids, stopped = self._update_request_with_output(
+                    request, new_token_ids
+                )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -289,7 +319,9 @@ class OmniARScheduler(VLLMScheduler):
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
             # transfer (e.g. prefill finished / special token) but continues decoding.
-            if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
+            if not stopped and self._process_kv_transfer_trigger(
+                request, new_token_ids
+            ):
                 stopped = True
 
             if stopped:
@@ -312,7 +344,11 @@ class OmniARScheduler(VLLMScheduler):
                     stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
-            if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
+            if (
+                request.sampling_params is not None
+                and request.sampling_params.logprobs is not None
+                and logprobs
+            ):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
@@ -332,7 +368,12 @@ class OmniARScheduler(VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+            if (
+                new_token_ids
+                or pooler_output is not None
+                or kv_transfer_params
+                or stopped
+            ):
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -424,7 +465,10 @@ class OmniARScheduler(VLLMScheduler):
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
-        engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
+        engine_core_outputs = {
+            client_index: EngineCoreOutputs(outputs=outs)
+            for client_index, outs in outputs.items()
+        }
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:
@@ -435,10 +479,16 @@ class OmniARScheduler(VLLMScheduler):
                 if (eco := engine_core_outputs.get(client_index)) is not None:
                     eco.finished_requests = finished_set
                 else:
-                    engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
+                    engine_core_outputs[client_index] = EngineCoreOutputs(
+                        finished_requests=finished_set
+                    )
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
+        if (
+            stats := self.make_stats(
+                spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
+            )
+        ) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
                 # We must return the stats even if there are no request
@@ -448,7 +498,9 @@ class OmniARScheduler(VLLMScheduler):
 
         # This is where we free blocks that were held for transfer
         try:
-            kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
+            kv_extracted_ids = getattr(
+                model_runner_output, "kv_extracted_req_ids", None
+            )
             if kv_extracted_ids:
                 for req_id in kv_extracted_ids:
                     # Mark transfer as finished
@@ -468,14 +520,20 @@ class OmniARScheduler(VLLMScheduler):
                             if req_id in self.active_kv_transfers:
                                 self.active_kv_transfers.remove(req_id)
 
-                            logger.debug(f"Freed blocks for {req_id} after transfer extraction")
+                            logger.debug(
+                                f"Freed blocks for {req_id} after transfer extraction"
+                            )
                         self.waiting_for_transfer_free.remove(req_id)
         except Exception:
-            init_logger(__name__).exception("Failed to process finished transfer requests")
+            init_logger(__name__).exception(
+                "Failed to process finished transfer requests"
+            )
 
         return engine_core_outputs
 
-    def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> dict[str, Any] | None:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
@@ -497,7 +555,9 @@ class OmniARScheduler(VLLMScheduler):
             if already_triggered:
                 if is_active:
                     # It triggered but hasn't finished yet. We MUST wait.
-                    logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
+                    logger.debug(
+                        f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting."
+                    )
                     self.waiting_for_transfer_free.add(request_id)
                     # We do NOT mark for transfer again, just wait.
                     kv_xfer_params = None  # No new transfer params
@@ -509,13 +569,18 @@ class OmniARScheduler(VLLMScheduler):
                     )
             else:
                 self.waiting_for_transfer_free.add(request_id)
-                self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
+                self._mark_request_for_kv_transfer(
+                    request_id, request.num_computed_tokens
+                )
                 # Return KV transfer metadata so it propagates to RequestOutput
                 if request_id in self.requests_needing_kv_transfer:
                     transfer_data = self.requests_needing_kv_transfer[request_id]
                     kv_xfer_params = {
                         "past_key_values": transfer_data["block_ids"],
-                        "kv_metadata": {"seq_len": transfer_data["seq_len"], "block_ids": transfer_data["block_ids"]},
+                        "kv_metadata": {
+                            "seq_len": transfer_data["seq_len"],
+                            "block_ids": transfer_data["block_ids"],
+                        },
                     }
                     # Also update request.additional_information for good measure
                     add_info = getattr(request, "additional_information", None)
@@ -568,14 +633,18 @@ class OmniARScheduler(VLLMScheduler):
                     # [Omni] Fix: Truncate blocks to match seq_len snapshot
                     # We need to know block_size. Usually in self.cache_config.block_size
                     # Note: vllm_config might not be directly available, check scheduler_config or cache_config
-                    if hasattr(self, "cache_config") and hasattr(self.cache_config, "block_size"):
+                    if hasattr(self, "cache_config") and hasattr(
+                        self.cache_config, "block_size"
+                    ):
                         block_size = self.cache_config.block_size
                     elif hasattr(self, "scheduler_config") and hasattr(
                         self.scheduler_config, "block_size"
                     ):  # Some versions
                         block_size = self.scheduler_config.block_size
                     else:
-                        raise ValueError("Block size not found in cache_config or scheduler_config")
+                        raise ValueError(
+                            "Block size not found in cache_config or scheduler_config"
+                        )
 
                     # ceil(seq_len / block_size)
                     num_blocks = (seq_len + block_size - 1) // block_size
@@ -589,11 +658,18 @@ class OmniARScheduler(VLLMScheduler):
                 else:
                     block_ids = []
             except Exception as e:
-                init_logger(__name__).warning(f"Failed to get block IDs for {req_id}: {e}")
+                init_logger(__name__).warning(
+                    f"Failed to get block IDs for {req_id}: {e}"
+                )
                 block_ids = []
 
-            self.requests_needing_kv_transfer[req_id] = {"seq_len": seq_len, "block_ids": block_ids}
-            logger.debug(f"Marked request {req_id} for KV cache transfer (len={seq_len}, blocks={len(block_ids)})")
+            self.requests_needing_kv_transfer[req_id] = {
+                "seq_len": seq_len,
+                "block_ids": block_ids,
+            }
+            logger.debug(
+                f"Marked request {req_id} for KV cache transfer (len={seq_len}, blocks={len(block_ids)})"
+            )
 
     def _should_transfer_kv_for_request(self, req_id: str) -> bool:
         """Determine if a request should trigger KV cache transfer."""
@@ -612,13 +688,21 @@ class OmniARScheduler(VLLMScheduler):
     def has_requests(self) -> bool:
         """Check if there are any requests to process, including KV transfers."""
         # [Omni] Also check for pending KV transfers
-        if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
+        if (
+            self.requests_needing_kv_transfer
+            or self.active_kv_transfers
+            or self.waiting_for_transfer_free
+        ):
             return True
         return super().has_requests()
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""
-        if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
+        if (
+            self.requests_needing_kv_transfer
+            or self.active_kv_transfers
+            or self.waiting_for_transfer_free
+        ):
             return True
         return super().has_finished_requests()
 
@@ -627,7 +711,11 @@ class OmniARScheduler(VLLMScheduler):
         # [Omni] Also check for pending KV transfers to ensure the engine loop continues
         # MUST verify waiting_for_transfer_free and active_kv_transfers
         # Otherwise engine loop might exit before transfer Ack is received.
-        if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
+        if (
+            self.requests_needing_kv_transfer
+            or self.active_kv_transfers
+            or self.waiting_for_transfer_free
+        ):
             return True
         return super().has_unfinished_requests()
 

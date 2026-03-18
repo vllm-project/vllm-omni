@@ -11,7 +11,9 @@ def parse_args():
         default="ByteDance-Seed/BAGEL-7B-MoT",
         help="Path to merged model directory.",
     )
-    parser.add_argument("--prompts", nargs="+", default=None, help="Input text prompts.")
+    parser.add_argument(
+        "--prompts", nargs="+", default=None, help="Input text prompts."
+    )
     parser.add_argument(
         "--txt-prompts",
         type=str,
@@ -40,15 +42,32 @@ def parse_args():
     parser.add_argument("--batch-timeout", type=int, default=5)
     parser.add_argument("--init-timeout", type=int, default=300)
     parser.add_argument("--shm-threshold-bytes", type=int, default=65536)
-    parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"])
+    parser.add_argument(
+        "--worker-backend", type=str, default="process", choices=["process", "ray"]
+    )
     parser.add_argument("--ray-address", type=str, default=None)
     parser.add_argument("--stage-configs-path", type=str, default=None)
-    parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
-
-    parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
-    parser.add_argument("--cfg-img-scale", type=float, default=1.5, help="Image CFG scale (default: 1.5)")
     parser.add_argument(
-        "--negative-prompt", type=str, default=None, help="Negative prompt for CFG (default: empty prompt)"
+        "--steps", type=int, default=50, help="Number of inference steps."
+    )
+
+    parser.add_argument(
+        "--cfg-text-scale",
+        type=float,
+        default=4.0,
+        help="Text CFG scale (default: 4.0)",
+    )
+    parser.add_argument(
+        "--cfg-img-scale",
+        type=float,
+        default=1.5,
+        help="Image CFG scale (default: 1.5)",
+    )
+    parser.add_argument(
+        "--negative-prompt",
+        type=str,
+        default=None,
+        help="Negative prompt for CFG (default: empty prompt)",
     )
     parser.add_argument(
         "--cfg-parallel-size",
@@ -57,7 +76,9 @@ def parse_args():
         choices=[1, 2, 3],
         help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
     )
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Random seed for generation."
+    )
 
     args = parser.parse_args()
     return args
@@ -112,7 +133,9 @@ def main():
     for p in prompts:
         if args.modality == "img2img":
             if not args.image_path or not os.path.exists(args.image_path):
-                raise ValueError(f"img2img requires --image-path pointing to an existing file, got: {args.image_path}")
+                raise ValueError(
+                    f"img2img requires --image-path pointing to an existing file, got: {args.image_path}"
+                )
             loaded_image = Image.open(args.image_path).convert("RGB")
             final_prompt_text = f"<|fim_middle|><|im_start|>{p}<|im_end|>"
             prompt_dict = {
@@ -134,7 +157,9 @@ def main():
                 }
                 formatted_prompts.append(prompt_dict)
         elif args.modality == "text2text":
-            final_prompt_text = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            final_prompt_text = (
+                f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            )
             prompt_dict = {"prompt": final_prompt_text, "modalities": ["text"]}
             formatted_prompts.append(prompt_dict)
         else:
@@ -161,7 +186,9 @@ def main():
                 extra["negative_prompt"] = args.negative_prompt
             diffusion_params.extra_args = extra  # type: ignore
 
-    omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
+    omni_outputs = list(
+        omni.generate(prompts=formatted_prompts, sampling_params_list=params_list)
+    )
 
     for i, req_output in enumerate(omni_outputs):
         images = getattr(req_output, "images", None)

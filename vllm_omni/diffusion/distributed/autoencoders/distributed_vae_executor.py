@@ -18,8 +18,12 @@ logger = init_logger(__name__)
 class GridSpec:
     """The Grid shape split"""
 
-    split_dims: tuple[int, ...]  # For example: (3,4) for (B, C, T, H, W), (2,3) for (B, C, H, W)
-    grid_shape: tuple[int, ...]  # For example: (nh, nw) for (B, C, T, H, W), (nh, nw) for (B, C, H, W)
+    split_dims: tuple[
+        int, ...
+    ]  # For example: (3,4) for (B, C, T, H, W), (2,3) for (B, C, H, W)
+    grid_shape: tuple[
+        int, ...
+    ]  # For example: (nh, nw) for (B, C, T, H, W), (nh, nw) for (B, C, H, W)
     tile_spec: dict = field(default_factory=dict)
     output_dtype: torch.dtype | None = None
 
@@ -54,7 +58,11 @@ class DistributedVaeExecutor:
         self.parallel_size = parallel_size
 
     def gather_tensors(self, tensor: torch.Tensor):
-        gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 else None
+        gather_list = (
+            [torch.empty_like(tensor) for _ in range(self.world_size)]
+            if self.rank == 0
+            else None
+        )
         dist.gather(tensor, gather_list=gather_list, dst=0, group=self.group)
         return gather_list
 
@@ -66,8 +74,12 @@ class DistributedVaeExecutor:
         local_tile_max_dims = [0] * output_ndim
         for _, tile_tensor in local_results:
             for dim_idx, dim_size in enumerate(tile_tensor.shape):
-                local_tile_max_dims[dim_idx] = max(local_tile_max_dims[dim_idx], dim_size)
-        local_shape_stat = torch.tensor([len(local_results), *local_tile_max_dims], device=device)
+                local_tile_max_dims[dim_idx] = max(
+                    local_tile_max_dims[dim_idx], dim_size
+                )
+        local_shape_stat = torch.tensor(
+            [len(local_results), *local_tile_max_dims], device=device
+        )
         dist.all_reduce(
             local_shape_stat,
             op=dist.ReduceOp.MAX,
@@ -75,10 +87,15 @@ class DistributedVaeExecutor:
         )
         return local_shape_stat.tolist()
 
-    def _pack_local_tiles(self, local_results, global_padding_shape, grid_spec, device, dtype):
+    def _pack_local_tiles(
+        self, local_results, global_padding_shape, grid_spec, device, dtype
+    ):
         tile_tensor = torch.zeros(global_padding_shape, device=device, dtype=dtype)
         meta_tensor = torch.full(
-            (global_padding_shape[0], len(grid_spec.split_dims) + 1), -1, device=device, dtype=torch.int64
+            (global_padding_shape[0], len(grid_spec.split_dims) + 1),
+            -1,
+            device=device,
+            dtype=torch.int64,
         )
         for idx, (tid, t_tensor) in enumerate(local_results):
             meta_tensor[idx, 0] = tid
@@ -116,7 +133,12 @@ class DistributedVaeExecutor:
 
         return assigned
 
-    def execute(self, z: torch.Tensor, operator: DistributedOperator, broadcast_result: bool = True):
+    def execute(
+        self,
+        z: torch.Tensor,
+        operator: DistributedOperator,
+        broadcast_result: bool = True,
+    ):
         pp_size = min(self.parallel_size, self.world_size)
 
         # 1. Split into tiles
@@ -129,10 +151,14 @@ class DistributedVaeExecutor:
         local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
 
         # 3. compute shape per rank
-        global_padding_shape = self._compute_global_padding_shape(local_results, z.ndim, z.device)
+        global_padding_shape = self._compute_global_padding_shape(
+            local_results, z.ndim, z.device
+        )
 
         # 5. prepare tile tensors
-        output_dtype = grid_spec.output_dtype if grid_spec.output_dtype is not None else z.dtype
+        output_dtype = (
+            grid_spec.output_dtype if grid_spec.output_dtype is not None else z.dtype
+        )
         local_tile_tensor, local_meta_tensor = self._pack_local_tiles(
             local_results, global_padding_shape, grid_spec, z.device, output_dtype
         )
@@ -145,21 +171,33 @@ class DistributedVaeExecutor:
             result = torch.empty(0, device=z.device)  # Dummy return for non-zero ranks
         else:
             # 7. reconstruct full tensor (rank 0)
-            coord_tensor_map = self._unpack_tiles(meta_gather, tile_gather, grid_spec, tid_coord_map)
+            coord_tensor_map = self._unpack_tiles(
+                meta_gather, tile_gather, grid_spec, tid_coord_map
+            )
             result = operator.merge(coord_tensor_map, grid_spec)
 
         if broadcast_result:
             result = self._sync_final_result(result, z.ndim, z.device, output_dtype)
         return result
 
-    def _sync_final_result(self, rank0_result, output_ndim, output_device, output_dtype):
-        shape_tensor = torch.empty((output_ndim,), device=output_device, dtype=torch.int64)
+    def _sync_final_result(
+        self, rank0_result, output_ndim, output_device, output_dtype
+    ):
+        shape_tensor = torch.empty(
+            (output_ndim,), device=output_device, dtype=torch.int64
+        )
         if self.rank == 0:
-            shape_tensor.copy_(torch.tensor(tuple(rank0_result.shape), device=output_device, dtype=torch.int64))
+            shape_tensor.copy_(
+                torch.tensor(
+                    tuple(rank0_result.shape), device=output_device, dtype=torch.int64
+                )
+            )
         dist.broadcast(shape_tensor, src=0, group=self.group)
 
         if self.rank != 0:
-            sync_result = torch.empty(tuple(shape_tensor.tolist()), device=output_device, dtype=output_dtype)
+            sync_result = torch.empty(
+                tuple(shape_tensor.tolist()), device=output_device, dtype=output_dtype
+            )
         else:
             sync_result = rank0_result
         dist.broadcast(sync_result, src=0, group=self.group)

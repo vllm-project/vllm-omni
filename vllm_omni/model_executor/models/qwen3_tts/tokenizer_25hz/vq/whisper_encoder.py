@@ -23,7 +23,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN, flash_attn_varlen_func
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    HAS_FLASH_ATTN,
+    flash_attn_varlen_func,
+)
 
 N_FFT = 400
 HOP_LENGTH = 160
@@ -126,17 +129,25 @@ def sinusoids(length, channels, max_timescale=10000):
 
 class Conv1d(nn.Conv1d):
     def _conv_forward(self, x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
-        return super()._conv_forward(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
+        return super()._conv_forward(
+            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+        )
 
 
 class ConvTranspose1d(nn.ConvTranspose1d):
     def _conv_forward(self, x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
-        return super()._conv_forward(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
+        return super()._conv_forward(
+            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+        )
 
 
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.weight.to(x.dtype), None if self.bias is None else self.bias.to(x.dtype))
+        return F.linear(
+            x,
+            self.weight.to(x.dtype),
+            None if self.bias is None else self.bias.to(x.dtype),
+        )
 
 
 class MultiHeadAttention(nn.Module):
@@ -176,7 +187,9 @@ class MultiHeadAttention(nn.Module):
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
-        x = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=0.0)
+        x = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=0.0
+        )
         x = x.reshape(n_ctx, n_state)
         return x
 
@@ -193,7 +206,14 @@ class MultiHeadAttention(nn.Module):
         batch_size = len(seqlens)
         max_seqlen = max(seqlens)
 
-        q_padded = torch.zeros(batch_size, max_seqlen, self.n_head, head_dim, dtype=q.dtype, device=q.device)
+        q_padded = torch.zeros(
+            batch_size,
+            max_seqlen,
+            self.n_head,
+            head_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
         k_padded = torch.zeros_like(q_padded)
         v_padded = torch.zeros_like(q_padded)
 
@@ -209,7 +229,10 @@ class MultiHeadAttention(nn.Module):
         k_padded = k_padded.transpose(1, 2)
         v_padded = v_padded.transpose(1, 2)
 
-        attn_mask = torch.arange(max_seqlen, device=q.device)[None, :] < torch.tensor(seqlens, device=q.device)[:, None]
+        attn_mask = (
+            torch.arange(max_seqlen, device=q.device)[None, :]
+            < torch.tensor(seqlens, device=q.device)[:, None]
+        )
         attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
 
         attn_mask = attn_mask.masked_fill(attn_mask == 0, -torch.finfo(q.dtype).max)
@@ -220,9 +243,13 @@ class MultiHeadAttention(nn.Module):
 
         context = torch.matmul(attn_weights, v_padded)
 
-        context = context.transpose(1, 2).contiguous().view(batch_size, max_seqlen, n_state)
+        context = (
+            context.transpose(1, 2).contiguous().view(batch_size, max_seqlen, n_state)
+        )
 
-        output_packed = torch.cat([context[i, : seqlens[i]] for i in range(batch_size)], dim=0)
+        output_packed = torch.cat(
+            [context[i, : seqlens[i]] for i in range(batch_size)], dim=0
+        )
 
         assert output_packed.shape == (n_ctx, n_state)
 
@@ -237,7 +264,9 @@ class ResidualAttentionBlock(nn.Module):
         self.mlp_ln = nn.LayerNorm(n_state)
 
         self.attn = MultiHeadAttention(n_state, n_head)
-        self.mlp = nn.Sequential(Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state))
+        self.mlp = nn.Sequential(
+            Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state)
+        )
 
     def forward(self, x: Tensor, cu_seqlens=None):
         x = x + self.attn(self.attn_ln(x), cu_seqlens=cu_seqlens)
@@ -265,7 +294,12 @@ class WhisperEncoder(nn.Module):
         self.n_mels = n_mels
 
         self.blocks = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head, sequence_parallel=audio_sequence_parallel) for _ in range(n_layer)]
+            [
+                ResidualAttentionBlock(
+                    n_state, n_head, sequence_parallel=audio_sequence_parallel
+                )
+                for _ in range(n_layer)
+            ]
         )
         self.ln_post = nn.LayerNorm(n_state)
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
@@ -284,7 +318,11 @@ class WhisperEncoder(nn.Module):
         self.tp_world_size = 1
 
     def forward(
-        self, x_list: list[Tensor], audio_mellens: list[int], audio_aftercnnlens: list[int], audio_seqlens: list[int]
+        self,
+        x_list: list[Tensor],
+        audio_mellens: list[int],
+        audio_aftercnnlens: list[int],
+        audio_seqlens: list[int],
     ):
         """
         x : torch.Tensor, shape = (n_mels, n_ctx)
@@ -298,8 +336,13 @@ class WhisperEncoder(nn.Module):
                 each_x_split = F.gelu(self.conv1(each_x_split))
                 each_x_split = F.gelu(self.conv2(each_x_split))
                 each_x_split = each_x_split.permute(1, 0)  # L,D
-                each_positional_embedding_split = self.positional_embedding[: each_x_split.shape[0]]
-                aftercnn_x_list.append(each_x_split + each_positional_embedding_split.to(each_x_split.dtype))
+                each_positional_embedding_split = self.positional_embedding[
+                    : each_x_split.shape[0]
+                ]
+                aftercnn_x_list.append(
+                    each_x_split
+                    + each_positional_embedding_split.to(each_x_split.dtype)
+                )
 
         x = torch.cat(aftercnn_x_list, dim=0)
 
@@ -331,13 +374,25 @@ class WhisperEncoder(nn.Module):
         x = self.ln_post(x)
         x = self.proj(x)
 
-        output = torch.zeros((x.size(0) + len(audio_seqlens) * 2, x.size(1)), device=x.device, dtype=x.dtype)
+        output = torch.zeros(
+            (x.size(0) + len(audio_seqlens) * 2, x.size(1)),
+            device=x.device,
+            dtype=x.dtype,
+        )
 
-        audio_seqlens_acc = list(accumulate(audio_seqlens, func=operator.add, initial=0))
-        start_ids = torch.tensor(audio_seqlens_acc[:-1], device=x.device, dtype=torch.int32)
-        end_ids = torch.tensor(audio_seqlens_acc[1:], device=x.device, dtype=torch.int32) - 1
+        audio_seqlens_acc = list(
+            accumulate(audio_seqlens, func=operator.add, initial=0)
+        )
+        start_ids = torch.tensor(
+            audio_seqlens_acc[:-1], device=x.device, dtype=torch.int32
+        )
+        end_ids = (
+            torch.tensor(audio_seqlens_acc[1:], device=x.device, dtype=torch.int32) - 1
+        )
 
-        audio_tokens_mask = torch.ones(output.size(0), device=x.device, dtype=torch.bool)
+        audio_tokens_mask = torch.ones(
+            output.size(0), device=x.device, dtype=torch.bool
+        )
         audio_tokens_mask[start_ids] = False
         audio_tokens_mask[end_ids] = False
         output[start_ids] = self.audio_bos_eos_token.weight[0].to(x.dtype)

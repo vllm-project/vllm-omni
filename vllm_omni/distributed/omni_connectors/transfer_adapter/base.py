@@ -70,7 +70,9 @@ class OmniTransferAdapterBase:
                 try:
                     self._send_single_request(task)
                 except Exception as e:
-                    logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
+                    logger.warning(
+                        f"Error saving data for {task.get('request_id')}: {e}"
+                    )
             time.sleep(0.001)
 
     def _poll_single_request(self, *args, **kwargs):

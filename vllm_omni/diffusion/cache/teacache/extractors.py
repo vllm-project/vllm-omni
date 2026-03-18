@@ -108,12 +108,18 @@ class CacheContext:
         """
         # Validate tensor fields
         if not isinstance(self.modulated_input, torch.Tensor):
-            raise TypeError(f"modulated_input must be torch.Tensor, got {type(self.modulated_input)}")
+            raise TypeError(
+                f"modulated_input must be torch.Tensor, got {type(self.modulated_input)}"
+            )
 
         if not isinstance(self.hidden_states, torch.Tensor):
-            raise TypeError(f"hidden_states must be torch.Tensor, got {type(self.hidden_states)}")
+            raise TypeError(
+                f"hidden_states must be torch.Tensor, got {type(self.hidden_states)}"
+            )
 
-        if self.encoder_hidden_states is not None and not isinstance(self.encoder_hidden_states, torch.Tensor):
+        if self.encoder_hidden_states is not None and not isinstance(
+            self.encoder_hidden_states, torch.Tensor
+        ):
             raise TypeError(
                 f"encoder_hidden_states must be torch.Tensor or None, got {type(self.encoder_hidden_states)}"
             )
@@ -123,10 +129,14 @@ class CacheContext:
 
         # Validate callables
         if not callable(self.run_transformer_blocks):
-            raise TypeError(f"run_transformer_blocks must be callable, got {type(self.run_transformer_blocks)}")
+            raise TypeError(
+                f"run_transformer_blocks must be callable, got {type(self.run_transformer_blocks)}"
+            )
 
         if not callable(self.postprocess):
-            raise TypeError(f"postprocess must be callable, got {type(self.postprocess)}")
+            raise TypeError(
+                f"postprocess must be callable, got {type(self.postprocess)}"
+            )
 
         # Validate tensor shapes are compatible
         if self.modulated_input.shape[0] != self.hidden_states.shape[0]:
@@ -199,10 +209,14 @@ def extract_qwen_context(
     temb = (
         module.time_text_embed(timestep, hidden_states, additional_t_cond)
         if guidance is None
-        else module.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
+        else module.time_text_embed(
+            timestep, guidance, hidden_states, additional_t_cond
+        )
     )
 
-    image_rotary_emb = module.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+    image_rotary_emb = module.pos_embed(
+        img_shapes, txt_seq_lens, device=hidden_states.device
+    )
 
     # ============================================================================
     # EXTRACT MODULATED INPUT (for cache decision)
@@ -221,7 +235,10 @@ def extract_qwen_context(
         e = encoder_hidden_states
         encoder_mask = encoder_hidden_states_mask
         hidden_states_mask = None  # default
-        if module.parallel_config is not None and module.parallel_config.sequence_parallel_size > 1:
+        if (
+            module.parallel_config is not None
+            and module.parallel_config.sequence_parallel_size > 1
+        ):
             ctx = get_forward_context()
             if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
                 # Create mask for the full (padded) sequence
@@ -320,7 +337,9 @@ def extract_bagel_context(
 
     # 1. Embed text
     packed_text_embedding = module.language_model.model.embed_tokens(packed_text_ids)
-    packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), module.hidden_size))
+    packed_sequence = packed_text_embedding.new_zeros(
+        (sum(packed_seqlens), module.hidden_size)
+    )
     packed_sequence[packed_text_indexes] = packed_text_embedding
 
     # 2. Embed timestep
@@ -463,7 +482,9 @@ def extract_zimage_context(
 
     # Run noise refiner blocks
     for layer in module.noise_refiner:
-        x_batched = layer(x_batched, x_attn_mask, x_cos_batched, x_sin_batched, adaln_input)
+        x_batched = layer(
+            x_batched, x_attn_mask, x_cos_batched, x_sin_batched, adaln_input
+        )
 
     # Process caption features through embedder and context refiner
     cap_item_seqlens = [len(_) for _ in cap_feats_processed]
@@ -483,13 +504,17 @@ def extract_zimage_context(
     cap_batched = pad_sequence(cap_list, batch_first=True, padding_value=0.0)
     cap_cos_batched = pad_sequence(cap_cos, batch_first=True, padding_value=0.0)
     cap_sin_batched = pad_sequence(cap_sin, batch_first=True, padding_value=0.0)
-    cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+    cap_attn_mask = torch.zeros(
+        (bsz, cap_max_item_seqlen), dtype=torch.bool, device=device
+    )
     for i, seq_len in enumerate(cap_item_seqlens):
         cap_attn_mask[i, :seq_len] = 1
 
     # Run context refiner blocks
     for layer in module.context_refiner:
-        cap_batched = layer(cap_batched, cap_attn_mask, cap_cos_batched, cap_sin_batched)
+        cap_batched = layer(
+            cap_batched, cap_attn_mask, cap_cos_batched, cap_sin_batched
+        )
 
     # Create unified sequence (image + caption)
     unified_list = []
@@ -499,8 +524,12 @@ def extract_zimage_context(
         x_len = x_item_seqlens[i]
         cap_len = cap_item_seqlens[i]
         unified_list.append(torch.cat([x_batched[i][:x_len], cap_batched[i][:cap_len]]))
-        unified_cos_list.append(torch.cat([x_cos_batched[i][:x_len], cap_cos_batched[i][:cap_len]]))
-        unified_sin_list.append(torch.cat([x_sin_batched[i][:x_len], cap_sin_batched[i][:cap_len]]))
+        unified_cos_list.append(
+            torch.cat([x_cos_batched[i][:x_len], cap_cos_batched[i][:cap_len]])
+        )
+        unified_sin_list.append(
+            torch.cat([x_sin_batched[i][:x_len], cap_sin_batched[i][:cap_len]])
+        )
 
     unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
     unified_max_item_seqlen = max(unified_item_seqlens)
@@ -508,7 +537,9 @@ def extract_zimage_context(
     unified = pad_sequence(unified_list, batch_first=True, padding_value=0.0)
     unified_cos = pad_sequence(unified_cos_list, batch_first=True, padding_value=0.0)
     unified_sin = pad_sequence(unified_sin_list, batch_first=True, padding_value=0.0)
-    unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
+    unified_attn_mask = torch.zeros(
+        (bsz, unified_max_item_seqlen), dtype=torch.bool, device=device
+    )
     for i, seq_len in enumerate(unified_item_seqlens):
         unified_attn_mask[i, :seq_len] = 1
 

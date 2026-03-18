@@ -26,7 +26,9 @@ except Exception:  # pragma: no cover - best-effort compatibility
 
 from .rope_real import apply_real_rotary_emb
 
-_HAS_FLASH_ATTN_VARLEN = bool(is_flash_attn_available()) and flash_attn_varlen_func is not None
+_HAS_FLASH_ATTN_VARLEN = (
+    bool(is_flash_attn_available()) and flash_attn_varlen_func is not None
+)
 
 
 class LuminaRMSNormZero(nn.Module):
@@ -161,7 +163,10 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
         super().__init__()
 
         self.time_proj = Timesteps(
-            num_channels=frequency_embedding_size, flip_sin_to_cos=True, downscale_freq_shift=0.0, scale=timestep_scale
+            num_channels=frequency_embedding_size,
+            flip_sin_to_cos=True,
+            downscale_freq_shift=0.0,
+            scale=timestep_scale,
         )
 
         self.timestep_embedder = TimestepEmbedding(
@@ -219,20 +224,30 @@ class SimpleQFormerImageRefiner(nn.Module):
                     dict(
                         ln_q1=Qwen2RMSNorm(hidden_size, eps=norm_eps),
                         self_attn=nn.MultiheadAttention(
-                            embed_dim=hidden_size, num_heads=self.num_heads, dropout=dropout, batch_first=True
+                            embed_dim=hidden_size,
+                            num_heads=self.num_heads,
+                            dropout=dropout,
+                            batch_first=True,
                         ),
                         ln_q2=Qwen2RMSNorm(hidden_size, eps=norm_eps),
                         cross_attn=nn.MultiheadAttention(
-                            embed_dim=hidden_size, num_heads=self.num_heads, dropout=dropout, batch_first=True
+                            embed_dim=hidden_size,
+                            num_heads=self.num_heads,
+                            dropout=dropout,
+                            batch_first=True,
                         ),
                         ln_ffn=Qwen2RMSNorm(hidden_size, eps=norm_eps),
-                        ffn=LuminaFeedForward(dim=hidden_size, inner_dim=4 * hidden_size),
+                        ffn=LuminaFeedForward(
+                            dim=hidden_size, inner_dim=4 * hidden_size
+                        ),
                     )
                 )
             )
 
     @staticmethod
-    def _choose_valid_num_heads(hidden_size: int, proposed_heads: int, preferred_head_dim: int = 128) -> int:
+    def _choose_valid_num_heads(
+        hidden_size: int, proposed_heads: int, preferred_head_dim: int = 128
+    ) -> int:
         """Pick a number of heads that divides hidden_size, close to proposed or preferred."""
         # If proposed is valid, use it
         if proposed_heads > 0 and hidden_size % proposed_heads == 0:
@@ -265,7 +280,9 @@ class SimpleQFormerImageRefiner(nn.Module):
 
             # Cross-attention: queries attend to inputs
             q_norm = layer["ln_q2"](q)
-            cross_out, _ = layer["cross_attn"](q_norm, kv, kv, need_weights=False, key_padding_mask=attention_mask)
+            cross_out, _ = layer["cross_attn"](
+                q_norm, kv, kv, need_weights=False, key_padding_mask=attention_mask
+            )
             q = q + cross_out
 
             # Feed-forward
@@ -277,7 +294,9 @@ class SimpleQFormerImageRefiner(nn.Module):
 class AttnProcessor:
     def __init__(self) -> None:
         if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("AttnProcessor requires PyTorch 2.0+ (F.scaled_dot_product_attention).")
+            raise ImportError(
+                "AttnProcessor requires PyTorch 2.0+ (F.scaled_dot_product_attention)."
+            )
 
     def __call__(
         self,
@@ -316,18 +335,26 @@ class AttnProcessor:
 
         # Apply Rotary Position Embeddings
         if image_rotary_emb is not None:
-            query = apply_real_rotary_emb(query, image_rotary_emb[0], image_rotary_emb[1])
+            query = apply_real_rotary_emb(
+                query, image_rotary_emb[0], image_rotary_emb[1]
+            )
             key = apply_real_rotary_emb(key, image_rotary_emb[0], image_rotary_emb[1])
 
         query, key = query.to(dtype), key.to(dtype)
 
         # Calculate attention scale
         if base_sequence_length is not None:
-            softmax_scale = math.sqrt(math.log(sequence_length, base_sequence_length)) * attn.scale
+            softmax_scale = (
+                math.sqrt(math.log(sequence_length, base_sequence_length)) * attn.scale
+            )
         else:
             softmax_scale = attn.scale
 
-        if _HAS_FLASH_ATTN_VARLEN and attention_mask is not None and hidden_states.is_cuda:
+        if (
+            _HAS_FLASH_ATTN_VARLEN
+            and attention_mask is not None
+            and hidden_states.is_cuda
+        ):
             # Flash-Attn varlen expects packed tokens + cu_seqlens. Here we only need
             # the self-attention case (q/k/v share the same padding mask).
             attention_mask = attention_mask.to(torch.bool)
@@ -336,13 +363,23 @@ class AttnProcessor:
             max_seqlen = int(seqlens.max().item())
             cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
 
-            query_states = query.reshape(batch_size * sequence_length, attn.heads, head_dim)[indices]
-            key_states = key.reshape(batch_size * sequence_length, kv_heads, head_dim)[indices]
-            value_states = value.reshape(batch_size * sequence_length, kv_heads, head_dim)[indices]
+            query_states = query.reshape(
+                batch_size * sequence_length, attn.heads, head_dim
+            )[indices]
+            key_states = key.reshape(batch_size * sequence_length, kv_heads, head_dim)[
+                indices
+            ]
+            value_states = value.reshape(
+                batch_size * sequence_length, kv_heads, head_dim
+            )[indices]
 
             if kv_heads < attn.heads:
-                key_states = repeat(key_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
-                value_states = repeat(value_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
+                key_states = repeat(
+                    key_states, "l h c -> l (h k) c", k=attn.heads // kv_heads
+                )
+                value_states = repeat(
+                    value_states, "l h c -> l (h k) c", k=attn.heads // kv_heads
+                )
 
             attn_output_unpad = flash_attn_varlen_func(
                 query_states,
@@ -363,7 +400,9 @@ class AttnProcessor:
                 dtype=attn_output_unpad.dtype,
             )
             out[indices] = attn_output_unpad
-            hidden_states = out.view(batch_size, sequence_length, attn.heads, head_dim).flatten(-2)
+            hidden_states = out.view(
+                batch_size, sequence_length, attn.heads, head_dim
+            ).flatten(-2)
             hidden_states = hidden_states.type_as(query)
         else:
             # PyTorch SDPA path.
@@ -394,7 +433,9 @@ class AttnProcessor:
                 # Keep padding tokens consistent with the flash-varlen path (zero output).
                 hidden_states = hidden_states * attention_mask[:, None, :, None]
 
-            hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+            hidden_states = hidden_states.transpose(1, 2).reshape(
+                batch_size, -1, attn.heads * head_dim
+            )
             hidden_states = hidden_states.type_as(query)
 
         # Apply output projection
@@ -441,12 +482,17 @@ class TransformerBlock(nn.Module):
 
         # Initialize feed-forward network
         self.feed_forward = LuminaFeedForward(
-            dim=dim, inner_dim=4 * dim, multiple_of=multiple_of, ffn_dim_multiplier=ffn_dim_multiplier
+            dim=dim,
+            inner_dim=4 * dim,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
         )
 
         # Initialize normalization layers
         if modulation:
-            self.norm1 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps, norm_elementwise_affine=True)
+            self.norm1 = LuminaRMSNormZero(
+                embedding_dim=dim, norm_eps=norm_eps, norm_elementwise_affine=True
+            )
         else:
             self.norm1 = Qwen2RMSNorm(dim, eps=norm_eps)
 
@@ -465,16 +511,24 @@ class TransformerBlock(nn.Module):
             if temb is None:
                 raise ValueError("temb must be provided when modulation is enabled")
 
-            norm_hidden_states, gate_msa, scale_mlp, gate_mlp = self.norm1(hidden_states, temb)
+            norm_hidden_states, gate_msa, scale_mlp, gate_mlp = self.norm1(
+                hidden_states, temb
+            )
             attn_output = self.attn(
                 hidden_states=norm_hidden_states,
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
             )
-            hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(attn_output)
-            mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
-            hidden_states = hidden_states + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(mlp_output)
+            hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(
+                attn_output
+            )
+            mlp_output = self.feed_forward(
+                self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1))
+            )
+            hidden_states = hidden_states + gate_mlp.unsqueeze(
+                1
+            ).tanh() * self.ffn_norm2(mlp_output)
         else:
             norm_hidden_states = self.norm1(hidden_states)
             attn_output = self.attn(
@@ -622,7 +676,9 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         )
 
         # Add learnable embeddings to distinguish different images
-        self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))  # support max 5 ref images
+        self.image_index_embedding = nn.Parameter(
+            torch.randn(5, hidden_size)
+        )  # support max 5 ref images
 
     def _validate_inputs(
         self,
@@ -635,12 +691,19 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         if return_dict:
             raise ValueError("return_dict=True is not supported in vLLM inference.")
         if ref_image_hidden_states is not None:
-            raise ValueError("ref_image_hidden_states is not supported in vLLM inference.")
+            raise ValueError(
+                "ref_image_hidden_states is not supported in vLLM inference."
+            )
         if hidden_states.ndim != 4:
-            raise ValueError(f"Expected hidden_states to be 4D [B,C,H,W], got shape={tuple(hidden_states.shape)}")
+            raise ValueError(
+                f"Expected hidden_states to be 4D [B,C,H,W], got shape={tuple(hidden_states.shape)}"
+            )
 
         batch_size, _channels, height, width = hidden_states.shape
-        if batch_size != text_hidden_states.shape[0] or batch_size != text_attention_mask.shape[0]:
+        if (
+            batch_size != text_hidden_states.shape[0]
+            or batch_size != text_attention_mask.shape[0]
+        ):
             raise ValueError(
                 "Batch size mismatch: "
                 f"hidden_states={batch_size}, text_hidden_states={text_hidden_states.shape[0]}, "
@@ -649,7 +712,9 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         p = self.config.patch_size
         if height % p != 0 or width % p != 0:
-            raise ValueError(f"Input latent H/W must be divisible by patch_size={p}, got {height}x{width}")
+            raise ValueError(
+                f"Input latent H/W must be divisible by patch_size={p}, got {height}x{width}"
+            )
         return batch_size, height, width
 
     def _prepare_embeddings(
@@ -666,9 +731,13 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         device = hidden_states.device
         p = self.config.patch_size
 
-        temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states.dtype)
+        temb, text_hidden_states = self.time_caption_embed(
+            timestep, text_hidden_states, hidden_states.dtype
+        )
 
-        img_tokens = rearrange(hidden_states, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
+        img_tokens = rearrange(
+            hidden_states, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p
+        )
         img_tokens = self.x_embedder(img_tokens)
 
         img_len = (height // p) * (width // p)
@@ -720,14 +789,18 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         temb: torch.Tensor,
     ):
         for layer in self.context_refiner:
-            text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
+            text_hidden_states = layer(
+                text_hidden_states, text_attention_mask, context_rotary_emb
+            )
 
         for layer in self.noise_refiner:
             img_tokens = layer(img_tokens, img_mask, noise_rotary_emb, temb)
 
         return text_hidden_states, img_tokens
 
-    def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
+    def _apply_transformer_layers(
+        self, hidden_states, attention_mask, rotary_emb, temb
+    ):
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
         return hidden_states
@@ -743,7 +816,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         return_dict: bool = False,
     ) -> torch.Tensor:
         batch_size, height, width = self._validate_inputs(
-            hidden_states, text_hidden_states, text_attention_mask, ref_image_hidden_states, return_dict
+            hidden_states,
+            text_hidden_states,
+            text_attention_mask,
+            ref_image_hidden_states,
+            return_dict,
         )
 
         (
@@ -779,14 +856,26 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         )
 
         max_seq_len = max(seq_lengths)
-        attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
-        joint_hidden_states = hidden_states.new_zeros(batch_size, max_seq_len, self.config.hidden_size)
-        for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        attention_mask = hidden_states.new_zeros(
+            batch_size, max_seq_len, dtype=torch.bool
+        )
+        joint_hidden_states = hidden_states.new_zeros(
+            batch_size, max_seq_len, self.config.hidden_size
+        )
+        for i, (encoder_seq_len, seq_len) in enumerate(
+            zip(encoder_seq_lengths, seq_lengths)
+        ):
             attention_mask[i, :seq_len] = True
-            joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
-            joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
+            joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[
+                i, :encoder_seq_len
+            ]
+            joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = (
+                img_tokens[i, :img_len]
+            )
 
-        hidden_states = self._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
+        hidden_states = self._apply_transformer_layers(
+            joint_hidden_states, attention_mask, rotary_emb, temb
+        )
 
         hidden_states = self.norm_out(hidden_states, temb)
 

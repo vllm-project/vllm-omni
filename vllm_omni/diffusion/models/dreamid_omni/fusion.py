@@ -52,17 +52,29 @@ class FusionModel(nn.Module):
         for vid_block in self.video_model.blocks:
             vid_block.cross_attn.k_fusion = nn.Linear(vid_block.dim, vid_block.dim)
             vid_block.cross_attn.v_fusion = nn.Linear(vid_block.dim, vid_block.dim)
-            vid_block.cross_attn.pre_attn_norm_fusion = WanLayerNorm(vid_block.dim, elementwise_affine=True)
+            vid_block.cross_attn.pre_attn_norm_fusion = WanLayerNorm(
+                vid_block.dim, elementwise_affine=True
+            )
             vid_block.cross_attn.norm_k_fusion = (
-                WanRMSNorm(vid_block.dim, eps=1e-6) if vid_block.qk_norm else nn.Identity()
+                WanRMSNorm(vid_block.dim, eps=1e-6)
+                if vid_block.qk_norm
+                else nn.Identity()
             )
 
         for audio_block in self.audio_model.blocks:
-            audio_block.cross_attn.k_fusion = nn.Linear(audio_block.dim, audio_block.dim)
-            audio_block.cross_attn.v_fusion = nn.Linear(audio_block.dim, audio_block.dim)
-            audio_block.cross_attn.pre_attn_norm_fusion = WanLayerNorm(audio_block.dim, elementwise_affine=True)
+            audio_block.cross_attn.k_fusion = nn.Linear(
+                audio_block.dim, audio_block.dim
+            )
+            audio_block.cross_attn.v_fusion = nn.Linear(
+                audio_block.dim, audio_block.dim
+            )
+            audio_block.cross_attn.pre_attn_norm_fusion = WanLayerNorm(
+                audio_block.dim, elementwise_affine=True
+            )
             audio_block.cross_attn.norm_k_fusion = (
-                WanRMSNorm(audio_block.dim, eps=1e-6) if audio_block.qk_norm else nn.Identity()
+                WanRMSNorm(audio_block.dim, eps=1e-6)
+                if audio_block.qk_norm
+                else nn.Identity()
             )
 
     def merge_kwargs(self, vid_kwargs, audio_kwargs):
@@ -117,10 +129,18 @@ class FusionModel(nn.Module):
         # is_vid = src_grid_sizes.shape[1] > 1
         # compute target attention
         target_seq = cross_attn_block.pre_attn_norm_fusion(target_seq)
-        k_target = cross_attn_block.norm_k_fusion(cross_attn_block.k_fusion(target_seq)).view(b, -1, n, d)
+        k_target = cross_attn_block.norm_k_fusion(
+            cross_attn_block.k_fusion(target_seq)
+        ).view(b, -1, n, d)
         v_target = cross_attn_block.v_fusion(target_seq).view(b, -1, n, d)
 
-        q = rope_apply(q, src_grid_sizes, src_freqs, ref_lengths=src_ref_lengths, freqs_scaling=src_freqs_scaling)
+        q = rope_apply(
+            q,
+            src_grid_sizes,
+            src_freqs,
+            ref_lengths=src_ref_lengths,
+            freqs_scaling=src_freqs_scaling,
+        )
         k_target = rope_apply(
             k_target,
             target_grid_sizes,
@@ -172,8 +192,13 @@ class FusionModel(nn.Module):
             target_ref_lengths=target_ref_lengths,
             target_freqs_scaling=target_freqs_scaling,
         )
-        y = attn_block.ffn(attn_block.norm2(src_seq).bfloat16() * (1 + src_e[4].squeeze(2)) + src_e[3].squeeze(2))
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+        y = attn_block.ffn(
+            attn_block.norm2(src_seq).bfloat16() * (1 + src_e[4].squeeze(2))
+            + src_e[3].squeeze(2)
+        )
+        with torch.autocast(
+            device_type=self.device.type, dtype=torch.bfloat16, enabled=True
+        ):
             src_seq = src_seq + y * src_e[5].squeeze(2)
         return src_seq
 
@@ -202,42 +227,56 @@ class FusionModel(nn.Module):
     ):
         ## audio modulation
         assert audio_e.dtype == torch.bfloat16
-        assert len(audio_e.shape) == 4 and audio_e.size(2) == 6 and audio_e.shape[1] == audio.shape[1], (
-            f"{audio_e.shape}, {audio.shape}"
-        )
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+        assert (
+            len(audio_e.shape) == 4
+            and audio_e.size(2) == 6
+            and audio_e.shape[1] == audio.shape[1]
+        ), f"{audio_e.shape}, {audio.shape}"
+        with torch.autocast(
+            device_type=self.device.type, dtype=torch.bfloat16, enabled=True
+        ):
             audio_e = audio_block.modulation(audio_e).chunk(6, dim=2)
         assert audio_e[0].dtype == torch.bfloat16
 
         # audio self-attention
         audio_y = audio_block.self_attn(
-            audio_block.norm1(audio).bfloat16() * (1 + audio_e[1].squeeze(2)) + audio_e[0].squeeze(2),
+            audio_block.norm1(audio).bfloat16() * (1 + audio_e[1].squeeze(2))
+            + audio_e[0].squeeze(2),
             audio_seq_lens,
             audio_grid_sizes,
             audio_freqs,
             ref_lengths=audio_ref_lengths,
             freqs_scaling=audio_freqs_scaling,
         )
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+        with torch.autocast(
+            device_type=self.device.type, dtype=torch.bfloat16, enabled=True
+        ):
             audio = audio + audio_y * audio_e[2].squeeze(2)
 
         ## video modulation
-        assert len(vid_e.shape) == 4 and vid_e.size(2) == 6 and vid_e.shape[1] == vid.shape[1], (
-            f"{vid_e.shape}, {vid.shape}"
-        )
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+        assert (
+            len(vid_e.shape) == 4
+            and vid_e.size(2) == 6
+            and vid_e.shape[1] == vid.shape[1]
+        ), f"{vid_e.shape}, {vid.shape}"
+        with torch.autocast(
+            device_type=self.device.type, dtype=torch.bfloat16, enabled=True
+        ):
             vid_e = vid_block.modulation(vid_e).chunk(6, dim=2)
 
         # video self-attention
         vid_y = vid_block.self_attn(
-            vid_block.norm1(vid).bfloat16() * (1 + vid_e[1].squeeze(2)) + vid_e[0].squeeze(2),
+            vid_block.norm1(vid).bfloat16() * (1 + vid_e[1].squeeze(2))
+            + vid_e[0].squeeze(2),
             vid_seq_lens,
             vid_grid_sizes,
             vid_freqs,
             ref_lengths=vid_ref_lengths,
         )
 
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+        with torch.autocast(
+            device_type=self.device.type, dtype=torch.bfloat16, enabled=True
+        ):
             vid = vid + vid_y * vid_e[2].squeeze(2)
 
         og_audio = audio
@@ -261,7 +300,9 @@ class FusionModel(nn.Module):
             target_freqs_scaling=None,
         )
 
-        assert not torch.equal(og_audio, audio), "Audio should be changed after cross-attention!"
+        assert not torch.equal(
+            og_audio, audio
+        ), "Audio should be changed after cross-attention!"
 
         # video cross-attention
         vid = self.single_fusion_cross_attention_ffn_forward(
@@ -299,16 +340,22 @@ class FusionModel(nn.Module):
         freqs_scaling=None,
     ):
         vid, vid_e, vid_kwargs = self.video_model.prepare_transformer_block_kwargs(
-            x=vid, t=t, context=vid_context, seq_len=vid_seq_len, ref_lengths=ref_ip_lengths
+            x=vid,
+            t=t,
+            context=vid_context,
+            seq_len=vid_seq_len,
+            ref_lengths=ref_ip_lengths,
         )
 
-        audio, audio_e, audio_kwargs = self.audio_model.prepare_transformer_block_kwargs(
-            x=audio,
-            t=t,
-            context=audio_context,
-            seq_len=audio_seq_len,
-            ref_lengths=ref_audio_lengths,
-            freqs_scaling=freqs_scaling,
+        audio, audio_e, audio_kwargs = (
+            self.audio_model.prepare_transformer_block_kwargs(
+                x=audio,
+                t=t,
+                context=audio_context,
+                seq_len=audio_seq_len,
+                ref_lengths=ref_audio_lengths,
+                freqs_scaling=freqs_scaling,
+            )
         )
 
         kwargs = self.merge_kwargs(vid_kwargs, audio_kwargs)
@@ -322,11 +369,19 @@ class FusionModel(nn.Module):
             audio_block = self.audio_model.blocks[i]
 
             vid, audio = self.single_fusion_block_forward(
-                vid_block=vid_block, audio_block=audio_block, vid=vid, audio=audio, **kwargs
+                vid_block=vid_block,
+                audio_block=audio_block,
+                vid=vid,
+                audio=audio,
+                **kwargs,
             )
 
-        vid = self.video_model.post_transformer_block_out(vid, vid_kwargs["grid_sizes"], vid_e)
-        audio = self.audio_model.post_transformer_block_out(audio, audio_kwargs["grid_sizes"], audio_e)
+        vid = self.video_model.post_transformer_block_out(
+            vid, vid_kwargs["grid_sizes"], vid_e
+        )
+        audio = self.audio_model.post_transformer_block_out(
+            audio, audio_kwargs["grid_sizes"], audio_e
+        )
 
         return vid, audio
 

@@ -20,7 +20,10 @@ from vllm.lora.utils import (
     get_supported_lora_modules,
     replace_submodule,
 )
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+)
 
 from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.utils import (
@@ -102,7 +105,11 @@ class DiffusionLoRAManager:
         )
 
         if lora_path is not None:
-            logger.info("Loading LoRA during initialization from %s with scale %.2f", lora_path, lora_scale)
+            logger.info(
+                "Loading LoRA during initialization from %s with scale %.2f",
+                lora_path,
+                lora_scale,
+            )
             init_request = LoRARequest(
                 lora_name="static",
                 lora_int_id=stable_lora_int_id(lora_path),
@@ -146,7 +153,9 @@ class DiffusionLoRAManager:
         model's `stacked_params_mapping`.
         """
 
-        def _derive_from_stacked_params_mapping(stacked: object) -> dict[str, list[str]]:
+        def _derive_from_stacked_params_mapping(
+            stacked: object,
+        ) -> dict[str, list[str]]:
             if not isinstance(stacked, (list, tuple)):
                 return {}
             derived: dict[str, list[str]] = {}
@@ -172,11 +181,15 @@ class DiffusionLoRAManager:
 
         mapping: dict[str, list[str]] = {}
         for module in self.pipeline.modules():
-            derived = _derive_from_stacked_params_mapping(getattr(module, "stacked_params_mapping", None))
+            derived = _derive_from_stacked_params_mapping(
+                getattr(module, "stacked_params_mapping", None)
+            )
             for packed_name, sub_names in derived.items():
                 if not isinstance(packed_name, str) or not packed_name:
                     continue
-                if not isinstance(sub_names, (list, tuple)) or not all(isinstance(s, str) for s in sub_names):
+                if not isinstance(sub_names, (list, tuple)) or not all(
+                    isinstance(s, str) for s in sub_names
+                ):
                     continue
                 sub_names_list = list(sub_names)
                 if not sub_names_list:
@@ -196,7 +209,9 @@ class DiffusionLoRAManager:
 
         return mapping
 
-    def _get_packed_sublayer_suffixes(self, packed_module_suffix: str, n_slices: int) -> list[str] | None:
+    def _get_packed_sublayer_suffixes(
+        self, packed_module_suffix: str, n_slices: int
+    ) -> list[str] | None:
         sub_suffixes = self._packed_modules_mapping.get(packed_module_suffix)
         if not sub_suffixes:
             return None
@@ -210,7 +225,9 @@ class DiffusionLoRAManager:
             return None
         return sub_suffixes
 
-    def set_active_adapter(self, lora_request: LoRARequest | None, lora_scale: float = 1.0) -> None:
+    def set_active_adapter(
+        self, lora_request: LoRARequest | None, lora_scale: float = 1.0
+    ) -> None:
         """Set the active LoRA adapter for the pipeline.
 
         Args:
@@ -222,7 +239,9 @@ class DiffusionLoRAManager:
             self._deactivate_all_adapters()
             return
         elif math.isclose(0.0, lora_scale):
-            logger.warning("Received a request with LoRA scale 0; deactivating all LoRA adapters")
+            logger.warning(
+                "Received a request with LoRA scale 0; deactivating all LoRA adapters"
+            )
             self._deactivate_all_adapters()
             return
 
@@ -237,7 +256,11 @@ class DiffusionLoRAManager:
             self.max_cached_adapters,
         )
         if adapter_id not in self._registered_adapters:
-            logger.info("Loading new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
+            logger.info(
+                "Loading new adapter: id=%d, name=%s",
+                adapter_id,
+                lora_request.lora_name,
+            )
             # Add the adapter + add to the cache
             self.add_adapter(lora_request)
         else:
@@ -271,7 +294,9 @@ class DiffusionLoRAManager:
         lora_request: LoRARequest,
     ) -> tuple[LoRAModel, PEFTHelper]:
         if not self._expected_lora_modules:
-            raise ValueError("No supported LoRA modules found in the diffusion pipeline.")
+            raise ValueError(
+                "No supported LoRA modules found in the diffusion pipeline."
+            )
 
         logger.debug("Supported LoRA modules: %s", self._expected_lora_modules)
 
@@ -371,23 +396,34 @@ class DiffusionLoRAManager:
                 # Don't recurse into already-replaced LoRA wrappers. Their
                 # original LinearBase lives under "base_layer", and replacing
                 # that again would nest LoRA wrappers and break execution.
-                if isinstance(module, BaseLayerWithLoRA) or "base_layer" in module_name.split("."):
+                if isinstance(
+                    module, BaseLayerWithLoRA
+                ) or "base_layer" in module_name.split("."):
                     continue
 
                 full_module_name = f"{component_name}.{module_name}"
                 if full_module_name in self._lora_modules:
-                    logger.debug("Layer %s already replaced, skipping", full_module_name)
+                    logger.debug(
+                        "Layer %s already replaced, skipping", full_module_name
+                    )
                     continue
 
                 packed_modules_list = self._get_packed_modules_list(module)
-                if target_modules_pattern is not None or target_modules_list is not None:
+                if (
+                    target_modules_pattern is not None
+                    or target_modules_list is not None
+                ):
                     should_replace = _matches_target(full_module_name)
                     if not should_replace and len(packed_modules_list) > 1:
                         prefix, _, packed_suffix = full_module_name.rpartition(".")
-                        sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, len(packed_modules_list))
+                        sub_suffixes = self._get_packed_sublayer_suffixes(
+                            packed_suffix, len(packed_modules_list)
+                        )
                         if sub_suffixes is not None:
                             for sub_suffix in sub_suffixes:
-                                sub_full_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
+                                sub_full_name = (
+                                    f"{prefix}.{sub_suffix}" if prefix else sub_suffix
+                                )
                                 if _matches_target(sub_full_name):
                                     should_replace = True
                                     break
@@ -403,10 +439,16 @@ class DiffusionLoRAManager:
                     model_config=None,
                 )
 
-                if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
+                if lora_layer is not module and isinstance(
+                    lora_layer, BaseLayerWithLoRA
+                ):
                     replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
-                    logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
+                    logger.debug(
+                        "Replaced layer: %s -> %s",
+                        full_module_name,
+                        type(lora_layer).__name__,
+                    )
 
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
@@ -420,7 +462,9 @@ class DiffusionLoRAManager:
 
         valid_max_rank = self._get_smallest_valid_max_rank(min_rank)
 
-        logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
+        logger.info(
+            "Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank
+        )
         self._max_lora_rank = valid_max_rank
 
         if not self._lora_modules:
@@ -436,7 +480,9 @@ class DiffusionLoRAManager:
 
         # Recreate per-layer buffers with the new maximum rank.
         for lora_layer in self._lora_modules.values():
-            lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+            lora_layer.create_lora_weights(
+                max_loras=1, lora_config=lora_config, model_config=None
+            )
 
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
@@ -453,7 +499,9 @@ class DiffusionLoRAManager:
 
         allowed_ranks = [rank for rank in cls._VALID_MAX_RANKS if rank >= min_rank]
         if not allowed_ranks:
-            raise ValueError(f"LoRA rank of {min_rank} exceeds max allowed rank of {max(cls._VALID_MAX_RANKS)}")
+            raise ValueError(
+                f"LoRA rank of {min_rank} exceeds max allowed rank of {max(cls._VALID_MAX_RANKS)}"
+            )
 
         return min(allowed_ranks)
 
@@ -473,7 +521,11 @@ class DiffusionLoRAManager:
         if lora_weights is not None:
             return lora_weights
 
-        component_relative_name = full_module_name.split(".", 1)[-1] if "." in full_module_name else full_module_name
+        component_relative_name = (
+            full_module_name.split(".", 1)[-1]
+            if "." in full_module_name
+            else full_module_name
+        )
         lora_weights = lora_model.get_lora(component_relative_name)
         if lora_weights is not None:
             return lora_weights
@@ -490,7 +542,9 @@ class DiffusionLoRAManager:
 
     def _activate_adapter(self, adapter_id: int, scale: float) -> None:
         if self._is_active_at_scale(adapter_id, scale):
-            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
+            logger.debug(
+                "Adapter %d already active at scale %.3f skipping", adapter_id, scale
+            )
             return
 
         logger.info("Activating adapter: id=%d", adapter_id)
@@ -504,7 +558,9 @@ class DiffusionLoRAManager:
                 n_slices = getattr(lora_layer, "n_slices", 1)
                 if n_slices > 1:
                     prefix, _, packed_suffix = full_module_name.rpartition(".")
-                    sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, n_slices)
+                    sub_suffixes = self._get_packed_sublayer_suffixes(
+                        packed_suffix, n_slices
+                    )
                     if sub_suffixes is None:
                         lora_layer.reset_lora(0)
                         continue
@@ -512,14 +568,18 @@ class DiffusionLoRAManager:
                     sub_loras: list[LoRALayerWeights | None] = []
                     any_found = False
                     for sub_suffix in sub_suffixes:
-                        sub_full_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
+                        sub_full_name = (
+                            f"{prefix}.{sub_suffix}" if prefix else sub_suffix
+                        )
                         sub_lora = self._get_lora_weights(lora_model, sub_full_name)
                         if sub_lora is not None:
                             any_found = True
                             # Packed layers expect plain (non-packed) subloras.
                             if isinstance(sub_lora, PackedLoRALayerWeights):
                                 sub_lora = None
-                        sub_loras.append(sub_lora if isinstance(sub_lora, LoRALayerWeights) else None)
+                        sub_loras.append(
+                            sub_lora if isinstance(sub_lora, LoRALayerWeights) else None
+                        )
 
                     if not any_found:
                         lora_layer.reset_lora(0)
@@ -580,7 +640,9 @@ class DiffusionLoRAManager:
                     lora_layer.reset_lora(0)
                     continue
 
-                b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
+                b_splits = list(
+                    torch.split(lora_weights.lora_b, list(output_slices), dim=0)
+                )
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
@@ -592,7 +654,9 @@ class DiffusionLoRAManager:
                 continue
 
             scaled_lora_b = lora_weights.lora_b * scale
-            lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
+            lora_layer.set_lora(
+                index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b
+            )
             logger.debug(
                 "Activated LoRA for %s: lora_a shape=%s, lora_b shape=%s, scale=%.2f",
                 full_module_name,
@@ -616,7 +680,11 @@ class DiffusionLoRAManager:
         adapter to be loaded."""
         while len(self._registered_adapters) > (self.max_cached_adapters - 1):
             # Pick LRU among non-pinned adapters
-            evict_candidates = [aid for aid in self._adapter_access_order.keys() if aid not in self._pinned_adapters]
+            evict_candidates = [
+                aid
+                for aid in self._adapter_access_order.keys()
+                if aid not in self._pinned_adapters
+            ]
             if not evict_candidates:
                 logger.warning(
                     "Cache full (%d) but all adapters are pinned; cannot evict. "
@@ -644,7 +712,9 @@ class DiffusionLoRAManager:
             logger.debug("Adapter %d already registered, skipping", adapter_id)
             return False
 
-        logger.info("Adding new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
+        logger.info(
+            "Adding new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name
+        )
 
         # evict if cache full before adding the new adapter
         # so that we don't go over capacity on the new load
@@ -658,7 +728,10 @@ class DiffusionLoRAManager:
         self._replace_layers_with_lora(peft_helper)
 
         logger.debug(
-            "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters
+            "Adapter %d added, cache size: %d/%d",
+            adapter_id,
+            len(self._registered_adapters),
+            self.max_cached_adapters,
         )
         return True
 

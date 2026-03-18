@@ -194,7 +194,9 @@ class Qwen3OmniCodePredictorDecoderLayer(nn.Module):
         )
         cp_cfg = config.code_predictor_config
         self.input_layernorm = RMSNorm(cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -231,7 +233,10 @@ class Qwen3OmniCodePredictorBaseModel(nn.Module):
         self.config = config
 
         self.codec_embedding = nn.ModuleList(
-            [VocabParallelEmbedding(config.vocab_size, config.hidden_size) for _ in range(config.num_code_groups - 1)]
+            [
+                VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+                for _ in range(config.num_code_groups - 1)
+            ]
         )
 
         self.layers = nn.ModuleList(
@@ -324,7 +329,9 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
     #  Lazy-init helpers
     # ------------------------------------------------------------------
 
-    def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
+    def _ensure_buffers(
+        self, bsz: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
         max_seq = self.num_code_groups + 1
         if (
             self._proj_buf is not None
@@ -333,7 +340,9 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             and self._proj_buf.dtype == dtype
         ):
             return
-        self._proj_buf = torch.zeros(bsz, max_seq, self._hidden_size, dtype=dtype, device=device)
+        self._proj_buf = torch.zeros(
+            bsz, max_seq, self._hidden_size, dtype=dtype, device=device
+        )
         self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device)
 
     def _ensure_cached_refs(self) -> None:
@@ -410,7 +419,9 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         for step in range(1, num_groups):
             seq_len = step + 1
             projected = proj_buf[:bsz, :seq_len, :]
-            step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+            step_pos_ids = (
+                pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+            )
 
             hidden_out = model_fwd(projected, step_pos_ids)
 

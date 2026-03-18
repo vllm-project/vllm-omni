@@ -8,7 +8,9 @@ import PIL.Image
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import QwenImageEditPipeline
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
+    QwenImageEditPipeline,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = logging.getLogger(__name__)
@@ -69,10 +71,14 @@ class CustomPipeline(QwenImageEditPipeline):
         )
 
         # Get actual num_inference_steps used
-        actual_num_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        actual_num_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
 
         # Create dummy trajectory data
-        dummy_trajectory_latents = torch.randn(actual_num_steps, 1, 16, 64, 64, dtype=torch.float32)
+        dummy_trajectory_latents = torch.randn(
+            actual_num_steps, 1, 16, 64, 64, dtype=torch.float32
+        )
 
         # Inject dummy trajectory data into output
         output.trajectory_latents = dummy_trajectory_latents

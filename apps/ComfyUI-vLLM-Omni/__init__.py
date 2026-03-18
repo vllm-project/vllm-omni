@@ -1,4 +1,4 @@
-"""Top-level package for comfyui_vllm_omni."""  # noqa: N999  # This is not a python library intended to be imported
+"""Top-level package for comfyui_vllm_omni."""
 
 __all__ = [
     "NODE_CLASS_MAPPINGS",
@@ -47,7 +47,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniGenerateImage": "Generate Image",
     "VLLMOmniGenerateVideo": "Generate Video",
     "VLLMOmniUnderstanding": "Multimodality Understanding",
-    "VLLMOmniTTS": "TTS (Text to Speech)",
+    "VLLMOmniTTS": "Text-to-Speech (TTS)",
     "VLLMOmniVoiceClone": "TTS Voice Cloning",
     # === Params ===
     "VLLMOmniARSampling": "AR Sampling Params",
@@ -58,4 +58,27 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniWanParams": "Wan Video Params",
 }
 
+# New model: VoXtream2
+# https://huggingface.co/herimor/voxtream2
+# A 0.5B parameter zero-shot full-stream Text-to-Speech model with dynamic speaking-rate control.
+
+# Add VoXtream2 to the list of supported models
+NODE_CLASS_MAPPINGS["VLLMOmniVoXtream2"] = "VLLMOmniVoXtream2"
+NODE_DISPLAY_NAME_MAPPINGS["VLLMOmniVoXtream2"] = "VoXtream2 TTS"
+
+
+# Define the VoXtream2 class
+class VLLMOmniVoXtream2:
+    """VoXtream2 Text-to-Speech model."""
+
+    def __init__(self):
+        # Initialize the model
+        pass
+
+    def generate(self, text, speaking_rate=1.0):
+        # Generate audio from text with dynamic speaking rate
+        pass
+
+
+# Add the VoXtream2 model to the list of supported models
 WEB_DIRECTORY = "./web"

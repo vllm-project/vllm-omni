@@ -6,14 +6,30 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
+from diffusers.models.embeddings import (
+    TimestepEmbedding,
+    Timesteps,
+    apply_rotary_emb,
+    get_1d_rotary_pos_embed,
+)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
-from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from diffusers.models.normalization import (
+    AdaLayerNormContinuous,
+    AdaLayerNormZero,
+    AdaLayerNormZeroSingle,
+)
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -30,7 +46,9 @@ logger = init_logger(__name__)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, dim_out: int | None = None, mult: int = 4, bias: bool = True):
+    def __init__(
+        self, dim: int, dim_out: int | None = None, mult: int = 4, bias: bool = True
+    ):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
@@ -101,7 +119,9 @@ class LongCatImageAttention(nn.Module):
                 bias=added_proj_bias,
             )
 
-            self.to_add_out = RowParallelLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(
+                self.inner_dim, query_dim, bias=out_bias
+            )
 
         self.attn = Attention(
             num_heads=heads,
@@ -141,7 +161,9 @@ class LongCatImageAttention(nn.Module):
             txt_rotary_emb = (freqs_cos[:text_seq_len], freqs_sin[:text_seq_len])
             img_rotary_emb_split = (freqs_cos[text_seq_len:], freqs_sin[text_seq_len:])
             # Apply RoPE to image Q/K
-            img_query = apply_rotary_emb(img_query, img_rotary_emb_split, sequence_dim=1)
+            img_query = apply_rotary_emb(
+                img_query, img_rotary_emb_split, sequence_dim=1
+            )
             img_key = apply_rotary_emb(img_key, img_rotary_emb_split, sequence_dim=1)
             # Apply RoPE to text Q/K
             text_query = apply_rotary_emb(text_query, txt_rotary_emb, sequence_dim=1)
@@ -199,11 +221,17 @@ class LongCatImageAttention(nn.Module):
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             q_size = self.add_kv_proj.num_heads * self.head_dim
             kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
-            encoder_query, encoder_key, encoder_value = encoder_qkv.split([q_size, kv_size, kv_size], dim=-1)
+            encoder_query, encoder_key, encoder_value = encoder_qkv.split(
+                [q_size, kv_size, kv_size], dim=-1
+            )
 
-            encoder_query = encoder_query.unflatten(-1, (self.add_kv_proj.num_heads, -1))
+            encoder_query = encoder_query.unflatten(
+                -1, (self.add_kv_proj.num_heads, -1)
+            )
             encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
+            encoder_value = encoder_value.unflatten(
+                -1, (self.add_kv_proj.num_kv_heads, -1)
+            )
 
             # Apply RMSNorm to text Q/K
             encoder_query = self.norm_added_q(encoder_query)
@@ -230,8 +258,12 @@ class LongCatImageAttention(nn.Module):
 
                 if image_rotary_emb is not None:
                     # Apply RoPE to full (text + image) sequence
-                    joint_query = apply_rotary_emb(joint_query, image_rotary_emb, sequence_dim=1)
-                    joint_key = apply_rotary_emb(joint_key, image_rotary_emb, sequence_dim=1)
+                    joint_query = apply_rotary_emb(
+                        joint_query, image_rotary_emb, sequence_dim=1
+                    )
+                    joint_key = apply_rotary_emb(
+                        joint_key, image_rotary_emb, sequence_dim=1
+                    )
 
                 hidden_states = self.attn(
                     joint_query,
@@ -291,7 +323,11 @@ class LongCatImageAttention(nn.Module):
             # In SP mode: seq_len = txt_seq_len + img_seq_len // SP
             # In non-SP mode: seq_len = txt_seq_len + img_seq_len
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+                [
+                    encoder_hidden_states.shape[1],
+                    hidden_states.shape[1] - encoder_hidden_states.shape[1],
+                ],
+                dim=1,
             )
             hidden_states, _ = self.to_out(hidden_states)
             encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
@@ -346,9 +382,11 @@ class LongCatImageTransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
-        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-            encoder_hidden_states, emb=temb
+        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+            hidden_states, emb=temb
+        )
+        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = (
+            self.norm1_context(encoder_hidden_states, emb=temb)
         )
         joint_attention_kwargs = joint_attention_kwargs or {}
 
@@ -370,7 +408,9 @@ class LongCatImageTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm_hidden_states = (
+            norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        )
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -384,10 +424,15 @@ class LongCatImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+        norm_encoder_hidden_states = (
+            norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
+            + c_shift_mlp[:, None]
+        )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        encoder_hidden_states = (
+            encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
@@ -428,12 +473,18 @@ class LongCatImageTimestepEmbeddings(nn.Module):
     def __init__(self, embedding_dim):
         super().__init__()
 
-        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
 
     def forward(self, timestep, hidden_dtype):
         timesteps_proj = self.time_proj(timestep)
-        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_dtype))  # (N, D)
+        timesteps_emb = self.timestep_embedder(
+            timesteps_proj.to(dtype=hidden_dtype)
+        )  # (N, D)
 
         return timesteps_emb
 
@@ -570,7 +621,10 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
-        encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+        encoder_hidden_states, hidden_states = (
+            hidden_states[:, :text_seq_len],
+            hidden_states[:, text_seq_len:],
+        )
         return encoder_hidden_states, hidden_states
 
 
@@ -581,7 +635,10 @@ class LongCatImageTransformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
-    _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
+    _repeated_blocks = [
+        "LongCatImageTransformerBlock",
+        "LongCatImageSingleTransformerBlock",
+    ]
 
     # Sequence Parallelism for LongCat (following diffusers' _cp_plan pattern)
     _sp_plan = {
@@ -654,8 +711,12 @@ class LongCatImageTransformer2DModel(nn.Module):
             ]
         )
 
-        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+        self.norm_out = AdaLayerNormContinuous(
+            self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
+        )
+        self.proj_out = nn.Linear(
+            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
+        )
 
         self.gradient_checkpointing = False
 

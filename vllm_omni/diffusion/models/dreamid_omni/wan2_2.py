@@ -64,7 +64,9 @@ class WanSelfAttention(nn.Module):
         v = self.v(x).view(b, s, n, d)
         return q, k, v
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, ref_lengths=None, freqs_scaling=None):
+    def forward(
+        self, x, seq_lens, grid_sizes, freqs, ref_lengths=None, freqs_scaling=None
+    ):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
@@ -76,8 +78,20 @@ class WanSelfAttention(nn.Module):
         q, k, v = self.qkv_fn(x)
 
         x = self.attn(
-            rope_apply(q, grid_sizes, freqs, ref_lengths=ref_lengths, freqs_scaling=freqs_scaling),
-            rope_apply(k, grid_sizes, freqs, ref_lengths=ref_lengths, freqs_scaling=freqs_scaling),
+            rope_apply(
+                q,
+                grid_sizes,
+                freqs,
+                ref_lengths=ref_lengths,
+                freqs_scaling=freqs_scaling,
+            ),
+            rope_apply(
+                k,
+                grid_sizes,
+                freqs,
+                ref_lengths=ref_lengths,
+                freqs_scaling=freqs_scaling,
+            ),
             v,
         )
 
@@ -121,7 +135,9 @@ class WanI2VCrossAttention(nn.Module):
         super().__init__()
 
     def forward(self, *args, **kwargs):
-        raise RuntimeError("WanT2VCrossAttention is currently disabled and should not be used.")
+        raise RuntimeError(
+            "WanT2VCrossAttention is currently disabled and should not be used."
+        )
 
 
 WAN_CROSSATTENTION_CLASSES = {
@@ -155,12 +171,22 @@ class WanAttentionBlock(nn.Module):
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
-        self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.norm3 = (
+            WanLayerNorm(dim, eps, elementwise_affine=True)
+            if cross_attn_norm
+            else nn.Identity()
+        )
         if cross_attn_type == "i2v_cross_attn":
-            assert additional_emb_length is not None, "additional_emb_length should be specified for i2v_cross_attn"
-            self.cross_attn = WanI2VCrossAttention(dim, num_heads, (-1, -1), qk_norm, eps, additional_emb_length)
+            assert (
+                additional_emb_length is not None
+            ), "additional_emb_length should be specified for i2v_cross_attn"
+            self.cross_attn = WanI2VCrossAttention(
+                dim, num_heads, (-1, -1), qk_norm, eps, additional_emb_length
+            )
         else:
-            assert additional_emb_length is None, "additional_emb_length should be None for t2v_cross_attn"
+            assert (
+                additional_emb_length is None
+            ), "additional_emb_length should be None for t2v_cross_attn"
             self.cross_attn = WanT2VCrossAttention(
                 dim,
                 num_heads,
@@ -169,7 +195,11 @@ class WanAttentionBlock(nn.Module):
                 eps,
             )
         self.norm2 = WanLayerNorm(dim, eps)
-        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ffn_dim, dim),
+        )
 
         # modulation
         self.modulation = ModulationAdd(dim, 6)
@@ -193,14 +223,19 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.bfloat16
-        assert len(e.shape) == 4 and e.size(2) == 6 and e.shape[1] == x.shape[1], f"{e.shape}, {x.shape}"
+        assert (
+            len(e.shape) == 4 and e.size(2) == 6 and e.shape[1] == x.shape[1]
+        ), f"{e.shape}, {x.shape}"
         with amp.autocast("cuda", dtype=torch.bfloat16):
             e = self.modulation(e).chunk(6, dim=2)
         assert e[0].dtype == torch.bfloat16
 
         # self-attention
         y = self.self_attn(
-            self.norm1(x).bfloat16() * (1 + e[1].squeeze(2)) + e[0].squeeze(2), seq_lens, grid_sizes, freqs
+            self.norm1(x).bfloat16() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
+            seq_lens,
+            grid_sizes,
+            freqs,
         )
         with amp.autocast("cuda", dtype=torch.bfloat16):
             x = x + y * e[2].squeeze(2)
@@ -208,7 +243,9 @@ class WanAttentionBlock(nn.Module):
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(self.norm2(x).bfloat16() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
+            y = self.ffn(
+                self.norm2(x).bfloat16() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)
+            )
             with amp.autocast("cuda", dtype=torch.bfloat16):
                 x = x + y * e[5].squeeze(2)
             return x
@@ -292,12 +329,14 @@ class WanModel(ModelMixin, ConfigMixin):
         self.model_type = model_type
         is_audio_type = "a" in self.model_type
         is_video_type = "v" in self.model_type
-        assert is_audio_type ^ is_video_type, "Either audio or video model should be specified"
+        assert (
+            is_audio_type ^ is_video_type
+        ), "Either audio or video model should be specified"
         if is_audio_type:
             ## audio model
-            assert len(patch_size) == 1 and patch_size[0] == 1, (
-                "Audio model should only accept 1 dimensional input, and we dont do patchify"
-            )
+            assert (
+                len(patch_size) == 1 and patch_size[0] == 1
+            ), "Audio model should only accept 1 dimensional input, and we dont do patchify"
 
         self.patch_size = patch_size
         self.text_len = text_len
@@ -325,25 +364,35 @@ class WanModel(ModelMixin, ConfigMixin):
                 ConvMLP(dim, dim * 4, kernel_size=7, padding=3),
             )
         else:
-            self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
+            self.patch_embedding = nn.Conv3d(
+                in_dim, dim, kernel_size=patch_size, stride=patch_size
+            )
 
-        self.text_embedding = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
+        self.text_embedding = nn.Sequential(
+            nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
+        )
 
-        self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
+        )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
 
         # blocks
         ## so i2v and tt2a share the same cross attention while t2v and t2a share the same cross attention
-        cross_attn_type = "t2v_cross_attn" if model_type in ["t2v", "t2a", "ti2v"] else "i2v_cross_attn"
+        cross_attn_type = (
+            "t2v_cross_attn"
+            if model_type in ["t2v", "t2a", "ti2v"]
+            else "i2v_cross_attn"
+        )
 
         if cross_attn_type == "t2v_cross_attn":
-            assert additional_emb_dim is None and additional_emb_length is None, (
-                "additional_emb_length should be None for t2v and t2a model"
-            )
+            assert (
+                additional_emb_dim is None and additional_emb_length is None
+            ), "additional_emb_length should be None for t2v and t2a model"
         else:
-            assert additional_emb_dim is not None and additional_emb_length is not None, (
-                "additional_emb_length should be specified for i2v and tt2a model"
-            )
+            assert (
+                additional_emb_dim is not None and additional_emb_length is not None
+            ), "additional_emb_length should be specified for i2v and tt2a model"
 
         self.blocks = nn.ModuleList(
             [
@@ -380,10 +429,16 @@ class WanModel(ModelMixin, ConfigMixin):
         if self.is_audio_type:
             ## to be determined
             # self.freqs = rope_params(1024, d, freqs_scaling=temporal_rope_scaling_factor)
-            self.freqs = rope_params(1024, d - 4 * (d // 6), freqs_scaling=self.temporal_rope_scaling_factor)
+            self.freqs = rope_params(
+                1024, d - 4 * (d // 6), freqs_scaling=self.temporal_rope_scaling_factor
+            )
         else:
             self.freqs = torch.cat(
-                [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))],
+                [
+                    rope_params(1024, d - 4 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6)),
+                ],
                 dim=1,
             )
 
@@ -407,26 +462,41 @@ class WanModel(ModelMixin, ConfigMixin):
                 scale_val = freqs_scaling
             d = self.dim // self.num_heads
 
-            current_freqs = rope_params(1024, d - 4 * (d // 6), freqs_scaling=scale_val).to(device)
+            current_freqs = rope_params(
+                1024, d - 4 * (d // 6), freqs_scaling=scale_val
+            ).to(device)
         else:
             current_freqs = self.freqs
             if current_freqs.device != device:
                 current_freqs = current_freqs.to(device)
 
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]  ## x is list of [B L D] or [B C F H W]
+        x = [
+            self.patch_embedding(u.unsqueeze(0)) for u in x
+        ]  ## x is list of [B L D] or [B C F H W]
         if self.is_audio_type:
             # [B, 1]
-            grid_sizes = torch.stack([torch.tensor(u.shape[1:2], dtype=torch.long) for u in x])
+            grid_sizes = torch.stack(
+                [torch.tensor(u.shape[1:2], dtype=torch.long) for u in x]
+            )
         else:
             # [B, 3]
-            grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-            x = [u.flatten(2).transpose(1, 2) for u in x]  # [B C F H W] -> [B (F H W) C] -> [B L C]
+            grid_sizes = torch.stack(
+                [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
+            )
+            x = [
+                u.flatten(2).transpose(1, 2) for u in x
+            ]  # [B C F H W] -> [B (F H W) C] -> [B L C]
 
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len, f"Sequence length {seq_lens.max()} exceeds maximum {seq_len}."
+        assert (
+            seq_lens.max() <= seq_len
+        ), f"Sequence length {seq_lens.max()} exceeds maximum {seq_len}."
         x = torch.cat(
-            [torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x]
+            [
+                torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
+                for u in x
+            ]
         )  # single [B, L, C]
 
         # time embeddings
@@ -435,14 +505,25 @@ class WanModel(ModelMixin, ConfigMixin):
         with amp.autocast("cuda", dtype=torch.bfloat16):
             bt = t.size(0)
             t = t.flatten()
-            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_len)).bfloat16())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))  # [1, 26784, 6, 3072] - B, seq_len, 6, dim
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t)
+                .unflatten(0, (bt, seq_len))
+                .bfloat16()
+            )
+            e0 = self.time_projection(e).unflatten(
+                2, (6, self.dim)
+            )  # [1, 26784, 6, 3072] - B, seq_len, 6, dim
             assert e.dtype == torch.bfloat16 and e0.dtype == torch.bfloat16
 
         # context
         context_lens = None
         context = self.text_embedding(
-            torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
+            torch.stack(
+                [
+                    torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    for u in context
+                ]
+            )
         )
 
         # arguments

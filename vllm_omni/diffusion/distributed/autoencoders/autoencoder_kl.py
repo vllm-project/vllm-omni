@@ -39,7 +39,12 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         tiletask_list = []
         for i in range(0, z.shape[2], overlap_size):
             for j in range(0, z.shape[3], overlap_size):
-                tile = z[:, :, i : i + self.tile_latent_min_size, j : j + self.tile_latent_min_size]
+                tile = z[
+                    :,
+                    :,
+                    i : i + self.tile_latent_min_size,
+                    j : j + self.tile_latent_min_size,
+                ]
                 tiletask_list.append(
                     TileTask(
                         len(tiletask_list),
@@ -55,7 +60,10 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         }
         grid_spec = GridSpec(
             split_dims=(2, 3),
-            grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
+            grid_shape=(
+                tiletask_list[-1].grid_coord[0] + 1,
+                tiletask_list[-1].grid_coord[1] + 1,
+            ),
             tile_spec=tile_spec,
         )
         return tiletask_list, grid_spec
@@ -68,7 +76,9 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         decoded = self.decoder(tile)
         return decoded
 
-    def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
+    def tile_merge(
+        self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec
+    ) -> torch.Tensor:
         """Merge decoded tiles into a full image."""
 
         grid_h, grid_w = grid_spec.grid_shape
@@ -78,17 +88,34 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             for j in range(grid_w):
                 tile = coord_tensor_map[(i, j)]
                 if i > 0:
-                    tile = self.blend_v(coord_tensor_map[(i - 1, j)], tile, grid_spec.tile_spec["blend_extent"])
+                    tile = self.blend_v(
+                        coord_tensor_map[(i - 1, j)],
+                        tile,
+                        grid_spec.tile_spec["blend_extent"],
+                    )
                 if j > 0:
-                    tile = self.blend_h(coord_tensor_map[(i, j - 1)], tile, grid_spec.tile_spec["blend_extent"])
-                result_row.append(tile[:, :, : grid_spec.tile_spec["row_limit"], : grid_spec.tile_spec["row_limit"]])
+                    tile = self.blend_h(
+                        coord_tensor_map[(i, j - 1)],
+                        tile,
+                        grid_spec.tile_spec["blend_extent"],
+                    )
+                result_row.append(
+                    tile[
+                        :,
+                        :,
+                        : grid_spec.tile_spec["row_limit"],
+                        : grid_spec.tile_spec["row_limit"],
+                    ]
+                )
             result_rows.append(torch.cat(result_row, dim=3))
 
         dec = torch.cat(result_rows, dim=2)
         return dec
 
     def patch_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
-        overlap_latent = int(self.tile_latent_min_size * float(self.tile_overlap_factor))
+        overlap_latent = int(
+            self.tile_latent_min_size * float(self.tile_overlap_factor)
+        )
         halo_base = max(0, overlap_latent // 2)
 
         _, _, latent_h, latent_w = z.shape
@@ -117,7 +144,11 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
                 pw0 = max(0, w0 - halo)
                 pw1 = min(latent_w, w1 + halo)
                 tile = z[:, :, ph0:ph1, pw0:pw1]
-                tiletask_list.append(TileTask(len(tiletask_list), (i, j), tile, tile.shape[2] * tile.shape[3]))
+                tiletask_list.append(
+                    TileTask(
+                        len(tiletask_list), (i, j), tile, tile.shape[2] * tile.shape[3]
+                    )
+                )
                 halo_size[(i, j)] = {
                     "up": h0 - ph0,
                     "down": ph1 - h1,
@@ -131,7 +162,10 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         }
         grid_spec = GridSpec(
             split_dims=(2, 3),
-            grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
+            grid_shape=(
+                tiletask_list[-1].grid_coord[0] + 1,
+                tiletask_list[-1].grid_coord[1] + 1,
+            ),
             tile_spec=tile_spec,
             output_dtype=self.dtype,
         )
@@ -140,7 +174,9 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
     def patch_exec(self, task: TileTask) -> torch.Tensor:
         return self.tile_exec(task)
 
-    def patch_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
+    def patch_merge(
+        self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec
+    ) -> torch.Tensor:
         grid_h, grid_w = grid_spec.grid_shape
         result_rows = []
         for i in range(grid_h):
@@ -178,7 +214,9 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
     # Normally, we should override tiled_decode. However, since we also need to
     # support the patch split strategy, we override decode instead.
-    def decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
+    def decode(
+        self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any
+    ):
         if not self.is_distributed_enabled():
             return super().decode(z, return_dict=return_dict, *args, **kwargs)
 
@@ -186,9 +224,13 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
         if split is not None:
             strategy = "tile" if split == self.tile_split else "patch"
-            logger.info(f"Decode run with distributed executor, split strategy is {strategy}")
+            logger.info(
+                f"Decode run with distributed executor, split strategy is {strategy}"
+            )
             result = self.distributed_decoder.execute(
-                z, DistributedOperator(split=split, exec=exec, merge=merge), broadcast_result=False
+                z,
+                DistributedOperator(split=split, exec=exec, merge=merge),
+                broadcast_result=False,
             )
             if not return_dict:
                 return (result,)

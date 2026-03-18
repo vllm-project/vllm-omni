@@ -62,7 +62,11 @@ class Qwen3OmniMoeSparseMoeBlock(nn.Module):
         from vllm.model_executor.layers.linear import ReplicatedLinear
 
         self.gate = ReplicatedLinear(
-            config.hidden_size, config.num_experts, bias=False, quant_config=quant_config, prefix=f"{prefix}.gate"
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -90,7 +94,9 @@ class Qwen3OmniMoeSparseMoeBlock(nn.Module):
         selected_experts, routing_weights = self._route_tokens(router_logits)
 
         # Forward through individual experts
-        final_hidden_states = self._forward_experts(hidden_states, selected_experts, routing_weights)
+        final_hidden_states = self._forward_experts(
+            hidden_states, selected_experts, routing_weights
+        )
 
         # Reshape back to original shape
         if is_input_1d:
@@ -104,25 +110,39 @@ class Qwen3OmniMoeSparseMoeBlock(nn.Module):
     def _route_tokens(self, router_logits: torch.Tensor):
         """Route tokens to experts using top-k selection (matching transformers)."""
         routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        )
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(router_logits.dtype)
         return selected_experts, routing_weights
 
     def _forward_experts(
-        self, hidden_states: torch.Tensor, selected_experts: torch.Tensor, routing_weights: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
     ):
         """Forward through individual experts (matching transformers implementation)."""
         final_hidden_states = torch.zeros_like(hidden_states)
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_mask = torch.nn.functional.one_hot(
+            selected_experts, num_classes=self.num_experts
+        ).permute(2, 1, 0)
 
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in expert_hit:
             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
-            current_hidden_states = self.experts[expert_idx](current_state) * routing_weights[top_x, idx, None]
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+            current_state = hidden_states[None, top_x].reshape(
+                -1, hidden_states.shape[-1]
+            )
+            current_hidden_states = (
+                self.experts[expert_idx](current_state)
+                * routing_weights[top_x, idx, None]
+            )
+            final_hidden_states.index_add_(
+                0, top_x, current_hidden_states.to(hidden_states.dtype)
+            )
 
         return final_hidden_states
 
@@ -137,14 +157,21 @@ class Qwen3MoeForCausalLM(_BaseQwen3MoeForCausalLM):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen3MoeModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = Qwen3MoeModel(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config, prefix=maybe_prefix(prefix, "lm_head")
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
         )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
         # Set MoE hyperparameters for individual experts
         self.expert_weights = []

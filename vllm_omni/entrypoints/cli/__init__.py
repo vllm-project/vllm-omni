@@ -4,6 +4,7 @@
 # ruff: noqa: E402, F401
 # isort: off
 from vllm_omni.benchmarks.patch import patch
+
 # isort: on
 
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand

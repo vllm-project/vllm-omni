@@ -80,8 +80,12 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
-        if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
-            raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
+        if args.stage_id is not None and (
+            args.omni_master_address is None or args.omni_master_port is None
+        ):
+            raise ValueError(
+                "--stage-id requires both --omni-master-address and --omni-master-port to be set"
+            )
 
         # Skip validation for diffusion models as they have different requirements
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
@@ -92,7 +96,9 @@ class OmniServeCommand(CLISubcommand):
             return
         validate_parsed_serve_args(args)
 
-    def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
+    def subparser_init(
+        self, subparsers: argparse._SubParsersAction
+    ) -> FlexibleArgumentParser:
         serve_parser = subparsers.add_parser(
             self.name,
             description=DESCRIPTION,
@@ -105,7 +111,8 @@ class OmniServeCommand(CLISubcommand):
         # Create OmniConfig argument group for omni-related parameters
         # This ensures the parameters appear in --help output
         omni_config_group = serve_parser.add_argument_group(
-            title="OmniConfig", description="Configuration for vLLM-Omni multi-stage and diffusion models."
+            title="OmniConfig",
+            description="Configuration for vLLM-Omni multi-stage and diffusion models.",
         )
 
         omni_config_group.add_argument(
@@ -371,7 +378,9 @@ class OmniServeCommand(CLISubcommand):
         return serve_parser
 
 
-def _create_default_diffusion_stage_cfg(args: argparse.Namespace) -> list[dict[str, Any]]:
+def _create_default_diffusion_stage_cfg(
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
     omni_base = OmniBase.__new__(OmniBase)
     return omni_base._create_default_diffusion_stage_cfg(vars(args))
 
@@ -392,7 +401,9 @@ def run_headless(args: argparse.Namespace) -> None:
     single_stage_id = args.stage_id
     if single_stage_id is None:
         if len(stage_configs) != 1:
-            raise ValueError("--stage-id is required in headless mode for multi-stage configs")
+            raise ValueError(
+                "--stage-id is required in headless mode for multi-stage configs"
+            )
         single_stage_id = getattr(stage_configs[0], "stage_id", 0)
 
     stage_config = None
@@ -404,8 +415,12 @@ def run_headless(args: argparse.Namespace) -> None:
         raise ValueError(f"No stage matches stage_id={single_stage_id}.")
 
     # TODO(wuhang): Support connectors config by cli
-    transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=args.shm_threshold_bytes)
-    connectors_config = get_connectors_config_for_stage(transfer_config, single_stage_id)
+    transfer_config = load_omni_transfer_config(
+        config_path, default_shm_threshold=args.shm_threshold_bytes
+    )
+    connectors_config = get_connectors_config_for_stage(
+        transfer_config, single_stage_id
+    )
 
     omni_master_address = args.omni_master_address
     omni_master_port = args.omni_master_port
@@ -416,7 +431,9 @@ def run_headless(args: argparse.Namespace) -> None:
             local_only=False, host=omni_master_address, port=omni_master_port
         )
 
-        with make_zmq_socket(zmq_ctx, handshake_endpoint, zmq.REQ, bind=False, linger=5000) as handshake_socket:
+        with make_zmq_socket(
+            zmq_ctx, handshake_endpoint, zmq.REQ, bind=False, linger=5000
+        ) as handshake_socket:
             # TODO(wuhang): Define protocol in python dataclass.
             handshake_msg = {"type": "handshake", "stage_id": single_stage_id}
             handshake_socket.send(msgspec.msgpack.encode(handshake_msg))
@@ -441,9 +458,14 @@ def run_headless(args: argparse.Namespace) -> None:
 
             if not response["ok"]:
                 error_msg = response["error"]
-                raise RuntimeError(f"Handshake failed for stage-{single_stage_id}: {error_msg}")
+                raise RuntimeError(
+                    f"Handshake failed for stage-{single_stage_id}: {error_msg}"
+                )
 
-            in_endpoint, out_endpoint = response["in_endpoint"], response["out_endpoint"]
+            in_endpoint, out_endpoint = (
+                response["in_endpoint"],
+                response["out_endpoint"],
+            )
 
             logger.info(
                 f"[Headless] Stage-{single_stage_id} received endpoints via handshake: "
@@ -467,14 +489,22 @@ def run_headless(args: argparse.Namespace) -> None:
 
     # Inject YAML-resolved connector config into omni_kv_config for in-engine usage.
     try:
-        omni_conn_cfg, omni_from, omni_to = resolve_omni_kv_config_for_stage(transfer_config, single_stage_id)
+        omni_conn_cfg, omni_from, omni_to = resolve_omni_kv_config_for_stage(
+            transfer_config, single_stage_id
+        )
         if omni_conn_cfg:
             inject_omni_kv_config(stage, omni_conn_cfg, omni_from, omni_to)  # type: ignore
     except Exception as e:
-        logger.debug("[Headless] Failed to inject omni connector config into stage-%s: %s", single_stage_id, e)
+        logger.debug(
+            "[Headless] Failed to inject omni connector config into stage-%s: %s",
+            single_stage_id,
+            e,
+        )
 
     old_env = os.environ.get("VLLM_LOGGING_PREFIX")
-    os.environ["VLLM_LOGGING_PREFIX"] = f"[Stage-{single_stage_id}] {'' if old_env is None else old_env}"
+    os.environ["VLLM_LOGGING_PREFIX"] = (
+        f"[Stage-{single_stage_id}] {'' if old_env is None else old_env}"
+    )
     try:
         stage.init_stage_worker(
             model,

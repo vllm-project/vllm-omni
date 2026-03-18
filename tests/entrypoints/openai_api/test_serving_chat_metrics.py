@@ -17,7 +17,9 @@ def test_omni_chat_completion_response_metrics():
     usage = UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0)
 
     # Default is None
-    response = OmniChatCompletionResponse(id="test-id", created=1234567890, model="test-model", choices=[], usage=usage)
+    response = OmniChatCompletionResponse(
+        id="test-id", created=1234567890, model="test-model", choices=[], usage=usage
+    )
     assert response.metrics is None
 
     # Can set metrics and serialize

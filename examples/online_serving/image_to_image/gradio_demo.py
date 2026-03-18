@@ -46,7 +46,12 @@ def edit_image(
     # Build user message with text and image
     content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
     for img in images:
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_pil_to_b64_png(img)}"}})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{_pil_to_b64_png(img)}"},
+            }
+        )
 
     messages = [
         {
@@ -177,7 +182,15 @@ def create_demo(server_url: str):
 
         edit_btn.click(
             fn=process_edit,
-            inputs=[input_image, extra_images, prompt, steps, guidance_scale, seed, negative_prompt],
+            inputs=[
+                input_image,
+                extra_images,
+                prompt,
+                steps,
+                guidance_scale,
+                seed,
+                negative_prompt,
+            ],
             outputs=[output_image],
         )
 

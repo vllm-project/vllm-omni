@@ -86,8 +86,12 @@ class TestAttentionModel(torch.nn.Module):
         )
         # Linear projection layers for Q, K, V
         self.q_proj = torch.nn.Linear(hidden_size, num_heads * head_size)
-        self.k_proj = torch.nn.Linear(hidden_size, (num_kv_heads or num_heads) * head_size)
-        self.v_proj = torch.nn.Linear(hidden_size, (num_kv_heads or num_heads) * head_size)
+        self.k_proj = torch.nn.Linear(
+            hidden_size, (num_kv_heads or num_heads) * head_size
+        )
+        self.v_proj = torch.nn.Linear(
+            hidden_size, (num_kv_heads or num_heads) * head_size
+        )
         self.o_proj = torch.nn.Linear(num_heads * head_size, hidden_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -191,7 +195,9 @@ def test_sequence_parallel(
     # Skip if not enough GPUs available
     available_gpus = current_omni_platform.get_device_count()
     if available_gpus < sequence_parallel_size:
-        pytest.skip(f"Test requires {sequence_parallel_size} GPUs but only {available_gpus} available")
+        pytest.skip(
+            f"Test requires {sequence_parallel_size} GPUs but only {available_gpus} available"
+        )
 
     # Create temporary files to share results between processes
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
@@ -232,7 +238,9 @@ def test_sequence_parallel(
         )
 
         # Step 2: Run with SP enabled
-        print(f"\n[SP Test] Running with SP (ulysses_degree={ulysses_degree}, ring_degree={ring_degree})...")
+        print(
+            f"\n[SP Test] Running with SP (ulysses_degree={ulysses_degree}, ring_degree={ring_degree})..."
+        )
         torch.multiprocessing.spawn(
             ulysses_attention_on_test_model,
             args=(
@@ -300,8 +308,12 @@ def test_sequence_parallel(
         print(f"  - Mean absolute difference: {mean_abs_diff:.6e}")
         print(f"  - Max relative difference: {max_relative_diff:.6e}")
         print(f"  - Mean relative difference: {mean_relative_diff:.6e}")
-        print(f"  - Baseline output range: [{baseline_tensor.min().item():.6e}, {baseline_tensor.max().item():.6e}]")
-        print(f"  - SP output range: [{sp_tensor.min().item():.6e}, {sp_tensor.max().item():.6e}]")
+        print(
+            f"  - Baseline output range: [{baseline_tensor.min().item():.6e}, {baseline_tensor.max().item():.6e}]"
+        )
+        print(
+            f"  - SP output range: [{sp_tensor.min().item():.6e}, {sp_tensor.max().item():.6e}]"
+        )
         print(f"{'=' * 80}\n")
 
         # Assert that differences are within acceptable tolerance
@@ -324,7 +336,12 @@ def test_sequence_parallel(
 
     finally:
         # Clean up temporary files
-        for f in [baseline_output_file, sp_output_file, model_state_file, input_data_file]:
+        for f in [
+            baseline_output_file,
+            sp_output_file,
+            model_state_file,
+            input_data_file,
+        ]:
             if os.path.exists(f):
                 os.remove(f)
 
@@ -355,8 +372,14 @@ def ulysses_attention_on_test_model(
     RANDOM_SEED = 42
     seed_everything(RANDOM_SEED)
 
-    mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
-    print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
+    mode_str = (
+        "Baseline (no SP)"
+        if is_baseline
+        else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+    )
+    print(
+        f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}"
+    )
 
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
     current_omni_platform.set_device(device)
@@ -452,13 +475,19 @@ def ulysses_attention_on_test_model(
         # This ensures exact same initialization and input for fair comparison
         with open(model_state_file, "rb") as f:
             model_state = pickle.load(f)
-        model.load_state_dict({k: v.to(device).to(dtype) for k, v in model_state.items()})
+        model.load_state_dict(
+            {k: v.to(device).to(dtype) for k, v in model_state.items()}
+        )
 
         with open(input_data_file, "rb") as f:
             full_hidden_states_np = pickle.load(f)
-        full_hidden_states = torch.from_numpy(full_hidden_states_np).to(device).to(dtype)
+        full_hidden_states = (
+            torch.from_numpy(full_hidden_states_np).to(device).to(dtype)
+        )
 
-        print(f"[Rank {local_rank}] Loaded model state and full input data with shape {full_hidden_states.shape}")
+        print(
+            f"[Rank {local_rank}] Loaded model state and full input data with shape {full_hidden_states.shape}"
+        )
 
         # Split input sequence according to sequence parallel BEFORE model forward
         # Each rank gets a contiguous chunk of the sequence dimension
@@ -483,23 +512,31 @@ def ulysses_attention_on_test_model(
         # Run forward pass with local sequence chunk
         print(f"[Rank {local_rank}] Running forward pass...")
         output = model(hidden_states)
-        print(f"[Rank {local_rank}] Forward pass completed, output shape: {output.shape}")
+        print(
+            f"[Rank {local_rank}] Forward pass completed, output shape: {output.shape}"
+        )
 
         # Verify output shape
-        assert output.shape == (batch_size, local_seq_len, hidden_size), (
-            f"Output shape mismatch: expected {(batch_size, local_seq_len, hidden_size)}, got {output.shape}"
-        )
+        assert output.shape == (
+            batch_size,
+            local_seq_len,
+            hidden_size,
+        ), f"Output shape mismatch: expected {(batch_size, local_seq_len, hidden_size)}, got {output.shape}"
 
         # Gather outputs from all ranks AFTER computation
         if world_size > 1:
-            print(f"[Rank {local_rank}] Gathering outputs from all {world_size} ranks...")
+            print(
+                f"[Rank {local_rank}] Gathering outputs from all {world_size} ranks..."
+            )
             # Gather all outputs to rank 0
             gathered_outputs = [torch.zeros_like(output) for _ in range(world_size)]
             torch.distributed.all_gather(gathered_outputs, output)
             if local_rank == 0:
                 # Concatenate along sequence dimension to reconstruct full sequence
                 full_output = torch.cat(gathered_outputs, dim=1)
-                print(f"[Rank 0] Gathered and concatenated outputs: {full_output.shape}")
+                print(
+                    f"[Rank 0] Gathered and concatenated outputs: {full_output.shape}"
+                )
                 # Verify the full output shape matches expected
                 assert full_output.shape == (batch_size, seq_len, hidden_size), (
                     f"Gathered output shape mismatch: expected {(batch_size, seq_len, hidden_size)}, "
@@ -510,7 +547,9 @@ def ulysses_attention_on_test_model(
         else:
             # For baseline (world_size=1), output is already complete
             full_output = output
-            print(f"[Rank 0] No gather needed (world_size=1), output shape: {full_output.shape}")
+            print(
+                f"[Rank 0] No gather needed (world_size=1), output shape: {full_output.shape}"
+            )
 
         # Save output from rank 0 for comparison
         if local_rank == 0:
@@ -518,7 +557,11 @@ def ulysses_attention_on_test_model(
             with open(output_file, "wb") as f:
                 pickle.dump(output_np, f)
 
-            mode_str = "baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+            mode_str = (
+                "baseline (no SP)"
+                if is_baseline
+                else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+            )
             print(
                 f"\n[{mode_str}] ✓ Saved output with shape {full_output.shape}:\n"
                 f"  - batch_size={batch_size}, seq_len={seq_len}\n"

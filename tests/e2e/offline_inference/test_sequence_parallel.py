@@ -91,7 +91,9 @@ def _run_inference(
     Args:
         warmup: If True, run one warmup iteration before the timed run.
     """
-    parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
+    parallel_config = DiffusionParallelConfig(
+        ulysses_degree=ulysses_degree, ring_degree=ring_degree
+    )
     omni = Omni(
         model=model_name,
         parallel_config=parallel_config,
@@ -109,7 +111,9 @@ def _run_inference(
                     width=width,
                     num_inference_steps=DEFAULT_STEPS,
                     guidance_scale=0.0,
-                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed + 1000),
+                    generator=torch.Generator(
+                        current_omni_platform.device_type
+                    ).manual_seed(seed + 1000),
                     num_outputs_per_prompt=1,
                 ),
             )
@@ -123,7 +127,9 @@ def _run_inference(
                 width=width,
                 num_inference_steps=DEFAULT_STEPS,
                 guidance_scale=0.0,
-                generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
+                generator=torch.Generator(
+                    current_omni_platform.device_type
+                ).manual_seed(seed),
                 num_outputs_per_prompt=1,
             ),
         )
@@ -196,7 +202,14 @@ def test_sp_correctness(model_name: str):
     print(f"Available GPUs: {device_count}")
     print("=" * 70)
 
-    for ulysses_degree, ring_degree, height, width, sp_warmup, is_perf_test in SP_CONFIGS_L2:
+    for (
+        ulysses_degree,
+        ring_degree,
+        height,
+        width,
+        sp_warmup,
+        is_perf_test,
+    ) in SP_CONFIGS_L2:
         sp_size = ulysses_degree * ring_degree
         sp_mode = _get_sp_mode(ulysses_degree, ring_degree)
 
@@ -210,7 +223,9 @@ def test_sp_correctness(model_name: str):
 
         # Get or compute baseline for this (height, width)
         if cache_key not in baseline_cache:
-            print(f"\n--- Running baseline {height}x{width} (warmup={baseline_warmup}) ---")
+            print(
+                f"\n--- Running baseline {height}x{width} (warmup={baseline_warmup}) ---"
+            )
             baseline = _run_inference(
                 model_name,
                 torch.bfloat16,
@@ -258,7 +273,11 @@ def test_sp_correctness(model_name: str):
 
         # Output based on test type
         if is_perf_test:
-            speedup = baseline.elapsed_ms / sp_result.elapsed_ms if sp_result.elapsed_ms > 0 else 0
+            speedup = (
+                baseline.elapsed_ms / sp_result.elapsed_ms
+                if sp_result.elapsed_ms > 0
+                else 0
+            )
             result["speedup"] = speedup
             print(
                 f"[{sp_mode}] {sp_size} GPUs | "
@@ -266,20 +285,24 @@ def test_sp_correctness(model_name: str):
                 f"speedup: {speedup:.2f}x"
             )
         else:
-            print(f"[{sp_mode}] {sp_size} GPUs | sp: {sp_result.elapsed_ms:.0f}ms (correctness only)")
+            print(
+                f"[{sp_mode}] {sp_size} GPUs | sp: {sp_result.elapsed_ms:.0f}ms (correctness only)"
+            )
 
         print(f"[{sp_mode}] diff: mean={mean_diff:.6e}, max={max_diff:.6e}")
 
         # Assert correctness
-        assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD, (
-            f"[{sp_mode}] SP output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
-        )
+        assert (
+            mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD
+        ), f"[{sp_mode}] SP output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
 
     # Summary
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"{'Mode':<15} {'GPUs':<6} {'Size':<10} {'Baseline':<12} {'SP':<12} {'Speedup':<10} {'Status'}")
+    print(
+        f"{'Mode':<15} {'GPUs':<6} {'Size':<10} {'Baseline':<12} {'SP':<12} {'Speedup':<10} {'Status'}"
+    )
     print("-" * 70)
     for r in results:
         speedup_str = f"{r['speedup']:.2f}x" if r.get("speedup") else "N/A"
@@ -319,7 +342,14 @@ def test_sp_correctness_advanced(model_name: str):
     print(f"Available GPUs: {device_count}")
     print("=" * 70)
 
-    for ulysses_degree, ring_degree, height, width, sp_warmup, is_perf_test in SP_CONFIGS_L3:
+    for (
+        ulysses_degree,
+        ring_degree,
+        height,
+        width,
+        sp_warmup,
+        is_perf_test,
+    ) in SP_CONFIGS_L3:
         sp_size = ulysses_degree * ring_degree
         sp_mode = _get_sp_mode(ulysses_degree, ring_degree)
 
@@ -333,7 +363,9 @@ def test_sp_correctness_advanced(model_name: str):
 
         # Get or compute baseline for this (height, width)
         if cache_key not in baseline_cache:
-            print(f"\n--- Running baseline {height}x{width} (warmup={baseline_warmup}) ---")
+            print(
+                f"\n--- Running baseline {height}x{width} (warmup={baseline_warmup}) ---"
+            )
             baseline = _run_inference(
                 model_name,
                 torch.bfloat16,
@@ -381,7 +413,11 @@ def test_sp_correctness_advanced(model_name: str):
 
         # Output based on test type
         if is_perf_test:
-            speedup = baseline.elapsed_ms / sp_result.elapsed_ms if sp_result.elapsed_ms > 0 else 0
+            speedup = (
+                baseline.elapsed_ms / sp_result.elapsed_ms
+                if sp_result.elapsed_ms > 0
+                else 0
+            )
             result["speedup"] = speedup
             print(
                 f"[{sp_mode}] {sp_size} GPUs | "
@@ -389,20 +425,24 @@ def test_sp_correctness_advanced(model_name: str):
                 f"speedup: {speedup:.2f}x"
             )
         else:
-            print(f"[{sp_mode}] {sp_size} GPUs | sp: {sp_result.elapsed_ms:.0f}ms (correctness only)")
+            print(
+                f"[{sp_mode}] {sp_size} GPUs | sp: {sp_result.elapsed_ms:.0f}ms (correctness only)"
+            )
 
         print(f"[{sp_mode}] diff: mean={mean_diff:.6e}, max={max_diff:.6e}")
 
         # Assert correctness
-        assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD, (
-            f"[{sp_mode}] SP output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
-        )
+        assert (
+            mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD
+        ), f"[{sp_mode}] SP output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
 
     # Summary
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"{'Mode':<15} {'GPUs':<6} {'Size':<10} {'Baseline':<12} {'SP':<12} {'Speedup':<10} {'Status'}")
+    print(
+        f"{'Mode':<15} {'GPUs':<6} {'Size':<10} {'Baseline':<12} {'SP':<12} {'Speedup':<10} {'Status'}"
+    )
     print("-" * 70)
     for r in results:
         speedup_str = f"{r['speedup']:.2f}x" if r.get("speedup") else "N/A"

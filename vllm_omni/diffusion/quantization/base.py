@@ -38,7 +38,9 @@ class DiffusionQuantizationConfig(ABC):
         """
         if self._vllm_config is not None:
             return self._vllm_config.get_name()
-        raise NotImplementedError("Subclass must initialize _vllm_config or override get_name().")
+        raise NotImplementedError(
+            "Subclass must initialize _vllm_config or override get_name()."
+        )
 
     def get_vllm_quant_config(self) -> "QuantizationConfig | None":
         """Return the underlying vLLM QuantizationConfig for linear layers."""

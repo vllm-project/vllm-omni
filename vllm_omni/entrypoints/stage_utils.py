@@ -43,7 +43,10 @@ SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
 
 
 def is_profiler_task(task_type: OmniStageTaskType) -> bool:
-    return task_type in (OmniStageTaskType.PROFILER_START, OmniStageTaskType.PROFILER_STOP)
+    return task_type in (
+        OmniStageTaskType.PROFILER_START,
+        OmniStageTaskType.PROFILER_STOP,
+    )
 
 
 def set_stage_devices(
@@ -96,7 +99,12 @@ def set_stage_devices(
                 try:
                     mapping = [int(x) for x in vis.split(",") if x.strip() != ""]
                 except Exception as e:
-                    logger.debug("[Stage-%s] Failed to parse existing %s: %s", stage_id, env_var, e)
+                    logger.debug(
+                        "[Stage-%s] Failed to parse existing %s: %s",
+                        stage_id,
+                        env_var,
+                        e,
+                    )
             for tok in toks:
                 try:
                     idx = int(tok)
@@ -120,9 +128,16 @@ def set_stage_devices(
                         selected_physical,
                     )
                 except Exception as e:
-                    logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type, e)
+                    logger.debug(
+                        "[Stage-%s] Failed to parse first %s device: %s",
+                        stage_id,
+                        device_type,
+                        e,
+                    )
                     selected_physical = None
-        elif isinstance(devices, (int, str)) and (isinstance(devices, int) or str(devices).isdigit()):
+        elif isinstance(devices, (int, str)) and (
+            isinstance(devices, int) or str(devices).isdigit()
+        ):
             logical_idx = max(0, int(devices))
             vis = os.environ.get(env_var)
             if vis:
@@ -131,7 +146,12 @@ def set_stage_devices(
                     if 0 <= logical_idx < len(mapping):
                         selected_physical = mapping[logical_idx]
                 except Exception as e:
-                    logger.debug("[Stage-%s] Failed to map logical index via %s: %s", stage_id, env_var, e)
+                    logger.debug(
+                        "[Stage-%s] Failed to map logical index via %s: %s",
+                        stage_id,
+                        env_var,
+                        e,
+                    )
                     selected_physical = None
             if selected_physical is None:
                 selected_physical = int(logical_idx)
@@ -144,11 +164,20 @@ def set_stage_devices(
                 env_var,
             )
         elif devices in (None, "cpu"):
-            logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
+            logger.debug(
+                "[Stage-%s] Using default device visibility (devices=%s)",
+                stage_id,
+                devices,
+            )
         else:
             selected_physical = int(str(devices))
             os.environ[env_var] = str(selected_physical)
-            logger.debug("[Stage-%s] Set %s to single device %s (fallback)", stage_id, env_var, selected_physical)
+            logger.debug(
+                "[Stage-%s] Set %s to single device %s (fallback)",
+                stage_id,
+                env_var,
+                selected_physical,
+            )
     except Exception as e:
         logger.warning("Failed to interpret devices for stage %s: %s", stage_id, e)
 
@@ -253,7 +282,9 @@ def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -
     decode-time and size metrics.
     """
     if shm_key in container:
-        from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+        from vllm_omni.distributed.omni_connectors.utils.serialization import (
+            OmniSerializer,
+        )
 
         return OmniSerializer.deserialize(shm_read_bytes(container[shm_key]))
     return container[obj_key]
@@ -295,7 +326,9 @@ def maybe_load_from_ipc_with_metrics(
     }
 
 
-def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> dict[str, Any]:
+def encode_for_ipc(
+    obj: Any, threshold: int, obj_key: str, shm_key: str
+) -> dict[str, Any]:
     """Return a dict payload for IPC: inline (obj_key) or SHM (shm_key).
 
     When serialized size exceeds threshold, returns {shm_key: {name,size}};
@@ -334,7 +367,10 @@ def _resolve_model_to_local_path(model: str) -> str:
         # no network access is attempted, check local model path only
         return snapshot_download(model, local_files_only=True)
     except Exception:
-        logger.warning(f"Could not resolve {model} to a local snapshot path; using as-is", exc_info=True)
+        logger.warning(
+            f"Could not resolve {model} to a local snapshot path; using as-is",
+            exc_info=True,
+        )
         return model
 
 
@@ -368,7 +404,11 @@ def _resolve_model_tokenizer_paths(
         logger.info(f"Using model subdirectory: {model}")
 
     if tokenizer_subdir is not None:
-        tokenizer_path = os.path.join(resolved_base, tokenizer_subdir) if tokenizer_subdir else resolved_base
+        tokenizer_path = (
+            os.path.join(resolved_base, tokenizer_subdir)
+            if tokenizer_subdir
+            else resolved_base
+        )
         engine_args["tokenizer"] = tokenizer_path
         logger.info(f"Using tokenizer from: {tokenizer_path}")
     elif model_subdir and "tokenizer" not in engine_args:

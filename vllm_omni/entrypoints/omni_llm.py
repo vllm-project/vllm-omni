@@ -67,7 +67,9 @@ class OmniLLM(LLM):
         log_stats: bool = False,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         hf_overrides: dict[str, Any] | None = None,
-        structured_outputs_config: dict[str, Any] | StructuredOutputsConfig | None = None,
+        structured_outputs_config: (
+            dict[str, Any] | StructuredOutputsConfig | None
+        ) = None,
         init_sleep_seconds: int = 20,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
@@ -86,7 +88,9 @@ class OmniLLM(LLM):
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
+            self.config_path,
+            worker_backend=self.worker_backend,
+            shm_threshold_bytes=shm_threshold_bytes,
         )
 
         # Initialize LLM engine
@@ -100,7 +104,9 @@ class OmniLLM(LLM):
             if isinstance(worker_cls, type):
                 kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
 
-        if "kv_transfer_config" in kwargs and isinstance(kwargs["kv_transfer_config"], dict):
+        if "kv_transfer_config" in kwargs and isinstance(
+            kwargs["kv_transfer_config"], dict
+        ):
             from vllm.config.kv_transfer import KVTransferConfig
 
             raw_config_dict = kwargs["kv_transfer_config"]
@@ -119,10 +125,16 @@ class OmniLLM(LLM):
 
         if compilation_config is not None:
             if isinstance(compilation_config, int):
-                compilation_config_instance = CompilationConfig(level=compilation_config)
+                compilation_config_instance = CompilationConfig(
+                    level=compilation_config
+                )
             elif isinstance(compilation_config, dict):
                 compilation_config_instance = CompilationConfig(
-                    **{k: v for k, v in compilation_config.items() if is_init_field(CompilationConfig, k)}
+                    **{
+                        k: v
+                        for k, v in compilation_config.items()
+                        if is_init_field(CompilationConfig, k)
+                    }
                 )
             else:
                 compilation_config_instance = compilation_config
@@ -132,7 +144,11 @@ class OmniLLM(LLM):
         if structured_outputs_config is not None:
             if isinstance(structured_outputs_config, dict):
                 structured_outputs_instance = StructuredOutputsConfig(
-                    **{k: v for k, v in structured_outputs_config.items() if is_init_field(StructuredOutputsConfig, k)}
+                    **{
+                        k: v
+                        for k, v in structured_outputs_config.items()
+                        if is_init_field(StructuredOutputsConfig, k)
+                    }
                 )
             else:
                 structured_outputs_instance = structured_outputs_config
@@ -149,13 +165,17 @@ class OmniLLM(LLM):
         )
 
         # Create the Engine (autoselects V0 vs V1)
-        self.llm_engine = LLMEngine.from_engine_args(engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
+        self.llm_engine = LLMEngine.from_engine_args(
+            engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
+        )
         self.llm_engine.output_processor = MultimodalOutputProcessor(
             tokenizer=self.llm_engine.tokenizer,
             log_stats=self.llm_engine.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
-        self.llm_engine.input_processor = OmniInputProcessor(vllm_config=self.llm_engine.vllm_config)
+        self.llm_engine.input_processor = OmniInputProcessor(
+            vllm_config=self.llm_engine.vllm_config
+        )
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
@@ -172,14 +192,18 @@ class OmniLLM(LLM):
         self.renderer = self.llm_engine.renderer
         # Load the Input/Output processor plugin if any
         io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
-        self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
+        self.io_processor = get_io_processor(
+            self.llm_engine.vllm_config, io_processor_plugin
+        )
         self.model_config = self.llm_engine.model_config
         self.input_processor = self.llm_engine.input_processor
 
         # Parity with upstream LLM for pooling/classify entrypoints
         chat_template = kwargs.get("chat_template", None)
         from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
-        from vllm.entrypoints.pooling.io_processor_factories import init_pooling_io_processors
+        from vllm.entrypoints.pooling.io_processor_factories import (
+            init_pooling_io_processors,
+        )
 
         self.chat_template = load_chat_template(chat_template)
         self.chat_template_config = ChatTemplateConfig(chat_template=self.chat_template)
@@ -204,8 +228,12 @@ class OmniLLM(LLM):
         renderer = self.renderer
         model_config = self.model_config
 
-        parsed_prompts = [parse_model_prompt(model_config, prompt) for prompt in prompts]
-        tok_params = renderer.default_cmpl_tok_params.with_kwargs(**(tokenization_kwargs or {}))
+        parsed_prompts = [
+            parse_model_prompt(model_config, prompt) for prompt in prompts
+        ]
+        tok_params = renderer.default_cmpl_tok_params.with_kwargs(
+            **(tokenization_kwargs or {})
+        )
         results = renderer.render_cmpl(parsed_prompts, tok_params)
 
         reinject_omni_fields(results, parsed_prompts)
@@ -258,7 +286,9 @@ class OmniLLM(LLM):
                             assert output.prompt_token_ids is not None
                             total_in_toks += len(output.prompt_token_ids) * n
                             in_spd = total_in_toks / pbar.format_dict["elapsed"]
-                            total_out_toks += sum(len(stp.token_ids) for stp in output.outputs)
+                            total_out_toks += sum(
+                                len(stp.token_ids) for stp in output.outputs
+                            )
                             out_spd = total_out_toks / pbar.format_dict["elapsed"]
                             pbar.postfix = f"est. speed input: {in_spd:.2f} toks/s, output: {out_spd:.2f} toks/s"
                             pbar.update(n)

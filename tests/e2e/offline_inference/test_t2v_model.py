@@ -43,7 +43,9 @@ def test_video_diffusion_model(model_name: str):
             num_frames=num_frames,
             num_inference_steps=2,
             guidance_scale=1.0,
-            generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+            generator=torch.Generator(current_omni_platform.device_type).manual_seed(
+                42
+            ),
         ),
     )
     first_output = outputs[0]

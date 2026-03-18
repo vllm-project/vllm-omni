@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 # Use the new import path for initialization utilities
-from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    load_omni_transfer_config,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -38,7 +40,9 @@ def get_config_files():
 config_files = get_config_files()
 
 
-@pytest.mark.skipif(len(config_files) == 0, reason="No config files found or directory missing")
+@pytest.mark.skipif(
+    len(config_files) == 0, reason="No config files found or directory missing"
+)
 @pytest.mark.parametrize("yaml_file", config_files, ids=lambda p: p.name)
 def test_load_qwen_yaml_configs(yaml_file):
     """

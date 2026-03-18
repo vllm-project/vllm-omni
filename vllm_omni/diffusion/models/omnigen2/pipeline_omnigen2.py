@@ -76,8 +76,12 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
     order = 1
 
     @register_to_config
-    def __init__(self, num_train_timesteps: int = 1000, dynamic_time_shift: bool = True):
-        timesteps = torch.linspace(0, 1, num_train_timesteps + 1, dtype=torch.float32)[:-1]
+    def __init__(
+        self, num_train_timesteps: int = 1000, dynamic_time_shift: bool = True
+    ):
+        timesteps = torch.linspace(0, 1, num_train_timesteps + 1, dtype=torch.float32)[
+            :-1
+        ]
 
         self.timesteps = timesteps
 
@@ -145,7 +149,9 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         if timesteps is None:
             self.num_inference_steps = num_inference_steps
-            timesteps = np.linspace(0, 1, num_inference_steps + 1, dtype=np.float32)[:-1]
+            timesteps = np.linspace(0, 1, num_inference_steps + 1, dtype=np.float32)[
+                :-1
+            ]
             if self.config.dynamic_time_shift and num_tokens is not None:
                 # when input resolution is 320*320, m = 1; when 1024*1024, m = 3.2
                 m = np.sqrt(num_tokens) / 40
@@ -200,7 +206,11 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 the sample tensor.
         """
 
-        if isinstance(timestep, int) or isinstance(timestep, torch.IntTensor) or isinstance(timestep, torch.LongTensor):
+        if (
+            isinstance(timestep, int)
+            or isinstance(timestep, torch.IntTensor)
+            or isinstance(timestep, torch.LongTensor)
+        ):
             raise ValueError(
                 (
                     "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
@@ -245,9 +255,15 @@ def get_omnigen2_pre_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+        vae_scale_factor = (
+            2 ** len(vae_config["temporal_downsample"])
+            if "temporal_downsample" in vae_config
+            else 8
+        )
 
-    image_processor = OmniGen2ImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_resize=True)
+    image_processor = OmniGen2ImageProcessor(
+        vae_scale_factor=vae_scale_factor * 2, do_resize=True
+    )
     latent_channels = vae_config.get("z_dim", 16)
 
     def pre_process_func(
@@ -255,8 +271,16 @@ def get_omnigen2_pre_process_func(
     ) -> OmniDiffusionRequest:
         """Pre-process requests for OmniGen2Pipeline."""
         for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            multi_modal_data = (
+                prompt.get("multi_modal_data", {})
+                if not isinstance(prompt, str)
+                else None
+            )
+            raw_image = (
+                multi_modal_data.get("image", None)
+                if multi_modal_data is not None
+                else None
+            )
 
             if isinstance(prompt, str):
                 prompt = OmniTextPrompt(prompt=prompt)
@@ -265,7 +289,10 @@ def get_omnigen2_pre_process_func(
 
             if raw_image is not None:
                 if isinstance(raw_image, list):
-                    images = [PIL.Image.open(img) if isinstance(img, str) else img for img in raw_image]
+                    images = [
+                        PIL.Image.open(img) if isinstance(img, str) else img
+                        for img in raw_image
+                    ]
                 elif isinstance(raw_image, str):
                     images = [PIL.Image.open(raw_image)]
                 else:
@@ -284,12 +311,18 @@ def get_omnigen2_pre_process_func(
                 preprocessed_images = []
                 for image in images:
                     if not (
-                        isinstance(image, torch.Tensor) and len(image.shape) > 1 and image.shape[1] == latent_channels
+                        isinstance(image, torch.Tensor)
+                        and len(image.shape) > 1
+                        and image.shape[1] == latent_channels
                     ):
-                        image = image_processor.preprocess(image, max_pixels=1024 * 1024, max_side_length=1024)
+                        image = image_processor.preprocess(
+                            image, max_pixels=1024 * 1024, max_side_length=1024
+                        )
                     preprocessed_images.append(image)
 
-                prompt["additional_information"]["preprocessed_images"] = preprocessed_images
+                prompt["additional_information"][
+                    "preprocessed_images"
+                ] = preprocessed_images
 
             request.prompts[i] = prompt
         return request
@@ -308,9 +341,15 @@ def get_omnigen2_post_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+        vae_scale_factor = (
+            2 ** (len(vae_config["block_out_channels"]) - 1)
+            if "block_out_channels" in vae_config
+            else 8
+        )
 
-    image_processor = OmniGen2ImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_resize=True)
+    image_processor = OmniGen2ImageProcessor(
+        vae_scale_factor=vae_scale_factor * 2, do_resize=True
+    )
 
     def post_process_func(
         images: torch.Tensor,
@@ -426,11 +465,17 @@ class OmniGen2ImageProcessor(VaeImageProcessor):
 
         cur_pixels = height * width
         max_pixels_ratio = (max_pixels / cur_pixels) ** 0.5
-        ratio = min(max_pixels_ratio, max_side_length_ratio, 1.0)  # do not upscale input image
+        ratio = min(
+            max_pixels_ratio, max_side_length_ratio, 1.0
+        )  # do not upscale input image
 
         new_height, new_width = (
-            int(height * ratio) // self.config.vae_scale_factor * self.config.vae_scale_factor,
-            int(width * ratio) // self.config.vae_scale_factor * self.config.vae_scale_factor,
+            int(height * ratio)
+            // self.config.vae_scale_factor
+            * self.config.vae_scale_factor,
+            int(width * ratio)
+            // self.config.vae_scale_factor
+            * self.config.vae_scale_factor,
         )
         return new_height, new_width
 
@@ -474,7 +519,11 @@ class OmniGen2ImageProcessor(VaeImageProcessor):
         supported_formats = (PIL.Image.Image, np.ndarray, torch.Tensor)
 
         # Expand the missing dimension for 3-dimensional pytorch tensor or numpy array that represents grayscale image
-        if self.config.do_convert_grayscale and isinstance(image, (torch.Tensor, np.ndarray)) and image.ndim == 3:
+        if (
+            self.config.do_convert_grayscale
+            and isinstance(image, (torch.Tensor, np.ndarray))
+            and image.ndim == 3
+        ):
             if isinstance(image, torch.Tensor):
                 # if image is a pytorch tensor could have 2 possible shapes:
                 #    1. batch x height x width: we should insert the channel dimension at position 1
@@ -492,14 +541,22 @@ class OmniGen2ImageProcessor(VaeImageProcessor):
                 else:
                     image = np.expand_dims(image, axis=-1)
 
-        if isinstance(image, list) and isinstance(image[0], np.ndarray) and image[0].ndim == 4:
+        if (
+            isinstance(image, list)
+            and isinstance(image[0], np.ndarray)
+            and image[0].ndim == 4
+        ):
             warnings.warn(
                 "Passing `image` as a list of 4d np.ndarray is deprecated."
                 "Please concatenate the list along the batch dimension and pass it as a single 4d np.ndarray",
                 FutureWarning,
             )
             image = np.concatenate(image, axis=0)
-        if isinstance(image, list) and isinstance(image[0], torch.Tensor) and image[0].ndim == 4:
+        if (
+            isinstance(image, list)
+            and isinstance(image[0], torch.Tensor)
+            and image[0].ndim == 4
+        ):
             warnings.warn(
                 "Passing `image` as a list of 4d torch.Tensor is deprecated."
                 "Please concatenate the list along the batch dimension and pass it as a single 4d torch.Tensor",
@@ -519,8 +576,13 @@ class OmniGen2ImageProcessor(VaeImageProcessor):
             if crops_coords is not None:
                 image = [i.crop(crops_coords) for i in image]
             if self.config.do_resize:
-                height, width = self.get_new_height_width(image[0], height, width, max_pixels, max_side_length)
-                image = [self.resize(i, height, width, resize_mode=resize_mode) for i in image]
+                height, width = self.get_new_height_width(
+                    image[0], height, width, max_pixels, max_side_length
+                )
+                image = [
+                    self.resize(i, height, width, resize_mode=resize_mode)
+                    for i in image
+                ]
             if self.config.do_convert_rgb:
                 image = [self.convert_to_rgb(i) for i in image]
             elif self.config.do_convert_grayscale:
@@ -529,16 +591,26 @@ class OmniGen2ImageProcessor(VaeImageProcessor):
             image = self.numpy_to_pt(image)  # to pt
 
         elif isinstance(image[0], np.ndarray):
-            image = np.concatenate(image, axis=0) if image[0].ndim == 4 else np.stack(image, axis=0)
+            image = (
+                np.concatenate(image, axis=0)
+                if image[0].ndim == 4
+                else np.stack(image, axis=0)
+            )
 
             image = self.numpy_to_pt(image)
 
-            height, width = self.get_new_height_width(image, height, width, max_pixels, max_side_length)
+            height, width = self.get_new_height_width(
+                image, height, width, max_pixels, max_side_length
+            )
             if self.config.do_resize:
                 image = self.resize(image, height, width)
 
         elif isinstance(image[0], torch.Tensor):
-            image = torch.cat(image, axis=0) if image[0].ndim == 4 else torch.stack(image, axis=0)
+            image = (
+                torch.cat(image, axis=0)
+                if image[0].ndim == 4
+                else torch.stack(image, axis=0)
+            )
 
             if self.config.do_convert_grayscale and image.ndim == 3:
                 image = image.unsqueeze(1)
@@ -548,7 +620,9 @@ class OmniGen2ImageProcessor(VaeImageProcessor):
             if channel == self.config.vae_latent_channels:
                 return image
 
-            height, width = self.get_new_height_width(image, height, width, max_pixels, max_side_length)
+            height, width = self.get_new_height_width(
+                image, height, width, max_pixels, max_side_length
+            )
             if self.config.do_resize:
                 image = self.resize(image, height, width)
 
@@ -603,7 +677,9 @@ def retrieve_timesteps(
         num_inference_steps (`int`): The number of inference steps.
     """
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accepts_timesteps = "timesteps" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -669,9 +745,9 @@ class OmniGen2Pipeline(nn.Module):
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = AutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
 
         transformer_config_path = os.path.join(model, "transformer", "config.json")
         transformer_kwargs = {}
@@ -716,9 +792,13 @@ class OmniGen2Pipeline(nn.Module):
             model, subfolder="processor", local_files_only=local_files_only
         )
         self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if hasattr(self, "vae") and self.vae is not None
+            else 8
         )
-        self.image_processor = OmniGen2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_resize=True)
+        self.image_processor = OmniGen2ImageProcessor(
+            vae_scale_factor=self.vae_scale_factor * 2, do_resize=True
+        )
         self.default_sample_size = 128
 
     def prepare_latents(
@@ -754,7 +834,9 @@ class OmniGen2Pipeline(nn.Module):
         shape = (batch_size, num_channels_latents, height, width)
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = randn_tensor(
+                shape, generator=generator, device=device, dtype=dtype
+            )
         else:
             latents = latents.to(device)
         return latents
@@ -807,7 +889,9 @@ class OmniGen2Pipeline(nn.Module):
             if img is not None and len(img) > 0:
                 ref_latents = []
                 for j, img_j in enumerate(img):
-                    ref_latents.append(self.encode_vae(img_j.to(device=device)).squeeze(0))
+                    ref_latents.append(
+                        self.encode_vae(img_j.to(device=device)).squeeze(0)
+                    )
             else:
                 ref_latents = None
             for _ in range(num_images_per_prompt):
@@ -855,10 +939,16 @@ class OmniGen2Pipeline(nn.Module):
         )
 
         text_input_ids = text_inputs.input_ids.to(device)
-        untruncated_ids = self.processor.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids.to(device)
+        untruncated_ids = self.processor.tokenizer(
+            prompt, padding="longest", return_tensors="pt"
+        ).input_ids.to(device)
 
-        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.processor.tokenizer.batch_decode(untruncated_ids[:, max_sequence_length - 1 : -1])
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+            text_input_ids, untruncated_ids
+        ):
+            removed_text = self.processor.tokenizer.batch_decode(
+                untruncated_ids[:, max_sequence_length - 1 : -1]
+            )
             logger.warning(
                 "The following part of your input was truncated because Qwen2.5-VL can only handle sequences up to"
                 f" {max_sequence_length} tokens: {removed_text}"
@@ -890,7 +980,9 @@ class OmniGen2Pipeline(nn.Module):
             },
             {"role": "user", "content": prompt},
         ]
-        prompt = self.processor.tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=False)
+        prompt = self.processor.tokenizer.apply_chat_template(
+            prompt, tokenize=False, add_generation_prompt=False
+        )
         return prompt
 
     def encode_prompt(
@@ -947,17 +1039,28 @@ class OmniGen2Pipeline(nn.Module):
         batch_size, seq_len, _ = prompt_embeds.shape
         # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
+        )
         prompt_attention_mask = prompt_attention_mask.repeat(num_images_per_prompt, 1)
-        prompt_attention_mask = prompt_attention_mask.view(batch_size * num_images_per_prompt, -1)
+        prompt_attention_mask = prompt_attention_mask.view(
+            batch_size * num_images_per_prompt, -1
+        )
 
         # Get negative embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             negative_prompt = negative_prompt if negative_prompt is not None else ""
 
             # Normalize str to list
-            negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            negative_prompt = [self._apply_chat_template(_negative_prompt) for _negative_prompt in negative_prompt]
+            negative_prompt = (
+                batch_size * [negative_prompt]
+                if isinstance(negative_prompt, str)
+                else negative_prompt
+            )
+            negative_prompt = [
+                self._apply_chat_template(_negative_prompt)
+                for _negative_prompt in negative_prompt
+            ]
 
             if prompt is not None and type(prompt) is not type(negative_prompt):
                 raise TypeError(
@@ -972,18 +1075,28 @@ class OmniGen2Pipeline(nn.Module):
                     f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
                     " the batch size of `prompt`."
                 )
-            negative_prompt_embeds, negative_prompt_attention_mask = self._get_qwen2_prompt_embeds(
-                prompt=negative_prompt,
-                device=device,
-                max_sequence_length=max_sequence_length,
+            negative_prompt_embeds, negative_prompt_attention_mask = (
+                self._get_qwen2_prompt_embeds(
+                    prompt=negative_prompt,
+                    device=device,
+                    max_sequence_length=max_sequence_length,
+                )
             )
 
             batch_size, seq_len, _ = negative_prompt_embeds.shape
             # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-            negative_prompt_attention_mask = negative_prompt_attention_mask.repeat(num_images_per_prompt, 1)
-            negative_prompt_attention_mask = negative_prompt_attention_mask.view(batch_size * num_images_per_prompt, -1)
+            negative_prompt_embeds = negative_prompt_embeds.repeat(
+                1, num_images_per_prompt, 1
+            )
+            negative_prompt_embeds = negative_prompt_embeds.view(
+                batch_size * num_images_per_prompt, seq_len, -1
+            )
+            negative_prompt_attention_mask = negative_prompt_attention_mask.repeat(
+                num_images_per_prompt, 1
+            )
+            negative_prompt_attention_mask = negative_prompt_attention_mask.view(
+                batch_size * num_images_per_prompt, -1
+            )
 
         return (
             prompt_embeds,
@@ -1044,22 +1157,40 @@ class OmniGen2Pipeline(nn.Module):
                 len(req.prompts) - 1,
             )
         first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or prompt)
+        prompt = (
+            first_prompt
+            if isinstance(first_prompt, str)
+            else (first_prompt.get("prompt") or prompt)
+        )
         negative_prompt = (
-            None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt", negative_prompt)
+            None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("negative_prompt", negative_prompt)
         )
         if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required for OmniGen2 generation.")
+            raise ValueError(
+                "Prompt or prompt_embeds is required for OmniGen2 generation."
+            )
 
         if not isinstance(first_prompt, str) and "preprocessed_images" in (
             additional_information := first_prompt.get("additional_information", {})
         ):
             input_images = additional_information.get("preprocessed_images")
 
-        height = req.sampling_params.height or height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or width or self.default_sample_size * self.vae_scale_factor
+        height = (
+            req.sampling_params.height
+            or height
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        width = (
+            req.sampling_params.width
+            or width
+            or self.default_sample_size * self.vae_scale_factor
+        )
         generator = req.sampling_params.generator or generator
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         if req.sampling_params.guidance_scale_provided:
             text_guidance_scale = req.sampling_params.guidance_scale
         self._text_guidance_scale = text_guidance_scale
@@ -1213,10 +1344,14 @@ class OmniGen2Pipeline(nn.Module):
                 ref_image_hidden_states=ref_latents,
             )
             text_guidance_scale = (
-                self.text_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
+                self.text_guidance_scale
+                if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1]
+                else 1.0
             )
             image_guidance_scale = (
-                self.image_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
+                self.image_guidance_scale
+                if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1]
+                else 1.0
             )
 
             if text_guidance_scale > 1.0 and image_guidance_scale > 1.0:
@@ -1252,7 +1387,9 @@ class OmniGen2Pipeline(nn.Module):
                     prompt_attention_mask=negative_prompt_attention_mask,
                     ref_image_hidden_states=None,
                 )
-                model_pred = model_pred_uncond + text_guidance_scale * (model_pred - model_pred_uncond)
+                model_pred = model_pred_uncond + text_guidance_scale * (
+                    model_pred - model_pred_uncond
+                )
 
             latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
 
@@ -1285,7 +1422,9 @@ class OmniGen2Pipeline(nn.Module):
         batch_size, num_channels_latents, height, width = latents.shape
 
         optional_kwargs = {}
-        if "ref_image_hidden_states" in set(inspect.signature(self.transformer.forward).parameters.keys()):
+        if "ref_image_hidden_states" in set(
+            inspect.signature(self.transformer.forward).parameters.keys()
+        ):
             optional_kwargs["ref_image_hidden_states"] = ref_image_hidden_states
 
         model_pred = self.transformer(

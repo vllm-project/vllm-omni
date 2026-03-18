@@ -97,7 +97,9 @@ class NextStepConfig(LlamaConfig):
         self.fm_head_dim = fm_head_dim
         self.fm_head_layers = fm_head_layers
         self.fm_head_batch_mul = fm_head_batch_mul
-        self.o_attention_bias = self.attention_bias if o_attention_bias is None else o_attention_bias
+        self.o_attention_bias = (
+            self.attention_bias if o_attention_bias is None else o_attention_bias
+        )
 
     @classmethod
     def from_json(cls, path: str) -> NextStepConfig:
@@ -120,9 +122,14 @@ class NextStepModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                LlamaDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
@@ -154,7 +161,11 @@ class NextStepModel(nn.Module):
     def _init_gen_pos_embed(self):
         self.register_buffer(
             "gen_pos_embed",
-            torch.from_numpy(get_2d_sincos_pos_embed(self.config.hidden_size, self.config.base_image_grid_size))
+            torch.from_numpy(
+                get_2d_sincos_pos_embed(
+                    self.config.hidden_size, self.config.base_image_grid_size
+                )
+            )
             .float()
             .unsqueeze(0),
         )
@@ -251,7 +262,9 @@ class NextStepModel(nn.Module):
                 return attention_mask
             return None
 
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
         using_static_cache = isinstance(past_key_values, StaticCache)
 
         if attn_impl == "sdpa" and not using_static_cache and not output_attentions:
@@ -291,7 +304,9 @@ class NextStepModel(nn.Module):
             and not output_attentions
         ):
             min_dtype = torch.finfo(dtype).min
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+            causal_mask = AttentionMaskConverter._unmask_unattended(
+                causal_mask, min_dtype
+            )
 
         return causal_mask
 
@@ -318,14 +333,20 @@ class NextStepModel(nn.Module):
         )
         if sequence_length != 1:
             causal_mask = torch.triu(causal_mask, diagonal=1)
-        causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+        causal_mask *= torch.arange(
+            target_length, device=device
+        ) > cache_position.reshape(-1, 1)
         causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
         if attention_mask is not None:
             causal_mask = causal_mask.clone()
             mask_length = attention_mask.shape[-1]
-            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(causal_mask.device)
+            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[
+                :, None, None, :
+            ].to(causal_mask.device)
             padding_mask = padding_mask == 0
-            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(padding_mask, min_dtype)
+            causal_mask[:, :, :, :mask_length] = causal_mask[
+                :, :, :, :mask_length
+            ].masked_fill(padding_mask, min_dtype)
 
         return causal_mask
 
@@ -344,20 +365,28 @@ class NextStepModel(nn.Module):
         cache_position: torch.LongTensor | None = None,
     ) -> BaseModelOutputWithPast:
         output_attentions = (
-            output_attentions if output_attentions is not None else getattr(self.config, "output_attentions", False)
+            output_attentions
+            if output_attentions is not None
+            else getattr(self.config, "output_attentions", False)
         )
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
-        use_cache = use_cache if use_cache is not None else getattr(self.config, "use_cache", True)
+        use_cache = (
+            use_cache
+            if use_cache is not None
+            else getattr(self.config, "use_cache", True)
+        )
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],

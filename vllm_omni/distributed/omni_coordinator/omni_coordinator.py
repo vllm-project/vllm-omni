@@ -71,13 +71,19 @@ class OmniCoordinator:
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
 
-        self._periodic_thread = threading.Thread(target=self._periodic_loop, daemon=True)
+        self._periodic_thread = threading.Thread(
+            target=self._periodic_loop, daemon=True
+        )
         self._periodic_thread.start()
 
     def get_active_instances(self) -> InstanceList:
         """Return an :class:`InstanceList` of active (UP) instances only."""
         with self._lock:
-            active = [inst for inst in self._instances.values() if inst.status == StageStatus.UP]
+            active = [
+                inst
+                for inst in self._instances.values()
+                if inst.status == StageStatus.UP
+            ]
         return InstanceList(instances=active, timestamp=time())
 
     def add_new_instance(self, event: InstanceEvent) -> None:
@@ -143,10 +149,16 @@ class OmniCoordinator:
             to_delete: list[str] = []
 
             for input_addr, info in self._instances.items():
-                if info.status == StageStatus.UP and now - info.last_heartbeat > self._heartbeat_timeout:
+                if (
+                    info.status == StageStatus.UP
+                    and now - info.last_heartbeat > self._heartbeat_timeout
+                ):
                     self._mark_instance_error_locked(info)
                     timed_out = True
-                elif info.status in (StageStatus.DOWN, StageStatus.ERROR) and now - info.last_heartbeat > gc_ttl:
+                elif (
+                    info.status in (StageStatus.DOWN, StageStatus.ERROR)
+                    and now - info.last_heartbeat > gc_ttl
+                ):
                     to_delete.append(input_addr)
 
             for input_addr in to_delete:

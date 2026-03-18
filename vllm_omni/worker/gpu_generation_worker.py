@@ -33,7 +33,8 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
             if (
-                parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
+                parallel_config.distributed_executor_backend
+                not in ("ray", "external_launcher")
                 and parallel_config.data_parallel_backend != "ray"
                 and parallel_config.nnodes_within_dp == 1
             ):
@@ -43,15 +44,18 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
                     dp_local_rank = self.parallel_config.data_parallel_index
 
                 tp_pp_world_size = (
-                    self.parallel_config.pipeline_parallel_size * self.parallel_config.tensor_parallel_size
+                    self.parallel_config.pipeline_parallel_size
+                    * self.parallel_config.tensor_parallel_size
                 )
 
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
-                assert self.local_rank < torch.cuda.device_count(), (
-                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                assert (
+                    self.local_rank < torch.cuda.device_count()
+                ), f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                visible_device_count = (
+                    torch.cuda.device_count() if torch.cuda.is_available() else 0
                 )
-                visible_device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
                 assert self.parallel_config.local_world_size <= visible_device_count, (
                     f"local_world_size ({self.parallel_config.local_world_size}) must "
                     f"be less than or equal to the number of visible devices "
@@ -85,7 +89,9 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
-            logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))
+            logger.debug(
+                "worker requested memory: %sGiB", format_gib(self.requested_memory)
+            )
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
@@ -95,7 +101,9 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         if self.use_v2_model_runner:
             # OMNI: v2 model runner does not yet include omni hooks.
-            logger.warning("OMNI GPUGenerationWorker forces v1 model runner for omni hooks.")
+            logger.warning(
+                "OMNI GPUGenerationWorker forces v1 model runner for omni hooks."
+            )
             self.use_v2_model_runner = False
 
         self.model_runner = GPUGenerationModelRunner(self.vllm_config, self.device)

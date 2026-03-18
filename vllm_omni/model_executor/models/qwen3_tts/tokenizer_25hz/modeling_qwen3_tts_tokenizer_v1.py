@@ -256,7 +256,9 @@ class AttentiveStatisticsPooling(nn.Module):
 
     def _compute_statistics(self, x, m, dim=2):
         mean = (m * x).sum(dim)
-        std = torch.sqrt((m * (x - mean.unsqueeze(dim)).pow(2)).sum(dim).clamp(self.eps))
+        std = torch.sqrt(
+            (m * (x - mean.unsqueeze(dim)).pow(2)).sum(dim).clamp(self.eps)
+        )
         return mean, std
 
     def forward(self, hidden_states):
@@ -265,7 +267,10 @@ class AttentiveStatisticsPooling(nn.Module):
 
         # Make binary mask of shape [N, 1, L]
         mask = self._length_to_mask(
-            lengths * seq_length, max_len=seq_length, dtype=hidden_states.dtype, device=hidden_states.device
+            lengths * seq_length,
+            max_len=seq_length,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
         mask = mask.unsqueeze(1)
 
@@ -315,7 +320,9 @@ class SqueezeExcitationRes2NetBlock(nn.Module):
             kernel_size=1,
             dilation=1,
         )
-        self.res2net_block = Res2NetBlock(out_channels, out_channels, res2net_scale, kernel_size, dilation)
+        self.res2net_block = Res2NetBlock(
+            out_channels, out_channels, res2net_scale, kernel_size, dilation
+        )
         self.tdnn2 = TimeDelayNetBlock(
             out_channels,
             out_channels,
@@ -343,10 +350,12 @@ class ECAPA_TimeDelayNet(torch.nn.Module):
 
     def __init__(self, config: Qwen3TTSTokenizerV1DecoderBigVGANConfig):
         super().__init__()
-        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(config.enc_channels) != len(
-            config.enc_dilations
-        ):
-            raise ValueError("enc_channels, enc_kernel_sizes and enc_dilations should have same length")
+        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(
+            config.enc_channels
+        ) != len(config.enc_dilations):
+            raise ValueError(
+                "enc_channels, enc_kernel_sizes and enc_dilations should have same length"
+            )
         self.channels = config.enc_channels
         self.blocks = nn.ModuleList()
 
@@ -440,14 +449,26 @@ class DiTInputEmbedding(nn.Module):
     ):
         if apply_cfg:
             hidden_states = torch.cat([hidden_states, hidden_states], dim=0)
-            speaker_embedding = torch.cat([speaker_embedding, torch.zeros_like(speaker_embedding)], dim=0)
-            condition_vector = torch.cat([condition_vector, torch.zeros_like(condition_vector)], dim=0)
+            speaker_embedding = torch.cat(
+                [speaker_embedding, torch.zeros_like(speaker_embedding)], dim=0
+            )
+            condition_vector = torch.cat(
+                [condition_vector, torch.zeros_like(condition_vector)], dim=0
+            )
             code_embed = torch.cat([code_embed, code_embed_uncond], dim=0)
         elif drop_audio_cond:  # cfg for cond audio
             condition_vector = torch.zeros_like(condition_vector)
             speaker_embedding = torch.zeros_like(speaker_embedding)
-        condition_vector = self.spk_encoder(condition_vector).unsqueeze(1).repeat(1, hidden_states.size(1), 1)
-        hidden_states = self.proj(torch.cat((hidden_states, condition_vector, code_embed, speaker_embedding), dim=-1))
+        condition_vector = (
+            self.spk_encoder(condition_vector)
+            .unsqueeze(1)
+            .repeat(1, hidden_states.size(1), 1)
+        )
+        hidden_states = self.proj(
+            torch.cat(
+                (hidden_states, condition_vector, code_embed, speaker_embedding), dim=-1
+            )
+        )
 
         return hidden_states
 
@@ -481,9 +502,13 @@ class AdaLayerNormZero(nn.Module):
 
     def forward(self, hidden_states, emb=None):
         emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(emb, 6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(
+            emb, 6, dim=1
+        )
 
-        hidden_states = self.norm(hidden_states) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        hidden_states = (
+            self.norm(hidden_states) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        )
         return hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
@@ -502,7 +527,9 @@ class AdaLayerNormZero_Final(nn.Module):
         emb = self.linear(self.silu(emb))
         scale, shift = torch.chunk(emb, 2, dim=1)
 
-        hidden_states = self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        hidden_states = (
+            self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
         return hidden_states
 
 
@@ -578,7 +605,9 @@ class DiTAttention(nn.Module):
         self.to_k = nn.Linear(config.hidden_size, self.inner_dim)
         self.to_v = nn.Linear(config.hidden_size, self.inner_dim)
 
-        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, config.hidden_size), nn.Dropout(config.dropout)])
+        self.to_out = nn.ModuleList(
+            [nn.Linear(self.inner_dim, config.hidden_size), nn.Dropout(config.dropout)]
+        )
 
     def forward(
         self,
@@ -616,7 +645,9 @@ class DiTAttention(nn.Module):
         )
 
         # mask. e.g. inference got a batch with different target durations, mask out the padding
-        attention_weights = attention_weights.reshape(batch_size, -1, self.heads * head_dim)
+        attention_weights = attention_weights.reshape(
+            batch_size, -1, self.heads * head_dim
+        )
         attention_weights = attention_weights.to(query.dtype)
 
         # linear proj
@@ -646,7 +677,9 @@ class DiTTimestepEmbedding(nn.Module):
     def __init__(self, dim, freq_embed_dim=256):
         super().__init__()
         self.time_embed = SinusPositionEmbedding(freq_embed_dim)
-        self.time_mlp = nn.ModuleList([nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim)])
+        self.time_mlp = nn.ModuleList(
+            [nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim)]
+        )
 
     def forward(self, timestep):
         time_hidden = self.time_embed(timestep)
@@ -657,21 +690,32 @@ class DiTTimestepEmbedding(nn.Module):
 
 
 class DiTDecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3TTSTokenizerV1DecoderBigVGANConfig, look_ahead_block=0, look_backward_block=0):
+    def __init__(
+        self,
+        config: Qwen3TTSTokenizerV1DecoderBigVGANConfig,
+        look_ahead_block=0,
+        look_backward_block=0,
+    ):
         super().__init__()
         self.attn_norm = AdaLayerNormZero(config.hidden_size)
 
         self.attn = DiTAttention(config)
         self.look_ahead_block = look_ahead_block
         self.look_backward_block = look_backward_block
-        self.ff_norm = nn.LayerNorm(config.hidden_size, elementwise_affine=False, eps=1e-6)
-        self.ff = DiTMLP(dim=config.hidden_size, mult=config.ff_mult, dropout=config.dropout)
+        self.ff_norm = nn.LayerNorm(
+            config.hidden_size, elementwise_affine=False, eps=1e-6
+        )
+        self.ff = DiTMLP(
+            dim=config.hidden_size, mult=config.ff_mult, dropout=config.dropout
+        )
 
     def forward(
         self, hidden_states, timestep, position_embeddings=None, block_diff=None
     ):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
-        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(hidden_states, emb=timestep)
+        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(
+            hidden_states, emb=timestep
+        )
 
         # attention
         attn_output = self.attn(
@@ -684,7 +728,9 @@ class DiTDecoderLayer(nn.Module):
         # process attention output for input x
         hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
 
-        norm = self.ff_norm(hidden_states) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm = (
+            self.ff_norm(hidden_states) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        )
         ff_output = self.ff(norm)
         hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
 
@@ -726,9 +772,9 @@ class SnakeBeta(nn.Module):
         beta = self.beta.unsqueeze(0).unsqueeze(-1)
         alpha = torch.exp(alpha)
         beta = torch.exp(beta)
-        hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(
-            torch.sin(hidden_states * alpha), 2
-        )
+        hidden_states = hidden_states + (
+            1.0 / (beta + self.no_div_by_zero)
+        ) * torch.pow(torch.sin(hidden_states * alpha), 2)
 
         return hidden_states
 
@@ -758,7 +804,9 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size) -> torch.Tensor:
     else:
         beta = 0.0
 
-    kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
+    kaiser_window = torch.kaiser_window(
+        kernel_size, beta=beta, periodic=False, dtype=torch.float32
+    )
 
     # Compute time indices
     if is_even:
@@ -768,7 +816,9 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size) -> torch.Tensor:
 
     # Compute sinc filter
     if cutoff == 0:
-        return torch.zeros((1, 1, kernel_size), dtype=torch.float32)  # Ensures correct shape
+        return torch.zeros(
+            (1, 1, kernel_size), dtype=torch.float32
+        )  # Ensures correct shape
 
     sinc_filter = torch.sinc(2 * cutoff * time_indices)
     normalized_filter = 2 * cutoff * kaiser_window * sinc_filter
@@ -783,13 +833,19 @@ class UpSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None):
         super().__init__()
         self.ratio = ratio
-        self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
+        self.kernel_size = (
+            int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
+        )
         self.stride = ratio
         self.pad = self.kernel_size // ratio - 1
         self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
-        self.pad_right = self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
+        self.pad_right = (
+            self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
+        )
 
-        filter = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size)
+        filter = kaiser_sinc_filter1d(
+            cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size
+        )
         self.register_buffer("filter", filter, persistent=False)
 
     def forward(self, hidden_states):
@@ -797,7 +853,10 @@ class UpSample1d(nn.Module):
 
         hidden_states = F.pad(hidden_states, (self.pad, self.pad), mode="replicate")
         hidden_states = self.ratio * F.conv_transpose1d(
-            hidden_states, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels
+            hidden_states,
+            self.filter.expand(channels, -1, -1),
+            stride=self.stride,
+            groups=channels,
         )
         hidden_states = hidden_states[..., self.pad_left : -self.pad_right]
 
@@ -824,8 +883,15 @@ class DownSample1d(nn.Module):
 
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
-        hidden_states = F.pad(hidden_states, (self.pad_left, self.pad_right), mode="replicate")
-        out = F.conv1d(hidden_states, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels)
+        hidden_states = F.pad(
+            hidden_states, (self.pad_left, self.pad_right), mode="replicate"
+        )
+        out = F.conv1d(
+            hidden_states,
+            self.filter.expand(channels, -1, -1),
+            stride=self.stride,
+            groups=channels,
+        )
         return out
 
 
@@ -859,7 +925,9 @@ class CausalConv1d(nn.Conv1d):
         self.causal_padding = self.dilation[0] * (self.kernel_size[0] - 1)
 
     def forward(self, x):
-        return self._conv_forward(F.pad(x, [self.causal_padding, 0]), self.weight, self.bias)
+        return self._conv_forward(
+            F.pad(x, [self.causal_padding, 0]), self.weight, self.bias
+        )
 
 
 class AMPBlock(torch.nn.Module):
@@ -954,10 +1022,15 @@ class AMPBlock(torch.nn.Module):
                 ]
             )
 
-        self.num_layers = len(self.convs1) + len(self.convs2)  # total number of conv layers
+        self.num_layers = len(self.convs1) + len(
+            self.convs2
+        )  # total number of conv layers
 
         self.activations = nn.ModuleList(
-            [TorchActivation1d(activation=SnakeBeta(channels)) for _ in range(self.num_layers)]
+            [
+                TorchActivation1d(activation=SnakeBeta(channels))
+                for _ in range(self.num_layers)
+            ]
         )
 
         if causal_type == "2":
@@ -998,7 +1071,9 @@ class Qwen3TTSTokenizerV1DecoderBigVGANModel(Qwen3TTSTokenizerV1DecoderPreTraine
         self.num_residual_blocks = len(config.resblock_kernel_sizes)
         self.num_upsample_layers = len(config.upsample_rates)
 
-        self.conv_pre = nn.Conv1d(config.mel_dim, config.upsample_initial_channel, 5, 1, padding=2)
+        self.conv_pre = nn.Conv1d(
+            config.mel_dim, config.upsample_initial_channel, 5, 1, padding=2
+        )
 
         # Removing extra ModuleList breaks official state dict
         ups = [
@@ -1013,7 +1088,9 @@ class Qwen3TTSTokenizerV1DecoderBigVGANModel(Qwen3TTSTokenizerV1DecoderPreTraine
                     )
                 ]
             )
-            for layer_idx, (stride, kernel_size) in enumerate(zip(config.upsample_rates, config.upsample_kernel_sizes))
+            for layer_idx, (stride, kernel_size) in enumerate(
+                zip(config.upsample_rates, config.upsample_kernel_sizes)
+            )
         ]
         self.ups = nn.ModuleList(ups)
 
@@ -1026,23 +1103,40 @@ class Qwen3TTSTokenizerV1DecoderBigVGANModel(Qwen3TTSTokenizerV1DecoderPreTraine
                     "1" if layer_idx > 1 else "2",
                 )
                 for layer_idx in range(self.num_upsample_layers)
-                for kernel_size, dilation in zip(config.resblock_kernel_sizes, config.resblock_dilation_sizes)
+                for kernel_size, dilation in zip(
+                    config.resblock_kernel_sizes, config.resblock_dilation_sizes
+                )
             ]
         )
 
         self.activation_post = TorchActivation1d(
-            activation=SnakeBeta(config.upsample_initial_channel // (2**self.num_upsample_layers))
+            activation=SnakeBeta(
+                config.upsample_initial_channel // (2**self.num_upsample_layers)
+            )
         )
         self.conv_post = nn.Conv1d(
-            config.upsample_initial_channel // (2**self.num_upsample_layers), 1, 7, 1, padding=3, bias=False
+            config.upsample_initial_channel // (2**self.num_upsample_layers),
+            1,
+            7,
+            1,
+            padding=3,
+            bias=False,
         )
 
     def normalize_spectrogram(self, spectrogram, max_value, min_db):
-        return torch.clamp((2 * max_value) * ((spectrogram - min_db) / (-min_db)) - max_value, -max_value, max_value)
+        return torch.clamp(
+            (2 * max_value) * ((spectrogram - min_db) / (-min_db)) - max_value,
+            -max_value,
+            max_value,
+        )
 
     def amplitude_to_db(self, amplitude, min_db_level):
         min_level = torch.exp(
-            torch.tensor(min_db_level / 20.0 * np.log(10), device=amplitude.device, dtype=amplitude.dtype)
+            torch.tensor(
+                min_db_level / 20.0 * np.log(10),
+                device=amplitude.device,
+                dtype=amplitude.dtype,
+            )
         )
         return 20 * torch.log10(torch.clamp(amplitude, min=min_level))
 
@@ -1058,7 +1152,9 @@ class Qwen3TTSTokenizerV1DecoderBigVGANModel(Qwen3TTSTokenizerV1DecoderPreTraine
         for layer_index in range(self.num_upsample_layers):
             hidden_representation = self.ups[layer_index][0](hidden_representation)
             residual_output = sum(
-                self.resblocks[layer_index * self.num_residual_blocks + block_index](hidden_representation)
+                self.resblocks[layer_index * self.num_residual_blocks + block_index](
+                    hidden_representation
+                )
                 for block_index in range(self.num_residual_blocks)
             )
             residual_output = residual_output / self.num_residual_blocks
@@ -1080,10 +1176,14 @@ class Qwen3TTSTokenizerV1DecoderDiTModel(Qwen3TTSTokenizerV1DecoderPreTrainedMod
         self.repeats = config.repeats
         self.time_embed = DiTTimestepEmbedding(config.hidden_size)
 
-        self.text_embed = DiTCodecEmbedding(config.num_embeds, config.emb_dim, config.repeats)
+        self.text_embed = DiTCodecEmbedding(
+            config.num_embeds, config.emb_dim, config.repeats
+        )
         self.input_embed = DiTInputEmbedding(config)
 
-        self.rotary_embed = Qwen3TTSTokenizerV1DecoderDiTRotaryEmbedding(config.head_dim)
+        self.rotary_embed = Qwen3TTSTokenizerV1DecoderDiTRotaryEmbedding(
+            config.head_dim
+        )
 
         self.hidden_size = config.hidden_size
         self.layers = config.num_hidden_layers
@@ -1105,7 +1205,9 @@ class Qwen3TTSTokenizerV1DecoderDiTModel(Qwen3TTSTokenizerV1DecoderPreTrainedMod
 
     def _create_block_diff(self, hidden_states):
         batch, seq_len = hidden_states.shape[0], hidden_states.shape[1]
-        block_indices = torch.arange(seq_len, device=hidden_states.device) // self.block_size  # [seq_length]
+        block_indices = (
+            torch.arange(seq_len, device=hidden_states.device) // self.block_size
+        )  # [seq_length]
 
         block_i = block_indices.unsqueeze(1)  # [seq_length, 1]
         block_j = block_indices.unsqueeze(0)  # [1, seq_length]
@@ -1130,8 +1232,12 @@ class Qwen3TTSTokenizerV1DecoderDiTModel(Qwen3TTSTokenizerV1DecoderPreTrainedMod
 
         # Compute embeddings
         time_embedding = self.time_embed(time_step)
-        text_embedding = self.text_embed(quantized_code, drop_code=False if apply_cfg else drop_code)
-        text_embedding_unconditioned = self.text_embed(quantized_code, drop_code=True) if apply_cfg else None
+        text_embedding = self.text_embed(
+            quantized_code, drop_code=False if apply_cfg else drop_code
+        )
+        text_embedding_unconditioned = (
+            self.text_embed(quantized_code, drop_code=True) if apply_cfg else None
+        )
 
         hidden_states = self.input_embed(
             hidden_states,
@@ -1181,11 +1287,16 @@ class Qwen3TTSTokenizerV1DecoderDiTModel(Qwen3TTSTokenizerV1DecoderPreTrainedMod
         sway_coefficient=-1.0,
     ):
         noise_initialization = torch.randn(
-            [quantized_code.shape[0], 30000, self.mel_dim], dtype=reference_mel_spectrogram.dtype
+            [quantized_code.shape[0], 30000, self.mel_dim],
+            dtype=reference_mel_spectrogram.dtype,
         )
         maximum_duration = quantized_code.shape[1] * self.repeats
-        initial_state = noise_initialization[:, :maximum_duration].to(quantized_code.device)
-        conditioning_vector = conditioning_vector.unsqueeze(1).repeat(1, maximum_duration, 1)
+        initial_state = noise_initialization[:, :maximum_duration].to(
+            quantized_code.device
+        )
+        conditioning_vector = conditioning_vector.unsqueeze(1).repeat(
+            1, maximum_duration, 1
+        )
 
         def ode_function(time_step, hidden_states):
             if guidance_scale < 1e-5:
@@ -1210,15 +1321,24 @@ class Qwen3TTSTokenizerV1DecoderDiTModel(Qwen3TTSTokenizerV1DecoderPreTrainedMod
             )
             guided_prediction, null_prediction = torch.chunk(model_output, 2, dim=0)
 
-            return guided_prediction + (guided_prediction - null_prediction) * guidance_scale
+            return (
+                guided_prediction
+                + (guided_prediction - null_prediction) * guidance_scale
+            )
 
         initial_time = 0
         time_embedding = torch.linspace(
-            initial_time, 1, num_steps, device=quantized_code.device, dtype=conditioning_vector.dtype
+            initial_time,
+            1,
+            num_steps,
+            device=quantized_code.device,
+            dtype=conditioning_vector.dtype,
         )
 
         if sway_coefficient is not None:
-            time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
+            time_embedding += sway_coefficient * (
+                torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding
+            )
 
         values = initial_state.clone()
         for t0, t1 in zip(time_embedding[:-1], time_embedding[1:]):
@@ -1234,7 +1354,10 @@ class Qwen3TTSTokenizerV1DecoderDiTModel(Qwen3TTSTokenizerV1DecoderPreTrainedMod
 class Qwen3TTSTokenizerV1Decoder(Qwen3TTSTokenizerV1DecoderPreTrainedModel):
     config: Qwen3TTSTokenizerV1DecoderConfig
     base_model_prefix = "model"
-    _no_split_modules = ["Qwen3TTSTokenizerV1DecoderDiTModel", "Qwen3TTSTokenizerV1DecoderBigVGANModel"]
+    _no_split_modules = [
+        "Qwen3TTSTokenizerV1DecoderDiTModel",
+        "Qwen3TTSTokenizerV1DecoderBigVGANModel",
+    ]
 
     def __init__(self, config: Qwen3TTSTokenizerV1DecoderConfig):
         super().__init__(config)
@@ -1252,7 +1375,9 @@ class Qwen3TTSTokenizerV1Decoder(Qwen3TTSTokenizerV1DecoderPreTrainedModel):
                 "Qwen3TTSTokenizerV1Decoder does not support eager attention implementation, fall back to sdpa"
             )
             attn_impl = "sdpa"
-        self.dit = Qwen3TTSTokenizerV1DecoderDiTModel._from_config(config.dit_config, attn_implementation=attn_impl)
+        self.dit = Qwen3TTSTokenizerV1DecoderDiTModel._from_config(
+            config.dit_config, attn_implementation=attn_impl
+        )
         self.bigvgan = Qwen3TTSTokenizerV1DecoderBigVGANModel._from_config(
             config.bigvgan_config, attn_implementation=attn_impl
         )
@@ -1311,7 +1436,9 @@ class Qwen3TTSTokenizerV1Encoder(Qwen3TTSTokenizerV1EncoderPreTrainedModel):
 
     def speech2mel(self, speeches):
         mels = [
-            get_mel_audio(speech, padding=self.padding, audio_vq_ds_rate=self.audio_vq_ds_rate)
+            get_mel_audio(
+                speech, padding=self.padding, audio_vq_ds_rate=self.audio_vq_ds_rate
+            )
             .to(speech.dtype)
             .to(self.tokenizer.conv1.weight.device)
             for speech in speeches
@@ -1333,7 +1460,9 @@ class Qwen3TTSTokenizerV1Encoder(Qwen3TTSTokenizerV1EncoderPreTrainedModel):
             )
 
         indice_lens = [T // self.tokenizer.audio_vq_ds_rate for T in audio_aftercnnlens]
-        indices = pad_sequence(torch.split(indices, indice_lens), batch_first=True, padding_value=0)
+        indices = pad_sequence(
+            torch.split(indices, indice_lens), batch_first=True, padding_value=0
+        )
 
         return indices, indice_lens
 
@@ -1355,11 +1484,9 @@ class Qwen3TTSTokenizerV1PreTrainedModel(PreTrainedModel):
     _supports_attention_backend = True
 
 
-@auto_docstring(
-    custom_intro="""
+@auto_docstring(custom_intro="""
     The Qwen3TTSTokenizerV1 model.
-    """
-)
+    """)
 class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
     def __init__(self, config: Qwen3TTSTokenizerV1Config):
         super().__init__(config)
@@ -1371,8 +1498,12 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
         self.decode_upsample_rate = config.decode_upsample_rate
         self.encode_downsample_rate = config.encode_downsample_rate
 
-        self.encoder = Qwen3TTSTokenizerV1Encoder._from_config(self.config.encoder_config)
-        self.decoder = Qwen3TTSTokenizerV1Decoder._from_config(self.config.decoder_config)
+        self.encoder = Qwen3TTSTokenizerV1Encoder._from_config(
+            self.config.encoder_config
+        )
+        self.decoder = Qwen3TTSTokenizerV1Decoder._from_config(
+            self.config.decoder_config
+        )
 
         self.encoder_xvector_extractor = None
 
@@ -1439,7 +1570,9 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
             revision=kwargs.pop("revision", None),
         )
         if encoder_xvector_extractor_path is None:
-            raise ValueError(f"""{pretrained_model_name_or_path}/{encoder_xvector_extractor_path} not exists""")
+            raise ValueError(
+                f"""{pretrained_model_name_or_path}/{encoder_xvector_extractor_path} not exists"""
+            )
         model.load_encoder_xvector_extractor(encoder_xvector_extractor_path)
 
         return model
@@ -1462,7 +1595,9 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
 
         wavs = [value[: mask.sum()] for value, mask in zip(input_values, padding_mask)]
 
@@ -1472,7 +1607,9 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
         xvectors = []
         ref_mels = []
         for wav in wavs:
-            xvector, ref_mel = self.encoder_xvector_extractor.extract_code(wav.cpu().numpy())
+            xvector, ref_mel = self.encoder_xvector_extractor.extract_code(
+                wav.cpu().numpy()
+            )
             xvector = torch.tensor(xvector).to(wav.dtype).to(wav.device)
             ref_mel = torch.tensor(ref_mel).to(wav.dtype).to(wav.device)
             xvectors.append(xvector)
@@ -1507,11 +1644,15 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
 
         """
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
         audio_lengths = (audio_codes > -1).sum(1) * self.decode_upsample_rate
 
         audio_codes = torch.clamp(audio_codes, min=0)
-        audio_values = self.decoder(code=audio_codes, reference_mel=ref_mels, conditioning=xvectors)
+        audio_values = self.decoder(
+            code=audio_codes, reference_mel=ref_mels, conditioning=xvectors
+        )
 
         audio_values = [a[:length] for a, length in zip(audio_values, audio_lengths)]
 

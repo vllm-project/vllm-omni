@@ -55,8 +55,12 @@ NUMERIC_FORMAT_COLUMNS: tuple[str, ...] = tuple(
 )
 
 _COLUMNS_FILENAME = "nightly_perf_summary_columns.txt"
-DEFAULT_INPUT_DIR = os.getenv("DEFAULT_INPUT_DIR") if os.getenv("DEFAULT_INPUT_DIR") else "tests"
-DEFAULT_OUTPUT_DIR = os.getenv("DEFAULT_OUTPUT_DIR") if os.getenv("DEFAULT_OUTPUT_DIR") else "tests"
+DEFAULT_INPUT_DIR = (
+    os.getenv("DEFAULT_INPUT_DIR") if os.getenv("DEFAULT_INPUT_DIR") else "tests"
+)
+DEFAULT_OUTPUT_DIR = (
+    os.getenv("DEFAULT_OUTPUT_DIR") if os.getenv("DEFAULT_OUTPUT_DIR") else "tests"
+)
 
 
 def _load_summary_columns(script_dir: str) -> list[str]:
@@ -113,7 +117,9 @@ def _vllm_omni_root() -> str:
         if os.path.isdir(os.path.join(path, "tests")):
             return path
         path = os.path.dirname(path)
-    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    return os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    )
 
 
 def _default_input_dir() -> str:
@@ -125,7 +131,9 @@ def _default_input_dir() -> str:
 def _default_output_file() -> str:
     """Default: vllm-omni root / DEFAULT_OUTPUT_DIR / nightly_perf_<timestamp>.xlsx."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return os.path.join(_vllm_omni_root(), DEFAULT_OUTPUT_DIR, f"nightly_perf_{ts}.xlsx")
+    return os.path.join(
+        _vllm_omni_root(), DEFAULT_OUTPUT_DIR, f"nightly_perf_{ts}.xlsx"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -391,13 +399,20 @@ def generate_excel_report(
         LOGGER.warning("no valid json records found under '%s'", input_dir)
 
     sorted_records = _sort_records_for_summary(records)
-    _apply_build_metadata_to_latest_only(sorted_records, commit_sha, build_id, build_url)
+    _apply_build_metadata_to_latest_only(
+        sorted_records, commit_sha, build_id, build_url
+    )
 
     wb = Workbook()
     ws_summary = wb.active
     ws_summary.title = "summary"
 
-    _write_sheet(ws_summary, summary_columns, sorted_records, numeric_columns=NUMERIC_FORMAT_COLUMNS)
+    _write_sheet(
+        ws_summary,
+        summary_columns,
+        sorted_records,
+        numeric_columns=NUMERIC_FORMAT_COLUMNS,
+    )
     _format_benchmark_columns(ws_summary, summary_columns, len(sorted_records))
     _apply_benchmark_change_highlight(ws_summary, summary_columns, sorted_records)
 

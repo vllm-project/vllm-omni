@@ -36,7 +36,12 @@ _VISION_START_TOKEN_ID = 151652  # "<|vision_start|>"
 _VISION_END_TOKEN_ID = 151653  # "<|vision_end|>"
 _AR_PATCH_SIZE = 16
 
-_STAGE_CONFIGS_DIR = Path(__file__).resolve().parents[3] / "vllm_omni" / "model_executor" / "stage_configs"
+_STAGE_CONFIGS_DIR = (
+    Path(__file__).resolve().parents[3]
+    / "vllm_omni"
+    / "model_executor"
+    / "stage_configs"
+)
 MODEL_PATH = os.environ.get(
     "MAMMOTHMODA2_MODEL_PATH",
     str(Path(__file__).resolve().parents[3] / "MammothModa2-Preview"),
@@ -135,7 +140,9 @@ def test_mammothmoda2_t2i_e2e():
     prompt_text = "A cat sitting on a laptop keyboard"
     formatted_prompt = _format_t2i_prompt(prompt_text, ar_width, ar_height)
 
-    omni = Omni(model=MODEL_PATH, stage_configs_path=T2I_STAGE_CONFIG, trust_remote_code=True)
+    omni = Omni(
+        model=MODEL_PATH, stage_configs_path=T2I_STAGE_CONFIG, trust_remote_code=True
+    )
     try:
         # Greedy / deterministic sampling so pixel values are reproducible.
         ar_sampling = SamplingParams(
@@ -192,21 +199,32 @@ def test_mammothmoda2_t2i_e2e():
                     mm = getattr(completion, "multimodal_output", None)
                     if not (isinstance(mm, dict) and "image" in mm):
                         continue
-                    img_list = mm["image"] if isinstance(mm["image"], list) else [mm["image"]]
+                    img_list = (
+                        mm["image"] if isinstance(mm["image"], list) else [mm["image"]]
+                    )
                     for img_tensor in img_list:
-                        assert isinstance(img_tensor, torch.Tensor), f"Expected image tensor, got {type(img_tensor)}"
-                        assert img_tensor.ndim in (3, 4), f"Expected 3D or 4D image tensor, got {img_tensor.ndim}D"
+                        assert isinstance(
+                            img_tensor, torch.Tensor
+                        ), f"Expected image tensor, got {type(img_tensor)}"
+                        assert img_tensor.ndim in (
+                            3,
+                            4,
+                        ), f"Expected 3D or 4D image tensor, got {img_tensor.ndim}D"
 
                         sampled = _sample_pixels(img_tensor)
 
                         if os.environ.get("UPDATE_GOLDEN"):
                             _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
-                            _GOLDEN_T2I_PATH.write_text(json.dumps({"pixels": sampled}, indent=2))
+                            _GOLDEN_T2I_PATH.write_text(
+                                json.dumps({"pixels": sampled}, indent=2)
+                            )
                             print(f"\nGolden file written to {_GOLDEN_T2I_PATH}")
                         elif _GOLDEN_T2I_PATH.exists():
                             golden = json.loads(_GOLDEN_T2I_PATH.read_text())["pixels"]
                             for i, (got, exp) in enumerate(zip(sampled, golden)):
-                                assert abs(got - exp) < 1e-4, f"Pixel {i} mismatch: got {got}, expected {exp}"
+                                assert (
+                                    abs(got - exp) < 1e-4
+                                ), f"Pixel {i} mismatch: got {got}, expected {exp}"
 
                         found_image = True
 

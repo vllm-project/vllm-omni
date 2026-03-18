@@ -12,7 +12,9 @@ class TestPreLookaheadLayer:
 
     @pytest.fixture
     def layer(self):
-        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import (
+            PreLookaheadLayer,
+        )
 
         return PreLookaheadLayer(in_channels=512, channels=512, pre_lookahead_len=3)
 
@@ -53,7 +55,9 @@ class TestDiTAttention:
 
     @pytest.fixture
     def attention(self):
-        from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiTAttention
+        from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import (
+            DiTAttention,
+        )
 
         return DiTAttention(dim=512, heads=8, dim_head=64, dropout=0.0)
 
@@ -192,7 +196,9 @@ class TestCFM:
         """Test CausalConditionalCFM forward pass."""
         from omegaconf import DictConfig
 
-        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
+            CausalConditionalCFM,
+        )
 
         cfm_params = DictConfig(
             {

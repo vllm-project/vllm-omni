@@ -27,7 +27,9 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalConvRNNF0Predictor,
     CausalHiFTGenerator,
 )
-from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import (
+    PreLookaheadLayer,
+)
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 
@@ -98,7 +100,9 @@ class CosyVoice3Code2Wav(nn.Module):
             resblock_kernel_sizes=config.hift["resblock_kernel_sizes"],
             resblock_dilation_sizes=config.hift["resblock_dilation_sizes"],
             source_resblock_kernel_sizes=config.hift["source_resblock_kernel_sizes"],
-            source_resblock_dilation_sizes=config.hift["source_resblock_dilation_sizes"],
+            source_resblock_dilation_sizes=config.hift[
+                "source_resblock_dilation_sizes"
+            ],
             lrelu_slope=config.hift["lrelu_slope"],
             audio_limit=config.hift["audio_limit"],
             conv_pre_look_right=config.hift["conv_pre_look_right"],
@@ -109,7 +113,9 @@ class CosyVoice3Code2Wav(nn.Module):
 
         # Streaming/chunking parameters
         self.token_overlap_len = 20
-        self.mel_overlap_len = int(self.token_overlap_len / self.flow_model.input_frame_rate * 22050 / 256)
+        self.mel_overlap_len = int(
+            self.token_overlap_len / self.flow_model.input_frame_rate * 22050 / 256
+        )
         self.mel_window = np.hamming(2 * self.mel_overlap_len)
         self.mel_cache_len = 20
         self.source_cache_len = int(self.mel_cache_len * 256)
@@ -253,14 +259,17 @@ class CosyVoice3Code2Wav(nn.Module):
 
         # Load flow weights
         flow_path = os.path.join(model_dir, "flow.pt")
-        self.flow_model.load_state_dict(torch.load(flow_path, map_location=device), strict=True)
+        self.flow_model.load_state_dict(
+            torch.load(flow_path, map_location=device), strict=True
+        )
         self.flow_model.to(device).eval()
         logger.info(f"Loaded flow weights from {flow_path}")
 
         # Load hift weights
         hift_path = os.path.join(model_dir, "hift.pt")
         hift_state_dict = {
-            k.replace("generator.", ""): v for k, v in torch.load(hift_path, map_location=device).items()
+            k.replace("generator.", ""): v
+            for k, v in torch.load(hift_path, map_location=device).items()
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(device).eval()

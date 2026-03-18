@@ -94,7 +94,9 @@ def build_interface(api_base: str):
 
     with gr.Blocks(css=css, title="Qwen3-TTS (FastRTC)") as demo:
         gr.Markdown("# Qwen3-TTS Online Serving Demo (FastRTC)")
-        gr.Markdown(f"**Server:** `{api_base}` | **Transport:** WebRTC (gapless streaming)")
+        gr.Markdown(
+            f"**Server:** `{api_base}` | **Transport:** WebRTC (gapless streaming)"
+        )
 
         with gr.Row():
             # Left column: inputs
@@ -128,7 +130,9 @@ def build_interface(api_base: str):
 
                 instructions = gr.Textbox(
                     label="Instructions",
-                    placeholder=("e.g., Speak with excitement / A warm, friendly female voice"),
+                    placeholder=(
+                        "e.g., Speak with excitement / A warm, friendly female voice"
+                    ),
                     lines=2,
                     visible=True,
                     info="Optional style/emotion instructions",
@@ -139,13 +143,17 @@ def build_interface(api_base: str):
                 # use a URL instead.
                 ref_audio_url = gr.Textbox(
                     label="Reference Audio URL",
-                    placeholder=("https://example.com/reference.wav (alternative to uploading)"),
+                    placeholder=(
+                        "https://example.com/reference.wav (alternative to uploading)"
+                    ),
                     lines=1,
                     visible=False,
                 )
                 ref_text = gr.Textbox(
                     label="Reference Audio Transcript",
-                    placeholder=("Transcript of the reference audio (optional, improves quality)"),
+                    placeholder=(
+                        "Transcript of the reference audio (optional, improves quality)"
+                    ),
                     lines=2,
                     visible=False,
                 )
@@ -153,7 +161,9 @@ def build_interface(api_base: str):
                     label="Use x-vector only",
                     value=False,
                     visible=False,
-                    info=("Skip reference transcript, use speaker embedding only (lower quality)"),
+                    info=(
+                        "Skip reference transcript, use speaker embedding only (lower quality)"
+                    ),
                 )
 
                 generate_btn = gr.Button(
@@ -252,7 +262,9 @@ def build_interface(api_base: str):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Gradio FastRTC demo for Qwen3-TTS (gapless streaming).")
+    parser = argparse.ArgumentParser(
+        description="Gradio FastRTC demo for Qwen3-TTS (gapless streaming)."
+    )
     add_common_args(parser)
     return parser.parse_args()
 

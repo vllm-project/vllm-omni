@@ -39,7 +39,9 @@ class OmniCoordClientForHub:
 
         self._init_done.wait(timeout=5.0)
         if self._init_error:
-            raise RuntimeError(f"Failed to connect to coordinator at {self._coord_zmq_addr}") from self._init_error[0]
+            raise RuntimeError(
+                f"Failed to connect to coordinator at {self._coord_zmq_addr}"
+            ) from self._init_error[0]
 
     def _decode_instance_list(self, payload: dict[str, Any]) -> InstanceList:
         """Convert a JSON-decoded dict into an :class:`InstanceList`."""
@@ -82,7 +84,9 @@ class OmniCoordClientForHub:
                     try:
                         sub = self._ctx.socket(zmq.SUB)
                         sub.setsockopt(zmq.SUBSCRIBE, b"")
-                        sub.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout, avoids busy-wait
+                        sub.setsockopt(
+                            zmq.RCVTIMEO, 100
+                        )  # 100ms timeout, avoids busy-wait
                         sub.connect(self._coord_zmq_addr)
                     except (zmq.ZMQError, OSError) as e:
                         logger.error(

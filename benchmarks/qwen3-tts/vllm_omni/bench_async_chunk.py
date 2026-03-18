@@ -83,7 +83,9 @@ class BenchmarkResult:
     per_request: list = field(default_factory=list)
 
 
-def pcm_bytes_to_duration(num_bytes: int, sample_rate: int = 24000, sample_width: int = 2) -> float:
+def pcm_bytes_to_duration(
+    num_bytes: int, sample_rate: int = 24000, sample_width: int = 2
+) -> float:
     return num_bytes / sample_width / sample_rate
 
 
@@ -150,13 +152,19 @@ async def run_benchmark(
 ) -> BenchmarkResult:
     api_url = f"http://{host}:{port}/v1/audio/speech"
 
-    connector = aiohttp.TCPConnector(limit=max_concurrency, limit_per_host=max_concurrency, keepalive_timeout=60)
-    session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=600))
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrency, limit_per_host=max_concurrency, keepalive_timeout=60
+    )
+    session = aiohttp.ClientSession(
+        connector=connector, timeout=aiohttp.ClientTimeout(total=600)
+    )
 
     if num_warmups > 0:
         print(f"  Warming up with {num_warmups} requests...")
         warmup_tasks = [
-            send_tts_request(session, api_url, PROMPTS[i % len(PROMPTS)], voice, language, stream)
+            send_tts_request(
+                session, api_url, PROMPTS[i % len(PROMPTS)], voice, language, stream
+            )
             for i in range(num_warmups)
         ]
         await asyncio.gather(*warmup_tasks)
@@ -170,7 +178,9 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, voice, language, stream, pbar)
+            return await send_tts_request(
+                session, api_url, prompt, voice, language, stream, pbar
+            )
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -232,8 +242,12 @@ async def run_benchmark(
         ]
 
     print(f"\n{'=' * 60}")
-    print(f"  Concurrency: {max_concurrency}  |  Completed: {bench.completed}  |  Failed: {bench.failed}")
-    print(f"  Duration: {duration:.2f}s  |  Throughput: {bench.request_throughput:.2f} req/s")
+    print(
+        f"  Concurrency: {max_concurrency}  |  Completed: {bench.completed}  |  Failed: {bench.failed}"
+    )
+    print(
+        f"  Duration: {duration:.2f}s  |  Throughput: {bench.request_throughput:.2f} req/s"
+    )
     print(
         f"  TTFP (ms):  mean={bench.mean_ttfp_ms:.1f}  median={bench.median_ttfp_ms:.1f}"
         f"  p90={bench.p90_ttfp_ms:.1f}  p99={bench.p99_ttfp_ms:.1f}"
@@ -281,7 +295,9 @@ async def main(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Qwen3-TTS async_chunk benchmark client")
+    parser = argparse.ArgumentParser(
+        description="Qwen3-TTS async_chunk benchmark client"
+    )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-prompts", type=int, default=50)

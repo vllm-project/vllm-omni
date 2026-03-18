@@ -9,7 +9,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
+from diffusers.models.embeddings import (
+    PixArtAlphaTextProjection,
+    TimestepEmbedding,
+    Timesteps,
+)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
 from vllm.distributed import (
@@ -19,7 +23,11 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -94,7 +102,9 @@ class DistributedRMSNorm(nn.Module):
 class ColumnParallelGELU(nn.Module):
     """Column parallel linear with GELU activation."""
 
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str = "tanh", bias: bool = True):
+    def __init__(
+        self, dim_in: int, dim_out: int, *, approximate: str = "tanh", bias: bool = True
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -167,13 +177,17 @@ class WanRotaryPosEmbed(nn.Module):
         # Split dimensions for temporal, height, width
         h_dim = w_dim = 2 * (attention_head_dim // 6)
         t_dim = attention_head_dim - h_dim - w_dim
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        freqs_dtype = (
+            torch.float32 if torch.backends.mps.is_available() else torch.float64
+        )
 
         freqs_cos = []
         freqs_sin = []
 
         for dim in [t_dim, h_dim, w_dim]:
-            freq_cos, freq_sin = self._get_1d_rotary_pos_embed(dim, max_seq_len, theta, freqs_dtype)
+            freq_cos, freq_sin = self._get_1d_rotary_pos_embed(
+                dim, max_seq_len, theta, freqs_dtype
+            )
             freqs_cos.append(freq_cos)
             freqs_sin.append(freq_sin)
 
@@ -218,8 +232,12 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
-        freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
-        freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+        freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(
+            1, ppf * pph * ppw, 1, -1
+        )
+        freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(
+            1, ppf * pph * ppw, 1, -1
+        )
 
         return freqs_cos, freqs_sin
 
@@ -227,21 +245,27 @@ class WanRotaryPosEmbed(nn.Module):
 class WanImageEmbedding(nn.Module):
     """Image embedding module for I2V tasks."""
 
-    def __init__(self, in_features: int, out_features: int, pos_embed_seq_len: int | None = None):
+    def __init__(
+        self, in_features: int, out_features: int, pos_embed_seq_len: int | None = None
+    ):
         super().__init__()
 
         self.norm1 = FP32LayerNorm(in_features)
         self.ff = FeedForward(in_features, out_features, mult=1, activation_fn="gelu")
         self.norm2 = FP32LayerNorm(out_features)
         if pos_embed_seq_len is not None:
-            self.pos_embed = nn.Parameter(torch.zeros(1, pos_embed_seq_len, in_features))
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, pos_embed_seq_len, in_features)
+            )
         else:
             self.pos_embed = None
 
     def forward(self, encoder_hidden_states_image: torch.Tensor) -> torch.Tensor:
         if self.pos_embed is not None:
             batch_size, seq_len, embed_dim = encoder_hidden_states_image.shape
-            encoder_hidden_states_image = encoder_hidden_states_image.view(-1, 2 * seq_len, embed_dim)
+            encoder_hidden_states_image = encoder_hidden_states_image.view(
+                -1, 2 * seq_len, embed_dim
+            )
             encoder_hidden_states_image = encoder_hidden_states_image + self.pos_embed
 
         hidden_states = self.norm1(encoder_hidden_states_image)
@@ -264,15 +288,23 @@ class WanTimeTextImageEmbedding(nn.Module):
     ):
         super().__init__()
 
-        self.timesteps_proj = Timesteps(num_channels=time_freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.time_embedder = TimestepEmbedding(in_channels=time_freq_dim, time_embed_dim=dim)
+        self.timesteps_proj = Timesteps(
+            num_channels=time_freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        self.time_embedder = TimestepEmbedding(
+            in_channels=time_freq_dim, time_embed_dim=dim
+        )
         self.act_fn = nn.SiLU()
         self.time_proj = nn.Linear(dim, time_proj_dim)
-        self.text_embedder = PixArtAlphaTextProjection(text_embed_dim, dim, act_fn="gelu_tanh")
+        self.text_embedder = PixArtAlphaTextProjection(
+            text_embed_dim, dim, act_fn="gelu_tanh"
+        )
 
         self.image_embedder = None
         if image_embed_dim is not None:
-            self.image_embedder = WanImageEmbedding(image_embed_dim, dim, pos_embed_seq_len=pos_embed_seq_len)
+            self.image_embedder = WanImageEmbedding(
+                image_embed_dim, dim, pos_embed_seq_len=pos_embed_seq_len
+            )
 
     def forward(
         self,
@@ -293,7 +325,9 @@ class WanTimeTextImageEmbedding(nn.Module):
 
         encoder_hidden_states = self.text_embedder(encoder_hidden_states)
         if encoder_hidden_states_image is not None:
-            encoder_hidden_states_image = self.image_embedder(encoder_hidden_states_image)
+            encoder_hidden_states_image = self.image_embedder(
+                encoder_hidden_states_image
+            )
 
         return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
@@ -323,17 +357,23 @@ class OutputScaleShiftPrepare(nn.Module):
 
     def __init__(self, inner_dim: int):
         super().__init__()
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
+        self.scale_shift_table = nn.Parameter(
+            torch.randn(1, 2, inner_dim) / inner_dim**0.5
+        )
 
     def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if temb.ndim == 3:
             # TI2V: [B, seq, D] -> 3D outputs for SP sharding
-            shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift, scale = (
+                self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)
+            ).chunk(2, dim=2)
             shift = shift.squeeze(2)
             scale = scale.squeeze(2)
         else:
             # T2V: [B, D] -> 2D outputs (skip SP sharding via expected_dims=3)
-            shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
+            shift, scale = (
+                self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)
+            ).chunk(2, dim=1)
             shift = shift.squeeze(1)
             scale = scale.squeeze(1)
         return shift, scale
@@ -459,7 +499,9 @@ class WanCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.inner_dim = num_heads * head_dim
-        self.kv_inner_dim = head_dim * num_heads  # For cross-attention, K/V come from encoder
+        self.kv_inner_dim = (
+            head_dim * num_heads
+        )  # For cross-attention, K/V come from encoder
 
         # Query projection
         self.to_q = ColumnParallelLinear(
@@ -630,7 +672,11 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             added_kv_proj_dim=added_kv_proj_dim,
         )
-        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.norm2 = (
+            FP32LayerNorm(dim, eps, elementwise_affine=True)
+            if cross_attn_norm
+            else nn.Identity()
+        )
 
         # 3. Feed-forward
         self.ffn = WanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
@@ -665,9 +711,13 @@ class WanTransformerBlock(nn.Module):
             ).chunk(6, dim=1)
 
         # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        norm_hidden_states = (
+            self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
+        ).type_as(hidden_states)
         attn_output = self.attn1(norm_hidden_states, rotary_emb, hidden_states_mask)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(
+            hidden_states
+        )
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
@@ -675,11 +725,13 @@ class WanTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
-            hidden_states
-        )
+        norm_hidden_states = (
+            self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa
+        ).type_as(hidden_states)
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        hidden_states = (
+            hidden_states.float() + ff_output.float() * c_gate_msa
+        ).type_as(hidden_states)
 
         return hidden_states
 
@@ -763,12 +815,18 @@ class WanTransformer3DModel(nn.Module):
         # Shard hidden_states at first transformer block input
         # (after patch_embedding + flatten + transpose)
         "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),  # [B, seq, dim]
+            "hidden_states": SequenceParallelInput(
+                split_dim=1, expected_dims=3, auto_pad=True
+            ),  # [B, seq, dim]
         },
         # Shard output scale/shift for TI2V (3D); T2V outputs 2D and skips sharding
         "output_scale_shift_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            0: SequenceParallelInput(
+                split_dim=1, expected_dims=3, split_output=True, auto_pad=True
+            ),
+            1: SequenceParallelInput(
+                split_dim=1, expected_dims=3, split_output=True, auto_pad=True
+            ),
         },
         # Gather at proj_out (final linear projection before unpatchify)
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
@@ -842,7 +900,14 @@ class WanTransformer3DModel(nn.Module):
         # 3. Transformer blocks
         self.blocks = nn.ModuleList(
             [
-                WanTransformerBlock(inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm)
+                WanTransformerBlock(
+                    inner_dim,
+                    ffn_dim,
+                    num_attention_heads,
+                    eps,
+                    added_kv_proj_dim,
+                    cross_attn_norm,
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -890,8 +955,13 @@ class WanTransformer3DModel(nn.Module):
         else:
             ts_seq_len = None
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
+        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
+            self.condition_embedder(
+                timestep,
+                encoder_hidden_states,
+                encoder_hidden_states_image,
+                timestep_seq_len=ts_seq_len,
+            )
         )
         # Prepare timestep_proj via TimestepProjPrepare module
         # _sp_plan will shard timestep_proj via split_output=True (when ts_seq_len is not None)
@@ -899,7 +969,9 @@ class WanTransformer3DModel(nn.Module):
         timestep_proj = self.timestep_proj_prepare(timestep_proj, ts_seq_len)
 
         if encoder_hidden_states_image is not None:
-            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+            encoder_hidden_states = torch.concat(
+                [encoder_hidden_states_image, encoder_hidden_states], dim=1
+            )
 
         # Check for SP auto_pad: create attention mask dynamically if padding was applied
         hidden_states_mask = None  # default
@@ -926,7 +998,13 @@ class WanTransformer3DModel(nn.Module):
 
         # Transformer blocks
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+            )
 
         # Output norm, projection & unpatchify
         shift, scale = self.output_scale_shift_prepare(temb)
@@ -936,11 +1014,20 @@ class WanTransformer3DModel(nn.Module):
             shift = shift.unsqueeze(1)
             scale = scale.unsqueeze(1)
 
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = (
+            self.norm_out(hidden_states.float()) * (1 + scale) + shift
+        ).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
-            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+            batch_size,
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            p_t,
+            p_h,
+            p_w,
+            -1,
         )
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
@@ -1029,7 +1116,9 @@ class WanTransformer3DModel(nn.Module):
                     ]
                 ):
                     shard_size = loaded_weight.shape[0] // tp_size
-                    loaded_weight = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+                    loaded_weight = loaded_weight[
+                        tp_rank * shard_size : (tp_rank + 1) * shard_size
+                    ]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

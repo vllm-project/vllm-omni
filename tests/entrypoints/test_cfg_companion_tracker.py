@@ -10,14 +10,22 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def dummy_expand_func(prompt, sp0):
     if prompt == "expand_me":
-        return [SimpleNamespace(prompt={"prompt": "neg"}, role="cfg_text", request_id_suffix="__cfg_text")]
+        return [
+            SimpleNamespace(
+                prompt={"prompt": "neg"},
+                role="cfg_text",
+                request_id_suffix="__cfg_text",
+            )
+        ]
     return []
 
 
 @pytest.fixture
 def tracker():
     sp0 = SimpleNamespace()
-    return CfgCompanionTracker(prompt_expand_func=dummy_expand_func, stage0_sampling_params=sp0, timeout_s=0.1)
+    return CfgCompanionTracker(
+        prompt_expand_func=dummy_expand_func, stage0_sampling_params=sp0, timeout_s=0.1
+    )
 
 
 def test_companion_tracker_initialization(tracker):

@@ -14,12 +14,16 @@
 
 import numpy as np
 import torch
-from diffusers.models.embeddings import get_1d_rotary_pos_embed as _get_1d_rotary_pos_embed
+from diffusers.models.embeddings import (
+    get_1d_rotary_pos_embed as _get_1d_rotary_pos_embed,
+)
 from einops import repeat
 from torch import nn
 
 
-def apply_real_rotary_emb(x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor) -> torch.Tensor:
+def apply_real_rotary_emb(
+    x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
+) -> torch.Tensor:
     """
     Apply real-valued rotary embeddings to input tensor.
 
@@ -73,7 +77,9 @@ def apply_real_rotary_emb(x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: t
         sin_1 = sin_1.unsqueeze(2)
         sin_2 = sin_2.unsqueeze(2)
 
-    x1 = x_reshaped[..., 0]  # [..., seq_len, num_heads, dim//2] or [..., seq_len, dim//2]
+    x1 = x_reshaped[
+        ..., 0
+    ]  # [..., seq_len, num_heads, dim//2] or [..., seq_len, dim//2]
     x2 = x_reshaped[..., 1]  # same
 
     out1 = x1 * cos_1 - x2 * sin_1
@@ -106,7 +112,11 @@ def get_1d_rotary_pos_embed_real(
 
 class RotaryPosEmbedReal(nn.Module):
     def __init__(
-        self, theta: int, axes_dim: tuple[int, int, int], axes_lens: tuple[int, int, int], patch_size: int = 2
+        self,
+        theta: int,
+        axes_dim: tuple[int, int, int],
+        axes_lens: tuple[int, int, int],
+        patch_size: int = 2,
     ):
         super().__init__()
         self.theta = theta
@@ -119,9 +129,13 @@ class RotaryPosEmbedReal(nn.Module):
         axes_dim: tuple[int, int, int], axes_lens: tuple[int, int, int], theta: int
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         freqs_real = []
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        freqs_dtype = (
+            torch.float32 if torch.backends.mps.is_available() else torch.float64
+        )
         for i, (d, e) in enumerate(zip(axes_dim, axes_lens)):
-            cos_emb, sin_emb = get_1d_rotary_pos_embed_real(d, e, theta=theta, freqs_dtype=freqs_dtype)
+            cos_emb, sin_emb = get_1d_rotary_pos_embed_real(
+                d, e, theta=theta, freqs_dtype=freqs_dtype
+            )
             freqs_real.append((cos_emb, sin_emb))
         return freqs_real
 
@@ -138,16 +152,37 @@ class RotaryPosEmbedReal(nn.Module):
             freqs_cos, freqs_sin = freqs_real[i]
             freqs_cos = freqs_cos.to(ids.device)
             freqs_sin = freqs_sin.to(ids.device)
-            index = ids[:, :, i : i + 1].repeat(1, 1, freqs_cos.shape[-1]).to(torch.int64)
-            cos_result.append(torch.gather(freqs_cos.unsqueeze(0).repeat(index.shape[0], 1, 1), dim=1, index=index))
-            sin_result.append(torch.gather(freqs_sin.unsqueeze(0).repeat(index.shape[0], 1, 1), dim=1, index=index))
+            index = (
+                ids[:, :, i : i + 1].repeat(1, 1, freqs_cos.shape[-1]).to(torch.int64)
+            )
+            cos_result.append(
+                torch.gather(
+                    freqs_cos.unsqueeze(0).repeat(index.shape[0], 1, 1),
+                    dim=1,
+                    index=index,
+                )
+            )
+            sin_result.append(
+                torch.gather(
+                    freqs_sin.unsqueeze(0).repeat(index.shape[0], 1, 1),
+                    dim=1,
+                    index=index,
+                )
+            )
 
         combined_cos = torch.cat(cos_result, dim=-1).to(device)
         combined_sin = torch.cat(sin_result, dim=-1).to(device)
         return combined_cos, combined_sin
 
     def forward(
-        self, freqs_real, attention_mask, l_effective_ref_img_len, l_effective_img_len, ref_img_sizes, img_sizes, device
+        self,
+        freqs_real,
+        attention_mask,
+        l_effective_ref_img_len,
+        l_effective_img_len,
+        ref_img_sizes,
+        img_sizes,
+        device,
     ):
         batch_size = len(attention_mask)
         p = self.patch_size
@@ -157,17 +192,25 @@ class RotaryPosEmbedReal(nn.Module):
         l_effective_cap_len = [int(len) for len in l_effective_cap_len]
         seq_lengths = [
             int(cap_len + sum(ref_img_len) + img_len)
-            for cap_len, ref_img_len, img_len in zip(l_effective_cap_len, l_effective_ref_img_len, l_effective_img_len)
+            for cap_len, ref_img_len, img_len in zip(
+                l_effective_cap_len, l_effective_ref_img_len, l_effective_img_len
+            )
         ]
 
         max_seq_len = max(seq_lengths)
-        max_ref_img_len = max([int(sum(ref_img_len)) for ref_img_len in l_effective_ref_img_len])
+        max_ref_img_len = max(
+            [int(sum(ref_img_len)) for ref_img_len in l_effective_ref_img_len]
+        )
         max_img_len = int(max(l_effective_img_len))
 
         # Create position IDs
-        position_ids = torch.zeros(batch_size, int(max_seq_len), 3, dtype=torch.int32, device=device)
+        position_ids = torch.zeros(
+            batch_size, int(max_seq_len), 3, dtype=torch.int32, device=device
+        )
 
-        for i, (cap_seq_len, seq_len) in enumerate(zip(l_effective_cap_len, seq_lengths)):
+        for i, (cap_seq_len, seq_len) in enumerate(
+            zip(l_effective_cap_len, seq_lengths)
+        ):
             # add text position ids
             position_ids[i, :cap_seq_len] = repeat(
                 torch.arange(cap_seq_len, dtype=torch.int32, device=device), "l -> l 3"
@@ -176,21 +219,33 @@ class RotaryPosEmbedReal(nn.Module):
             pe_shift_len = cap_seq_len
 
             if ref_img_sizes[i] is not None:
-                for ref_img_size, ref_img_len in zip(ref_img_sizes[i], l_effective_ref_img_len[i]):
+                for ref_img_size, ref_img_len in zip(
+                    ref_img_sizes[i], l_effective_ref_img_len[i]
+                ):
                     H, W = ref_img_size
                     ref_H_tokens, ref_W_tokens = H // p, W // p
                     assert ref_H_tokens * ref_W_tokens == ref_img_len
                     # add image position ids
 
                     row_ids = repeat(
-                        torch.arange(ref_H_tokens, dtype=torch.int32, device=device), "h -> h w", w=ref_W_tokens
+                        torch.arange(ref_H_tokens, dtype=torch.int32, device=device),
+                        "h -> h w",
+                        w=ref_W_tokens,
                     ).flatten()
                     col_ids = repeat(
-                        torch.arange(ref_W_tokens, dtype=torch.int32, device=device), "w -> h w", h=ref_H_tokens
+                        torch.arange(ref_W_tokens, dtype=torch.int32, device=device),
+                        "w -> h w",
+                        h=ref_H_tokens,
                     ).flatten()
-                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 0] = pe_shift
-                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 1] = row_ids
-                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 2] = col_ids
+                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 0] = (
+                        pe_shift
+                    )
+                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 1] = (
+                        row_ids
+                    )
+                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 2] = (
+                        col_ids
+                    )
 
                     pe_shift += max(ref_H_tokens, ref_W_tokens)
                     pe_shift_len += ref_img_len
@@ -199,8 +254,16 @@ class RotaryPosEmbedReal(nn.Module):
             H_tokens, W_tokens = H // p, W // p
             assert H_tokens * W_tokens == l_effective_img_len[i]
 
-            row_ids = repeat(torch.arange(H_tokens, dtype=torch.int32, device=device), "h -> h w", w=W_tokens).flatten()
-            col_ids = repeat(torch.arange(W_tokens, dtype=torch.int32, device=device), "w -> h w", h=H_tokens).flatten()
+            row_ids = repeat(
+                torch.arange(H_tokens, dtype=torch.int32, device=device),
+                "h -> h w",
+                w=W_tokens,
+            ).flatten()
+            col_ids = repeat(
+                torch.arange(W_tokens, dtype=torch.int32, device=device),
+                "w -> h w",
+                h=H_tokens,
+            ).flatten()
 
             assert pe_shift_len + l_effective_img_len[i] == seq_len
             position_ids[i, pe_shift_len:seq_len, 0] = pe_shift
@@ -212,32 +275,77 @@ class RotaryPosEmbedReal(nn.Module):
 
         # create separate rotary embeddings for captions and images
         cap_freqs_cos = torch.zeros(
-            batch_size, encoder_seq_len, freqs_cos.shape[-1], device=device, dtype=freqs_cos.dtype
+            batch_size,
+            encoder_seq_len,
+            freqs_cos.shape[-1],
+            device=device,
+            dtype=freqs_cos.dtype,
         )
         cap_freqs_sin = torch.zeros(
-            batch_size, encoder_seq_len, freqs_sin.shape[-1], device=device, dtype=freqs_sin.dtype
+            batch_size,
+            encoder_seq_len,
+            freqs_sin.shape[-1],
+            device=device,
+            dtype=freqs_sin.dtype,
         )
         ref_img_freqs_cos = torch.zeros(
-            batch_size, max_ref_img_len, freqs_cos.shape[-1], device=device, dtype=freqs_cos.dtype
+            batch_size,
+            max_ref_img_len,
+            freqs_cos.shape[-1],
+            device=device,
+            dtype=freqs_cos.dtype,
         )
         ref_img_freqs_sin = torch.zeros(
-            batch_size, max_ref_img_len, freqs_sin.shape[-1], device=device, dtype=freqs_sin.dtype
+            batch_size,
+            max_ref_img_len,
+            freqs_sin.shape[-1],
+            device=device,
+            dtype=freqs_sin.dtype,
         )
-        img_freqs_cos = torch.zeros(batch_size, max_img_len, freqs_cos.shape[-1], device=device, dtype=freqs_cos.dtype)
-        img_freqs_sin = torch.zeros(batch_size, max_img_len, freqs_sin.shape[-1], device=device, dtype=freqs_sin.dtype)
+        img_freqs_cos = torch.zeros(
+            batch_size,
+            max_img_len,
+            freqs_cos.shape[-1],
+            device=device,
+            dtype=freqs_cos.dtype,
+        )
+        img_freqs_sin = torch.zeros(
+            batch_size,
+            max_img_len,
+            freqs_sin.shape[-1],
+            device=device,
+            dtype=freqs_sin.dtype,
+        )
 
         for i, (cap_seq_len, ref_img_len, img_len, seq_len) in enumerate(
-            zip(l_effective_cap_len, l_effective_ref_img_len, l_effective_img_len, seq_lengths)
+            zip(
+                l_effective_cap_len,
+                l_effective_ref_img_len,
+                l_effective_img_len,
+                seq_lengths,
+            )
         ):
             cap_freqs_cos[i, :cap_seq_len] = freqs_cos[i, :cap_seq_len]
             cap_freqs_sin[i, :cap_seq_len] = freqs_sin[i, :cap_seq_len]
-            ref_img_freqs_cos[i, : sum(ref_img_len)] = freqs_cos[i, cap_seq_len : cap_seq_len + sum(ref_img_len)]
-            ref_img_freqs_sin[i, : sum(ref_img_len)] = freqs_sin[i, cap_seq_len : cap_seq_len + sum(ref_img_len)]
+            ref_img_freqs_cos[i, : sum(ref_img_len)] = freqs_cos[
+                i, cap_seq_len : cap_seq_len + sum(ref_img_len)
+            ]
+            ref_img_freqs_sin[i, : sum(ref_img_len)] = freqs_sin[
+                i, cap_seq_len : cap_seq_len + sum(ref_img_len)
+            ]
             img_freqs_cos[i, :img_len] = freqs_cos[
-                i, cap_seq_len + sum(ref_img_len) : cap_seq_len + sum(ref_img_len) + img_len
+                i,
+                cap_seq_len
+                + sum(ref_img_len) : cap_seq_len
+                + sum(ref_img_len)
+                + img_len,
             ]
             img_freqs_sin[i, :img_len] = freqs_sin[
-                i, cap_seq_len + sum(ref_img_len) : cap_seq_len + sum(ref_img_len) + img_len
+                i,
+                cap_seq_len
+                + sum(ref_img_len) : cap_seq_len
+                + sum(ref_img_len)
+                + img_len,
             ]
 
         return (

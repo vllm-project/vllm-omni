@@ -8,7 +8,9 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     get_ltx2_post_process_func,
     load_transformer_config,
 )
-from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import LTX2ImageToVideoPipeline
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import (
+    LTX2ImageToVideoPipeline,
+)
 
 __all__ = [
     "LTX2Pipeline",

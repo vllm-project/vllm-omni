@@ -39,6 +39,7 @@ if current_platform.is_rocm():
             yield
         finally:
             amdsmi_shut_down()
+
 elif current_platform.is_cuda():
     from vllm.third_party.pynvml import (
         nvmlDeviceGetHandleByIndex,
@@ -54,6 +55,7 @@ elif current_platform.is_cuda():
             yield
         finally:
             nvmlShutdown()
+
 else:
 
     @contextmanager
@@ -97,13 +99,16 @@ def wait_for_gpu_memory_to_clear(
         threshold_str = f"{threshold_percent:.1f}%"
         condition_str = f"Memory usage ratio ≤ {threshold_str}"
 
-    print(f"[GPU Memory Monitor] Waiting for GPU {device_list} to free memory, Condition: {condition_str}")
+    print(
+        f"[GPU Memory Monitor] Waiting for GPU {device_list} to free memory, Condition: {condition_str}"
+    )
 
     # Define the is_free function based on threshold type
     if threshold_bytes is not None:
 
         def is_free(used, total):
             return used <= threshold_bytes / 2**30
+
     else:
 
         def is_free(used, total):
@@ -126,7 +131,9 @@ def wait_for_gpu_memory_to_clear(
             output_raw[device] = (gb_used, gb_total)
             # Format to more readable form
             usage_percent = (gb_used / gb_total) * 100 if gb_total > 0 else 0
-            output[device] = f"{gb_used:.1f}GiB/{gb_total:.1f}GiB ({usage_percent:.1f}%)"
+            output[device] = (
+                f"{gb_used:.1f}GiB/{gb_total:.1f}GiB ({usage_percent:.1f}%)"
+            )
 
         # Optimized GPU memory status print
         print("[GPU Memory Status] Current usage:")
@@ -153,12 +160,15 @@ def wait_for_gpu_memory_to_clear(
             raise ValueError(
                 f"[GPU Memory Timeout] Devices {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
                 f"Condition: {condition_str}\n"
-                f"Current status:\n" + "\n".join(f"  GPU {device}: {output[device]}" for device in devices)
+                f"Current status:\n"
+                + "\n".join(f"  GPU {device}: {output[device]}" for device in devices)
             )
 
         # Add waiting hint (optional)
         if dur_s > 10 and int(dur_s) % 10 == 0:  # Show hint every 10 seconds
-            print(f"Waiting... Already waited {dur_s:.1f} seconds ({elapsed_minutes:.1f} minutes)")
+            print(
+                f"Waiting... Already waited {dur_s:.1f} seconds ({elapsed_minutes:.1f} minutes)"
+            )
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -182,7 +192,10 @@ def fork_new_process_for_each_test(func: Callable[_P, None]) -> Callable[_P, Non
         # process. Use test function name and process ID to avoid collisions.
         with (
             tempfile.NamedTemporaryFile(
-                delete=False, mode="w+b", prefix=f"vllm_test_{func.__name__}_{os.getpid()}_", suffix=".exc"
+                delete=False,
+                mode="w+b",
+                prefix=f"vllm_test_{func.__name__}_{os.getpid()}_",
+                suffix=".exc",
             ) as exc_file,
             ExitStack() as delete_after,
         ):
@@ -246,7 +259,9 @@ def fork_new_process_for_each_test(func: Callable[_P, None]) -> Callable[_P, Non
                         with suppress(Exception), open(exc_file_path, "rb") as f:
                             exc_info = cloudpickle.load(f)
 
-                    if (original_exception := exc_info.get("pickled_exception")) is not None:
+                    if (
+                        original_exception := exc_info.get("pickled_exception")
+                    ) is not None:
                         # Re-raise the actual exception object if it was
                         # successfully pickled.
                         assert isinstance(original_exception, Exception)
@@ -300,14 +315,18 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
 
             cmd = [sys.executable, "-m", f"{module_name}"]
 
-            returned = subprocess.run(cmd, input=input_bytes, capture_output=True, env=env)
+            returned = subprocess.run(
+                cmd, input=input_bytes, capture_output=True, env=env
+            )
 
             # check if the subprocess is successful
             try:
                 returned.check_returncode()
             except Exception as e:
                 # wrap raised exception to provide more information
-                raise RuntimeError(f"Error raised in subprocess:\n{returned.stderr.decode()}") from e
+                raise RuntimeError(
+                    f"Error raised in subprocess:\n{returned.stderr.decode()}"
+                ) from e
 
     return wrapper
 
@@ -470,7 +489,11 @@ def npu_marks(*, res: str, num_cards: int):
         # Multiple cards scenario needs distributed_npu mark
         test_distributed = pytest.mark.distributed_npu(num_cards=num_cards)
         # TODO: add NPU support for `skipif_npu` marker
-        return [mark for mark in [test_platform, test_resource, test_distributed] if mark is not None]
+        return [
+            mark
+            for mark in [test_platform, test_resource, test_distributed]
+            if mark is not None
+        ]
 
 
 def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
@@ -579,8 +602,12 @@ class DeviceMemoryMonitor:
 
     @property
     def peak_used_mb(self) -> float:
-        fallback_alloc = current_omni_platform.max_memory_allocated(device=self.device_index) / (1024**2)
-        fallback_reserved = current_omni_platform.max_memory_reserved(device=self.device_index) / (1024**2)
+        fallback_alloc = current_omni_platform.max_memory_allocated(
+            device=self.device_index
+        ) / (1024**2)
+        fallback_reserved = current_omni_platform.max_memory_reserved(
+            device=self.device_index
+        ) / (1024**2)
         return max(self._peak_used_mb, fallback_alloc, fallback_reserved)
 
     def __del__(self):

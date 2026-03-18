@@ -43,6 +43,8 @@ class BaseScheduler(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def scale_model_input(self, sample: torch.Tensor, timestep: int | None = None) -> torch.Tensor:
+    def scale_model_input(
+        self, sample: torch.Tensor, timestep: int | None = None
+    ) -> torch.Tensor:
         """Scale the model input."""
         raise NotImplementedError

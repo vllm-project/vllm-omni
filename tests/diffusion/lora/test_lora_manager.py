@@ -20,7 +20,10 @@ class _DummyLoRALayer:
         self.n_slices = n_slices
         self.output_slices = output_slices
         self.set_calls: list[
-            tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
+            tuple[
+                list[torch.Tensor | None] | torch.Tensor,
+                list[torch.Tensor | None] | torch.Tensor,
+            ]
         ] = []
         self.reset_calls: int = 0
 
@@ -44,7 +47,10 @@ class _DummyBaseLayerWithLoRA(torch.nn.Module):
         self.base_layer = base_layer
 
         self.set_calls: list[
-            tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
+            tuple[
+                list[torch.Tensor | None] | torch.Tensor,
+                list[torch.Tensor | None] | torch.Tensor,
+            ]
         ] = []
         self.reset_calls: int = 0
         self.create_calls: int = 0
@@ -136,7 +142,9 @@ def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
 
     replace_calls: list[str] = []
 
-    def _fake_replace_submodule(root: torch.nn.Module, module_name: str, submodule: torch.nn.Module):
+    def _fake_replace_submodule(
+        root: torch.nn.Module, module_name: str, submodule: torch.nn.Module
+    ):
         replace_calls.append(module_name)
         setattr(root, module_name, submodule)
 
@@ -174,7 +182,9 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
 
     replace_calls: list[str] = []
 
-    def _fake_replace_submodule(root: torch.nn.Module, module_name: str, submodule: torch.nn.Module):
+    def _fake_replace_submodule(
+        root: torch.nn.Module, module_name: str, submodule: torch.nn.Module
+    ):
         replace_calls.append(module_name)
         setattr(root, module_name, submodule)
 
@@ -199,7 +209,9 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
 
     # Treat the dummy layer as a packed 3-slice projection so the manager uses
     # `stacked_params_mapping` to decide replacement based on target_modules.
-    monkeypatch.setattr(manager, "_get_packed_modules_list", lambda _module: ["q", "k", "v"])
+    monkeypatch.setattr(
+        manager, "_get_packed_modules_list", lambda _module: ["q", "k", "v"]
+    )
 
     peft_helper = type("_PH", (), {"r": 1, "target_modules": ["to_q"]})()
     manager._replace_layers_with_lora(peft_helper)
@@ -220,7 +232,9 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
 
     rank = 2
     A = torch.ones((rank, 4))
-    B = torch.arange(0, sum(packed_layer.output_slices) * rank, dtype=torch.bfloat16).view(-1, rank)
+    B = torch.arange(
+        0, sum(packed_layer.output_slices) * rank, dtype=torch.bfloat16
+    ).view(-1, rank)
     lora = LoRALayerWeights(
         module_name="transformer.blocks.0.attn.to_qkv",
         rank=rank,
@@ -285,7 +299,11 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
         )
 
     manager._registered_adapters = {
-        1: type("LM", (), {"id": 1, "loras": loras, "get_lora": lambda self, k: self.loras.get(k)})()
+        1: type(
+            "LM",
+            (),
+            {"id": 1, "loras": loras, "get_lora": lambda self, k: self.loras.get(k)},
+        )()
     }
 
     manager._activate_adapter(1, scale=2.0)

@@ -19,7 +19,9 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 logger = init_logger(__name__)
 
 
-def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
+def inject_omni_kv_config(
+    stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str
+) -> None:
     """Inject connector configuration into stage engine arguments."""
     # Prepare omni_kv_config dict
     omni_conf_dict = {}
@@ -63,7 +65,9 @@ def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     """
     model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
     if model_index and isinstance(model_index, dict) and "_class_name" in model_index:
-        logger.debug(f"Found model_type '{model_index['_class_name']}' in model_index.json")
+        logger.debug(
+            f"Found model_type '{model_index['_class_name']}' in model_index.json"
+        )
         return model_index["_class_name"]
 
     return None
@@ -157,9 +161,15 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
         return None
     # Handle lists and tuples (recurse into items)
     if isinstance(obj, (list, tuple)):
-        return type(obj)(_convert_dataclasses_to_dict(item) for item in obj if not callable(item))
+        return type(obj)(
+            _convert_dataclasses_to_dict(item) for item in obj if not callable(item)
+        )
     # Try to convert any dict-like object (has keys/values methods) to dict
-    if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, (str, bytes)):
+    if (
+        hasattr(obj, "keys")
+        and hasattr(obj, "values")
+        and not isinstance(obj, (str, bytes))
+    ):
         try:
             return _filter_dict_like_object(obj)
         except (TypeError, ValueError, AttributeError):
@@ -207,9 +217,13 @@ def resolve_model_config_path(model: str) -> str:
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
-                    raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
+                    raise ValueError(
+                        f"config.json found but missing 'model_type' for model: {model}"
+                    )
             except Exception as e:
-                raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
+                raise ValueError(
+                    f"Failed to read config.json for model: {model}. Error: {e}"
+                ) from e
         else:
             raise ValueError(
                 f"Could not determine model_type for model: {model}. "
@@ -231,7 +245,9 @@ def resolve_model_config_path(model: str) -> str:
     return str(stage_config_path)
 
 
-def load_stage_configs_from_model(model: str, base_engine_args: dict | None = None) -> list:
+def load_stage_configs_from_model(
+    model: str, base_engine_args: dict | None = None
+) -> list:
     """Load stage configurations from model's default config file.
 
     .. deprecated::
@@ -257,11 +273,15 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict | None = No
     stage_config_path = resolve_model_config_path(model)
     if stage_config_path is None:
         return []
-    stage_configs = load_stage_configs_from_yaml(config_path=stage_config_path, base_engine_args=base_engine_args)
+    stage_configs = load_stage_configs_from_yaml(
+        config_path=stage_config_path, base_engine_args=base_engine_args
+    )
     return stage_configs
 
 
-def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None = None) -> list:
+def load_stage_configs_from_yaml(
+    config_path: str, base_engine_args: dict | None = None
+) -> list:
     """Load stage configurations from a YAML file.
 
     .. deprecated::
@@ -285,9 +305,15 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
         base_engine_args_tmp = base_engine_args.copy()
         # Update base_engine_args with stage-specific engine_args if they exist
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
-            base_engine_args_tmp = create_config(merge_configs(base_engine_args_tmp, stage_arg.engine_args))
+            base_engine_args_tmp = create_config(
+                merge_configs(base_engine_args_tmp, stage_arg.engine_args)
+            )
         stage_type = getattr(stage_arg, "stage_type", "llm")
-        if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
+        if (
+            hasattr(stage_arg, "runtime")
+            and stage_arg.runtime is not None
+            and stage_type != "diffusion"
+        ):
             runtime_cfg = stage_arg.runtime
             max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
             base_engine_args_tmp["max_num_seqs"] = max_batch_size
@@ -325,7 +351,9 @@ def load_and_resolve_stage_configs(
                 stage_configs = []
     else:
         config_path = stage_configs_path
-        stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
+        stage_configs = load_stage_configs_from_yaml(
+            stage_configs_path, base_engine_args=kwargs
+        )
 
     return config_path, stage_configs
 
@@ -397,7 +425,11 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
 
         origin = get_origin(annotation)
         if origin is None:
-            if isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
+            if (
+                isinstance(annotation, type)
+                and is_dataclass(annotation)
+                and isinstance(value, dict)
+            ):
                 return filter_dataclass_kwargs(annotation, value)
             return value
 
@@ -417,7 +449,11 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
 
         if origin is types.UnionType or origin is getattr(types, "UnionType", None):
             for arg in get_args(annotation):
-                if isinstance(arg, type) and is_dataclass(arg) and isinstance(value, dict):
+                if (
+                    isinstance(arg, type)
+                    and is_dataclass(arg)
+                    and isinstance(value, dict)
+                ):
                     return filter_dataclass_kwargs(arg, value)
                 # Try container-style filtering for union members
                 filtered = _filter_value(value, arg)
@@ -473,10 +509,14 @@ def build_base_engine_args(source: Any) -> dict[str, Any] | None:
     ]
 
     if is_dict_like:
-        parallel_overrides = {k: source[k] for k in parallel_keys if k in source and source[k] is not None}
+        parallel_overrides = {
+            k: source[k] for k in parallel_keys if k in source and source[k] is not None
+        }
     else:
         parallel_overrides = {
-            k: getattr(source, k) for k in parallel_keys if hasattr(source, k) and getattr(source, k) is not None
+            k: getattr(source, k)
+            for k in parallel_keys
+            if hasattr(source, k) and getattr(source, k) is not None
         }
 
     if parallel_overrides:

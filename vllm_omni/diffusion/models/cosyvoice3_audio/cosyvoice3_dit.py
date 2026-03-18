@@ -29,7 +29,9 @@ d - dimension
 """
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, theta_rescale_factor=1.0):
+def precompute_freqs_cis(
+    dim: int, end: int, theta: float = 10000.0, theta_rescale_factor=1.0
+):
     """Precompute rotary embedding frequencies."""
     theta *= theta_rescale_factor ** (dim / (dim - 2))
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -45,7 +47,10 @@ def get_pos_embed_indices(start, length, max_pos, scale=1.0):
     scale = scale * torch.ones_like(start, dtype=torch.float32)
     pos = (
         start.unsqueeze(1)
-        + (torch.arange(length, device=start.device, dtype=torch.float32).unsqueeze(0) * scale.unsqueeze(1)).long()
+        + (
+            torch.arange(length, device=start.device, dtype=torch.float32).unsqueeze(0)
+            * scale.unsqueeze(1)
+        ).long()
     )
     pos = torch.where(pos < max_pos, pos, max_pos - 1)
     return pos
@@ -54,14 +59,18 @@ def get_pos_embed_indices(start, length, max_pos, scale=1.0):
 class FeedForward(nn.Module):
     """Feed-forward network with GELU activation."""
 
-    def __init__(self, dim, dim_out=None, mult=4, dropout=0.0, approximate: str = "none"):
+    def __init__(
+        self, dim, dim_out=None, mult=4, dropout=0.0, approximate: str = "none"
+    ):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
 
         activation = nn.GELU(approximate=approximate)
         project_in = nn.Sequential(nn.Linear(dim, inner_dim), activation)
-        self.ff = nn.Sequential(project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out))
+        self.ff = nn.Sequential(
+            project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out)
+        )
 
     def forward(self, x):
         return self.ff(x)
@@ -121,7 +130,9 @@ class DiTAttention(nn.Module):
         # Apply rotary position embedding
         if rope is not None:
             freqs, xpos_scale = rope
-            q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+            q_xpos_scale, k_xpos_scale = (
+                (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+            )
             query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
             key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
@@ -168,7 +179,9 @@ class DiTBlock(nn.Module):
         )
 
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
+        self.ff = FeedForward(
+            dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh"
+        )
 
     def forward(self, x, t, mask=None, rope=None):
         # pre-norm & modulation for attention input
@@ -257,7 +270,9 @@ class ConvNeXtV2Block(nn.Module):
     def __init__(self, dim: int, intermediate_dim: int, dilation: int = 1):
         super().__init__()
         padding = (dilation * (7 - 1)) // 2
-        self.dwconv = nn.Conv1d(dim, dim, kernel_size=7, padding=padding, groups=dim, dilation=dilation)
+        self.dwconv = nn.Conv1d(
+            dim, dim, kernel_size=7, padding=padding, groups=dim, dilation=dilation
+        )
         self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, intermediate_dim)
         self.act = nn.GELU()
@@ -300,7 +315,9 @@ class TimestepEmbedding(nn.Module):
     def __init__(self, dim, freq_embed_dim=256):
         super().__init__()
         self.time_embed = SinusPositionEmbedding(freq_embed_dim)
-        self.time_mlp = nn.Sequential(nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.time_mlp = nn.Sequential(
+            nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
+        )
 
     def forward(self, timestep: torch.Tensor):
         time_hidden = self.time_embed(timestep)
@@ -319,9 +336,16 @@ class TextEmbedding(nn.Module):
         if conv_layers > 0:
             self.extra_modeling = True
             self.precompute_max_pos = 4096
-            self.register_buffer("freqs_cis", precompute_freqs_cis(text_dim, self.precompute_max_pos), persistent=False)
+            self.register_buffer(
+                "freqs_cis",
+                precompute_freqs_cis(text_dim, self.precompute_max_pos),
+                persistent=False,
+            )
             self.text_blocks = nn.Sequential(
-                *[ConvNeXtV2Block(text_dim, text_dim * conv_mult) for _ in range(conv_layers)]
+                *[
+                    ConvNeXtV2Block(text_dim, text_dim * conv_mult)
+                    for _ in range(conv_layers)
+                ]
             )
         else:
             self.extra_modeling = False
@@ -339,7 +363,9 @@ class TextEmbedding(nn.Module):
 
         if self.extra_modeling:
             batch_start = torch.zeros((batch,), dtype=torch.long)
-            pos_idx = get_pos_embed_indices(batch_start, seq_len, max_pos=self.precompute_max_pos)
+            pos_idx = get_pos_embed_indices(
+                batch_start, seq_len, max_pos=self.precompute_max_pos
+            )
             text_pos_embed = self.freqs_cis[pos_idx]
             text = text + text_pos_embed
             text = self.text_blocks(text)
@@ -405,9 +431,20 @@ class DiT(nn.Module):
         self.depth = depth
 
         self.transformer_blocks = nn.ModuleList(
-            [DiTBlock(dim=dim, heads=heads, dim_head=dim_head, ff_mult=ff_mult, dropout=dropout) for _ in range(depth)]
+            [
+                DiTBlock(
+                    dim=dim,
+                    heads=heads,
+                    dim_head=dim_head,
+                    ff_mult=ff_mult,
+                    dropout=dropout,
+                )
+                for _ in range(depth)
+            ]
         )
-        self.long_skip_connection = nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
+        self.long_skip_connection = (
+            nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
+        )
 
         self.norm_out = AdaLayerNormZero_Final(dim)
         self.proj_out = nn.Linear(dim, mel_dim)

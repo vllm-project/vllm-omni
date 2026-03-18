@@ -27,7 +27,9 @@ class DiffusionExecutor(ABC):
         elif distributed_executor_backend == "ray":
             raise NotImplementedError("ray backend is not yet supported.")
         elif distributed_executor_backend == "mp":
-            from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+            from vllm_omni.diffusion.executor.multiproc_executor import (
+                MultiprocDiffusionExecutor,
+            )
 
             executor_class = MultiprocDiffusionExecutor
         elif distributed_executor_backend == "external_launcher":
@@ -46,7 +48,9 @@ class DiffusionExecutor(ABC):
                     f"distributed_executor_backend must be a subclass of DiffusionExecutor. Got {executor_class}."
                 )
         else:
-            raise ValueError(f"Unknown distributed executor backend: {distributed_executor_backend}")
+            raise ValueError(
+                f"Unknown distributed executor backend: {distributed_executor_backend}"
+            )
         return executor_class
 
     def __init__(self, od_config: OmniDiffusionConfig):

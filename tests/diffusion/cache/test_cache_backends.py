@@ -78,7 +78,9 @@ class TestCacheDiTBackend:
         mock_cache_dit.refresh_context = Mock()
         mock_steps_mask_50 = [1, 0, 1, 0, 1] * 10  # Mock mask for 50 steps
         mock_steps_mask_100 = [1, 0, 1, 0, 1] * 20  # Mock mask for 100 steps
-        mock_cache_dit.steps_mask = Mock(side_effect=[mock_steps_mask_50, mock_steps_mask_100])
+        mock_cache_dit.steps_mask = Mock(
+            side_effect=[mock_steps_mask_50, mock_steps_mask_100]
+        )
 
         # Enable cache-dit with SCM enabled (using mask policy)
         config = DiffusionCacheConfig(
@@ -113,7 +115,9 @@ class TestCacheDiTBackend:
         assert mock_cache_dit.steps_mask.call_count == 2
         # Check the last call was with 100 steps and mask policy
         assert mock_cache_dit.steps_mask.call_args_list[-1].kwargs["total_steps"] == 100
-        assert mock_cache_dit.steps_mask.call_args_list[-1].kwargs["mask_policy"] == "fast"
+        assert (
+            mock_cache_dit.steps_mask.call_args_list[-1].kwargs["mask_policy"] == "fast"
+        )
 
         # Verify refresh_context was called again with updated mask
         mock_cache_dit.refresh_context.assert_called_once()
@@ -160,7 +164,9 @@ class TestTeaCacheBackend:
         mock_transformer.__class__.__name__ = "QwenImageTransformer2DModel"
         mock_pipeline.transformer = mock_transformer
 
-        config = DiffusionCacheConfig(rel_l1_thresh=0.3, coefficients=[1.0, 0.5, 0.2, 0.1, 0.05])
+        config = DiffusionCacheConfig(
+            rel_l1_thresh=0.3, coefficients=[1.0, 0.5, 0.2, 0.1, 0.05]
+        )
         backend = TeaCacheBackend(config)
         backend.enable(mock_pipeline)
 

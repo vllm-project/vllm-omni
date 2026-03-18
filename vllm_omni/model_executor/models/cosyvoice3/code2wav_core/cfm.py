@@ -38,7 +38,14 @@ class BASECFM(torch.nn.Module, ABC):
 
 
 class ConditionalCFM(BASECFM):
-    def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
+    def __init__(
+        self,
+        in_channels,
+        cfm_params,
+        n_spks=1,
+        spk_emb_dim=64,
+        estimator: torch.nn.Module = None,
+    ):
         super().__init__(
             n_feats=in_channels,
             cfm_params=cfm_params,
@@ -54,7 +61,15 @@ class ConditionalCFM(BASECFM):
 
     @torch.inference_mode()
     def forward(
-        self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, prompt_len=0, cache=torch.zeros(1, 80, 0, 2)
+        self,
+        mu,
+        mask,
+        n_timesteps,
+        temperature=1.0,
+        spks=None,
+        cond=None,
+        prompt_len=0,
+        cache=torch.zeros(1, 80, 0, 2),
     ):
         """Forward diffusion
 
@@ -87,7 +102,10 @@ class ConditionalCFM(BASECFM):
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if self.t_scheduler == "cosine":
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
+        return (
+            self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond),
+            cache,
+        )
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond):
         """
@@ -126,9 +144,13 @@ class ConditionalCFM(BASECFM):
             t_in[:] = t.unsqueeze(0)
             spks_in[0] = spks
             cond_in[0] = cond
-            dphi_dt = self.forward_estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+            dphi_dt = self.forward_estimator(
+                x_in, mask_in, mu_in, t_in, spks_in, cond_in
+            )
             dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+            dphi_dt = (
+                1.0 + self.inference_cfg_rate
+            ) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
             x = x + dt * dphi_dt
             t = t + dt
             sol.append(x)
@@ -163,14 +185,24 @@ class ConditionalCFM(BASECFM):
                 for i, j in enumerate(data_ptrs):
                     estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
                 # run trt engine
-                assert estimator.execute_async_v3(torch.cuda.current_stream().cuda_stream) is True
+                assert (
+                    estimator.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+                    is True
+                )
                 torch.cuda.current_stream().synchronize()
             self.estimator.release_estimator(estimator, stream)
             return x
 
 
 class CausalConditionalCFM(ConditionalCFM):
-    def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
+    def __init__(
+        self,
+        in_channels,
+        cfm_params,
+        n_spks=1,
+        spk_emb_dim=64,
+        estimator: torch.nn.Module = None,
+    ):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
 
     @torch.inference_mode()
@@ -208,7 +240,10 @@ class CausalConditionalCFM(ConditionalCFM):
         if self.t_scheduler == "cosine":
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
 
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
+        return (
+            self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond),
+            None,
+        )
 
 
 class CausalMaskedDiffWithDiT(torch.nn.Module):
@@ -287,7 +322,10 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         embedding = self.spk_embed_affine_layer(embedding)
 
         # concat text and prompt_text
-        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        token, token_len = (
+            torch.concat([prompt_token, token], dim=1),
+            prompt_token_len + token_len,
+        )
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
         # text encode
@@ -295,14 +333,17 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             h = self.pre_lookahead_layer(token)
         else:
             h = self.pre_lookahead_layer(
-                token[:, : -self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len :]
+                token[:, : -self.pre_lookahead_len],
+                context=token[:, -self.pre_lookahead_len :],
             )
         h = h.repeat_interleave(self.token_mel_ratio, dim=1)
 
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
 
         # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
+        conds = torch.zeros(
+            [1, mel_len1 + mel_len2, self.output_size], device=token.device
+        ).to(h.dtype)
 
         conds[:, :mel_len1] = prompt_feat
 

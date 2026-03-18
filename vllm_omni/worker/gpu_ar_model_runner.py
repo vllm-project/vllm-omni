@@ -21,7 +21,10 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -35,7 +38,9 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
-from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVTransferManager,
+)
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
@@ -72,9 +77,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
-        self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        self.inputs_embeds = self._make_buffer(
+            self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False
+        )
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
-        self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(
+            self.vllm_config, self.model_config
+        )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -96,7 +105,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
-            raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+            raise RuntimeError(
+                "State error: sample_tokens() must be called after execute_model() returns None."
+            )
 
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
@@ -104,7 +115,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 self.model._clear_warmup_state()
 
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
-        finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
+        finished_reqs = getattr(
+            scheduler_output, "finished_requests_needing_kv_transfer", {}
+        )
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
             for req_id, data in finished_reqs.items():
                 try:
@@ -114,13 +127,17 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         existing.update(model_meta)
                         data["custom_metadata"] = existing
                 except Exception as e:
-                    logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
-        self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=finished_reqs,
-            kv_caches=self.kv_caches,
-            block_size=self.cache_config.block_size,
-            cache_dtype=str(self.cache_config.cache_dtype),
-            request_id_resolver=self._resolve_global_request_id,
+                    logger.warning(
+                        f"Failed to get custom metadata from model for {req_id}: {e}"
+                    )
+        self.kv_extracted_req_ids = (
+            self.kv_transfer_manager.handle_finished_requests_kv_transfer(
+                finished_reqs=finished_reqs,
+                kv_caches=self.kv_caches,
+                block_size=self.cache_config.block_size,
+                cache_dtype=str(self.cache_config.cache_dtype),
+                request_id_resolver=self._resolve_global_request_id,
+            )
         )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
@@ -131,7 +148,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logger.error("RoutedExpertsCapturer not initialized.")
 
         if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(scheduler_output.preempted_req_ids)
+            get_kv_transfer_group().handle_preemptions(
+                scheduler_output.preempted_req_ids
+            )
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -151,7 +170,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
             if not num_scheduled_tokens:
                 if (
-                    self.parallel_config.distributed_executor_backend == "external_launcher"
+                    self.parallel_config.distributed_executor_backend
+                    == "external_launcher"
                     and self.parallel_config.data_parallel_size > 1
                 ):
                     # this is a corner case when both external launcher
@@ -211,7 +231,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             )
 
             num_tokens_padded = batch_desc.num_tokens
-            num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+            num_reqs_padded = (
+                batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+            )
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
                 num_scheduled_tokens_np,
@@ -231,30 +253,41 @@ class GPUARModelRunner(OmniGPUModelRunner):
             from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
 
             has_separate_kv_update = not all(
-                all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+                all(
+                    g.backend.forward_includes_kv_cache_update
+                    for g in self.attn_groups[id]
+                )
                 for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
             )
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
-                num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
+                num_tokens_padded=(
+                    num_tokens_padded
+                    if pad_attn or has_separate_kv_update
+                    else num_tokens_unpadded
+                ),
+                num_reqs_padded=(
+                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
+                ),
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded if pad_attn else None,
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded if pad_attn else None,
-                max_query_len=max_num_scheduled_tokens,
-                ubatch_slices=ubatch_slices_attn,
-                logits_indices=logits_indices,
-                use_spec_decode=use_spec_decode,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                slot_mappings=slot_mappings_by_group,
+            attn_metadata, spec_decode_common_attn_metadata = (
+                self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    use_spec_decode=use_spec_decode,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    slot_mappings=slot_mappings_by_group,
+                )
             )
 
             (
@@ -264,7 +297,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 intermediate_tensors,
                 model_kwargs,
                 ec_connector_output,
-            ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+            ) = self._preprocess(
+                scheduler_output, num_tokens_padded, intermediate_tensors
+            )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -319,7 +354,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
+                model_output
+            )
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -343,7 +380,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
                     logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                        sample_hidden_states,
+                        sampling_metadata=self.input_batch.sampling_metadata,
                     )
                 except TypeError:
                     logits = self.model.compute_logits(sample_hidden_states)
@@ -354,7 +392,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens_padded)
+                        "residual": not is_residual_scattered_for_sp(
+                            self.vllm_config, num_tokens_padded
+                        )
                     }
                     get_pp_group().send_tensor_dict(
                         hidden_states.tensors,
@@ -366,7 +406,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     # Try with sampling_metadata first; fall back to without for models that don't support it
                     try:
                         logits = self.model.compute_logits(
-                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                            sample_hidden_states,
+                            sampling_metadata=self.input_batch.sampling_metadata,
                         )
                     except TypeError:
                         logits = self.model.compute_logits(sample_hidden_states)
@@ -440,7 +481,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
-            apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
+            apply_grammar_bitmask(
+                scheduler_output, grammar_output, self.input_batch, logits
+            )
 
         # Correct padding values of prompt_token_ids to match the logits vocabulary size
         if logits is not None and not self.input_batch.sampling_metadata.no_penalties:
@@ -481,7 +524,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 <= self.effective_drafter_max_model_len
             )
             use_gpu_toks = (
-                spec_config.use_eagle() or spec_config.uses_draft_model() or spec_config.uses_extract_hidden_states()
+                spec_config.use_eagle()
+                or spec_config.uses_draft_model()
+                or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
                 assert isinstance(
@@ -493,19 +538,23 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
-                    next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
-                        spec_decode_common_attn_metadata,
-                        sampled_token_ids,
-                        self.requests,
-                        self.input_batch,
-                        self.discard_request_mask.gpu,
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            spec_decode_common_attn_metadata,
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
                     )
-                    self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
                     # Since we couldn't run the drafter,
                     # just use zeros for the draft tokens.
-                    self._draft_token_ids = torch.zeros(1, device=self.device, dtype=torch.int32).expand(
-                        len(self.input_batch.req_ids), self.num_spec_tokens
-                    )
+                    self._draft_token_ids = torch.zeros(
+                        1, device=self.device, dtype=torch.int32
+                    ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                     self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
@@ -571,13 +620,21 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 mm_payload: dict[str, object] = {}
                 for k, v in multimodal_outputs.items():
                     try:
-                        if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                        if (
+                            isinstance(v, torch.Tensor)
+                            and v.shape[0] == hidden_states_cpu.shape[0]
+                        ):
                             mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
                         elif isinstance(v, dict):
                             sub_dict: dict[str, torch.Tensor] = {}
                             for sk, sv in v.items():
-                                if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
-                                    sub_dict[str(sk)] = sv.detach().to("cpu")[start:end].contiguous()
+                                if (
+                                    isinstance(sv, torch.Tensor)
+                                    and sv.shape[0] == hidden_states_cpu.shape[0]
+                                ):
+                                    sub_dict[str(sk)] = (
+                                        sv.detach().to("cpu")[start:end].contiguous()
+                                    )
                             if sub_dict:
                                 mm_payload[k] = sub_dict
                         elif isinstance(v, list):
@@ -603,9 +660,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
-                pooler_output=(pooler_output if self.vllm_config.model_config.engine_output_type != "text" else None),
+                pooler_output=(
+                    pooler_output
+                    if self.vllm_config.model_config.engine_output_type != "text"
+                    else None
+                ),
                 kv_connector_output=kv_connector_output,
-                ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+                ec_connector_output=(
+                    ec_connector_output if self.supports_mm_inputs else None
+                ),
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
@@ -613,7 +676,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         if not self.use_async_scheduling:
             return output
-        with record_function_or_nullcontext("gpu_model_runner: AsyncGPUModelRunnerOutput"):
+        with record_function_or_nullcontext(
+            "gpu_model_runner: AsyncGPUModelRunnerOutput"
+        ):
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -622,7 +687,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
             )
-        with record_function_or_nullcontext("gpu_model_runner: set_async_sampled_token_ids"):
+        with record_function_or_nullcontext(
+            "gpu_model_runner: set_async_sampled_token_ids"
+        ):
             # Save ref of sampled_token_ids CPU tensor if the batch contains
             # any requests with sampling params that require output ids.
             self.input_batch.set_async_sampled_token_ids(

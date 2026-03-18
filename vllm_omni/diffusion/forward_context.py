@@ -19,7 +19,9 @@ class ForwardContext:
 
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
-    attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
+    attn_metadata: (
+        dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
+    ) = None
     split_text_embed_in_sp: bool = False
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
@@ -70,9 +72,9 @@ _forward_context: ForwardContext | None = None
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
-    assert _forward_context is not None, (
-        "Forward context is not set. Please use `set_forward_context` to set the forward context."
-    )
+    assert (
+        _forward_context is not None
+    ), "Forward context is not set. Please use `set_forward_context` to set the forward context."
     return _forward_context
 
 
@@ -83,7 +85,9 @@ def is_forward_context_available() -> bool:
 def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
-    attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    attn_metadata: (
+        dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
+    ) = None,
     split_text_embed_in_sp: bool = False,
 ):
     return ForwardContext(
@@ -113,7 +117,9 @@ def override_forward_context(forward_context: ForwardContext | None):
 def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
-    attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    attn_metadata: (
+        dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
+    ) = None,
     split_text_embed_in_sp: bool = False,
 ):
     """A context manager that stores the current forward context,

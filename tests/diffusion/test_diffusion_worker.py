@@ -59,7 +59,9 @@ class TestDiffusionWorkerLoadWeights:
         expected_loaded = {"layer1.weight", "layer2.weight"}
 
         # Configure model_runner mock
-        mock_gpu_worker.model_runner.load_weights = mocker.Mock(return_value=expected_loaded)
+        mock_gpu_worker.model_runner.load_weights = mocker.Mock(
+            return_value=expected_loaded
+        )
 
         # Call load_weights
         result = mock_gpu_worker.load_weights(mock_weights)
@@ -83,9 +85,15 @@ class TestDiffusionWorkerSleep:
 
     def test_sleep_level_1(self, mocker: MockerFixture, mock_gpu_worker):
         """Test sleep mode level 1 (offload weights only)."""
-        mock_allocator_class = mocker.patch("vllm.device_allocator.cumem.CuMemAllocator")
-        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
-        mock_get_process_memory = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory")
+        mock_allocator_class = mocker.patch(
+            "vllm.device_allocator.cumem.CuMemAllocator"
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform"
+        )
+        mock_get_process_memory = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory"
+        )
 
         # Setup process-scoped memory mocks
         # Before sleep: 3GB used
@@ -111,9 +119,15 @@ class TestDiffusionWorkerSleep:
 
     def test_sleep_level_2(self, mocker: MockerFixture, mock_gpu_worker):
         """Test sleep mode level 2 (offload all, save buffers)."""
-        mock_allocator_class = mocker.patch("vllm.device_allocator.cumem.CuMemAllocator")
-        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
-        mock_get_process_memory = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory")
+        mock_allocator_class = mocker.patch(
+            "vllm.device_allocator.cumem.CuMemAllocator"
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform"
+        )
+        mock_get_process_memory = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory"
+        )
 
         # Setup process-scoped memory mocks
         mock_get_process_memory.side_effect = [
@@ -148,11 +162,19 @@ class TestDiffusionWorkerSleep:
         assert "buffer1" in mock_gpu_worker._sleep_saved_buffers
         assert "buffer2" in mock_gpu_worker._sleep_saved_buffers
 
-    def test_sleep_memory_freed_validation(self, mocker: MockerFixture, mock_gpu_worker):
+    def test_sleep_memory_freed_validation(
+        self, mocker: MockerFixture, mock_gpu_worker
+    ):
         """Test that sleep validates memory was actually freed."""
-        mock_allocator_class = mocker.patch("vllm.device_allocator.cumem.CuMemAllocator")
-        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
-        mock_get_process_memory = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory")
+        mock_allocator_class = mocker.patch(
+            "vllm.device_allocator.cumem.CuMemAllocator"
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform"
+        )
+        mock_get_process_memory = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory"
+        )
 
         # Simulate process memory increase (should trigger assertion error)
         mock_get_process_memory.side_effect = [
@@ -165,15 +187,25 @@ class TestDiffusionWorkerSleep:
         mock_allocator.sleep = mocker.Mock()
 
         # This should raise an assertion error
-        with pytest.raises(AssertionError, match="Memory usage increased after sleeping"):
+        with pytest.raises(
+            AssertionError, match="Memory usage increased after sleeping"
+        ):
             mock_gpu_worker.sleep(level=1)
 
-    def test_sleep_falls_back_to_device_memory_when_nvml_unavailable(self, mocker: MockerFixture, mock_gpu_worker):
+    def test_sleep_falls_back_to_device_memory_when_nvml_unavailable(
+        self, mocker: MockerFixture, mock_gpu_worker
+    ):
         """Test sleep uses device-scoped fallback when NVML is unavailable."""
 
-        mock_allocator_class = mocker.patch("vllm.device_allocator.cumem.CuMemAllocator")
-        mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
-        mock_get_process_memory = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory")
+        mock_allocator_class = mocker.patch(
+            "vllm.device_allocator.cumem.CuMemAllocator"
+        )
+        mock_platform = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform"
+        )
+        mock_get_process_memory = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory"
+        )
         mock_get_process_memory.side_effect = [None, None]
         mock_platform.get_free_memory.side_effect = [
             1 * 1024**3,  # Before sleep
@@ -196,7 +228,9 @@ class TestDiffusionWorkerWakeUp:
 
     def test_wake_up_without_buffers(self, mocker: MockerFixture, mock_gpu_worker):
         """Test wake_up without saved buffers (level 1 sleep)."""
-        mock_allocator_class = mocker.patch("vllm.device_allocator.cumem.CuMemAllocator")
+        mock_allocator_class = mocker.patch(
+            "vllm.device_allocator.cumem.CuMemAllocator"
+        )
 
         # Setup allocator mock
         mock_allocator = mocker.Mock()
@@ -215,7 +249,9 @@ class TestDiffusionWorkerWakeUp:
 
     def test_wake_up_with_buffers(self, mocker: MockerFixture, mock_gpu_worker):
         """Test wake_up with saved buffers (level 2 sleep)."""
-        mock_allocator_class = mocker.patch("vllm.device_allocator.cumem.CuMemAllocator")
+        mock_allocator_class = mocker.patch(
+            "vllm.device_allocator.cumem.CuMemAllocator"
+        )
 
         # Setup allocator mock
         mock_allocator = mocker.Mock()
@@ -257,9 +293,13 @@ class TestDiffusionWorkerWakeUp:
         assert len(mock_gpu_worker._sleep_saved_buffers) == 0
         assert result is True
 
-    def test_wake_up_partial_buffer_restore(self, mocker: MockerFixture, mock_gpu_worker):
+    def test_wake_up_partial_buffer_restore(
+        self, mocker: MockerFixture, mock_gpu_worker
+    ):
         """Test wake_up only restores buffers that were saved."""
-        mock_allocator_class = mocker.patch("vllm.device_allocator.cumem.CuMemAllocator")
+        mock_allocator_class = mocker.patch(
+            "vllm.device_allocator.cumem.CuMemAllocator"
+        )
 
         # Setup allocator mock
         mock_allocator = mocker.Mock()

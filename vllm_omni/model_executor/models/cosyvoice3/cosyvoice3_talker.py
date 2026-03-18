@@ -21,7 +21,9 @@ class VLLMQwen2Encoder(torch.nn.Module):
         self.model = Qwen2Model(vllm_config=vllm_config, prefix=prefix)
         self.hidden_size = vllm_config.model_config.hf_config.hidden_size
 
-    def forward(self, inputs_embeds: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, inputs_embeds: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
         """Forward pass using vLLM's attention with external KV cache.
 
         Args:
@@ -41,7 +43,9 @@ class VLLMQwen2Encoder(torch.nn.Module):
         # KV cache managed externally via ForwardContext (set by GPUARModelRunner)
         # input_ids is required but ignored when inputs_embeds is provided
         hidden_states = self.model(
-            input_ids=torch.zeros(inputs_flat.size(0), dtype=torch.long, device=inputs_flat.device),
+            input_ids=torch.zeros(
+                inputs_flat.size(0), dtype=torch.long, device=inputs_flat.device
+            ),
             positions=positions_flat,
             intermediate_tensors=None,
             inputs_embeds=inputs_flat,
@@ -67,9 +71,13 @@ class TransformerLM(torch.nn.Module):
         self.llm_input_size = llm_input_size
         self.speech_token_size = speech_token_size
         # 1. build text token inputs related modules
-        self.text_embedding = torch.nn.Embedding(text_token_size, text_encoder_input_size)
+        self.text_embedding = torch.nn.Embedding(
+            text_token_size, text_encoder_input_size
+        )
         self.text_encoder = text_encoder
-        self.text_encoder_affine_layer = nn.Linear(self.text_encoder.output_size(), llm_input_size)
+        self.text_encoder_affine_layer = nn.Linear(
+            self.text_encoder.output_size(), llm_input_size
+        )
 
         # 2. build speech token language model related modules
         self.sos = 0
@@ -111,7 +119,9 @@ class Qwen2LM(TransformerLM):
         self.llm_decoder = nn.Linear(llm_output_size, speech_token_size + 3)
 
         # 3. [Optional] build speech token related modules
-        self.speech_embedding = torch.nn.Embedding(speech_token_size + 3, llm_input_size)
+        self.speech_embedding = torch.nn.Embedding(
+            speech_token_size + 3, llm_input_size
+        )
 
         # 4. sampling method
         self.sampling = sampling
@@ -144,10 +154,14 @@ class CosyVoice3LM(Qwen2LM):
         self.fill_token = speech_token_size + 3
 
         self.llm = llm
-        self.llm_decoder = nn.Linear(llm_output_size, speech_token_size + 200, bias=False)
+        self.llm_decoder = nn.Linear(
+            llm_output_size, speech_token_size + 200, bias=False
+        )
 
         # 3. [Optional] build speech token related modules
-        self.speech_embedding = torch.nn.Embedding(speech_token_size + 200, llm_input_size)
+        self.speech_embedding = torch.nn.Embedding(
+            speech_token_size + 200, llm_input_size
+        )
 
         # 4. sampling method
         # self.sampling = sampling

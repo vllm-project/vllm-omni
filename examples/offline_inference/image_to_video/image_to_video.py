@@ -43,7 +43,9 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video from an image with Wan2.2 or LTX2.")
+    parser = argparse.ArgumentParser(
+        description="Generate a video from an image with Wan2.2 or LTX2."
+    )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
@@ -55,20 +57,40 @@ def parse_args() -> argparse.Namespace:
         help="Override model class name (e.g., LTX2ImageToVideoPipeline).",
     )
     parser.add_argument("--image", required=True, help="Path to input image.")
-    parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
+    parser.add_argument(
+        "--prompt", default="", help="Text prompt describing the desired motion."
+    )
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG scale.")
     parser.add_argument(
-        "--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise (MoE only)."
+        "--guidance-scale-high",
+        type=float,
+        default=None,
+        help="Optional separate CFG for high-noise (MoE only).",
     )
     parser.add_argument(
-        "--height", type=int, default=None, help="Video height (auto-calculated from image if not set)."
+        "--height",
+        type=int,
+        default=None,
+        help="Video height (auto-calculated from image if not set).",
     )
-    parser.add_argument("--width", type=int, default=None, help="Video width (auto-calculated from image if not set).")
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Video width (auto-calculated from image if not set).",
+    )
     parser.add_argument("--num-frames", type=int, default=81, help="Number of frames.")
-    parser.add_argument("--num-inference-steps", type=int, default=50, help="Sampling steps.")
-    parser.add_argument("--boundary-ratio", type=float, default=0.875, help="Boundary split ratio for MoE models.")
+    parser.add_argument(
+        "--num-inference-steps", type=int, default=50, help="Sampling steps."
+    )
+    parser.add_argument(
+        "--boundary-ratio",
+        type=float,
+        default=0.875,
+        help="Boundary split ratio for MoE models.",
+    )
     parser.add_argument(
         "--frame-rate",
         type=float,
@@ -76,10 +98,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional generation frame rate (used by models like LTX2). Defaults to --fps.",
     )
     parser.add_argument(
-        "--flow-shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
+        "--flow-shift",
+        type=float,
+        default=5.0,
+        help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p).",
     )
-    parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
-    parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="i2v_output.mp4",
+        help="Path to save the video (mp4).",
+    )
+    parser.add_argument(
+        "--fps", type=int, default=None, help="Frames per second for the output video."
+    )
     parser.add_argument(
         "--vae-use-slicing",
         action="store_true",
@@ -156,7 +188,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-hsdp",
         action="store_true",
-        help=("Enable Hybrid Sharded Data Parallel to shard model weights across GPUs. "),
+        help=(
+            "Enable Hybrid Sharded Data Parallel to shard model weights across GPUs. "
+        ),
     )
     parser.add_argument(
         "--hsdp-shard-size",
@@ -195,10 +229,14 @@ def calculate_dimensions(
 
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(
+        args.seed
+    )
     model_name = str(args.model).lower() if args.model is not None else ""
     model_class_name = args.model_class_name
-    is_ltx2 = "ltx2" in model_name or (model_class_name and "ltx2" in model_class_name.lower())
+    is_ltx2 = "ltx2" in model_name or (
+        model_class_name and "ltx2" in model_class_name.lower()
+    )
     if model_class_name is None and is_ltx2:
         model_class_name = "LTX2ImageToVideoPipeline"
 
@@ -207,9 +245,19 @@ def main():
 
     fps = args.fps if args.fps is not None else (24 if is_ltx2 else 16)
     frame_rate = args.frame_rate if args.frame_rate is not None else float(fps)
-    guidance_scale = args.guidance_scale if args.guidance_scale is not None else (4.0 if is_ltx2 else 5.0)
-    num_frames = args.num_frames if args.num_frames is not None else (121 if is_ltx2 else 81)
-    num_inference_steps = args.num_inference_steps if args.num_inference_steps is not None else (40 if is_ltx2 else 50)
+    guidance_scale = (
+        args.guidance_scale
+        if args.guidance_scale is not None
+        else (4.0 if is_ltx2 else 5.0)
+    )
+    num_frames = (
+        args.num_frames if args.num_frames is not None else (121 if is_ltx2 else 81)
+    )
+    num_inference_steps = (
+        args.num_inference_steps
+        if args.num_inference_steps is not None
+        else (40 if is_ltx2 else 50)
+    )
 
     # Calculate dimensions if not provided
     height = args.height
@@ -218,7 +266,9 @@ def main():
         # Default to 480P area for Wan2.2 I2V, 512x768 area for LTX2
         max_area = 512 * 768 if is_ltx2 else 480 * 832
         mod_value = 32 if is_ltx2 else 16
-        calc_height, calc_width = calculate_dimensions(image, max_area=max_area, mod_value=mod_value)
+        calc_height, calc_width = calculate_dimensions(
+            image, max_area=max_area, mod_value=mod_value
+        )
         height = height or calc_height
         width = width or calc_width
 
@@ -323,7 +373,9 @@ def main():
     generation_time = generation_end - generation_start
 
     # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+    print(
+        f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)"
+    )
 
     audio = None
     if isinstance(frames, list):
@@ -341,16 +393,25 @@ def main():
             if isinstance(inner_output, list):
                 inner_output = inner_output[0] if inner_output else None
             if isinstance(inner_output, OmniRequestOutput):
-                if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
+                if (
+                    inner_output.multimodal_output
+                    and "audio" in inner_output.multimodal_output
+                ):
                     audio = inner_output.multimodal_output["audio"]
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
-                if len(frames.images) == 1 and isinstance(frames.images[0], tuple) and len(frames.images[0]) == 2:
+                if (
+                    len(frames.images) == 1
+                    and isinstance(frames.images[0], tuple)
+                    and len(frames.images[0]) == 2
+                ):
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
-                    frames = frames.images[0].get("frames") or frames.images[0].get("video")
+                    frames = frames.images[0].get("frames") or frames.images[0].get(
+                        "video"
+                    )
                 else:
                     frames = frames.images
             else:

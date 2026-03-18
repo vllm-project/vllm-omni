@@ -27,7 +27,9 @@ def test_omni_new_request_data_copies_payloads():
         additional_information=additional_information,
     )
 
-    data = OmniNewRequestData.from_request(request, ([0, 1],), prefill_token_ids=[101, 102])
+    data = OmniNewRequestData.from_request(
+        request, ([0, 1],), prefill_token_ids=[101, 102]
+    )
 
     assert data.prompt_embeds is prompt_embeds
     assert data.additional_information is additional_information

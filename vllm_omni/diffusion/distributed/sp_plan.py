@@ -107,7 +107,9 @@ class SequenceParallelConfig:
         Raises:
             RuntimeError: If parallel state is not initialized.
         """
-        from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sequence_parallel_world_size,
+        )
 
         return get_sequence_parallel_world_size()
 
@@ -120,7 +122,9 @@ class SequenceParallelConfig:
         Raises:
             RuntimeError: If parallel state is not initialized.
         """
-        from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_rank
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sequence_parallel_rank,
+        )
 
         return get_sequence_parallel_rank()
 
@@ -130,7 +134,9 @@ class SequenceParallelConfig:
         Returns:
             The world size for Ulysses (All-to-All) parallelism.
         """
-        from vllm_omni.diffusion.distributed.parallel_state import get_ulysses_parallel_world_size
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_ulysses_parallel_world_size,
+        )
 
         return get_ulysses_parallel_world_size()
 
@@ -140,7 +146,9 @@ class SequenceParallelConfig:
         Returns:
             The rank within the Ulysses parallel group.
         """
-        from vllm_omni.diffusion.distributed.parallel_state import get_ulysses_parallel_rank
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_ulysses_parallel_rank,
+        )
 
         return get_ulysses_parallel_rank()
 
@@ -150,7 +158,9 @@ class SequenceParallelConfig:
         Returns:
             The world size for Ring attention parallelism.
         """
-        from vllm_omni.diffusion.distributed.parallel_state import get_ring_parallel_world_size
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_ring_parallel_world_size,
+        )
 
         return get_ring_parallel_world_size()
 
@@ -160,7 +170,9 @@ class SequenceParallelConfig:
         Returns:
             The rank within the Ring parallel group.
         """
-        from vllm_omni.diffusion.distributed.parallel_state import get_ring_parallel_rank
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_ring_parallel_rank,
+        )
 
         return get_ring_parallel_rank()
 
@@ -337,11 +349,17 @@ AnySequenceParallelInput = SequenceParallelInput | SequenceParallelPartialInput
 # Input specification: maps parameter names (str) or output indices (int) to split config
 SequenceParallelInputType = dict[
     str | int,
-    AnySequenceParallelInput | list[AnySequenceParallelInput] | tuple[AnySequenceParallelInput, ...],
+    AnySequenceParallelInput
+    | list[AnySequenceParallelInput]
+    | tuple[AnySequenceParallelInput, ...],
 ]
 
 # Output specification: single or multiple gather configs
-SequenceParallelOutputType = SequenceParallelOutput | list[SequenceParallelOutput] | tuple[SequenceParallelOutput, ...]
+SequenceParallelOutputType = (
+    SequenceParallelOutput
+    | list[SequenceParallelOutput]
+    | tuple[SequenceParallelOutput, ...]
+)
 
 # Full model plan: maps module names to input/output specifications
 # - Key "" refers to the model itself (root level)
@@ -364,7 +382,9 @@ SequenceParallelOutputType = SequenceParallelOutput | list[SequenceParallelOutpu
 #         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
 #     }
 #
-SequenceParallelModelPlan = dict[str, SequenceParallelInputType | SequenceParallelOutputType]
+SequenceParallelModelPlan = dict[
+    str, SequenceParallelInputType | SequenceParallelOutputType
+]
 
 
 # =============================================================================
@@ -398,7 +418,9 @@ def validate_sp_plan(plan: SequenceParallelModelPlan) -> None:
 
     for module_id, module_plan in plan.items():
         if not isinstance(module_id, str):
-            raise ValueError(f"_sp_plan keys must be strings, got {type(module_id).__name__}")
+            raise ValueError(
+                f"_sp_plan keys must be strings, got {type(module_id).__name__}"
+            )
 
         # Check if it's an output specification (SequenceParallelOutput or list/tuple thereof)
         if isinstance(module_plan, SequenceParallelOutput):

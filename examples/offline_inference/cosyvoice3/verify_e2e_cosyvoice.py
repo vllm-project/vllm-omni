@@ -18,7 +18,15 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
 
 def _ensure_mel_filters_asset() -> None:
     repo_root = Path(__file__).resolve().parents[3]
-    filters_path = repo_root / "vllm_omni" / "model_executor" / "models" / "cosyvoice3" / "assets" / "mel_filters.npz"
+    filters_path = (
+        repo_root
+        / "vllm_omni"
+        / "model_executor"
+        / "models"
+        / "cosyvoice3"
+        / "assets"
+        / "mel_filters.npz"
+    )
     if filters_path.exists():
         return
 
@@ -41,8 +49,16 @@ def run_e2e():
         required=True,
         help="Path to CosyVoice3 model directory (e.g., pretrained_models/Fun-CosyVoice3-0.5B/).",
     )
-    parser.add_argument("--stage-config", type=str, default="vllm_omni/model_executor/stage_configs/cosyvoice3.yaml")
-    parser.add_argument("--prompt", type=str, default="Hello, this is a test of the CosyVoice system capability.")
+    parser.add_argument(
+        "--stage-config",
+        type=str,
+        default="vllm_omni/model_executor/stage_configs/cosyvoice3.yaml",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="Hello, this is a test of the CosyVoice system capability.",
+    )
     parser.add_argument(
         "--prompt-text",
         type=str,
@@ -119,7 +135,9 @@ def run_e2e():
         skip_special_tokens=config.skip_special_tokens,
         version=config.version,
     )
-    _, text_token_len = extract_text_token(args.prompt, tokenizer, config.allowed_special)
+    _, text_token_len = extract_text_token(
+        args.prompt, tokenizer, config.allowed_special
+    )
     base_len = int(text_token_len)
     min_len = int(base_len * config.min_token_text_ratio)
     max_len = int(base_len * config.max_token_text_ratio)
@@ -154,7 +172,9 @@ def run_e2e():
         omni.start_profile()
 
     # Generate (Omni orchestrator requires a per-stage SamplingParams list)
-    outputs = list(omni.generate(prompts, sampling_params_list=sampling_params_list[:2]))
+    outputs = list(
+        omni.generate(prompts, sampling_params_list=sampling_params_list[:2])
+    )
 
     # Stop profiling and get results
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):

@@ -49,14 +49,20 @@ class MammothModa2DiTPipeline(nn.Module):
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---
         if self.config.gen_vae_config is None or self.config.gen_dit_config is None:
-            raise ValueError("Mammothmoda2Config.gen_vae_config / gen_dit_config must not be None")
+            raise ValueError(
+                "Mammothmoda2Config.gen_vae_config / gen_dit_config must not be None"
+            )
 
         self.gen_vae = AutoencoderKL.from_config(self.config.gen_vae_config)
-        self.gen_transformer = Transformer2DModel.from_config(self.config.gen_dit_config)
+        self.gen_transformer = Transformer2DModel.from_config(
+            self.config.gen_dit_config
+        )
 
         llm_hidden_size = int(getattr(self.config.llm_config, "hidden_size", 0) or 0)
         if llm_hidden_size <= 0:
-            raise ValueError("Failed to infer llm hidden_size from Mammothmoda2Config.llm_config.hidden_size")
+            raise ValueError(
+                "Failed to infer llm hidden_size from Mammothmoda2Config.llm_config.hidden_size"
+            )
         self._reinit_caption_embedder(llm_hidden_size)
 
         # Optional: image condition refiner (Q-Former)
@@ -86,22 +92,33 @@ class MammothModa2DiTPipeline(nn.Module):
     def _reinit_caption_embedder(self, in_features: int) -> None:
         # Align with upstream Mammothmoda2Model's `reinit_caption_embedder`:
         # Use Qwen2RMSNorm(in_features) + Linear(in_features -> out_features).
-        out_features = int(getattr(self.gen_transformer, "hidden_size", 0) or self.gen_transformer.config.hidden_size)
+        out_features = int(
+            getattr(self.gen_transformer, "hidden_size", 0)
+            or self.gen_transformer.config.hidden_size
+        )
         self.gen_transformer.time_caption_embed.caption_embedder = nn.Sequential(
             Qwen2RMSNorm(in_features, eps=1e-5),
             nn.Linear(in_features, out_features, bias=True),
         )
 
-    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
+    def get_dummy_runtime_additional_information(
+        self, num_reqs: int
+    ) -> list[dict[str, object]]:
         if num_reqs <= 0:
             raise ValueError(f"num_reqs must be positive, got {num_reqs}")
         if num_reqs > 1:
             raise NotImplementedError(
                 f"get_dummy_runtime_additional_information does not support num_reqs > 1, got {num_reqs}"
             )
-        text_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
-        image_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
-        negative_prompt_embeds = torch.zeros((0, self._llm_hidden_size), dtype=torch.float32)
+        text_prompt_embeds = torch.zeros(
+            (1, self._llm_hidden_size), dtype=torch.float32
+        )
+        image_prompt_embeds = torch.zeros(
+            (1, self._llm_hidden_size), dtype=torch.float32
+        )
+        negative_prompt_embeds = torch.zeros(
+            (0, self._llm_hidden_size), dtype=torch.float32
+        )
         info = {
             "text_prompt_embeds": text_prompt_embeds,
             "image_prompt_embeds": image_prompt_embeds,
@@ -156,13 +173,19 @@ class MammothModa2DiTPipeline(nn.Module):
             if x.ndim == 3 and x.shape[0] == 1:
                 x = x[0]
             if x.ndim != 2:
-                raise ValueError(f"Expected {name} to be 2D [T,H], got shape={tuple(x.shape)}")
+                raise ValueError(
+                    f"Expected {name} to be 2D [T,H], got shape={tuple(x.shape)}"
+                )
             return x
 
         text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
         image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
-        text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
-        image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+        text_cond = text_cond.to(
+            device=model_device, dtype=target_dtype, non_blocking=True
+        ).contiguous()
+        image_cond = image_cond.to(
+            device=model_device, dtype=target_dtype, non_blocking=True
+        ).contiguous()
 
         text_embeds = text_cond.unsqueeze(0)  # [1, T_text, H]
         text_attention_mask = torch.ones(
@@ -180,7 +203,9 @@ class MammothModa2DiTPipeline(nn.Module):
 
         # Apply optional refiner ONLY on image condition tokens.
         if self.gen_image_condition_refiner is not None and image_embeds.shape[1] > 0:
-            image_embeds = self.gen_image_condition_refiner(image_embeds, ~image_attention_mask.bool())
+            image_embeds = self.gen_image_condition_refiner(
+                image_embeds, ~image_attention_mask.bool()
+            )
             image_attention_mask = torch.ones(
                 image_embeds.shape[:2],
                 dtype=torch.bool,
@@ -188,7 +213,9 @@ class MammothModa2DiTPipeline(nn.Module):
             )
 
         prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
-        prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
+        prompt_attention_mask = torch.cat(
+            [text_attention_mask, image_attention_mask], dim=1
+        )
 
         # Prepare negative prompt (for CFG). If none provided, fall back to unconditional.
         negative_prompt_embeds = None
@@ -197,7 +224,9 @@ class MammothModa2DiTPipeline(nn.Module):
             if negative_cond is not None:
                 negative_cond = _ensure_2d(negative_cond, "negative_prompt_embeds")
                 negative_prompt_embeds = (
-                    negative_cond.to(device=model_device, dtype=target_dtype, non_blocking=True)
+                    negative_cond.to(
+                        device=model_device, dtype=target_dtype, non_blocking=True
+                    )
                     .contiguous()
                     .unsqueeze(0)
                 )
@@ -214,7 +243,9 @@ class MammothModa2DiTPipeline(nn.Module):
                         device=negative_prompt_embeds.device,
                     )
                 else:
-                    neg_mask = neg_mask.to(device=negative_prompt_embeds.device, dtype=torch.bool)
+                    neg_mask = neg_mask.to(
+                        device=negative_prompt_embeds.device, dtype=torch.bool
+                    )
                     if neg_mask.ndim == 1:
                         neg_mask = neg_mask.unsqueeze(0)
                     negative_prompt_attention_mask = neg_mask
@@ -236,12 +267,21 @@ class MammothModa2DiTPipeline(nn.Module):
         if height <= 0 or width <= 0:
             raise ValueError(f"Invalid image size: {height}x{width}")
         if height % 16 != 0 or width % 16 != 0:
-            raise ValueError(f"Image size must be multiples of 16, got {height}x{width}")
+            raise ValueError(
+                f"Image size must be multiples of 16, got {height}x{width}"
+            )
         vae_scale_factor = 16
 
         latent_channels = int(self.gen_transformer.config.in_channels)
-        shape = (1, latent_channels, 2 * height // vae_scale_factor, 2 * width // vae_scale_factor)
-        latents = randn_tensor(shape, device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+        shape = (
+            1,
+            latent_channels,
+            2 * height // vae_scale_factor,
+            2 * width // vae_scale_factor,
+        )
+        latents = randn_tensor(
+            shape, device=prompt_embeds.device, dtype=prompt_embeds.dtype
+        )
 
         scheduler = FlowMatchEulerDiscreteScheduler()
 
@@ -263,7 +303,11 @@ class MammothModa2DiTPipeline(nn.Module):
                 ref_image_hidden_states=None,
                 freqs_cis=self.gen_freqs_cis,
             )
-            guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0
+            guidance_scale = (
+                text_guidance_scale
+                if cfg_range[0] <= i / total_steps <= cfg_range[1]
+                else 1.0
+            )
             if guidance_scale > 1.0 and negative_prompt_embeds is not None:
                 model_pred_uncond = self.gen_transformer(
                     hidden_states=latents,
@@ -273,7 +317,9 @@ class MammothModa2DiTPipeline(nn.Module):
                     ref_image_hidden_states=None,
                     freqs_cis=self.gen_freqs_cis,
                 )
-                model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
+                model_pred = model_pred_uncond + guidance_scale * (
+                    model_pred - model_pred_uncond
+                )
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = latents.to(dtype=prompt_embeds.dtype)
 
@@ -290,7 +336,9 @@ class MammothModa2DiTPipeline(nn.Module):
             intermediate_tensors=None,
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:  # noqa: ARG002
+    def compute_logits(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:  # noqa: ARG002
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

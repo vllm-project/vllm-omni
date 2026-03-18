@@ -45,7 +45,9 @@ def is_diffusion_model(model_name: str) -> bool:
 
                 with open(model_index_path) as f:
                     config_dict = json.load(f)
-                if config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
+                if config_dict.get("_class_name") and config_dict.get(
+                    "_diffusers_version"
+                ):
                     logger.debug("Detected diffusion model via local model_index.json")
                     return True
             except Exception as e:
@@ -54,7 +56,11 @@ def is_diffusion_model(model_name: str) -> bool:
     # Strategy 2: Check using vllm's utility (works for both local and remote models)
     try:
         config_dict = get_hf_file_to_dict("model_index.json", model_name)
-        if config_dict is not None and config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
+        if (
+            config_dict is not None
+            and config_dict.get("_class_name")
+            and config_dict.get("_diffusers_version")
+        ):
             logger.debug("Detected diffusion model via model_index.json")
             return True
     except Exception as e:

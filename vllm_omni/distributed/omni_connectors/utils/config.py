@@ -30,7 +30,9 @@ class OmniTransferConfig:
     connectors: dict[tuple[str, str], ConnectorSpec] = field(default_factory=dict)
     default_connector: ConnectorSpec | None = None
 
-    def get_connector_for_edge(self, from_stage: str, to_stage: str) -> ConnectorSpec | None:
+    def get_connector_for_edge(
+        self, from_stage: str, to_stage: str
+    ) -> ConnectorSpec | None:
         """Get connector spec for a specific edge."""
         edge_key = (from_stage, to_stage)
         return self.connectors.get(edge_key, self.default_connector)

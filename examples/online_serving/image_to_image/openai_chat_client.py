@@ -65,7 +65,9 @@ def edit_image(
     # Build user message with text and image
     content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
     for p in input_paths:
-        content.append({"type": "image_url", "image_url": {"url": _encode_image_as_data_url(p)}})
+        content.append(
+            {"type": "image_url", "image_url": {"url": _encode_image_as_data_url(p)}}
+        )
 
     messages = [
         {
@@ -123,10 +125,14 @@ def edit_image(
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen-Image-Edit chat client")
-    parser.add_argument("--input", "-i", required=True, nargs="+", help="Input image path(s)")
+    parser.add_argument(
+        "--input", "-i", required=True, nargs="+", help="Input image path(s)"
+    )
     parser.add_argument("--prompt", "-p", required=True, help="Edit prompt")
     parser.add_argument("--output", "-o", default="output.png", help="Output file")
-    parser.add_argument("--server", "-s", default="http://localhost:8092", help="Server URL")
+    parser.add_argument(
+        "--server", "-s", default="http://localhost:8092", help="Server URL"
+    )
     parser.add_argument("--height", type=int, default=1024, help="Output image height")
     parser.add_argument("--width", type=int, default=1024, help="Output image width")
     parser.add_argument("--steps", type=int, default=50, help="Inference steps")

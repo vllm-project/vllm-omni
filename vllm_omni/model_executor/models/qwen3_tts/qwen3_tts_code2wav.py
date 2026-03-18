@@ -58,10 +58,14 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         cfg_path = cached_file(self.model_path, "speech_tokenizer/config.json")
         if cfg_path is None:
-            raise ValueError(f"{self.model_path}/speech_tokenizer/config.json not found")
+            raise ValueError(
+                f"{self.model_path}/speech_tokenizer/config.json not found"
+            )
         speech_tokenizer_dir = os.path.dirname(cfg_path)
 
-        prep_cfg = cached_file(self.model_path, "speech_tokenizer/preprocessor_config.json")
+        prep_cfg = cached_file(
+            self.model_path, "speech_tokenizer/preprocessor_config.json"
+        )
         if prep_cfg is None:
             raise ValueError(
                 f"{self.model_path}/speech_tokenizer/preprocessor_config.json not found. "
@@ -79,7 +83,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             tok.device = self._module_device(tok.model)
 
         dec_cfg = getattr(tok.model.config, "decoder_config", None)
-        num_q = getattr(dec_cfg, "num_quantizers", None) if dec_cfg is not None else None
+        num_q = (
+            getattr(dec_cfg, "num_quantizers", None) if dec_cfg is not None else None
+        )
         if num_q is None:
             raise ValueError("speech_tokenizer decoder_config.num_quantizers not found")
         num_q = int(num_q)
@@ -121,27 +127,45 @@ class Qwen3TTSCode2Wav(nn.Module):
                     )
                     if isinstance(extra_cfg, dict):
                         chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
-                        left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+                        left_frames = int(
+                            extra_cfg.get("codec_left_context_frames") or 0
+                        )
                         if chunk_frames > 0 and left_frames >= 0:
-                            from .cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+                            from .cuda_graph_decoder_wrapper import (
+                                CUDAGraphDecoderWrapper,
+                            )
 
                             steady_window = left_frames + chunk_frames
-                            capture_sizes = sorted({*CUDAGraphDecoderWrapper.DEFAULT_CAPTURE_SIZES, steady_window})
+                            capture_sizes = sorted(
+                                {
+                                    *CUDAGraphDecoderWrapper.DEFAULT_CAPTURE_SIZES,
+                                    steady_window,
+                                }
+                            )
                     decoder.enable_cudagraph(capture_sizes=capture_sizes, device=device)
                     logger.info("Code2Wav decoder CUDA Graph enabled")
                 except Exception:
-                    logger.warning("Failed to enable CUDA Graph for Code2Wav decoder", exc_info=True)
+                    logger.warning(
+                        "Failed to enable CUDA Graph for Code2Wav decoder",
+                        exc_info=True,
+                    )
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
         if input_ids.numel() == 0:
             return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
-        return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
+        return torch.zeros(
+            (input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32
+        )
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
+    def compute_logits(
+        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
+    ) -> None:
         return None
 
-    def _split_request_ids(self, ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
+    def _split_request_ids(
+        self, ids: torch.Tensor, seq_token_counts: list[int] | None = None
+    ) -> list[torch.Tensor]:
         """Split concatenated input_ids into per-request segments.
 
         Uses seq_token_counts (injected by the runner via model_kwargs) when
@@ -153,14 +177,24 @@ class Qwen3TTSCode2Wav(nn.Module):
             for count in seq_token_counts:
                 boundaries.append(boundaries[-1] + count)
             n = ids.numel()
-            return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
+            return [
+                ids[boundaries[i] : min(boundaries[i + 1], n)]
+                for i in range(len(seq_token_counts))
+            ]
         if is_forward_context_available():
             slices = get_forward_context().ubatch_slices
-            if slices is not None and len(slices) > 1 and not any(hasattr(s, "token_slice") for s in slices):
+            if (
+                slices is not None
+                and len(slices) > 1
+                and not any(hasattr(s, "token_slice") for s in slices)
+            ):
                 boundaries = [0]
                 for s in slices:
                     boundaries.append(boundaries[-1] + s)
-                return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
+                return [
+                    ids[boundaries[i] : boundaries[i + 1]]
+                    for i in range(len(boundaries) - 1)
+                ]
         return [ids]
 
     @torch.no_grad()
@@ -310,12 +344,16 @@ class Qwen3TTSCode2Wav(nn.Module):
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
 
-    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+    def make_omni_output(
+        self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any
+    ) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
         if not (isinstance(model_outputs, tuple) and len(model_outputs) == 2):
-            raise TypeError(f"Qwen3TTSCode2Wav expected (audio_tensor, sr) outputs, got {type(model_outputs)}")
+            raise TypeError(
+                f"Qwen3TTSCode2Wav expected (audio_tensor, sr) outputs, got {type(model_outputs)}"
+            )
 
         audio_tensor, sr = model_outputs
         return OmniOutput(

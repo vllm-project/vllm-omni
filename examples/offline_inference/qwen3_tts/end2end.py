@@ -41,7 +41,9 @@ def _estimate_prompt_len(
     embeddings that ``preprocess`` will produce.
     """
     try:
-        from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
+        from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
+            Qwen3TTSConfig,
+        )
         from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
             Qwen3TTSTalkerForConditionalGeneration,
         )
@@ -49,7 +51,9 @@ def _estimate_prompt_len(
         if model_name not in _cache:
             from transformers import AutoTokenizer
 
-            tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
+            tok = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True, padding_side="left"
+            )
             cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
             _cache[model_name] = (tok, getattr(cfg, "talker_config", None))
 
@@ -90,7 +94,9 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
         languages = ["Chinese", "English", "English", "English", "English"]
         speakers = ["Vivian", "Ryan", "Ryan", "Ryan", "Ryan"]
         inputs = []
-        for text, instruct, language, speaker in zip(texts, instructs, languages, speakers):
+        for text, instruct, language, speaker in zip(
+            texts, instructs, languages, speakers
+        ):
             additional_information = {
                 "task_type": [task_type],
                 "text": [text],
@@ -101,7 +107,8 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
             }
             inputs.append(
                 {
-                    "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+                    "prompt_token_ids": [0]
+                    * _estimate_prompt_len(additional_information, model_name),
                     "additional_information": additional_information,
                 }
             )
@@ -119,7 +126,8 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
             "max_new_tokens": [2048],
         }
         inputs = {
-            "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+            "prompt_token_ids": [0]
+            * _estimate_prompt_len(additional_information, model_name),
             "additional_information": additional_information,
         }
     return QueryResult(
@@ -161,7 +169,8 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
             }
             inputs.append(
                 {
-                    "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+                    "prompt_token_ids": [0]
+                    * _estimate_prompt_len(additional_information, model_name),
                     "additional_information": additional_information,
                 }
             )
@@ -178,7 +187,8 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
             "non_streaming_mode": [True],
         }
         inputs = {
-            "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+            "prompt_token_ids": [0]
+            * _estimate_prompt_len(additional_information, model_name),
             "additional_information": additional_information,
         }
     return QueryResult(
@@ -187,7 +197,9 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
     )
 
 
-def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> QueryResult:
+def get_base_query(
+    use_batch_sample: bool = False, mode_tag: str = "icl"
+) -> QueryResult:
     """Build Base (voice clone) sample inputs.
 
     Args:
@@ -199,12 +211,14 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
     """
     task_type = "Base"
     model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-    ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
-    ref_audio_single = ref_audio_path_1
-    ref_text_single = (
-        "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+    ref_audio_path_1 = (
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
     )
-    syn_text_single = "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."
+    ref_audio_single = ref_audio_path_1
+    ref_text_single = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+    syn_text_single = (
+        "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."
+    )
     syn_lang_single = "Auto"
     x_vector_only_mode = mode_tag == "xvec_only"
     if use_batch_sample:
@@ -226,7 +240,8 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
             }
             inputs.append(
                 {
-                    "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+                    "prompt_token_ids": [0]
+                    * _estimate_prompt_len(additional_information, model_name),
                     "additional_information": additional_information,
                 }
             )
@@ -241,7 +256,8 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
             "max_new_tokens": [2048],
         }
         inputs = {
-            "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+            "prompt_token_ids": [0]
+            * _estimate_prompt_len(additional_information, model_name),
             "additional_information": additional_information,
         }
     return QueryResult(
@@ -270,7 +286,9 @@ def _build_inputs(args) -> tuple[str, list]:
     if args.query_type in {"CustomVoice", "VoiceDesign"}:
         query_result = query_func(use_batch_sample=args.use_batch_sample)
     elif args.query_type == "Base":
-        query_result = query_func(use_batch_sample=args.use_batch_sample, mode_tag=args.mode_tag)
+        query_result = query_func(
+            use_batch_sample=args.use_batch_sample, mode_tag=args.mode_tag
+        )
     else:
         query_result = query_func()
 
@@ -281,17 +299,26 @@ def _build_inputs(args) -> tuple[str, list]:
             lines = [line.strip() for line in f if line.strip()]
         if not lines:
             raise ValueError(f"No valid prompts found in {args.txt_prompts}")
-        template = query_result.inputs if not isinstance(query_result.inputs, list) else query_result.inputs[0]
+        template = (
+            query_result.inputs
+            if not isinstance(query_result.inputs, list)
+            else query_result.inputs[0]
+        )
         template_info = template["additional_information"]
         inputs = [
             {
-                "prompt_token_ids": [0] * _estimate_prompt_len({**template_info, "text": [t]}, model_name),
+                "prompt_token_ids": [0]
+                * _estimate_prompt_len({**template_info, "text": [t]}, model_name),
                 "additional_information": {**template_info, "text": [t]},
             }
             for t in lines
         ]
     else:
-        inputs = query_result.inputs if isinstance(query_result.inputs, list) else [query_result.inputs]
+        inputs = (
+            query_result.inputs
+            if isinstance(query_result.inputs, list)
+            else [query_result.inputs]
+        )
 
     return model_name, inputs
 
@@ -302,9 +329,16 @@ def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
     sr_raw = mm["sr"]
     sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
     sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-    audio_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+    audio_tensor = (
+        torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+    )
     out_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-    sf.write(out_wav, audio_tensor.float().cpu().numpy().flatten(), samplerate=sr, format="WAV")
+    sf.write(
+        out_wav,
+        audio_tensor.float().cpu().numpy().flatten(),
+        samplerate=sr,
+        format="WAV",
+    )
     logger.info(f"Request ID: {request_id}, Saved audio to {out_wav}")
 
 
@@ -326,7 +360,9 @@ def main(args):
         batch = inputs[batch_start : batch_start + batch_size]
         for stage_outputs in omni.generate(batch):
             for output in stage_outputs.request_output:
-                _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+                _save_wav(
+                    output_dir, output.request_id, output.outputs[0].multimodal_output
+                )
 
 
 async def main_streaming(args):
@@ -352,24 +388,36 @@ async def main_streaming(args):
             if not stage_output.finished:
                 t_now = time.perf_counter()
                 audio = mm.get("audio")
-                n = len(audio) if isinstance(audio, list) else (0 if audio is None else 1)
+                n = (
+                    len(audio)
+                    if isinstance(audio, list)
+                    else (0 if audio is None else 1)
+                )
                 dt_ms = (t_now - t_prev) * 1000
                 ttfa_ms = (t_now - t_start) * 1000
                 if chunk_idx == 0:
-                    logger.info(f"Request {request_id}: chunk {chunk_idx} samples={n} TTFA={ttfa_ms:.1f}ms")
+                    logger.info(
+                        f"Request {request_id}: chunk {chunk_idx} samples={n} TTFA={ttfa_ms:.1f}ms"
+                    )
                 else:
-                    logger.info(f"Request {request_id}: chunk {chunk_idx} samples={n} inter_chunk={dt_ms:.1f}ms")
+                    logger.info(
+                        f"Request {request_id}: chunk {chunk_idx} samples={n} inter_chunk={dt_ms:.1f}ms"
+                    )
                 t_prev = t_now
                 chunk_idx += 1
             else:
                 t_end = time.perf_counter()
                 total_ms = (t_end - t_start) * 1000
-                logger.info(f"Request {request_id}: done total={total_ms:.1f}ms chunks={chunk_idx}")
+                logger.info(
+                    f"Request {request_id}: done total={total_ms:.1f}ms chunks={chunk_idx}"
+                )
                 _save_wav(output_dir, request_id, mm)
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = FlexibleArgumentParser(
+        description="Demo on using vLLM for offline inference with audio language models"
+    )
     parser.add_argument(
         "--query-type",
         "-q",

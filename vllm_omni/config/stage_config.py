@@ -182,9 +182,13 @@ class ModelPipeline:
         for stage in self.stages:
             for source_id in stage.input_sources:
                 if source_id not in stage_id_set:
-                    errors.append(f"Stage {stage.stage_id} references non-existent input source {source_id}")
+                    errors.append(
+                        f"Stage {stage.stage_id} references non-existent input source {source_id}"
+                    )
                 if source_id == stage.stage_id:
-                    errors.append(f"Stage {stage.stage_id} references itself as input source")
+                    errors.append(
+                        f"Stage {stage.stage_id} references itself as input source"
+                    )
 
         # Check for at least one entry point
         entry_points = [s for s in self.stages if not s.input_sources]
@@ -312,7 +316,9 @@ class StageConfigFactory:
         return [config_dict]
 
     @classmethod
-    def _load_pipeline(cls, model: str, trust_remote_code: bool = True) -> ModelPipeline | None:
+    def _load_pipeline(
+        cls, model: str, trust_remote_code: bool = True
+    ) -> ModelPipeline | None:
         """Load pipeline YAML for the model.
 
         Args:
@@ -322,7 +328,9 @@ class StageConfigFactory:
         Returns:
             ModelPipeline if found, None otherwise.
         """
-        model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
+        model_type, hf_config = cls._auto_detect_model_type(
+            model, trust_remote_code=trust_remote_code
+        )
         if model_type is None:
             return None
 
@@ -380,7 +388,9 @@ class StageConfigFactory:
                 model_stage=stage_data.model_stage,
                 stage_type=stage_type,
                 input_sources=input_sources,
-                custom_process_input_func=stage_data.get("custom_process_input_func", None),
+                custom_process_input_func=stage_data.get(
+                    "custom_process_input_func", None
+                ),
                 final_output=stage_data.get("final_output", False),
                 final_output_type=stage_data.get("final_output_type", None),
                 worker_type=stage_data.get("worker_type", None),
@@ -394,7 +404,11 @@ class StageConfigFactory:
         async_chunk = config_data.get("async_chunk", False)
 
         # Get optional connector config
-        connectors = to_dict(config_data.connectors) if hasattr(config_data, "connectors") else None
+        connectors = (
+            to_dict(config_data.connectors)
+            if hasattr(config_data, "connectors")
+            else None
+        )
         edges = to_dict(config_data.edges) if hasattr(config_data, "edges") else None
 
         return ModelPipeline(
@@ -406,7 +420,9 @@ class StageConfigFactory:
         )
 
     @classmethod
-    def _auto_detect_model_type(cls, model: str, trust_remote_code: bool = True) -> tuple[str | None, Any]:
+    def _auto_detect_model_type(
+        cls, model: str, trust_remote_code: bool = True
+    ) -> tuple[str | None, Any]:
         """Auto-detect model_type from model directory.
 
         Args:

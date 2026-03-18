@@ -151,7 +151,8 @@ def _test_processing_correctness(
     processing_info = factories.info(ctx)
     supported_mm_limits = processing_info.get_supported_mm_limits()
     limit_mm_per_prompt_ints = {
-        modality: 3 if limit is None else limit for modality, limit in supported_mm_limits.items()
+        modality: 3 if limit is None else limit
+        for modality, limit in supported_mm_limits.items()
     }
 
     def _to_dummy_options(modality: str, count: int) -> BaseDummyOptions:
@@ -164,7 +165,8 @@ def _test_processing_correctness(
         return BaseDummyOptions(count=count)
 
     model_config.get_multimodal_config().limit_per_prompt = {
-        modality: _to_dummy_options(modality, count) for modality, count in limit_mm_per_prompt_ints.items()
+        modality: _to_dummy_options(modality, count)
+        for modality, count in limit_mm_per_prompt_ints.items()
     }
 
     baseline_processor = factories.build_processor(ctx, cache=None)
@@ -179,7 +181,9 @@ def _test_processing_correctness(
     }
     input_factory = {
         "image": partial(random_image, rng, min_wh=128, max_wh=256),
-        "video": partial(random_video, rng, min_frames=2, max_frames=16, min_wh=128, max_wh=256),
+        "video": partial(
+            random_video, rng, min_frames=2, max_frames=16, min_wh=128, max_wh=256
+        ),
         "audio": partial(random_audio, rng, min_len=512, max_len=1024, sr=16000),
     }
 

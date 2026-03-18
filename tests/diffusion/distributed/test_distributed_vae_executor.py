@@ -30,8 +30,12 @@ class E2EOperator:
                         tile_id=len(tasks),
                         grid_coord=(i, j),
                         tensor=z[
-                            ((i * h_size) // rows_num) : (((i + 1) * h_size) // rows_num),
-                            ((j * w_size) // cols_num) : (((j + 1) * w_size) // cols_num),
+                            ((i * h_size) // rows_num) : (
+                                ((i + 1) * h_size) // rows_num
+                            ),
+                            ((j * w_size) // cols_num) : (
+                                ((j + 1) * w_size) // cols_num
+                            ),
                         ],
                     )
                 )
@@ -88,8 +92,12 @@ def mock_dit_group():
 @pytest.fixture(autouse=True)
 def mock_dist_vae_executor():
     with (
-        patch.object(DistributedVaeExecutor, "gather_tensors", side_effect=lambda x: [x]),
-        patch.object(DistributedVaeExecutor, "broadcast_tensor", side_effect=lambda x: x),
+        patch.object(
+            DistributedVaeExecutor, "gather_tensors", side_effect=lambda x: [x]
+        ),
+        patch.object(
+            DistributedVaeExecutor, "broadcast_tensor", side_effect=lambda x: x
+        ),
     ):
         yield
 
@@ -102,7 +110,10 @@ def mock_dist_vae_executor():
 def test_balance_tasks():
     executor = DistributedVaeExecutor()
     workloads = [2, 5, 13, 8, 2, 4]  # each is 17
-    tasks = [TileTask(0, (i,), torch.tensor([i]), workload=load) for i, load in enumerate(workloads)]
+    tasks = [
+        TileTask(0, (i,), torch.tensor([i]), workload=load)
+        for i, load in enumerate(workloads)
+    ]
     assigned = executor._balance_tasks(tasks, num_rank=2)
     assert len(assigned) == 2
     total_work = [sum(t.workload for t in group) for group in assigned]
@@ -151,7 +162,9 @@ def test_pack_and_unpack():
 
     tid_coord_map = {0: (0, 0)}
 
-    coord_tensor_map = executor._unpack_tiles(meta_gather, tile_gather, grid_spec, tid_coord_map)
+    coord_tensor_map = executor._unpack_tiles(
+        meta_gather, tile_gather, grid_spec, tid_coord_map
+    )
 
     # check unpack
     assert torch.equal(coord_tensor_map[(0, 0)], torch.tensor([[1, 2], [3, 4]]))

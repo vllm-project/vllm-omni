@@ -45,7 +45,9 @@ class AudioMixin:
                 "Only mono (1D) and stereo (2D) are supported."
             )
 
-        audio_tensor, sample_rate = self._apply_speed_adjustment(audio_tensor, speed, sample_rate)
+        audio_tensor, sample_rate = self._apply_speed_adjustment(
+            audio_tensor, speed, sample_rate
+        )
 
         supported_formats = {
             "wav": ("WAV", "audio/wav", {}),
@@ -57,13 +59,17 @@ class AudioMixin:
         }
 
         if response_format not in supported_formats:
-            logger.warning(f"Unsupported response format '{response_format}', defaulting to 'wav'.")
+            logger.warning(
+                f"Unsupported response format '{response_format}', defaulting to 'wav'."
+            )
             response_format = "wav"
 
         soundfile_format, media_type, kwargs = supported_formats[response_format]
 
         with BytesIO() as buffer:
-            soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
+            soundfile.write(
+                buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs
+            )
             audio_data = buffer.getvalue()
 
         if base64_encode:
@@ -73,13 +79,17 @@ class AudioMixin:
 
         return AudioResponse(audio_data=audio_data, media_type=media_type)
 
-    def _apply_speed_adjustment(self, audio_tensor: np.ndarray, speed: float, sample_rate: int):
+    def _apply_speed_adjustment(
+        self, audio_tensor: np.ndarray, speed: float, sample_rate: int
+    ):
         """Apply speed adjustment to the audio tensor while preserving pitch."""
         if speed == 1.0:
             return audio_tensor, sample_rate
 
         if librosa is None:
-            raise ImportError("librosa is required for speed adjustment. Please install it with: pip install librosa")
+            raise ImportError(
+                "librosa is required for speed adjustment. Please install it with: pip install librosa"
+            )
 
         try:
             # librosa.effects.time_stretch requires a float audio tensor.

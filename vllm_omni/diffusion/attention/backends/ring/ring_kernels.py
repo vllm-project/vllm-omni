@@ -15,12 +15,16 @@ from .ring_globals import (
 )
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
-_scaled_dot_product_efficient_attention = torch.ops.aten._scaled_dot_product_efficient_attention
+_scaled_dot_product_efficient_attention = (
+    torch.ops.aten._scaled_dot_product_efficient_attention
+)
 
 try:
     import torch_musa  # noqa: F401
 
-    _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_attention_flash_musa
+    _scaled_dot_product_flash_attention = (
+        torch.ops.aten._scaled_dot_product_attention_flash_musa
+    )
     _scaled_dot_product_efficient_attention = None
 except ModuleNotFoundError:
     pass
@@ -140,7 +144,18 @@ def flash_attn_forward(
     return block_out, block_lse
 
 
-def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax):
+def fa3_forward(
+    q,
+    k,
+    v,
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size,
+    softcap,
+    alibi_slopes,
+    return_softmax,
+):
     """FA3 forward pass for inference.
 
     FA3 supports Ampere, Ada, and Hopper GPUs. Dropout is ignored since FA3 is inference-only.

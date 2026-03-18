@@ -20,7 +20,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # used in distributed environment to determine the master address
     "MASTER_ADDR": lambda: os.getenv("MASTER_ADDR", ""),
     # used in distributed environment to manually set the communication port
-    "MASTER_PORT": lambda: int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None,
+    "MASTER_PORT": lambda: (
+        int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None
+    ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
     "CUDA_HOME": lambda: os.environ.get("CUDA_HOME", None),
@@ -91,7 +93,9 @@ class PackagesEnvChecker:
             return True
         except (ImportError, ModuleNotFoundError):
             if not packages_info.get("has_aiter", False):
-                logger.warning("No Flash Attention backend found, using pytorch SDPA implementation")
+                logger.warning(
+                    "No Flash Attention backend found, using pytorch SDPA implementation"
+                )
             return False
 
     def get_packages_info(self) -> dict:

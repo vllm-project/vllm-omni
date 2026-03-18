@@ -56,7 +56,9 @@ class OmniServerParams(NamedTuple):
     server_args: list[str] | None = None
 
 
-def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
+def assert_image_valid(
+    image: Path | Image.Image, *, width: int | None = None, height: int | None = None
+):
     """Assert the file is a loadable image with optional exact dimensions."""
     if isinstance(image, Path):
         assert image.exists(), f"Image not found: {image}"
@@ -64,33 +66,47 @@ def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, h
         image.load()
     assert image.width > 0 and image.height > 0
     if width is not None:
-        assert image.width == width, f"Expected width={width}, got {image.width} in {image.name}"
+        assert (
+            image.width == width
+        ), f"Expected width={width}, got {image.width} in {image.name}"
     if height is not None:
-        assert image.height == height, f"Expected height={height}, got {image.height} in {image.name}"
+        assert (
+            image.height == height
+        ), f"Expected height={height}, got {image.height} in {image.name}"
     return image
 
 
-def assert_video_valid(frames: Path | np.ndarray, *, width: int, height: int, num_frames: int) -> None:
+def assert_video_valid(
+    frames: Path | np.ndarray, *, width: int, height: int, num_frames: int
+) -> None:
     """Assert the MP4 has the expected resolution and exact frame count."""
     if isinstance(frames, Path):
         assert frames.exists(), f"Video not found: {frames}"
         frames = iio.imread(str(frames), plugin="pyav", index=None)
-    assert frames.shape[0] == num_frames, f"Expected {num_frames} frames, got {frames.shape[0]}"
+    assert (
+        frames.shape[0] == num_frames
+    ), f"Expected {num_frames} frames, got {frames.shape[0]}"
     assert frames.shape[1] == height, f"Expected height={height}, got {frames.shape[1]}"
     assert frames.shape[2] == width, f"Expected width={width}, got {frames.shape[2]}"
 
 
-def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
+def assert_audio_valid(
+    path: Path, *, sample_rate: int, channels: int, duration_s: float
+) -> None:
     """Assert the WAV has the expected sample rate, channel count, and duration."""
 
     assert path.exists(), f"Audio not found: {path}"
     info = sf.info(str(path))
-    assert info.samplerate == sample_rate, f"Expected sample_rate={sample_rate}, got {info.samplerate}"
-    assert info.channels == channels, f"Expected {channels} channel(s), got {info.channels}"
+    assert (
+        info.samplerate == sample_rate
+    ), f"Expected sample_rate={sample_rate}, got {info.samplerate}"
+    assert (
+        info.channels == channels
+    ), f"Expected {channels} channel(s), got {info.channels}"
     expected_frames = int(duration_s * sample_rate)
-    assert info.frames == expected_frames, (
-        f"Expected {expected_frames} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
-    )
+    assert (
+        info.frames == expected_frames
+    ), f"Expected {expected_frames} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
 
 
 def decode_b64_image(b64: str):
@@ -324,7 +340,9 @@ def generate_synthetic_audio(
         best_voice = voices[0]
         best_score = float("-inf")
         for voice in voices:
-            voice_text = f"{getattr(voice, 'id', '')} {getattr(voice, 'name', '')}".lower()
+            voice_text = (
+                f"{getattr(voice, 'id', '')} {getattr(voice, 'name', '')}".lower()
+            )
             voice_languages = " ".join(
                 lang.decode(errors="ignore") if isinstance(lang, bytes) else str(lang)
                 for lang in getattr(voice, "languages", [])
@@ -337,7 +355,11 @@ def generate_synthetic_audio(
             for token in discouraged_tokens:
                 if token in combined_text:
                     score -= 10
-            if "english" in combined_text or "en_" in combined_text or "en-" in combined_text:
+            if (
+                "english" in combined_text
+                or "en_" in combined_text
+                or "en-" in combined_text
+            ):
                 score += 4
             if "en-us" in combined_text or "english-us" in combined_text:
                 score += 4
@@ -358,7 +380,9 @@ def generate_synthetic_audio(
 
         resampled_channels: list[np.ndarray] = []
         for ch in range(audio.shape[1]):
-            resampled_channels.append(np.interp(dst_idx, src_idx, audio[:, ch]).astype(np.float32))
+            resampled_channels.append(
+                np.interp(dst_idx, src_idx, audio[:, ch]).astype(np.float32)
+            )
         return np.stack(resampled_channels, axis=1)
 
     def _match_channels(audio: np.ndarray, target_channels: int) -> np.ndarray:
@@ -474,7 +498,9 @@ def generate_synthetic_audio(
         output_path = f"audio_{num_channels}ch_{timestamp}.wav"
 
         try:
-            sf.write(output_path, audio_data, sample_rate, format="WAV", subtype="PCM_16")
+            sf.write(
+                output_path, audio_data, sample_rate, format="WAV", subtype="PCM_16"
+            )
             print(f"Audio saved: {output_path}")
 
             with open(output_path, "rb") as f:
@@ -499,7 +525,9 @@ def generate_synthetic_audio(
     return result
 
 
-def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> dict[str, Any]:
+def generate_synthetic_video(
+    width: int, height: int, num_frames: int, save_to_file: bool = False
+) -> dict[str, Any]:
     """Generate synthetic video with bouncing balls and return base64 string."""
 
     import cv2
@@ -512,7 +540,9 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
     for _ in range(num_balls):
         radius = min(width, height) // 8
         if radius < 1:
-            raise ValueError(f"Video dimensions ({width}x{height}) are too small for synthetic video generation")
+            raise ValueError(
+                f"Video dimensions ({width}x{height}) are too small for synthetic video generation"
+            )
         x = random.randint(radius, width - radius)
         y = random.randint(radius, height - radius)
 
@@ -523,9 +553,22 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
 
         # OpenCV uses BGR format, but imageio expects RGB
         # We'll create in BGR first, then convert to RGB later
-        color_bgr = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
+        color_bgr = (
+            random.randint(50, 255),
+            random.randint(50, 255),
+            random.randint(50, 255),
+        )
 
-        balls.append({"x": x, "y": y, "vx": vx, "vy": vy, "radius": radius, "color_bgr": color_bgr})
+        balls.append(
+            {
+                "x": x,
+                "y": y,
+                "vx": vx,
+                "vy": vy,
+                "radius": radius,
+                "color_bgr": color_bgr,
+            }
+        )
 
     # Generate video frames
     video_frames = []
@@ -558,12 +601,22 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
             # Add simple 3D effect: draw a brighter center
             if radius > 3:  # Only add highlight when radius is large enough
                 highlight_radius = max(1, radius // 2)
-                highlight_x = max(highlight_radius, min(x - radius // 4, width - highlight_radius))
-                highlight_y = max(highlight_radius, min(y - radius // 4, height - highlight_radius))
+                highlight_x = max(
+                    highlight_radius, min(x - radius // 4, width - highlight_radius)
+                )
+                highlight_y = max(
+                    highlight_radius, min(y - radius // 4, height - highlight_radius)
+                )
 
                 # Create highlight color (brighter)
                 highlight_color = tuple(min(c + 40, 255) for c in ball["color_bgr"])
-                cv2.circle(frame_bgr, (highlight_x, highlight_y), highlight_radius, highlight_color, -1)
+                cv2.circle(
+                    frame_bgr,
+                    (highlight_x, highlight_y),
+                    highlight_radius,
+                    highlight_color,
+                    -1,
+                )
 
         # Convert BGR to RGB for imageio
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -634,7 +687,9 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
     return result
 
 
-def generate_synthetic_image(width: int, height: int, save_to_file: bool = False) -> dict[str, Any]:
+def generate_synthetic_image(
+    width: int, height: int, save_to_file: bool = False
+) -> dict[str, Any]:
     """Generate synthetic image with randomly colored squares and return base64 string."""
     from PIL import Image, ImageDraw
 
@@ -660,7 +715,12 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
         border_width = random.randint(1, 5)
 
         # Draw square
-        draw.rectangle([x, y, x + square_size, y + square_size], fill=color, outline=(0, 0, 0), width=border_width)
+        draw.rectangle(
+            [x, y, x + square_size, y + square_size],
+            fill=color,
+            outline=(0, 0, 0),
+            width=border_width,
+        )
 
     image_array = np.array(image)
     result = {"np_array": image_array.copy()}
@@ -802,7 +862,9 @@ def convert_audio_file_to_text(output_path: str) -> str:
     """Convert an audio file to text in an isolated subprocess."""
     # Import locally to avoid impacting test module import time.
     ctx = multiprocessing.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=1, mp_context=ctx
+    ) as executor:
         future = executor.submit(_whisper_transcribe_in_current_process, output_path)
         return future.result()
 
@@ -939,7 +1001,9 @@ def modify_stage_config(
             current[last_key] = value
         else:
             # Current is not a dict, cannot set key
-            raise TypeError(f"Cannot set value at {key_path}. Current type is {type(current).__name__}, expected dict.")
+            raise TypeError(
+                f"Cannot set value at {key_path}. Current type is {type(current).__name__}, expected dict."
+            )
 
     # Helper function to delete by path
     def delete_by_path(config_dict: dict, path: str) -> None:
@@ -1003,8 +1067,12 @@ def modify_stage_config(
                                 break
 
                         if target_stage is None:
-                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
-                            raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+                            available_ids = [
+                                s.get("stage_id") for s in stage_args if "stage_id" in s
+                            ]
+                            raise KeyError(
+                                f"Stage ID {stage_id} not found, available: {available_ids}"
+                            )
 
                         # Delete specified paths in this stage
                         for path in delete_paths:
@@ -1035,8 +1103,12 @@ def modify_stage_config(
                                 break
 
                         if target_stage is None:
-                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
-                            raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+                            available_ids = [
+                                s.get("stage_id") for s in stage_args if "stage_id" in s
+                            ]
+                            raise KeyError(
+                                f"Stage ID {stage_id} not found, available: {available_ids}"
+                            )
 
                         # Apply updates to this stage
                         for path, val in stage_updates.items():
@@ -1061,7 +1133,14 @@ def modify_stage_config(
     output_path = f"{base_name}_{timestamp}.yaml"
 
     with open(output_path, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
+        yaml.dump(
+            config,
+            f,
+            default_flow_style=None,
+            sort_keys=False,
+            allow_unicode=True,
+            indent=2,
+        )
 
     return output_path
 
@@ -1114,7 +1193,9 @@ class OmniServer:
         self.proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
+            cwd=os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            ),  # Set working directory to vllm-omni root
         )
 
         # Wait for server to be ready
@@ -1124,7 +1205,9 @@ class OmniServer:
             # Check for process status
             ret = self.proc.poll()
             if ret is not None:
-                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+                raise RuntimeError(
+                    f"Server processes exited with code {ret} before becoming ready."
+                )
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
                 result = sock.connect_ex((self.host, self.port))
@@ -1225,7 +1308,9 @@ _omni_server_lock = threading.Lock()
 
 
 @pytest.fixture(scope="module")
-def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: str) -> Generator[OmniServer, Any, None]:
+def omni_server(
+    request: pytest.FixtureRequest, run_level: str, model_prefix: str
+) -> Generator[OmniServer, Any, None]:
     """Start vLLM-Omni server as a subprocess with actual model weights.
     Uses session scope so the server starts only once for the entire test session.
     Multi-stage initialization can take 10-20+ minutes.
@@ -1252,7 +1337,11 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         if stage_config_path is not None:
             server_args += ["--stage-configs-path", stage_config_path]
 
-        with OmniServer(model, server_args, port=port) if port else OmniServer(model, server_args) as server:
+        with (
+            OmniServer(model, server_args, port=port)
+            if port
+            else OmniServer(model, server_args)
+        ) as server:
             print("OmniServer started successfully")
             yield server
             print("OmniServer stopping...")
@@ -1282,7 +1371,9 @@ class DiffusionResponse:
     error_message: str | None = None
 
 
-def assert_omni_response(response: OmniResponse, request_config: dict[str, Any], run_level):
+def assert_omni_response(
+    response: OmniResponse, request_config: dict[str, Any], run_level
+):
     """
     Validate response results.
 
@@ -1315,22 +1406,27 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
             keywords = keywords_dict.get(word_type)
             if "text" in modalities:
                 if keywords:
-                    assert any(keyword in response.text_content.lower() for keyword in keywords), (
-                        "The output does not contain any of the keywords."
-                    )
+                    assert any(
+                        keyword in response.text_content.lower() for keyword in keywords
+                    ), "The output does not contain any of the keywords."
             else:
                 if keywords:
-                    assert any(keyword in response.audio_content.lower() for keyword in keywords), (
-                        "The output does not contain any of the keywords."
-                    )
+                    assert any(
+                        keyword in response.audio_content.lower()
+                        for keyword in keywords
+                    ), "The output does not contain any of the keywords."
 
         # Verify similarity
         if "text" in modalities and "audio" in modalities:
-            assert response.similarity > 0.9, "The audio content is not same as the text"
+            assert (
+                response.similarity > 0.9
+            ), "The audio content is not same as the text"
             print(f"similarity is: {response.similarity}")
 
 
-def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
+def assert_diffusion_response(
+    response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None
+):
     """
     Validate diffusion response results.
 
@@ -1357,9 +1453,9 @@ def assert_diffusion_response(response: DiffusionResponse, request_config: dict[
 
     if response.images is not None:
         assert len(response.images) > 0, "No images in response"
-        assert len(response.images) == num_outputs_per_prompt, (
-            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
-        )
+        assert (
+            len(response.images) == num_outputs_per_prompt
+        ), f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
         if run_level == "advanced_model":
             expected_width = extra_body["width"]  # intend to raise KeyError
             expected_height = extra_body["height"]  # intend to raise KeyError
@@ -1384,7 +1480,11 @@ class OpenAIClientHandler:
     """
 
     def __init__(
-        self, host: str = "127.0.0.1", port: int = get_open_port(), api_key: str = "EMPTY", run_level: str = None
+        self,
+        host: str = "127.0.0.1",
+        port: int = get_open_port(),
+        api_key: str = "EMPTY",
+        run_level: str = None,
     ):
         """
         Initialize the OpenAI client.
@@ -1443,7 +1543,9 @@ class OpenAIClientHandler:
                 if audio_data:
                     audio_content = merge_base64_and_convert_to_text(audio_data)
                 if audio_content and text_content:
-                    similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
+                    similarity = cosine_similarity_text(
+                        audio_content.lower(), text_content.lower()
+                    )
 
             # Populate result object
             result.text_content = text_content
@@ -1479,12 +1581,18 @@ class OpenAIClientHandler:
             # Iterate through all choices
             for choice in chat_completion.choices:
                 # Process audio data
-                if hasattr(choice.message, "audio") and choice.message.audio is not None:
+                if (
+                    hasattr(choice.message, "audio")
+                    and choice.message.audio is not None
+                ):
                     audio_message = choice.message
                     audio_data = audio_message.audio.data
 
                 # Process text content
-                if hasattr(choice.message, "content") and choice.message.content is not None:
+                if (
+                    hasattr(choice.message, "content")
+                    and choice.message.content is not None
+                ):
                     text_content = choice.message.content
 
             # Calculate end-to-end latency
@@ -1498,7 +1606,9 @@ class OpenAIClientHandler:
                 if audio_data:
                     audio_content = convert_audio_to_text(audio_data)
                 if audio_content and text_content:
-                    similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
+                    similarity = cosine_similarity_text(
+                        audio_content.lower(), text_content.lower()
+                    )
 
             # Populate result object
             result.text_content = text_content
@@ -1530,11 +1640,17 @@ class OpenAIClientHandler:
             # [TODO] reading video and audio output from API response for later validation
 
             for choice in chat_completion.choices:
-                if hasattr(choice.message, "content") and choice.message.content is not None:
+                if (
+                    hasattr(choice.message, "content")
+                    and choice.message.content is not None
+                ):
                     content = choice.message.content
                     if isinstance(content, list):
                         for item in content:
-                            if hasattr(item, "image_url") and item.image_url is not None:
+                            if (
+                                hasattr(item, "image_url")
+                                and item.image_url is not None
+                            ):
                                 image_url = item.image_url.url
                                 if image_url.startswith("data:image"):
                                     b64_data = image_url.split(",", 1)[1]
@@ -1551,7 +1667,9 @@ class OpenAIClientHandler:
 
         return result
 
-    def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_omni_request(
+        self, request_config: dict[str, Any], request_num: int = 1
+    ) -> list[OmniResponse]:
         """
         Send OpenAI requests.
 
@@ -1586,7 +1704,9 @@ class OpenAIClientHandler:
 
         else:
             # Send concurrent requests
-            with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=request_num
+            ) as executor:
                 futures = []
 
                 # Submit all request tasks
@@ -1607,14 +1727,20 @@ class OpenAIClientHandler:
                     if stream:
                         response = self._process_stream_omni_response(chat_completion)
                     else:
-                        response = self._process_non_stream_omni_response(chat_completion)
+                        response = self._process_non_stream_omni_response(
+                            chat_completion
+                        )
 
-                    assert_omni_response(response, request_config, run_level=self.run_level)
+                    assert_omni_response(
+                        response, request_config, run_level=self.run_level
+                    )
                     responses.append(response)
 
         return responses
 
-    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_diffusion_request(
+        self, request_config: dict[str, Any], request_num: int = 1
+    ) -> list[OmniResponse]:
         """
         Send OpenAI requests for diffusion models.
 
@@ -1626,11 +1752,15 @@ class OpenAIClientHandler:
         """
         responses = []
         stream = request_config.get("stream", False)
-        modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
+        modalities = request_config.get(
+            "modalities", omit
+        )  # Most diffusion models don't require modalities param
         extra_body = request_config.get("extra_body", None)
 
         if stream:
-            raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
+            raise NotImplementedError(
+                "Streaming is not currently implemented for diffusion model e2e test"
+            )
 
         if request_num == 1:
             # Send single request
@@ -1642,12 +1772,16 @@ class OpenAIClientHandler:
             )
 
             response = self._process_diffusion_response(chat_completion)
-            assert_diffusion_response(response, request_config, run_level=self.run_level)
+            assert_diffusion_response(
+                response, request_config, run_level=self.run_level
+            )
             responses.append(response)
 
         else:
             # Send concurrent requests
-            with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=request_num
+            ) as executor:
                 futures = []
 
                 # Submit all request tasks
@@ -1665,7 +1799,9 @@ class OpenAIClientHandler:
                 for future in concurrent.futures.as_completed(futures):
                     chat_completion = future.result()
                     response = self._process_diffusion_response(chat_completion)
-                    assert_diffusion_response(response, request_config, run_level=self.run_level)
+                    assert_diffusion_response(
+                        response, request_config, run_level=self.run_level
+                    )
                     responses.append(response)
 
         return responses
@@ -1674,8 +1810,14 @@ class OpenAIClientHandler:
 @pytest.fixture
 def openai_client(omni_server: OmniServer, run_level: str):
     """Create OpenAIClientHandler fixture to facilitate communication with OmniServer
-    with encapsulated request sending, concurrent requests, response handling, and validation."""
-    return OpenAIClientHandler(host=omni_server.host, port=omni_server.port, api_key="EMPTY", run_level=run_level)
+    with encapsulated request sending, concurrent requests, response handling, and validation.
+    """
+    return OpenAIClientHandler(
+        host=omni_server.host,
+        port=omni_server.port,
+        api_key="EMPTY",
+        run_level=run_level,
+    )
 
 
 class OmniRunner:
@@ -1803,7 +1945,9 @@ class OmniRunner:
             if audio is not None:
                 if isinstance(audio, list):
                     for _ in audio:
-                        user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                        user_content += (
+                            f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                        )
                     multi_modal_data["audio"] = audio
                 else:
                     user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
@@ -1813,7 +1957,9 @@ class OmniRunner:
             if image is not None:
                 if isinstance(image, list):
                     for _ in image:
-                        user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                        user_content += (
+                            f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                        )
                     multi_modal_data["image"] = image
                 else:
                     user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
@@ -1823,7 +1969,9 @@ class OmniRunner:
             if video is not None:
                 if isinstance(video, list):
                     for _ in video:
-                        user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                        user_content += (
+                            f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                        )
                     multi_modal_data["video"] = video
                 else:
                     user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
@@ -1922,7 +2070,9 @@ class OmniRunner:
                     )
 
                     if is_process:
-                        print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
+                        print(
+                            f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}"
+                        )
 
                         try:
                             proc.terminate()
@@ -1955,7 +2105,9 @@ def omni_runner(request, model_prefix):
     with _omni_server_lock:
         model, stage_config_path = request.param
         model = model_prefix + model
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
+        with OmniRunner(
+            model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300
+        ) as runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")
@@ -1976,7 +2128,11 @@ class OmniRunnerHandler:
                 if getattr(stage_output, "final_output_type", None) == "text":
                     text_content = stage_output.request_output[0].outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output[0].outputs[0].multimodal_output["audio"]
+                    audio_content = (
+                        stage_output.request_output[0]
+                        .outputs[0]
+                        .multimodal_output["audio"]
+                    )
 
             result.audio_content = audio_content
             result.text_content = text_content
@@ -1989,7 +2145,9 @@ class OmniRunnerHandler:
 
         return result
 
-    def send_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:
+    def send_request(
+        self, request_config: dict[str, Any] | None = None
+    ) -> OmniResponse:
         if request_config is None:
             request_config = {}
         prompts = request_config.get("prompts")
@@ -1998,7 +2156,11 @@ class OmniRunnerHandler:
         audios = request_config.get("audios")
         modalities = request_config.get("modalities", ["text", "audio"])
         outputs = self.runner.generate_multimodal(
-            prompts=prompts, videos=videos, images=images, audios=audios, modalities=modalities
+            prompts=prompts,
+            videos=videos,
+            images=images,
+            audios=audios,
+            modalities=modalities,
         )
         response = self._process_output(outputs)
         assert_omni_response(response, request_config, run_level="L2")

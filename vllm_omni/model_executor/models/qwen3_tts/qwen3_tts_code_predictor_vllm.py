@@ -23,7 +23,10 @@ from vllm.model_executor.models.utils import is_pp_missing_parameter
 
 from vllm_omni.platforms import current_omni_platform
 
-from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
+from .configuration_qwen3_tts import (
+    Qwen3TTSTalkerCodePredictorConfig,
+    Qwen3TTSTalkerConfig,
+)
 
 logger = init_logger(__name__)
 
@@ -170,7 +173,9 @@ class _CodePredictorDecoderLayer(nn.Module):
         self.self_attn = _CodePredictorAttention(config, prefix=f"{prefix}.self_attn")
         self.mlp = _CodePredictorMLP(config, prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -208,15 +213,25 @@ class Qwen3TTSTalkerCodePredictorModelVLLM(nn.Module):
         self.config = config
 
         self.layers = nn.ModuleList(
-            [_CodePredictorDecoderLayer(config, prefix=f"{prefix}.layers.{i}") for i in range(config.num_hidden_layers)]
+            [
+                _CodePredictorDecoderLayer(config, prefix=f"{prefix}.layers.{i}")
+                for i in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Codec embeddings: one per residual group. Stored in talker hidden dim
         # (some checkpoints use talker_hidden_size != code_predictor hidden_size).
-        emb_dim = int(talker_hidden_size) if talker_hidden_size is not None else int(config.hidden_size)
+        emb_dim = (
+            int(talker_hidden_size)
+            if talker_hidden_size is not None
+            else int(config.hidden_size)
+        )
         self.codec_embedding = nn.ModuleList(
-            [nn.Embedding(config.vocab_size, emb_dim) for _ in range(config.num_code_groups - 1)]
+            [
+                nn.Embedding(config.vocab_size, emb_dim)
+                for _ in range(config.num_code_groups - 1)
+            ]
         )
 
     def get_input_embeddings(self) -> nn.ModuleList:
@@ -332,11 +347,16 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         )
 
         self.lm_head = nn.ModuleList(
-            [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(config.num_code_groups - 1)]
+            [
+                nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+                for _ in range(config.num_code_groups - 1)
+            ]
         )
 
         if config.hidden_size != talker_config.hidden_size:
-            self.small_to_mtp_projection = nn.Linear(talker_config.hidden_size, config.hidden_size, bias=True)
+            self.small_to_mtp_projection = nn.Linear(
+                talker_config.hidden_size, config.hidden_size, bias=True
+            )
         else:
             self.small_to_mtp_projection = nn.Identity()
 
@@ -380,7 +400,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     #  Pre-allocated buffer management
     # ------------------------------------------------------------------
 
-    def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
+    def _ensure_buffers(
+        self, bsz: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
         max_seq = self._num_groups + 1
         if (
             self._proj_buf is not None
@@ -465,8 +487,12 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         lm_heads = list(self.lm_head)
         codec_embeds = list(self.model.codec_embedding)
 
-        proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1)).reshape(bsz, -1)
-        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+        proj_buf[:bsz, 0, :] = projection(
+            last_talker_hidden.reshape(bsz, 1, -1)
+        ).reshape(bsz, -1)
+        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1)).reshape(
+            bsz, -1
+        )
 
         use_sampling = do_sample and temperature > 0
         inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
@@ -479,7 +505,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             seq_len = step + 1
 
             projected = proj_buf[:bsz, :seq_len, :]
-            step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+            step_pos_ids = (
+                pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+            )
 
             hidden_out = model_fwd(projected, step_pos_ids)
 
@@ -489,7 +517,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
                 scaled = logits * inv_temperature
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(top_k, dim=-1)
-                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                    scaled = scaled.masked_fill(
+                        scaled < topk_vals[:, -1:], float("-inf")
+                    )
                 probs = F.softmax(scaled, dim=-1)
                 next_ids = torch.multinomial(probs, num_samples=1)
             else:
@@ -499,6 +529,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
             if step < num_groups - 1:
                 new_embed = codec_embeds[step - 1](next_ids)
-                proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+                proj_buf[:bsz, step + 1, :] = projection(
+                    new_embed.reshape(bsz, 1, -1)
+                ).reshape(bsz, -1)
 
         return all_codes

@@ -15,7 +15,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 SEED = 42
 
-stage_config = str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_thinker_ci.yaml")
+stage_config = str(
+    Path(__file__).parent.parent
+    / "e2e"
+    / "stage_configs"
+    / "qwen2_5_omni_thinker_ci.yaml"
+)
 model = "Qwen/Qwen2.5-Omni-7B"
 
 
@@ -85,8 +90,14 @@ async def test_abort():
         # Create concurrent requests.
         tasks: list[asyncio.Task] = []
         for idx, request_id in enumerate(request_ids):
-            max_tokens = NUM_EXPECTED_TOKENS_LONG if (idx in REQUEST_IDS_TO_ABORT) else NUM_EXPECTED_TOKENS
-            tasks.append(asyncio.create_task(generate(engine, request_id, prompt, max_tokens)))
+            max_tokens = (
+                NUM_EXPECTED_TOKENS_LONG
+                if (idx in REQUEST_IDS_TO_ABORT)
+                else NUM_EXPECTED_TOKENS
+            )
+            tasks.append(
+                asyncio.create_task(generate(engine, request_id, prompt, max_tokens))
+            )
 
         # API server cancels requests when they disconnect.
         # Explicitly abort in the engine to avoid orphaned requests hanging.
@@ -103,15 +114,19 @@ async def test_abort():
                     await asyncio.wait_for(task, timeout=60)
             else:
                 # Otherwise, make sure the request was not impacted.
-                num_generated_tokens, request_id = await asyncio.wait_for(task, timeout=180)
-                expected_tokens = NUM_EXPECTED_TOKENS
-                assert num_generated_tokens == expected_tokens, (
-                    f"{request_id} generated {num_generated_tokens} but expected {expected_tokens}"
+                num_generated_tokens, request_id = await asyncio.wait_for(
+                    task, timeout=180
                 )
+                expected_tokens = NUM_EXPECTED_TOKENS
+                assert (
+                    num_generated_tokens == expected_tokens
+                ), f"{request_id} generated {num_generated_tokens} but expected {expected_tokens}"
 
         # Confirm we can do another generation.
         request_id = f"request-{REQUEST_IDS_TO_ABORT[0]}"
-        task = asyncio.create_task(generate(engine, request_id, prompt, NUM_EXPECTED_TOKENS))
+        task = asyncio.create_task(
+            generate(engine, request_id, prompt, NUM_EXPECTED_TOKENS)
+        )
         num_generated_tokens, request_id = await task
         assert num_generated_tokens == NUM_EXPECTED_TOKENS
     await asyncio.sleep(5)

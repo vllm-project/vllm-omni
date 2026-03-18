@@ -109,9 +109,15 @@ def generate_image(
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen-Image chat client")
-    parser.add_argument("--prompt", "-p", default="a cup of coffee on the table", help="Text prompt")
-    parser.add_argument("--output", "-o", default="qwen_image_output.png", help="Output file")
-    parser.add_argument("--server", "-s", default="http://localhost:8091", help="Server URL")
+    parser.add_argument(
+        "--prompt", "-p", default="a cup of coffee on the table", help="Text prompt"
+    )
+    parser.add_argument(
+        "--output", "-o", default="qwen_image_output.png", help="Output file"
+    )
+    parser.add_argument(
+        "--server", "-s", default="http://localhost:8091", help="Server URL"
+    )
     parser.add_argument("--height", type=int, default=1024, help="Image height")
     parser.add_argument("--width", type=int, default=1024, help="Image width")
     parser.add_argument("--steps", type=int, default=50, help="Inference steps")
@@ -119,7 +125,11 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
-    parser.add_argument("--lora-path", default=None, help="Server-local LoRA adapter folder (PEFT format)")
+    parser.add_argument(
+        "--lora-path",
+        default=None,
+        help="Server-local LoRA adapter folder (PEFT format)",
+    )
     parser.add_argument("--lora-name", default=None, help="LoRA name (optional)")
     parser.add_argument("--lora-scale", type=float, default=1.0, help="LoRA scale")
     parser.add_argument(

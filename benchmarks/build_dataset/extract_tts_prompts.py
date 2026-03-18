@@ -50,13 +50,25 @@ def extract_prompts(input_file: str, output_file: str, num_lines: int) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Extract prompts from meta.lst file")
     parser.add_argument(
-        "-i", "--input", type=str, default="meta.lst", help="Input meta.lst file path (default: meta.lst)"
+        "-i",
+        "--input",
+        type=str,
+        default="meta.lst",
+        help="Input meta.lst file path (default: meta.lst)",
     )
     parser.add_argument(
-        "-o", "--output", type=str, default="prompts.txt", help="Output txt file path (default: prompts.txt)"
+        "-o",
+        "--output",
+        type=str,
+        default="prompts.txt",
+        help="Output txt file path (default: prompts.txt)",
     )
     parser.add_argument(
-        "-n", "--num-lines", type=int, required=True, help="Number of lines to extract from the beginning"
+        "-n",
+        "--num-lines",
+        type=int,
+        required=True,
+        help="Number of lines to extract from the beginning",
     )
 
     args = parser.parse_args()

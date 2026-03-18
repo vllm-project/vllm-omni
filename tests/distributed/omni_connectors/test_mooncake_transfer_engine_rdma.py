@@ -41,7 +41,9 @@ def get_rdma_host() -> str:
 
     for ip_cmd in ("ip", "/sbin/ip", "/usr/sbin/ip"):
         try:
-            result = subprocess.run([ip_cmd, "addr", "show"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(
+                [ip_cmd, "addr", "show"], capture_output=True, text=True, timeout=5
+            )
             if result.returncode != 0:
                 continue
             lines = result.stdout.split("\n")
@@ -51,7 +53,9 @@ def get_rdma_host() -> str:
                     for pat in rdma_patterns:
                         if pat in line.lower():
                             ip = line.strip().split()[1].split("/")[0]
-                            if not ip.startswith("127.") and not ip.startswith("169.254."):
+                            if not ip.startswith("127.") and not ip.startswith(
+                                "169.254."
+                            ):
                                 return ip
             for line in lines:
                 if "inet " in line and "scope global" in line:
@@ -94,9 +98,13 @@ def _detect_rdma_device() -> str:
     # 2. ibdev2netdev: most reliable, no Mooncake dependency
     #    Prefer RoCE (Ethernet-backed) over IB for loopback reliability.
     try:
-        result = subprocess.run(["ibdev2netdev"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            ["ibdev2netdev"], capture_output=True, text=True, timeout=5
+        )
         if result.returncode == 0:
-            up_lines = [ln.strip() for ln in result.stdout.strip().splitlines() if "(Up)" in ln]
+            up_lines = [
+                ln.strip() for ln in result.stdout.strip().splitlines() if "(Up)" in ln
+            ]
             # Prefer Ethernet-backed (RoCE) — interface name is NOT ib*
             for line in up_lines:
                 # Format: "mlx5_2 port 1 ==> enp75s0f0 (Up)"
@@ -105,12 +113,16 @@ def _detect_rdma_device() -> str:
                     iface = parts[1].strip().split()[0]  # e.g. "enp75s0f0"
                     if not iface.startswith("ib"):
                         dev = line.split()[0]
-                        print(f"[_detect_rdma_device] ibdev2netdev selected RoCE: {dev} ({line})")
+                        print(
+                            f"[_detect_rdma_device] ibdev2netdev selected RoCE: {dev} ({line})"
+                        )
                         return dev
             # Fallback: any Up device (IB)
             if up_lines:
                 dev = up_lines[0].split()[0]
-                print(f"[_detect_rdma_device] ibdev2netdev selected IB: {dev} ({up_lines[0]})")
+                print(
+                    f"[_detect_rdma_device] ibdev2netdev selected IB: {dev} ({up_lines[0]})"
+                )
                 return dev
             print("[_detect_rdma_device] ibdev2netdev: no device with (Up) link found")
     except FileNotFoundError:
@@ -134,24 +146,34 @@ def _detect_rdma_device() -> str:
                         if isinstance(info, dict):
                             gid = info.get("gid", "")
                             if gid.startswith("00:00:00:00:00:00:00:00:00:00:ff:ff"):
-                                print(f"[_detect_rdma_device] Mooncake topology selected RoCE: {name}")
+                                print(
+                                    f"[_detect_rdma_device] Mooncake topology selected RoCE: {name}"
+                                )
                                 return name
                     # Prefer bonded device
                     for name in topo:
                         if "bond" in name:
-                            print(f"[_detect_rdma_device] Mooncake topology selected bond: {name}")
+                            print(
+                                f"[_detect_rdma_device] Mooncake topology selected bond: {name}"
+                            )
                             return name
                     # First available
                     for name, info in topo.items():
                         if isinstance(info, dict):
-                            print(f"[_detect_rdma_device] Mooncake topology fallback: {name}")
+                            print(
+                                f"[_detect_rdma_device] Mooncake topology fallback: {name}"
+                            )
                             return name
                 else:
-                    print("[_detect_rdma_device] get_local_topology() returned None/empty")
+                    print(
+                        "[_detect_rdma_device] get_local_topology() returned None/empty"
+                    )
         except Exception as exc:
             print(f"[_detect_rdma_device] Mooncake topology query failed: {exc}")
 
-    print("[_detect_rdma_device] WARNING: no device detected, Mooncake will use ALL NICs")
+    print(
+        "[_detect_rdma_device] WARNING: no device detected, Mooncake will use ALL NICs"
+    )
     return ""
 
 
@@ -194,13 +216,17 @@ def _md5(tensor: torch.Tensor) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@pytest.mark.skipif(
+    TransferEngine is None, reason="Mooncake TransferEngine not available"
+)
 class TestBasicConnector:
     """Verify connector initialization, put, cleanup, and health check."""
 
     def test_initialization(self):
         port = _free_port()
-        with MooncakeTransferEngineConnector(_connector_config(port, pool_size=1024 * 1024)) as c:
+        with MooncakeTransferEngineConnector(
+            _connector_config(port, pool_size=1024 * 1024)
+        ) as c:
             assert c.rpc_port != 0
             assert c.pool_size == 1024 * 1024
             assert c.pool.is_pinned()
@@ -235,7 +261,9 @@ class TestBasicConnector:
     def test_pool_exhaustion_and_recovery(self):
         """Fill pool, verify failure, free, verify recovery."""
         port = _free_port()
-        with MooncakeTransferEngineConnector(_connector_config(port, pool_size=64 * 1024)) as c:
+        with MooncakeTransferEngineConnector(
+            _connector_config(port, pool_size=64 * 1024)
+        ) as c:
             ids = []
             for i in range(10):
                 ok, _, _ = c.put("s", "s", f"f{i}", torch.randn(1000))
@@ -254,7 +282,9 @@ class TestBasicConnector:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@pytest.mark.skipif(
+    TransferEngine is None, reason="Mooncake TransferEngine not available"
+)
 class TestEndToEnd:
     """E2E RDMA transfer: tensor, bytes, object, zero-copy, large payload, mixed types."""
 
@@ -397,7 +427,9 @@ class TestEndToEnd:
     def test_concurrent_put(self):
         """10 concurrent puts should all succeed."""
         port = _free_port()
-        conn = MooncakeTransferEngineConnector(_connector_config(port, pool_size=64 * 1024 * 1024))
+        conn = MooncakeTransferEngineConnector(
+            _connector_config(port, pool_size=64 * 1024 * 1024)
+        )
         errors: list[str] = []
         lock = threading.Lock()
 
@@ -414,7 +446,9 @@ class TestEndToEnd:
         with conn:
             threads = []
             for i in range(10):
-                t = threading.Thread(target=worker, args=(f"r{i}", torch.randn(256, 256)))
+                t = threading.Thread(
+                    target=worker, args=(f"r{i}", torch.randn(256, 256))
+                )
                 threads.append(t)
                 t.start()
             for t in threads:
@@ -447,12 +481,16 @@ class TestEndToEnd:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@pytest.mark.skipif(
+    TransferEngine is None, reason="Mooncake TransferEngine not available"
+)
 class TestLifecycle:
     """Close, context manager, double-close safety."""
 
     def test_close_releases_resources(self):
-        c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size=1024 * 1024))
+        c = MooncakeTransferEngineConnector(
+            _connector_config(_free_port(), pool_size=1024 * 1024)
+        )
         c.put("s0", "s1", "x", torch.randn(100))
         c.close()
         assert c._stop_event.is_set()
@@ -476,7 +514,9 @@ class TestLifecycle:
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@pytest.mark.skipif(
+    TransferEngine is None, reason="Mooncake TransferEngine not available"
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestGPUPool:
     """GPU memory pool: initialization, put (CPU/GPU tensor), E2E transfer."""
@@ -496,7 +536,9 @@ class TestGPUPool:
             assert ok
             assert meta["is_fast_path"]
 
-            ok, _, meta = c.put("s0", "s1", "d2d", torch.randn(256, 256, device="cuda:0"))
+            ok, _, meta = c.put(
+                "s0", "s1", "d2d", torch.randn(256, 256, device="cuda:0")
+            )
             assert ok
             assert meta["is_fast_path"]
 
@@ -526,7 +568,9 @@ class TestGPUPool:
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@pytest.mark.skipif(
+    TransferEngine is None, reason="Mooncake TransferEngine not available"
+)
 class TestStressCorrectness:
     """
     Slow but high-value regression tests: concurrent put+get with data
@@ -638,7 +682,9 @@ class TestStressCorrectness:
                     item = item_queue.get(timeout=30)
                 except queue.Empty:
                     with lock:
-                        errors.append(f"consumer: queue.Empty after 30s, consumed {consumed_count[0]}/{num_items}")
+                        errors.append(
+                            f"consumer: queue.Empty after 30s, consumed {consumed_count[0]}/{num_items}"
+                        )
                     break
                 if item is None:
                     break
@@ -683,7 +729,9 @@ class TestStressCorrectness:
                 t.join()
             ct.join(timeout=60)
             assert len(errors) == 0, f"errors: {errors}"
-            assert consumed_count[0] == num_items, f"Consumer only processed {consumed_count[0]}/{num_items} items"
+            assert (
+                consumed_count[0] == num_items
+            ), f"Consumer only processed {consumed_count[0]}/{num_items} items"
         finally:
             p.close()
             c.close()
@@ -711,7 +759,9 @@ class TestStressCorrectness:
     def test_empty_bytes_rejected(self):
         """Connector should gracefully reject empty bytes payload."""
         port = _free_port()
-        with MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024)) as c:
+        with MooncakeTransferEngineConnector(
+            _connector_config(port, pool_size=8 * 1024 * 1024)
+        ) as c:
             ok, sz, meta = c.put("s0", "s1", "empty_b", b"")
             assert not ok, "Empty bytes should be rejected by connector"
 
@@ -743,7 +793,9 @@ class TestStressCorrectness:
     def test_rapid_alloc_free_cycle(self):
         """Put + cleanup in tight loop to stress allocator under real connector."""
         port = _free_port()
-        with MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024)) as c:
+        with MooncakeTransferEngineConnector(
+            _connector_config(port, pool_size=8 * 1024 * 1024)
+        ) as c:
             for i in range(50):
                 rid = f"cycle_{i}"
                 ok, _, _ = c.put("s0", "s1", rid, torch.randn(256, 256))

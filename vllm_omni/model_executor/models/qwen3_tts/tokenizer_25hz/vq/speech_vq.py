@@ -87,7 +87,9 @@ class MelSpectrogramFeatures(nn.Module):
         self.mel_fmin = mel_fmin
         self.mel_fmax = mel_fmax
         self.sampling_rate = sampling_rate
-        self.sampling_rate_org = sampling_rate_org if sampling_rate_org is not None else sampling_rate
+        self.sampling_rate_org = (
+            sampling_rate_org if sampling_rate_org is not None else sampling_rate
+        )
         self.mel_basis = {}
         self.hann_window = {}
 
@@ -110,12 +112,19 @@ class MelSpectrogramFeatures(nn.Module):
                 fmin=self.mel_fmin,
                 fmax=self.mel_fmax,
             )
-            self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)] = torch.from_numpy(mel).float().to(y.device)
-            self.hann_window[str(y.device)] = torch.hann_window(self.win_length).to(y.device)
+            self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)] = (
+                torch.from_numpy(mel).float().to(y.device)
+            )
+            self.hann_window[str(y.device)] = torch.hann_window(self.win_length).to(
+                y.device
+            )
 
         y = torch.nn.functional.pad(
             y.unsqueeze(1),
-            (int((self.filter_length - self.hop_length) / 2), int((self.filter_length - self.hop_length) / 2)),
+            (
+                int((self.filter_length - self.hop_length) / 2),
+                int((self.filter_length - self.hop_length) / 2),
+            ),
             mode="reflect",
         )
         y = y.squeeze(1)
@@ -135,7 +144,9 @@ class MelSpectrogramFeatures(nn.Module):
         spec = torch.view_as_real(spec)
         spec = torch.sqrt(spec.pow(2).sum(-1) + (1e-9))
 
-        spec = torch.matmul(self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)], spec)
+        spec = torch.matmul(
+            self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)], spec
+        )
         spec = spectral_normalize_torch(spec)
 
         return spec
@@ -145,7 +156,9 @@ class XVectorExtractor(nn.Module):
     def __init__(self, audio_codec_with_xvector):
         super().__init__()
         option = onnxruntime.SessionOptions()
-        option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        option.graph_optimization_level = (
+            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
         option.intra_op_num_threads = 1
         providers = ["CPUExecutionProvider"]
         self.ort_session = onnxruntime.InferenceSession(
@@ -170,10 +183,18 @@ class XVectorExtractor(nn.Module):
             norm_audio = self.sox_norm(audio)
 
             norm_audio = torch.from_numpy(copy.deepcopy(norm_audio)).unsqueeze(0)
-            feat = kaldi.fbank(norm_audio, num_mel_bins=80, dither=0, sample_frequency=16000)
+            feat = kaldi.fbank(
+                norm_audio, num_mel_bins=80, dither=0, sample_frequency=16000
+            )
             feat = feat - feat.mean(dim=0, keepdim=True)
             norm_embedding = self.ort_session.run(
-                None, {self.ort_session.get_inputs()[0].name: feat.unsqueeze(dim=0).cpu().numpy()}
+                None,
+                {
+                    self.ort_session.get_inputs()[0]
+                    .name: feat.unsqueeze(dim=0)
+                    .cpu()
+                    .numpy()
+                },
             )[0].flatten()
             norm_embedding = F.normalize(torch.from_numpy(norm_embedding), dim=0)
 
@@ -242,10 +263,16 @@ class WhisperEncoderVQ(WhisperEncoder):
             assert audio_vq_ds_rate % self.audio_vq_ds_rate == 0
             stride = audio_vq_ds_rate // self.audio_vq_ds_rate
             self.audio_vq_downsample = Conv1d(
-                self.vq_feature_dim, self.vq_feature_dim, kernel_size=stride, stride=stride
+                self.vq_feature_dim,
+                self.vq_feature_dim,
+                kernel_size=stride,
+                stride=stride,
             )
             self.audio_vq_upsample = ConvTranspose1d(
-                self.vq_feature_dim, self.vq_feature_dim, kernel_size=stride, stride=stride
+                self.vq_feature_dim,
+                self.vq_feature_dim,
+                kernel_size=stride,
+                stride=stride,
             )
             self.audio_vq_ds_rate = audio_vq_ds_rate
 
@@ -253,7 +280,11 @@ class WhisperEncoderVQ(WhisperEncoder):
             self.audio_quantizer = DistributedGroupResidualVectorQuantization(
                 codebook_size=audio_vq_codebook_size,
                 dim=self.vq_feature_dim,
-                codebook_dim=self.vq_codebook_dim if audio_vq_codebook_dim is None else audio_vq_codebook_dim,
+                codebook_dim=(
+                    self.vq_codebook_dim
+                    if audio_vq_codebook_dim is None
+                    else audio_vq_codebook_dim
+                ),
                 num_groups=1,
                 num_quantizers=1,
                 kmeans_init=False,
@@ -266,7 +297,9 @@ class WhisperEncoderVQ(WhisperEncoder):
             self.project_after_vq_pe = nn.Linear(self.n_state, self.n_state)
 
     def _calc_quantize_activities(self, indices):
-        indices_onehot = F.one_hot(indices.long().flatten(), self.audio_vq_codebook_size).sum(dim=0)
+        indices_onehot = F.one_hot(
+            indices.long().flatten(), self.audio_vq_codebook_size
+        ).sum(dim=0)
         vq_num_activities = sum(indices_onehot > 0)
         vq_num_tokens = sum(indices_onehot)
         return {
@@ -309,7 +342,9 @@ class WhisperEncoderVQ(WhisperEncoder):
 
         if self.audio_vq_out_commit_loss > 0:
             vq_out_commit_loss = F.mse_loss(x_teacher.detach(), x)
-            vq_stats["vq_out_commit_loss"] = vq_out_commit_loss * self.audio_vq_out_commit_loss
+            vq_stats["vq_out_commit_loss"] = (
+                vq_out_commit_loss * self.audio_vq_out_commit_loss
+            )
 
         return x, indices, vq_stats
 
@@ -336,10 +371,17 @@ class WhisperEncoderVQ(WhisperEncoder):
                 each_x_split = F.gelu(self.conv2(each_x_split))
                 each_x_split = each_x_split.permute(1, 0)  # L,D
 
-                each_positional_embedding_split = self.positional_embedding[: each_x_split.shape[0]]
-                aftercnn_x_list.append(each_x_split + each_positional_embedding_split.to(each_x_split.dtype))
+                each_positional_embedding_split = self.positional_embedding[
+                    : each_x_split.shape[0]
+                ]
+                aftercnn_x_list.append(
+                    each_x_split
+                    + each_positional_embedding_split.to(each_x_split.dtype)
+                )
 
-                pe_for_vq_split = self.positional_embedding[: each_x_split.shape[0] // self.audio_vq_ds_rate]
+                pe_for_vq_split = self.positional_embedding[
+                    : each_x_split.shape[0] // self.audio_vq_ds_rate
+                ]
                 pe_for_vq_list.append(pe_for_vq_split.to(each_x_split.dtype))
 
         pe_for_vq = torch.cat(pe_for_vq_list, dim=0)
@@ -381,13 +423,25 @@ class WhisperEncoderVQ(WhisperEncoder):
 
         x = self.proj(x)
 
-        output = torch.zeros((x.size(0) + len(audio_seqlens) * 2, x.size(1)), device=x.device, dtype=x.dtype)
+        output = torch.zeros(
+            (x.size(0) + len(audio_seqlens) * 2, x.size(1)),
+            device=x.device,
+            dtype=x.dtype,
+        )
 
-        audio_seqlens_acc = list(accumulate(audio_seqlens, func=operator.add, initial=0))
-        start_ids = torch.tensor(audio_seqlens_acc[:-1], device=x.device, dtype=torch.int32)
-        end_ids = torch.tensor(audio_seqlens_acc[1:], device=x.device, dtype=torch.int32) - 1
+        audio_seqlens_acc = list(
+            accumulate(audio_seqlens, func=operator.add, initial=0)
+        )
+        start_ids = torch.tensor(
+            audio_seqlens_acc[:-1], device=x.device, dtype=torch.int32
+        )
+        end_ids = (
+            torch.tensor(audio_seqlens_acc[1:], device=x.device, dtype=torch.int32) - 1
+        )
 
-        audio_tokens_mask = torch.ones(output.size(0), device=x.device, dtype=torch.bool)
+        audio_tokens_mask = torch.ones(
+            output.size(0), device=x.device, dtype=torch.bool
+        )
         audio_tokens_mask[start_ids] = False
         audio_tokens_mask[end_ids] = False
         output[start_ids] = self.audio_bos_eos_token.weight[0].to(x.dtype)

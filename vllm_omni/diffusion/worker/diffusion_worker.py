@@ -104,18 +104,28 @@ class DiffusionWorker:
 
         # Create vllm_config for parallel configuration
         vllm_config = VllmConfig(compilation_config=CompilationConfig())
-        vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
-        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
-        vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
+        vllm_config.parallel_config.tensor_parallel_size = (
+            self.od_config.parallel_config.tensor_parallel_size
+        )
+        vllm_config.parallel_config.data_parallel_size = (
+            self.od_config.parallel_config.data_parallel_size
+        )
+        vllm_config.parallel_config.enable_expert_parallel = (
+            self.od_config.parallel_config.enable_expert_parallel
+        )
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
         with (
-            set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
+            set_forward_context(
+                vllm_config=self.vllm_config, omni_diffusion_config=self.od_config
+            ),
             set_current_vllm_config(self.vllm_config),
         ):
             init_distributed_environment(world_size=world_size, rank=rank)
-            logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
+            logger.info(
+                f"Worker {self.rank}: Initialized device and distributed environment."
+            )
 
             parallel_config = self.od_config.parallel_config
             initialize_model_parallel(
@@ -126,16 +136,26 @@ class DiffusionWorker:
                 ring_degree=parallel_config.ring_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-                fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
-                hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
+                fully_shard_degree=(
+                    parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1
+                ),
+                hsdp_replicate_size=(
+                    parallel_config.hsdp_replicate_size
+                    if parallel_config.use_hsdp
+                    else 1
+                ),
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
             init_workspace_manager(self.device)
 
-    def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None:
+    def load_model(
+        self, load_format: str = "default", custom_pipeline_name: str | None = None
+    ) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
         with (
-            set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
+            set_forward_context(
+                vllm_config=self.vllm_config, omni_diffusion_config=self.od_config
+            ),
             set_current_vllm_config(self.vllm_config),
         ):
             self.model_runner.load_model(
@@ -182,12 +202,16 @@ class DiffusionWorker:
         """Stop profiling and return the result dictionary."""
         return CurrentProfiler.stop()
 
-    def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig
+    ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
             try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
+                self.lora_manager.set_active_adapter(
+                    req.sampling_params.lora_request, req.sampling_params.lora_scale
+                )
             except Exception as exc:
                 if req.sampling_params.lora_request is not None:
                     raise
@@ -230,12 +254,17 @@ class DiffusionWorker:
         # Save the buffers before level 2 sleep
         if level == 2 and self.model_runner is not None:
             model = self.model_runner.pipeline
-            self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
+            self._sleep_saved_buffers = {
+                name: buffer.cpu().clone() for name, buffer in model.named_buffers()
+            }
 
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
         process_memory_after_sleep = get_process_gpu_memory(self.local_rank)
-        if process_memory_before_sleep is not None and process_memory_after_sleep is not None:
+        if (
+            process_memory_before_sleep is not None
+            and process_memory_after_sleep is not None
+        ):
             freed_bytes = process_memory_before_sleep - process_memory_after_sleep
             used_bytes = process_memory_after_sleep
             accounting_scope = "process-scoped"
@@ -289,7 +318,9 @@ class DiffusionWorker:
 
             allocator = CuMemAllocator.get_instance()
             if tag == "weights":
-                assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
+                assert (
+                    allocator.get_current_usage() == 0
+                ), "Sleep mode can only be used for one instance per process."
             return allocator.use_memory_pool(tag=tag)
         else:
             return nullcontext()
@@ -350,14 +381,18 @@ class WorkerProc:
 
         # Setup result sender (only for rank 0)
         if gpu_id == 0:
-            self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
+            self.result_mq = MessageQueue(
+                n_reader=1, n_local_reader=1, local_reader_ranks=[0]
+            )
             self.result_mq_handle = self.result_mq.export_handle()
             logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
 
         # Create worker using WorkerWrapperBase for extension support
-        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
+        self.worker = self._create_worker(
+            gpu_id, od_config, worker_extension_cls, custom_pipeline_args
+        )
         self._running = True
 
     def _create_worker(
@@ -397,8 +432,12 @@ class WorkerProc:
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
 
-        should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
-        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
+        should_execute = (
+            exec_all_ranks or output_rank is None or output_rank == self.gpu_id
+        )
+        should_reply = (
+            output_rank is None or output_rank == self.gpu_id
+        ) and self.result_mq is not None
 
         if not should_execute:
             return None, False
@@ -427,7 +466,9 @@ class WorkerProc:
                 continue
 
             if msg is None or len(msg) == 0:
-                logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
+                logger.warning(
+                    "Worker %s: Received empty payload, ignoring", self.gpu_id
+                )
                 continue
 
             # Route message based on type
@@ -467,7 +508,9 @@ class WorkerProc:
         try:
             self.worker.shutdown()
         except Exception as exc:
-            logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
+            logger.warning(
+                "Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc
+            )
         self.context.term()
 
     @staticmethod
@@ -567,7 +610,9 @@ class WorkerWrapperBase:
 
         if self.worker_extension_cls:
             if isinstance(self.worker_extension_cls, str):
-                worker_extension_cls = resolve_obj_by_qualname(self.worker_extension_cls)
+                worker_extension_cls = resolve_obj_by_qualname(
+                    self.worker_extension_cls
+                )
             else:
                 worker_extension_cls = self.worker_extension_cls
             extended_calls = []
@@ -587,8 +632,12 @@ class WorkerWrapperBase:
                         extended_calls.append(attr)
 
                 # Dynamically inherit the worker extension class
-                class_name = f"{worker_class.__name__}With{worker_extension_cls.__name__}"
-                worker_class = type(class_name, (worker_extension_cls, worker_class), {})
+                class_name = (
+                    f"{worker_class.__name__}With{worker_extension_cls.__name__}"
+                )
+                worker_class = type(
+                    class_name, (worker_extension_cls, worker_class), {}
+                )
                 logger.info(
                     "Created extended worker class %s from %s for extended calls %s",
                     class_name,
@@ -610,7 +659,9 @@ class WorkerWrapperBase:
         """
         return self.worker.generate(requests)
 
-    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig
+    ) -> DiffusionOutput:
         """
         Execute a forward pass.
 

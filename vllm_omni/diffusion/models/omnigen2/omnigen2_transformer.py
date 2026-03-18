@@ -93,7 +93,9 @@ class OmniGen2Attention(nn.Module):
         # Reshape tensors for attention computation
         query = query.view(batch_size, sequence_length, self.num_heads, self.head_dim)
         key = key.view(batch_size, sequence_length, self.num_kv_heads, self.head_dim)
-        value = value.view(batch_size, sequence_length, self.num_kv_heads, self.head_dim)
+        value = value.view(
+            batch_size, sequence_length, self.num_kv_heads, self.head_dim
+        )
 
         # Apply Query-Key normalization
         if self.norm_q is not None:
@@ -123,7 +125,9 @@ class OmniGen2Attention(nn.Module):
         )
 
         # Reshape back
-        hidden_states = hidden_states.reshape(batch_size, -1, self.num_heads * self.head_dim)
+        hidden_states = hidden_states.reshape(
+            batch_size, -1, self.num_heads * self.head_dim
+        )
         hidden_states = hidden_states.to(dtype)
 
         hidden_states = self.to_out[0](hidden_states)
@@ -212,21 +216,29 @@ def apply_rotary_emb(
 
         if use_real_unbind_dim == -1:
             # Used for flux, cogvideox, hunyuan-dit
-            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D//2]
+            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(
+                -1
+            )  # [B, S, H, D//2]
             x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
         elif use_real_unbind_dim == -2:
             # Used for Stable Audio, OmniGen and CogView4
-            x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(-2)  # [B, S, H, D//2]
+            x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(
+                -2
+            )  # [B, S, H, D//2]
             x_rotated = torch.cat([-x_imag, x_real], dim=-1)
         else:
-            raise ValueError(f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2.")
+            raise ValueError(
+                f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2."
+            )
 
         out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
 
         return out
     else:
         # used for lumina
-        x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2))
+        x_rotated = torch.view_as_complex(
+            x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
+        )
         freqs_cis = freqs_cis.unsqueeze(2)
         x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
 
@@ -293,7 +305,9 @@ class LuminaLayerNormContinuous(nn.Module):
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
         elif norm_type == "rms_norm":
-            self.norm = RMSNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
+            self.norm = RMSNorm(
+                embedding_dim, eps=eps, elementwise_affine=elementwise_affine
+            )
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
@@ -432,7 +446,9 @@ class OmniGen2RotaryPosEmbed(nn.Module):
         axes_dim: tuple[int, int, int], axes_lens: tuple[int, int, int], theta: int
     ) -> list[torch.Tensor]:
         freqs_cis = []
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        freqs_dtype = (
+            torch.float32 if torch.backends.mps.is_available() else torch.float64
+        )
         for i, (d, e) in enumerate(zip(axes_dim, axes_lens)):
             emb = get_1d_rotary_pos_embed(d, e, theta=theta, freqs_dtype=freqs_dtype)
             freqs_cis.append(emb)
@@ -447,7 +463,11 @@ class OmniGen2RotaryPosEmbed(nn.Module):
         for i in range(len(self.axes_dim)):
             freqs = freqs_cis[i].to(ids.device)
             index = ids[:, :, i : i + 1].repeat(1, 1, freqs.shape[-1]).to(torch.int64)
-            result.append(torch.gather(freqs.unsqueeze(0).repeat(index.shape[0], 1, 1), dim=1, index=index))
+            result.append(
+                torch.gather(
+                    freqs.unsqueeze(0).repeat(index.shape[0], 1, 1), dim=1, index=index
+                )
+            )
         return torch.cat(result, dim=-1).to(device)
 
     def forward(
@@ -468,17 +488,25 @@ class OmniGen2RotaryPosEmbed(nn.Module):
 
         seq_lengths = [
             cap_len + sum(ref_img_len) + img_len
-            for cap_len, ref_img_len, img_len in zip(l_effective_cap_len, l_effective_ref_img_len, l_effective_img_len)
+            for cap_len, ref_img_len, img_len in zip(
+                l_effective_cap_len, l_effective_ref_img_len, l_effective_img_len
+            )
         ]
 
         max_seq_len = max(seq_lengths)
-        max_ref_img_len = max([sum(ref_img_len) for ref_img_len in l_effective_ref_img_len])
+        max_ref_img_len = max(
+            [sum(ref_img_len) for ref_img_len in l_effective_ref_img_len]
+        )
         max_img_len = max(l_effective_img_len)
 
         # Create position IDs
-        position_ids = torch.zeros(batch_size, max_seq_len, 3, dtype=torch.int32, device=device)
+        position_ids = torch.zeros(
+            batch_size, max_seq_len, 3, dtype=torch.int32, device=device
+        )
 
-        for i, (cap_seq_len, seq_len) in enumerate(zip(l_effective_cap_len, seq_lengths)):
+        for i, (cap_seq_len, seq_len) in enumerate(
+            zip(l_effective_cap_len, seq_lengths)
+        ):
             # add text position ids
             position_ids[i, :cap_seq_len] = repeat(
                 torch.arange(cap_seq_len, dtype=torch.int32, device=device), "l -> l 3"
@@ -488,7 +516,9 @@ class OmniGen2RotaryPosEmbed(nn.Module):
             pe_shift_len = cap_seq_len
 
             if ref_img_sizes[i] is not None:
-                for ref_img_size, ref_img_len in zip(ref_img_sizes[i], l_effective_ref_img_len[i]):
+                for ref_img_size, ref_img_len in zip(
+                    ref_img_sizes[i], l_effective_ref_img_len[i]
+                ):
                     H, W = ref_img_size
                     ref_H_tokens, ref_W_tokens = H // p, W // p
                     assert ref_H_tokens * ref_W_tokens == ref_img_len
@@ -504,9 +534,15 @@ class OmniGen2RotaryPosEmbed(nn.Module):
                         "w -> h w",
                         h=ref_H_tokens,
                     ).flatten()
-                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 0] = pe_shift
-                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 1] = row_ids
-                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 2] = col_ids
+                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 0] = (
+                        pe_shift
+                    )
+                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 1] = (
+                        row_ids
+                    )
+                    position_ids[i, pe_shift_len : pe_shift_len + ref_img_len, 2] = (
+                        col_ids
+                    )
 
                     pe_shift += max(ref_H_tokens, ref_W_tokens)
                     pe_shift_len += ref_img_len
@@ -566,10 +602,15 @@ class OmniGen2RotaryPosEmbed(nn.Module):
             )
         ):
             cap_freqs_cis[i, :cap_seq_len] = freqs_cis[i, :cap_seq_len]
-            ref_img_freqs_cis[i, : sum(ref_img_len)] = freqs_cis[i, cap_seq_len : cap_seq_len + sum(ref_img_len)]
+            ref_img_freqs_cis[i, : sum(ref_img_len)] = freqs_cis[
+                i, cap_seq_len : cap_seq_len + sum(ref_img_len)
+            ]
             img_freqs_cis[i, :img_len] = freqs_cis[
                 i,
-                cap_seq_len + sum(ref_img_len) : cap_seq_len + sum(ref_img_len) + img_len,
+                cap_seq_len
+                + sum(ref_img_len) : cap_seq_len
+                + sum(ref_img_len)
+                + img_len,
             ]
 
         return (
@@ -634,7 +675,9 @@ class OmniGen2TransformerBlock(nn.Module):
 
         # Initialize normalization layers
         if modulation:
-            self.norm1 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps, norm_elementwise_affine=True)
+            self.norm1 = LuminaRMSNormZero(
+                embedding_dim=dim, norm_eps=norm_eps, norm_elementwise_affine=True
+            )
         else:
             self.norm1 = RMSNorm(dim, eps=norm_eps)
 
@@ -684,15 +727,23 @@ class OmniGen2TransformerBlock(nn.Module):
             if temb is None:
                 raise ValueError("temb must be provided when modulation is enabled")
 
-            norm_hidden_states, gate_msa, scale_mlp, gate_mlp = self.norm1(hidden_states, temb)
+            norm_hidden_states, gate_msa, scale_mlp, gate_mlp = self.norm1(
+                hidden_states, temb
+            )
             attn_output = self.attn(
                 hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
             )
-            hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(attn_output)
-            mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
-            hidden_states = hidden_states + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(mlp_output)
+            hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(
+                attn_output
+            )
+            mlp_output = self.feed_forward(
+                self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1))
+            )
+            hidden_states = hidden_states + gate_mlp.unsqueeze(
+                1
+            ).tanh() * self.ffn_norm2(mlp_output)
         else:
             norm_hidden_states = self.norm1(hidden_states)
             attn_output = self.attn(
@@ -871,7 +922,9 @@ class OmniGen2Transformer2DModel(nn.Module):
         )
 
         # Add learnable embeddings to distinguish different images
-        self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))  # support max 5 ref images
+        self.image_index_embedding = nn.Parameter(
+            torch.randn(5, hidden_size)
+        )  # support max 5 ref images
 
         self.initialize_weights()
 
@@ -908,7 +961,12 @@ class OmniGen2Transformer2DModel(nn.Module):
     ):
         batch_size = len(hidden_states)
         max_combined_img_len = max(
-            [img_len + sum(ref_img_len) for img_len, ref_img_len in zip(l_effective_img_len, l_effective_ref_img_len)]
+            [
+                img_len + sum(ref_img_len)
+                for img_len, ref_img_len in zip(
+                    l_effective_img_len, l_effective_ref_img_len
+                )
+            ]
         )
 
         hidden_states = self.x_embedder(hidden_states)
@@ -918,18 +976,23 @@ class OmniGen2Transformer2DModel(nn.Module):
             shift = 0
             for j, ref_img_len in enumerate(l_effective_ref_img_len[i]):
                 ref_image_hidden_states[i, shift : shift + ref_img_len, :] = (
-                    ref_image_hidden_states[i, shift : shift + ref_img_len, :] + self.image_index_embedding[j]
+                    ref_image_hidden_states[i, shift : shift + ref_img_len, :]
+                    + self.image_index_embedding[j]
                 )
                 shift += ref_img_len
 
         for layer in self.noise_refiner:
-            hidden_states = layer(hidden_states, padded_img_mask, noise_rotary_emb, temb)
+            hidden_states = layer(
+                hidden_states, padded_img_mask, noise_rotary_emb, temb
+            )
 
         flat_l_effective_ref_img_len = list(itertools.chain(*l_effective_ref_img_len))
         num_ref_images = len(flat_l_effective_ref_img_len)
         max_ref_img_len = max(flat_l_effective_ref_img_len)
 
-        batch_ref_img_mask = ref_image_hidden_states.new_zeros(num_ref_images, max_ref_img_len, dtype=torch.bool)
+        batch_ref_img_mask = ref_image_hidden_states.new_zeros(
+            num_ref_images, max_ref_img_len, dtype=torch.bool
+        )
         batch_ref_image_hidden_states = ref_image_hidden_states.new_zeros(
             num_ref_images, max_ref_img_len, self.config.hidden_size
         )
@@ -947,10 +1010,12 @@ class OmniGen2Transformer2DModel(nn.Module):
             shift = 0
             for ref_img_len in l_effective_ref_img_len[i]:
                 batch_ref_img_mask[idx, :ref_img_len] = True
-                batch_ref_image_hidden_states[idx, :ref_img_len] = ref_image_hidden_states[
+                batch_ref_image_hidden_states[idx, :ref_img_len] = (
+                    ref_image_hidden_states[i, shift : shift + ref_img_len]
+                )
+                batch_ref_img_rotary_emb[idx, :ref_img_len] = ref_img_rotary_emb[
                     i, shift : shift + ref_img_len
                 ]
-                batch_ref_img_rotary_emb[idx, :ref_img_len] = ref_img_rotary_emb[i, shift : shift + ref_img_len]
                 batch_temb[idx] = temb[i]
                 shift += ref_img_len
                 idx += 1
@@ -969,16 +1034,24 @@ class OmniGen2Transformer2DModel(nn.Module):
         for i in range(batch_size):
             shift = 0
             for ref_img_len in l_effective_ref_img_len[i]:
-                ref_image_hidden_states[i, shift : shift + ref_img_len] = batch_ref_image_hidden_states[
-                    idx, :ref_img_len
-                ]
+                ref_image_hidden_states[i, shift : shift + ref_img_len] = (
+                    batch_ref_image_hidden_states[idx, :ref_img_len]
+                )
                 shift += ref_img_len
                 idx += 1
 
-        combined_img_hidden_states = hidden_states.new_zeros(batch_size, max_combined_img_len, self.config.hidden_size)
-        for i, (ref_img_len, img_len) in enumerate(zip(l_effective_ref_img_len, l_effective_img_len)):
-            combined_img_hidden_states[i, : sum(ref_img_len)] = ref_image_hidden_states[i, : sum(ref_img_len)]
-            combined_img_hidden_states[i, sum(ref_img_len) : sum(ref_img_len) + img_len] = hidden_states[i, :img_len]
+        combined_img_hidden_states = hidden_states.new_zeros(
+            batch_size, max_combined_img_len, self.config.hidden_size
+        )
+        for i, (ref_img_len, img_len) in enumerate(
+            zip(l_effective_ref_img_len, l_effective_img_len)
+        ):
+            combined_img_hidden_states[i, : sum(ref_img_len)] = ref_image_hidden_states[
+                i, : sum(ref_img_len)
+            ]
+            combined_img_hidden_states[
+                i, sum(ref_img_len) : sum(ref_img_len) + img_len
+            ] = hidden_states[i, :img_len]
 
         return combined_img_hidden_states
 
@@ -992,12 +1065,19 @@ class OmniGen2Transformer2DModel(nn.Module):
 
         if ref_image_hidden_states is not None:
             ref_img_sizes = [
-                ([(img.size(1), img.size(2)) for img in imgs] if imgs is not None else None)
+                (
+                    [(img.size(1), img.size(2)) for img in imgs]
+                    if imgs is not None
+                    else None
+                )
                 for imgs in ref_image_hidden_states
             ]
             l_effective_ref_img_len = [
                 (
-                    [(ref_img_size[0] // p) * (ref_img_size[1] // p) for ref_img_size in _ref_img_sizes]
+                    [
+                        (ref_img_size[0] // p) * (ref_img_size[1] // p)
+                        for ref_img_size in _ref_img_sizes
+                    ]
                     if _ref_img_sizes is not None
                     else [0]
                 )
@@ -1007,7 +1087,9 @@ class OmniGen2Transformer2DModel(nn.Module):
             ref_img_sizes = [None for _ in range(batch_size)]
             l_effective_ref_img_len = [[0] for _ in range(batch_size)]
 
-        max_ref_img_len = max([sum(ref_img_len) for ref_img_len in l_effective_ref_img_len])
+        max_ref_img_len = max(
+            [sum(ref_img_len) for ref_img_len in l_effective_ref_img_len]
+        )
         max_img_len = max(l_effective_img_len)
 
         # ref image patch embeddings
@@ -1017,7 +1099,9 @@ class OmniGen2Transformer2DModel(nn.Module):
                 imgs = []
                 for ref_img in ref_image_hidden_states[i]:
                     C, H, W = ref_img.size()
-                    ref_img = rearrange(ref_img, "c (h p1) (w p2) -> (h w) (p1 p2 c)", p1=p, p2=p)
+                    ref_img = rearrange(
+                        ref_img, "c (h p1) (w p2) -> (h w) (p1 p2 c)", p1=p, p2=p
+                    )
                     imgs.append(ref_img)
 
                 img = torch.cat(imgs, dim=0)
@@ -1041,10 +1125,14 @@ class OmniGen2Transformer2DModel(nn.Module):
             device=device,
             dtype=flat_hidden_states[0].dtype,
         )
-        padded_ref_img_mask = torch.zeros(batch_size, max_ref_img_len, dtype=torch.bool, device=device)
+        padded_ref_img_mask = torch.zeros(
+            batch_size, max_ref_img_len, dtype=torch.bool, device=device
+        )
         for i in range(batch_size):
             if ref_img_sizes[i] is not None:
-                padded_ref_img_hidden_states[i, : sum(l_effective_ref_img_len[i])] = flat_ref_img_hidden_states[i]
+                padded_ref_img_hidden_states[i, : sum(l_effective_ref_img_len[i])] = (
+                    flat_ref_img_hidden_states[i]
+                )
                 padded_ref_img_mask[i, : sum(l_effective_ref_img_len[i])] = True
 
         padded_hidden_states = torch.zeros(
@@ -1054,7 +1142,9 @@ class OmniGen2Transformer2DModel(nn.Module):
             device=device,
             dtype=flat_hidden_states[0].dtype,
         )
-        padded_img_mask = torch.zeros(batch_size, max_img_len, dtype=torch.bool, device=device)
+        padded_img_mask = torch.zeros(
+            batch_size, max_img_len, dtype=torch.bool, device=device
+        )
         for i in range(batch_size):
             padded_hidden_states[i, : l_effective_img_len[i]] = flat_hidden_states[i]
             padded_img_mask[i, : l_effective_img_len[i]] = True
@@ -1090,7 +1180,9 @@ class OmniGen2Transformer2DModel(nn.Module):
 
         device = hidden_states[0].device
 
-        temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states[0].dtype)
+        temb, text_hidden_states = self.time_caption_embed(
+            timestep, text_hidden_states, hidden_states[0].dtype
+        )
 
         (
             hidden_states,
@@ -1122,7 +1214,9 @@ class OmniGen2Transformer2DModel(nn.Module):
 
         # 2. Context refinement
         for layer in self.context_refiner:
-            text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
+            text_hidden_states = layer(
+                text_hidden_states, text_attention_mask, context_rotary_emb
+            )
 
         combined_img_hidden_states = self.img_patch_embed_and_refine(
             hidden_states,
@@ -1139,12 +1233,22 @@ class OmniGen2Transformer2DModel(nn.Module):
         # 3. Joint Transformer blocks
         max_seq_len = max(seq_lengths)
 
-        attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
-        joint_hidden_states = hidden_states.new_zeros(batch_size, max_seq_len, self.config.hidden_size)
-        for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        attention_mask = hidden_states.new_zeros(
+            batch_size, max_seq_len, dtype=torch.bool
+        )
+        joint_hidden_states = hidden_states.new_zeros(
+            batch_size, max_seq_len, self.config.hidden_size
+        )
+        for i, (encoder_seq_len, seq_len) in enumerate(
+            zip(encoder_seq_lengths, seq_lengths)
+        ):
             attention_mask[i, :seq_len] = True
-            joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
-            joint_hidden_states[i, encoder_seq_len:seq_len] = combined_img_hidden_states[i, : seq_len - encoder_seq_len]
+            joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[
+                i, :encoder_seq_len
+            ]
+            joint_hidden_states[i, encoder_seq_len:seq_len] = (
+                combined_img_hidden_states[i, : seq_len - encoder_seq_len]
+            )
 
         hidden_states = joint_hidden_states
 
@@ -1156,7 +1260,9 @@ class OmniGen2Transformer2DModel(nn.Module):
 
         p = self.config.patch_size
         output = []
-        for i, (img_size, img_len, seq_len) in enumerate(zip(img_sizes, l_effective_img_len, seq_lengths)):
+        for i, (img_size, img_len, seq_len) in enumerate(
+            zip(img_sizes, l_effective_img_len, seq_lengths)
+        ):
             height, width = img_size
             output.append(
                 rearrange(

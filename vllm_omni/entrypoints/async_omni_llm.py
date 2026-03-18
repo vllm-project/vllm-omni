@@ -122,7 +122,9 @@ class AsyncOmniLLM(AsyncLLM):
         )
 
         if self.observability_config.otlp_traces_endpoint is not None:
-            tracer = init_tracer("vllm.llm_engine", self.observability_config.otlp_traces_endpoint)
+            tracer = init_tracer(
+                "vllm.llm_engine", self.observability_config.otlp_traces_endpoint
+            )
             self.output_processor.tracer = tracer
 
         # Pause / resume state for async RL workflows.
@@ -160,7 +162,10 @@ class AsyncOmniLLM(AsyncLLM):
             pass
 
         # Use profiler_config from vllm_config (new way, aligned with vllm v1)
-        if vllm_config.profiler_config.profiler == "torch" and not vllm_config.profiler_config.ignore_frontend:
+        if (
+            vllm_config.profiler_config.profiler == "torch"
+            and not vllm_config.profiler_config.ignore_frontend
+        ):
             profiler_dir = vllm_config.profiler_config.torch_profiler_dir
             logger.info(
                 "Torch profiler enabled. AsyncOmniLLM CPU traces will be collected under %s",
@@ -184,7 +189,9 @@ class AsyncOmniLLM(AsyncLLM):
     @classmethod
     @deprecate_kwargs(
         "disable_log_requests",
-        additional_message=("This argument will have no effect. Use `enable_log_requests` instead."),
+        additional_message=(
+            "This argument will have no effect. Use `enable_log_requests` instead."
+        ),
     )
     def from_vllm_config(
         cls,

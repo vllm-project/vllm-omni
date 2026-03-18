@@ -31,7 +31,9 @@ class PatchedRecvReqMeta:
 def _import_mooncake_module():
     """Import MooncakeConnector module, supporting both vLLM >=0.16 and older."""
     try:
-        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import mooncake_connector
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
+            mooncake_connector,
+        )
 
         return mooncake_connector
     except ImportError:
@@ -102,7 +104,9 @@ def _create_patched_mooncake_connector():
             kv_transfer_params: dict[str, Any] | None = None,
             **kwargs: Any,
         ) -> None:
-            super().add_new_req(request_id, local_block_ids, kv_transfer_params, **kwargs)
+            super().add_new_req(
+                request_id, local_block_ids, kv_transfer_params, **kwargs
+            )
 
             kv_transfer_params = kv_transfer_params or {}
             load_remote_cache = kv_transfer_params.get(
@@ -111,7 +115,9 @@ def _create_patched_mooncake_connector():
             )
 
             if load_remote_cache:
-                remote_request_id = kv_transfer_params.get("remote_request_id", request_id)
+                remote_request_id = kv_transfer_params.get(
+                    "remote_request_id", request_id
+                )
                 meta = PatchedRecvReqMeta(
                     request_id=request_id,
                     remote_request_id=remote_request_id,
@@ -160,7 +166,8 @@ def _create_patched_mooncake_connector():
                 completed = [
                     rid
                     for rid, lid in self.remote_to_local_req.items()
-                    if not hasattr(self, "_reqs_need_recv") or lid not in self._reqs_need_recv
+                    if not hasattr(self, "_reqs_need_recv")
+                    or lid not in self._reqs_need_recv
                 ]
                 for remote_id in completed:
                     self.remote_to_local_req.pop(remote_id, None)
@@ -180,7 +187,9 @@ def apply_mooncake_connector_patch() -> bool:
 
     _mc_module = _import_mooncake_module()
     if _mc_module is None:
-        logger.warning("[monkey_patch] Cannot import MooncakeConnector — patch NOT applied.")
+        logger.warning(
+            "[monkey_patch] Cannot import MooncakeConnector — patch NOT applied."
+        )
         return False
 
     _OriginalClass = _mc_module.MooncakeConnector
@@ -189,7 +198,10 @@ def apply_mooncake_connector_patch() -> bool:
 
     _mc_module.MooncakeConnector = PatchedClass
     for _, module in sys.modules.items():
-        if hasattr(module, "MooncakeConnector") and module.MooncakeConnector is _OriginalClass:
+        if (
+            hasattr(module, "MooncakeConnector")
+            and module.MooncakeConnector is _OriginalClass
+        ):
             module.MooncakeConnector = PatchedClass
 
     _patched = True

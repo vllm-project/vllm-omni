@@ -33,7 +33,9 @@ from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
-from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
+from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import (
+    OmniRandomMultiModalDataset,
+)
 
 get_samples_old = datasets.get_samples
 
@@ -42,7 +44,9 @@ def get_samples(args, tokenizer):
     if args.backend not in ["openai-chat-omni", "openai-audio-speech"]:
         return get_samples_old(args, tokenizer)
     elif args.dataset_name == "random-mm":
-        dataset = OmniRandomMultiModalDataset(random_seed=args.seed, dataset_path=args.dataset_path)
+        dataset = OmniRandomMultiModalDataset(
+            random_seed=args.seed, dataset_path=args.dataset_path
+        )
         input_requests = dataset.sample(
             tokenizer=tokenizer,
             num_requests=args.num_prompts,
@@ -86,7 +90,11 @@ async def async_request_openai_chat_omni_completions(
     content = _get_chat_content(request_func_input, mm_position=mm_position)
 
     payload = {
-        "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
+        "model": (
+            request_func_input.model_name
+            if request_func_input.model_name
+            else request_func_input.model
+        ),
         "messages": [
             {"role": "user", "content": content},
         ],
@@ -101,10 +109,8 @@ async def async_request_openai_chat_omni_completions(
 
     response_format = payload.get("response_format", "wav")
     if response_format == "pcm":
-        raise ValueError(
-            "pcm response format is not supported yet. \
-        Please use other formats like wav, mp3, etc. instead."
-        )
+        raise ValueError("pcm response format is not supported yet. \
+        Please use other formats like wav, mp3, etc. instead.")
 
     headers = {
         "Content-Type": "application/json",
@@ -155,7 +161,9 @@ async def async_request_openai_chat_omni_completions(
                                         ttft = timestamp - st
                                         output.ttft = ttft
                                     else:
-                                        output.itl.append(timestamp - most_recent_timestamp)
+                                        output.itl.append(
+                                            timestamp - most_recent_timestamp
+                                        )
                                     generated_text += content or ""
                                     most_recent_timestamp = timestamp
                                     output.text_latency = timestamp - st
@@ -165,7 +173,9 @@ async def async_request_openai_chat_omni_completions(
                                     audio_generate_time = timestamp - st
                                     if content != "":
                                         audio_bytes = base64.b64decode(content)
-                                        seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
+                                        seg = AudioSegment.from_file(
+                                            io.BytesIO(audio_bytes)
+                                        )
                                         if seg is not None:
                                             if generated_audio is None:
                                                 generated_audio = seg
@@ -181,7 +191,9 @@ async def async_request_openai_chat_omni_completions(
                     output.audio_duration = len(generated_audio) / 1000.0
                     frame_width = generated_audio.frame_width
                     if frame_width > 0:
-                        output.audio_frames = len(generated_audio.raw_data) // frame_width
+                        output.audio_frames = (
+                            len(generated_audio.raw_data) // frame_width
+                        )
                     else:
                         output.audio_frames = 0
                         logger.warning("Audio frame width is zero")
@@ -206,7 +218,9 @@ async def async_request_openai_chat_omni_completions(
 
 
 async def async_request_openai_audio_speech(
-    request_func_input: RequestFuncInput, session: aiohttp.ClientSession, pbar: tqdm | None = None
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
 ) -> MixRequestFuncOutput:
     """Streaming request to /v1/audio/speech endpoint.
 
@@ -218,7 +232,11 @@ async def async_request_openai_audio_speech(
     _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
 
     payload = {
-        "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
+        "model": (
+            request_func_input.model_name
+            if request_func_input.model_name
+            else request_func_input.model
+        ),
         "input": request_func_input.prompt,
         "stream": True,
         "response_format": "pcm",
@@ -290,9 +308,17 @@ if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
 # ruff: noqa: E402
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
-from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request, wait_for_endpoint
+from vllm.benchmarks.serve import (
+    TaskType,
+    calculate_metrics_for_embeddings,
+    get_request,
+    wait_for_endpoint,
+)
 
-from vllm_omni.benchmarks.metrics.metrics import MultiModalsBenchmarkMetrics, calculate_metrics
+from vllm_omni.benchmarks.metrics.metrics import (
+    MultiModalsBenchmarkMetrics,
+    calculate_metrics,
+)
 
 # ruff: noqa: E402
 
@@ -363,7 +389,10 @@ async def benchmark(
     assert (
         test_mm_content is None
         or isinstance(test_mm_content, dict)
-        or (isinstance(test_mm_content, list) and all(isinstance(item, dict) for item in test_mm_content))
+        or (
+            isinstance(test_mm_content, list)
+            and all(isinstance(item, dict) for item in test_mm_content)
+        )
     ), "multi_modal_data must be a dict or list[dict]"
     test_input = RequestFuncInput(
         model=model_id,
@@ -400,12 +429,18 @@ async def benchmark(
     if num_warmups > 0:
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
-        warmup_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+        warmup_semaphore = (
+            asyncio.Semaphore(max_concurrency)
+            if max_concurrency
+            else contextlib.nullcontext()
+        )
         warmup_tasks = []
 
         async def warmup_limited_request_func():
             async with warmup_semaphore:
-                return await request_func(request_func_input=test_input, session=session, pbar=warmup_pbar)
+                return await request_func(
+                    request_func_input=test_input, session=session, pbar=warmup_pbar
+                )
 
         for _ in range(num_warmups):
             request_task = asyncio.create_task(warmup_limited_request_func())
@@ -420,7 +455,9 @@ async def benchmark(
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
-        lora_modules = iter([random.choice(lora_modules) for _ in range(len(input_requests))])
+        lora_modules = iter(
+            [random.choice(lora_modules) for _ in range(len(input_requests))]
+        )
 
     if profile:
         print("Starting profiler...")
@@ -437,7 +474,9 @@ async def benchmark(
             extra_headers=extra_headers,
             extra_body=extra_body,
         )
-        profile_output = await request_func(request_func_input=profile_input, session=session)
+        profile_output = await request_func(
+            request_func_input=profile_input, session=session
+        )
         if profile_output.success:
             print("Profiler started")
 
@@ -456,11 +495,17 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+    semaphore = (
+        asyncio.Semaphore(max_concurrency)
+        if max_concurrency
+        else contextlib.nullcontext()
+    )
 
     async def limited_request_func(request_func_input, session, pbar):
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
+            return await request_func(
+                request_func_input=request_func_input, session=session, pbar=pbar
+            )
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
@@ -518,7 +563,11 @@ async def benchmark(
             request_id=request_id,
         )
         tasks.append(
-            asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
+            asyncio.create_task(
+                limited_request_func(
+                    request_func_input=request_func_input, session=session, pbar=pbar
+                )
+            )
         )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
 
@@ -610,7 +659,9 @@ async def benchmark(
         median_attr_name = f"median_{metric_attribute_name}{suffix}"
         median_value = getattr(metrics, median_attr_name, 0.0)
         result[median_attr_name] = median_value
-        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}"):
+        for p, value in getattr(
+            metrics, f"percentiles_{metric_attribute_name}{suffix}"
+        ):
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
 
@@ -630,7 +681,9 @@ async def benchmark(
             output_len=test_output_len,
             logprobs=logprobs,
         )
-        profile_output = await request_func(request_func_input=profile_input, session=session)
+        profile_output = await request_func(
+            request_func_input=profile_input, session=session
+        )
         if profile_output.success:
             print("Profiler stopped")
 

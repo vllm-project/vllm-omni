@@ -100,7 +100,9 @@ class BufferAllocator:
                         self.free_blocks.pop(i)
                     return start
 
-        raise MemoryError(f"Out of memory in buffer pool. Requested {size} bytes (aligned {aligned_size}).")
+        raise MemoryError(
+            f"Out of memory in buffer pool. Requested {size} bytes (aligned {aligned_size})."
+        )
 
     def free(self, offset: int, size: int):
         """
@@ -113,7 +115,9 @@ class BufferAllocator:
             for start, length in self.free_blocks:
                 # Case 1: Exact match = double free, safe to ignore
                 if offset == start and aligned_size == length:
-                    logger.warning(f"Double free detected at offset {offset}, size {aligned_size}. Ignoring.")
+                    logger.warning(
+                        f"Double free detected at offset {offset}, size {aligned_size}. Ignoring."
+                    )
                     return
                 # Case 2: Block is fully contained within an existing free block = also double free
                 # This happens when the block was freed and then merged with adjacent blocks
@@ -152,7 +156,13 @@ class ManagedBuffer:
     Must be kept alive while the data view is being used.
     """
 
-    def __init__(self, allocator: BufferAllocator, offset: int, size: int, pool_tensor: torch.Tensor):
+    def __init__(
+        self,
+        allocator: BufferAllocator,
+        offset: int,
+        size: int,
+        pool_tensor: torch.Tensor,
+    ):
         self.allocator = allocator
         self.offset = offset
         self.size = size
@@ -202,7 +212,9 @@ class ManagedBuffer:
 
         # Check alignment (offset must be divisible by itemsize)
         if self.offset % itemsize != 0:
-            raise RuntimeError(f"Buffer offset {self.offset} is not aligned for dtype {dtype} (itemsize {itemsize})")
+            raise RuntimeError(
+                f"Buffer offset {self.offset} is not aligned for dtype {dtype} (itemsize {itemsize})"
+            )
 
         raw_view = self.tensor
         # view() requires contiguous memory, slice of contiguous tensor is contiguous
@@ -252,7 +264,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             raise ImportError("Mooncake not available")
 
         self._closed = False
-        self._bind_error: Exception | None = None  # fatal ZMQ bind error from listener thread
+        self._bind_error: Exception | None = (
+            None  # fatal ZMQ bind error from listener thread
+        )
 
         # --- Early init of all teardown-related fields ---
         # If __init__ fails later (engine init, pool alloc, etc.), __del__ → close()
@@ -325,39 +339,53 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.engine = TransferEngine()
         # Note: For P2P handshake mode, local_hostname should be just the IP address.
         # Mooncake will auto-assign an RPC port, retrievable via get_rpc_port().
-        ret = self.engine.initialize(self.host, "P2PHANDSHAKE", self.protocol, self.device_name)
+        ret = self.engine.initialize(
+            self.host, "P2PHANDSHAKE", self.protocol, self.device_name
+        )
         if ret != 0:
             raise RuntimeError(f"Mooncake Engine initialization failed with code {ret}")
 
         self.rpc_port = self.engine.get_rpc_port()
-        logger.info(f"MooncakeTransferEngineConnector initialized at {self.host}:{self.rpc_port}")
+        logger.info(
+            f"MooncakeTransferEngineConnector initialized at {self.host}:{self.rpc_port}"
+        )
 
         # --- Pool Allocation & Registration ---
-        logger.info(f"Allocating RDMA Memory Pool: {self.pool_size / 1024**2:.2f} MB on {self.pool_device}")
+        logger.info(
+            f"Allocating RDMA Memory Pool: {self.pool_size / 1024**2:.2f} MB on {self.pool_device}"
+        )
         try:
             if self.pool_device == "cpu":
                 self.pool = torch.empty(self.pool_size, dtype=torch.uint8).pin_memory()
                 self.base_ptr = self.pool.data_ptr()
             else:
-                self.pool = torch.empty(self.pool_size, dtype=torch.uint8, device=self.pool_device)
+                self.pool = torch.empty(
+                    self.pool_size, dtype=torch.uint8, device=self.pool_device
+                )
                 self.base_ptr = self.pool.data_ptr()
 
             # Register the entire pool
             ret = self.engine.register_memory(self.base_ptr, self.pool_size)
             if ret != 0:
-                raise RuntimeError("Failed to register memory pool with Mooncake Engine")
+                raise RuntimeError(
+                    "Failed to register memory pool with Mooncake Engine"
+                )
 
         except Exception as e:
             logger.error(f"Failed to allocate/register memory pool: {e}")
             raise
 
-        self.allocator = BufferAllocator(self.pool_size, alignment=4096)  # 4KB alignment for safety
+        self.allocator = BufferAllocator(
+            self.pool_size, alignment=4096
+        )  # 4KB alignment for safety
 
         # --- State Management & Background Threads ---
         # Most fields already initialized at the top of __init__ for teardown
         # safety.  Only create the real ZMQ context and thread pool here.
         self.zmq_ctx = zmq.Context()
-        self._sender_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mooncake-sender")
+        self._sender_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="mooncake-sender"
+        )
 
         # Log complete connector configuration for debugging
         logger.info(
@@ -370,7 +398,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # Only sender needs ZMQ listener to handle pull requests
         if self.can_put:
             self._last_ttl_check = _time_mod.monotonic()  # reset after slow init
-            self._listener_thread = threading.Thread(target=self._zmq_listener_loop, daemon=True)
+            self._listener_thread = threading.Thread(
+                target=self._zmq_listener_loop, daemon=True
+            )
             self._listener_thread.start()
             # Wait briefly for listener to bind (or fail)
             self._listener_ready.wait(timeout=1.0)
@@ -415,7 +445,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         """
         self.sender_host = sender_host
         self.sender_zmq_port = sender_zmq_port
-        logger.info(f"Sender info updated: host={sender_host!r}, zmq_port={sender_zmq_port}")
+        logger.info(
+            f"Sender info updated: host={sender_host!r}, zmq_port={sender_zmq_port}"
+        )
 
     def _get_local_ip(self) -> str:
         """
@@ -432,14 +464,18 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 local_ip = s.getsockname()[0]
             return local_ip
         except Exception as e:
-            logger.warning(f"Failed to auto-detect local IP: {e}, falling back to hostname lookup")
+            logger.warning(
+                f"Failed to auto-detect local IP: {e}, falling back to hostname lookup"
+            )
             try:
                 # Fallback: use hostname resolution
                 hostname = socket.gethostname()
                 local_ip = socket.gethostbyname(hostname)
                 return local_ip
             except Exception as e2:
-                logger.error(f"Failed to get local IP via hostname: {e2}, using 127.0.0.1")
+                logger.error(
+                    f"Failed to get local IP via hostname: {e2}, using 127.0.0.1"
+                )
                 return "127.0.0.1"
 
     def _get_req_socket(self, zmq_addr: str, timeout_ms: int) -> zmq.Socket:
@@ -483,7 +519,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             except Exception:
                 pass  # Best-effort; zmq_ctx.term() will reclaim if needed
 
-    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+    def put(
+        self, from_stage: str, to_stage: str, put_key: str, data: Any
+    ) -> tuple[bool, int, dict[str, Any] | None]:
         """
         Producer Side.
         Exposes data for RDMA transfer.
@@ -496,7 +534,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
           (receiver will deserialize automatically)
         """
         if self._closed:
-            raise RuntimeError("Cannot put data: MooncakeTransferEngineConnector is closed")
+            raise RuntimeError(
+                "Cannot put data: MooncakeTransferEngineConnector is closed"
+            )
 
         if not self.can_put:
             logger.warning(
@@ -537,7 +577,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 if data.pool_tensor.data_ptr() != self.pool.data_ptr():
                     # Fallback to copy path: extract tensor and let the
                     # torch.Tensor branch below handle the copy.
-                    logger.warning("ManagedBuffer from different pool detected. Falling back to copy path.")
+                    logger.warning(
+                        "ManagedBuffer from different pool detected. Falling back to copy path."
+                    )
                     data = data.tensor.contiguous()
                     # Fall through to torch.Tensor branch
                 else:
@@ -615,7 +657,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             if size <= 0:
                 if should_release_holder and isinstance(holder, ManagedBuffer):
                     holder.release()
-                logger.warning(f"Rejecting put for {put_key}: final payload size is {size}")
+                logger.warning(
+                    f"Rejecting put for {put_key}: final payload size is {size}"
+                )
                 return False, 0, None
 
             with self._local_buffers_lock:
@@ -625,7 +669,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     _, _, old_holder, old_should_release, _, _ = old_item
                     if old_should_release and isinstance(old_holder, ManagedBuffer):
                         old_holder.release()
-                        logger.warning(f"Released old buffer for duplicate put_key: {put_key}")
+                        logger.warning(
+                            f"Released old buffer for duplicate put_key: {put_key}"
+                        )
 
                 # Store: (src_addrs, lengths, holder, should_release, is_fast_path, created_at)
                 self._local_buffers[put_key] = (
@@ -733,7 +779,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 Buffer is auto-released internally after deserialization.
         """
         if self._closed:
-            raise RuntimeError("Cannot get data: MooncakeTransferEngineConnector is closed")
+            raise RuntimeError(
+                "Cannot get data: MooncakeTransferEngineConnector is closed"
+            )
 
         get_key = self._make_key(get_key, from_stage, to_stage)
 
@@ -742,7 +790,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # If no metadata provided, try to query from sender
         if not metadata:
             # Must insert sender info before using get() without metadata.
-            if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
+            if (
+                not self.sender_host
+                or not self.sender_zmq_port
+                or str(self.sender_host).lower() == "auto"
+            ):
                 raise RuntimeError(
                     f"get(metadata=None) requires sender info to be resolved, "
                     f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
@@ -768,7 +820,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return None
 
         if data_size == 0:
-            logger.warning(f"Skipping get for {get_key}: data_size is 0 (metadata={metadata})")
+            logger.warning(
+                f"Skipping get for {get_key}: data_size is 0 (metadata={metadata})"
+            )
             return None
 
         # 1. Allocate Destination Buffer from Pool
@@ -836,7 +890,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     #   - Fallback:       data = buf.to_bytes(); buf.release()
                     _t5 = _time_mod.perf_counter()
                     _total_ms = (_t5 - _t0) * 1000
-                    _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                    _mbps = (
+                        (data_size / 1024 / 1024) / (_total_ms / 1000)
+                        if _total_ms > 0
+                        else 0
+                    )
                     logger.info(
                         f"[RDMA GET] {get_key}: query={_query_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
                         f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, "
@@ -861,7 +919,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                         _deser_ms = (_t_deser_end - _t_deser_start) * 1000
 
                         _total_ms = (_t_deser_end - _t0) * 1000
-                        _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                        _mbps = (
+                            (data_size / 1024 / 1024) / (_total_ms / 1000)
+                            if _total_ms > 0
+                            else 0
+                        )
                         logger.info(
                             f"[RDMA GET] {get_key}: query={_query_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
                             f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, copy={_copy_ms:.1f}ms, "
@@ -885,7 +947,12 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             recv_buffer.release()
             return None
 
-    def cleanup(self, request_id: str, from_stage: str | None = None, to_stage: str | None = None) -> None:
+    def cleanup(
+        self,
+        request_id: str,
+        from_stage: str | None = None,
+        to_stage: str | None = None,
+    ) -> None:
         """Release the producer-side buffer associated with the request.
 
         Args:
@@ -1014,13 +1081,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         """
         now = _time_mod.monotonic()
         with self._local_buffers_lock:
-            stale_keys = [k for k, v in self._local_buffers.items() if now - v[5] > _BUFFER_TTL_SECONDS]
+            stale_keys = [
+                k
+                for k, v in self._local_buffers.items()
+                if now - v[5] > _BUFFER_TTL_SECONDS
+            ]
             for k in stale_keys:
                 item = self._local_buffers.pop(k)
                 _, _, holder, should_release, _, _ = item
                 if should_release and isinstance(holder, ManagedBuffer):
                     holder.release()
-                logger.warning(f"TTL expired ({_BUFFER_TTL_SECONDS}s): cleaned up stale buffer for {k}")
+                logger.warning(
+                    f"TTL expired ({_BUFFER_TTL_SECONDS}s): cleaned up stale buffer for {k}"
+                )
 
     def _zmq_listener_loop(self):
         socket = self.zmq_ctx.socket(zmq.ROUTER)
@@ -1030,7 +1103,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Any bind failure (EADDRINUSE, EADDRNOTAVAIL, EACCES, etc.)
             # is fatal for a sender — fail fast so __init__ propagates the error.
             # There is no silent receiver fallback; roles are explicitly assigned.
-            logger.error(f"ZMQ bind failed on {self.host}:{self.zmq_port}: {exc} (errno={exc.errno})")
+            logger.error(
+                f"ZMQ bind failed on {self.host}:{self.zmq_port}: {exc} (errno={exc.errno})"
+            )
             self.can_put = False
             self._bind_error = exc
             self._listener_ready.set()
@@ -1103,7 +1178,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             except Exception:
                 pass  # Best-effort cleanup during listener shutdown
 
-    def _handle_pull_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
+    def _handle_pull_request(
+        self, response_queue: queue.Queue, notify_addr: str, identity, payload
+    ):
         """
         Handle pull request or query request in worker thread.
         Results are put into response_queue and listener is notified via inproc.
@@ -1111,7 +1188,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         try:
             # Check if this is a query request
             if payload.startswith(QUERY_INFO):
-                self._handle_query_request(response_queue, notify_addr, identity, payload[len(QUERY_INFO) :])
+                self._handle_query_request(
+                    response_queue, notify_addr, identity, payload[len(QUERY_INFO) :]
+                )
                 return
 
             # Normal RDMA transfer request
@@ -1129,7 +1208,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
 
             # RDMA Write
-            ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
+            ret = self.engine.batch_transfer_sync_write(
+                remote_session, src_addrs, meta.dst_addrs, src_lengths
+            )
 
             if ret == 0:
                 self.cleanup(meta.request_id)
@@ -1151,7 +1232,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # Notify listener thread that response is ready
         self._notify_listener(notify_addr)
 
-    def _handle_query_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
+    def _handle_query_request(
+        self, response_queue: queue.Queue, notify_addr: str, identity, payload
+    ):
         """Handle metadata query request."""
         try:
             query = msgspec.msgpack.decode(payload, type=QueryRequest)

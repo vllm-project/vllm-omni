@@ -77,7 +77,10 @@ def test_eof_marker_when_finished_empty():
         request=_req("r", finished=True),
         is_finished=True,
     )
-    assert p == {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
+    assert p == {
+        "code_predictor_codes": [],
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
 
 
 def test_flush_on_finish():
@@ -256,7 +259,10 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
 
     first_payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
-        pooling_output={"audio_codes": torch.tensor([[1, 2, 3, 4]]), "ref_code": ref_code},
+        pooling_output={
+            "audio_codes": torch.tensor([[1, 2, 3, 4]]),
+            "ref_code": ref_code,
+        },
         request=_req(rid, finished=False, initial_codec_chunk_frames=10),
         is_finished=False,
     )
@@ -295,7 +301,9 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
         ],
         dtype=torch.long,
     )
-    output = SimpleNamespace(multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code})
+    output = SimpleNamespace(
+        multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code}
+    )
     stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])
 
     prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
@@ -335,7 +343,9 @@ def test_non_async_processor_filters_out_of_range_codec_values():
         ],
         dtype=torch.long,
     )
-    output = SimpleNamespace(multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code})
+    output = SimpleNamespace(
+        multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code}
+    )
     stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])
 
     prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])

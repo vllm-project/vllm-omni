@@ -32,7 +32,9 @@ def load_yaml(path: Path) -> dict:
         return yaml.safe_load(f)
 
 
-PYTEST_CMD_RE = re.compile(r"(?:timeout\s+\S+\s+)?(?:python3? -m\s+)?pytest\s+[^\n&|;]*")
+PYTEST_CMD_RE = re.compile(
+    r"(?:timeout\s+\S+\s+)?(?:python3? -m\s+)?pytest\s+[^\n&|;]*"
+)
 
 
 def normalize_commands(step: dict) -> list[str]:
@@ -127,7 +129,9 @@ def _parse_extra_args_from_line(raw_line: str) -> list[str]:
     return extra
 
 
-def _parse_collect_only_stdout(stdout: str, *, raise_on_empty: bool = True, stderr: str = "") -> list[str]:
+def _parse_collect_only_stdout(
+    stdout: str, *, raise_on_empty: bool = True, stderr: str = ""
+) -> list[str]:
     """
     Parse pytest --collect-only -q stdout into a list of node ids.
     Normalizes \\r\\n and \\r to \\n before splitting.
@@ -147,7 +151,9 @@ def _parse_collect_only_stdout(stdout: str, *, raise_on_empty: bool = True, stde
     return out
 
 
-def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_line: str) -> tuple[list[str], str, int]:
+def _resolve_pytest_target(
+    target: str, repo_root: Path, extra: list[str], raw_line: str
+) -> tuple[list[str], str, int]:
     """
     Resolve target + repo_root + extra to (path_args, fallback_path, timeout).
     Raises FileNotFoundError/RuntimeError on invalid config.
@@ -160,7 +166,9 @@ def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_l
         if any(ch in target for ch in ["*", "?", "["]):
             matches = sorted(repo_root.glob(rel.as_posix()))
             if not matches:
-                raise FileNotFoundError(f"Pytest target glob did not match any files: {repo_root / target}")
+                raise FileNotFoundError(
+                    f"Pytest target glob did not match any files: {repo_root / target}"
+                )
             return [str(p.resolve()) for p in matches], target.replace("\\", "/"), 90
 
         path = (repo_root / rel).resolve()
@@ -168,7 +176,9 @@ def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_l
             raise FileNotFoundError(f"Pytest target path does not exist: {path}")
         return [str(path)], target.replace("\\", "/"), 60
     if not extra:
-        raise RuntimeError(f"Failed to parse -m/--run-level from pytest line: {raw_line!r}")
+        raise RuntimeError(
+            f"Failed to parse -m/--run-level from pytest line: {raw_line!r}"
+        )
     if not (repo_root / "tests").exists():
         raise FileNotFoundError("tests/ directory not found under repo root")
     return ["tests/"], "tests/", 120
@@ -180,7 +190,9 @@ def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]
     target: path like tests/foo.py or marker string (e.g. "-m expr"). raw_line used for -m/--run-level.
     """
     extra = _parse_extra_args_from_line(raw_line)
-    path_args, _fallback, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
+    path_args, _fallback, timeout_quiet = _resolve_pytest_target(
+        target, repo_root, extra, raw_line
+    )
 
     cmd_quiet = [sys.executable, "-m", "pytest", *path_args, "--collect-only", "-q"]
     cmd_quiet.extend(extra)
@@ -192,8 +204,12 @@ def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]
         timeout=timeout_quiet,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"pytest --collect-only failed for {path_args} with args {extra}: {result.stderr.strip()}")
-    print(f"pytest --collect-only success for {path_args} with args {extra}: {result.stdout.strip()}")
+        raise RuntimeError(
+            f"pytest --collect-only failed for {path_args} with args {extra}: {result.stderr.strip()}"
+        )
+    print(
+        f"pytest --collect-only success for {path_args} with args {extra}: {result.stdout.strip()}"
+    )
     return _parse_collect_only_stdout(result.stdout or "", stderr=result.stderr or "")
 
 
@@ -224,7 +240,9 @@ def get_skip_status(target: str, raw_line: str, repo_root: Path) -> set[str]:
     """
     extra = _parse_extra_args_from_line(raw_line)
     try:
-        path_args, _, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
+        path_args, _, timeout_quiet = _resolve_pytest_target(
+            target, repo_root, extra, raw_line
+        )
     except (FileNotFoundError, RuntimeError):
         return set()
 
@@ -278,7 +296,11 @@ def get_docstring_for_node_id(repo_root: Path, node_id: str) -> str:
         target_class = parts[1]
         target_func = func_part
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == target_func and target_class is None:
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == target_func
+            and target_class is None
+        ):
             doc = ast.get_docstring(node)
             return (doc or "").strip()
         if isinstance(node, ast.ClassDef) and node.name == target_class:
@@ -301,7 +323,9 @@ def get_test_file_for_node_id(node_id: str) -> str:
     return "(marker-only / no collection)"
 
 
-def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Path | None = None) -> None:
+def write_html(
+    all_stats: list[tuple], out_path: Path, total: int, repo_root: Path | None = None
+) -> None:
     """Write stats to HTML with styling and responsive tables."""
     root = repo_root if repo_root is not None else REPO_ROOT
     pipeline_badges = {
@@ -321,9 +345,15 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         _, pipeline_name, _, _, _, _, count, _, _, _ = item
         pipeline_totals[pipeline_name] = pipeline_totals.get(pipeline_name, 0) + count
     pipeline_summary_rows = []
-    for idx, (pipeline_name, pipeline_count) in enumerate(sorted(pipeline_totals.items())):
+    for idx, (pipeline_name, pipeline_count) in enumerate(
+        sorted(pipeline_totals.items())
+    ):
         badge = pipeline_badges.get(pipeline_name, "")
-        badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
+        badge_span = (
+            f'<span class="badge {badge}">{esc(pipeline_name)}</span>'
+            if badge
+            else esc(pipeline_name)
+        )
         pipeline_summary_rows.append(
             f'<tr class="{tr_class(idx)}"><td>{badge_span}</td><td class="num">{pipeline_count}</td></tr>'
         )
@@ -340,7 +370,11 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         else:
             files_html = "<em>No explicit tests or markers</em>"
         badge = pipeline_badges.get(pipeline_name, "")
-        badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
+        badge_span = (
+            f'<span class="badge {badge}">{esc(pipeline_name)}</span>'
+            if badge
+            else esc(pipeline_name)
+        )
         summary_rows.append(
             f'<tr class="{tr_class(i)}">'
             f'<td>{badge_span}</td><td>{esc(label)}</td><td class="num">{count}</td>'
@@ -359,11 +393,17 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
               <th>Description</th>
             </tr>"""
     # Per-item: (pipeline_name, label, count, badge_span, suite_rows_html)
-    pipeline_suites: dict[str, list[tuple[str, int, str, str]]] = {}  # pipeline -> [(label, count, summary, body)]
+    pipeline_suites: dict[str, list[tuple[str, int, str, str]]] = (
+        {}
+    )  # pipeline -> [(label, count, summary, body)]
     for item in all_stats:
         _, pipeline_name, label, _, _, _, count, names, docstrings, skipped_ids = item
         badge = pipeline_badges.get(pipeline_name, "")
-        badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
+        badge_span = (
+            f'<span class="badge {badge}">{esc(pipeline_name)}</span>'
+            if badge
+            else esc(pipeline_name)
+        )
         suite_summary = f"{esc(label)} ({count} cases)"
         file_sections: list[str] = []
         if not names:
@@ -387,13 +427,17 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
                 if not desc and "::" in name and not name.startswith("["):
                     desc = get_docstring_for_node_id(root, name)
                 file_key = get_test_file_for_node_id(name)
-                file_groups.setdefault(file_key, []).append((name, desc, name in skipped_ids))
+                file_groups.setdefault(file_key, []).append(
+                    (name, desc, name in skipped_ids)
+                )
 
             for file_name in sorted(file_groups.keys()):
                 suite_rows = []
                 for i, (name, desc, is_skipped) in enumerate(file_groups[file_name], 1):
                     desc_html = esc(desc).replace("\n", "<br>") if desc else ""
-                    status_html = '<span class="badge skip">Skipped</span>' if is_skipped else "—"
+                    status_html = (
+                        '<span class="badge skip">Skipped</span>' if is_skipped else "—"
+                    )
                     suite_rows.append(
                         f'<tr class="{tr_class(i - 1)}">'
                         f'<td>{badge_span}</td><td>{esc(label)}</td><td class="files">{esc(file_name)}</td>'
@@ -420,7 +464,11 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         suites = pipeline_suites[pipeline_name]
         pipeline_total = sum(c for _, c, _, _ in suites)
         badge = pipeline_badges.get(pipeline_name, "")
-        badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
+        badge_span = (
+            f'<span class="badge {badge}">{esc(pipeline_name)}</span>'
+            if badge
+            else esc(pipeline_name)
+        )
         pipeline_summary = f"{badge_span} ({pipeline_total} cases)"
         inner_html = "".join(
             f'<details class="suite-details"><summary>{suite_summary}</summary>'
@@ -724,7 +772,9 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Count pytest cases from Buildkite pipelines")
+    parser = argparse.ArgumentParser(
+        description="Count pytest cases from Buildkite pipelines"
+    )
     parser.add_argument(
         "--buildkite-dir",
         type=Path,
@@ -769,7 +819,9 @@ def main() -> None:
             # marker_targets: synthetic marker targets (e.g. "-m expr", "-m expr --run-level level").
             marker_targets = [t for t, _ in targets if not t.endswith(".py")]
             # marker_only: all targets are marker expressions (no explicit .py files).
-            marker_only = bool(targets) and all(not t.endswith(".py") for t, _ in targets)
+            marker_only = bool(targets) and all(
+                not t.endswith(".py") for t, _ in targets
+            )
 
             names = []
             skipped_ids: set[str] = set()
@@ -779,7 +831,12 @@ def main() -> None:
                 names.extend(collected)
             count = len(names) - len(skipped_ids)
             docstrings = [
-                get_docstring_for_node_id(REPO_ROOT, n) if "::" in n and not n.startswith("[") else "" for n in names
+                (
+                    get_docstring_for_node_id(REPO_ROOT, n)
+                    if "::" in n and not n.startswith("[")
+                    else ""
+                )
+                for n in names
             ]
             all_stats.append(
                 (

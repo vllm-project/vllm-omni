@@ -142,10 +142,42 @@ def create_demo(server_url: str):
         # Examples
         gr.Examples(
             examples=[
-                ["A beautiful landscape painting with misty mountains", "", 1024, 1024, 100, 4.0, 42],
-                ["A cute cat sitting on a windowsill with sunlight", "", 1024, 1024, 100, 4.0, 123],
-                ["Cyberpunk style futuristic city with neon lights", "blurry, low quality", 1024, 768, 100, 4.0, 456],
-                ["Chinese ink painting of bamboo forest with a house", "", 768, 1024, 100, 4.0, 789],
+                [
+                    "A beautiful landscape painting with misty mountains",
+                    "",
+                    1024,
+                    1024,
+                    100,
+                    4.0,
+                    42,
+                ],
+                [
+                    "A cute cat sitting on a windowsill with sunlight",
+                    "",
+                    1024,
+                    1024,
+                    100,
+                    4.0,
+                    123,
+                ],
+                [
+                    "Cyberpunk style futuristic city with neon lights",
+                    "blurry, low quality",
+                    1024,
+                    768,
+                    100,
+                    4.0,
+                    456,
+                ],
+                [
+                    "Chinese ink painting of bamboo forest with a house",
+                    "",
+                    768,
+                    1024,
+                    100,
+                    4.0,
+                    789,
+                ],
             ],
             inputs=[prompt, negative_prompt, height, width, steps, cfg_scale, seed],
         )

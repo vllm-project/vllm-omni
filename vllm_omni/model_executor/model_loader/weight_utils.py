@@ -45,7 +45,9 @@ def download_weights_from_hf_specific(
     """
     assert len(allow_patterns) > 0
     local_only = huggingface_hub.constants.HF_HUB_OFFLINE
-    download_kwargs = {"tqdm_class": DisabledTqdm} if not envs.VLLM_USE_MODELSCOPE else {}
+    download_kwargs = (
+        {"tqdm_class": DisabledTqdm} if not envs.VLLM_USE_MODELSCOPE else {}
+    )
 
     logger.info("Using model weights format %s", allow_patterns)
     # Use file lock to prevent multiple processes from

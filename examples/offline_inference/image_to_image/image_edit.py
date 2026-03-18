@@ -159,13 +159,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--guidance-scale-2", type=float, default=None, help="image guidance scale for image-to-image generation."
+        "--guidance-scale-2",
+        type=float,
+        default=None,
+        help="image guidance scale for image-to-image generation.",
     )
     parser.add_argument(
         "--output",
         type=str,
         default="output_image_edit.png",
-        help=("Path to save the edited image (PNG). Or prefix for Qwen-Image-Layered model save images(PNG)."),
+        help=(
+            "Path to save the edited image (PNG). Or prefix for Qwen-Image-Layered model save images(PNG)."
+        ),
     )
     parser.add_argument(
         "--num-outputs-per-prompt",
@@ -213,7 +218,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable expert parallelism for MoE layers.",
     )
-    parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=4,
+        help="Number of layers to decompose the input image into.",
+    )
     parser.add_argument(
         "--resolution",
         type=int,
@@ -346,7 +356,9 @@ def main():
     else:
         input_image = input_images
 
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(
+        args.seed
+    )
 
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
@@ -400,7 +412,9 @@ def main():
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(
+        f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}"
+    )
     if isinstance(input_image, list):
         print(f"  Number of input images: {len(input_image)}")
         for idx, img in enumerate(input_image):
@@ -440,7 +454,9 @@ def main():
     generation_time = generation_end - generation_start
 
     # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+    print(
+        f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)"
+    )
 
     if profiler_enabled:
         print("\n[Profiler] Stopping profiler and collecting results...")

@@ -21,7 +21,11 @@ class StageStats:
 
     @property
     def avg_tokens_per_s(self) -> float:
-        return (self.total_token * 1000.0 / self.total_gen_time_ms) if self.total_gen_time_ms > 0 else 0.0
+        return (
+            (self.total_token * 1000.0 / self.total_gen_time_ms)
+            if self.total_gen_time_ms > 0
+            else 0.0
+        )
 
 
 @dataclass
@@ -45,14 +49,19 @@ class StageRequestStats:
     @property
     def rx_mbps(self) -> float:
         return (
-            (float(self.rx_transfer_bytes) * 8.0) / (max(float(self.rx_decode_time_ms), 1e-6) * 1000.0)
+            (float(self.rx_transfer_bytes) * 8.0)
+            / (max(float(self.rx_decode_time_ms), 1e-6) * 1000.0)
             if self.rx_transfer_bytes > 0
             else 0.0
         )
 
     @property
     def tokens_per_s(self) -> float:
-        return (self.num_tokens_out * 1000.0 / self.stage_gen_time_ms) if (self.stage_gen_time_ms > 0) else 0.0
+        return (
+            (self.num_tokens_out * 1000.0 / self.stage_gen_time_ms)
+            if (self.stage_gen_time_ms > 0)
+            else 0.0
+        )
 
 
 @dataclass
@@ -68,7 +77,11 @@ class TransferEdgeStats:
 
     @property
     def total_time_ms(self) -> float:
-        return float(self.tx_time_ms) + float(self.rx_decode_time_ms) + float(self.in_flight_time_ms)
+        return (
+            float(self.tx_time_ms)
+            + float(self.rx_decode_time_ms)
+            + float(self.in_flight_time_ms)
+        )
 
 
 @dataclass
@@ -81,7 +94,11 @@ class RequestE2EStats:
 
     @property
     def e2e_tpt(self) -> float:
-        return (self.e2e_total_ms / self.e2e_total_tokens) if self.e2e_total_tokens > 0 else 0.0
+        return (
+            (self.e2e_total_ms / self.e2e_total_tokens)
+            if self.e2e_total_tokens > 0
+            else 0.0
+        )
 
 
 # === Field Configuration ===
@@ -108,7 +125,9 @@ E2E_EXCLUDE = {"request_id"}
 # Decide the order of overall summary fields, or None for auto
 OVERALL_FIELDS: list[str] | None = None
 STAGE_FIELDS = _build_field_defs(StageRequestStats, STAGE_EXCLUDE, FIELD_TRANSFORMS)
-TRANSFER_FIELDS = _build_field_defs(TransferEdgeStats, TRANSFER_EXCLUDE, FIELD_TRANSFORMS)
+TRANSFER_FIELDS = _build_field_defs(
+    TransferEdgeStats, TRANSFER_EXCLUDE, FIELD_TRANSFORMS
+)
 E2E_FIELDS = _build_field_defs(RequestE2EStats, E2E_EXCLUDE, FIELD_TRANSFORMS)
 
 
@@ -125,9 +144,9 @@ class OrchestratorAggregator:
         self.final_stage_id_for_e2e = final_stage_id_for_e2e
         self.init_run_state(wall_start_ts)
         self.stage_events: dict[str, list[StageRequestStats]] = {}
-        self.transfer_events: dict[
-            tuple[int, int, str], TransferEdgeStats
-        ] = {}  # Key: (from_stage, to_stage, request_id)
+        self.transfer_events: dict[tuple[int, int, str], TransferEdgeStats] = (
+            {}
+        )  # Key: (from_stage, to_stage, request_id)
         self.e2e_events: list[RequestE2EStats] = []
 
     def init_run_state(self, wall_start_ts: float) -> None:
@@ -141,8 +160,8 @@ class OrchestratorAggregator:
         self.last_finish_ts = float(wall_start_ts)
         self.stage_first_ts = [None for _ in range(self.num_stages)]
         self.stage_last_ts = [None for _ in range(self.num_stages)]
-        self.accumulated_gen_time_ms: defaultdict[str, defaultdict[int, float]] = defaultdict(
-            lambda: defaultdict(float)
+        self.accumulated_gen_time_ms: defaultdict[str, defaultdict[int, float]] = (
+            defaultdict(lambda: defaultdict(float))
         )  # {request_id: {stage_id:accumulated_gen_time_ms}}
         self.diffusion_metrics: defaultdict[str, defaultdict[str, float]] = defaultdict(
             lambda: defaultdict(float)
@@ -223,12 +242,19 @@ class OrchestratorAggregator:
         try:
             if (
                 output_to_yield.final_output_type == "audio"
-                and (multimodal_output := output_to_yield.multimodal_output.get("audio")) is not None
+                and (
+                    multimodal_output := output_to_yield.multimodal_output.get("audio")
+                )
+                is not None
                 and len(multimodal_output) > 0
             ):
                 nframes = sum(
                     int(t.shape[0]) if t.ndim > 0 else 1
-                    for t in (multimodal_output if isinstance(multimodal_output, list) else [multimodal_output])
+                    for t in (
+                        multimodal_output
+                        if isinstance(multimodal_output, list)
+                        else [multimodal_output]
+                    )
                 )
                 stage_events_for_req = self.stage_events.get(request_id, [])
                 if stage_events_for_req:
@@ -295,7 +321,11 @@ class OrchestratorAggregator:
             # 4. Finished with output: assign text metrics if available
             output_to_yield.metrics = {}
             stage_event = next(
-                (evt for evt in reversed(self.stage_events.get(req_id, [])) if evt.stage_id == stage_id),
+                (
+                    evt
+                    for evt in reversed(self.stage_events.get(req_id, []))
+                    if evt.stage_id == stage_id
+                ),
                 None,
             )
             if stage_event is not None and stage_event.final_output_type == "text":
@@ -342,7 +372,9 @@ class OrchestratorAggregator:
         metrics: StageRequestStats,
         final_output_type: str | None = None,
     ) -> None:
-        stats = self._as_stage_request_stats(stage_id, req_id, metrics, final_output_type)
+        stats = self._as_stage_request_stats(
+            stage_id, req_id, metrics, final_output_type
+        )
         self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_out)
         if stats.stage_id == 0:
             self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_in)
@@ -350,7 +382,9 @@ class OrchestratorAggregator:
 
         self.record_transfer_rx(stats)
 
-    def record_stage_postprocess_time(self, stage_id: int, req_id: Any, postproc_time_ms: float) -> None:
+    def record_stage_postprocess_time(
+        self, stage_id: int, req_id: Any, postproc_time_ms: float
+    ) -> None:
         if req_id in self.stage_events:
             for stats in self.stage_events[req_id]:
                 if stats.stage_id == stage_id:
@@ -378,7 +412,9 @@ class OrchestratorAggregator:
             _postproc_ms = (time.perf_counter() - _t0) * 1000.0
             self.record_stage_postprocess_time(stage_id, req_id, _postproc_ms)
 
-    def accumulate_diffusion_metrics(self, stage_type: str, req_id: Any, engine_outputs: Any) -> None:
+    def accumulate_diffusion_metrics(
+        self, stage_type: str, req_id: Any, engine_outputs: Any
+    ) -> None:
         """Accumulate diffusion metrics for a request.
 
         Handles extraction and accumulation of diffusion stage metrics.
@@ -389,7 +425,11 @@ class OrchestratorAggregator:
         """
         if stage_type != "diffusion":
             return
-        engine_output = engine_outputs[0] if isinstance(engine_outputs, list) and engine_outputs else engine_outputs
+        engine_output = (
+            engine_outputs[0]
+            if isinstance(engine_outputs, list) and engine_outputs
+            else engine_outputs
+        )
         diffusion_metrics: dict = getattr(engine_output, "metrics", {})
         if isinstance(diffusion_metrics, list):
             diffusion_metrics = diffusion_metrics[0]
@@ -453,10 +493,18 @@ class OrchestratorAggregator:
             e2e_total_ms=e2e_ms,
             e2e_total_tokens=total_tokens,
             transfers_total_time_ms=float(
-                sum(evt.total_time_ms for evt in self.transfer_events.values() if evt.request_id == rid_key)
+                sum(
+                    evt.total_time_ms
+                    for evt in self.transfer_events.values()
+                    if evt.request_id == rid_key
+                )
             ),
             transfers_total_bytes=int(
-                sum(evt.size_bytes for evt in self.transfer_events.values() if evt.request_id == rid_key)
+                sum(
+                    evt.size_bytes
+                    for evt in self.transfer_events.values()
+                    if evt.request_id == rid_key
+                )
             ),
         )
         self.e2e_events.append(per_req_record)
@@ -466,7 +514,9 @@ class OrchestratorAggregator:
             return {}
         wall_time_ms = max(0.0, (self.last_finish_ts - self.wall_start_ts) * 1000.0)
         e2e_avg_req = (wall_time_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
-        e2e_avg_tok = (self.e2e_total_tokens * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
+        e2e_avg_tok = (
+            (self.e2e_total_tokens * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
+        )
 
         if isinstance(self.final_stage_id_for_e2e, int):
             final_stage_id_map: dict[str, int] = {"*": int(self.final_stage_id_for_e2e)}
@@ -474,9 +524,14 @@ class OrchestratorAggregator:
             final_stage_id_map = self.final_stage_id_for_e2e
 
         stage_wall_time_ms = [
-            ((self.stage_last_ts[i] - self.stage_first_ts[i]) * 1000.0)
-            if (self.stage_first_ts[i] is not None and self.stage_last_ts[i] is not None)
-            else 0.0
+            (
+                ((self.stage_last_ts[i] - self.stage_first_ts[i]) * 1000.0)
+                if (
+                    self.stage_first_ts[i] is not None
+                    and self.stage_last_ts[i] is not None
+                )
+                else 0.0
+            )
             for i in range(self.num_stages)
         ]
 
@@ -504,7 +559,9 @@ class OrchestratorAggregator:
                 _format_table("Overall Summary", overall_summary, overall_fields),
             )
 
-        all_request_ids = sorted(set(self.stage_events.keys()) | {e.request_id for e in self.e2e_events})
+        all_request_ids = sorted(
+            set(self.stage_events.keys()) | {e.request_id for e in self.e2e_events}
+        )
 
         result_stage_table = []
         result_trans_table = []
@@ -542,10 +599,14 @@ class OrchestratorAggregator:
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
             # because it is already included in diffusion_metrics
             local_exclude = STAGE_EXCLUDE.copy()
-            has_diffusion_metrics = any(getattr(evt, "diffusion_metrics", None) for evt in stage_evts)
+            has_diffusion_metrics = any(
+                getattr(evt, "diffusion_metrics", None) for evt in stage_evts
+            )
             if has_diffusion_metrics:
                 local_exclude.add("postprocess_time_ms")
-            local_stage_fields = _build_field_defs(StageRequestStats, local_exclude, FIELD_TRANSFORMS)
+            local_stage_fields = _build_field_defs(
+                StageRequestStats, local_exclude, FIELD_TRANSFORMS
+            )
 
             # if diffusion_metrics is present, expand it into multiple columns
             # then remove diffusion_metrics from the table
@@ -594,7 +655,10 @@ class OrchestratorAggregator:
                 key=lambda e: (e.from_stage, e.to_stage),
             )
             transfer_rows = [
-                {"edge": f"{evt.from_stage}->{evt.to_stage}", **_build_row(evt, TRANSFER_FIELDS)}
+                {
+                    "edge": f"{evt.from_stage}->{evt.to_stage}",
+                    **_build_row(evt, TRANSFER_FIELDS),
+                }
                 for evt in transfer_evts
             ]
             result_trans_table.append({"request_id": rid, "transfers": transfer_rows})

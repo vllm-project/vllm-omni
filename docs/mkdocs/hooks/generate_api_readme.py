@@ -83,7 +83,9 @@ class APIVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def parse_file_for_symbols(file_path: Path, module_path: str) -> tuple[list[str], list[str]]:
+def parse_file_for_symbols(
+    file_path: Path, module_path: str
+) -> tuple[list[str], list[str]]:
     """
     Parse a Python file and extract public classes and functions.
 
@@ -134,7 +136,9 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
 
             # Get module path
             relative_path = py_file.relative_to(ROOT_DIR)
-            module_path = str(relative_path.with_suffix("")).replace("/", ".").replace("\\", ".")
+            module_path = (
+                str(relative_path.with_suffix("")).replace("/", ".").replace("\\", ".")
+            )
 
             # Skip excluded modules (avoid importing vllm during docs build)
             excluded_prefixes = [
@@ -220,7 +224,9 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
             # Add important functions (parse, preprocess, etc.)
             for func_name in functions:
                 # Include functions that match certain patterns
-                if any(keyword in func_name.lower() for keyword in ["parse", "preprocess"]):
+                if any(
+                    keyword in func_name.lower() for keyword in ["parse", "preprocess"]
+                ):
                     categorized[category].append(func_name)
 
         # Sort symbols within each category

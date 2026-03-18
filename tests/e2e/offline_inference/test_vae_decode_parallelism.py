@@ -71,7 +71,15 @@ def is_nextstep_model(model_name: str) -> bool:
     return False
 
 
-def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, vae_patch_parallel_size=1):
+def model_run(
+    model_configs,
+    tp,
+    out_height,
+    out_width,
+    out_frames,
+    using_tile,
+    vae_patch_parallel_size=1,
+):
     try:
         parallel_config = DiffusionParallelConfig(
             tensor_parallel_size=tp,
@@ -100,7 +108,9 @@ def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, 
                 width=model_configs["out_width"],
                 num_frames=model_configs["out_frames"],
                 num_inference_steps=2,
-                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+                generator=torch.Generator(
+                    current_omni_platform.device_type
+                ).manual_seed(42),
             ),
         )
         end = time.perf_counter()

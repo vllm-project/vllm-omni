@@ -6,7 +6,9 @@ from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 
-def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBackend | None:
+def get_cache_backend(
+    cache_backend: str | None, cache_config: Any
+) -> CacheBackend | None:
     """Get cache backend instance based on cache_backend string.
 
     This is a selector function that routes to the appropriate backend implementation.
@@ -35,4 +37,6 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     elif cache_backend == "tea_cache":
         return TeaCacheBackend(cache_config)
     else:
-        raise ValueError(f"Unsupported cache backend: {cache_backend}. Supported: 'cache_dit', 'tea_cache'")
+        raise ValueError(
+            f"Unsupported cache backend: {cache_backend}. Supported: 'cache_dit', 'tea_cache'"
+        )

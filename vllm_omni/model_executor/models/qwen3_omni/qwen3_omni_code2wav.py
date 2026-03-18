@@ -72,20 +72,26 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         self.config: Qwen3OmniMoeCode2WavConfig = vllm_config.model_config.hf_config
 
         # Calculate total upsampling factor
-        self.total_upsample = np.prod(self.config.upsample_rates + self.config.upsampling_ratios)
+        self.total_upsample = np.prod(
+            self.config.upsample_rates + self.config.upsampling_ratios
+        )
 
         # Pre-transformer
-        self.pre_transformer = Qwen3OmniMoeCode2WavTransformerModel._from_config(self.config)
+        self.pre_transformer = Qwen3OmniMoeCode2WavTransformerModel._from_config(
+            self.config
+        )
 
         # Code embedding: Single embedding table for all RVQ layers
         self.code_embedding = nn.Embedding(
-            self.config.codebook_size * self.config.num_quantizers, self.config.hidden_size
+            self.config.codebook_size * self.config.num_quantizers,
+            self.config.hidden_size,
         )
 
         # Offset for each RVQ layer (layer 0: 0-1023, layer 1: 1024-2047, etc.)
         self.register_buffer(
             "code_offset",
-            torch.arange(self.config.num_quantizers).view(1, -1, 1) * self.config.codebook_size,
+            torch.arange(self.config.num_quantizers).view(1, -1, 1)
+            * self.config.codebook_size,
             persistent=False,
         )
 
@@ -96,7 +102,10 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 nn.ModuleList(
                     [
                         Qwen3OmniMoeCausalTransConvNet(
-                            self.config.hidden_size, self.config.hidden_size, factor, factor
+                            self.config.hidden_size,
+                            self.config.hidden_size,
+                            factor,
+                            factor,
                         ),
                         Qwen3OmniMoeConvNeXtBlock(self.config.hidden_size),
                     ]
@@ -105,7 +114,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         self.upsample = nn.ModuleList(upsample)
 
         # Decoder: Initial projection + progressive upsampling blocks
-        decoder = [Qwen3OmniMoeCausalConvNet(self.config.hidden_size, self.config.decoder_dim, kernel_size=7)]
+        decoder = [
+            Qwen3OmniMoeCausalConvNet(
+                self.config.hidden_size, self.config.decoder_dim, kernel_size=7
+            )
+        ]
 
         # Add decoder blocks (each upsamples and reduces channels)
         for i in range(len(self.config.upsample_rates)):
@@ -130,7 +143,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             waveform: [batch, 1, waveform_len] - Audio waveform clipped to [-1, 1]
         """
         if codes.shape[1] != self.config.num_quantizers:
-            raise ValueError(f"Expected {self.config.num_quantizers} layers of codes, got {codes.shape[1]}")
+            raise ValueError(
+                f"Expected {self.config.num_quantizers} layers of codes, got {codes.shape[1]}"
+            )
 
         # Stage 1: Code Embedding
         # Add offset to separate layer vocabularies, then embed and average
@@ -185,7 +200,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
 
         while start_index < codes.shape[-1]:
             end_index = min(start_index + chunk_size, codes.shape[-1])
-            context_size = left_context_size if start_index >= left_context_size else start_index
+            context_size = (
+                left_context_size if start_index >= left_context_size else start_index
+            )
 
             # Extract chunk with left context
             codes_chunk = codes[..., start_index - context_size : end_index]
@@ -199,7 +216,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             start_index = end_index
 
         if seq_token_counts is not None:
-            code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in seq_token_counts]
+            code_seq_lens = [
+                seq_len // self.config.num_quantizers for seq_len in seq_token_counts
+            ]
         else:
             # Fallback: assume all batch elements share the same sequence length.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
@@ -233,7 +252,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
-        if not (left_context_size and seq_token_counts and len(left_context_size) == len(seq_token_counts)):
+        if not (
+            left_context_size
+            and seq_token_counts
+            and len(left_context_size) == len(seq_token_counts)
+        ):
             logger.warning(
                 "chunked_decode_streaming: missing/invalid left_context_size or seq_token_counts; "
                 "defaulting to left_context_size=zeros(len=codes.shape[0])."
@@ -250,7 +273,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         for idx, code_seq_len in enumerate(code_seq_lens):
             # Remove context from output (left_context_size * total_upsample samples)
             wav_chunk = batch_wav[
-                idx, :, left_context_size[idx] * self.total_upsample : code_seq_len * self.total_upsample
+                idx,
+                :,
+                left_context_size[idx]
+                * self.total_upsample : code_seq_len
+                * self.total_upsample,
             ]
             wavs.append(wav_chunk)
         return wavs

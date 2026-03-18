@@ -14,7 +14,11 @@ from vllm.v1.request import Request as _OriginalRequest
 from vllm.v1.request import RequestStatus
 
 import vllm_omni.logger  # noqa: F401
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.engine import (
+    OmniEngineCoreOutput,
+    OmniEngineCoreOutputs,
+    OmniEngineCoreRequest,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest
@@ -36,7 +40,10 @@ try:
         # Ensure rope_parameters exists and contains mrope_section
         if self.rope_parameters is None:
             self.rope_parameters = {}
-        if isinstance(self.rope_parameters, dict) and "mrope_section" not in self.rope_parameters:
+        if (
+            isinstance(self.rope_parameters, dict)
+            and "mrope_section" not in self.rope_parameters
+        ):
             # GLM-Image uses mrope_section: [8, 12, 12] for T/H/W dimensions
             self.rope_parameters["mrope_section"] = [8, 12, 12]
 
@@ -53,7 +60,10 @@ _orig_is_mm_prefix_lm = _ModelConfig.__dict__["is_mm_prefix_lm"].func
 
 @_cached_property
 def _patched_is_mm_prefix_lm(self) -> bool:
-    return _orig_is_mm_prefix_lm(self) or getattr(self.hf_config, "model_type", None) == "bagel"
+    return (
+        _orig_is_mm_prefix_lm(self)
+        or getattr(self.hf_config, "model_type", None) == "bagel"
+    )
 
 
 _patched_is_mm_prefix_lm.__set_name__(_ModelConfig, "is_mm_prefix_lm")
@@ -69,15 +79,27 @@ for module_name, module in sys.modules.items():
     # only do patch on module of vllm, pass others
     if "vllm" not in module_name:
         continue
-    if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
+    if (
+        hasattr(module, "EngineCoreOutput")
+        and module.EngineCoreOutput == _OriginalEngineCoreOutput
+    ):
         module.EngineCoreOutput = OmniEngineCoreOutput
-    if hasattr(module, "EngineCoreOutputs") and module.EngineCoreOutputs == _OriginalEngineCoreOutputs:
+    if (
+        hasattr(module, "EngineCoreOutputs")
+        and module.EngineCoreOutputs == _OriginalEngineCoreOutputs
+    ):
         module.EngineCoreOutputs = OmniEngineCoreOutputs
     if hasattr(module, "TokensPrompt") and module.TokensPrompt == _OriginalTokensPrompt:
         module.TokensPrompt = OmniTokensPrompt
-    if hasattr(module, "MRotaryEmbedding") and module.MRotaryEmbedding == _OriginalMRotaryEmbedding:
+    if (
+        hasattr(module, "MRotaryEmbedding")
+        and module.MRotaryEmbedding == _OriginalMRotaryEmbedding
+    ):
         module.MRotaryEmbedding = OmniMRotaryEmbedding
     if hasattr(module, "Request") and module.Request == _OriginalRequest:
         module.Request = OmniRequest
-    if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
+    if (
+        hasattr(module, "EngineCoreRequest")
+        and module.EngineCoreRequest == _OriginalEngineCoreRequest
+    ):
         module.EngineCoreRequest = OmniEngineCoreRequest

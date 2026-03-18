@@ -145,7 +145,9 @@ def get_video_query(
             raise FileNotFoundError(f"Video file not found: {video_path}")
         video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
     else:
-        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+        video_frames = VideoAsset(
+            name="baby_reading", num_frames=num_frames
+        ).np_ndarrays
     return QueryResult(
         inputs={
             "prompt": prompt,
@@ -250,7 +252,11 @@ async def run_single_request(
                             first_audio_ts = time.perf_counter()
                         if audio_sr is None and "sr" in mm_out:
                             sr_val = mm_out["sr"]
-                            audio_sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                            audio_sr = (
+                                sr_val.item()
+                                if hasattr(sr_val, "item")
+                                else int(sr_val)
+                            )
                             samplerate = audio_sr
                         audio_data = mm_out["audio"]
                         if isinstance(audio_data, list):
@@ -272,7 +278,9 @@ async def run_single_request(
                                     subtype="FLOAT",
                                 )
                             for chunk in new_chunks:
-                                chunk_np = chunk.float().detach().cpu().numpy().flatten()
+                                chunk_np = (
+                                    chunk.float().detach().cpu().numpy().flatten()
+                                )
                                 sf_writer.write(chunk_np)
                                 audio_samples_written += len(chunk_np)
                         else:
@@ -363,13 +371,18 @@ async def run_all(args):
 
     # Build prompt list
     if args.txt_prompts is not None:
-        assert args.query_type == "text", "txt-prompts is only supported for text query type"
+        assert (
+            args.query_type == "text"
+        ), "txt-prompts is only supported for text query type"
         with open(args.txt_prompts, encoding="utf-8") as f:
             lines = [ln.strip() for ln in f if ln.strip()]
         prompts = [get_text_query(ln).inputs for ln in lines]
         print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
     else:
-        prompts = [clone_prompt_for_request(query_result.inputs) for _ in range(args.num_prompts)]
+        prompts = [
+            clone_prompt_for_request(query_result.inputs)
+            for _ in range(args.num_prompts)
+        ]
 
     # Inject output modalities if specified
     output_modalities = None
@@ -379,7 +392,9 @@ async def run_all(args):
             prompt["modalities"] = output_modalities
 
     # Create AsyncOmni
-    print(f"[Info] Creating AsyncOmni with stage_configs_path={args.stage_configs_path}")
+    print(
+        f"[Info] Creating AsyncOmni with stage_configs_path={args.stage_configs_path}"
+    )
     async_omni = None
     try:
         async_omni = AsyncOmni(
@@ -434,7 +449,9 @@ async def run_all(args):
             else:
                 success_count += 1
                 total_audio_dur += r.get("audio_duration_s", 0.0)
-                print(f"  [{r['request_id']}] e2e={r['e2e_latency_s']:.3f}s  files={r['saved_files']}")
+                print(
+                    f"  [{r['request_id']}] e2e={r['e2e_latency_s']:.3f}s  files={r['saved_files']}"
+                )
         wall_time = wall_end - wall_start
         print(f"\nTotal: {success_count}/{len(prompts)} succeeded")
         print(f"Wall time: {wall_time:.3f}s")

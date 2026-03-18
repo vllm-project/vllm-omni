@@ -12,7 +12,6 @@ Easy, fast, and cheap omni-modality model serving for everyone
 | <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1XJWgv79lORl8rbaVvp2d5Sqs6ZEBgAgj/edit?slide=id.p1#slide=id.p1"><b>Slides</b></a> |
 </p>
 
-
 ---
 
 *Latest News* 🔥
@@ -95,3 +94,44 @@ Feel free to ask questions, provide feedbacks and discuss with fellow users of v
 ## License
 
 Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
+
+### New Model: VoXtream2
+
+We are excited to announce the support for the new model **VoXtream2**. This model is a 0.5B parameter zero-shot full-stream Text-to-Speech model with dynamic speaking-rate control.
+
+#### Architecture
+
+VoXtream2 uses a fully autoregressive, codec-based TTS architecture with three transformer components:
+
+- Incremental Phoneme Transformer (streaming phoneme processing)
+- Temporal Transformer (semantic + duration tokens via monotonic alignment)
+- Depth Transformer (acoustic codec token generation)
+
+#### Audio Codec
+
+VoXtream2 uses the Mimi (Kyutai) audio codec with 16 codebooks.
+
+#### Speaker Encoder
+
+VoXtream2 uses the ReDimNet speaker encoder for zero-shot voice cloning from 3-10s audio prompt.
+
+#### Output
+
+VoXtream2 generates 24kHz streaming WAV audio.
+
+#### VRAM and Latency
+
+VoXtream2 requires 2.2-4.2 GB VRAM and has a latency of 74ms first-packet.
+
+#### Key Features
+
+VoXtream2 has the following key features:
+
+- Dynamic mid-utterance speaking-rate control via distribution matching + classifier-free guidance
+- Textless voice prompting (prompt-text masking)
+
+#### Paper
+
+The paper for VoXtream2 can be found at [arXiv:2603.13518](https://arxiv.org/abs/2603.13518).
+
+#### License

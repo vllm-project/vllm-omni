@@ -42,10 +42,14 @@ def parse_size(size_str: str) -> tuple[int, int]:
         width = int(parts[0])
         height = int(parts[1])
     except ValueError:
-        raise ValueError(f"Invalid size format: '{size_str}'. Width and height must be integers.")
+        raise ValueError(
+            f"Invalid size format: '{size_str}'. Width and height must be integers."
+        )
 
     if width <= 0 or height <= 0:
-        raise ValueError(f"Invalid size: {width}x{height}. Width and height must be positive integers.")
+        raise ValueError(
+            f"Invalid size: {width}x{height}. Width and height must be positive integers."
+        )
 
     return width, height
 

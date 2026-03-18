@@ -31,7 +31,9 @@ def _get_mel_basis(
     fmax: float | None,
     device_str: str,
 ) -> torch.Tensor:
-    mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+    mel = librosa_mel_fn(
+        sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
+    )
     return torch.from_numpy(mel).float().to(torch.device(device_str))
 
 
@@ -40,7 +42,9 @@ def _get_hann_window(win_size: int, device_str: str) -> torch.Tensor:
     return torch.hann_window(win_size).to(torch.device(device_str))
 
 
-def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
+def mel_spectrogram(
+    y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False
+):
     device_str = str(y.device)
     mel = _get_mel_basis(
         int(sampling_rate),
@@ -53,7 +57,9 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
     window = _get_hann_window(int(win_size), device_str)
 
     y = torch.nn.functional.pad(
-        y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
+        y.unsqueeze(1),
+        (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
+        mode="reflect",
     )
     y = y.squeeze(1)
 
@@ -95,7 +101,9 @@ def load_wav(wav, target_sr, min_sr=16000):
                 f"Minimum required: {min_sr} Hz, target: {target_sr} Hz. "
                 f"Please provide audio with sample rate >= {min_sr} Hz."
             )
-        speech = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr)(speech)
+        speech = torchaudio.transforms.Resample(
+            orig_freq=sample_rate, new_freq=target_sr
+        )(speech)
 
     speech = speech.to(dtype=torch.float32)
     return speech
@@ -201,21 +209,30 @@ def log_mel_spectrogram(
 
 def extract_speech_token(prompt_wav, speech_tokenizer_session, device):
     speech = load_wav(prompt_wav, 16000)
-    assert speech.shape[1] / 16000 <= 30, "do not support extract speech token for audio longer than 30s"
+    assert (
+        speech.shape[1] / 16000 <= 30
+    ), "do not support extract speech token for audio longer than 30s"
     feat = log_mel_spectrogram(speech, n_mels=128)
     speech_token = (
         speech_tokenizer_session.run(
             None,
             {
-                speech_tokenizer_session.get_inputs()[0].name: feat.detach().cpu().numpy(),
-                speech_tokenizer_session.get_inputs()[1].name: np.array([feat.shape[2]], dtype=np.int32),
+                speech_tokenizer_session.get_inputs()[0]
+                .name: feat.detach()
+                .cpu()
+                .numpy(),
+                speech_tokenizer_session.get_inputs()[1].name: np.array(
+                    [feat.shape[2]], dtype=np.int32
+                ),
             },
         )[0]
         .flatten()
         .tolist()
     )
     speech_token = torch.tensor([speech_token], dtype=torch.int32).to(device)
-    speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(device)
+    speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(
+        device
+    )
     return speech_token, speech_token_len
 
 
@@ -224,7 +241,15 @@ def extract_spk_embedding(prompt_wav, campplus_session, device):
     feat = kaldi.fbank(speech, num_mel_bins=80, dither=0, sample_frequency=16000)
     feat = feat - feat.mean(dim=0, keepdim=True)
     embedding = (
-        campplus_session.run(None, {campplus_session.get_inputs()[0].name: feat.unsqueeze(dim=0).cpu().numpy()})[0]
+        campplus_session.run(
+            None,
+            {
+                campplus_session.get_inputs()[0]
+                .name: feat.unsqueeze(dim=0)
+                .cpu()
+                .numpy()
+            },
+        )[0]
         .flatten()
         .tolist()
     )

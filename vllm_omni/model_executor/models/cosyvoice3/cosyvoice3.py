@@ -13,7 +13,11 @@ from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalDataDict, MultiModalFieldConfig, MultiModalKwargsItems
+from vllm.multimodal.inputs import (
+    MultiModalDataDict,
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+)
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
@@ -60,19 +64,27 @@ class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
         )
 
 
-class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModalProcessingInfo]):
-    def _ensure_cached_runtime_components(self, model_dir: str, config: CosyVoice3Config) -> None:
+class CosyVoice3MultiModalProcessor(
+    BaseMultiModalProcessor[CosyVoice3MultiModalProcessingInfo]
+):
+    def _ensure_cached_runtime_components(
+        self, model_dir: str, config: CosyVoice3Config
+    ) -> None:
         cached_model_dir = getattr(self, "_cached_model_dir", None)
         if cached_model_dir == model_dir:
             return
 
         import onnxruntime
 
-        from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
+        from vllm_omni.model_executor.models.cosyvoice3.tokenizer import (
+            get_qwen_tokenizer,
+        )
         from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 
         option = onnxruntime.SessionOptions()
-        option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        option.graph_optimization_level = (
+            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
         option.intra_op_num_threads = 1
 
         self.tokenizer = get_qwen_tokenizer(
@@ -83,9 +95,17 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         self.speech_tokenizer = onnxruntime.InferenceSession(
             os.path.join(model_dir, config.speech_tokenizer_path),
             sess_options=option,
-            providers=["CUDAExecutionProvider" if torch.cuda.is_available() else "CPUExecutionProvider"],
+            providers=[
+                (
+                    "CUDAExecutionProvider"
+                    if torch.cuda.is_available()
+                    else "CPUExecutionProvider"
+                )
+            ],
         )
-        self.feat_extractor = partial(mel_spectrogram, **getattr(config, "feat_extractor", {}))
+        self.feat_extractor = partial(
+            mel_spectrogram, **getattr(config, "feat_extractor", {})
+        )
         self.campplus_session = onnxruntime.InferenceSession(
             os.path.join(model_dir, config.campplus_onxx_path),
             sess_options=option,
@@ -117,10 +137,14 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             if audio is not None:
                 audio = audio[0], config.target_sr
 
-        text_token, text_token_len = extract_text_token(prompt, self.tokenizer, config.allowed_special)
+        text_token, text_token_len = extract_text_token(
+            prompt, self.tokenizer, config.allowed_special
+        )
         if audio is None:
             # Text-only path for profiling/cache
-            return BatchFeature({"input_ids": text_token, "input_len": [text_token_len]})
+            return BatchFeature(
+                {"input_ids": text_token, "input_len": [text_token_len]}
+            )
 
         prompt_text = mm_kwargs.get("prompt_text")
 
@@ -149,12 +173,19 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         )
         device = "cpu"
 
-        speech_token, speech_token_len = extract_speech_token(audio, self.speech_tokenizer, device)
-        speech_feat, speech_feat_len = extract_speech_feat(audio, self.feat_extractor, device)
+        speech_token, speech_token_len = extract_speech_token(
+            audio, self.speech_tokenizer, device
+        )
+        speech_feat, speech_feat_len = extract_speech_feat(
+            audio, self.feat_extractor, device
+        )
 
         if config.sample_rate == 24000:
             token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
-            speech_feat, speech_feat_len[:] = speech_feat[:, : 2 * token_len], 2 * token_len
+            speech_feat, speech_feat_len[:] = (
+                speech_feat[:, : 2 * token_len],
+                2 * token_len,
+            )
             speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
 
         embedding = extract_spk_embedding(audio, self.campplus_session, device)
@@ -215,12 +246,17 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         ]
 
 
-class CosyVoice3DummyInputsBuilder(BaseDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]):
+class CosyVoice3DummyInputsBuilder(
+    BaseDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]
+):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         return "Hello, this is a test of the CosyVoice3 system capability."
 
     def get_dummy_mm_data(
-        self, seq_len: int, mm_counts: Mapping[str, int], mm_options: Mapping[str, BaseDummyOptions] | None = None
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio")
         max_prompt_seconds = 30
@@ -241,10 +277,15 @@ class CosyVoice3DummyInputsBuilder(BaseDummyInputsBuilder[CosyVoice3MultiModalPr
         return mm_data
 
     def get_dummy_processor_inputs(
-        self, seq_len: int, mm_counts: Mapping[str, int], mm_options: Mapping[str, BaseDummyOptions] | None = None
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> ProcessorInputs:
         inputs = super().get_dummy_processor_inputs(seq_len, mm_counts, mm_options)
-        inputs.hf_processor_mm_kwargs = {"prompt_text": "Testing my voices. Why should I not?"}
+        inputs.hf_processor_mm_kwargs = {
+            "prompt_text": "Testing my voices. Why should I not?"
+        }
         return inputs
 
 
@@ -270,7 +311,10 @@ class CosyVoice3Model(
         self.model = None
         if self.model_stage == "talker":
             # Initialize talker stage (text to speech tokens)
-            from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_talker import CosyVoice3LM, VLLMQwen2Encoder
+            from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_talker import (
+                CosyVoice3LM,
+                VLLMQwen2Encoder,
+            )
 
             llm_vllm_config = self._create_llm_vllm_config(vllm_config)
             llm = VLLMQwen2Encoder(vllm_config=llm_vllm_config, prefix="model")
@@ -288,7 +332,9 @@ class CosyVoice3Model(
             self.model = self.talker
         elif self.model_stage == "code2wav":
             # Initialize code2wav stage (flow matching + vocoder)
-            from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+            from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+                CosyVoice3Code2Wav,
+            )
 
             self.code2wav = CosyVoice3Code2Wav(self.config)
             self.model = self.code2wav.flow_model
@@ -313,13 +359,19 @@ class CosyVoice3Model(
         """
         from transformers import Qwen2Config
 
-        qwen_config_path = os.path.join(self.model_dir, self.config.llm["llm"]["pretrain_path"])
+        qwen_config_path = os.path.join(
+            self.model_dir, self.config.llm["llm"]["pretrain_path"]
+        )
         qwen_hf_config = Qwen2Config.from_pretrained(qwen_config_path)
 
         # Use parent's cache config - critical for PagedAttention to work correctly
-        return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
+        return parent_config.with_hf_config(
+            qwen_hf_config, architectures=["Qwen2Model"]
+        )
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
+    def compute_logits(
+        self, hidden_states: torch.Tensor | OmniOutput
+    ) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         if self.model_stage == "talker":
@@ -342,7 +394,9 @@ class CosyVoice3Model(
             speech_token_emb = self.model.speech_embedding(speech_token)
             return speech_token_emb
         else:
-            raise RuntimeError(f"embed_multimodal is only valid for {self.model_stage}.")
+            raise RuntimeError(
+                f"embed_multimodal is only valid for {self.model_stage}."
+            )
 
     def embed_input_ids(
         self,
@@ -354,11 +408,21 @@ class CosyVoice3Model(
             if is_multimodal is not None and any(is_multimodal):
                 embed_tokens = self.model.llm.model.embed_tokens(input_ids)
                 sos = self.model.speech_embedding.weight[self.model.sos].reshape(1, -1)
-                task_id = self.model.speech_embedding.weight[self.model.task_id].reshape(1, -1)
+                task_id = self.model.speech_embedding.weight[
+                    self.model.task_id
+                ].reshape(1, -1)
                 prompt_speech_token_emb = multimodal_embeddings[0]
-                pstoken_len = prompt_speech_token_emb.shape[0]  # Get length from tensor shape
+                pstoken_len = prompt_speech_token_emb.shape[
+                    0
+                ]  # Get length from tensor shape
                 embed_tokens = torch.cat(
-                    [sos, embed_tokens[2 + pstoken_len :], task_id, prompt_speech_token_emb], dim=0
+                    [
+                        sos,
+                        embed_tokens[2 + pstoken_len :],
+                        task_id,
+                        prompt_speech_token_emb,
+                    ],
+                    dim=0,
                 )
             else:
                 embed_tokens = self.model.speech_embedding.weight[input_ids]
@@ -398,13 +462,17 @@ class CosyVoice3Model(
                     "embedding": [kwargs.get("embedding")],
                 }
 
-            return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
+            return OmniOutput(
+                text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs
+            )
         elif self.model_stage == "code2wav":
             runtime_info = kwargs.get("runtime_additional_information", [])
             if not runtime_info:
                 length = 30 * 24000
                 audio = np.zeros((length,))
-                return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audio})
+                return OmniOutput(
+                    text_hidden_states=None, multimodal_outputs={"audio": audio}
+                )
 
             # Remove the last eos token and add batch dimension
             token = input_ids[..., :-1].unsqueeze(0)
@@ -455,7 +523,9 @@ class CosyVoice3Model(
             self.model.speech_embedding.load_state_dict(speech_emb_state)
 
             llm_decoder_state = {
-                k.replace("llm_decoder.", ""): v for k, v in checkpoint.items() if k.startswith("llm_decoder.")
+                k.replace("llm_decoder.", ""): v
+                for k, v in checkpoint.items()
+                if k.startswith("llm_decoder.")
             }
             self.model.llm_decoder.load_state_dict(llm_decoder_state)
 

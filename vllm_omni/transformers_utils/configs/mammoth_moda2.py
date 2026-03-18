@@ -122,7 +122,9 @@ class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
         self.moe_type = moe_type
         if gen_vocab_start_index is None:
             self.gen_vocab_start_index = (
-                self.vocab_size if self.extra_gen_vocab else self.vocab_size - self.gen_vocab_size
+                self.vocab_size
+                if self.extra_gen_vocab
+                else self.vocab_size - self.gen_vocab_size
             )
         else:
             self.gen_vocab_start_index = gen_vocab_start_index
@@ -179,7 +181,9 @@ class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
                 text_config.setdefault(key, val)
             text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
-            text_config = self.sub_configs["text_config"](**{**text_extra_kwargs, **kwargs})
+            text_config = self.sub_configs["text_config"](
+                **{**text_extra_kwargs, **kwargs}
+            )
         elif isinstance(text_config, PretrainedConfig):
             text_config = text_config
 
@@ -200,10 +204,16 @@ class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
-        self.extra_gen_vocab = getattr(self.text_config, "extra_gen_vocab", extra_gen_vocab)
-        self.gen_vocab_size = getattr(self.text_config, "gen_vocab_size", gen_vocab_size)
+        self.extra_gen_vocab = getattr(
+            self.text_config, "extra_gen_vocab", extra_gen_vocab
+        )
+        self.gen_vocab_size = getattr(
+            self.text_config, "gen_vocab_size", gen_vocab_size
+        )
         self.moe_type = getattr(self.text_config, "moe_type", moe_type)
-        self.gen_vocab_start_index = getattr(self.text_config, "gen_vocab_start_index", gen_vocab_start_index)
+        self.gen_vocab_start_index = getattr(
+            self.text_config, "gen_vocab_start_index", gen_vocab_start_index
+        )
         self.tokenizer_class = "MammothUTokenizer"
 
 
@@ -230,7 +240,9 @@ class Mammothmoda2Config(PretrainedConfig):
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self.llm_config = AutoConfig.for_model(**llm_config) if llm_config is not None else None
+        self.llm_config = (
+            AutoConfig.for_model(**llm_config) if llm_config is not None else None
+        )
         self.gen_vae_config = gen_vae_config
         self.gen_dit_config = gen_dit_config
 
@@ -243,7 +255,9 @@ class Mammothmoda2Config(PretrainedConfig):
         self.tokenizer_class = "MammothUTokenizer"
         self.architectures = ["Mammothmoda2Model"]
 
-    def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
+    def get_text_config(
+        self, decoder: bool = False
+    ) -> PretrainedConfig:  # noqa: ARG002
         return self.llm_config
 
     def _require_llm_config(self) -> PretrainedConfig:
@@ -278,6 +292,12 @@ class Mammothmoda2Config(PretrainedConfig):
 
 # Register model_type -> config class for AutoConfig
 AutoConfig.register(Mammothmoda2Config.model_type, Mammothmoda2Config)
-AutoConfig.register(Mammothmoda2Qwen2_5_VLConfig.model_type, Mammothmoda2Qwen2_5_VLConfig)
-AutoConfig.register(Mammothmoda2Qwen2_5_VLTextConfig.model_type, Mammothmoda2Qwen2_5_VLTextConfig)
-AutoConfig.register(Mammothmoda2Qwen2_5_VLVisionConfig.model_type, Mammothmoda2Qwen2_5_VLVisionConfig)
+AutoConfig.register(
+    Mammothmoda2Qwen2_5_VLConfig.model_type, Mammothmoda2Qwen2_5_VLConfig
+)
+AutoConfig.register(
+    Mammothmoda2Qwen2_5_VLTextConfig.model_type, Mammothmoda2Qwen2_5_VLTextConfig
+)
+AutoConfig.register(
+    Mammothmoda2Qwen2_5_VLVisionConfig.model_type, Mammothmoda2Qwen2_5_VLVisionConfig
+)

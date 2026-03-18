@@ -5,8 +5,12 @@ import torch
 from PIL import Image
 
 import vllm_omni.diffusion.models.nextstep_1_1.pipeline_nextstep_1_1 as nextstep_pipeline_module
-from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep_heads import FlowMatchingHead
-from vllm_omni.diffusion.models.nextstep_1_1.pipeline_nextstep_1_1 import NextStep11Pipeline
+from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep_heads import (
+    FlowMatchingHead,
+)
+from vllm_omni.diffusion.models.nextstep_1_1.pipeline_nextstep_1_1 import (
+    NextStep11Pipeline,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -36,7 +40,9 @@ class _DummyImageHead:
             }
         )
         batch_per_prompt = c.shape[0] // cfg_mult
-        return torch.ones(batch_per_prompt, self.token_dim, dtype=c.dtype, device=c.device)
+        return torch.ones(
+            batch_per_prompt, self.token_dim, dtype=c.dtype, device=c.device
+        )
 
 
 class _DummyModel:
@@ -50,9 +56,21 @@ class _DummyModel:
 
     def image_in_projector(self, sampled_tokens: torch.Tensor) -> torch.Tensor:
         bsz = sampled_tokens.shape[0]
-        return torch.zeros(bsz, 1, self.hidden_dim, dtype=sampled_tokens.dtype, device=sampled_tokens.device)
+        return torch.zeros(
+            bsz,
+            1,
+            self.hidden_dim,
+            dtype=sampled_tokens.dtype,
+            device=sampled_tokens.device,
+        )
 
-    def forward_model(self, inputs_embeds: torch.Tensor, attention_mask, past_key_values, use_cache: bool):
+    def forward_model(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask,
+        past_key_values,
+        use_cache: bool,
+    ):
         del attention_mask, use_cache
         self.forward_batches.append(inputs_embeds.shape[0])
         return SimpleNamespace(
@@ -69,7 +87,9 @@ class _DummyModel:
 
 def _make_minimal_pipeline_for_decoding(hidden_dim: int = 8, token_dim: int = 4):
     pipeline = object.__new__(NextStep11Pipeline)
-    pipeline.config = SimpleNamespace(latent_channels=token_dim, latent_patch_size=1, use_gen_pos_embed=False)
+    pipeline.config = SimpleNamespace(
+        latent_channels=token_dim, latent_patch_size=1, use_gen_pos_embed=False
+    )
     pipeline.model = _DummyModel(hidden_dim=hidden_dim, token_dim=token_dim)
     return pipeline
 
@@ -83,8 +103,12 @@ def _make_minimal_pipeline_for_decoding(hidden_dim: int = 8, token_dim: int = 4)
         (7.5, 1.5, True, 3, 1.5),
     ],
 )
-def test_resolve_cfg_layout(cfg, cfg_img, has_image_conditions, expected_cfg_mult, expected_cfg_img):
-    cfg_mult, effective_cfg_img = NextStep11Pipeline._resolve_cfg_layout(cfg, cfg_img, has_image_conditions)
+def test_resolve_cfg_layout(
+    cfg, cfg_img, has_image_conditions, expected_cfg_mult, expected_cfg_img
+):
+    cfg_mult, effective_cfg_img = NextStep11Pipeline._resolve_cfg_layout(
+        cfg, cfg_img, has_image_conditions
+    )
     assert cfg_mult == expected_cfg_mult
     assert effective_cfg_img == expected_cfg_img
 
@@ -134,7 +158,9 @@ def test_build_captions_enables_three_way_cfg_when_image_conditions_exist():
 
 def test_decoding_non_parallel_uses_cfg_mult_for_sampling_and_duplication(monkeypatch):
     pipeline = _make_minimal_pipeline_for_decoding()
-    monkeypatch.setattr(nextstep_pipeline_module, "get_classifier_free_guidance_world_size", lambda: 1)
+    monkeypatch.setattr(
+        nextstep_pipeline_module, "get_classifier_free_guidance_world_size", lambda: 1
+    )
 
     c = torch.zeros(2, 1, 8)
     attention_mask = torch.ones(2, 3, dtype=torch.long)
@@ -159,13 +185,19 @@ def test_decoding_non_parallel_uses_cfg_mult_for_sampling_and_duplication(monkey
 def test_decoding_cfg_parallel_mismatch_falls_back_to_non_parallel(monkeypatch):
     pipeline = _make_minimal_pipeline_for_decoding()
 
-    monkeypatch.setattr(nextstep_pipeline_module, "get_classifier_free_guidance_world_size", lambda: 2)
+    monkeypatch.setattr(
+        nextstep_pipeline_module, "get_classifier_free_guidance_world_size", lambda: 2
+    )
 
     def _unexpected(*args, **kwargs):
         del args, kwargs
-        raise AssertionError("CFG rank/group should not be queried on mismatch fallback.")
+        raise AssertionError(
+            "CFG rank/group should not be queried on mismatch fallback."
+        )
 
-    monkeypatch.setattr(nextstep_pipeline_module, "get_classifier_free_guidance_rank", _unexpected)
+    monkeypatch.setattr(
+        nextstep_pipeline_module, "get_classifier_free_guidance_rank", _unexpected
+    )
     monkeypatch.setattr(nextstep_pipeline_module, "get_cfg_group", _unexpected)
 
     c = torch.zeros(3, 1, 8)
@@ -190,7 +222,9 @@ def test_decoding_cfg_parallel_mismatch_falls_back_to_non_parallel(monkeypatch):
 
 def test_decoding_rejects_incompatible_batch_and_cfg_mult(monkeypatch):
     pipeline = _make_minimal_pipeline_for_decoding()
-    monkeypatch.setattr(nextstep_pipeline_module, "get_classifier_free_guidance_world_size", lambda: 1)
+    monkeypatch.setattr(
+        nextstep_pipeline_module, "get_classifier_free_guidance_world_size", lambda: 1
+    )
 
     with pytest.raises(ValueError, match="not divisible"):
         pipeline.decoding(

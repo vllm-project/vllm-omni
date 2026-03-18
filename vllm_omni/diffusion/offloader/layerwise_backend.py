@@ -40,7 +40,9 @@ class LayerwiseOffloadHook(ModelHook):
         stream: current_omni_platform.Stream | None = None,
         pin_memory: bool = True,
     ):
-        assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
+        assert isinstance(
+            next_block, nn.Module
+        ), "transformer block must be type `torch.nn.Module`"
 
         self.next_block = next_block
         self.device = device
@@ -66,12 +68,21 @@ class LayerwiseOffloadHook(ModelHook):
         self.block_parameters: dict[str, nn.Parameter] = dict(module.named_parameters())
         self.block_buffers: dict[str, torch.Tensor] = dict(module.named_buffers())
 
-        self.next_block_parameters: dict[str, nn.Parameter] = dict(self.next_block.named_parameters())
-        self.next_block_buffers: dict[str, torch.Tensor] = dict(self.next_block.named_buffers())
+        self.next_block_parameters: dict[str, nn.Parameter] = dict(
+            self.next_block.named_parameters()
+        )
+        self.next_block_buffers: dict[str, torch.Tensor] = dict(
+            self.next_block.named_buffers()
+        )
 
         # Pre-allocate gpu tensors in a flattened way
-        self.dtype_cpu_flattened_weights, self.dtype_metadata = LayerwiseOffloadHook._to_cpu(
-            self.next_block_parameters, self.next_block_buffers, self.device, self.pin_memory
+        self.dtype_cpu_flattened_weights, self.dtype_metadata = (
+            LayerwiseOffloadHook._to_cpu(
+                self.next_block_parameters,
+                self.next_block_buffers,
+                self.device,
+                self.pin_memory,
+            )
         )
 
         return module
@@ -82,7 +93,9 @@ class LayerwiseOffloadHook(ModelHook):
         bufs: dict[str, torch.Tensor],
         device: torch.device,
         pin_memory: bool = True,
-    ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
+    ) -> tuple[
+        dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]
+    ]:
         """Helper method to move block parameters and buffers to CPU, flattening by dtype.
 
         Consolidates parameters and buffers into contiguous CPU tensors grouped by dtype
@@ -107,12 +120,16 @@ class LayerwiseOffloadHook(ModelHook):
         for dtype, name2weights in dtype_grouped_weights.items():
             # total # of parameters + buffers
             total_numel = sum(t.numel() for _, t in name2weights.items())
-            cpu_tensor = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=pin_memory)
+            cpu_tensor = torch.empty(
+                total_numel, dtype=dtype, device="cpu", pin_memory=pin_memory
+            )
 
             current_offset = 0
             for name, param_or_buf in name2weights.items():
                 numel = param_or_buf.numel()
-                cpu_tensor[current_offset : current_offset + numel].copy_(param_or_buf.flatten())
+                cpu_tensor[current_offset : current_offset + numel].copy_(
+                    param_or_buf.flatten()
+                )
                 if dtype not in dtype_metadata:
                     dtype_metadata[dtype] = []
                 dtype_metadata[dtype].append(
@@ -156,7 +173,9 @@ class LayerwiseOffloadHook(ModelHook):
 
         with current_omni_platform.stream(self.copy_stream):
             for dtype, cpu_weight in self.dtype_cpu_flattened_weights.items():
-                gpu_weight = torch.empty(cpu_weight.shape, dtype=dtype, device=self.device)
+                gpu_weight = torch.empty(
+                    cpu_weight.shape, dtype=dtype, device=self.device
+                )
                 gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
                 gpu_weights[dtype] = gpu_weight
 
@@ -169,12 +188,14 @@ class LayerwiseOffloadHook(ModelHook):
             for metadata in ordered_metadata:
                 target_name = metadata["name"]
                 target_param_or_buf = (
-                    layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
+                    layer_params[target_name]
+                    if target_name in layer_params
+                    else layer_bufs[target_name]
                 )
 
-                target_param_or_buf.data = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
-                    metadata["shape"]
-                )
+                target_param_or_buf.data = gpu_weight[
+                    metadata["offset"] : metadata["offset"] + metadata["numel"]
+                ].view(metadata["shape"])
 
         self._prefetch_done = evt
 
@@ -195,7 +216,9 @@ class LayerwiseOffloadHook(ModelHook):
         for _, buf in self.block_buffers.items():
             buf.data = torch.empty((), device=self.device, dtype=buf.dtype)
 
-    def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
+    def pre_forward(
+        self, module: nn.Module, *args: Any, **kwargs: Any
+    ) -> tuple[tuple, dict]:
         # if the previous hook was skipped and the weights are not on device,
         # (e.g. by cache-dit block caching), ask the previous hook to
         # synchronously prefetch *this* block's weights before computation
@@ -254,7 +277,9 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
         modules = ModuleDiscovery.discover(pipeline)
         if not modules.dits:
-            logger.warning("No DiT/transformer modules found, skipping layer-wise offloading")
+            logger.warning(
+                "No DiT/transformer modules found, skipping layer-wise offloading"
+            )
             return
 
         # Move encoders to GPU (they stay resident)
@@ -274,7 +299,9 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # Note that there might exist multiple DiT models in specific pipelines
         for i, dit_module in enumerate(modules.dits):
             dit_name = modules.dit_names[i]
-            logger.info(f"Applying hooks on {dit_name} ({dit_module.__class__.__name__})")
+            logger.info(
+                f"Applying hooks on {dit_name} ({dit_module.__class__.__name__})"
+            )
 
             blocks_attr_name = LayerWiseOffloadBackend.get_blocks_attr_name(dit_module)
             blocks = LayerWiseOffloadBackend.get_blocks_from_dit(dit_module)
@@ -311,7 +338,11 @@ class LayerWiseOffloadBackend(OffloadBackend):
             # during the last layer compute of the previous request.
             last_block, first_block = blocks[-1], blocks[0]
             last_hook = apply_block_hook(
-                last_block, first_block, self.device, self.copy_stream, self.config.pin_cpu_memory
+                last_block,
+                first_block,
+                self.device,
+                self.copy_stream,
+                self.config.pin_cpu_memory,
             )
             last_hook.prefetch_layer(non_blocking=False)
 
@@ -319,7 +350,13 @@ class LayerWiseOffloadBackend(OffloadBackend):
             # Register hook for each of blocks
             for i, block in enumerate(blocks[:-1]):
                 next_block = blocks[(i + 1) % num_blocks]
-                hook = apply_block_hook(block, next_block, self.device, self.copy_stream, self.config.pin_cpu_memory)
+                hook = apply_block_hook(
+                    block,
+                    next_block,
+                    self.device,
+                    self.copy_stream,
+                    self.config.pin_cpu_memory,
+                )
                 block_hooks.append(hook)
 
             # NOTE(yuanheng-zhao): We make each hook gets a backward reference to the hook
@@ -328,7 +365,9 @@ class LayerWiseOffloadBackend(OffloadBackend):
             for i in range(len(block_hooks)):
                 block_hooks[i]._prev_hook = block_hooks[i - 1]
 
-            logger.info(f"Layer-wise offloading enabled on {num_blocks} layers (blocks)")
+            logger.info(
+                f"Layer-wise offloading enabled on {num_blocks} layers (blocks)"
+            )
 
             # Track hooked blocks for cleanup
             self._blocks.append(blocks)

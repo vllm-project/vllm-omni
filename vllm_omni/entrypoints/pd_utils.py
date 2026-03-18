@@ -118,10 +118,14 @@ class PDDisaggregationMixin:
             if cfg is None:
                 cfg = ea.get("kv_transfer_config", None) if hasattr(ea, "get") else None
             if cfg is None:
-                raise ValueError(f"Stage-{stage.stage_id} is marked for PD but has no 'kv_transfer_config'")
+                raise ValueError(
+                    f"Stage-{stage.stage_id} is marked for PD but has no 'kv_transfer_config'"
+                )
             cfg_dict = self._kv_cfg_to_dict(cfg)
             if not cfg_dict:
-                raise ValueError(f"Stage-{stage.stage_id} kv_transfer_config could not be parsed")
+                raise ValueError(
+                    f"Stage-{stage.stage_id} kv_transfer_config could not be parsed"
+                )
             return cfg_dict
 
         p_cfg = _get_kv_cfg(p_stage)
@@ -130,18 +134,26 @@ class PDDisaggregationMixin:
         p_role = p_cfg.get("kv_role")
         d_role = d_cfg.get("kv_role")
         if p_role not in ("kv_producer", "kv_both"):
-            raise ValueError(f"Prefill stage-{p_id} kv_role must be 'kv_producer' or 'kv_both', got '{p_role}'")
+            raise ValueError(
+                f"Prefill stage-{p_id} kv_role must be 'kv_producer' or 'kv_both', got '{p_role}'"
+            )
         if d_role not in ("kv_consumer", "kv_both"):
-            raise ValueError(f"Decode stage-{d_id} kv_role must be 'kv_consumer' or 'kv_both', got '{d_role}'")
+            raise ValueError(
+                f"Decode stage-{d_id} kv_role must be 'kv_consumer' or 'kv_both', got '{d_role}'"
+            )
 
         d_sources = list(getattr(d_stage, "engine_input_source", []) or [])
         if p_id not in d_sources and p_stage.stage_id not in d_sources:
-            raise ValueError(f"Decode stage-{d_id} must list prefill stage-{p_id} in engine_input_source")
+            raise ValueError(
+                f"Decode stage-{d_id} must list prefill stage-{p_id} in engine_input_source"
+            )
 
         p_conn = p_cfg.get("kv_connector")
         d_conn = d_cfg.get("kv_connector")
         if p_conn != d_conn:
-            raise ValueError(f"PD connector mismatch: prefill uses '{p_conn}', decode uses '{d_conn}'")
+            raise ValueError(
+                f"PD connector mismatch: prefill uses '{p_conn}', decode uses '{d_conn}'"
+            )
         if not p_conn:
             raise ValueError("PD requires kv_connector in kv_transfer_config")
 
@@ -149,12 +161,16 @@ class PDDisaggregationMixin:
             p_val = p_cfg.get(key)
             d_val = d_cfg.get(key)
             if p_val is not None and d_val is not None and p_val != d_val:
-                raise ValueError(f"PD {key} mismatch: prefill='{p_val}', decode='{d_val}'")
+                raise ValueError(
+                    f"PD {key} mismatch: prefill='{p_val}', decode='{d_val}'"
+                )
 
         p_tp = getattr(getattr(p_stage, "engine_args", None), "tensor_parallel_size", 1)
         d_tp = getattr(getattr(d_stage, "engine_args", None), "tensor_parallel_size", 1)
         if p_tp != d_tp:
-            raise ValueError(f"PD stages must have matching tensor_parallel_size: prefill={p_tp}, decode={d_tp}")
+            raise ValueError(
+                f"PD stages must have matching tensor_parallel_size: prefill={p_tp}, decode={d_tp}"
+            )
 
     def _get_pd_connector_info(self) -> dict[str, Any] | None:
         """Extract prefill engine KV connector info."""
@@ -183,13 +199,17 @@ class PDDisaggregationMixin:
         info: dict[str, Any] = {}
 
         if "mooncake" in kv_connector.lower():
-            bootstrap_port = extra_cfg.get("mooncake_bootstrap_port", _DEFAULT_MOONCAKE_BOOTSTRAP_PORT)
+            bootstrap_port = extra_cfg.get(
+                "mooncake_bootstrap_port", _DEFAULT_MOONCAKE_BOOTSTRAP_PORT
+            )
             kv_ip = kv_cfg_dict.get("kv_ip") or "127.0.0.1"
             info["prefill_bootstrap_addr"] = f"{kv_ip}:{bootstrap_port}"
 
         return info
 
-    def _prepare_prefill_sampling_params(self, req_id: str, sp: "SamplingParams") -> "SamplingParams":
+    def _prepare_prefill_sampling_params(
+        self, req_id: str, sp: "SamplingParams"
+    ) -> "SamplingParams":
         sp = sp.clone()
         sp.max_tokens = 1
         if hasattr(sp, "min_tokens"):
@@ -203,7 +223,9 @@ class PDDisaggregationMixin:
         sp.include_stop_str_in_output = False
         if sp.extra_args is None:
             sp.extra_args = {}
-        kv_params = self._normalize_kv_transfer_params(sp.extra_args.get("kv_transfer_params"))
+        kv_params = self._normalize_kv_transfer_params(
+            sp.extra_args.get("kv_transfer_params")
+        )
         merged: dict[str, Any] = {}
         if kv_params:
             merged.update(kv_params)
@@ -218,7 +240,9 @@ class PDDisaggregationMixin:
         logger.debug("[PD] prefill SP: req=%s kv_transfer_params=%s", req_id, merged)
         return sp
 
-    def _pop_pd_kv_params(self, req_id: str, fallback: Any | None = None) -> dict[str, Any] | None:
+    def _pop_pd_kv_params(
+        self, req_id: str, fallback: Any | None = None
+    ) -> dict[str, Any] | None:
         kv_params = self._normalize_kv_transfer_params(fallback)
         with self._pd_kv_params_lock:
             stored = self._pd_kv_params_by_req.pop(req_id, None)
@@ -232,7 +256,9 @@ class PDDisaggregationMixin:
 
     def _extract_kv_transfer_params(self, engine_outputs: Any) -> dict[str, Any] | None:
         """Extract kv_transfer_params from engine outputs (if available)."""
-        outputs = engine_outputs if isinstance(engine_outputs, list) else [engine_outputs]
+        outputs = (
+            engine_outputs if isinstance(engine_outputs, list) else [engine_outputs]
+        )
         for output in outputs:
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is not None:
@@ -271,7 +297,9 @@ class PDDisaggregationMixin:
         }
 
         if sp_next.extra_args:
-            existing = self._normalize_kv_transfer_params(sp_next.extra_args.get("kv_transfer_params"))
+            existing = self._normalize_kv_transfer_params(
+                sp_next.extra_args.get("kv_transfer_params")
+            )
             if existing:
                 decode_kv_params.update(existing)
 

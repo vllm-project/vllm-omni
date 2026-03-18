@@ -43,7 +43,9 @@ class AttnBlock(nn.Module):
         super().__init__()
         self.in_channels = in_channels
 
-        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = nn.GroupNorm(
+            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
+        )
 
         self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1)
@@ -75,12 +77,22 @@ class ResnetBlock(nn.Module):
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
 
-        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.norm1 = nn.GroupNorm(
+            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
+        )
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=1, padding=1
+        )
+        self.norm2 = nn.GroupNorm(
+            num_groups=32, num_channels=out_channels, eps=1e-6, affine=True
+        )
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1
+        )
         if self.in_channels != self.out_channels:
-            self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+            self.nin_shortcut = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, stride=1, padding=0
+            )
 
     def forward(self, x):
         h = x
@@ -101,7 +113,9 @@ class ResnetBlock(nn.Module):
 class Downsample(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
+        self.conv = nn.Conv2d(
+            in_channels, in_channels, kernel_size=3, stride=2, padding=0
+        )
 
     def forward(self, x: Tensor):
         pad = (0, 1, 0, 1)
@@ -113,7 +127,9 @@ class Downsample(nn.Module):
 class Upsample(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.conv = nn.Conv2d(
+            in_channels, in_channels, kernel_size=3, stride=1, padding=1
+        )
 
     def forward(self, x: Tensor):
         x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
@@ -138,7 +154,9 @@ class Encoder(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
         # downsampling
-        self.conv_in = nn.Conv2d(in_channels, self.ch, kernel_size=3, stride=1, padding=1)
+        self.conv_in = nn.Conv2d(
+            in_channels, self.ch, kernel_size=3, stride=1, padding=1
+        )
 
         curr_res = resolution
         in_ch_mult = (1,) + tuple(ch_mult)
@@ -168,8 +186,12 @@ class Encoder(nn.Module):
         self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
 
         # end
-        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-        self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
+        self.norm_out = nn.GroupNorm(
+            num_groups=32, num_channels=block_in, eps=1e-6, affine=True
+        )
+        self.conv_out = nn.Conv2d(
+            block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         # downsampling
@@ -220,7 +242,9 @@ class Decoder(nn.Module):
         self.z_shape = (1, z_channels, curr_res, curr_res)
 
         # z to block_in
-        self.conv_in = nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
+        self.conv_in = nn.Conv2d(
+            z_channels, block_in, kernel_size=3, stride=1, padding=1
+        )
 
         # middle
         self.mid = nn.Module()
@@ -246,7 +270,9 @@ class Decoder(nn.Module):
             self.up.insert(0, up)
 
         # end
-        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
+        self.norm_out = nn.GroupNorm(
+            num_groups=32, num_channels=block_in, eps=1e-6, affine=True
+        )
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z: Tensor) -> Tensor:
@@ -397,7 +423,9 @@ class AutoencoderKL(nn.Module):
 
         moments = torch.cat([mean, logvar], dim=1).contiguous()
 
-        posterior = DiagonalGaussianDistribution(moments, deterministic=self.params.deterministic)
+        posterior = DiagonalGaussianDistribution(
+            moments, deterministic=self.params.deterministic
+        )
 
         if not return_dict:
             return (posterior,)
@@ -412,16 +440,24 @@ class AutoencoderKL(nn.Module):
 
         return DecoderOutput(sample=dec)
 
-    def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    def blend_v(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
         blend_extent = min(a.shape[2], b.shape[2], blend_extent)
         for y in range(blend_extent):
-            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, y, :] * (y / blend_extent)
+            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[
+                :, :, y, :
+            ] * (y / blend_extent)
         return b
 
-    def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    def blend_h(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
         blend_extent = min(a.shape[3], b.shape[3], blend_extent)
         for x in range(blend_extent):
-            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, x] * (x / blend_extent)
+            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[
+                :, :, :, x
+            ] * (x / blend_extent)
         return b
 
     def forward(self, input, sample_posterior=True, noise_strength=0.0):
@@ -429,9 +465,9 @@ class AutoencoderKL(nn.Module):
         z = posterior.sample() if sample_posterior else posterior.mode()
         if noise_strength > 0.0:
             p = torch.distributions.Uniform(0, noise_strength)
-            z = z + p.sample((z.shape[0],)).reshape(-1, 1, 1, 1).to(z.device) * randn_tensor(
-                z.shape, device=z.device, dtype=z.dtype
-            )
+            z = z + p.sample((z.shape[0],)).reshape(-1, 1, 1, 1).to(
+                z.device
+            ) * randn_tensor(z.shape, device=z.device, dtype=z.dtype)
         dec = self.decode(z).sample
         return dec, posterior
 

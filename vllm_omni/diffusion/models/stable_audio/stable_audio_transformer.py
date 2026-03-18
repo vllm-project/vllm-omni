@@ -65,7 +65,9 @@ class StableAudioGaussianFourierProjection(nn.Module):
 
     def __init__(self, embedding_size: int = 256, scale: float = 1.0):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(embedding_size) * scale, requires_grad=False)
+        self.weight = nn.Parameter(
+            torch.randn(embedding_size) * scale, requires_grad=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch] or [batch, 1]
@@ -227,14 +229,18 @@ class StableAudioCrossAttention(nn.Module):
         # Reshape for multi-head attention
         query = query.view(batch_size, seq_len, self.num_heads, self.head_dim)
         key = key.view(batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim)
-        value = value.view(batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim)
+        value = value.view(
+            batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim
+        )
 
         # Expand K/V heads to match Q heads for GQA
         # [B, S, kv_heads, D] -> [B, S, kv_heads, 1, D] -> [B, S, kv_heads, groups, D] -> [B, S, num_heads, D]
         key = key.unsqueeze(3).expand(-1, -1, -1, self.num_kv_groups, -1)
         key = key.reshape(batch_size, encoder_seq_len, self.num_heads, self.head_dim)
         value = value.unsqueeze(3).expand(-1, -1, -1, self.num_kv_groups, -1)
-        value = value.reshape(batch_size, encoder_seq_len, self.num_heads, self.head_dim)
+        value = value.reshape(
+            batch_size, encoder_seq_len, self.num_heads, self.head_dim
+        )
 
         # Compute attention
         hidden_states = self.attn(query, key, value)
@@ -334,7 +340,9 @@ class StableAudioDiTBlock(nn.Module):
         # Self-attention with skip connection
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
-        hidden_states = self.attn1(hidden_states, rotary_emb=rotary_embedding, attention_mask=attention_mask)
+        hidden_states = self.attn1(
+            hidden_states, rotary_emb=rotary_embedding, attention_mask=attention_mask
+        )
         hidden_states = residual + hidden_states
 
         # Cross-attention with skip connection
@@ -424,7 +432,9 @@ class StableAudioDiTModel(nn.Module):
         # Time projection (Gaussian Fourier features)
         # time_proj_dim is the OUTPUT dimension (after sin/cos concatenation)
         # So embedding_size = time_proj_dim // 2
-        self.time_proj = StableAudioGaussianFourierProjection(embedding_size=time_proj_dim // 2)
+        self.time_proj = StableAudioGaussianFourierProjection(
+            embedding_size=time_proj_dim // 2
+        )
 
         # Timestep projection: time_proj_dim -> inner_dim
         self.timestep_proj = nn.Sequential(

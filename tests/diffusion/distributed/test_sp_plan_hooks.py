@@ -64,8 +64,12 @@ class TestSequenceParallelPlanValidation:
         """Test a simple valid _sp_plan."""
         plan = {
             "rope": {
-                0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
-                1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
+                0: SequenceParallelInput(
+                    split_dim=1, expected_dims=4, split_output=True
+                ),
+                1: SequenceParallelInput(
+                    split_dim=1, expected_dims=4, split_output=True
+                ),
             },
             "blocks.0": {
                 "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
@@ -206,7 +210,9 @@ class TestModuleForwardMetadata:
         metadata._cls = DummyModule
 
         kwargs = {"hidden_states": torch.randn(2, 4, 8)}
-        val, is_kwarg, index = metadata._get_parameter_from_args_kwargs("hidden_states", (), kwargs)
+        val, is_kwarg, index = metadata._get_parameter_from_args_kwargs(
+            "hidden_states", (), kwargs
+        )
         assert is_kwarg is True
         assert index is None
         assert val.shape == (2, 4, 8)
@@ -224,7 +230,9 @@ class TestModuleForwardMetadata:
 
         tensor = torch.randn(2, 4, 8)
         args = (tensor,)
-        val, is_kwarg, index = metadata._get_parameter_from_args_kwargs("hidden_states", args, {})
+        val, is_kwarg, index = metadata._get_parameter_from_args_kwargs(
+            "hidden_states", args, {}
+        )
         assert is_kwarg is False
         assert index == 0
         assert torch.equal(val, tensor)
@@ -328,7 +336,9 @@ class TestGetSubmoduleByName:
         class Model(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.outputs = nn.ModuleDict({"main": nn.Linear(10, 10), "aux": nn.Linear(10, 5)})
+                self.outputs = nn.ModuleDict(
+                    {"main": nn.Linear(10, 10), "aux": nn.Linear(10, 5)}
+                )
 
         model = Model()
         submodule = _get_submodule_by_name(model, "outputs.main")
@@ -437,7 +447,9 @@ class TestModelSpPlans:
         Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
         """
         try:
-            from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
+            from vllm_omni.diffusion.models.z_image.z_image_transformer import (
+                ZImageTransformer2DModel,
+            )
 
             plan = getattr(ZImageTransformer2DModel, "_sp_plan", None)
             assert plan is not None, "ZImageTransformer2DModel should define _sp_plan"
@@ -476,7 +488,9 @@ class TestModelSpPlans:
             )
 
             plan = getattr(QwenImageTransformer2DModel, "_sp_plan", None)
-            assert plan is not None, "QwenImageTransformer2DModel should define _sp_plan"
+            assert (
+                plan is not None
+            ), "QwenImageTransformer2DModel should define _sp_plan"
             assert isinstance(plan, dict)
 
             # Check image_rope_prepare sharding
@@ -569,7 +583,10 @@ class TestMockSharding:
         batch_size, shard_seq_len, hidden_dim = 2, 4, 64
         world_size = 4
 
-        shards = [torch.randn(batch_size, shard_seq_len, hidden_dim) for _ in range(world_size)]
+        shards = [
+            torch.randn(batch_size, shard_seq_len, hidden_dim)
+            for _ in range(world_size)
+        ]
 
         # Simulate gathering (concatenate along dim 1)
         gathered = torch.cat(shards, dim=1)
@@ -658,7 +675,9 @@ class TestSequenceParallelSplitHookInit:
     def test_hook_init(self):
         """Test SequenceParallelSplitHook initialization."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
-        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
 
         metadata = {
             "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
@@ -668,12 +687,16 @@ class TestSequenceParallelSplitHookInit:
         hook = SequenceParallelSplitHook(metadata, config)
         assert hook.metadata == metadata
         assert hook.config == config
-        assert hook.module_forward_metadata is None  # Not initialized until initialize_hook
+        assert (
+            hook.module_forward_metadata is None
+        )  # Not initialized until initialize_hook
 
     def test_hook_initialize(self):
         """Test SequenceParallelSplitHook.initialize_hook."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
-        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
 
         class DummyModule(nn.Module):
             def forward(self, hidden_states, encoder_hidden_states):
@@ -701,7 +724,9 @@ class TestSequenceParallelGatherHookInit:
     def test_hook_init_single_output(self):
         """Test SequenceParallelGatherHook with single output."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
-        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelGatherHook
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelGatherHook,
+        )
 
         metadata = SequenceParallelOutput(gather_dim=1, expected_dims=3)
         config = SequenceParallelConfig(ulysses_degree=2, ring_degree=1)
@@ -715,7 +740,9 @@ class TestSequenceParallelGatherHookInit:
     def test_hook_init_multiple_outputs(self):
         """Test SequenceParallelGatherHook with multiple outputs."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
-        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelGatherHook
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelGatherHook,
+        )
 
         metadata = [
             SequenceParallelOutput(gather_dim=1, expected_dims=3),
@@ -736,7 +763,9 @@ class TestResolveTextLen:
     def test_resolve_int_source(self):
         """Test resolving text length from integer source."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
-        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
 
         class DummyModule(nn.Module):
             def forward(self, x, txt_ids):
@@ -759,7 +788,9 @@ class TestResolveTextLen:
     def test_resolve_string_source_from_tensor(self):
         """Test resolving text length from tensor parameter."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
-        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
 
         class DummyModule(nn.Module):
             def forward(self, x, txt_ids):
@@ -785,7 +816,9 @@ class TestResolveTextLen:
     def test_resolve_text_len_caching(self):
         """Test that text length is cached."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
-        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
 
         class DummyModule(nn.Module):
             def forward(self, x, txt_ids):
@@ -859,7 +892,9 @@ class TestApplyRemoveSequenceParallel:
         model = SimpleModel()
         config = SequenceParallelConfig(ulysses_degree=2, ring_degree=1)
         plan = {
-            "proj_in": {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3)},
+            "proj_in": {
+                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3)
+            },
             "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
         }
 
@@ -900,7 +935,9 @@ class TestApplyRemoveSequenceParallel:
         model = SimpleModel()
         config = SequenceParallelConfig(ulysses_degree=2, ring_degree=1)
         plan = {
-            "proj_in": {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3)},
+            "proj_in": {
+                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3)
+            },
             "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
         }
 
@@ -913,7 +950,9 @@ class TestApplyRemoveSequenceParallel:
         proj_out_registry = model.proj_out._hook_registry
 
         assert _SP_INPUT_HOOK_TEMPLATE.format("proj_in") not in proj_in_registry._hooks
-        assert _SP_OUTPUT_HOOK_TEMPLATE.format("proj_out") not in proj_out_registry._hooks
+        assert (
+            _SP_OUTPUT_HOOK_TEMPLATE.format("proj_out") not in proj_out_registry._hooks
+        )
 
     def test_apply_sp_with_wildcard(self):
         """Test apply_sequence_parallel with wildcard module names."""
@@ -964,7 +1003,9 @@ class TestDimensionValidation:
     def test_skip_shard_on_wrong_dims(self):
         """Test that sharding is skipped when tensor dims don't match expected."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
-        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
 
         class DummyModule(nn.Module):
             def forward(self, x):

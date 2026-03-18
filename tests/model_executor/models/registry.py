@@ -63,7 +63,10 @@ class _OmniExamplesInfo:
     ) -> str | None:
         """Skip / error / return a message when the installed
         ``transformers`` does not satisfy the version constraints."""
-        if self.min_transformers_version is None and self.max_transformers_version is None:
+        if (
+            self.min_transformers_version is None
+            and self.max_transformers_version is None
+        ):
             return None
 
         current = TRANSFORMERS_VERSION
@@ -175,5 +178,7 @@ _OMNI_EXAMPLE_MODELS: dict[str, _OmniExamplesInfo] = {
 # Only architectures that register a multimodal processor are relevant for
 # processing-correctness tests.
 _MULTIMODAL_OMNI_EXAMPLE_MODELS: dict[str, _OmniExamplesInfo] = {
-    arch: info for arch, info in _OMNI_EXAMPLE_MODELS.items() if info.has_multimodal_processor
+    arch: info
+    for arch, info in _OMNI_EXAMPLE_MODELS.items()
+    if info.has_multimodal_processor
 }

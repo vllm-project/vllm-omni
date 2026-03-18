@@ -58,7 +58,11 @@ class VoiceCacheManager:
     - Cache path confined to voice samples directory
     """
 
-    def __init__(self, speech_voice_samples_dir: str | None = None, metadata_manager: MetadataManager | None = None):
+    def __init__(
+        self,
+        speech_voice_samples_dir: str | None = None,
+        metadata_manager: MetadataManager | None = None,
+    ):
         """
         Initialize the voice cache manager.
 
@@ -91,7 +95,9 @@ class VoiceCacheManager:
             logger.warning(f"Failed to load uploaded speakers from metadata: {e}")
             return None
 
-    def update_metadata_cache_info(self, speaker: str, cache_file_path: Path, status: str = "ready") -> bool:
+    def update_metadata_cache_info(
+        self, speaker: str, cache_file_path: Path, status: str = "ready"
+    ) -> bool:
         """
         Update cache information using metadata manager.
 
@@ -136,16 +142,24 @@ class VoiceCacheManager:
             for i, item in enumerate(prompt_items):
                 prefix = f"item_{i}_"
 
-                tensors[prefix + "ref_spk_embedding"] = item.ref_spk_embedding.detach().cpu()
+                tensors[prefix + "ref_spk_embedding"] = (
+                    item.ref_spk_embedding.detach().cpu()
+                )
 
                 has_ref_code = item.ref_code is not None
-                tensors[prefix + "has_ref_code"] = torch.tensor(int(has_ref_code), dtype=torch.int8)
+                tensors[prefix + "has_ref_code"] = torch.tensor(
+                    int(has_ref_code), dtype=torch.int8
+                )
 
                 if has_ref_code:
                     tensors[prefix + "ref_code"] = item.ref_code.detach().cpu()
 
-                tensors[prefix + "x_vector_only_mode"] = torch.tensor(int(item.x_vector_only_mode), dtype=torch.int8)
-                tensors[prefix + "icl_mode"] = torch.tensor(int(item.icl_mode), dtype=torch.int8)
+                tensors[prefix + "x_vector_only_mode"] = torch.tensor(
+                    int(item.x_vector_only_mode), dtype=torch.int8
+                )
+                tensors[prefix + "icl_mode"] = torch.tensor(
+                    int(item.icl_mode), dtype=torch.int8
+                )
 
                 if item.ref_text is not None:
                     metadata[prefix + "ref_text"] = item.ref_text
@@ -201,7 +215,9 @@ class VoiceCacheManager:
                 return None
 
             if cache_file_path.suffix != ".safetensors":
-                logger.error(f"Legacy or unsafe cache format rejected: {cache_file_path}")
+                logger.error(
+                    f"Legacy or unsafe cache format rejected: {cache_file_path}"
+                )
                 return None
 
             with safe_open(cache_file_path, framework="pt", device="cpu") as f:
@@ -215,11 +231,19 @@ class VoiceCacheManager:
 
                     has_ref_code = bool(f.get_tensor(prefix + "has_ref_code").item())
 
-                    ref_code = f.get_tensor(prefix + "ref_code").to(device) if has_ref_code else None
+                    ref_code = (
+                        f.get_tensor(prefix + "ref_code").to(device)
+                        if has_ref_code
+                        else None
+                    )
 
-                    ref_spk_embedding = f.get_tensor(prefix + "ref_spk_embedding").to(device)
+                    ref_spk_embedding = f.get_tensor(prefix + "ref_spk_embedding").to(
+                        device
+                    )
 
-                    x_vector_only_mode = bool(f.get_tensor(prefix + "x_vector_only_mode").item())
+                    x_vector_only_mode = bool(
+                        f.get_tensor(prefix + "x_vector_only_mode").item()
+                    )
                     icl_mode = bool(f.get_tensor(prefix + "icl_mode").item())
 
                     ref_text = meta.get(prefix + "ref_text")
@@ -238,7 +262,9 @@ class VoiceCacheManager:
             return result
 
         except Exception as e:
-            logger.warning(f"Failed to load safetensors cache for speaker {speaker}: {e}")
+            logger.warning(
+                f"Failed to load safetensors cache for speaker {speaker}: {e}"
+            )
             return None
 
     # ------------------------------------------------------------------

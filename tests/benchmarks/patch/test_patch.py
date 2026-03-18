@@ -12,7 +12,10 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
-from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput, async_request_openai_chat_omni_completions
+from vllm_omni.benchmarks.patch.patch import (
+    MixRequestFuncOutput,
+    async_request_openai_chat_omni_completions,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -86,7 +89,9 @@ async def test_output_tokens_assigned_with_metrics(mocker: MockerFixture):
     mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
-    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+    output = await async_request_openai_chat_omni_completions(
+        request_input, mock_session
+    )
 
     # Assert
     assert output.success is True
@@ -129,11 +134,15 @@ async def test_output_tokens_not_assigned_without_metrics(mocker: MockerFixture)
     mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
-    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+    output = await async_request_openai_chat_omni_completions(
+        request_input, mock_session
+    )
 
     # Assert
     assert output.success is True
-    assert output.output_tokens == 0, "output_tokens should default to 0 when no metrics"
+    assert (
+        output.output_tokens == 0
+    ), "output_tokens should default to 0 when no metrics"
     assert output.generated_text == "Hello world"
 
 
@@ -181,11 +190,15 @@ async def test_output_tokens_assigned_multiple_metrics(mocker: MockerFixture):
     mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
-    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+    output = await async_request_openai_chat_omni_completions(
+        request_input, mock_session
+    )
 
     # Assert
     assert output.success is True
-    assert output.output_tokens == 15, "output_tokens should be updated to the latest value"
+    assert (
+        output.output_tokens == 15
+    ), "output_tokens should be updated to the latest value"
     assert output.generated_text == "Hello world!"
 
 
@@ -230,11 +243,15 @@ async def test_output_tokens_with_audio_and_text(mocker: MockerFixture):
     mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
-    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+    output = await async_request_openai_chat_omni_completions(
+        request_input, mock_session
+    )
 
     # Assert
     assert output.success is True
-    assert output.output_tokens == 25, "output_tokens should be assigned even with audio modality"
+    assert (
+        output.output_tokens == 25
+    ), "output_tokens should be assigned even with audio modality"
 
 
 @pytest.mark.asyncio
@@ -273,11 +290,15 @@ async def test_output_tokens_with_missing_num_tokens_out(mocker: MockerFixture):
     mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
-    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+    output = await async_request_openai_chat_omni_completions(
+        request_input, mock_session
+    )
 
     # Assert
     assert output.success is True
-    assert output.output_tokens == 0, "output_tokens should default to 0 when num_tokens_out is missing"
+    assert (
+        output.output_tokens == 0
+    ), "output_tokens should default to 0 when num_tokens_out is missing"
 
 
 @pytest.mark.asyncio
@@ -287,7 +308,9 @@ async def test_output_tokens_initialization():
     output = MixRequestFuncOutput()
 
     # Assert
-    assert hasattr(output, "output_tokens"), "MixRequestFuncOutput should have output_tokens attribute"
+    assert hasattr(
+        output, "output_tokens"
+    ), "MixRequestFuncOutput should have output_tokens attribute"
     assert output.output_tokens == 0, "output_tokens should be initialized to 0"
 
 
@@ -302,17 +325,23 @@ class TestTextLatencyAttribute:
     def test_mix_request_func_output_has_text_latency(self):
         """Test that MixRequestFuncOutput has text_latency attribute"""
         output = MixRequestFuncOutput()
-        assert hasattr(output, "text_latency"), "MixRequestFuncOutput should have text_latency attribute"
+        assert hasattr(
+            output, "text_latency"
+        ), "MixRequestFuncOutput should have text_latency attribute"
 
     def test_text_latency_initial_value(self):
         """Test that text_latency initializes to a default value"""
         output = MixRequestFuncOutput()
         # Check if attribute exists and has a value (should be 0.0 or similar default)
         text_latency = getattr(output, "text_latency", None)
-        assert text_latency is not None or hasattr(output, "text_latency"), "text_latency attribute should exist"
+        assert text_latency is not None or hasattr(
+            output, "text_latency"
+        ), "text_latency attribute should exist"
 
     @pytest.mark.asyncio
-    async def test_text_latency_assigned_with_text_response(self, mocker: MockerFixture):
+    async def test_text_latency_assigned_with_text_response(
+        self, mocker: MockerFixture
+    ):
         """Test that text_latency is assigned when text response is received"""
         request_input = RequestFuncInput(
             model="test-model",
@@ -345,15 +374,23 @@ class TestTextLatencyAttribute:
         mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
-        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+        output = await async_request_openai_chat_omni_completions(
+            request_input, mock_session
+        )
 
         # Assert
         assert output.success is True
-        assert hasattr(output, "text_latency"), "Output should have text_latency attribute"
-        assert output.text_latency > 0, "text_latency should be greater than 0 for text response"
+        assert hasattr(
+            output, "text_latency"
+        ), "Output should have text_latency attribute"
+        assert (
+            output.text_latency > 0
+        ), "text_latency should be greater than 0 for text response"
 
     @pytest.mark.asyncio
-    async def test_text_latency_updated_with_multiple_text_chunks(self, mocker: MockerFixture):
+    async def test_text_latency_updated_with_multiple_text_chunks(
+        self, mocker: MockerFixture
+    ):
         """Test that text_latency is updated as more text chunks arrive"""
         request_input = RequestFuncInput(
             model="test-model",
@@ -392,11 +429,15 @@ class TestTextLatencyAttribute:
         mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
-        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+        output = await async_request_openai_chat_omni_completions(
+            request_input, mock_session
+        )
 
         # Assert
         assert output.success is True
-        assert hasattr(output, "text_latency"), "Output should have text_latency attribute"
+        assert hasattr(
+            output, "text_latency"
+        ), "Output should have text_latency attribute"
         assert output.text_latency > 0, "text_latency should accumulate"
         assert output.generated_text == "First second third"
 
@@ -428,11 +469,15 @@ class TestTextLatencyAttribute:
         mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
-        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+        output = await async_request_openai_chat_omni_completions(
+            request_input, mock_session
+        )
 
         # Assert
         assert output.success is True
-        assert hasattr(output, "text_latency"), "Output should have text_latency attribute even with audio-only"
+        assert hasattr(
+            output, "text_latency"
+        ), "Output should have text_latency attribute even with audio-only"
         # text_latency should either be 0 or the initial value since no text was processed
         assert output.text_latency >= 0, "text_latency should be non-negative"
 
@@ -471,7 +516,9 @@ class TestTextLatencyAttribute:
         mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
-        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+        output = await async_request_openai_chat_omni_completions(
+            request_input, mock_session
+        )
 
         # Assert
         assert output.success is True
@@ -520,12 +567,18 @@ class TestTextLatencyAttribute:
         mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
-        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+        output = await async_request_openai_chat_omni_completions(
+            request_input, mock_session
+        )
 
         # Assert
         assert output.success is True
-        assert hasattr(output, "text_latency"), "text_latency should exist with mixed modalities"
-        assert output.text_latency > 0, "text_latency should be set when text is present"
+        assert hasattr(
+            output, "text_latency"
+        ), "text_latency should exist with mixed modalities"
+        assert (
+            output.text_latency > 0
+        ), "text_latency should be set when text is present"
         assert output.generated_text == "Text more text"
 
     @pytest.mark.asyncio
@@ -561,7 +614,9 @@ class TestTextLatencyAttribute:
         mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
-        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+        output = await async_request_openai_chat_omni_completions(
+            request_input, mock_session
+        )
 
         # Assert
         assert output.success is True
@@ -569,9 +624,9 @@ class TestTextLatencyAttribute:
         assert hasattr(output, "ttft"), "ttft should exist"
         assert hasattr(output, "latency"), "latency should exist"
         # text_latency should be between ttft and total latency
-        assert output.ttft <= output.text_latency <= output.latency, (
-            "text_latency should be between ttft and total latency"
-        )
+        assert (
+            output.ttft <= output.text_latency <= output.latency
+        ), "text_latency should be between ttft and total latency"
 
 
 if __name__ == "__main__":

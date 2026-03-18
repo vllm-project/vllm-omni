@@ -39,7 +39,9 @@ class TestParallelConfigPropagation:
 
     def test_tp4_devices_and_config(self):
         pc = DiffusionParallelConfig(tensor_parallel_size=4)
-        stages = StageConfigFactory.create_default_diffusion({"parallel_config": pc, "model": "x"})
+        stages = StageConfigFactory.create_default_diffusion(
+            {"parallel_config": pc, "model": "x"}
+        )
         assert stages[0]["runtime"]["devices"] == "0,1,2,3"
 
         # Let __post_init__ reconstruct from dict (real code path)
@@ -81,14 +83,18 @@ class TestCreateDefaultDiffusion:
     def test_parallel_config_serialized_as_dict(self):
         """The key fix: parallel_config must appear in engine_args as a dict."""
         pc = DiffusionParallelConfig(tensor_parallel_size=2)
-        stages = StageConfigFactory.create_default_diffusion({"model": "x", "parallel_config": pc})
+        stages = StageConfigFactory.create_default_diffusion(
+            {"model": "x", "parallel_config": pc}
+        )
         ea = stages[0]["engine_args"]
         assert "parallel_config" in ea
         assert isinstance(ea["parallel_config"], Mapping)
         assert ea["parallel_config"]["tensor_parallel_size"] == 2
 
     def test_dtype_serialized_as_string(self):
-        stages = StageConfigFactory.create_default_diffusion({"dtype": torch.float16, "model": "x"})
+        stages = StageConfigFactory.create_default_diffusion(
+            {"dtype": torch.float16, "model": "x"}
+        )
         assert stages[0]["engine_args"]["dtype"] == "torch.float16"
 
     def test_cache_backend_defaults_to_none(self):

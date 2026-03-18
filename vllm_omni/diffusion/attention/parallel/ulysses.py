@@ -11,7 +11,9 @@ import torch.distributed as dist
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
-from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.distributed.group_coordinator import (
+    SequenceParallelGroupCoordinator,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +78,11 @@ class UlyssesParallelAttention:
             joint_strategy = attn_metadata.joint_strategy
 
         is_joint = False
-        if joint_tensor_query is not None and joint_tensor_key is not None and joint_tensor_value is not None:
+        if (
+            joint_tensor_query is not None
+            and joint_tensor_key is not None
+            and joint_tensor_value is not None
+        ):
             supported_joint_strategy = ["front", "rear"]
             if joint_strategy not in supported_joint_strategy:
                 raise ValueError(
@@ -88,36 +94,52 @@ class UlyssesParallelAttention:
             # joint_query is (B, S, H, D). We split H (dim 2).
             ulysses_world_size = self._sp_group.ulysses_world_size
             ulysses_rank = self._sp_group.ulysses_rank
-            attn_heads_per_ulysses_rank = joint_tensor_query.shape[-2] // ulysses_world_size
+            attn_heads_per_ulysses_rank = (
+                joint_tensor_query.shape[-2] // ulysses_world_size
+            )
 
             # Note: We use the same heads for Q/K/V
             joint_tensor_query = joint_tensor_query[
                 ...,
-                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
+                attn_heads_per_ulysses_rank
+                * ulysses_rank : attn_heads_per_ulysses_rank
+                * (ulysses_rank + 1),
                 :,
             ]
 
             joint_len = joint_tensor_query.shape[1]
 
             is_joint = True
-        elif joint_tensor_query is None and joint_tensor_key is None and joint_tensor_value is None:
+        elif (
+            joint_tensor_query is None
+            and joint_tensor_key is None
+            and joint_tensor_value is None
+        ):
             pass
         else:
-            raise ValueError("joint_query, joint_key, and joint_value should be None or not None simultaneously.")
+            raise ValueError(
+                "joint_query, joint_key, and joint_value should be None or not None simultaneously."
+            )
 
         if is_joint:
             # Slice joint key/value heads for this ulysses rank.
             # Using same slicing logic as query
-            attn_heads_per_ulysses_rank_kv = joint_tensor_key.shape[-2] // ulysses_world_size
+            attn_heads_per_ulysses_rank_kv = (
+                joint_tensor_key.shape[-2] // ulysses_world_size
+            )
 
             joint_tensor_key = joint_tensor_key[
                 ...,
-                attn_heads_per_ulysses_rank_kv * ulysses_rank : attn_heads_per_ulysses_rank_kv * (ulysses_rank + 1),
+                attn_heads_per_ulysses_rank_kv
+                * ulysses_rank : attn_heads_per_ulysses_rank_kv
+                * (ulysses_rank + 1),
                 :,
             ]
             joint_tensor_value = joint_tensor_value[
                 ...,
-                attn_heads_per_ulysses_rank_kv * ulysses_rank : attn_heads_per_ulysses_rank_kv * (ulysses_rank + 1),
+                attn_heads_per_ulysses_rank_kv
+                * ulysses_rank : attn_heads_per_ulysses_rank_kv
+                * (ulysses_rank + 1),
                 :,
             ]
 
@@ -127,9 +149,15 @@ class UlyssesParallelAttention:
                 attn_metadata.joint_value = joint_tensor_value
 
         # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-        query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
-        key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
-        value = SeqAllToAll4D.apply(self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync)
+        query = SeqAllToAll4D.apply(
+            self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
+        )
+        key = SeqAllToAll4D.apply(
+            self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync
+        )
+        value = SeqAllToAll4D.apply(
+            self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync
+        )
 
         if is_joint:
             # Concatenate joint query AFTER AllToAll
@@ -166,36 +194,53 @@ class UlyssesParallelAttention:
 
         if attn_metadata is not None:
             if is_joint:
-                if attn_metadata.joint_attn_mask is None and attn_metadata.attn_mask is None:
+                if (
+                    attn_metadata.joint_attn_mask is None
+                    and attn_metadata.attn_mask is None
+                ):
                     attn_metadata.attn_mask = None
                 else:
                     if attn_metadata.attn_mask is None:
                         attn_metadata.attn_mask = torch.ones(
-                            [query.shape[0], query.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
+                            [
+                                query.shape[0],
+                                query.shape[1] - attn_metadata.joint_attn_mask.shape[1],
+                            ],
                             dtype=torch.bool,
                             device=query.device,
                         )
                     elif attn_metadata.joint_attn_mask is None:
                         attn_metadata.joint_attn_mask = torch.ones(
-                            [query.shape[0], query.shape[1] - attn_metadata.attn_mask.shape[1]],
+                            [
+                                query.shape[0],
+                                query.shape[1] - attn_metadata.attn_mask.shape[1],
+                            ],
                             dtype=torch.bool,
                             device=query.device,
                         )
                     attn_metadata.attn_mask = (
-                        torch.cat([attn_metadata.joint_attn_mask, attn_metadata.attn_mask], dim=1)
+                        torch.cat(
+                            [attn_metadata.joint_attn_mask, attn_metadata.attn_mask],
+                            dim=1,
+                        )
                         if joint_strategy == "front"
-                        else torch.cat([attn_metadata.attn_mask, attn_metadata.joint_attn_mask], dim=1)
+                        else torch.cat(
+                            [attn_metadata.attn_mask, attn_metadata.joint_attn_mask],
+                            dim=1,
+                        )
                     )
 
             if attn_metadata.attn_mask is not None:
                 # the final attn_mask is ready, the length should be aligedn with query length
-                assert attn_metadata.attn_mask.shape[1] == query.shape[1], (
-                    f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != query length: {query.shape[1]}"
-                )
+                assert (
+                    attn_metadata.attn_mask.shape[1] == query.shape[1]
+                ), f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != query length: {query.shape[1]}"
                 attn_metadata.attn_mask = attn_metadata.attn_mask.bool().contiguous()
         return query, key, value, attn_metadata, ctx
 
-    def post_attention(self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None) -> torch.Tensor:
+    def post_attention(
+        self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None
+    ) -> torch.Tensor:
         assert isinstance(ctx, _UlyssesCtx), f"Unexpected ctx type: {type(ctx)!r}"
 
         # If we have joint tensors (Text), they were Head-Sliced.
@@ -217,14 +262,23 @@ class UlyssesParallelAttention:
             # SeqAllToAll4D handles: Scatter gather_idx, Gather scatter_idx.
             # Forward: Scatter 2 (H), Gather 1 (S).
             # Reverse: Scatter 1 (S), Gather 2 (H).
-            output_img = SeqAllToAll4D.apply(ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)
+            output_img = SeqAllToAll4D.apply(
+                ctx.ulysses_pg,
+                output_img,
+                ctx.gather_idx,
+                ctx.scatter_idx,
+                ctx.use_sync,
+            )
 
             # 2. Process Joint part: AllGather on Heads
             # Input: (B, JointLen, H/P, D). Output: (B, JointLen, H, D).
             # AllGather along dim 2.
             # Ensure tensor is contiguous for all_gather (slicing may create non-contiguous views)
             output_joint = output_joint.contiguous()
-            gathered_joint = [torch.zeros_like(output_joint) for _ in range(dist.get_world_size(ctx.ulysses_pg))]
+            gathered_joint = [
+                torch.zeros_like(output_joint)
+                for _ in range(dist.get_world_size(ctx.ulysses_pg))
+            ]
             dist.all_gather(gathered_joint, output_joint, group=ctx.ulysses_pg)
             output_joint = torch.cat(gathered_joint, dim=2)
 
@@ -235,4 +289,6 @@ class UlyssesParallelAttention:
                 return torch.cat([output_img, output_joint], dim=1)
 
         # Standard Ulysses Reverse
-        return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)
+        return SeqAllToAll4D.apply(
+            ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
+        )

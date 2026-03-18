@@ -21,7 +21,9 @@ def talker2code2wav(
 ) -> list[Any]:
     """Non-async: collect all talker codes, then pass to code2wav at once."""
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
+    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+        _validate_stage_inputs,
+    )
 
     talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     code2wav_inputs: list[OmniTokensPrompt] = []
@@ -32,7 +34,9 @@ def talker2code2wav(
         # Filter invalid frames: zero-padded (EOS) and frames containing
         # out-of-range values (e.g. stop_token_id=2150 exceeds codebook_size=2048).
         _CODEBOOK_SIZE = 2048
-        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
+        valid_mask = audio_codes.any(dim=1) & (
+            audio_codes.max(dim=1).values < _CODEBOOK_SIZE
+        )
         audio_codes = audio_codes[valid_mask]
         ref_code = output.multimodal_output.get("ref_code")
         if isinstance(ref_code, list):
@@ -40,12 +44,16 @@ def talker2code2wav(
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
             ref_code = ref_code.to(torch.long).cpu().contiguous()
             ref_code_len = int(ref_code.shape[0])
-            audio_codes = torch.cat([ref_code.to(audio_codes.device), audio_codes], dim=0)
+            audio_codes = torch.cat(
+                [ref_code.to(audio_codes.device), audio_codes], dim=0
+            )
         else:
             ref_code_len = 0
         # Code2Wav expects codebook-major flat: [Q*num_frames]
         codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
-        additional_information = {"left_context_size": [ref_code_len]} if ref_code_len > 0 else None
+        additional_information = (
+            {"left_context_size": [ref_code_len]} if ref_code_len > 0 else None
+        )
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,
@@ -68,7 +76,9 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
         return frame.to(torch.long).reshape(-1)
     if audio_codes.ndim == 1:
         return audio_codes.to(torch.long).reshape(-1)
-    raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
+    raise ValueError(
+        f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}"
+    )
 
 
 def talker2code2wav_async_chunk(
@@ -90,7 +100,11 @@ def talker2code2wav_async_chunk(
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
         ref_code = pooling_output.get("ref_code")
-        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
+        if (
+            isinstance(ref_code, torch.Tensor)
+            and ref_code.numel() > 0
+            and request_payload.get(request_id) is None
+        ):
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
     elif not finished:
         # Some steps may not produce pooling_output. Only flush on finish.
@@ -125,9 +139,13 @@ def talker2code2wav_async_chunk(
             transfer_manager._cached_ic = _ic_cache
         if request_id not in _ic_cache:
             max_ic = max_ic_for_chunk_size(chunk_size)
-            active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
+            active = sum(
+                1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0
+            )
             capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
-            _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
+            _ic_cache[request_id] = compute_dynamic_initial_chunk_size(
+                active, capacity, max_ic
+            )
         initial_chunk_size = _ic_cache[request_id]
 
     if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
@@ -154,20 +172,28 @@ def talker2code2wav_async_chunk(
             }
         return None
 
-    in_initial_phase = initial_chunk_size > 0 and initial_chunk_size < chunk_size and length < chunk_size
+    in_initial_phase = (
+        initial_chunk_size > 0
+        and initial_chunk_size < chunk_size
+        and length < chunk_size
+    )
 
     if in_initial_phase:
         # IC phase: emit every initial_chunk_size frames with growing left context.
         if not finished and length % initial_chunk_size != 0:
             return None
         context_length = (
-            length % initial_chunk_size if (finished and length % initial_chunk_size != 0) else initial_chunk_size
+            length % initial_chunk_size
+            if (finished and length % initial_chunk_size != 0)
+            else initial_chunk_size
         )
     else:
         # Normal phase: offset so the first normal emit picks up after IC phase.
         # IC is stateless (may change with load); any mismatch is absorbed by left_context.
         initial_coverage = (
-            ((chunk_size - 1) // initial_chunk_size) * initial_chunk_size if 0 < initial_chunk_size < chunk_size else 0
+            ((chunk_size - 1) // initial_chunk_size) * initial_chunk_size
+            if 0 < initial_chunk_size < chunk_size
+            else 0
         )
         adjusted = length - initial_coverage
         if not finished and adjusted % chunk_size != 0:
@@ -191,7 +217,9 @@ def talker2code2wav_async_chunk(
         window_frames = ref_frames + window_frames
         left_context_size += len(ref_frames)
 
-    code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    code_predictor_codes = (
+        torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    )
 
     return {
         "code_predictor_codes": code_predictor_codes,

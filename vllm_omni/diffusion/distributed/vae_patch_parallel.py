@@ -18,7 +18,9 @@ logger = init_logger(__name__)
 
 def _get_vae_spatial_scale_factor(vae: Any) -> int:
     try:
-        block_out_channels = getattr(getattr(vae, "config", None), "block_out_channels", None)
+        block_out_channels = getattr(
+            getattr(vae, "config", None), "block_out_channels", None
+        )
         if block_out_channels:
             return 2 ** (len(block_out_channels) - 1)
     except Exception:
@@ -119,12 +121,16 @@ def _distributed_tiled_decode(
             # Offset assignment by 1 so rank0 avoids decoding the largest (tile_id=0) tile.
             tile_rank = (tile_id + 1) % pp_size
             if active and (tile_rank == rank):
-                tile = z[:, :, i : i + tile_latent_min_size, j : j + tile_latent_min_size]
+                tile = z[
+                    :, :, i : i + tile_latent_min_size, j : j + tile_latent_min_size
+                ]
                 if getattr(getattr(vae, "config", None), "use_post_quant_conv", False):
                     tile = vae.post_quant_conv(tile)
                 decoded = vae.decoder(tile)
                 local_tiles.append(decoded)
-                local_meta.append((tile_id, int(decoded.shape[-2]), int(decoded.shape[-1])))
+                local_meta.append(
+                    (tile_id, int(decoded.shape[-2]), int(decoded.shape[-1]))
+                )
             tile_id += 1
 
     # Gather per-rank tile counts.
@@ -147,7 +153,13 @@ def _distributed_tiled_decode(
     # Prepare padded metadata + tiles for gather.
     meta_tensor = torch.full((max_count, 3), -1, device=z.device, dtype=torch.int64)
     tile_tensor = torch.zeros(
-        (max_count, z.shape[0], out_channels, tile_sample_min_size, tile_sample_min_size),
+        (
+            max_count,
+            z.shape[0],
+            out_channels,
+            tile_sample_min_size,
+            tile_sample_min_size,
+        ),
         device=z.device,
         dtype=z.dtype,
     )
@@ -308,7 +320,9 @@ def _distributed_patch_decode(
     if max_h == 0 or max_w == 0:
         padded = torch.empty(0, device=z.device, dtype=z.dtype)
     else:
-        padded = torch.zeros((bsz, out_channels, max_h, max_w), device=z.device, dtype=z.dtype)
+        padded = torch.zeros(
+            (bsz, out_channels, max_h, max_w), device=z.device, dtype=z.dtype
+        )
         if local_h and local_w:
             padded[:, :, :local_h, :local_w] = local_core
 
@@ -340,7 +354,9 @@ def _distributed_patch_decode(
             continue
 
         tile = block_gather[src_rank]  # type: ignore[index]
-        out[:, :, h0 * scale : h1 * scale, w0 * scale : w1 * scale] = tile[:, :, :ph, :pw]
+        out[:, :, h0 * scale : h1 * scale, w0 * scale : w1 * scale] = tile[
+            :, :, :ph, :pw
+        ]
 
     return out
 
@@ -366,7 +382,9 @@ class VaePatchParallelism:
         self._vae_scale_factor = _get_vae_spatial_scale_factor(vae)
         self._orig_decode = vae.decode
 
-    def decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
+    def decode(
+        self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any
+    ):
         # Keep the original path for unsupported VAE types / shapes.
         if z.ndim != 4:
             return self._orig_decode(z, return_dict=return_dict, *args, **kwargs)
@@ -399,7 +417,9 @@ class VaePatchParallelism:
                 vae_patch_parallel_size=pp_size,
             )
         else:
-            should_tile = (z.shape[-1] > tile_latent_min_size) or (z.shape[-2] > tile_latent_min_size)
+            should_tile = (z.shape[-1] > tile_latent_min_size) or (
+                z.shape[-2] > tile_latent_min_size
+            )
             if should_tile:
                 decoded = _distributed_tiled_decode(
                     vae=self._vae,
@@ -419,7 +439,9 @@ class VaePatchParallelism:
                 )
 
         if rank == 0 and decoded.numel() == 0:
-            logger.warning("VAE patch parallel decode produced empty output on rank0; falling back to vae.decode.")
+            logger.warning(
+                "VAE patch parallel decode produced empty output on rank0; falling back to vae.decode."
+            )
             decoded = self._orig_decode(z, return_dict=False, *args, **kwargs)[0]
         if rank == 0 and decoded.dtype != z.dtype:
             decoded = decoded.to(dtype=z.dtype)
@@ -428,11 +450,17 @@ class VaePatchParallelism:
 
         shape_tensor = torch.empty((4,), device=z.device, dtype=torch.int64)
         if rank == 0:
-            shape_tensor.copy_(torch.tensor(tuple(decoded.shape), device=z.device, dtype=torch.int64))
+            shape_tensor.copy_(
+                torch.tensor(tuple(decoded.shape), device=z.device, dtype=torch.int64)
+            )
         dist.broadcast(shape_tensor, src=0, group=group)
 
         if rank != 0:
-            decoded = torch.empty(tuple(int(x) for x in shape_tensor.tolist()), device=z.device, dtype=z.dtype)
+            decoded = torch.empty(
+                tuple(int(x) for x in shape_tensor.tolist()),
+                device=z.device,
+                dtype=z.dtype,
+            )
         dist.broadcast(decoded, src=0, group=group)
 
         if not return_dict:

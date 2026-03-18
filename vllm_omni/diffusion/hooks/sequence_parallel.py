@@ -103,7 +103,9 @@ class ModuleForwardMetadata:
         if self.cached_parameter_indices is not None:
             index = self.cached_parameter_indices.get(identifier, None)
             if index is None:
-                raise ValueError(f"Parameter '{identifier}' not found in cached indices.")
+                raise ValueError(
+                    f"Parameter '{identifier}' not found in cached indices."
+                )
             if index < len(args):
                 return args[index], False, index
             return None, False, index
@@ -117,7 +119,9 @@ class ModuleForwardMetadata:
         self.cached_parameter_indices = {param: i for i, param in enumerate(parameters)}
 
         if identifier not in self.cached_parameter_indices:
-            raise ValueError(f"Parameter '{identifier}' not found in function signature.")
+            raise ValueError(
+                f"Parameter '{identifier}' not found in function signature."
+            )
 
         index = self.cached_parameter_indices[identifier]
 
@@ -164,7 +168,9 @@ class SequenceParallelSplitHook(ModelHook):
 
     def __init__(
         self,
-        metadata: dict[str | int, AnySequenceParallelInput | list[AnySequenceParallelInput]],
+        metadata: dict[
+            str | int, AnySequenceParallelInput | list[AnySequenceParallelInput]
+        ],
         config: SequenceParallelConfig,
     ) -> None:
         super().__init__()
@@ -179,7 +185,9 @@ class SequenceParallelSplitHook(ModelHook):
         self.module_forward_metadata = ModuleForwardMetadata(_cls=cls)
         return module
 
-    def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
+    def pre_forward(
+        self, module: nn.Module, *args: Any, **kwargs: Any
+    ) -> tuple[tuple, dict]:
         """Shard inputs before forward."""
         args_list = list(args)
         # Clear text length cache for this forward pass
@@ -187,12 +195,17 @@ class SequenceParallelSplitHook(ModelHook):
 
         for name, spm in self.metadata.items():
             # Skip if this is a split_output entry (handled in post_forward)
-            if isinstance(spm, (SequenceParallelInput, SequenceParallelPartialInput)) and spm.split_output:
+            if (
+                isinstance(spm, (SequenceParallelInput, SequenceParallelPartialInput))
+                and spm.split_output
+            ):
                 continue
 
             # Get the parameter value
-            input_val, is_kwarg, index = self.module_forward_metadata._get_parameter_from_args_kwargs(
-                name, args_list, kwargs
+            input_val, is_kwarg, index = (
+                self.module_forward_metadata._get_parameter_from_args_kwargs(
+                    name, args_list, kwargs
+                )
             )
 
             if input_val is None:
@@ -209,7 +222,9 @@ class SequenceParallelSplitHook(ModelHook):
                         f"which is a list/tuple, but got {type(spm).__name__}"
                     )
                 if len(input_val) != len(spm):
-                    raise ValueError(f"Expected {len(spm)} elements for parameter '{name}', got {len(input_val)}")
+                    raise ValueError(
+                        f"Expected {len(spm)} elements for parameter '{name}', got {len(input_val)}"
+                    )
                 sharded_input_val = []
                 for i, x in enumerate(input_val):
                     if torch.is_tensor(x) and not spm[i].split_output:
@@ -217,7 +232,9 @@ class SequenceParallelSplitHook(ModelHook):
                     sharded_input_val.append(x)
                 input_val = type(input_val)(sharded_input_val)
             else:
-                raise ValueError(f"Unsupported input type for sharding: {type(input_val).__name__}")
+                raise ValueError(
+                    f"Unsupported input type for sharding: {type(input_val).__name__}"
+                )
 
             # Update args or kwargs
             if is_kwarg:
@@ -235,10 +252,15 @@ class SequenceParallelSplitHook(ModelHook):
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         """Shard outputs for split_output=True entries."""
-        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
 
         is_tensor = isinstance(output, torch.Tensor)
-        is_tensor_list = isinstance(output, (list, tuple)) and all(isinstance(x, torch.Tensor) for x in output)
+        is_tensor_list = isinstance(output, (list, tuple)) and all(
+            isinstance(x, torch.Tensor) for x in output
+        )
 
         if not is_tensor and not is_tensor_list:
             # No tensor outputs to shard
@@ -250,13 +272,22 @@ class SequenceParallelSplitHook(ModelHook):
         for index, spm in self.metadata.items():
             if not isinstance(index, int):
                 continue
-            if not isinstance(spm, (SequenceParallelInput, SequenceParallelPartialInput)) or not spm.split_output:
+            if (
+                not isinstance(
+                    spm, (SequenceParallelInput, SequenceParallelPartialInput)
+                )
+                or not spm.split_output
+            ):
                 continue
             if index >= len(output_list):
-                raise ValueError(f"Index {index} out of bounds for output of length {len(output_list)}.")
+                raise ValueError(
+                    f"Index {index} out of bounds for output of length {len(output_list)}."
+                )
 
             original = output_list[index]
-            output_list[index] = self._prepare_sp_input(original, spm, self._last_args, self._last_kwargs)
+            output_list[index] = self._prepare_sp_input(
+                original, spm, self._last_args, self._last_kwargs
+            )
             if output_list[index] is not original:
                 actually_sharded = True
 
@@ -284,9 +315,13 @@ class SequenceParallelSplitHook(ModelHook):
 
         # Try to get from kwargs/args
         try:
-            val, _, _ = self.module_forward_metadata._get_parameter_from_args_kwargs(source, args, kwargs)
+            val, _, _ = self.module_forward_metadata._get_parameter_from_args_kwargs(
+                source, args, kwargs
+            )
             if val is None:
-                raise ValueError(f"Parameter '{source}' is None, cannot determine text length.")
+                raise ValueError(
+                    f"Parameter '{source}' is None, cannot determine text length."
+                )
             if isinstance(val, torch.Tensor):
                 # TODO: Currently assumes batch_size=1, where shape[0] is sequence length.
                 # For batch inference support, this should be updated to handle
@@ -295,11 +330,15 @@ class SequenceParallelSplitHook(ModelHook):
             elif isinstance(val, int):
                 text_len = val
             else:
-                raise ValueError(f"Cannot determine text length from '{source}' of type {type(val).__name__}")
+                raise ValueError(
+                    f"Cannot determine text length from '{source}' of type {type(val).__name__}"
+                )
             self._text_len_cache[source] = text_len
             return text_len
         except ValueError as e:
-            raise ValueError(f"Failed to resolve text_len_source '{source}': {e}") from e
+            raise ValueError(
+                f"Failed to resolve text_len_source '{source}': {e}"
+            ) from e
 
     def _prepare_sp_input(
         self,
@@ -312,7 +351,9 @@ class SequenceParallelSplitHook(ModelHook):
         kwargs = kwargs or {}
 
         if sp_input.expected_dims is not None and x.dim() != sp_input.expected_dims:
-            logger.warning_once(f"Expected tensor with {sp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
+            logger.warning_once(
+                f"Expected tensor with {sp_input.expected_dims} dims, got {x.dim()}. Skipping split."
+            )
             return x
 
         if isinstance(sp_input, SequenceParallelInput):
@@ -335,7 +376,9 @@ class SequenceParallelSplitHook(ModelHook):
             # Concatenate back: [text_full, image_sharded]
             return torch.cat([text_part, image_part_sharded], dim=dim)
         else:
-            raise ValueError(f"Unsupported input config type: {type(sp_input).__name__}")
+            raise ValueError(
+                f"Unsupported input config type: {type(sp_input).__name__}"
+            )
 
     def _shard_with_auto_pad(self, x: torch.Tensor, dim: int) -> torch.Tensor:
         """Shard tensor with automatic padding and attention mask creation.
@@ -351,7 +394,10 @@ class SequenceParallelSplitHook(ModelHook):
             get_sequence_parallel_rank,
             get_sequence_parallel_world_size,
         )
-        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
 
         world_size = get_sequence_parallel_world_size()
         if world_size == 1:
@@ -435,19 +481,29 @@ class SequenceParallelGatherHook(ModelHook):
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         """Gather outputs after forward and remove padding if applied."""
-        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
 
         is_tensor = isinstance(output, torch.Tensor)
 
         if is_tensor:
             output = [output]
-        elif not (isinstance(output, (list, tuple)) and all(isinstance(x, torch.Tensor) for x in output)):
-            raise ValueError(f"Expected tensor or list/tuple of tensors, got {type(output).__name__}")
+        elif not (
+            isinstance(output, (list, tuple))
+            and all(isinstance(x, torch.Tensor) for x in output)
+        ):
+            raise ValueError(
+                f"Expected tensor or list/tuple of tensors, got {type(output).__name__}"
+            )
 
         output = list(output)
 
         if len(output) != len(self.metadata):
-            raise ValueError(f"Expected {len(self.metadata)} outputs, got {len(output)}.")
+            raise ValueError(
+                f"Expected {len(self.metadata)} outputs, got {len(output)}."
+            )
 
         # Check if padding was applied during split
         original_seq_len = None
@@ -472,9 +528,14 @@ class SequenceParallelGatherHook(ModelHook):
             gathered = sp_gather(x, spm.gather_dim, validate=False)
 
             # Remove padding if it was applied
-            if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
+            if (
+                original_seq_len is not None
+                and gathered.size(spm.gather_dim) > original_seq_len
+            ):
                 gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)
-                logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
+                logger.debug(
+                    f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})"
+                )
 
             output[i] = gathered
             actually_gathered = True
@@ -528,7 +589,9 @@ def _find_submodule_by_name(model: nn.Module, name: str) -> nn.Module | list[nn.
             submodule = getattr(model, first_atom)
             return _find_submodule_by_name(submodule, remaining_name)
         else:
-            raise ValueError(f"'{first_atom}' is not a submodule of '{model.__class__.__name__}'")
+            raise ValueError(
+                f"'{first_atom}' is not a submodule of '{model.__class__.__name__}'"
+            )
 
 
 def apply_sequence_parallel(
@@ -591,12 +654,19 @@ def apply_sequence_parallel(
                 # Output specification
                 if isinstance(sp_model_plan, SequenceParallelOutput):
                     sp_model_plan = [sp_model_plan]
-                if not all(isinstance(x, SequenceParallelOutput) or x is None for x in sp_model_plan):
-                    raise ValueError(f"Expected SequenceParallelOutput elements, got {sp_model_plan}")
+                if not all(
+                    isinstance(x, SequenceParallelOutput) or x is None
+                    for x in sp_model_plan
+                ):
+                    raise ValueError(
+                        f"Expected SequenceParallelOutput elements, got {sp_model_plan}"
+                    )
                 hook = SequenceParallelGatherHook(sp_model_plan, config)
                 hook_name = _SP_OUTPUT_HOOK_TEMPLATE.format(module_id)
             else:
-                raise ValueError(f"Unsupported plan type: {type(sp_model_plan).__name__}")
+                raise ValueError(
+                    f"Unsupported plan type: {type(sp_model_plan).__name__}"
+                )
 
             registry = HookRegistry.get_or_create(m)
             registry.register_hook(hook_name, hook)

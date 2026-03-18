@@ -50,7 +50,9 @@ def _video_api_url(server: OmniServer, suffix: str = "") -> str:
 
 
 def _multipart_fields(payload: dict[str, Any]) -> list[tuple[str, tuple[None, str]]]:
-    return [(key, (None, str(value))) for key, value in payload.items() if value is not None]
+    return [
+        (key, (None, str(value))) for key, value in payload.items() if value is not None
+    ]
 
 
 def _create_video_job(
@@ -84,7 +86,9 @@ def _retrieve_video_job(server: OmniServer, video_id: str) -> requests.Response:
     return requests.get(_video_api_url(server, f"/{video_id}"), timeout=VIDEO_TIMEOUT_S)
 
 
-def _wait_for_video_status(server: OmniServer, video_id: str, expected_status: str) -> dict[str, Any]:
+def _wait_for_video_status(
+    server: OmniServer, video_id: str, expected_status: str
+) -> dict[str, Any]:
     deadline = time.time() + VIDEO_TIMEOUT_S
     last_payload: dict[str, Any] | None = None
 
@@ -96,7 +100,9 @@ def _wait_for_video_status(server: OmniServer, video_id: str, expected_status: s
         if status == expected_status:
             return last_payload
         if status == "failed":
-            raise AssertionError(f"Video job {video_id} failed unexpectedly: {last_payload}")
+            raise AssertionError(
+                f"Video job {video_id} failed unexpectedly: {last_payload}"
+            )
         time.sleep(VIDEO_POLL_INTERVAL_S)
 
     raise AssertionError(
@@ -115,14 +121,20 @@ def _wait_for_video_missing(server: OmniServer, video_id: str) -> None:
             return
         time.sleep(0.5)
 
-    raise AssertionError(f"Timed out waiting for video job {video_id} to disappear. Last status={last_status}")
+    raise AssertionError(
+        f"Timed out waiting for video job {video_id} to disappear. Last status={last_status}"
+    )
 
 
 def _delete_video_job(server: OmniServer, video_id: str) -> requests.Response:
-    return requests.delete(_video_api_url(server, f"/{video_id}"), timeout=VIDEO_TIMEOUT_S)
+    return requests.delete(
+        _video_api_url(server, f"/{video_id}"), timeout=VIDEO_TIMEOUT_S
+    )
 
 
-def _delete_video_job_with_retry(server: OmniServer, video_id: str) -> requests.Response:
+def _delete_video_job_with_retry(
+    server: OmniServer, video_id: str
+) -> requests.Response:
     deadline = time.time() + 30.0
     last_response: requests.Response | None = None
 
@@ -143,23 +155,31 @@ def _best_effort_delete(server: OmniServer, video_id: str) -> None:
     try:
         response = _delete_video_job_with_retry(server, video_id)
         if response.status_code not in (200, 404):
-            print(f"Cleanup delete for {video_id} returned {response.status_code}: {response.text}")
+            print(
+                f"Cleanup delete for {video_id} returned {response.status_code}: {response.text}"
+            )
     except Exception as exc:
         print(f"Cleanup delete for {video_id} failed: {exc}")
 
 
 def _assert_mp4_payload(content: bytes) -> None:
-    assert len(content) > 32, f"Downloaded video payload is unexpectedly small: {len(content)} bytes"
+    assert (
+        len(content) > 32
+    ), f"Downloaded video payload is unexpectedly small: {len(content)} bytes"
     assert content[4:8] == b"ftyp", "Downloaded payload does not look like an MP4 file."
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
-def test_create_list_retrieve_download_video(video_server: OmniServer, tmp_path: Path) -> None:
+def test_create_list_retrieve_download_video(
+    video_server: OmniServer, tmp_path: Path
+) -> None:
     video_id: str | None = None
     try:
-        create_response = _create_video_job(video_server, prompt="A small paper airplane gliding over a lake at dawn.")
+        create_response = _create_video_job(
+            video_server, prompt="A small paper airplane gliding over a lake at dawn."
+        )
         assert create_response.status_code == 200, create_response.text
 
         created = create_response.json()
@@ -179,7 +199,9 @@ def test_create_list_retrieve_download_video(video_server: OmniServer, tmp_path:
         assert retrieved["id"] == video_id
         assert retrieved["status"] == "completed"
 
-        list_response = requests.get(_video_api_url(video_server), timeout=VIDEO_TIMEOUT_S)
+        list_response = requests.get(
+            _video_api_url(video_server), timeout=VIDEO_TIMEOUT_S
+        )
         assert list_response.status_code == 200, list_response.text
         listed = list_response.json()
         assert listed["object"] == "list"
@@ -191,7 +213,9 @@ def test_create_list_retrieve_download_video(video_server: OmniServer, tmp_path:
         )
         assert download_response.status_code == 200, download_response.text
         assert download_response.headers["content-type"].startswith("video/mp4")
-        assert completed["file_name"] in download_response.headers.get("content-disposition", "")
+        assert completed["file_name"] in download_response.headers.get(
+            "content-disposition", ""
+        )
         _assert_mp4_payload(download_response.content)
 
         output_path = tmp_path / completed["file_name"]

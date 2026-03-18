@@ -62,7 +62,9 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Gradio demo for Qwen3-Omni online inference.")
+    parser = argparse.ArgumentParser(
+        description="Gradio demo for Qwen3-Omni online inference."
+    )
     parser.add_argument(
         "--model",
         default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -78,8 +80,12 @@ def parse_args():
         default="127.0.0.1",
         help="Host/IP for gradio `launch`.",
     )
-    parser.add_argument("--port", type=int, default=7861, help="Port for gradio `launch`.")
-    parser.add_argument("--share", action="store_true", help="Share the Gradio demo publicly.")
+    parser.add_argument(
+        "--port", type=int, default=7861, help="Port for gradio `launch`."
+    )
+    parser.add_argument(
+        "--share", action="store_true", help="Share the Gradio demo publicly."
+    )
     return parser.parse_args()
 
 
@@ -189,7 +195,9 @@ def process_audio_file(
             elif isinstance(first, str):
                 if isinstance(second, tuple) and len(second) == 2:
                     sr_candidate, data_candidate = second
-                    if isinstance(sr_candidate, (int, float)) and isinstance(data_candidate, np.ndarray):
+                    if isinstance(sr_candidate, (int, float)) and isinstance(
+                        data_candidate, np.ndarray
+                    ):
                         sample_rate = int(sr_candidate)
                         audio_np = data_candidate
                 if audio_np is None:
@@ -199,7 +207,9 @@ def process_audio_file(
             # Case 3: (None, (sample_rate, np.ndarray))
             elif first is None and isinstance(second, tuple) and len(second) == 2:
                 sr_candidate, data_candidate = second
-                if isinstance(sr_candidate, (int, float)) and isinstance(data_candidate, np.ndarray):
+                if isinstance(sr_candidate, (int, float)) and isinstance(
+                    data_candidate, np.ndarray
+                ):
                     sample_rate = int(sr_candidate)
                     audio_np = data_candidate
         elif len(audio_file) == 1 and isinstance(audio_file[0], str):
@@ -360,7 +370,9 @@ def run_inference_api(
                         audio_np = audio_np[:, 0]
                     audio_output = (int(sample_rate), audio_np.astype(np.float32))
 
-            text_response = "\n\n".join(text_outputs) if text_outputs else "No text output."
+            text_response = (
+                "\n\n".join(text_outputs) if text_outputs else "No text output."
+            )
             yield text_response, audio_output
         else:
             # Streaming mode: yield incremental updates
@@ -384,7 +396,10 @@ def run_inference_api(
                             # Convert to mono if needed
                             if audio_np.ndim > 1:
                                 audio_np = audio_np[:, 0]
-                            audio_output = (int(sample_rate), audio_np.astype(np.float32))
+                            audio_output = (
+                                int(sample_rate),
+                                audio_np.astype(np.float32),
+                            )
                             # Yield current text and audio
                             yield text_content if text_content else "", audio_output
                         except Exception:  # pylint: disable=broad-except
@@ -549,9 +564,9 @@ def main():
     args = parse_args()
 
     model_name = "/".join(args.model.split("/")[-2:])
-    assert model_name in SUPPORTED_MODELS, (
-        f"Unsupported model '{model_name}'. Supported models: {SUPPORTED_MODELS.keys()}"
-    )
+    assert (
+        model_name in SUPPORTED_MODELS
+    ), f"Unsupported model '{model_name}'. Supported models: {SUPPORTED_MODELS.keys()}"
 
     # Initialize OpenAI client
     print(f"Connecting to API server at: {args.api_base}")

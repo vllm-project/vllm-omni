@@ -1,7 +1,9 @@
 import numpy as np
 
 
-async def extract_audio_from_video_async(video_url: str) -> tuple[np.ndarray, int | float]:
+async def extract_audio_from_video_async(
+    video_url: str,
+) -> tuple[np.ndarray, int | float]:
     """Extract audio from a video URL using librosa.
 
     Returns a (audio_array, sample_rate) tuple compatible with audio format.
@@ -40,7 +42,9 @@ async def extract_audio_from_video_async(video_url: str) -> tuple[np.ndarray, in
     try:
         if parsed_url.scheme in ("http", "https"):
             video_data = await asyncio.to_thread(_download_video_sync, video_url)
-            temp_video_file_path = await asyncio.to_thread(_write_temp_file_sync, video_data, ".mp4")
+            temp_video_file_path = await asyncio.to_thread(
+                _write_temp_file_sync, video_data, ".mp4"
+            )
         elif parsed_url.scheme == "file":
             from urllib.request import url2pathname
 
@@ -50,12 +54,16 @@ async def extract_audio_from_video_async(video_url: str) -> tuple[np.ndarray, in
 
             header, data = video_url.split(",", 1)
             video_data = base64.b64decode(data)
-            temp_video_file_path = await asyncio.to_thread(_write_temp_file_sync, video_data, ".mp4")
+            temp_video_file_path = await asyncio.to_thread(
+                _write_temp_file_sync, video_data, ".mp4"
+            )
         else:
             # Assume local file path
             temp_video_file_path = video_url
 
-        audio_array, sample_rate = await asyncio.to_thread(_load_audio_sync, temp_video_file_path)
+        audio_array, sample_rate = await asyncio.to_thread(
+            _load_audio_sync, temp_video_file_path
+        )
         return audio_array, sample_rate
     finally:
         if temp_video_file_path and parsed_url.scheme in ("http", "https", "data"):

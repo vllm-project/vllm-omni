@@ -1,6 +1,9 @@
 from typing import Any
 
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponse, ChatCompletionStreamResponse
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionResponse,
+    ChatCompletionStreamResponse,
+)
 
 
 class OmniChatCompletionStreamResponse(ChatCompletionStreamResponse):

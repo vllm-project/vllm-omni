@@ -7,9 +7,13 @@ from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
 
 try:
-    from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
+    from .connectors.mooncake_transfer_engine_connector import (
+        MooncakeTransferEngineConnector,
+    )
 except ImportError:
-    MooncakeTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mooncake) not installed
+    MooncakeTransferEngineConnector = (
+        None  # RDMA deps (msgspec/zmq/mooncake) not installed
+    )
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (

@@ -26,7 +26,9 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate audio with Stable Audio Open.")
+    parser = argparse.ArgumentParser(
+        description="Generate audio with Stable Audio Open."
+    )
     parser.add_argument(
         "--model",
         default="stabilityai/stable-audio-open-1.0",
@@ -118,7 +120,9 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
 
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(
+        args.seed
+    )
 
     print(f"\n{'=' * 60}")
     print("Stable Audio Open - Text-to-Audio Generation")

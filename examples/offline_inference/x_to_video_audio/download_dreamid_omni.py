@@ -24,7 +24,16 @@ def download_dependency():
         if not DEPENDENCY_DIR.exists():
             print(f"Downloading DreamID-Omni to {DEPENDENCY_DIR} ...")
             subprocess.run(
-                ["git", "clone", "--depth", "1", DEPENDENCY_REPO, "--branch", DEPENDENCY_BRANCH, str(DEPENDENCY_DIR)],
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    DEPENDENCY_REPO,
+                    "--branch",
+                    DEPENDENCY_BRANCH,
+                    str(DEPENDENCY_DIR),
+                ],
                 check=True,
             )
             print("Download finished.")
@@ -53,7 +62,9 @@ def timed_download(repo_id: str, local_dir: str, allow_patterns: list | None = N
     )
 
     elapsed = time.time() - start_time
-    print(f"✅ Finished downloading {repo_id} in {elapsed:.2f} seconds. Files saved at: {local_dir}")
+    print(
+        f"✅ Finished downloading {repo_id} in {elapsed:.2f} seconds. Files saved at: {local_dir}"
+    )
 
 
 def main(output_dir: str):
@@ -62,7 +73,11 @@ def main(output_dir: str):
     timed_download(
         repo_id="Wan-AI/Wan2.2-TI2V-5B",
         local_dir=wan_dir,
-        allow_patterns=["google/*", "models_t5_umt5-xxl-enc-bf16.pth", "Wan2.2_VAE.pth"],
+        allow_patterns=[
+            "google/*",
+            "models_t5_umt5-xxl-enc-bf16.pth",
+            "Wan2.2_VAE.pth",
+        ],
     )
 
     # MMAudio
@@ -97,7 +112,10 @@ def main(output_dir: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download models from Hugging Face")
     parser.add_argument(
-        "--output-dir", type=str, default="./dreamid_omni", help="Base directory to save downloaded models"
+        "--output-dir",
+        type=str,
+        default="./dreamid_omni",
+        help="Base directory to save downloaded models",
     )
     args = parser.parse_args()
     main(args.output_dir)

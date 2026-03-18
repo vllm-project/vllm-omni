@@ -190,7 +190,9 @@ def main(args: argparse.Namespace) -> None:
         else:
             # Try relative to script location
             script_dir = Path(__file__).parent.parent.parent.parent
-            config_path = script_dir / "vllm_omni/model_executor/stage_configs/glm_image.yaml"
+            config_path = (
+                script_dir / "vllm_omni/model_executor/stage_configs/glm_image.yaml"
+            )
             if not config_path.exists():
                 raise FileNotFoundError(
                     f"Stage config not found. Please specify --config-path. Tried: {DEFAULT_CONFIG_PATH}"
@@ -228,7 +230,9 @@ def main(args: argparse.Namespace) -> None:
         mode = "text-to-image"
 
     print(f"Mode: {mode}")
-    print(f"Target size: {prompt_dict.get('height', 1024)}x{prompt_dict.get('width', 1024)}")
+    print(
+        f"Target size: {prompt_dict.get('height', 1024)}x{prompt_dict.get('width', 1024)}"
+    )
 
     # Add generation parameters to prompt
     prompt_dict["seed"] = args.seed
@@ -266,10 +270,14 @@ def main(args: argparse.Namespace) -> None:
 
     # Use calculated value unless user explicitly specified a different value
     # Default args.max_tokens is 16384 (very large), so prefer calculated value
-    effective_max_tokens = calculated_max_tokens if args.max_tokens == 16384 else args.max_tokens
+    effective_max_tokens = (
+        calculated_max_tokens if args.max_tokens == 16384 else args.max_tokens
+    )
 
     if args.verbose:
-        print(f"AR max_tokens: {effective_max_tokens} (calculated: {calculated_max_tokens}, arg: {args.max_tokens})")
+        print(
+            f"AR max_tokens: {effective_max_tokens} (calculated: {calculated_max_tokens}, arg: {args.max_tokens})"
+        )
 
     # IMPORTANT: GLM-Image AR model requires these exact sampling parameters
     # from generation_config.json for proper image token generation.
@@ -309,7 +317,9 @@ def main(args: argparse.Namespace) -> None:
         os.makedirs(output_dir, exist_ok=True)
 
     output_count = 0
-    for stage_outputs in omni.generate(prompts, sampling_params_list, py_generator=True):
+    for stage_outputs in omni.generate(
+        prompts, sampling_params_list, py_generator=True
+    ):
         if stage_outputs.final_output_type == "image":
             for output in stage_outputs.request_output:
                 request_id = output.request_id
@@ -330,7 +340,9 @@ def main(args: argparse.Namespace) -> None:
                     if isinstance(img, Image.Image):
                         save_image(img, output_path)
                     else:
-                        print(f"Warning: Unexpected image type for request {request_id}: {type(img)}")
+                        print(
+                            f"Warning: Unexpected image type for request {request_id}: {type(img)}"
+                        )
 
                     output_count += 1
 

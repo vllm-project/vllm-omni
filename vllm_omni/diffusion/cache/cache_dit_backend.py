@@ -14,7 +14,13 @@ from typing import Any, Optional
 
 import cache_dit
 import torch
-from cache_dit import BlockAdapter, DBCacheConfig, ForwardPattern, ParamsModifier, TaylorSeerCalibratorConfig
+from cache_dit import (
+    BlockAdapter,
+    DBCacheConfig,
+    ForwardPattern,
+    ParamsModifier,
+    TaylorSeerCalibratorConfig,
+)
 from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 from cache_dit.caching.cache_adapters.cache_adapter import CachedAdapter
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
@@ -134,7 +140,9 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
             A tuple of (num_high_noise_steps, num_low_noise_steps).
         """
         if pipeline.boundary_ratio is not None:
-            boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
+            boundary_timestep = (
+                pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
+            )
         else:
             boundary_timestep = None
 
@@ -151,7 +159,9 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
         num_low_noise_steps = num_inference_steps - num_high_noise_steps
         return num_high_noise_steps, num_low_noise_steps
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """Refresh cache context for both transformers with new num_inference_steps.
 
         Args:
@@ -159,7 +169,9 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
             num_inference_steps: New number of inference steps.
         """
 
-        num_high_noise_steps, num_low_noise_steps = _split_inference_steps(num_inference_steps)
+        num_high_noise_steps, num_low_noise_steps = _split_inference_steps(
+            num_inference_steps
+        )
         # Refresh context for high-noise transformer
         if cache_config.scm_steps_mask_policy is None:
             # cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_high_noise_steps, verbose=verbose)
@@ -179,7 +191,8 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_high_noise_steps,
                     steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy, total_steps=num_high_noise_steps
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_high_noise_steps,
                     ),
                     steps_computation_policy=cache_config.scm_steps_policy,
                 ),
@@ -191,7 +204,8 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_low_noise_steps,
                     steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy, total_steps=num_low_noise_steps
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_low_noise_steps,
                     ),
                     steps_computation_policy=cache_config.scm_steps_policy,
                 ),
@@ -201,7 +215,9 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
     return refresh_cache_context
 
 
-def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+def enable_cache_for_longcat_image(
+    pipeline: Any, cache_config: Any
+) -> Callable[[int], None]:
     """Enable cache-dit for LongCatImage pipeline.
 
     Args:
@@ -246,7 +262,9 @@ def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable
         cache_config=db_cache_config,
     )
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """Refresh cache context for the transformer with new num_inference_steps.
 
         Args:
@@ -254,7 +272,11 @@ def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable
             num_inference_steps: New number of inference steps.
         """
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_inference_steps,
+                verbose=verbose,
+            )
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
@@ -320,7 +342,9 @@ def enable_cache_for_flux(pipeline: Any, cache_config: Any) -> Callable[[int], N
         cache_config=db_cache_config,
     )
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """Refresh cache context for the transformer with new num_inference_steps.
 
         Args:
@@ -328,7 +352,11 @@ def enable_cache_for_flux(pipeline: Any, cache_config: Any) -> Callable[[int], N
             num_inference_steps: New number of inference steps.
         """
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_inference_steps,
+                verbose=verbose,
+            )
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
@@ -346,7 +374,9 @@ def enable_cache_for_flux(pipeline: Any, cache_config: Any) -> Callable[[int], N
     return refresh_cache_context
 
 
-def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+def enable_cache_for_flux2_klein(
+    pipeline: Any, cache_config: Any
+) -> Callable[[int], None]:
     """Enable cache-dit for FLUX.2-klein-4B pipeline.
 
     Args:
@@ -397,7 +427,9 @@ def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[
         cache_config=db_cache_config,
     )
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """Refresh cache context for the transformer with new num_inference_steps.
 
         Args:
@@ -405,7 +437,11 @@ def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[
             num_inference_steps: New number of inference steps.
         """
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_inference_steps,
+                verbose=verbose,
+            )
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
@@ -466,7 +502,9 @@ def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], No
         cache_config=db_cache_config,
     )
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """Refresh cache context for the transformer with new num_inference_steps.
 
         Args:
@@ -474,7 +512,11 @@ def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], No
             num_inference_steps: New number of inference steps.
         """
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_inference_steps,
+                verbose=verbose,
+            )
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
@@ -501,7 +543,9 @@ def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], N
     calibrator_config = None
     if cache_config.enable_taylorseer:
         taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        calibrator_config = TaylorSeerCalibratorConfig(
+            taylorseer_order=taylorseer_order
+        )
         logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
 
     blocks = transformer.transformer_blocks
@@ -526,9 +570,15 @@ def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], N
         calibrator_config=calibrator_config,
     )
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_inference_steps,
+                verbose=verbose,
+            )
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
@@ -563,7 +613,9 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
     calibrator_config = None
     if cache_config.enable_taylorseer:
         taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        calibrator_config = TaylorSeerCalibratorConfig(
+            taylorseer_order=taylorseer_order
+        )
         logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
 
     logger.info(
@@ -580,7 +632,9 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
         calibrator_config=calibrator_config,
     )
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """Refresh cache context for the transformer with new num_inference_steps.
 
         Args:
@@ -588,7 +642,11 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
             num_inference_steps: New number of inference steps.
         """
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_inference_steps,
+                verbose=verbose,
+            )
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
@@ -648,7 +706,9 @@ class BagelCachedContextManager(CachedContextManager):
                     if isinstance(encoder_hidden_states, torch.Tensor) and isinstance(
                         encoder_hidden_states_prev, torch.Tensor
                     ):
-                        encoder_hidden_states = encoder_hidden_states_prev + encoder_hidden_states
+                        encoder_hidden_states = (
+                            encoder_hidden_states_prev + encoder_hidden_states
+                        )
                 else:
                     # If encoder cache is not residual, we use the encoder hidden states directly
                     encoder_hidden_states = encoder_hidden_states_prev
@@ -682,7 +742,9 @@ class BagelCachedBlocks(CachedBlocks_Pattern_0_1_2):
                 *args,
                 **kwargs,
             )
-            hidden_states, encoder_hidden_states = self._process_block_outputs(hidden_states, encoder_hidden_states)
+            hidden_states, encoder_hidden_states = self._process_block_outputs(
+                hidden_states, encoder_hidden_states
+            )
 
         # compute hidden_states residual
         hidden_states = hidden_states.contiguous()
@@ -695,7 +757,9 @@ class BagelCachedBlocks(CachedBlocks_Pattern_0_1_2):
             and isinstance(encoder_hidden_states, torch.Tensor)  # FIX: Added Check
         ):
             encoder_hidden_states = encoder_hidden_states.contiguous()
-            encoder_hidden_states_residual = encoder_hidden_states - original_encoder_hidden_states
+            encoder_hidden_states_residual = (
+                encoder_hidden_states - original_encoder_hidden_states
+            )
         else:
             encoder_hidden_states_residual = None
 
@@ -754,7 +818,9 @@ class BagelCachedBlocks(CachedBlocks_Pattern_0_1_2):
                 *args,
                 **kwargs,
             )
-            hidden_states, encoder_hidden_states = self._process_block_outputs(hidden_states, encoder_hidden_states)
+            hidden_states, encoder_hidden_states = self._process_block_outputs(
+                hidden_states, encoder_hidden_states
+            )
             if not self._skip_prune(block_id):
                 hidden_states = hidden_states.contiguous()
                 hidden_states_residual = hidden_states - original_hidden_states
@@ -762,10 +828,14 @@ class BagelCachedBlocks(CachedBlocks_Pattern_0_1_2):
                 if (
                     encoder_hidden_states is not None
                     and original_encoder_hidden_states is not None
-                    and isinstance(encoder_hidden_states, torch.Tensor)  # FIX: Added Check
+                    and isinstance(
+                        encoder_hidden_states, torch.Tensor
+                    )  # FIX: Added Check
                 ):
                     encoder_hidden_states = encoder_hidden_states.contiguous()
-                    encoder_hidden_states_residual = encoder_hidden_states - original_encoder_hidden_states
+                    encoder_hidden_states_residual = (
+                        encoder_hidden_states - original_encoder_hidden_states
+                    )
                 else:
                     encoder_hidden_states_residual = None
 
@@ -833,7 +903,9 @@ class BagelCachedAdapter(CachedAdapter):
             persistent_context=isinstance(block_adapter.pipe, FakeDiffusionPipeline),
         )
 
-        flatten_contexts, contexts_kwargs = cls.modify_context_params(block_adapter, **context_kwargs)
+        flatten_contexts, contexts_kwargs = cls.modify_context_params(
+            block_adapter, **context_kwargs
+        )
 
         block_adapter.pipe._context_manager = context_manager  # instance level
 
@@ -844,7 +916,9 @@ class BagelCachedAdapter(CachedAdapter):
             def new_call(self, *args, **kwargs):
                 with ExitStack() as stack:
                     # cache context will be reset for each pipe inference
-                    for context_name, context_kwargs in zip(flatten_contexts, contexts_kwargs):
+                    for context_name, context_kwargs in zip(
+                        flatten_contexts, contexts_kwargs
+                    ):
                         stack.enter_context(
                             context_manager.enter_context(
                                 context_manager.reset_context(
@@ -891,25 +965,29 @@ class BagelCachedAdapter(CachedAdapter):
         for i in range(len(block_adapter.transformer)):
             unified_blocks_bind_context = {}
             for j in range(len(block_adapter.blocks[i])):
-                cache_config: BasicCacheConfig = contexts_kwargs[i * len(block_adapter.blocks[i]) + j]["cache_config"]
+                cache_config: BasicCacheConfig = contexts_kwargs[
+                    i * len(block_adapter.blocks[i]) + j
+                ]["cache_config"]
 
                 # Directly instantiate BagelCachedBlocks
-                unified_blocks_bind_context[block_adapter.unique_blocks_name[i][j]] = torch.nn.ModuleList(
-                    [
-                        BagelCachedBlocks(
-                            # 0. Transformer blocks configuration
-                            block_adapter.blocks[i][j],
-                            transformer=block_adapter.transformer[i],
-                            forward_pattern=block_adapter.forward_pattern[i][j],
-                            check_forward_pattern=block_adapter.check_forward_pattern,
-                            check_num_outputs=block_adapter.check_num_outputs,
-                            # 1. Cache/Prune context configuration
-                            cache_prefix=block_adapter.blocks_name[i][j],
-                            cache_context=block_adapter.unique_blocks_name[i][j],
-                            context_manager=block_adapter.pipe._context_manager,
-                            cache_type=cache_config.cache_type,
-                        )
-                    ]
+                unified_blocks_bind_context[block_adapter.unique_blocks_name[i][j]] = (
+                    torch.nn.ModuleList(
+                        [
+                            BagelCachedBlocks(
+                                # 0. Transformer blocks configuration
+                                block_adapter.blocks[i][j],
+                                transformer=block_adapter.transformer[i],
+                                forward_pattern=block_adapter.forward_pattern[i][j],
+                                check_forward_pattern=block_adapter.check_forward_pattern,
+                                check_num_outputs=block_adapter.check_num_outputs,
+                                # 1. Cache/Prune context configuration
+                                cache_prefix=block_adapter.blocks_name[i][j],
+                                cache_context=block_adapter.unique_blocks_name[i][j],
+                                context_manager=block_adapter.pipe._context_manager,
+                                cache_type=cache_config.cache_type,
+                            )
+                        ]
+                    )
                 )
 
             total_cached_blocks.append(unified_blocks_bind_context)
@@ -934,7 +1012,9 @@ def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], 
     calibrator_config = None
     if cache_config.enable_taylorseer:
         taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        calibrator_config = TaylorSeerCalibratorConfig(
+            taylorseer_order=taylorseer_order
+        )
         logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
 
     # Access the transformer: BagelPipeline -> Qwen2MoTForCausalLM -> Qwen2MoTModel
@@ -963,10 +1043,14 @@ def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], 
         calibrator_config=calibrator_config,
     )
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         transformer = pipeline.language_model.model
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                transformer, num_inference_steps=num_inference_steps, verbose=verbose
+            )
         else:
             cache_dit.refresh_context(
                 transformer,
@@ -1032,7 +1116,9 @@ def enable_cache_for_flux2(pipeline: Any, cache_config: Any) -> Callable[[int], 
         cache_config=db_cache_config,
     )
 
-    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh_cache_context(
+        pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """Refresh cache context for the transformer with new num_inference_steps.
 
         Args:
@@ -1040,7 +1126,11 @@ def enable_cache_for_flux2(pipeline: Any, cache_config: Any) -> Callable[[int], 
             num_inference_steps: New number of inference steps.
         """
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_inference_steps,
+                verbose=verbose,
+            )
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
@@ -1130,7 +1220,9 @@ class CacheDiTBackend(CacheBackend):
         # Check if this model has a custom cache-dit enabler
         if pipeline_name in CUSTOM_DIT_ENABLERS:
             logger.info(f"Using custom cache-dit enabler for model: {pipeline_name}")
-            self._refresh_func = CUSTOM_DIT_ENABLERS[pipeline_name](pipeline, self.config)
+            self._refresh_func = CUSTOM_DIT_ENABLERS[pipeline_name](
+                pipeline, self.config
+            )
         else:
             # For regular single-transformer models
             self._refresh_func = enable_cache_for_dit(pipeline, self.config)
@@ -1138,7 +1230,9 @@ class CacheDiTBackend(CacheBackend):
         self.enabled = True
         logger.info(f"Cache-dit enabled successfully on {pipeline_name}")
 
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(
+        self, pipeline: Any, num_inference_steps: int, verbose: bool = True
+    ) -> None:
         """Refresh cache context with new num_inference_steps.
 
         This method updates the cache context when num_inference_steps changes
@@ -1155,9 +1249,14 @@ class CacheDiTBackend(CacheBackend):
             return
 
         # Only refresh if num_inference_steps has changed
-        if self._last_num_inference_steps is None or num_inference_steps != self._last_num_inference_steps:
+        if (
+            self._last_num_inference_steps is None
+            or num_inference_steps != self._last_num_inference_steps
+        ):
             if verbose:
-                logger.info(f"Refreshing cache context for transformer with num_inference_steps: {num_inference_steps}")
+                logger.info(
+                    f"Refreshing cache context for transformer with num_inference_steps: {num_inference_steps}"
+                )
             self._refresh_func(pipeline, num_inference_steps, verbose)
             self._last_num_inference_steps = num_inference_steps
 
@@ -1170,7 +1269,9 @@ class CacheDiTBackend(CacheBackend):
         return self.enabled
 
 
-def may_enable_cache_dit(pipeline: Any, od_config: OmniDiffusionConfig) -> Optional["CacheDiTBackend"]:
+def may_enable_cache_dit(
+    pipeline: Any, od_config: OmniDiffusionConfig
+) -> Optional["CacheDiTBackend"]:
     """Enable cache-dit on the pipeline if configured (convenience function).
 
     This is a convenience function that creates and enables a CacheDiTBackend.

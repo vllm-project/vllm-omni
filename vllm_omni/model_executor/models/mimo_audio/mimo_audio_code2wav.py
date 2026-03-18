@@ -18,8 +18,13 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID, MiMoAudioConfig
-from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import MiMoAudioTokenizer
+from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
+    TALKER_CODEC_PAD_TOKEN_ID,
+    MiMoAudioConfig,
+)
+from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import (
+    MiMoAudioTokenizer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +115,17 @@ class MiMoAudioTokenizerWorker:
             warmup_dtype = torch.float32 if device_str == "cpu" else torch.bfloat16
             try:
                 self.encode_wav_base(torch.zeros(self.sample_rate, dtype=warmup_dtype))
-                self.decode(torch.zeros(self.audio_channels, self.group_size, dtype=torch.long))
+                self.decode(
+                    torch.zeros(self.audio_channels, self.group_size, dtype=torch.long)
+                )
                 logger.info(
                     "[tokenizer worker] Warmup finished in %.2fs",
                     time.monotonic() - warmup_start,
                 )
             except Exception as e:
-                logger.warning("[tokenizer worker] Warmup failed (non-critical): %s", str(e))
+                logger.warning(
+                    "[tokenizer worker] Warmup failed (non-critical): %s", str(e)
+                )
         else:
             logger.info("[tokenizer worker] Skipping warmup for CPU device")
 
@@ -124,7 +133,9 @@ class MiMoAudioTokenizerWorker:
         """Resample audio if sample rate doesn't match config"""
         target_sr = self.sample_rate
         if original_sr != target_sr:
-            wav_tensor = torchaudio.functional.resample(wav_tensor, original_sr, target_sr)
+            wav_tensor = torchaudio.functional.resample(
+                wav_tensor, original_sr, target_sr
+            )
         return wav_tensor
 
     def wav2mel(self, wav: torch.Tensor):
@@ -133,9 +144,13 @@ class MiMoAudioTokenizerWorker:
         spec = self.mel_transform(wav[None, :])
         return torch.log(torch.clip(spec, min=1e-7)).squeeze()
 
-    def group_by_length(self, features: torch.Tensor, lengths: torch.Tensor, max_length: int):
+    def group_by_length(
+        self, features: torch.Tensor, lengths: torch.Tensor, max_length: int
+    ):
         if features.size(0) != lengths.sum().item():
-            raise ValueError(f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}")
+            raise ValueError(
+                f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}"
+            )
 
         split_points = []
         current_sum = 0
@@ -195,7 +210,9 @@ class MiMoAudioTokenizerWorker:
         return audio_codes  # [audio_channels, T] cpu
 
     @torch.inference_mode()
-    def encode(self, audio: tuple[torch.Tensor, int], max_length: float | None = 256000) -> torch.Tensor:
+    def encode(
+        self, audio: tuple[torch.Tensor, int], max_length: float | None = 256000
+    ) -> torch.Tensor:
         """wav: [samples] cpu, sample_rate = 24000"""
         wav, original_sr = audio
         wav = self.resample_audio_if_needed(wav, original_sr)
@@ -212,7 +229,9 @@ class MiMoAudioTokenizerWorker:
 
         input_lens = torch.tensor(input_len_seg, device=self.device)
 
-        feature_groups, len_groups = self.group_by_length(input_features, input_lens, max_length)
+        feature_groups, len_groups = self.group_by_length(
+            input_features, input_lens, max_length
+        )
 
         audio_codes = self.encode_batch_base(feature_groups, len_groups)
         return audio_codes  # [audio_channels, T] cpu
@@ -336,7 +355,9 @@ def _normalize_tokenizer_worker_cache_key(
     audio_tokenizer_path: str,
 ) -> tuple[str, str, str]:
     """Normalize cache key so that same tokenizer always hits the same cache entry."""
-    device_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    device_type = (
+        device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    )
     # Use realpath so symlinks / trailing slash don't create duplicate entries
     ap = audio_tokenizer_path or ""
     if ap and os.path.exists(ap):
@@ -358,7 +379,9 @@ def get_tokenizer_worker(
     config_path: str,
     audio_tokenizer_path: str,
 ) -> MiMoAudioTokenizerWorker:
-    key = _normalize_tokenizer_worker_cache_key(device, config_path, audio_tokenizer_path)
+    key = _normalize_tokenizer_worker_cache_key(
+        device, config_path, audio_tokenizer_path
+    )
     if key not in _TOKENIZER_WORKER_CACHE:
         device_type = key[0]
         _TOKENIZER_WORKER_CACHE[key] = MiMoAudioTokenizerWorker(
@@ -381,7 +404,11 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
-        config = MiMoAudioConfig(**vars(config)) if isinstance(config, Qwen2Config) else config
+        config = (
+            MiMoAudioConfig(**vars(config))
+            if isinstance(config, Qwen2Config)
+            else config
+        )
         self.config = config
         self.vllm_config = vllm_config
         self.quant_config = vllm_config.quant_config
@@ -393,16 +420,18 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         self.device = torch.device(device_str)
         self.sample_rate = getattr(config, "audio_sample_rate", 24000)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.name_or_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config.name_or_path, trust_remote_code=True
+        )
         self.codes = MiMoAudioCodes.from_tokenizer(self.tokenizer)
         self.streamer_config = AudioStreamerConfig(
             group_size=self.config.group_size,
             audio_channels=self.config.audio_channels,
         )
 
-        self.audio_tokenizer_path = getattr(vllm_config.model_config, "audio_tokenizer_path", None) or os.environ.get(
-            "MIMO_AUDIO_TOKENIZER_PATH"
-        )
+        self.audio_tokenizer_path = getattr(
+            vllm_config.model_config, "audio_tokenizer_path", None
+        ) or os.environ.get("MIMO_AUDIO_TOKENIZER_PATH")
         if not self.audio_tokenizer_path:
             raise ValueError(
                 "Audio tokenizer path is not set. Provide "
@@ -481,7 +510,9 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             raise ValueError("code_tensor is empty.")
 
         if getattr(self.vllm_config.model_config, "async_chunk", False):
-            waveform = self.chunked_decode_streaming(code_tensor, chunk_size=10, left_context_size=10)
+            waveform = self.chunked_decode_streaming(
+                code_tensor, chunk_size=10, left_context_size=10
+            )
         else:
             waveform = self._decode_waveform_from_codes(code_tensor)
 
@@ -524,7 +555,11 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             return code_tensor
 
         sampling_metadata = kwargs.get("sampling_metadata")
-        prompt_token_ids = getattr(sampling_metadata, "prompt_token_ids", None) if sampling_metadata else None
+        prompt_token_ids = (
+            getattr(sampling_metadata, "prompt_token_ids", None)
+            if sampling_metadata
+            else None
+        )
 
         if prompt_token_ids is None:
             return code_tensor
@@ -547,9 +582,12 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
 
     def _check_dummy_code_tensor(self, code_tensor: torch.Tensor) -> bool:
         if code_tensor is not None and code_tensor.numel() == DUMMY_CODE_SHAPE:
-            code_groups = code_tensor.view(self.config.group_size, self.config.audio_channels + 1)
+            code_groups = code_tensor.view(
+                self.config.group_size, self.config.audio_channels + 1
+            )
             return (
-                (code_groups[:, 0] == TALKER_CODEC_PAD_TOKEN_ID).all() and (code_groups[:, 1:].sum() == 0).all()
+                (code_groups[:, 0] == TALKER_CODEC_PAD_TOKEN_ID).all()
+                and (code_groups[:, 1:].sum() == 0).all()
             ).item()
         return False
 
@@ -604,7 +642,11 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         multimodal_embeddings=None,
         is_multimodal: bool = False,
     ) -> torch.Tensor:
-        return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
+        return (
+            torch.zeros_like(input_ids)
+            .reshape(-1, 1)
+            .repeat(1, self.vllm_config.model_config.get_hidden_size())
+        )
 
     def compute_logits(
         self,

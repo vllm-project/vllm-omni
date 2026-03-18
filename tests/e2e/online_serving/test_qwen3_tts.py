@@ -25,7 +25,13 @@ MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
 def get_stage_config(name: str = "qwen3_tts.yaml"):
     """Get the stage config path for Qwen3-TTS."""
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
+    return str(
+        Path(__file__).parent.parent.parent.parent
+        / "vllm_omni"
+        / "model_executor"
+        / "stage_configs"
+        / name
+    )
 
 
 @pytest.fixture(scope="class")
@@ -111,9 +117,9 @@ class TestQwen3TTSCustomVoice:
         assert response.status_code == 200, f"Request failed: {response.text}"
         assert response.headers.get("content-type") == "audio/wav"
         assert verify_wav_audio(response.content), "Response is not valid WAV audio"
-        assert len(response.content) > MIN_AUDIO_BYTES, (
-            f"Audio content too small ({len(response.content)} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
-        )
+        assert (
+            len(response.content) > MIN_AUDIO_BYTES
+        ), f"Audio content too small ({len(response.content)} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
 
     @pytest.mark.core_model
     @pytest.mark.omni
@@ -131,9 +137,9 @@ class TestQwen3TTSCustomVoice:
         assert response.status_code == 200, f"Request failed: {response.text}"
         assert response.headers.get("content-type") == "audio/wav"
         assert verify_wav_audio(response.content), "Response is not valid WAV audio"
-        assert len(response.content) > MIN_AUDIO_BYTES, (
-            f"Audio content too small ({len(response.content)} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
-        )
+        assert (
+            len(response.content) > MIN_AUDIO_BYTES
+        ), f"Audio content too small ({len(response.content)} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
 
     @pytest.mark.core_model
     @pytest.mark.omni
@@ -150,7 +156,9 @@ class TestQwen3TTSCustomVoice:
                 language="English",
             )
 
-            assert response.status_code == 200, f"Request failed for voice {voice}: {response.text}"
+            assert (
+                response.status_code == 200
+            ), f"Request failed for voice {voice}: {response.text}"
             assert verify_wav_audio(response.content), f"Invalid WAV for voice {voice}"
 
     @pytest.mark.core_model
@@ -179,7 +187,9 @@ class TestQwen3TTSCustomVoice:
         try:
             # If this succeeds and starts with {"error", it's a bug
             text = response.content.decode("utf-8")
-            assert not text.startswith('{"error"'), f"Got error response instead of audio: {text}"
+            assert not text.startswith(
+                '{"error"'
+            ), f"Got error response instead of audio: {text}"
         except UnicodeDecodeError:
             # This is expected - binary audio can't be decoded as UTF-8
             pass

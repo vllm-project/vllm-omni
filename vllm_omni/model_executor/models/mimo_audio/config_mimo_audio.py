@@ -176,14 +176,22 @@ class MiMoAudioTokenizerConfig(PretrainedConfig):
         self.encoder_attention_heads = encoder_attention_heads
         self.encoder_ffn_dim = encoder_ffn_dim
         self.encoder_causal = encoder_causal
-        self.encoder_attn_window_size = encoder_attn_window_size if encoder_attn_window_size is not None else [-1, -1]
+        self.encoder_attn_window_size = (
+            encoder_attn_window_size
+            if encoder_attn_window_size is not None
+            else [-1, -1]
+        )
         self.decoder_layers = decoder_layers
         self.decoder_attention_heads = decoder_attention_heads
         self.decoder_ffn_dim = decoder_ffn_dim
         self.decoder_kernel_size = decoder_kernel_size
         self.decoder_stride_size = decoder_stride_size
         self.decoder_causal = decoder_causal
-        self.decoder_attn_window_size = decoder_attn_window_size if decoder_attn_window_size is not None else [-1, -1]
+        self.decoder_attn_window_size = (
+            decoder_attn_window_size
+            if decoder_attn_window_size is not None
+            else [-1, -1]
+        )
         self.nfft = nfft
         self.vocoder_dim = vocoder_dim
         self.vocoder_intermediate_dim = vocoder_intermediate_dim
@@ -203,4 +211,8 @@ class MiMoAudioTokenizerConfig(PretrainedConfig):
         self.rope_type = rope_type
         self.ln_type = ln_type
         self.vocoder_attention_heads = vocoder_attention_heads
-        self.vocoder_attn_window_size = vocoder_attn_window_size if vocoder_attn_window_size is not None else [40, 10]
+        self.vocoder_attn_window_size = (
+            vocoder_attn_window_size
+            if vocoder_attn_window_size is not None
+            else [40, 10]
+        )

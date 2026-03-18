@@ -8,7 +8,9 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: Any) -> nn.Module:
+def regionally_compile(
+    model: nn.Module, *compile_args: Any, **compile_kwargs: Any
+) -> nn.Module:
     """
     Apply regional compilation to a PyTorch model.
 
@@ -24,7 +26,9 @@ def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: A
     repeated_blocks = getattr(model, "_repeated_blocks", None)
 
     if not repeated_blocks:
-        logger.warning("Regional compilation skipped because the model does not define `_repeated_blocks`.")
+        logger.warning(
+            "Regional compilation skipped because the model does not define `_repeated_blocks`."
+        )
         return model
 
     # Check if we have modules with the specified class names
@@ -36,6 +40,8 @@ def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: A
             has_compiled_region = True
 
     if not has_compiled_region:
-        logger.warning(f"Regional compilation skipped because {repeated_blocks} classes are not found in the model.")
+        logger.warning(
+            f"Regional compilation skipped because {repeated_blocks} classes are not found in the model."
+        )
 
     return model

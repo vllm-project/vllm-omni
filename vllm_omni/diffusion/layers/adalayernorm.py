@@ -17,12 +17,16 @@ class AdaLayerNorm(CustomOp):
         out = layernorm(x) * (1 + scale) + shift
     """
 
-    def __init__(self, hidden_size: int, elementwise_affine: bool = False, eps: float = 1e-6) -> None:
+    def __init__(
+        self, hidden_size: int, elementwise_affine: bool = False, eps: float = 1e-6
+    ) -> None:
         super().__init__()
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         self.hidden_size = hidden_size
-        self.layernorm = nn.LayerNorm(self.hidden_size, elementwise_affine=self.elementwise_affine, eps=self.eps)
+        self.layernorm = nn.LayerNorm(
+            self.hidden_size, elementwise_affine=self.elementwise_affine, eps=self.eps
+        )
 
     def preprocess(
         self,
@@ -36,7 +40,10 @@ class AdaLayerNorm(CustomOp):
             # Assuming mod_params batch dim is 2*actual_batch (chunked into 2 parts)
             # So shift, scale, gate have shape [2*actual_batch, d]
             actual_batch = shift.size(0) // 2
-            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]  # each: [actual_batch, d]
+            shift_0, shift_1 = (
+                shift[:actual_batch],
+                shift[actual_batch:],
+            )  # each: [actual_batch, d]
             scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
             gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
 
@@ -91,16 +98,23 @@ class AdaLayerNorm(CustomOp):
             try:
                 from mindiesd import layernorm_scale_shift
 
-                output = layernorm_scale_shift(self.layernorm, x, scale_result, shift_result, fused=True)
+                output = layernorm_scale_shift(
+                    self.layernorm, x, scale_result, shift_result, fused=True
+                )
 
                 return output, gate_result
             except ImportError as e:
-                logger.warning_once(f"mindiesd import failed, falling back to torch_npu: {e}")
+                logger.warning_once(
+                    f"mindiesd import failed, falling back to torch_npu: {e}"
+                )
 
         import torch_npu
 
         output = (
-            torch_npu.npu_layer_norm_eval(x, normalized_shape=[self.hidden_size], eps=self.eps) * (1 + scale_result)
+            torch_npu.npu_layer_norm_eval(
+                x, normalized_shape=[self.hidden_size], eps=self.eps
+            )
+            * (1 + scale_result)
             + shift_result
         )
 

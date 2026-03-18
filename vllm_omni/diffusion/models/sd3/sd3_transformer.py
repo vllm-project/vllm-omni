@@ -7,7 +7,11 @@ import torch.nn.functional as F
 # TODO replace this with vLLM implementation
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, SD35AdaLayerNormZeroX
+from diffusers.models.normalization import (
+    AdaLayerNormContinuous,
+    AdaLayerNormZero,
+    SD35AdaLayerNormZeroX,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -25,7 +29,9 @@ logger = init_logger(__name__)
 
 
 class GELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True):
+    def __init__(
+        self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(dim_in, dim_out, bias=bias)
         self.approximate = approximate
@@ -94,7 +100,11 @@ class SD3PatchEmbed(nn.Module):
         self.embed_dim = embed_dim
 
         self.proj = nn.Conv2d(
-            in_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias=True
+            in_channels,
+            embed_dim,
+            kernel_size=(patch_size, patch_size),
+            stride=patch_size,
+            bias=True,
         )
 
     def forward(self, latent):
@@ -152,7 +162,9 @@ class SD3CrossAttention(nn.Module):
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
-            self.to_out.append(RowParallelLinear(self.inner_dim, self.dim, bias=out_bias))
+            self.to_out.append(
+                RowParallelLinear(self.inner_dim, self.dim, bias=out_bias)
+            )
         else:
             self.to_out = None
 
@@ -268,7 +280,9 @@ class SD3TransformerBlock(nn.Module):
 
         self.use_dual_attention = use_dual_attention
         self.context_pre_only = context_pre_only
-        context_norm_type = "ada_norm_continuous" if context_pre_only else "ada_norm_zero"
+        context_norm_type = (
+            "ada_norm_continuous" if context_pre_only else "ada_norm_zero"
+        )
 
         if use_dual_attention:
             self.norm1 = SD35AdaLayerNormZeroX(dim)
@@ -277,7 +291,12 @@ class SD3TransformerBlock(nn.Module):
 
         if context_norm_type == "ada_norm_continuous":
             self.norm1_context = AdaLayerNormContinuous(
-                dim, dim, elementwise_affine=False, eps=1e-6, bias=True, norm_type="layer_norm"
+                dim,
+                dim,
+                elementwise_affine=False,
+                eps=1e-6,
+                bias=True,
+                norm_type="layer_norm",
             )
         elif context_norm_type == "ada_norm_zero":
             self.norm1_context = AdaLayerNormZero(dim)
@@ -317,7 +336,9 @@ class SD3TransformerBlock(nn.Module):
 
         if not context_pre_only:
             self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-            self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+            self.ff_context = FeedForward(
+                dim=dim, dim_out=dim, activation_fn="gelu-approximate"
+            )
         else:
             self.norm2_context = None
             self.ff_context = None
@@ -331,18 +352,30 @@ class SD3TransformerBlock(nn.Module):
         if isinstance(encoder_hidden_states, tuple):
             encoder_hidden_states = encoder_hidden_states[0]
         if self.use_dual_attention:
-            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_hidden_states2, gate_msa2 = self.norm1(
+            (
+                norm_hidden_states,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                norm_hidden_states2,
+                gate_msa2,
+            ) = self.norm1(hidden_states, emb=temb)
+        else:
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
                 hidden_states, emb=temb
             )
-        else:
-            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
 
         if self.context_pre_only:
             norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states, temb)
         else:
-            norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-                encoder_hidden_states, emb=temb
-            )
+            (
+                norm_encoder_hidden_states,
+                c_gate_msa,
+                c_shift_mlp,
+                c_scale_mlp,
+                c_gate_mlp,
+            ) = self.norm1_context(encoder_hidden_states, emb=temb)
 
         # Attention.
         attn_output, context_attn_output = self.attn(
@@ -360,7 +393,9 @@ class SD3TransformerBlock(nn.Module):
             hidden_states = hidden_states + attn_output2
 
         norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm_hidden_states = (
+            norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        )
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
 
@@ -374,9 +409,14 @@ class SD3TransformerBlock(nn.Module):
             encoder_hidden_states = encoder_hidden_states + context_attn_output
 
             norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-            norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+            norm_encoder_hidden_states = (
+                norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
+                + c_shift_mlp[:, None]
+            )
             context_ff_output = self.ff_context(norm_encoder_hidden_states)
-            encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+            encoder_hidden_states = (
+                encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+            )
 
         return encoder_hidden_states, hidden_states
 
@@ -401,13 +441,17 @@ class SD3Transformer2DModel(nn.Module):
         self.out_channels = model_config.out_channels
         self.num_attention_heads = model_config.num_attention_heads
         self.attention_head_dim = model_config.attention_head_dim
-        self.inner_dim = model_config.num_attention_heads * model_config.attention_head_dim
+        self.inner_dim = (
+            model_config.num_attention_heads * model_config.attention_head_dim
+        )
         self.caption_projection_dim = model_config.caption_projection_dim
         self.pooled_projection_dim = model_config.pooled_projection_dim
         self.joint_attention_dim = model_config.joint_attention_dim
         self.patch_size = model_config.patch_size
         self.dual_attention_layers = (
-            model_config.dual_attention_layers if hasattr(model_config, "dual_attention_layers") else ()
+            model_config.dual_attention_layers
+            if hasattr(model_config, "dual_attention_layers")
+            else ()
         )
         self.qk_norm = model_config.qk_norm if hasattr(model_config, "qk_norm") else ""
         self.pos_embed_max_size = model_config.pos_embed_max_size
@@ -422,9 +466,12 @@ class SD3Transformer2DModel(nn.Module):
         )
 
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
-            embedding_dim=self.inner_dim, pooled_projection_dim=self.pooled_projection_dim
+            embedding_dim=self.inner_dim,
+            pooled_projection_dim=self.pooled_projection_dim,
         )
-        self.context_embedder = ReplicatedLinear(self.joint_attention_dim, self.caption_projection_dim)
+        self.context_embedder = ReplicatedLinear(
+            self.joint_attention_dim, self.caption_projection_dim
+        )
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -434,15 +481,21 @@ class SD3Transformer2DModel(nn.Module):
                     attention_head_dim=self.attention_head_dim,
                     context_pre_only=i == self.num_layers - 1,
                     qk_norm=self.qk_norm,
-                    use_dual_attention=True if i in self.dual_attention_layers else False,
+                    use_dual_attention=(
+                        True if i in self.dual_attention_layers else False
+                    ),
                 )
                 for i in range(self.num_layers)
             ]
         )
 
-        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
+        self.norm_out = AdaLayerNormContinuous(
+            self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
+        )
         self.proj_out = ReplicatedLinear(
-            self.inner_dim, self.patch_size * self.patch_size * self.out_channels, bias=True
+            self.inner_dim,
+            self.patch_size * self.patch_size * self.out_channels,
+            bias=True,
         )
 
     def forward(
@@ -499,11 +552,23 @@ class SD3Transformer2DModel(nn.Module):
         width = width // patch_size
 
         hidden_states = hidden_states.reshape(
-            shape=(hidden_states.shape[0], height, width, patch_size, patch_size, self.out_channels)
+            shape=(
+                hidden_states.shape[0],
+                height,
+                width,
+                patch_size,
+                patch_size,
+                self.out_channels,
+            )
         )
         hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
         output = hidden_states.reshape(
-            shape=(hidden_states.shape[0], self.out_channels, height * patch_size, width * patch_size)
+            shape=(
+                hidden_states.shape[0],
+                self.out_channels,
+                height * patch_size,
+                width * patch_size,
+            )
         )
 
         return Transformer2DModelOutput(sample=output)

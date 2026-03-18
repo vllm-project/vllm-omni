@@ -21,7 +21,9 @@ def _register_omni_hf_configs() -> None:
             Qwen3TTSConfig,
         )
     except Exception as exc:  # pragma: no cover - best-effort optional registration
-        logger.warning("Skipping omni HF config registration due to import error: %s", exc)
+        logger.warning(
+            "Skipping omni HF config registration due to import error: %s", exc
+        )
         return
 
     try:
@@ -42,7 +44,10 @@ def register_omni_models_to_vllm():
     supported_archs = ModelRegistry.get_supported_archs()
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         if arch not in supported_archs:
-            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+            ModelRegistry.register_model(
+                arch,
+                f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}",
+            )
 
 
 @dataclass
@@ -124,7 +129,9 @@ class OmniEngineArgs(EngineArgs):
         mm_processor_kwargs = getattr(self, "mm_processor_kwargs", None)
         mm_processor_cache_gb = getattr(self, "mm_processor_cache_gb", 4)
         mm_processor_cache_type = getattr(self, "mm_processor_cache_type", None)
-        mm_shm_cache_max_object_size_mb = getattr(self, "mm_shm_cache_max_object_size_mb", 128)
+        mm_shm_cache_max_object_size_mb = getattr(
+            self, "mm_shm_cache_max_object_size_mb", 128
+        )
         mm_encoder_only = getattr(self, "mm_encoder_only", False)
         mm_encoder_tp_mode = getattr(self, "mm_encoder_tp_mode", "weights")
         mm_encoder_attn_backend = getattr(self, "mm_encoder_attn_backend", None)
@@ -286,7 +293,9 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         mm_processor_kwargs = getattr(self, "mm_processor_kwargs", None)
         mm_processor_cache_gb = getattr(self, "mm_processor_cache_gb", 4)
         mm_processor_cache_type = getattr(self, "mm_processor_cache_type", None)
-        mm_shm_cache_max_object_size_mb = getattr(self, "mm_shm_cache_max_object_size_mb", 128)
+        mm_shm_cache_max_object_size_mb = getattr(
+            self, "mm_shm_cache_max_object_size_mb", 128
+        )
         mm_encoder_only = getattr(self, "mm_encoder_only", False)
         mm_encoder_tp_mode = getattr(self, "mm_encoder_tp_mode", "weights")
         mm_encoder_attn_backend = getattr(self, "mm_encoder_attn_backend", None)

@@ -40,7 +40,9 @@ class OmniCoordClientForStage:
             self._socket.connect(self._coord_zmq_addr)
         except zmq.ZMQError as e:
             self._socket.close()
-            raise RuntimeError(f"Failed to connect to coordinator at {self._coord_zmq_addr}: {e}") from e
+            raise RuntimeError(
+                f"Failed to connect to coordinator at {self._coord_zmq_addr}: {e}"
+            ) from e
 
         self._status = StageStatus.UP
         self._queue_length = 0
@@ -125,7 +127,9 @@ class OmniCoordClientForStage:
             except (RuntimeError, zmq.ZMQError) as e:
                 # First send failed; try reconnecting a few times.
                 if not self._reconnect:
-                    logger.error("Failed to send event and reconnect to coordinator", exc_info=e)
+                    logger.error(
+                        "Failed to send event and reconnect to coordinator", exc_info=e
+                    )
                     raise
 
                 # Reconnected successfully; try sending once more.
@@ -134,7 +138,9 @@ class OmniCoordClientForStage:
                 except zmq.Again:
                     logger.debug("Send buffer full after reconnect, dropping event")
                 except (RuntimeError, zmq.ZMQError) as e2:
-                    logger.error("Failed to send event after successful reconnect", exc_info=e2)
+                    logger.error(
+                        "Failed to send event after successful reconnect", exc_info=e2
+                    )
                     raise
 
     def update_info(

@@ -55,7 +55,9 @@ def run_inference(
         OmniDiffusionSamplingParams(
             height=height,
             width=width,
-            generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
+            generator=torch.Generator(
+                device=current_omni_platform.device_type
+            ).manual_seed(42),
             guidance_scale=1.0,
             num_inference_steps=num_inference_steps,
             num_frames=num_frames,
@@ -83,17 +85,24 @@ def test_layerwise_offload_diffusion_model(model_name: str):
         cleanup_dist_env_and_memory()
 
         # Run with layerwise offloading (1 layer on device)
-        layerwise_offload_peak_memory = run_inference(model_name, layerwise_offload=True)
+        layerwise_offload_peak_memory = run_inference(
+            model_name, layerwise_offload=True
+        )
         cleanup_dist_env_and_memory()
     except Exception:
         pytest.fail("Inference failed")
 
-    print(f"Layerwise offload peak memory (1 GPU layer): {layerwise_offload_peak_memory} MB")
+    print(
+        f"Layerwise offload peak memory (1 GPU layer): {layerwise_offload_peak_memory} MB"
+    )
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
 
     # Verify that layerwise offloading significantly reduces memory usage
     # Passes only if the actual savings exceeds the expected savings
-    assert layerwise_offload_peak_memory + MODELS_SAVED_MEMORY_MB[model_name] < no_offload_peak_memory, (
+    assert (
+        layerwise_offload_peak_memory + MODELS_SAVED_MEMORY_MB[model_name]
+        < no_offload_peak_memory
+    ), (
         f"Layerwise offload peak memory {layerwise_offload_peak_memory} MB "
         f"should be significantly less than no offload peak memory {no_offload_peak_memory} MB"
     )

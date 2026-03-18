@@ -50,7 +50,9 @@ class OmniDiffusion:
         if stage_id is not None:
             self.od_config.omni_kv_config.setdefault("stage_id", stage_id)
         if engine_input_source is not None:
-            self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
+            self.od_config.omni_kv_config.setdefault(
+                "engine_input_source", engine_input_source
+            )
 
         # Detect model class and load config
         # Diffusers-style models expose `model_index.json` with `_class_name`.
@@ -81,25 +83,35 @@ class OmniDiffusion:
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             cfg = get_hf_file_to_dict("config.json", od_config.model)
             if cfg is None:
-                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+                raise ValueError(
+                    f"Could not find config.json or model_index.json for model {od_config.model}"
+                )
 
             # Map model_type or architecture to pipeline class
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
             pipeline_class = None
             # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
-            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+            if (
+                model_type == "bagel"
+                or "BagelForConditionalGeneration" in architectures
+            ):
                 pipeline_class = "BagelPipeline"
             elif model_type == "nextstep":
                 if od_config.model_class_name is None:
                     pipeline_class = "NextStep11Pipeline"
-            elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
+            elif (
+                model_type == "glm-image"
+                or "GlmImageForConditionalGeneration" in architectures
+            ):
                 pipeline_class = "GlmImagePipeline"
             elif architectures and len(architectures) == 1:
                 pipeline_class = architectures[0]
 
             if pipeline_class is None:
-                raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")
+                raise ValueError(
+                    f"Unknown model type: {model_type}, architectures: {architectures}"
+                )
 
             if od_config.model_class_name is None:
                 od_config.model_class_name = pipeline_class
@@ -125,7 +137,10 @@ class OmniDiffusion:
 
         # Check if request_id is provided in kwargs
         if len(request_ids) < len(prompts):
-            request_ids.extend(f"{i + len(request_ids)}_{uuid.uuid4()}" for i in range(len(prompts) - len(request_ids)))
+            request_ids.extend(
+                f"{i + len(request_ids)}_{uuid.uuid4()}"
+                for i in range(len(prompts) - len(request_ids))
+            )
 
         request = OmniDiffusionRequest(prompts, sampling_params, request_ids)
         result = self._run_engine(request)

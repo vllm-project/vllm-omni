@@ -88,7 +88,9 @@ class OmniStreamingSpeechHandler:
                     await self._send_error(websocket, str(error))
                     return
 
-            boundary_re = SPLIT_CLAUSE if config.split_granularity == "clause" else SPLIT_SENTENCE
+            boundary_re = (
+                SPLIT_CLAUSE if config.split_granularity == "clause" else SPLIT_SENTENCE
+            )
             splitter = SentenceSplitter(boundary_re=boundary_re)
             sentence_index = 0
 
@@ -100,7 +102,9 @@ class OmniStreamingSpeechHandler:
                         timeout=self._idle_timeout,
                     )
                 except asyncio.TimeoutError:
-                    await self._send_error(websocket, "Idle timeout: no message received")
+                    await self._send_error(
+                        websocket, "Idle timeout: no message received"
+                    )
                     return
 
                 if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
@@ -114,7 +118,9 @@ class OmniStreamingSpeechHandler:
                     continue
 
                 if not isinstance(msg, dict):
-                    await self._send_error(websocket, "WebSocket messages must be JSON objects")
+                    await self._send_error(
+                        websocket, "WebSocket messages must be JSON objects"
+                    )
                     continue
 
                 msg_type = msg.get("type")
@@ -122,18 +128,24 @@ class OmniStreamingSpeechHandler:
                 if msg_type == "input.text":
                     text = msg.get("text", "")
                     if not isinstance(text, str):
-                        await self._send_error(websocket, "input.text requires a string value")
+                        await self._send_error(
+                            websocket, "input.text requires a string value"
+                        )
                         continue
                     sentences = splitter.add_text(text)
                     for sentence in sentences:
-                        await self._generate_and_send(websocket, config, sentence, sentence_index)
+                        await self._generate_and_send(
+                            websocket, config, sentence, sentence_index
+                        )
                         sentence_index += 1
 
                 elif msg_type == "input.done":
                     # Flush remaining buffer
                     remaining = splitter.flush()
                     if remaining:
-                        await self._generate_and_send(websocket, config, remaining, sentence_index)
+                        await self._generate_and_send(
+                            websocket, config, remaining, sentence_index
+                        )
                         sentence_index += 1
 
                     # Send session.done
@@ -158,9 +170,13 @@ class OmniStreamingSpeechHandler:
             try:
                 await self._send_error(websocket, f"Internal error: {e}")
             except Exception:
-                logger.debug("Failed to send error to streaming speech client", exc_info=True)
+                logger.debug(
+                    "Failed to send error to streaming speech client", exc_info=True
+                )
 
-    async def _receive_config(self, websocket: WebSocket) -> StreamingSpeechSessionConfig | None:
+    async def _receive_config(
+        self, websocket: WebSocket
+    ) -> StreamingSpeechSessionConfig | None:
         """Wait for and validate the session.config message."""
         try:
             raw = await asyncio.wait_for(
@@ -193,7 +209,9 @@ class OmniStreamingSpeechHandler:
             return None
 
         try:
-            config = StreamingSpeechSessionConfig(**{k: v for k, v in msg.items() if k != "type"})
+            config = StreamingSpeechSessionConfig(
+                **{k: v for k, v in msg.items() if k != "type"}
+            )
         except ValidationError as e:
             await self._send_error(websocket, f"Invalid session config: {e}")
             return None
@@ -242,13 +260,19 @@ class OmniStreamingSpeechHandler:
         request_id = None
         try:
             if config.stream_audio:
-                request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
-                async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+                request_id, generator, _ = (
+                    await self._speech_service._prepare_speech_generation(request)
+                )
+                async with aclosing(
+                    self._speech_service._generate_pcm_chunks(generator, request_id)
+                ) as stream:
                     async for chunk in stream:
                         total_bytes += len(chunk)
                         await websocket.send_bytes(chunk)
             else:
-                audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
+                audio_bytes, _ = await self._speech_service._generate_audio_bytes(
+                    request
+                )
                 total_bytes = len(audio_bytes)
                 await websocket.send_bytes(audio_bytes)
         except WebSocketDisconnect:
@@ -256,12 +280,18 @@ class OmniStreamingSpeechHandler:
                 try:
                     await self._speech_service.engine_client.abort(request_id)
                 except Exception:
-                    logger.debug("Failed to abort streaming speech request %s", request_id, exc_info=True)
+                    logger.debug(
+                        "Failed to abort streaming speech request %s",
+                        request_id,
+                        exc_info=True,
+                    )
             raise
         except Exception as e:
             generation_failed = True
             logger.error("Generation failed for sentence %d: %s", sentence_index, e)
-            await self._send_error(websocket, f"Generation failed for sentence {sentence_index}: {e}")
+            await self._send_error(
+                websocket, f"Generation failed for sentence {sentence_index}: {e}"
+            )
         finally:
             try:
                 await websocket.send_json(
@@ -273,7 +303,11 @@ class OmniStreamingSpeechHandler:
                     }
                 )
             except Exception:
-                logger.debug("Failed to send audio.done for sentence %d", sentence_index, exc_info=True)
+                logger.debug(
+                    "Failed to send audio.done for sentence %d",
+                    sentence_index,
+                    exc_info=True,
+                )
 
     @staticmethod
     async def _send_error(websocket: WebSocket, message: str) -> None:

@@ -20,7 +20,10 @@ from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio, OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    CreateAudio,
+    OpenAICreateSpeechRequest,
+)
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _create_wav_header,
@@ -42,7 +45,9 @@ class TestAudioMixin:
         audio_obj = CreateAudio(audio_tensor=stereo_tensor)
 
         mock_speed = mocker.patch.object(
-            audio_mixin, "_apply_speed_adjustment", side_effect=lambda tensor, speed, sr: (tensor, sr)
+            audio_mixin,
+            "_apply_speed_adjustment",
+            side_effect=lambda tensor, speed, sr: (tensor, sr),
         )
         mocker.patch("soundfile.write")
 
@@ -58,12 +63,16 @@ class TestAudioMixin:
         mock_time_stretch.return_value = np.zeros(12000)
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
-        adjusted_audio, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=2.0, sample_rate=24000)
+        adjusted_audio, _ = audio_mixin._apply_speed_adjustment(
+            audio_tensor, speed=2.0, sample_rate=24000
+        )
 
         mock_time_stretch.assert_called_with(y=audio_tensor, rate=2.0)
         assert adjusted_audio.shape == (12000,)
 
-    def test_unsupported_format_fallback(self, audio_mixin, caplog, mocker: MockerFixture):
+    def test_unsupported_format_fallback(
+        self, audio_mixin, caplog, mocker: MockerFixture
+    ):
         mock_write = mocker.patch("soundfile.write")
         audio_tensor = np.random.rand(24000).astype(np.float32)
         # Use a format that is not in the list of supported formats
@@ -112,7 +121,9 @@ class TestAudioMixin:
 
         mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
         # speed=1.0 should return immediately without calling librosa
-        result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
+        result, _ = audio_mixin._apply_speed_adjustment(
+            audio_tensor, speed=1.0, sample_rate=24000
+        )
 
         mock_time_stretch.assert_not_called()
         assert np.array_equal(result, audio_tensor)
@@ -124,7 +135,9 @@ class TestAudioMixin:
         # Mock return value representing a sped-up version (half length)
         mock_time_stretch.return_value = np.zeros((12000, 2), dtype=np.float32)
 
-        result, _ = audio_mixin._apply_speed_adjustment(stereo_tensor, speed=2.0, sample_rate=24000)
+        result, _ = audio_mixin._apply_speed_adjustment(
+            stereo_tensor, speed=2.0, sample_rate=24000
+        )
 
         mock_time_stretch.assert_called_once()
         # Ensure the stereo tensor was passed to librosa
@@ -161,7 +174,9 @@ def create_mock_audio_output_for_test(
 
     num_samples = 24000
     audio_tensor = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, num_samples))
-    mock_request_output = MockRequestOutput(request_id=request_id, audio_tensor=audio_tensor)
+    mock_request_output = MockRequestOutput(
+        request_id=request_id, audio_tensor=audio_tensor
+    )
 
     return OmniRequestOutput(
         stage_id=0,
@@ -200,9 +215,13 @@ def test_app(mocker: MockerFixture):
 
     sig = signature(original_create_speech)
 
-    new_parameters = [param for name, param in sig.parameters.items() if name != "raw_request"]
+    new_parameters = [
+        param for name, param in sig.parameters.items() if name != "raw_request"
+    ]
 
-    new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+    new_sig = Signature(
+        parameters=new_parameters, return_annotation=sig.return_annotation
+    )
 
     async def awaitable_patched_create_speech(*args, **kwargs):
         return await original_create_speech(*args, **kwargs)
@@ -211,11 +230,20 @@ def test_app(mocker: MockerFixture):
     speech_server.create_speech = awaitable_patched_create_speech
 
     app = FastAPI()
-    app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+    app.add_api_route(
+        "/v1/audio/speech",
+        speech_server.create_speech,
+        methods=["POST"],
+        response_model=None,
+    )
 
     # Add list_voices endpoint
     async def list_voices():
-        speakers = sorted(speech_server.supported_speakers) if speech_server.supported_speakers else []
+        speakers = (
+            sorted(speech_server.supported_speakers)
+            if speech_server.supported_speakers
+            else []
+        )
         uploaded_voices = []
         if hasattr(speech_server, "uploaded_speakers"):
             for voice_name, info in speech_server.uploaded_speakers.items():
@@ -233,7 +261,11 @@ def test_app(mocker: MockerFixture):
     app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
 
     # Add upload_voice endpoint
-    async def upload_voice(audio_sample: UploadFile = File(...), consent: str = Form(...), name: str = Form(...)):
+    async def upload_voice(
+        audio_sample: UploadFile = File(...),
+        consent: str = Form(...),
+        name: str = Form(...),
+    ):
         try:
             result = await speech_server.upload_voice(audio_sample, consent, name)
             return {"success": True, "voice": result}
@@ -241,7 +273,9 @@ def test_app(mocker: MockerFixture):
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             logger.exception(f"Failed to upload voice: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to upload voice: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail=f"Failed to upload voice: {str(e)}"
+            )
 
     app.add_api_route("/v1/audio/voices", upload_voice, methods=["POST"])
 
@@ -258,7 +292,9 @@ def test_app(mocker: MockerFixture):
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             logger.exception(f"Failed to delete voice '{name}': {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to delete voice: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail=f"Failed to delete voice: {str(e)}"
+            )
 
     app.add_api_route("/v1/audio/voices/{name}", delete_voice, methods=["DELETE"])
 
@@ -546,11 +582,15 @@ class TestTTSMethods:
 
         # CustomVoice on model with no speakers -> rejected
         req = OpenAICreateSpeechRequest(input="Hello", voice="Invalid")
-        assert "does not support CustomVoice" in speech_server._validate_tts_request(req)
+        assert "does not support CustomVoice" in speech_server._validate_tts_request(
+            req
+        )
 
         # CustomVoice without voice on model with no speakers -> also rejected
         req = OpenAICreateSpeechRequest(input="Hello")
-        assert "does not support CustomVoice" in speech_server._validate_tts_request(req)
+        assert "does not support CustomVoice" in speech_server._validate_tts_request(
+            req
+        )
 
     def test_validate_tts_request_task_types(self, speech_server):
         """Test task-specific validation."""
@@ -569,7 +609,9 @@ class TestTTSMethods:
     def test_validate_tts_request_auto_infer_base(self, speech_server):
         """Test auto-inference of Base task when ref_audio/ref_text is provided."""
         # ref_audio without task_type -> infers Base, requires non-empty ref_text
-        req = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        req = OpenAICreateSpeechRequest(
+            input="Hello", ref_audio="data:audio/wav;base64,abc"
+        )
         result = speech_server._validate_tts_request(req)
         assert "ref_text" in result
         assert req.task_type == "Base"
@@ -583,14 +625,21 @@ class TestTTSMethods:
     def test_validate_tts_request_base_empty_ref_text(self, speech_server):
         """Empty ref_text on Base task returns 400 instead of crashing engine."""
         req = OpenAICreateSpeechRequest(
-            input="Hello", task_type="Base", ref_audio="data:audio/wav;base64,abc", ref_text=""
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="",
         )
         result = speech_server._validate_tts_request(req)
         assert "non-empty 'ref_text'" in result
 
         # x_vector_only_mode bypasses ref_text requirement
         req = OpenAICreateSpeechRequest(
-            input="Hello", task_type="Base", ref_audio="data:audio/wav;base64,abc", ref_text="", x_vector_only_mode=True
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="",
+            x_vector_only_mode=True,
         )
         assert speech_server._validate_tts_request(req) is None
 
@@ -649,7 +698,9 @@ class TestTTSMethods:
         with patch.object(speech_server, "_get_uploaded_audio_data") as mock_get_audio:
             mock_get_audio.return_value = "data:audio/wav;base64,ZmFrZWF1ZGlv"
 
-            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice", task_type="Base")
+            req = OpenAICreateSpeechRequest(
+                input="Hello", voice="custom_voice", task_type="Base"
+            )
 
             params = speech_server._build_tts_params(req)
 
@@ -687,7 +738,10 @@ class TestTTSMethods:
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
 
         req = OpenAICreateSpeechRequest(
-            input="Hello", voice="custom_voice", task_type="Base", ref_audio="data:audio/wav;base64,ZXhwbGljaXQ="
+            input="Hello",
+            voice="custom_voice",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,ZXhwbGljaXQ=",
         )
 
         params = speech_server._build_tts_params(req)
@@ -718,7 +772,11 @@ class TestTTSMethods:
 
             # Setup uploaded speaker
             speech_server.uploaded_speakers = {
-                "test_voice": {"name": "test_voice", "file_path": "/tmp/test.wav", "mime_type": "audio/wav"}
+                "test_voice": {
+                    "name": "test_voice",
+                    "file_path": "/tmp/test.wav",
+                    "mime_type": "audio/wav",
+                }
             }
             result = speech_server._get_uploaded_audio_data("test_voice")
 
@@ -733,7 +791,11 @@ class TestTTSMethods:
 
             # Setup uploaded speaker
             speech_server.uploaded_speakers = {
-                "test_voice": {"name": "test_voice", "file_path": "/tmp/test.wav", "mime_type": "audio/wav"}
+                "test_voice": {
+                    "name": "test_voice",
+                    "file_path": "/tmp/test.wav",
+                    "mime_type": "audio/wav",
+                }
             }
 
             result = speech_server._get_uploaded_audio_data("test_voice")
@@ -793,7 +855,9 @@ class TestTTSMethods:
         # Value is cached during __init__
         assert server._max_instructions_length == 750
 
-    def test_max_instructions_length_cli_overrides_stage_config(self, mocker: MockerFixture):
+    def test_max_instructions_length_cli_overrides_stage_config(
+        self, mocker: MockerFixture
+    ):
         """Test CLI override (in engine_client) takes precedence over stage config."""
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
@@ -816,7 +880,9 @@ class TestTTSMethods:
         # CLI value (2000) should override stage config (750)
         assert server._max_instructions_length == 2000
 
-    def test_validate_instructions_length_uses_cached_value(self, mocker: MockerFixture):
+    def test_validate_instructions_length_uses_cached_value(
+        self, mocker: MockerFixture
+    ):
         """Test instructions length validation uses cached _max_instructions_length."""
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
@@ -872,8 +938,14 @@ class TestFileValidationFunctions:
 
         # Test special characters
         assert _sanitize_filename("file with spaces.wav") == "file_with_spaces.wav"
-        assert _sanitize_filename("file&with&special&chars.wav") == "file_with_special_chars.wav"
-        assert _sanitize_filename("file@with#special$chars%.wav") == "file_with_special_chars_.wav"
+        assert (
+            _sanitize_filename("file&with&special&chars.wav")
+            == "file_with_special_chars.wav"
+        )
+        assert (
+            _sanitize_filename("file@with#special$chars%.wav")
+            == "file_with_special_chars_.wav"
+        )
 
         # Test empty filename
         assert _sanitize_filename("") == "file"
@@ -886,7 +958,9 @@ class TestFileValidationFunctions:
 
     def test_validate_path_within_directory(self, tmp_path):
         """Test _validate_path_within_directory function."""
-        from vllm_omni.entrypoints.openai.serving_speech import _validate_path_within_directory
+        from vllm_omni.entrypoints.openai.serving_speech import (
+            _validate_path_within_directory,
+        )
 
         # Create test directory structure
         base_dir = tmp_path / "uploads"
@@ -923,17 +997,25 @@ class TestStreamingProtocolValidation:
 
     def test_stream_validation_errors(self):
         """stream=True requires response_format not in ('pcm', 'wav') and speed=1.0."""
-        with pytest.raises(ValidationError, match="requires response_format not in \\('pcm', 'wav'\\)"):
+        with pytest.raises(
+            ValidationError, match="requires response_format not in \\('pcm', 'wav'\\)"
+        ):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
         with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
-            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+            OpenAICreateSpeechRequest(
+                input="Hello", stream=True, response_format="pcm", speed=2.0
+            )
 
     def test_stream_valid(self):
         """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted."""
-        req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm")
+        req = OpenAICreateSpeechRequest(
+            input="Hello", stream=True, response_format="pcm"
+        )
         assert req.stream is True
 
-        req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
+        req = OpenAICreateSpeechRequest(
+            input="Hello", stream=True, response_format="wav"
+        )
         assert req.stream is True
 
     def test_sse_stream_format_is_blocked(self):
@@ -986,7 +1068,9 @@ class TestStreamingResponse:
             yield _make_output(finished=False)
             yield _make_output(finished=True)
 
-        mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
+        mock_engine_client.generate = mocker.MagicMock(
+            side_effect=mock_generate_streaming
+        )
         mock_engine_client.default_sampling_params_list = [{}]
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
@@ -999,8 +1083,12 @@ class TestStreamingResponse:
 
         original_create_speech = speech_server.create_speech
         sig = signature(original_create_speech)
-        new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
-        new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+        new_parameters = [
+            p for name, p in sig.parameters.items() if name != "raw_request"
+        ]
+        new_sig = Signature(
+            parameters=new_parameters, return_annotation=sig.return_annotation
+        )
 
         async def awaitable_create_speech(*args, **kwargs):
             return await original_create_speech(*args, **kwargs)
@@ -1009,13 +1097,21 @@ class TestStreamingResponse:
         speech_server.create_speech = awaitable_create_speech
 
         app = FastAPI()
-        app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        app.add_api_route(
+            "/v1/audio/speech",
+            speech_server.create_speech,
+            methods=["POST"],
+            response_model=None,
+        )
         return app
 
     def test_streaming(self, streaming_app):
         """stream=True must return audio/pcm with non-empty body."""
         client = TestClient(streaming_app)
-        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "response_format": "pcm"},
+        )
         assert response.status_code == 200
         assert "audio/pcm" in response.headers["content-type"]
         assert len(response.content) > 0
@@ -1023,7 +1119,9 @@ class TestStreamingResponse:
     def test_non_streaming_unchanged(self, streaming_app):
         """Non-streaming path must still return audio/wav."""
         client = TestClient(streaming_app)
-        response = client.post("/v1/audio/speech", json={"input": "Hello", "response_format": "wav"})
+        response = client.post(
+            "/v1/audio/speech", json={"input": "Hello", "response_format": "wav"}
+        )
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
 
@@ -1067,7 +1165,9 @@ def test_api_server_create_speech_wraps_error_response_status():
     handler = MagicMock()
     handler.create_speech = AsyncMock(
         return_value=ErrorResponse(
-            error=ErrorInfo(message="bad request", type="BadRequestError", param=None, code=400),
+            error=ErrorInfo(
+                message="bad request", type="BadRequestError", param=None, code=400
+            ),
         )
     )
 
@@ -1098,7 +1198,9 @@ class TestWAVHeaderGeneration:
 
     def test_wav_header_basic_structure(self):
         """Test basic WAV header structure with default parameters."""
-        header = _create_wav_header(sample_rate=24000, num_channels=1, bits_per_sample=16)
+        header = _create_wav_header(
+            sample_rate=24000, num_channels=1, bits_per_sample=16
+        )
 
         # Verify header length (should be 44 bytes)
         assert len(header) == 44, f"Expected 44 bytes, got {len(header)}"
@@ -1122,7 +1224,9 @@ class TestWAVHeaderGeneration:
 
         # Verify RIFF header
         assert chunk_id == b"RIFF", f"Expected RIFF, got {chunk_id}"
-        assert chunk_size == 0xFFFFFFFF, f"Expected placeholder 0xFFFFFFFF, got {chunk_size:#x}"
+        assert (
+            chunk_size == 0xFFFFFFFF
+        ), f"Expected placeholder 0xFFFFFFFF, got {chunk_size:#x}"
         assert format_type == b"WAVE", f"Expected WAVE, got {format_type}"
 
         # Verify fmt chunk
@@ -1137,7 +1241,9 @@ class TestWAVHeaderGeneration:
 
         # Verify data chunk
         assert subchunk2_id == b"data", f"Expected 'data', got {subchunk2_id}"
-        assert subchunk2_size == 0xFFFFFFFF, f"Expected placeholder 0xFFFFFFFF, got {subchunk2_size:#x}"
+        assert (
+            subchunk2_size == 0xFFFFFFFF
+        ), f"Expected placeholder 0xFFFFFFFF, got {subchunk2_size:#x}"
 
     def test_wav_header_different_sample_rates(self):
         """Test WAV header with different sample rates."""
@@ -1155,13 +1261,15 @@ class TestWAVHeaderGeneration:
 
             # Parse sample rate from header
             parsed_sample_rate = struct.unpack("<I", header[24:28])[0]
-            assert parsed_sample_rate == sample_rate, (
-                f"Sample rate mismatch: expected {sample_rate}, got {parsed_sample_rate}"
-            )
+            assert (
+                parsed_sample_rate == sample_rate
+            ), f"Sample rate mismatch: expected {sample_rate}, got {parsed_sample_rate}"
 
     def test_wav_header_stereo(self):
         """Test WAV header with stereo audio."""
-        header = _create_wav_header(sample_rate=44100, num_channels=2, bits_per_sample=16)
+        header = _create_wav_header(
+            sample_rate=44100, num_channels=2, bits_per_sample=16
+        )
 
         # Parse header
         parsed = struct.unpack("<4sI4s4sIHHIIHH4sI", header)
@@ -1182,7 +1290,9 @@ class TestWAVHeaderGeneration:
         subchunk2_size = struct.unpack("<I", header[40:44])[0]
 
         assert chunk_size == 0xFFFFFFFF, "ChunkSize should be 0xFFFFFFFF for streaming"
-        assert subchunk2_size == 0xFFFFFFFF, "Subchunk2Size should be 0xFFFFFFFF for streaming"
+        assert (
+            subchunk2_size == 0xFFFFFFFF
+        ), "Subchunk2Size should be 0xFFFFFFFF for streaming"
 
 
 class TestWAVStreaming:
@@ -1229,7 +1339,9 @@ class TestWAVStreaming:
             yield _make_output(finished=False)
             yield _make_output(finished=True)
 
-        mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
+        mock_engine_client.generate = mocker.MagicMock(
+            side_effect=mock_generate_streaming
+        )
         mock_engine_client.default_sampling_params_list = [{}]
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
@@ -1242,8 +1354,12 @@ class TestWAVStreaming:
 
         original_create_speech = speech_server.create_speech
         sig = signature(original_create_speech)
-        new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
-        new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+        new_parameters = [
+            p for name, p in sig.parameters.items() if name != "raw_request"
+        ]
+        new_sig = Signature(
+            parameters=new_parameters, return_annotation=sig.return_annotation
+        )
 
         async def awaitable_create_speech(*args, **kwargs):
             return await original_create_speech(*args, **kwargs)
@@ -1252,13 +1368,21 @@ class TestWAVStreaming:
         speech_server.create_speech = awaitable_create_speech
 
         app = FastAPI()
-        app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        app.add_api_route(
+            "/v1/audio/speech",
+            speech_server.create_speech,
+            methods=["POST"],
+            response_model=None,
+        )
         return app
 
     def test_wav_streaming_success(self, wav_streaming_app):
         """Test WAV format streaming returns correct content type and includes WAV header."""
         client = TestClient(wav_streaming_app)
-        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "wav"})
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "response_format": "wav"},
+        )
 
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
@@ -1277,5 +1401,8 @@ class TestWAVStreaming:
 
         unsupported_formats = ["mp3"]
         for fmt in unsupported_formats:
-            response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": fmt})
+            response = client.post(
+                "/v1/audio/speech",
+                json={"input": "Hello", "stream": True, "response_format": fmt},
+            )
             assert response.status_code == 422

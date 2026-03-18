@@ -86,7 +86,9 @@ class OmniRequestState(RequestState):
                         self.mm_accumulated[k] = v
                     else:
                         existing = self.mm_accumulated[k]
-                        if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
+                        if isinstance(v, torch.Tensor) and isinstance(
+                            existing, torch.Tensor
+                        ):
                             # Use list accumulation to avoid O(n²) repeated concatenation
                             self.mm_accumulated[k] = [existing, v]
                         elif isinstance(v, torch.Tensor) and isinstance(existing, list):
@@ -97,9 +99,13 @@ class OmniRequestState(RequestState):
                             for sk, sv in v.items():
                                 if sk not in existing:
                                     existing[sk] = sv
-                                elif isinstance(sv, torch.Tensor) and isinstance(existing[sk], torch.Tensor):
+                                elif isinstance(sv, torch.Tensor) and isinstance(
+                                    existing[sk], torch.Tensor
+                                ):
                                     existing[sk] = [existing[sk], sv]
-                                elif isinstance(sv, torch.Tensor) and isinstance(existing[sk], list):
+                                elif isinstance(sv, torch.Tensor) and isinstance(
+                                    existing[sk], list
+                                ):
                                     existing[sk].append(sv)
                                 else:
                                     existing[sk] = sv
@@ -128,11 +134,17 @@ class OmniRequestState(RequestState):
                             self.mm_accumulated[k] = torch.cat(v, dim=0)
                     except Exception:
                         # Keep last tensor on failure
-                        logger.warning(f"Error concatenating tensor for key {k}; keeping last tensor")
+                        logger.warning(
+                            f"Error concatenating tensor for key {k}; keeping last tensor"
+                        )
                         self.mm_accumulated[k] = v[-1]
                 elif isinstance(v, dict):
                     for sk, sv in v.items():
-                        if isinstance(sv, list) and sv and isinstance(sv[0], torch.Tensor):
+                        if (
+                            isinstance(sv, list)
+                            and sv
+                            and isinstance(sv[0], torch.Tensor)
+                        ):
                             try:
                                 v[sk] = torch.cat(sv, dim=0)
                             except Exception:
@@ -199,18 +211,23 @@ class OmniRequestState(RequestState):
             if not (
                 finished
                 or self.sent_tokens_offset == 0
-                or self.detokenizer.num_output_tokens() - self.sent_tokens_offset >= self.stream_interval
+                or self.detokenizer.num_output_tokens() - self.sent_tokens_offset
+                >= self.stream_interval
             ):
                 return None
 
             if self.output_kind == RequestOutputKind.DELTA:
                 # Send tokens from the offset in DELTA mode, otherwise all
                 # tokens are sent.
-                new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
+                new_token_ids = self.detokenizer.output_token_ids[
+                    self.sent_tokens_offset :
+                ]
                 self.sent_tokens_offset = self.detokenizer.num_output_tokens()
 
         external_req_id = self.external_req_id
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
+        output = self._new_completion_output(
+            new_token_ids, finish_reason, stop_reason, routed_experts
+        )
 
         if self.parent_req is None:
             outputs = [output]
@@ -220,7 +237,9 @@ class OmniRequestState(RequestState):
                 return None
             external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
+        return self._new_request_output(
+            external_req_id, outputs, finished, kv_transfer_params
+        )
 
     def _new_completion_output(
         self,
@@ -230,7 +249,9 @@ class OmniRequestState(RequestState):
         routed_experts: np.ndarray | None = None,
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
-        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
+        base_output = super()._new_completion_output(
+            token_ids, finish_reason, stop_reason, routed_experts
+        )
         try:
             if self.mm_accumulated is not None:
                 # Attach accumulated multimodal dict on the completion output
@@ -343,7 +364,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
             if eco.pooling_output is not None and req_state.detokenizer is not None:
-                mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
+                mm_type = (
+                    getattr(eco, "output_type", self.engine_core_output_type) or ""
+                ).lower()
                 req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                 # Force text path in base processor for multimodal outputs.
                 eco.pooling_output = None

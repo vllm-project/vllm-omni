@@ -96,7 +96,9 @@ class _FastARAttention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, position_ids: torch.Tensor
+    ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
 
         qkv, _ = self.qkv_proj(hidden_states.reshape(bsz * seq_len, -1))
@@ -161,9 +163,13 @@ class _FastARDecoderLayer(nn.Module):
         self.self_attn = _FastARAttention(config, prefix=f"{prefix}.self_attn")
         self.mlp = _FastARMLP(config, prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, position_ids: torch.Tensor
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_ids)
@@ -188,12 +194,17 @@ class FishSpeechFastARModel(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [_FastARDecoderLayer(config, prefix=f"{prefix}.layers.{i}") for i in range(config.num_hidden_layers)]
+            [
+                _FastARDecoderLayer(config, prefix=f"{prefix}.layers.{i}")
+                for i in range(config.num_hidden_layers)
+            ]
         )
         # NOTE: final norm is handled by FishSpeechFastAR.fast_norm (one norm weight
         # in checkpoint: audio_decoder.norm.weight → fast_ar.fast_norm.weight).
 
-    def forward(self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor
+    ) -> torch.Tensor:
         hidden_states = inputs_embeds
         for layer in self.layers:
             hidden_states = layer(hidden_states, position_ids)
@@ -297,7 +308,9 @@ class FishSpeechFastAR(nn.Module):
         # s2-pro has same dim for both (2560) and no fast_project_in in checkpoint,
         # so use identity when dims match.
         if slow_ar_config.hidden_size != config.hidden_size:
-            self.fast_project_in = nn.Linear(slow_ar_config.hidden_size, config.hidden_size, bias=True)
+            self.fast_project_in = nn.Linear(
+                slow_ar_config.hidden_size, config.hidden_size, bias=True
+            )
         else:
             self.fast_project_in = nn.Identity()
 
@@ -309,7 +322,9 @@ class FishSpeechFastAR(nn.Module):
         self._pos_ids: torch.Tensor | None = None
         self._compiled_model_fwd: object | None = None
 
-    def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
+    def _ensure_buffers(
+        self, bsz: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
         max_seq = self._num_codebooks + 1  # hidden_state + num_codebooks codes
         if (
             self._embed_buf is not None
@@ -318,7 +333,9 @@ class FishSpeechFastAR(nn.Module):
             and self._embed_buf.dtype == dtype
         ):
             return
-        self._embed_buf = torch.zeros(bsz, max_seq, self._fast_dim, dtype=dtype, device=device)
+        self._embed_buf = torch.zeros(
+            bsz, max_seq, self._fast_dim, dtype=dtype, device=device
+        )
         self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device)
 
     def _setup_compile(self) -> None:
@@ -359,7 +376,9 @@ class FishSpeechFastAR(nn.Module):
         codebook_size = semantic_end - semantic_begin + 1  # 4096
         # Convert vocab-space semantic token to codebook index.
         # Clamp to valid range: im_end or other non-semantic tokens map to 0 (pad).
-        semantic_code = (semantic_token_id.reshape(bsz) - semantic_begin).clamp(min=0, max=codebook_size - 1)
+        semantic_code = (semantic_token_id.reshape(bsz) - semantic_begin).clamp(
+            min=0, max=codebook_size - 1
+        )
 
         all_codes = torch.empty(bsz, num_cb, dtype=torch.long, device=device)
         all_codes[:, 0] = semantic_code
@@ -390,7 +409,9 @@ class FishSpeechFastAR(nn.Module):
         for step in range(1, num_cb):
             seq_len = step + 1
             step_input = embed_buf[:bsz, :seq_len, :]
-            step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+            step_pos_ids = (
+                pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+            )
 
             hidden_out = model_fwd(step_input, step_pos_ids)
             logits = self.fast_output(self.fast_norm(hidden_out[:, -1, :]))
@@ -403,11 +424,17 @@ class FishSpeechFastAR(nn.Module):
                 scaled = logits * inv_temperature
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(min(top_k, scaled.shape[-1]), dim=-1)
-                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                    scaled = scaled.masked_fill(
+                        scaled < topk_vals[:, -1:], float("-inf")
+                    )
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+                    cumulative_probs = torch.cumsum(
+                        F.softmax(sorted_logits, dim=-1), dim=-1
+                    )
+                    sorted_indices_to_remove = (
+                        cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+                    )
                     sorted_logits[sorted_indices_to_remove] = float("-inf")
                     scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
                 probs = F.softmax(scaled, dim=-1)
@@ -449,7 +476,9 @@ class FishSpeechFastAR(nn.Module):
                     if mapped not in params_dict:
                         continue
                     param = params_dict[mapped]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     if weight_loader == default_weight_loader:
                         weight_loader(param, loaded_weight)
                     else:
@@ -463,7 +492,9 @@ class FishSpeechFastAR(nn.Module):
 
                 if name in params_dict:
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     loaded.add(name)
 

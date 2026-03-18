@@ -48,7 +48,9 @@ def mock_dependencies(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     mock_text_encoder = mocker.MagicMock()
     mock_text_encoder.dtype = torch.float32
     # Output of text encoder must be on the same device as inputs (which are moved to execution_device)
-    mock_text_encoder.return_value.last_hidden_state = torch.randn(1, 50, 32, device=device)
+    mock_text_encoder.return_value.last_hidden_state = torch.randn(
+        1, 50, 32, device=device
+    )
 
     # Mock VAE
     mock_vae = mocker.MagicMock()
@@ -78,11 +80,19 @@ def mock_dependencies(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
 
     module_path = "vllm_omni.diffusion.models.ovis_image.pipeline_ovis_image"
 
-    monkeypatch.setattr(f"{module_path}.Qwen2TokenizerFast.from_pretrained", lambda *a, **k: mock_tokenizer)
-    monkeypatch.setattr(f"{module_path}.Qwen3Model.from_pretrained", lambda *a, **k: mock_text_encoder)
-    monkeypatch.setattr(f"{module_path}.AutoencoderKL.from_pretrained", lambda *a, **k: mock_vae)
     monkeypatch.setattr(
-        f"{module_path}.FlowMatchEulerDiscreteScheduler.from_pretrained", lambda *a, **k: mock_scheduler
+        f"{module_path}.Qwen2TokenizerFast.from_pretrained",
+        lambda *a, **k: mock_tokenizer,
+    )
+    monkeypatch.setattr(
+        f"{module_path}.Qwen3Model.from_pretrained", lambda *a, **k: mock_text_encoder
+    )
+    monkeypatch.setattr(
+        f"{module_path}.AutoencoderKL.from_pretrained", lambda *a, **k: mock_vae
+    )
+    monkeypatch.setattr(
+        f"{module_path}.FlowMatchEulerDiscreteScheduler.from_pretrained",
+        lambda *a, **k: mock_scheduler,
     )
 
     return {
@@ -95,7 +105,9 @@ def mock_dependencies(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def ovis_pipeline(mocker: MockerFixture, mock_dependencies, monkeypatch: pytest.MonkeyPatch):
+def ovis_pipeline(
+    mocker: MockerFixture, mock_dependencies, monkeypatch: pytest.MonkeyPatch
+):
     """
     Creates an OvisImagePipeline instance with mocked components.
     """
@@ -125,7 +137,9 @@ def ovis_pipeline(mocker: MockerFixture, mock_dependencies, monkeypatch: pytest.
     mock_transformer_cls = mocker.MagicMock()
     mock_transformer_instance = mocker.MagicMock()
     mock_transformer_instance.dtype = torch.float32
-    mock_transformer_instance.in_channels = 16  # Must be 16 so num_channel_latents=4, packed=16
+    mock_transformer_instance.in_channels = (
+        16  # Must be 16 so num_channel_latents=4, packed=16
+    )
     # Forward return: noise prediction
 
     def mock_forward(hidden_states, *args, **kwargs):
@@ -139,7 +153,8 @@ def ovis_pipeline(mocker: MockerFixture, mock_dependencies, monkeypatch: pytest.
     mock_transformer_cls.return_value = mock_transformer_instance
 
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ovis_image.pipeline_ovis_image.OvisImageTransformer2DModel", mock_transformer_cls
+        "vllm_omni.diffusion.models.ovis_image.pipeline_ovis_image.OvisImageTransformer2DModel",
+        mock_transformer_cls,
     )
 
     # Initialize pipeline
@@ -229,7 +244,9 @@ def test_resolution_check(ovis_pipeline):
 def test_real_transformer_init_and_forward(mocker: MockerFixture):
     """Test the real OvisImageTransformer2DModel initialization and forward pass for coverage."""
 
-    from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
+    from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import (
+        OvisImageTransformer2DModel,
+    )
 
     device = get_local_device()
     tf_config = TransformerConfig(
@@ -246,7 +263,9 @@ def test_real_transformer_init_and_forward(mocker: MockerFixture):
         }
     )
 
-    od_config = OmniDiffusionConfig(model="dummy-ovis", tf_model_config=tf_config, dtype=torch.bfloat16, num_gpus=1)
+    od_config = OmniDiffusionConfig(
+        model="dummy-ovis", tf_model_config=tf_config, dtype=torch.bfloat16, num_gpus=1
+    )
     torch.set_default_dtype(torch.bfloat16)
 
     # Mock distributed state for QKVParallelLinear initialization
@@ -255,7 +274,9 @@ def test_real_transformer_init_and_forward(mocker: MockerFixture):
     mock_group.rank_in_group = 0
     mock_group.world_size = 1
 
-    mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+    mocker.patch(
+        "vllm.distributed.parallel_state.get_tp_group", return_value=mock_group
+    )
     # Initialize real model
     model = OvisImageTransformer2DModel(
         od_config=od_config,
@@ -272,7 +293,9 @@ def test_real_transformer_init_and_forward(mocker: MockerFixture):
     # Create dummy inputs
     B, Seq, C = 1, 16, 16
     hidden_states = torch.randn(B, Seq, C, device=device)
-    encoder_hidden_states = torch.randn(B, 10, 32, device=device)  # joint_attention_dim=32
+    encoder_hidden_states = torch.randn(
+        B, 10, 32, device=device
+    )  # joint_attention_dim=32
     timestep = torch.tensor([1], device=device)
     img_ids = torch.zeros(Seq, 3, device=device)
     txt_ids = torch.zeros(10, 3, device=device)

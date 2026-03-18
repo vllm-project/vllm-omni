@@ -11,11 +11,18 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer
+from transformers import (
+    CLIPTextModelWithProjection,
+    CLIPTokenizer,
+    T5EncoderModel,
+    T5Tokenizer,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import (
+    DistributedAutoencoderKL,
+)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -43,7 +50,11 @@ def get_sd3_image_post_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+        vae_scale_factor = (
+            2 ** (len(vae_config["block_out_channels"]) - 1)
+            if "block_out_channels" in vae_config
+            else 8
+        )
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
 
@@ -100,9 +111,13 @@ def retrieve_timesteps(
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+        raise ValueError(
+            "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
+        )
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accepts_timesteps = "timesteps" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -112,7 +127,9 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accept_sigmas = "sigmas" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -154,7 +171,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.tokenizer = CLIPTokenizer.from_pretrained(
+            model, subfolder="tokenizer", local_files_only=local_files_only
+        )
         self.tokenizer_2 = CLIPTokenizer.from_pretrained(
             model, subfolder="tokenizer_2", local_files_only=local_files_only
         )
@@ -178,11 +197,17 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             model, subfolder="vae", local_files_only=local_files_only
         ).to(self.device)
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = (
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if getattr(self, "vae", None)
+            else 8
+        )
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
         self.tokenizer_max_length = (
-            self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 77
+            self.tokenizer.model_max_length
+            if hasattr(self, "tokenizer") and self.tokenizer is not None
+            else 77
         )
         self.default_sample_size = 128
         self.patch_size = 2
@@ -233,12 +258,24 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
-        elif prompt_2 is not None and (not isinstance(prompt_2, str) and not isinstance(prompt_2, list)):
-            raise ValueError(f"`prompt_2` has to be of type `str` or `list` but is {type(prompt_2)}")
-        elif prompt_3 is not None and (not isinstance(prompt_3, str) and not isinstance(prompt_3, list)):
-            raise ValueError(f"`prompt_3` has to be of type `str` or `list` but is {type(prompt_3)}")
+        elif prompt is not None and (
+            not isinstance(prompt, str) and not isinstance(prompt, list)
+        ):
+            raise ValueError(
+                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
+            )
+        elif prompt_2 is not None and (
+            not isinstance(prompt_2, str) and not isinstance(prompt_2, list)
+        ):
+            raise ValueError(
+                f"`prompt_2` has to be of type `str` or `list` but is {type(prompt_2)}"
+            )
+        elif prompt_3 is not None and (
+            not isinstance(prompt_3, str) and not isinstance(prompt_3, list)
+        ):
+            raise ValueError(
+                f"`prompt_3` has to be of type `str` or `list` but is {type(prompt_3)}"
+            )
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(
@@ -265,7 +302,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
                 )
 
         if max_sequence_length is not None and max_sequence_length > 512:
-            raise ValueError(f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}")
+            raise ValueError(
+                f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}"
+            )
 
     def _get_clip_prompt_embeds(
         self,
@@ -293,24 +332,38 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
         )
 
         text_input_ids = text_inputs.input_ids
-        untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
-        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = tokenizer.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+        untruncated_ids = tokenizer(
+            prompt, padding="longest", return_tensors="pt"
+        ).input_ids
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+            text_input_ids, untruncated_ids
+        ):
+            removed_text = tokenizer.batch_decode(
+                untruncated_ids[:, self.tokenizer_max_length - 1 : -1]
+            )
             logger.warning(
                 "The following part of your input was truncated because CLIP can only handle sequences up to"
                 f" {self.tokenizer_max_length} tokens: {removed_text}"
             )
-        prompt_embeds = text_encoder(text_input_ids.to(self.device), output_hidden_states=True)
+        prompt_embeds = text_encoder(
+            text_input_ids.to(self.device), output_hidden_states=True
+        )
         pooled_prompt_embeds = prompt_embeds[0]
 
         prompt_embeds = prompt_embeds.hidden_states[-2]
 
-        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=self.device)
+        prompt_embeds = prompt_embeds.to(
+            dtype=self.text_encoder.dtype, device=self.device
+        )
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
+        )
         pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt)
-        pooled_prompt_embeds = pooled_prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+        pooled_prompt_embeds = pooled_prompt_embeds.view(
+            batch_size * num_images_per_prompt, -1
+        )
 
         return prompt_embeds, pooled_prompt_embeds
 
@@ -346,10 +399,16 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             return_tensors="pt",
         ).to(self.device)
         text_input_ids = text_inputs.input_ids
-        untruncated_ids = self.tokenizer_3(prompt, padding="longest", return_tensors="pt").input_ids
+        untruncated_ids = self.tokenizer_3(
+            prompt, padding="longest", return_tensors="pt"
+        ).input_ids
 
-        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.tokenizer_3.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+            text_input_ids, untruncated_ids
+        ):
+            removed_text = self.tokenizer_3.batch_decode(
+                untruncated_ids[:, self.tokenizer_max_length - 1 : -1]
+            )
             logger.warning(
                 "The following part of your input was truncated because `max_sequence_length` is set to "
                 f" {max_sequence_length} tokens: {removed_text}"
@@ -361,7 +420,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=self.device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
+        )
 
         return prompt_embeds
 
@@ -421,11 +482,14 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             )
 
             clip_prompt_embeds = torch.nn.functional.pad(
-                clip_prompt_embeds, (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1])
+                clip_prompt_embeds,
+                (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1]),
             )
 
             prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
-            pooled_prompt_embeds = torch.cat([pooled_prompt_embed, pooled_prompt_2_embed], dim=-1)
+            pooled_prompt_embeds = torch.cat(
+                [pooled_prompt_embed, pooled_prompt_2_embed], dim=-1
+            )
 
         return prompt_embeds, pooled_prompt_embeds
 
@@ -532,7 +596,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             self._current_timestep = t
 
             # Broadcast timestep to match batch size
-            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+            timestep = t.expand(latents.shape[0]).to(
+                device=latents.device, dtype=latents.dtype
+            )
 
             positive_kwargs = {
                 "hidden_states": latents,
@@ -562,7 +628,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             )
 
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+            latents = self.scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, do_true_cfg
+            )
 
         return latents
 
@@ -590,16 +658,29 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
     ) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        prompt = [
+            p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts
+        ] or prompt
         negative_prompt = [
-            "" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts
+            "" if isinstance(p, str) else (p.get("negative_prompt") or "")
+            for p in req.prompts
         ] or negative_prompt
 
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        height = (
+            req.sampling_params.height
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        width = (
+            req.sampling_params.width
+            or self.default_sample_size * self.vae_scale_factor
+        )
         sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        max_sequence_length = (
+            req.sampling_params.max_sequence_length or max_sequence_length
+        )
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         generator = req.sampling_params.generator or generator
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
@@ -667,7 +748,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             latents,
         )
 
-        timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
+        timesteps, num_inference_steps = self.prepare_timesteps(
+            num_inference_steps, sigmas, latents.shape[1]
+        )
         self._num_timesteps = len(timesteps)
 
         # Denoising loop using diffuse method
@@ -677,7 +760,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds if do_cfg else None,
-            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds if do_cfg else None,
+            negative_pooled_prompt_embeds=(
+                negative_pooled_prompt_embeds if do_cfg else None
+            ),
             do_true_cfg=do_cfg,
             guidance_scale=self.guidance_scale,
             cfg_normalize=False,
@@ -688,7 +773,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             image = latents
         else:
             latents = latents.to(self.vae.dtype)
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            latents = (
+                latents / self.vae.config.scaling_factor
+            ) + self.vae.config.shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
 

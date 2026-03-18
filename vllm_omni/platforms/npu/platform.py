@@ -7,7 +7,9 @@ import torch
 from vllm.logger import init_logger
 from vllm_ascend.platform import NPUPlatform
 
-from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.attention.backends.registry import (
+    DiffusionAttentionBackendEnum,
+)
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
@@ -29,7 +31,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
-        return "vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker"
+        return (
+            "vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker"
+        )
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
@@ -38,7 +42,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
         if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.platforms.npu.models.hunyuan_fused_moe.AscendHunyuanFusedMoE"
+            return (
+                "vllm_omni.platforms.npu.models.hunyuan_fused_moe.AscendHunyuanFusedMoE"
+            )
         return super().get_diffusion_model_impl_qualname(op_name)
 
     @classmethod

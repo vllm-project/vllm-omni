@@ -57,7 +57,9 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     shm = shared_memory.SharedMemory(name=handle["name"])
     try:
         np_dtype = np.dtype(handle["numpy_dtype"])
-        arr = np.ndarray(handle["shape"], dtype=np_dtype, buffer=shm.buf[: handle["nbytes"]])
+        arr = np.ndarray(
+            handle["shape"], dtype=np_dtype, buffer=shm.buf[: handle["nbytes"]]
+        )
         tensor = torch.from_numpy(arr.copy())
     finally:
         shm.close()
@@ -72,10 +74,19 @@ def pack_diffusion_output_shm(output: DiffusionOutput) -> DiffusionOutput:
     object can be serialised cheaply through a MessageQueue.
     """
     if output.output is not None and isinstance(output.output, torch.Tensor):
-        if output.output.nelement() * output.output.element_size() > _SHM_TENSOR_THRESHOLD:
+        if (
+            output.output.nelement() * output.output.element_size()
+            > _SHM_TENSOR_THRESHOLD
+        ):
             output.output = _tensor_to_shm(output.output)
-    if output.trajectory_latents is not None and isinstance(output.trajectory_latents, torch.Tensor):
-        if output.trajectory_latents.nelement() * output.trajectory_latents.element_size() > _SHM_TENSOR_THRESHOLD:
+    if output.trajectory_latents is not None and isinstance(
+        output.trajectory_latents, torch.Tensor
+    ):
+        if (
+            output.trajectory_latents.nelement()
+            * output.trajectory_latents.element_size()
+            > _SHM_TENSOR_THRESHOLD
+        ):
             output.trajectory_latents = _tensor_to_shm(output.trajectory_latents)
     return output
 
@@ -84,6 +95,8 @@ def unpack_diffusion_output_shm(output: DiffusionOutput) -> DiffusionOutput:
     """Reconstruct tensors from shared-memory handles produced by ``pack_diffusion_output_shm``."""
     if isinstance(output.output, dict) and output.output.get("__tensor_shm__"):
         output.output = _tensor_from_shm(output.output)
-    if isinstance(output.trajectory_latents, dict) and output.trajectory_latents.get("__tensor_shm__"):
+    if isinstance(output.trajectory_latents, dict) and output.trajectory_latents.get(
+        "__tensor_shm__"
+    ):
         output.trajectory_latents = _tensor_from_shm(output.trajectory_latents)
     return output

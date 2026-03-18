@@ -85,12 +85,8 @@ class VBenchDataset(BaseDataset):
     Supports t2v, i2v.
     """
 
-    T2V_PROMPT_URL = (
-        "https://raw.githubusercontent.com/Vchitect/VBench/master/prompts/prompts_per_dimension/subject_consistency.txt"
-    )
-    I2V_DOWNLOAD_SCRIPT_URL = (
-        "https://raw.githubusercontent.com/Vchitect/VBench/master/vbench2_beta_i2v/download_data.sh"
-    )
+    T2V_PROMPT_URL = "https://raw.githubusercontent.com/Vchitect/VBench/master/prompts/prompts_per_dimension/subject_consistency.txt"
+    I2V_DOWNLOAD_SCRIPT_URL = "https://raw.githubusercontent.com/Vchitect/VBench/master/vbench2_beta_i2v/download_data.sh"
 
     def __init__(self, args, api_url: str, model: str):
         super().__init__(args, api_url, model)
@@ -168,7 +164,9 @@ class VBenchDataset(BaseDataset):
         except Exception as e:
             print(f"Failed to download VBench I2V dataset: {e}")
             print("Please manually download following instructions at:")
-            print("https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v#22-download")
+            print(
+                "https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v#22-download"
+            )
             return None
 
         return vbench_i2v_dir if os.path.exists(info_json_path) else None
@@ -178,7 +176,9 @@ class VBenchDataset(BaseDataset):
         with open(json_path) as f:
             items = json.load(f)
 
-        base_dir = os.path.dirname(os.path.dirname(json_path))  # Go up to vbench2_beta_i2v
+        base_dir = os.path.dirname(
+            os.path.dirname(json_path)
+        )  # Go up to vbench2_beta_i2v
         origin_dir = os.path.join(base_dir, "data", "origin")
 
         data = []
@@ -207,7 +207,10 @@ class VBenchDataset(BaseDataset):
                 files.extend(glob.glob(os.path.join(origin_dir, ext)))
                 files.extend(glob.glob(os.path.join(origin_dir, ext.upper())))
 
-        return [{"prompt": os.path.splitext(os.path.basename(f))[0], "image_path": f} for f in files]
+        return [
+            {"prompt": os.path.splitext(os.path.basename(f))[0], "image_path": f}
+            for f in files
+        ]
 
     def _create_dummy_data(self) -> list[dict[str, Any]]:
         """Create dummy data with a placeholder image in cache directory."""
@@ -309,8 +312,12 @@ class TraceDataset(BaseDataset):
 
     def __init__(self, args, api_url: str, model: str):
         super().__init__(args, api_url, model)
-        self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "vllm-omni", "trace")
-        self.default_filename = self.DEFAULT_FILENAME_BY_TASK.get(getattr(args, "task", ""), self.DEFAULT_FILENAME)
+        self.cache_dir = os.path.join(
+            os.path.expanduser("~"), ".cache", "vllm-omni", "trace"
+        )
+        self.default_filename = self.DEFAULT_FILENAME_BY_TASK.get(
+            getattr(args, "task", ""), self.DEFAULT_FILENAME
+        )
         dataset_root = args.dataset_path
         if not dataset_root:
             dataset_root = self._download_default_trace()
@@ -378,7 +385,9 @@ class TraceDataset(BaseDataset):
             if any(ch in p for ch in ["*", "?", "["]):
                 paths.extend(sorted(glob.glob(p)))
             elif os.path.isdir(p):
-                paths.extend(sorted(glob.glob(os.path.join(p, "**", "*.txt"), recursive=True)))
+                paths.extend(
+                    sorted(glob.glob(os.path.join(p, "**", "*.txt"), recursive=True))
+                )
             else:
                 paths.append(p)
 
@@ -449,7 +458,9 @@ class TraceDataset(BaseDataset):
     def _load_items(self, dataset_root: str) -> list[dict[str, Any]]:
         paths = self._expand_paths(dataset_root)
         if not paths:
-            raise ValueError("No trace files found. Provide --dataset-path or rely on default HuggingFace download.")
+            raise ValueError(
+                "No trace files found. Provide --dataset-path or rely on default HuggingFace download."
+            )
 
         items: list[dict[str, Any]] = []
         for p in paths:
@@ -502,13 +513,19 @@ class TraceDataset(BaseDataset):
             width=width,
             height=height,
             num_frames=num_frames if num_frames is not None else self.args.num_frames,
-            num_inference_steps=num_steps if num_steps is not None else self.args.num_inference_steps,
+            num_inference_steps=(
+                num_steps if num_steps is not None else self.args.num_inference_steps
+            ),
             seed=seed if seed is not None else self.args.seed,
             fps=fps if fps is not None else self.args.fps,
             timestamp=timestamp,
             slo_ms=slo_ms,
             image_paths=image_paths,
-            request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
+            request_id=(
+                str(row.get("request_id"))
+                if row.get("request_id") is not None
+                else str(uuid.uuid4())
+            ),
         )
 
     def get_requests(self) -> list[RequestFuncInput]:
@@ -542,7 +559,9 @@ class RandomDataset(BaseDataset):
         return [self[i] for i in range(len(self))]
 
 
-def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_time_ms: float | None) -> float | None:
+def _compute_expected_latency_ms_from_base(
+    req: RequestFuncInput, args, base_time_ms: float | None
+) -> float | None:
     """Compute expected execution time (ms) based on a base per-step-per-frame unit time.
 
     Assumes linear scaling with pixel area, frame count, and num_inference_steps.
@@ -558,7 +577,11 @@ def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_tim
         return None
 
     frames = req.num_frames if req.num_frames is not None else args.num_frames
-    steps = req.num_inference_steps if req.num_inference_steps is not None else args.num_inference_steps
+    steps = (
+        req.num_inference_steps
+        if req.num_inference_steps is not None
+        else args.num_inference_steps
+    )
 
     frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
     step_scale = steps if isinstance(steps, int) and steps > 0 else 1
@@ -589,7 +612,11 @@ def _infer_slo_base_time_ms_from_warmups(
             continue
 
         frames = req.num_frames if req.num_frames is not None else args.num_frames
-        steps = req.num_inference_steps if req.num_inference_steps is not None else args.num_inference_steps
+        steps = (
+            req.num_inference_steps
+            if req.num_inference_steps is not None
+            else args.num_inference_steps
+        )
 
         frame_scale = int(frames) if isinstance(frames, int) and frames > 0 else 1
         step_scale = int(steps) if isinstance(steps, int) and steps > 0 else 1
@@ -638,7 +665,12 @@ def _populate_slo_ms_from_warmups(
             updated.append(req)
             continue
         expected_ms = _compute_expected_latency_ms_from_base(req, args, base_time_ms)
-        updated.append(replace(req, slo_ms=(expected_ms * slo_scale) if expected_ms is not None else None))
+        updated.append(
+            replace(
+                req,
+                slo_ms=(expected_ms * slo_scale) if expected_ms is not None else None,
+            )
+        )
 
     return updated
 
@@ -655,7 +687,9 @@ async def iter_requests(
 
     if request_rate != float("inf"):
         if request_rate <= 0:
-            raise ValueError(f"request_rate must be positive or inf, got {request_rate}.")
+            raise ValueError(
+                f"request_rate must be positive or inf, got {request_rate}."
+            )
         interval_s = 1.0 / float(request_rate)
 
     for i, req in enumerate(requests_list):
@@ -705,7 +739,9 @@ def calculate_metrics(
             if out.slo_achieved:
                 slo_met_success += 1
 
-        slo_attain_all = (slo_met_success / slo_defined_total) if slo_defined_total > 0 else 0.0
+        slo_attain_all = (
+            (slo_met_success / slo_defined_total) if slo_defined_total > 0 else 0.0
+        )
 
         metrics.update(
             {
@@ -732,7 +768,9 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
             pass
 
         if time.time() - start_time > timeout:
-            raise TimeoutError(f"Service at {base_url} did not start within {timeout} seconds.")
+            raise TimeoutError(
+                f"Service at {base_url} did not start within {timeout} seconds."
+            )
 
         time.sleep(1)
 
@@ -778,10 +816,8 @@ async def benchmark(args):
     async with aiohttp.ClientSession() as session:
         warmup_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = []
         if args.warmup_requests and requests_list:
-            print(
-                f"Running {args.warmup_requests} warmup request(s) \
-                with num_inference_steps={args.warmup_num_inference_steps}..."
-            )
+            print(f"Running {args.warmup_requests} warmup request(s) \
+                with num_inference_steps={args.warmup_num_inference_steps}...")
             for i in range(args.warmup_requests):
                 warm_req = requests_list[i % len(requests_list)]
                 if args.warmup_num_inference_steps is not None:
@@ -802,7 +838,9 @@ async def benchmark(args):
 
         start_time = time.perf_counter()
         tasks = []
-        async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
+        async for req in iter_requests(
+            requests_list=requests_list, request_rate=args.request_rate
+        ):
             task = asyncio.create_task(limited_request_func(req, session, pbar))
             tasks.append(task)
 
@@ -838,27 +876,55 @@ async def benchmark(args):
             str(args.max_concurrency) if args.max_concurrency else "not set",
         )
     )
-    print("{:<40} {}/{:<15}".format("Successful requests:", metrics["completed_requests"], len(requests_list)))
+    print(
+        "{:<40} {}/{:<15}".format(
+            "Successful requests:", metrics["completed_requests"], len(requests_list)
+        )
+    )
 
     # Section 3: Performance Metrics
     print(f"{'-' * 50}")
 
-    print("{:<40} {:<15.2f}".format("Request throughput (req/s):", metrics["throughput_qps"]))
+    print(
+        "{:<40} {:<15.2f}".format(
+            "Request throughput (req/s):", metrics["throughput_qps"]
+        )
+    )
     print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
 
     if args.slo:
         print(f"{'-' * 50}")
-        print("{:<40} {:<15.2%}".format("SLO Attainment Rate (all):", metrics.get("slo_attainment_rate", 0.0)))
-        print("{:<40} {:<15}".format("SLO Met (success count):", str(metrics.get("slo_met_success", 0))))
+        print(
+            "{:<40} {:<15.2%}".format(
+                "SLO Attainment Rate (all):", metrics.get("slo_attainment_rate", 0.0)
+            )
+        )
+        print(
+            "{:<40} {:<15}".format(
+                "SLO Met (success count):", str(metrics.get("slo_met_success", 0))
+            )
+        )
         print("{:<40} {:<15}".format("SLO Scale:", str(metrics.get("slo_scale", 3.0))))
 
     if metrics["peak_memory_mb_max"] > 0:
         print(f"{'-' * 50}")
-        print("{:<40} {:<15.2f}".format("Peak Memory Max (MB):", metrics["peak_memory_mb_max"]))
-        print("{:<40} {:<15.2f}".format("Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]))
-        print("{:<40} {:<15.2f}".format("Peak Memory Median (MB):", metrics["peak_memory_mb_median"]))
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Max (MB):", metrics["peak_memory_mb_max"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
+            )
+        )
 
     print("\n" + "=" * 60)
 
@@ -869,7 +935,9 @@ async def benchmark(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark serving for diffusion models.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark serving for diffusion models."
+    )
     parser.add_argument(
         "--base-url",
         type=str,
@@ -906,7 +974,9 @@ if __name__ == "__main__":
         default=None,
         help="Path to local dataset file (optional).",
     )
-    parser.add_argument("--num-prompts", type=int, default=10, help="Number of prompts to benchmark.")
+    parser.add_argument(
+        "--num-prompts", type=int, default=10, help="Number of prompts to benchmark."
+    )
     parser.add_argument(
         "--max-concurrency",
         type=int,
@@ -941,7 +1011,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
-    parser.add_argument("--num-frames", type=int, default=None, help="Number of frames (for video).")
+    parser.add_argument(
+        "--num-frames", type=int, default=None, help="Number of frames (for video)."
+    )
     parser.add_argument(
         "--num-inference-steps",
         type=int,
@@ -955,7 +1027,9 @@ if __name__ == "__main__":
         help="Random seed (for diffusion models).",
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
-    parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
+    parser.add_argument(
+        "--output-file", type=str, default=None, help="Output JSON file for metrics."
+    )
     parser.add_argument(
         "--slo",
         action="store_true",
@@ -971,7 +1045,9 @@ if __name__ == "__main__":
         default=3.0,
         help="SLO target multiplier: slo_ms = estimated_exec_time_ms * slo_scale (default: 3).",
     )
-    parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
+    parser.add_argument(
+        "--disable-tqdm", action="store_true", help="Disable progress bar."
+    )
 
     args = parser.parse_args()
 

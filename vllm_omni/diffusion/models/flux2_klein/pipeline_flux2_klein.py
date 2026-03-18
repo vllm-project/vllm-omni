@@ -27,8 +27,12 @@ import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
+    retrieve_timesteps,
+)
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
+    retrieve_latents,
+)
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
@@ -46,7 +50,9 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
-from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 
 logger = init_logger(__name__)
 
@@ -82,7 +88,9 @@ class Flux2ImageProcessor(VaeImageProcessor):
 
         width, height = image.size
         if width < min_side_length or height < min_side_length:
-            raise ValueError(f"Image too small: {width}x{height}. Both dimensions must be at least {min_side_length}px")
+            raise ValueError(
+                f"Image too small: {width}x{height}. Both dimensions must be at least {min_side_length}px"
+            )
 
         aspect_ratio = max(width / height, height / width)
         if aspect_ratio > max_aspect_ratio:
@@ -92,12 +100,16 @@ class Flux2ImageProcessor(VaeImageProcessor):
             )
 
         if width * height > max_area:
-            logger.warning("Image area exceeds recommended maximum; resizing will be applied.")
+            logger.warning(
+                "Image area exceeds recommended maximum; resizing will be applied."
+            )
 
         return image
 
     @staticmethod
-    def _resize_to_target_area(image: PIL.Image.Image, target_area: int = 1024 * 1024) -> PIL.Image.Image:
+    def _resize_to_target_area(
+        image: PIL.Image.Image, target_area: int = 1024 * 1024
+    ) -> PIL.Image.Image:
         image_width, image_height = image.size
         scale = math.sqrt(target_area / (image_width * image_height))
         width = int(image_width * scale)
@@ -105,13 +117,17 @@ class Flux2ImageProcessor(VaeImageProcessor):
         return image.resize((width, height), PIL.Image.Resampling.LANCZOS)
 
     @staticmethod
-    def _resize_if_exceeds_area(image: PIL.Image.Image, target_area: int = 1024 * 1024) -> PIL.Image.Image:
+    def _resize_if_exceeds_area(
+        image: PIL.Image.Image, target_area: int = 1024 * 1024
+    ) -> PIL.Image.Image:
         image_width, image_height = image.size
         if image_width * image_height <= target_area:
             return image
         return Flux2ImageProcessor._resize_to_target_area(image, target_area)
 
-    def _resize_and_crop(self, image: PIL.Image.Image, width: int, height: int) -> PIL.Image.Image:
+    def _resize_and_crop(
+        self, image: PIL.Image.Image, width: int, height: int
+    ) -> PIL.Image.Image:
         image_width, image_height = image.size
         left = (image_width - width) // 2
         top = (image_height - height) // 2
@@ -151,7 +167,11 @@ def get_flux2_klein_post_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+        vae_scale_factor = (
+            2 ** (len(vae_config["block_out_channels"]) - 1)
+            if "block_out_channels" in vae_config
+            else 8
+        )
 
     image_processor = Flux2ImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -230,12 +250,22 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             local_files_only=local_files_only,
         ).to(self._execution_device)
 
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
+        transformer_kwargs = get_transformer_config_kwargs(
+            od_config.tf_model_config, Flux2Transformer2DModel
+        )
         quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
-        self.transformer = Flux2Transformer2DModel(quant_config=quant_config, **transformer_kwargs)
+        self.transformer = Flux2Transformer2DModel(
+            quant_config=quant_config, **transformer_kwargs
+        )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
-        self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.vae_scale_factor = (
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if getattr(self, "vae", None)
+            else 8
+        )
+        self.image_processor = Flux2ImageProcessor(
+            vae_scale_factor=self.vae_scale_factor * 2
+        )
         self.tokenizer_max_length = 512
         self.default_sample_size = 128
 
@@ -294,11 +324,15 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         )
 
         # Only use outputs from intermediate layers and stack them
-        out = torch.stack([output.hidden_states[k] for k in hidden_states_layers], dim=1)
+        out = torch.stack(
+            [output.hidden_states[k] for k in hidden_states_layers], dim=1
+        )
         out = out.to(dtype=dtype, device=device)
 
         batch_size, num_channels, seq_len, hidden_dim = out.shape
-        prompt_embeds = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_channels * hidden_dim)
+        prompt_embeds = out.permute(0, 2, 1, 3).reshape(
+            batch_size, seq_len, num_channels * hidden_dim
+        )
 
         return prompt_embeds
 
@@ -387,7 +421,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         """
 
         if not isinstance(image_latents, list):
-            raise ValueError(f"Expected `image_latents` to be a list, got {type(image_latents)}.")
+            raise ValueError(
+                f"Expected `image_latents` to be a list, got {type(image_latents)}."
+            )
 
         # create time offset for each reference image
         t_coords = [scale + scale * t for t in torch.arange(0, len(image_latents))]
@@ -398,7 +434,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             x = x.squeeze(0)
             _, height, width = x.shape
 
-            x_ids = torch.cartesian_prod(t, torch.arange(height), torch.arange(width), torch.arange(1))
+            x_ids = torch.cartesian_prod(
+                t, torch.arange(height), torch.arange(width), torch.arange(1)
+            )
             image_latent_ids.append(x_ids)
 
         image_latent_ids = torch.cat(image_latent_ids, dim=0)
@@ -410,18 +448,26 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._patchify_latents
     def _patchify_latents(latents):
         batch_size, num_channels_latents, height, width = latents.shape
-        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.view(
+            batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+        )
         latents = latents.permute(0, 1, 3, 5, 2, 4)
-        latents = latents.reshape(batch_size, num_channels_latents * 4, height // 2, width // 2)
+        latents = latents.reshape(
+            batch_size, num_channels_latents * 4, height // 2, width // 2
+        )
         return latents
 
     @staticmethod
     # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._unpatchify_latents
     def _unpatchify_latents(latents):
         batch_size, num_channels_latents, height, width = latents.shape
-        latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), 2, 2, height, width)
+        latents = latents.reshape(
+            batch_size, num_channels_latents // (2 * 2), 2, 2, height, width
+        )
         latents = latents.permute(0, 1, 4, 2, 5, 3)
-        latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), height * 2, width * 2)
+        latents = latents.reshape(
+            batch_size, num_channels_latents // (2 * 2), height * 2, width * 2
+        )
         return latents
 
     @staticmethod
@@ -432,13 +478,17 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         """
 
         batch_size, num_channels, height, width = latents.shape
-        latents = latents.reshape(batch_size, num_channels, height * width).permute(0, 2, 1)
+        latents = latents.reshape(batch_size, num_channels, height * width).permute(
+            0, 2, 1
+        )
 
         return latents
 
     @staticmethod
     # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._unpack_latents_with_ids
-    def _unpack_latents_with_ids(x: torch.Tensor, x_ids: torch.Tensor) -> list[torch.Tensor]:
+    def _unpack_latents_with_ids(
+        x: torch.Tensor, x_ids: torch.Tensor
+    ) -> list[torch.Tensor]:
         """
         using position ids to scatter tokens into place
         """
@@ -491,7 +541,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         batch_size, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
+        )
 
         text_ids = self._prepare_text_ids(prompt_embeds)
         text_ids = text_ids.to(device)
@@ -502,11 +554,17 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         if image.ndim != 4:
             raise ValueError(f"Expected image dims 4, got {image.ndim}.")
 
-        image_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
+        image_latents = retrieve_latents(
+            self.vae.encode(image), generator=generator, sample_mode="argmax"
+        )
         image_latents = self._patchify_latents(image_latents)
 
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(image_latents.device, image_latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps)
+        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(
+            image_latents.device, image_latents.dtype
+        )
+        latents_bn_std = torch.sqrt(
+            self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
+        )
         image_latents = (image_latents - latents_bn_mean) / latents_bn_std
 
         return image_latents
@@ -535,7 +593,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = randn_tensor(
+                shape, generator=generator, device=device, dtype=dtype
+            )
         else:
             latents = latents.to(device=device, dtype=dtype)
 
@@ -604,9 +664,12 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             )
 
         if callback_on_step_end_tensor_inputs is not None and not all(
-            k in ["latents", "prompt_embeds"] for k in callback_on_step_end_tensor_inputs
+            k in ["latents", "prompt_embeds"]
+            for k in callback_on_step_end_tensor_inputs
         ):
-            raise ValueError("`callback_on_step_end_tensor_inputs` must be a subset of ['latents', 'prompt_embeds'].")
+            raise ValueError(
+                "`callback_on_step_end_tensor_inputs` must be a subset of ['latents', 'prompt_embeds']."
+            )
 
         if prompt is not None and prompt_embeds is not None:
             raise ValueError(
@@ -617,11 +680,17 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+        elif prompt is not None and (
+            not isinstance(prompt, str) and not isinstance(prompt, list)
+        ):
+            raise ValueError(
+                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
+            )
 
         if guidance_scale > 1.0 and self.is_distilled:
-            logger.warning(f"Guidance scale {guidance_scale} is ignored for step-wise distilled models.")
+            logger.warning(
+                f"Guidance scale {guidance_scale} is ignored for step-wise distilled models."
+            )
 
     @property
     def guidance_scale(self):
@@ -629,7 +698,11 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
     @property
     def do_classifier_free_guidance(self):
-        return self._guidance_scale is not None and self._guidance_scale > 1 and not self.is_distilled
+        return (
+            self._guidance_scale is not None
+            and self._guidance_scale > 1
+            and not self.is_distilled
+        )
 
     @property
     def attention_kwargs(self):
@@ -751,25 +824,42 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 """Taking only the first image for now.""",
             )
         first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        prompt = (
+            first_prompt
+            if isinstance(first_prompt, str)
+            else (first_prompt.get("prompt") or "")
+        )
 
         if (
-            raw_image := None
-            if isinstance(first_prompt, str)
-            else first_prompt.get("multi_modal_data", {}).get("image")
+            raw_image := (
+                None
+                if isinstance(first_prompt, str)
+                else first_prompt.get("multi_modal_data", {}).get("image")
+            )
         ) is None:
             pass  # use image from param list
         elif isinstance(raw_image, list):
-            image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
+            image = [
+                PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im)
+                for im in raw_image
+            ]
         else:
-            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
+            image = (
+                PIL.Image.open(raw_image)
+                if isinstance(raw_image, str)
+                else cast(PIL.Image.Image, raw_image)
+            )
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+            req.sampling_params.guidance_scale
+            if req.sampling_params.guidance_scale is not None
+            else guidance_scale
         )
         generator = req.sampling_params.generator or generator
         num_images_per_prompt = (
@@ -777,10 +867,17 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
         )
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
+        max_sequence_length = (
+            req.sampling_params.max_sequence_length or max_sequence_length
+        )
+        text_encoder_out_layers = req.sampling_params.extra_args.get(
+            "text_encoder_out_layers", text_encoder_out_layers
+        )
 
-        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
+        req_prompt_embeds = [
+            p.get("prompt_embeds") if not isinstance(p, str) else None
+            for p in req.prompts
+        ]
         if any(p is not None for p in req_prompt_embeds):
             # If at list one prompt is provided as an embedding,
             # Then assume that the user wants to provide embeddings for all prompts, and enter this if block
@@ -789,7 +886,8 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
         req_negative_prompt_embeds = [
-            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
+            p.get("negative_prompt_embeds") if not isinstance(p, str) else None
+            for p in req.prompts
         ]
         if any(p is not None for p in req_negative_prompt_embeds):
             negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
@@ -861,7 +959,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 multiple_of = self.vae_scale_factor * 2
                 image_width = (image_width // multiple_of) * multiple_of
                 image_height = (image_height // multiple_of) * multiple_of
-                img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+                img = self.image_processor.preprocess(
+                    img, height=image_height, width=image_width, resize_mode="crop"
+                )
                 condition_images.append(img)
                 height = height or image_height
                 width = width or image_width
@@ -894,11 +994,20 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             )
 
         # 6. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+        sigmas = (
+            np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+            if sigmas is None
+            else sigmas
+        )
+        if (
+            hasattr(self.scheduler.config, "use_flow_sigmas")
+            and self.scheduler.config.use_flow_sigmas
+        ):
             sigmas = None
         image_seq_len = latents.shape[1]
-        mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
+        mu = compute_empirical_mu(
+            image_seq_len=image_seq_len, num_steps=num_inference_steps
+        )
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
@@ -923,7 +1032,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             latent_image_ids = latent_ids
 
             if image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                latent_model_input = torch.cat([latents, image_latents], dim=1).to(
+                    self.transformer.dtype
+                )
                 latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
             positive_kwargs = {
@@ -963,7 +1074,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             )
 
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, self.do_classifier_free_guidance)
+            latents = self.scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, self.do_classifier_free_guidance
+            )
 
             if callback_on_step_end is not None:
                 callback_kwargs = {}
@@ -978,10 +1091,12 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         latents = self._unpack_latents_with_ids(latents, latent_ids)
 
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(
             latents.device, latents.dtype
         )
+        latents_bn_std = torch.sqrt(
+            self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
+        ).to(latents.device, latents.dtype)
         latents = latents * latents_bn_std + latents_bn_mean
         latents = self._unpatchify_latents(latents)
         if output_type == "latent":
@@ -998,5 +1113,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         loaded_weights = loader.load_weights(weights)
         # Record components loaded by diffusers submodules to satisfy strict checks.
         loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
-        loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
+        loaded_weights |= {
+            f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()
+        }
         return loaded_weights

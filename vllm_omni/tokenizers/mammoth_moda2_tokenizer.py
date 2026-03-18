@@ -77,11 +77,19 @@ QWEN_SPECIAL_TOKENS = (
 )
 
 # align to qwen2.5 tokenizer length (151846)
-EXTRAS = [f"<|extra_{i}|>" for i in range(181)]  # 205 - 19[len(QWEN_SPECIAL_TOKENS)] - 5
+EXTRAS = [
+    f"<|extra_{i}|>" for i in range(181)
+]  # 205 - 19[len(QWEN_SPECIAL_TOKENS)] - 5
 # align to qwen2.5 embedding size (152064)
 EXTRAS += [f"<|extra_margin_{i}|>" for i in range(152064 - 151846)]
 # append new token in gen embedding range
-EXTRAS += ["<|endofline|>", "<|endoffile|>", "<|gen_placeholder|>", "<|useless token|>", "<|beginoftext|>"]
+EXTRAS += [
+    "<|endofline|>",
+    "<|endoffile|>",
+    "<|gen_placeholder|>",
+    "<|useless token|>",
+    "<|beginoftext|>",
+]
 EXTRAS = tuple(EXTRAS)
 # changed to use actual index to avoid misconfiguration with vocabulary expansion
 SPECIAL_START_ID = 151643
@@ -91,7 +99,8 @@ def _load_tiktoken_bpe(tiktoken_bpe_file: str) -> dict[bytes, int]:
     with open(tiktoken_bpe_file, "rb") as f:
         contents = f.read()
     return {
-        base64.b64decode(token): int(rank) for token, rank in (line.split() for line in contents.splitlines() if line)
+        base64.b64decode(token): int(rank)
+        for token, rank in (line.split() for line in contents.splitlines() if line)
     }
 
 
@@ -149,9 +158,9 @@ class MammothUTokenizer(PreTrainedTokenizer):
             special_tokens=self.special_tokens,
         )
 
-        assert len(self.mergeable_ranks) + len(self.special_tokens) == enc.n_vocab, (
-            f"{len(self.mergeable_ranks) + len(self.special_tokens)} != {enc.n_vocab} in encoding"
-        )
+        assert (
+            len(self.mergeable_ranks) + len(self.special_tokens) == enc.n_vocab
+        ), f"{len(self.mergeable_ranks) + len(self.special_tokens)} != {enc.n_vocab} in encoding"
 
         self.decoder = {v: k for k, v in self.mergeable_ranks.items()}
         self.decoder.update({v: k for k, v in self.special_tokens.items()})
@@ -168,10 +177,20 @@ class MammothUTokenizer(PreTrainedTokenizer):
         self.image_content_token = "<|image_pad|>"  # come from Qwen2.5-VL
         self.gen_image_token = "<|gen_image_pad|>"
         self.gen_image_placeholder_token = "<|gen_placeholder|>"
-        self.visual_tokens = ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
-        self.visual_tokens_ids = [self.get_vocab()[token] for token in self.visual_tokens]
+        self.visual_tokens = [
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+        ]
+        self.visual_tokens_ids = [
+            self.get_vocab()[token] for token in self.visual_tokens
+        ]
 
-        self.vision_range = (self.get_vocab()[self.boi_token], self.tokenizer.n_vocab - 1)
+        self.vision_range = (
+            self.get_vocab()[self.boi_token],
+            self.tokenizer.n_vocab - 1,
+        )
         logger.info(f"MammothUTokeniser Vision range: {self.vision_range}")
 
     def __getstate__(self):
@@ -203,7 +222,9 @@ class MammothUTokenizer(PreTrainedTokenizer):
     def gen_placeholder_id(self):
         return self.get_vocab()[self.gen_image_placeholder_token]
 
-    def convert_tokens_to_ids(self, tokens: bytes | str | list[bytes | str]) -> list[int]:
+    def convert_tokens_to_ids(
+        self, tokens: bytes | str | list[bytes | str]
+    ) -> list[int]:
         if isinstance(tokens, (str, bytes)):
             if tokens in self.special_tokens:
                 return self.special_tokens[tokens]
@@ -233,11 +254,15 @@ class MammothUTokenizer(PreTrainedTokenizer):
                 # Token already exists in our special tokens set
                 added_tokens += 1
             else:
-                logger.warning(f"Token {surface_form} is not in the predefined special tokens set and cannot be added")
+                logger.warning(
+                    f"Token {surface_form} is not in the predefined special tokens set and cannot be added"
+                )
 
         return added_tokens
 
-    def add_special_tokens(self, special_tokens_dict: dict[str, str | AddedToken]) -> int:
+    def add_special_tokens(
+        self, special_tokens_dict: dict[str, str | AddedToken]
+    ) -> int:
         """
         Add special tokens to the tokenizer and update the special tokens mapping.
         Only adds tokens that are already in the special_tokens_set.
@@ -273,7 +298,9 @@ class MammothUTokenizer(PreTrainedTokenizer):
         Returns:
             `tuple(str)`: Paths to the files saved.
         """
-        regular_file_path = os.path.join(save_directory, self.vocab_files_names["vocab_file"])
+        regular_file_path = os.path.join(
+            save_directory, self.vocab_files_names["vocab_file"]
+        )
         with open(regular_file_path, "w", encoding="utf8") as w:
             for k, v in self.mergeable_ranks.items():
                 line = base64.b64encode(k).decode("utf8") + " " + str(v) + "\n"
@@ -287,7 +314,9 @@ class MammothUTokenizer(PreTrainedTokenizer):
             )
             + EXTRAS
         )
-        special_file_path = os.path.join(save_directory, self.vocab_files_names["special_tokens_file"])
+        special_file_path = os.path.join(
+            save_directory, self.vocab_files_names["special_tokens_file"]
+        )
         with open(special_file_path, "w", encoding="utf8") as w:
             for k in self.special_tokens:
                 if k not in excluded_special_tokens:
@@ -325,7 +354,9 @@ class MammothUTokenizer(PreTrainedTokenizer):
         text = unicodedata.normalize("NFC", text)
 
         # this implementation takes a detour: text -> token id -> token surface forms
-        for t in self.tokenizer.encode(text, allowed_special=allowed_special, disallowed_special=disallowed_special):
+        for t in self.tokenizer.encode(
+            text, allowed_special=allowed_special, disallowed_special=disallowed_special
+        ):
             tokens.append(self.decoder[t])
 
         return tokens
@@ -395,7 +426,11 @@ class MammothUTokenizer(PreTrainedTokenizer):
             If input is a single byte object, returns the string representation.
         """
         if isinstance(byte_tokens, dict):
-            return {k.decode("utf-8", errors=self.errors): v for k, v in byte_tokens.items() if isinstance(k, bytes)}
+            return {
+                k.decode("utf-8", errors=self.errors): v
+                for k, v in byte_tokens.items()
+                if isinstance(k, bytes)
+            }
         if isinstance(byte_tokens, bytes):
             return byte_tokens.decode("utf-8", errors=self.errors)
         return byte_tokens

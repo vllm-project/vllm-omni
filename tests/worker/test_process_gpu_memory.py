@@ -87,7 +87,10 @@ class TestGetProcessGpuMemory:
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
         mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetCount", return_value=8)
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
-        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses", return_value=[])
+        mocker.patch(
+            "vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses",
+            return_value=[],
+        )
 
         memory = get_process_gpu_memory(0)
         assert memory == 0
@@ -101,8 +104,14 @@ class TestGetProcessGpuMemory:
         mocker.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": uuid})
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
-        mock_by_uuid = mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetHandleByUUID", return_value=mock_handle)
-        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses", return_value=[])
+        mock_by_uuid = mocker.patch(
+            "vllm.third_party.pynvml.nvmlDeviceGetHandleByUUID",
+            return_value=mock_handle,
+        )
+        mocker.patch(
+            "vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses",
+            return_value=[],
+        )
 
         memory = get_process_gpu_memory(0)
         assert memory == 0
@@ -116,7 +125,10 @@ class TestGetProcessGpuMemory:
         mocker.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": uuid})
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
-        mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetHandleByUUID", side_effect=Exception("Invalid UUID"))
+        mocker.patch(
+            "vllm.third_party.pynvml.nvmlDeviceGetHandleByUUID",
+            side_effect=Exception("Invalid UUID"),
+        )
 
         with pytest.raises(RuntimeError, match="Failed to get NVML handle"):
             get_process_gpu_memory(0)
@@ -124,7 +136,10 @@ class TestGetProcessGpuMemory:
     def test_returns_none_on_nvml_init_failure(self, mocker: MockerFixture):
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
-        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit", side_effect=Exception("NVML unavailable"))
+        mocker.patch(
+            "vllm_omni.worker.gpu_memory_utils.nvmlInit",
+            side_effect=Exception("NVML unavailable"),
+        )
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
         result = get_process_gpu_memory(0)
         assert result is None

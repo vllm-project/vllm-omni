@@ -21,9 +21,17 @@ from typing import Any
 import torch
 import torch.nn as nn
 from diffusers.models.attention import FeedForward
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps, get_1d_rotary_pos_embed
+from diffusers.models.embeddings import (
+    TimestepEmbedding,
+    Timesteps,
+    get_1d_rotary_pos_embed,
+)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from diffusers.models.normalization import (
+    AdaLayerNormContinuous,
+    AdaLayerNormZero,
+    AdaLayerNormZeroSingle,
+)
 from diffusers.utils import is_torch_npu_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -80,7 +88,9 @@ class OvisImageAttention(nn.Module):
 
         if not self.pre_only:
             self.to_out = nn.ModuleList([])
-            self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
+            self.to_out.append(
+                torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias)
+            )
             self.to_out.append(nn.Dropout(dropout))
 
         if self.added_kv_proj_dim is not None:
@@ -155,7 +165,11 @@ class OvisImageAttention(nn.Module):
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+                [
+                    encoder_hidden_states.shape[1],
+                    hidden_states.shape[1] - encoder_hidden_states.shape[1],
+                ],
+                dim=1,
             )
             hidden_states = self.to_out[0](hidden_states)
             hidden_states = self.to_out[1](hidden_states)
@@ -167,7 +181,13 @@ class OvisImageAttention(nn.Module):
 
 
 class OvisImageSingleTransformerBlock(nn.Module):
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        mlp_ratio: float = 4.0,
+    ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
@@ -200,7 +220,9 @@ class OvisImageSingleTransformerBlock(nn.Module):
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         mlp_hidden_states, mlp_hidden_gate = torch.split(
-            self.proj_mlp(norm_hidden_states), [self.mlp_hidden_dim, self.mlp_hidden_dim], dim=-1
+            self.proj_mlp(norm_hidden_states),
+            [self.mlp_hidden_dim, self.mlp_hidden_dim],
+            dim=-1,
         )
         mlp_hidden_states = self.act_mlp(mlp_hidden_gate) * mlp_hidden_states
         joint_attention_kwargs = joint_attention_kwargs or {}
@@ -217,7 +239,10 @@ class OvisImageSingleTransformerBlock(nn.Module):
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
-        encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+        encoder_hidden_states, hidden_states = (
+            hidden_states[:, :text_seq_len],
+            hidden_states[:, text_seq_len:],
+        )
         return encoder_hidden_states, hidden_states
 
 
@@ -260,9 +285,11 @@ class OvisImageTransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
-        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-            encoder_hidden_states, emb=temb
+        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+            hidden_states, emb=temb
+        )
+        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = (
+            self.norm1_context(encoder_hidden_states, emb=temb)
         )
         joint_attention_kwargs = joint_attention_kwargs or {}
 
@@ -284,7 +311,9 @@ class OvisImageTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm_hidden_states = (
+            norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        )
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -298,10 +327,15 @@ class OvisImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+        norm_encoder_hidden_states = (
+            norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
+            + c_shift_mlp[:, None]
+        )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        encoder_hidden_states = (
+            encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
@@ -388,8 +422,12 @@ class OvisImageTransformer2DModel(nn.Module):
         self.inner_dim = num_attention_heads * attention_head_dim
         self.pos_embed = OvisImagePosEmbed(theta=10000, axes_dim=axes_dims_rope)
 
-        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=self.inner_dim)
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=self.inner_dim
+        )
 
         self.context_embedder_norm = RMSNorm(joint_attention_dim, eps=1e-6)
         self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim)
@@ -416,8 +454,12 @@ class OvisImageTransformer2DModel(nn.Module):
                 for _ in range(num_single_layers)
             ]
         )
-        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+        self.norm_out = AdaLayerNormContinuous(
+            self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
+        )
+        self.proj_out = nn.Linear(
+            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
+        )
 
     def forward(
         self,
@@ -452,10 +494,14 @@ class OvisImageTransformer2DModel(nn.Module):
         """
 
         hidden_states = self.x_embedder(hidden_states)
-        timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
+        timestep = (
+            timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
+        )
 
         timesteps_proj = self.time_proj(timestep)
-        temb = self.timestep_embedder(timesteps_proj.to(device=hidden_states.device, dtype=hidden_states.dtype))
+        temb = self.timestep_embedder(
+            timesteps_proj.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        )
 
         encoder_hidden_states = self.context_embedder_norm(encoder_hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)

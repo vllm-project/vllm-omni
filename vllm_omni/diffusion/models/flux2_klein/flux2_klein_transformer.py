@@ -220,7 +220,11 @@ class Flux2Attention(nn.Module):
 
             sp_size = self.parallel_config.sequence_parallel_size
             forward_ctx = get_forward_context()
-            use_sp_joint_attention = sp_size is not None and sp_size > 1 and not forward_ctx.split_text_embed_in_sp
+            use_sp_joint_attention = (
+                sp_size is not None
+                and sp_size > 1
+                and not forward_ctx.split_text_embed_in_sp
+            )
 
             if use_sp_joint_attention and image_rotary_emb is not None:
                 cos, sin = image_rotary_emb
@@ -240,8 +244,12 @@ class Flux2Attention(nn.Module):
                     joint_value=encoder_value,
                     joint_strategy="front",
                 )
-                hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
-                encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
+                hidden_states_mask: torch.Tensor | None = kwargs.get(
+                    "hidden_states_mask", None
+                )
+                encoder_hidden_states_mask: torch.Tensor | None = kwargs.get(
+                    "encoder_hidden_states_mask", None
+                )
                 if hidden_states_mask is not None:
                     attn_metadata.attn_mask = hidden_states_mask
                 if encoder_hidden_states_mask is not None:
@@ -395,7 +403,10 @@ class Flux2ParallelSelfAttention(nn.Module):
         forward_ctx = get_forward_context()
         text_seq_len = kwargs.get("text_seq_len", None)
         use_sp_single_stream = (
-            sp_size is not None and sp_size > 1 and not forward_ctx.split_text_embed_in_sp and text_seq_len is not None
+            sp_size is not None
+            and sp_size > 1
+            and not forward_ctx.split_text_embed_in_sp
+            and text_seq_len is not None
         )
 
         if use_sp_single_stream and image_rotary_emb is not None:
@@ -423,8 +434,12 @@ class Flux2ParallelSelfAttention(nn.Module):
                 joint_value=text_value,
                 joint_strategy="front",
             )
-            hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
-            encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
+            hidden_states_mask: torch.Tensor | None = kwargs.get(
+                "hidden_states_mask", None
+            )
+            encoder_hidden_states_mask: torch.Tensor | None = kwargs.get(
+                "encoder_hidden_states_mask", None
+            )
             if hidden_states_mask is not None:
                 attn_metadata.attn_mask = hidden_states_mask
             if encoder_hidden_states_mask is not None:
@@ -516,7 +531,10 @@ class Flux2SingleTransformerBlock(nn.Module):
             hidden_states = hidden_states.clip(-65504, 65504)
 
         if split_hidden_states:
-            encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+            encoder_hidden_states, hidden_states = (
+                hidden_states[:, :text_seq_len],
+                hidden_states[:, text_seq_len:],
+            )
             return encoder_hidden_states, hidden_states
         return hidden_states
 
@@ -552,7 +570,9 @@ class Flux2TransformerBlock(nn.Module):
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config)
+        self.ff = Flux2FeedForward(
+            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config
+        )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff_context = Flux2FeedForward(
@@ -567,21 +587,33 @@ class Flux2TransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        temb_mod_params_img: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
-        temb_mod_params_txt: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
+        temb_mod_params_img: tuple[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...
+        ],
+        temb_mod_params_txt: tuple[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...
+        ],
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
-        (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = temb_mod_params_img
-        (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = temb_mod_params_txt
+        (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = (
+            temb_mod_params_img
+        )
+        (c_shift_msa, c_scale_msa, c_gate_msa), (
+            c_shift_mlp,
+            c_scale_mlp,
+            c_gate_mlp,
+        ) = temb_mod_params_txt
 
         norm_hidden_states = self.norm1(hidden_states)
         norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
 
         norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (1 + c_scale_msa) * norm_encoder_hidden_states + c_shift_msa
+        norm_encoder_hidden_states = (
+            1 + c_scale_msa
+        ) * norm_encoder_hidden_states + c_shift_msa
 
         attn_output, context_attn_output = self.attn(
             hidden_states=norm_hidden_states,
@@ -602,7 +634,9 @@ class Flux2TransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        norm_encoder_hidden_states = (
+            norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        )
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
         if encoder_hidden_states.dtype == torch.float16:
@@ -689,7 +723,9 @@ class Flux2TimestepGuidanceEmbeddings(nn.Module):
         guidance_embeds: bool = True,
     ):
         super().__init__()
-        self.time_proj = Timesteps(num_channels=in_channels, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.time_proj = Timesteps(
+            num_channels=in_channels, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
         self.timestep_embedder = TimestepEmbedding(
             in_channels=in_channels,
             time_embed_dim=embedding_dim,
@@ -705,7 +741,9 @@ class Flux2TimestepGuidanceEmbeddings(nn.Module):
         else:
             self.guidance_embedder = None
 
-    def forward(self, timestep: torch.Tensor, guidance: torch.Tensor | None) -> torch.Tensor:
+    def forward(
+        self, timestep: torch.Tensor, guidance: torch.Tensor | None
+    ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(timestep.dtype))
 
@@ -723,13 +761,17 @@ class Flux2Modulation(nn.Module):
         self.linear = nn.Linear(dim, dim * 3 * self.mod_param_sets, bias=bias)
         self.act_fn = nn.SiLU()
 
-    def forward(self, temb: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+    def forward(
+        self, temb: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
         mod = self.act_fn(temb)
         mod = self.linear(mod)
         if mod.ndim == 2:
             mod = mod.unsqueeze(1)
         mod_params = torch.chunk(mod, 3 * self.mod_param_sets, dim=-1)
-        return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(self.mod_param_sets))
+        return tuple(
+            mod_params[3 * i : 3 * (i + 1)] for i in range(self.mod_param_sets)
+        )
 
 
 class Flux2Transformer2DModel(nn.Module):
@@ -743,16 +785,24 @@ class Flux2Transformer2DModel(nn.Module):
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
-        return ("transformer_blocks" in name or "single_transformer_blocks" in name) and name.split(".")[-1].isdigit()
+        return (
+            "transformer_blocks" in name or "single_transformer_blocks" in name
+        ) and name.split(".")[-1].isdigit()
 
     _hsdp_shard_conditions = [_is_transformer_block]
     _sp_plan = {
         "": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+            "hidden_states": SequenceParallelInput(
+                split_dim=1, expected_dims=3, auto_pad=True
+            ),
         },
         "rope_prepare": {
-            2: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
-            3: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(
+                split_dim=0, expected_dims=2, split_output=True, auto_pad=True
+            ),
+            3: SequenceParallelInput(
+                split_dim=0, expected_dims=2, split_output=True, auto_pad=True
+            ),
         },
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -812,12 +862,20 @@ class Flux2Transformer2DModel(nn.Module):
             guidance_embeds=guidance_embeds,
         )
 
-        self.double_stream_modulation_img = Flux2Modulation(self.inner_dim, mod_param_sets=2, bias=False)
-        self.double_stream_modulation_txt = Flux2Modulation(self.inner_dim, mod_param_sets=2, bias=False)
-        self.single_stream_modulation = Flux2Modulation(self.inner_dim, mod_param_sets=1, bias=False)
+        self.double_stream_modulation_img = Flux2Modulation(
+            self.inner_dim, mod_param_sets=2, bias=False
+        )
+        self.double_stream_modulation_txt = Flux2Modulation(
+            self.inner_dim, mod_param_sets=2, bias=False
+        )
+        self.single_stream_modulation = Flux2Modulation(
+            self.inner_dim, mod_param_sets=1, bias=False
+        )
 
         self.x_embedder = nn.Linear(in_channels, self.inner_dim, bias=False)
-        self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim, bias=False)
+        self.context_embedder = nn.Linear(
+            joint_attention_dim, self.inner_dim, bias=False
+        )
 
         self.rope_prepare = Flux2RopePrepare(self.pos_embed)
 
@@ -860,7 +918,9 @@ class Flux2Transformer2DModel(nn.Module):
             eps=eps,
             bias=False,
         )
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=False)
+        self.proj_out = nn.Linear(
+            self.inner_dim, patch_size * patch_size * self.out_channels, bias=False
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -903,7 +963,9 @@ class Flux2Transformer2DModel(nn.Module):
         hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(img_ids, txt_ids)
+        txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(
+            img_ids, txt_ids
+        )
 
         concat_rotary_emb = (
             torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
@@ -931,7 +993,9 @@ class Flux2Transformer2DModel(nn.Module):
         if hidden_states_mask is not None:
             joint_attention_kwargs["hidden_states_mask"] = hidden_states_mask
         if encoder_hidden_states_mask is not None:
-            joint_attention_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
+            joint_attention_kwargs["encoder_hidden_states_mask"] = (
+                encoder_hidden_states_mask
+            )
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(

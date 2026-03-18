@@ -33,14 +33,20 @@ class CfgCompanionTracker:
         self._expand_func = prompt_expand_func
         self._sp0 = stage0_sampling_params
         self._timeout_s = (
-            timeout_s if timeout_s is not None else float(os.environ.get("VLLM_CFG_PENDING_TIMEOUT_S", "120"))
+            timeout_s
+            if timeout_s is not None
+            else float(os.environ.get("VLLM_CFG_PENDING_TIMEOUT_S", "120"))
         )
 
-        self._companion_map: dict[str, dict[str, str]] = {}  # parent -> {role: companion_id}
+        self._companion_map: dict[str, dict[str, str]] = (
+            {}
+        )  # parent -> {role: companion_id}
         self._companion_ids: set[str] = set()
         self._companion_to_parent: dict[str, str] = {}  # companion -> parent
         self._done: dict[str, set[str]] = {}  # parent -> completed companion ids
-        self._pending_parents: dict[str, dict[str, Any]] = {}  # parent -> deferred result
+        self._pending_parents: dict[str, dict[str, Any]] = (
+            {}
+        )  # parent -> deferred result
         self._failed_parents: set[str] = set()
 
     @property
@@ -111,7 +117,11 @@ class CfgCompanionTracker:
         if parent_id is None:
             return None, False
         self._failed_parents.add(parent_id)
-        logger.error("CFG companion %s failed; marking parent %s as failed", companion_id, parent_id)
+        logger.error(
+            "CFG companion %s failed; marking parent %s as failed",
+            companion_id,
+            parent_id,
+        )
         aborted = parent_id in self._pending_parents
         if aborted:
             self._pending_parents.pop(parent_id, None)
@@ -157,7 +167,11 @@ class CfgCompanionTracker:
                 self._pending_parents.pop(pid)
                 self._failed_parents.discard(pid)
                 timed_out.append(pid)
-                logger.error("Parent %s timed out waiting for CFG companions (>%.0fs)", pid, self._timeout_s)
+                logger.error(
+                    "Parent %s timed out waiting for CFG companions (>%.0fs)",
+                    pid,
+                    self._timeout_s,
+                )
         return timed_out
 
     # -- Forward parent with CFG KV --
@@ -228,6 +242,8 @@ class CfgCompanionTracker:
                 "Configure a connector for this edge or inspect connector logs for details."
             )
 
-        logger.debug("Forwarded CFG-enabled request %s to stage-%d", req_id, next_stage_id)
+        logger.debug(
+            "Forwarded CFG-enabled request %s to stage-%d", req_id, next_stage_id
+        )
         remaining_by_stage[next_stage_id] += 1
         return True

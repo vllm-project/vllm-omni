@@ -27,7 +27,13 @@ _MODEL_COEFFICIENTS = {
     ],
     # Bagel transformer coefficients
     # Using Qwen's coefficients as reasonable default given shared architecture
-    "Bagel": [1.33313129e06, -1.68644226e05, 7.95050740e03, -1.63747873e02, 1.26352397e00],
+    "Bagel": [
+        1.33313129e06,
+        -1.68644226e05,
+        7.95050740e03,
+        -1.63747873e02,
+        1.26352397e00,
+    ],
     # Z-Image transformer coefficients
     # Copied from Qwen-Image, need to be tuned specifically for Z-Image in future
     "ZImageTransformer2DModel": [
@@ -69,7 +75,9 @@ class TeaCacheConfig:
     def __post_init__(self) -> None:
         """Validate and set default coefficients."""
         if self.rel_l1_thresh <= 0:
-            raise ValueError(f"rel_l1_thresh must be positive, got {self.rel_l1_thresh}")
+            raise ValueError(
+                f"rel_l1_thresh must be positive, got {self.rel_l1_thresh}"
+            )
 
         if self.coefficients is None:
             # Use model-specific coefficients, explicitly check if the type exists or not
@@ -81,4 +89,6 @@ class TeaCacheConfig:
             self.coefficients = _MODEL_COEFFICIENTS[self.transformer_type]
 
         if len(self.coefficients) != 5:
-            raise ValueError(f"coefficients must contain exactly 5 elements, got {len(self.coefficients)}")
+            raise ValueError(
+                f"coefficients must contain exactly 5 elements, got {len(self.coefficients)}"
+            )

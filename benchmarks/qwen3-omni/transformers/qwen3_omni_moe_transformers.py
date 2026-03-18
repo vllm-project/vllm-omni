@@ -65,8 +65,12 @@ def run_benchmark(
         ]
 
         # Preparation for inference
-        text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-        audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video)
+        text = processor.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=False
+        )
+        audios, images, videos = process_mm_info(
+            conversation, use_audio_in_video=use_audio_in_video
+        )
         inputs = processor(
             text=text,
             audio=audios,
@@ -80,7 +84,10 @@ def run_benchmark(
 
         # Inference: Generation of the output text and audio
         text_ids, audio = model.generate(
-            **inputs, speaker=speaker, thinker_return_dict_in_generate=True, use_audio_in_video=use_audio_in_video
+            **inputs,
+            speaker=speaker,
+            thinker_return_dict_in_generate=True,
+            use_audio_in_video=use_audio_in_video,
         )
 
         # Decode output text
@@ -134,7 +141,12 @@ def run_benchmark(
     # Save aggregated stats
     stats_path = os.path.join(output_dir, "perf_stats.json")
     with open(stats_path, "w", encoding="utf-8") as f:
-        json.dump({"aggregated": aggregated_stats, "per_prompt": all_stats}, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {"aggregated": aggregated_stats, "per_prompt": all_stats},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     # Count saved audio files
     num_audio_saved = sum(1 for a in audio_outputs if a is not None)
@@ -233,11 +245,23 @@ def main():
         help="Path to the prompts file (one prompt per line)",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="benchmark_results", help="Directory to save benchmark results"
+        "--output-dir",
+        type=str,
+        default="benchmark_results",
+        help="Directory to save benchmark results",
     )
-    parser.add_argument("--model-path", type=str, default=MODEL_PATH, help="Path to the model")
-    parser.add_argument("--speaker", type=str, default="Ethan", help="Speaker voice for audio output")
-    parser.add_argument("--num-prompts", type=int, default=None, help="Number of prompts to process (default: all)")
+    parser.add_argument(
+        "--model-path", type=str, default=MODEL_PATH, help="Path to the model"
+    )
+    parser.add_argument(
+        "--speaker", type=str, default="Ethan", help="Speaker voice for audio output"
+    )
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=None,
+        help="Number of prompts to process (default: all)",
+    )
     args = parser.parse_args()
 
     # Load model and processor

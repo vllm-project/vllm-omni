@@ -27,7 +27,9 @@ class OmniConnectorFactory:
     _registry: dict[str, Callable[[dict[str, Any]], OmniConnectorBase]] = {}
 
     @classmethod
-    def register_connector(cls, name: str, constructor: Callable[[dict[str, Any]], OmniConnectorBase]) -> None:
+    def register_connector(
+        cls, name: str, constructor: Callable[[dict[str, Any]], OmniConnectorBase]
+    ) -> None:
         """Register a connector constructor."""
         if name in cls._registry:
             raise ValueError(f"Connector '{name}' is already registered.")
@@ -38,7 +40,9 @@ class OmniConnectorFactory:
     def create_connector(cls, spec: ConnectorSpec) -> OmniConnectorBase:
         """Create a connector from specification."""
         if spec.name not in cls._registry:
-            raise ValueError(f"Unknown connector: {spec.name}. Available: {list(cls._registry.keys())}")
+            raise ValueError(
+                f"Unknown connector: {spec.name}. Available: {list(cls._registry.keys())}"
+            )
 
         constructor = cls._registry[spec.name]
         try:
@@ -64,7 +68,9 @@ def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBas
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors.mooncake_store_connector import MooncakeStoreConnector
+        from omni_connectors.connectors.mooncake_store_connector import (
+            MooncakeStoreConnector,
+        )
     return MooncakeStoreConnector(config)
 
 
@@ -91,21 +97,33 @@ def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return YuanrongConnector(config)
 
 
-def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
+def _create_mooncake_transfer_engine_connector(
+    config: dict[str, Any],
+) -> OmniConnectorBase:
     try:
-        from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
+        from .connectors.mooncake_transfer_engine_connector import (
+            MooncakeTransferEngineConnector,
+        )
     except ImportError:
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
+        from omni_connectors.connectors.mooncake_transfer_engine_connector import (
+            MooncakeTransferEngineConnector,
+        )
     return MooncakeTransferEngineConnector(config)
 
 
 # Register connectors
-OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
-OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
+OmniConnectorFactory.register_connector(
+    "MooncakeStoreConnector", _create_mooncake_store_connector
+)
+OmniConnectorFactory.register_connector(
+    "MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector
+)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
 # Backward-compatible aliases – will be removed in the future
-OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_store_connector)
+OmniConnectorFactory.register_connector(
+    "MooncakeConnector", _create_mooncake_store_connector
+)

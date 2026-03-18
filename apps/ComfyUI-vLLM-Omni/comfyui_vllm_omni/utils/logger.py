@@ -51,7 +51,9 @@ class OmitBase64PrettyPrinter(pprint.PrettyPrinter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def _format(self, obj: Any, stream, indent: int, allowance: int, context, level: int) -> None:
+    def _format(
+        self, obj: Any, stream, indent: int, allowance: int, context, level: int
+    ) -> None:
         # Check if this is a dict with redacted keys
         if isinstance(obj, dict):
             # Create a copy with redacted values
@@ -106,11 +108,15 @@ if __name__ == "__main__":
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAwAAAA"},
+                        "image_url": {
+                            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAwAAAA"
+                        },
                     },
                     {
                         "type": "audio_url",
-                        "audio_url": {"url": "data:audio/mpeg;base64,SUQzBAAAAAAAIlRTU0UAAAAOAAADT="},
+                        "audio_url": {
+                            "url": "data:audio/mpeg;base64,SUQzBAAAAAAAIlRTU0UAAAAOAAADT="
+                        },
                     },
                 ],
             },

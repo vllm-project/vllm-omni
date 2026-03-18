@@ -107,7 +107,9 @@ def initialize_ray_cluster(address: str | None = None):
         ray.init(address=address, ignore_reinit_error=True, runtime_env=runtime_env)
 
 
-def create_placement_group(number_of_stages: int, address: str | None = None, strategy: str = "PACK") -> PlacementGroup:
+def create_placement_group(
+    number_of_stages: int, address: str | None = None, strategy: str = "PACK"
+) -> PlacementGroup:
     """Create a placement group for the given number of stages.
     Args:
         number_of_stages: The number of stages to create the placement group for.
@@ -120,7 +122,9 @@ def create_placement_group(number_of_stages: int, address: str | None = None, st
 
     # Initialize Ray if not already initialized (using default args if needed)
     if not ray.is_initialized():
-        logger.warning("[Orchestrator] Ray is not initialized. Initializing with default settings.")
+        logger.warning(
+            "[Orchestrator] Ray is not initialized. Initializing with default settings."
+        )
         initialize_ray_cluster(address)
 
     bundles = [{"GPU": 1.0, "CPU": 1.0} for _ in range(number_of_stages)]
@@ -171,9 +175,13 @@ def start_ray_actor(
 
     worker_actor = OmniStageRayWorker.options(
         scheduling_strategy=PlacementGroupSchedulingStrategy(
-            placement_group=placement_group, placement_group_bundle_index=placement_group_bundle_index
+            placement_group=placement_group,
+            placement_group_bundle_index=placement_group_bundle_index,
         ),
-        runtime_env={"env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}, "CUDA_LAUNCH_BLOCKING": "1"},
+        runtime_env={
+            "env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")},
+            "CUDA_LAUNCH_BLOCKING": "1",
+        },
     ).remote()
 
     task_ref = worker_actor.run.remote(worker_entry_fn, *args, **kwargs)

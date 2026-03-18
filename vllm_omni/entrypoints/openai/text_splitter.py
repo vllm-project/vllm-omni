@@ -13,16 +13,10 @@ _MAX_BUFFER_SIZE = 100_000  # ~100 KB of text
 # Sentence-level: .!? + CJK sentence-ending 。！？
 # NOTE: English requires trailing whitespace to confirm a boundary —
 # end-of-string is NOT treated as a boundary (that is what flush() is for).
-SPLIT_SENTENCE = re.compile(
-    r"(?<=[.!?])\s+"
-    r"|(?<=[。！？])"
-)
+SPLIT_SENTENCE = re.compile(r"(?<=[.!?])\s+" r"|(?<=[。！？])")
 
 # Clause-level: adds CJK commas ， and semicolons ；
-SPLIT_CLAUSE = re.compile(
-    r"(?<=[.!?])\s+"
-    r"|(?<=[。！？，；])"
-)
+SPLIT_CLAUSE = re.compile(r"(?<=[.!?])\s+" r"|(?<=[。！？，；])")
 
 # Default alias
 _SENTENCE_BOUNDARY_RE = SPLIT_SENTENCE

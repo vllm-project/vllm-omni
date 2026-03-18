@@ -29,7 +29,9 @@ def _build_field_defs(
         if f.name in transforms:
             display_name, transform_fn = transforms[f.name]
             # Capture variables in closure to avoid late binding issues
-            result.append((display_name, lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n))))
+            result.append(
+                (display_name, lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n)))
+            )
         else:
             result.append((f.name, lambda e, n=f.name: getattr(e, n)))
     return result

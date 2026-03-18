@@ -74,7 +74,9 @@ def test_regex():
     ]
     for i, (line, should_match) in enumerate(test_cases):
         result = bool(PICKLE_RE.match(line))
-        assert result == should_match, f"Test case {i} failed: '{line}' (expected {should_match}, got {result})"
+        assert (
+            result == should_match
+        ), f"Test case {i} failed: '{line}' (expected {should_match}, got {result})"
     print("All regex tests passed.")
 
 

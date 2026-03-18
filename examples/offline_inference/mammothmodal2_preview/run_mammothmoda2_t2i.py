@@ -30,7 +30,9 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni import Omni
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -89,9 +91,18 @@ def load_t2i_generation_config(model_dir: str) -> T2IGenConfig:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run MammothModa2 T2I (AR -> DiT) with vLLM-Omni.")
-    p.add_argument("--model", type=str, required=True, help="Path to the model directory.")
-    p.add_argument("--stage-config", type=str, required=True, help="Path to the multi-stage YAML configuration.")
+    p = argparse.ArgumentParser(
+        description="Run MammothModa2 T2I (AR -> DiT) with vLLM-Omni."
+    )
+    p.add_argument(
+        "--model", type=str, required=True, help="Path to the model directory."
+    )
+    p.add_argument(
+        "--stage-config",
+        type=str,
+        required=True,
+        help="Path to the multi-stage YAML configuration.",
+    )
     p.add_argument(
         "--prompt",
         type=str,
@@ -102,11 +113,29 @@ def parse_args() -> argparse.Namespace:
             "to generate multiple images with shared height/width/CFG settings."
         ),
     )
-    p.add_argument("--height", type=int, default=1024, help="Output image height (must be a multiple of 16).")
-    p.add_argument("--width", type=int, default=1024, help="Output image width (must be a multiple of 16).")
-    p.add_argument("--num-inference-steps", type=int, default=50, help="Number of diffusion steps for the DiT stage.")
     p.add_argument(
-        "--text-guidance-scale", type=float, default=9.0, help="Classifier-Free Guidance (CFG) scale for DiT."
+        "--height",
+        type=int,
+        default=1024,
+        help="Output image height (must be a multiple of 16).",
+    )
+    p.add_argument(
+        "--width",
+        type=int,
+        default=1024,
+        help="Output image width (must be a multiple of 16).",
+    )
+    p.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=50,
+        help="Number of diffusion steps for the DiT stage.",
+    )
+    p.add_argument(
+        "--text-guidance-scale",
+        type=float,
+        default=9.0,
+        help="Classifier-Free Guidance (CFG) scale for DiT.",
     )
     p.add_argument(
         "--cfg-range",
@@ -115,8 +144,17 @@ def parse_args() -> argparse.Namespace:
         default=(0.0, 1.0),
         help="Relative step range [start, end] where CFG is active.",
     )
-    p.add_argument("--out", type=str, default="output.png", help="Path to save the generated image.")
-    p.add_argument("--trust-remote-code", action="store_true", help="Trust remote code when loading the model.")
+    p.add_argument(
+        "--out",
+        type=str,
+        default="output.png",
+        help="Path to save the generated image.",
+    )
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading the model.",
+    )
     args = p.parse_args()
     if not args.prompt:
         args.prompt = ["A stylish woman with sunglasses riding a motorcycle in NYC."]
@@ -187,9 +225,13 @@ def main() -> None:
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     if args.height <= 0 or args.width <= 0:
-        raise ValueError(f"Height and width must be positive, got {args.height}x{args.width}")
+        raise ValueError(
+            f"Height and width must be positive, got {args.height}x{args.width}"
+        )
     if args.height % _PATCH_SIZE != 0 or args.width % _PATCH_SIZE != 0:
-        raise ValueError(f"Height and width must be multiples of {_PATCH_SIZE}, got {args.height}x{args.width}")
+        raise ValueError(
+            f"Height and width must be multiples of {_PATCH_SIZE}, got {args.height}x{args.width}"
+        )
 
     ar_height = args.height // _PATCH_SIZE
     ar_width = args.width // _PATCH_SIZE
@@ -197,7 +239,11 @@ def main() -> None:
     expected_grid_tokens = ar_height * (ar_width + 1)
 
     logger.info("Initializing Omni pipeline...")
-    omni = Omni(model=args.model, stage_configs_path=args.stage_config, trust_remote_code=args.trust_remote_code)
+    omni = Omni(
+        model=args.model,
+        stage_configs_path=args.stage_config,
+        trust_remote_code=args.trust_remote_code,
+    )
     try:
         ar_sampling = SamplingParams(
             temperature=1.0,

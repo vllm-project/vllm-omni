@@ -158,7 +158,10 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
 
         # Check if we're in a subdirectory (vision_language_encoder)
         # and need to go to processor/ instead
-        if model_path.endswith("vision_language_encoder") or "/vision_language_encoder" in model_path:
+        if (
+            model_path.endswith("vision_language_encoder")
+            or "/vision_language_encoder" in model_path
+        ):
             # Go up one level and into processor/
             base_path = os.path.dirname(model_path.rstrip("/"))
             processor_path = os.path.join(base_path, "processor")
@@ -350,7 +353,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             # Text-to-image mode
             if processor is not None:
                 # Build messages format expected by processor
-                messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+                messages = [
+                    {"role": "user", "content": [{"type": "text", "text": prompt}]}
+                ]
 
                 # Use apply_chat_template which handles target dimensions
                 hf_inputs = processor.apply_chat_template(
@@ -394,7 +399,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             content.append({"type": "text", "text": clean_prompt})
             messages = [{"role": "user", "content": content}]
 
-            logger.debug(f"_call_hf_processor: calling apply_chat_template with {len(images)} images in content")
+            logger.debug(
+                f"_call_hf_processor: calling apply_chat_template with {len(images)} images in content"
+            )
 
             # Use apply_chat_template - processor will process images when they're in content
             hf_inputs = processor.apply_chat_template(
@@ -406,7 +413,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 return_tensors="pt",
             )
 
-            logger.debug(f"_call_hf_processor: apply_chat_template returned keys: {list(hf_inputs.keys())}")
+            logger.debug(
+                f"_call_hf_processor: apply_chat_template returned keys: {list(hf_inputs.keys())}"
+            )
 
             # IMPORTANT (i2i): vLLM multimodal encoder must see source-only grids
             # (matching pixel_values and number of images), but M-RoPE needs full
@@ -457,9 +466,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 logger.debug(f"_call_hf_processor: last 20 tokens: {ids_list[-20:]}")
 
                 # Find positions of image tokens
-                image_positions = [i for i, t in enumerate(ids_list) if t == image_token_id]
+                image_positions = [
+                    i for i, t in enumerate(ids_list) if t == image_token_id
+                ]
                 if image_positions:
-                    logger.debug(f"_call_hf_processor: image token positions (first 10): {image_positions[:10]}")
+                    logger.debug(
+                        f"_call_hf_processor: image token positions (first 10): {image_positions[:10]}"
+                    )
 
             return hf_inputs
         else:
@@ -518,7 +531,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         images = mm_items.get_items("image", ImageProcessorItems)
         image_list = [images.get(i) for i in range(images.get_count())]
 
-        logger.debug(f"_apply_hf_processor_mm_only: processing {len(image_list)} images directly")
+        logger.debug(
+            f"_apply_hf_processor_mm_only: processing {len(image_list)} images directly"
+        )
 
         # Process images directly with image processor
         image_inputs = image_processor(
@@ -592,7 +607,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
 
-        logger.debug(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
+        logger.debug(
+            f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}"
+        )
 
         if num_images == 0 or enable_hf_prompt_update:
             # t2i mode or normal flow - use parent implementation
@@ -606,7 +623,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         # i2i mode with enable_hf_prompt_update=False (cache miss scenario)
         # We need to build prompt_ids with image placeholders
-        logger.debug(f"_apply_hf_processor_main: i2i mode with enable_hf_prompt_update=False, num_images={num_images}")
+        logger.debug(
+            f"_apply_hf_processor_main: i2i mode with enable_hf_prompt_update=False, num_images={num_images}"
+        )
 
         # Get mm data from our overridden _apply_hf_processor_mm_only
         mm_processed_data = self._apply_hf_processor_mm_only(
@@ -620,7 +639,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         # Keep `image_grid_thw` source-only for MM batching/validation.
         try:
             source_grid_thw = mm_processed_data.get("image_grid_thw")
-            if source_grid_thw is not None and isinstance(source_grid_thw, torch.Tensor):
+            if source_grid_thw is not None and isinstance(
+                source_grid_thw, torch.Tensor
+            ):
                 # Compute target grid following HF GlmImageProcessor: factor=32.
                 # Prefer explicit target_h/target_w if present, otherwise fall back.
                 target_h = (
@@ -651,9 +672,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 target_w = (target_w // factor) * factor
                 token_h = target_h // factor
                 token_w = target_w // factor
-                target_grid = torch.tensor([[1, token_h, token_w]], dtype=source_grid_thw.dtype)
+                target_grid = torch.tensor(
+                    [[1, token_h, token_w]], dtype=source_grid_thw.dtype
+                )
 
-                mm_processed_data["mrope_image_grid_thw"] = torch.cat([source_grid_thw, target_grid], dim=0)
+                mm_processed_data["mrope_image_grid_thw"] = torch.cat(
+                    [source_grid_thw, target_grid], dim=0
+                )
         except Exception:
             # Best-effort only; M-RoPE has additional fallbacks.
             pass
@@ -700,7 +725,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 token_h = target_h // factor
                 token_w = target_w // factor
 
-                expanded_prompt = f"{prompt}{grid_bos}{token_h} {token_w}{grid_eos}{bos}"
+                expanded_prompt = (
+                    f"{prompt}{grid_bos}{token_h} {token_w}{grid_eos}{bos}"
+                )
                 text_ids = tokenizer.encode(expanded_prompt, add_special_tokens=False)
             except Exception:
                 text_ids = tokenizer.encode(prompt, add_special_tokens=False)
@@ -710,7 +737,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         # Prepend image placeholders - one per image
         prompt_ids = [image_token_id] * num_images + text_ids
 
-        logger.debug(f"_apply_hf_processor_main: built prompt_ids with {num_images} image placeholders")
+        logger.debug(
+            f"_apply_hf_processor_main: built prompt_ids with {num_images} image placeholders"
+        )
 
         # Return is_update_applied=False so _apply_prompt_updates will expand the placeholders
         return prompt_ids, mm_processed_data, False
@@ -747,7 +776,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 # Calculate grid sizes for source images
                 image_grid_sizes = image_grid_thw.prod(-1)
 
-                result["pixel_values"] = MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes)
+                result["pixel_values"] = MultiModalFieldConfig.flat_from_sizes(
+                    "image", image_grid_sizes
+                )
 
                 # Register image_grid_thw - it's been sliced in _call_hf_processor
                 # to only include source image grids, so batching will work correctly
@@ -824,8 +855,12 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         # Debug: log mm_items info
         logger.debug(f"_get_prompt_updates: image_token_id={image_token_id}")
-        logger.debug(f"_get_prompt_updates: mm_items modalities={list(mm_items.get_all_counts().keys())}")
-        logger.debug(f"_get_prompt_updates: mm_items counts={mm_items.get_all_counts()}")
+        logger.debug(
+            f"_get_prompt_updates: mm_items modalities={list(mm_items.get_all_counts().keys())}"
+        )
+        logger.debug(
+            f"_get_prompt_updates: mm_items counts={mm_items.get_all_counts()}"
+        )
         logger.debug(
             f"_get_prompt_updates: out_mm_kwargs key={list(out_mm_kwargs.get_data().keys()) if out_mm_kwargs else None}"
         )
@@ -834,7 +869,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         num_images = mm_items.get_count("image", strict=False)
         if num_images == 0:
             # t2i mode: no images, no prompt updates needed
-            logger.debug("_get_prompt_updates: no images, returning empty list (t2i mode)")
+            logger.debug(
+                "_get_prompt_updates: no images, returning empty list (t2i mode)"
+            )
             return []
 
         def get_replacement_glm_image(item_idx: int) -> list[int]:
@@ -860,19 +897,15 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                     num_tokens = int(grid_data.prod().item())
                 else:
                     num_tokens = int(grid_data[0] * grid_data[1] * grid_data[2])
-                logger.debug(
-                    f"get_replacement_glm_image: item_idx={item_idx}, \
+                logger.debug(f"get_replacement_glm_image: item_idx={item_idx}, \
                         grid={grid_data.tolist() if isinstance(grid_data, torch.Tensor) else grid_data},\
-                              num_tokens={num_tokens}"
-                )
+                              num_tokens={num_tokens}")
             else:
                 # Fallback: use default 1024x1024 grid size
                 # (1024/16) * (1024/16) = 64 * 64 = 4096 tokens
                 num_tokens = 64 * 64
-                logger.warning(
-                    f"get_replacement_glm_image: item_idx={item_idx}, \
-                    no grid_thw found, using default num_tokens={num_tokens}"
-                )
+                logger.warning(f"get_replacement_glm_image: item_idx={item_idx}, \
+                    no grid_thw found, using default num_tokens={num_tokens}")
 
             return [image_token_id] * num_tokens
 
@@ -944,7 +977,9 @@ class GlmImageVQVAEVectorQuantizer(nn.Module):
         batch_size, channels, height, width = hidden_state.shape
 
         # Permute to (batch, height, width, channels) and flatten for processing
-        hidden_state_flat = hidden_state.permute(0, 2, 3, 1).reshape(-1, self.embedding_dim)
+        hidden_state_flat = hidden_state.permute(0, 2, 3, 1).reshape(
+            -1, self.embedding_dim
+        )
 
         # L2 normalize both hidden states and embeddings
         # This is the key difference from Chameleon's implementation
@@ -967,7 +1002,9 @@ class GlmImageVQVAEVectorQuantizer(nn.Module):
         # Reshape back to (batch, height, width, channels)
         # then (batch, channels, height, width)
         hidden_state_quant = (
-            hidden_state_quant.view(batch_size, height, width, self.embedding_dim).permute(0, 3, 1, 2).contiguous()
+            hidden_state_quant.view(batch_size, height, width, self.embedding_dim)
+            .permute(0, 3, 1, 2)
+            .contiguous()
         )
 
         return hidden_state_quant, min_encoding_indices
@@ -1072,7 +1109,11 @@ class GlmImageVisionMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data" if multimodal_config else False
+        use_data_parallel = (
+            multimodal_config.mm_encoder_tp_mode == "data"
+            if multimodal_config
+            else False
+        )
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
@@ -1116,8 +1157,14 @@ class GlmImageVisionAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data" if multimodal_config else False
-        self.tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        use_data_parallel = (
+            multimodal_config.mm_encoder_tp_mode == "data"
+            if multimodal_config
+            else False
+        )
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_heads
@@ -1226,9 +1273,13 @@ class GlmImageVisionPatchEmbed(nn.Module):
         """
         target_dtype = self.proj.weight.dtype
         # Reshape from [N, C*P*P] to [N, C, P, P]
-        hidden_states = hidden_states.view(-1, self.in_channels, self.patch_size, self.patch_size)
+        hidden_states = hidden_states.view(
+            -1, self.in_channels, self.patch_size, self.patch_size
+        )
         # Conv2d and flatten: [N, C, P, P] -> [N, embed_dim, 1, 1] -> [N, embed_dim]
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
+        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
+            -1, self.embed_dim
+        )
         return hidden_states
 
 
@@ -1285,13 +1336,17 @@ class GlmImageVisionEmbeddings(nn.Module):
 
         # Handle empty sequence case
         if total_seq == 0:
-            adapted_pos_embed = torch.empty(0, hidden_size, device=device, dtype=pos_embed_weight.dtype)
+            adapted_pos_embed = torch.empty(
+                0, hidden_size, device=device, dtype=pos_embed_weight.dtype
+            )
         else:
             # Convert to tensors if needed
             if isinstance(lengths, list):
                 lengths = torch.tensor(lengths, device=device, dtype=torch.long)
             if not isinstance(image_shapes, torch.Tensor):
-                image_shapes = torch.tensor(image_shapes, device=device, dtype=torch.long)
+                image_shapes = torch.tensor(
+                    image_shapes, device=device, dtype=torch.long
+                )
 
             # Prepare 2D position embedding for interpolation
             orig_size_sq = pos_embed_weight.shape[0]
@@ -1304,12 +1359,12 @@ class GlmImageVisionEmbeddings(nn.Module):
             )
 
             # Calculate target dimensions for each patch
-            target_h = torch.cat([image_shapes[i, 1].repeat(lengths[i]) for i in range(len(lengths))]).to(
-                device=device, dtype=torch.float32
-            )
-            target_w = torch.cat([image_shapes[i, 2].repeat(lengths[i]) for i in range(len(lengths))]).to(
-                device=device, dtype=torch.float32
-            )
+            target_h = torch.cat(
+                [image_shapes[i, 1].repeat(lengths[i]) for i in range(len(lengths))]
+            ).to(device=device, dtype=torch.float32)
+            target_w = torch.cat(
+                [image_shapes[i, 2].repeat(lengths[i]) for i in range(len(lengths))]
+            ).to(device=device, dtype=torch.float32)
 
             # Normalize coordinates to [-1, 1] for grid_sample
             h_coords = h_coords.to(device=device, dtype=torch.float32)
@@ -1330,7 +1385,9 @@ class GlmImageVisionEmbeddings(nn.Module):
             )
 
             # Reshape: [1, C, total_seq, 1] -> [total_seq, C]
-            adapted_pos_embed = (interpolated_embed.squeeze(0).squeeze(-1).permute(1, 0)).to(pos_embed_weight.dtype)
+            adapted_pos_embed = (
+                interpolated_embed.squeeze(0).squeeze(-1).permute(1, 0)
+            ).to(pos_embed_weight.dtype)
 
         # Add position embedding to patch embeddings
         embeddings = embeddings + adapted_pos_embed.to(embeddings.device)
@@ -1534,9 +1591,9 @@ class GlmImageVisionModel(nn.Module):
         position_ids = self.compute_position_ids(grid_thw)
 
         # Compute cumulative sequence lengths for attention
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0, dtype=torch.int32
-        )
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         cu_seqlens = cu_seqlens.to(self.device)
 
@@ -1658,7 +1715,13 @@ class GlmImageRotaryEmbedding(nn.Module):
 
         # Compute inverse frequencies
         # inv_freq shape: [rotary_dim // 2]
-        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
+        inv_freq = 1.0 / (
+            rope_theta
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+                / self.rotary_dim
+            )
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _apply_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
@@ -1741,8 +1804,12 @@ class GlmImageRotaryEmbedding(nn.Module):
 
         # Compute frequencies using broadcasting (equivalent to matmul in reference)
         positions_expanded = positions_3d.unsqueeze(-1).float()  # [3, num_tokens, 1]
-        inv_freq_expanded = inv_freq.unsqueeze(0).unsqueeze(0)  # [1, 1, rotary_dim // 2]
-        freqs = positions_expanded * inv_freq_expanded  # [3, num_tokens, rotary_dim // 2]
+        inv_freq_expanded = inv_freq.unsqueeze(0).unsqueeze(
+            0
+        )  # [1, 1, rotary_dim // 2]
+        freqs = (
+            positions_expanded * inv_freq_expanded
+        )  # [3, num_tokens, rotary_dim // 2]
 
         # Apply M-RoPE interleaving
         # This selects different frequency dims from different position dims
@@ -1836,7 +1903,9 @@ class GlmImageTextAttention(nn.Module):
 
         if rope_parameters is not None:
             rope_theta = rope_parameters.get("rope_theta", rope_theta)
-            partial_rotary_factor = rope_parameters.get("partial_rotary_factor", partial_rotary_factor)
+            partial_rotary_factor = rope_parameters.get(
+                "partial_rotary_factor", partial_rotary_factor
+            )
             mrope_section = rope_parameters.get("mrope_section", mrope_section)
 
         self.rotary_emb = GlmImageRotaryEmbedding(
@@ -1898,7 +1967,9 @@ class GlmImageTextDecoderLayer(nn.Module):
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=getattr(config, "num_key_value_heads", config.num_attention_heads),
+            num_kv_heads=getattr(
+                config, "num_key_value_heads", config.num_attention_heads
+            ),
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             bias=attention_bias,
@@ -1915,8 +1986,12 @@ class GlmImageTextDecoderLayer(nn.Module):
 
         # GLM-Image uses 4 RMSNorm layers per decoder layer
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_self_attn_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_self_attn_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -2039,7 +2114,9 @@ class GlmImageTextModel(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -2101,7 +2178,9 @@ class GlmImageModel(nn.Module):
         self.image_start_token_id = config.image_start_token_id
         self.image_end_token_id = config.image_end_token_id
 
-        self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.language_model.get_input_embeddings()
@@ -2233,7 +2312,9 @@ class GlmImageModel(nn.Module):
                 # Reshape to 2D grid
                 tokens_2d = tokens.view(1, 1, grid_h, grid_w)
                 # Upsample by 2x (nearest neighbor)
-                tokens_upsampled = F.interpolate(tokens_2d.float(), scale_factor=2, mode="nearest").to(dtype=torch.long)
+                tokens_upsampled = F.interpolate(
+                    tokens_2d.float(), scale_factor=2, mode="nearest"
+                ).to(dtype=torch.long)
                 upsampled_token_ids.append(tokens_upsampled.view(-1))
 
             prior_token_image_ids_info = {
@@ -2278,7 +2359,9 @@ class GlmImageModel(nn.Module):
     info=GlmImageProcessingInfo,
     dummy_inputs=GlmImageDummyInputsBuilder,
 )
-class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
+class GlmImageForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE
+):
     """
     GLM-Image model for conditional image generation.
 
@@ -2354,7 +2437,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             soft_cap=None,
         )
 
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
         # Cache for prior_token_image_ids computed in embed_multimodal
         # This is needed because vLLM's multimodal flow calls embed_multimodal first,
@@ -2441,9 +2526,13 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             # Reshape to 2D grid
             tokens_2d = tokens.view(1, 1, grid_h, grid_w)
             # Upsample by 2x (nearest neighbor)
-            tokens_upsampled = F.interpolate(tokens_2d.float(), scale_factor=2, mode="nearest").to(dtype=torch.long)
+            tokens_upsampled = F.interpolate(
+                tokens_2d.float(), scale_factor=2, mode="nearest"
+            ).to(dtype=torch.long)
             # Keep as CPU tensor for proper serialization through pooling_output
-            upsampled_token_ids.append(tokens_upsampled.view(-1).detach().cpu().contiguous())
+            upsampled_token_ids.append(
+                tokens_upsampled.view(-1).detach().cpu().contiguous()
+            )
 
         # Note: We only include prior_token_image_ids in the info dict.
         # image_grid_thw is NOT included because:
@@ -2490,7 +2579,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         image_grid_thw = kwargs.get("image_grid_thw")
 
         # Debug: log what we found
-        logger.debug(f"pixel_values type: {type(pixel_values)}, image_grid_thw type: {type(image_grid_thw)}")
+        logger.debug(
+            f"pixel_values type: {type(pixel_values)}, image_grid_thw type: {type(image_grid_thw)}"
+        )
 
         if pixel_values is None and image_embeds is None:
             # No image inputs
@@ -2601,8 +2692,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                             # Assume first two tokens are H and W values
                             # This is a heuristic - actual values depend on tokenizer
                             # For GLM-Image with ChatGLM tokenizer, numbers are tokenized specially
-                            h = grid_tokens[0] if grid_tokens[0] < 256 else 32  # fallback
-                            w = grid_tokens[1] if grid_tokens[1] < 256 else 32  # fallback
+                            h = (
+                                grid_tokens[0] if grid_tokens[0] < 256 else 32
+                            )  # fallback
+                            w = (
+                                grid_tokens[1] if grid_tokens[1] < 256 else 32
+                            )  # fallback
                             grids.append([1, h, w])
 
                     i = j + 1
@@ -2641,8 +2736,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             Tuple of (position_ids [3, total_len], mrope_position_delta)
         """
         hf_config = self.config
-        image_token_id = hf_config.image_token_id  # 167855, repeated for each image patch
-        image_start_token_id = hf_config.image_start_token_id  # 16384, marks image start / generation bos
+        image_token_id = (
+            hf_config.image_token_id
+        )  # 167855, repeated for each image patch
+        image_start_token_id = (
+            hf_config.image_start_token_id
+        )  # 16384, marks image start / generation bos
         image_end_token_id = hf_config.image_end_token_id  # 16385, marks image end
 
         # Prefer full grids preserved by the processor for M-RoPE.
@@ -2657,8 +2756,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         # Fallback: get image_grid_thw from mm_features (usually source-only grids).
         if image_grid_thw is None and mm_features is not None:
-            feature_kwargs = MultiModalFeatureSpec.gather_kwargs(mm_features, {"image_grid_thw"})
-            image_grid_thw = [item.tolist() for item in feature_kwargs.get("image_grid_thw", [])]
+            feature_kwargs = MultiModalFeatureSpec.gather_kwargs(
+                mm_features, {"image_grid_thw"}
+            )
+            image_grid_thw = [
+                item.tolist() for item in feature_kwargs.get("image_grid_thw", [])
+            ]
 
         if image_grid_thw is None:
             image_grid_thw = []
@@ -2677,13 +2780,17 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # Check if this is a text-to-image request:
                 # - Prompt ends with image_start_token_id (16384, the <bos> token for image generation)
                 # - No image_end_token_id (16385) in prompt (no completed images)
-                prompt_ends_with_start = len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
+                prompt_ends_with_start = (
+                    len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
+                )
                 has_end_token = image_end_token_id in input_tokens
 
                 # Text-to-image: ends with start token but no end token
                 if prompt_ends_with_start and not has_end_token:
                     # Parse grid dimensions from prompt tokens
-                    image_grid_thw = self._parse_grid_from_tokens(input_tokens, hf_config)
+                    image_grid_thw = self._parse_grid_from_tokens(
+                        input_tokens, hf_config
+                    )
                     if not image_grid_thw:
                         # Fallback to default 1024x1024 grids if parsing fails
                         image_grid_thw = [[1, 32, 32], [1, 16, 16]]
@@ -2694,7 +2801,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Find image boundaries using image_start_token_id and image_end_token_id
         # This follows the reference implementation in modeling_glm_image.py get_rope_index()
         image_end_positions = torch.where(input_tokens_tensor == image_end_token_id)[0]
-        image_start_positions = torch.where(input_tokens_tensor == image_start_token_id)[0]
+        image_start_positions = torch.where(
+            input_tokens_tensor == image_start_token_id
+        )[0]
 
         logger.debug(
             f"get_mrope_input_positions: seq_len={seq_len}, "
@@ -2707,10 +2816,17 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         valid_start_positions = []
         for start_pos in image_start_positions:
             # Check if there's a token after this start and it's an image token
-            if start_pos + 1 < seq_len and input_tokens[start_pos + 1] == image_token_id:
-                valid_start_positions.append(start_pos.item() + 1)  # +1 to skip the start marker
+            if (
+                start_pos + 1 < seq_len
+                and input_tokens[start_pos + 1] == image_token_id
+            ):
+                valid_start_positions.append(
+                    start_pos.item() + 1
+                )  # +1 to skip the start marker
 
-        logger.debug(f"get_mrope_input_positions: valid_start_positions={valid_start_positions}")
+        logger.debug(
+            f"get_mrope_input_positions: valid_start_positions={valid_start_positions}"
+        )
 
         # Pair starts with ends to find complete image regions
         num_complete_images = min(len(valid_start_positions), len(image_end_positions))
@@ -2720,8 +2836,14 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         # For i2i mode: image_grid_thw may only contain source image grids
         # We need to add generation target grids for proper M-RoPE position calculation
-        prompt_ends_with_start = len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
-        if prompt_ends_with_start and len(image_grid_thw) == num_source_images and num_source_images > 0:
+        prompt_ends_with_start = (
+            len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
+        )
+        if (
+            prompt_ends_with_start
+            and len(image_grid_thw) == num_source_images
+            and num_source_images > 0
+        ):
             # i2i mode: source grids exist but no target grids
             # Parse target grids from prompt tokens or use defaults
             parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)
@@ -2729,7 +2851,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # parsed_grids contains all grids mentioned in prompt
                 # For i2i, add only the generation target grids
                 if len(parsed_grids) > num_source_images:
-                    image_grid_thw = list(image_grid_thw) + parsed_grids[num_source_images:]
+                    image_grid_thw = (
+                        list(image_grid_thw) + parsed_grids[num_source_images:]
+                    )
                 else:
                     # Fallback: add default 1024x1024 generation grids (1 target for i2i)
                     image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
@@ -2787,10 +2911,14 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # Text tokens before this image (from prev_image_end to start)
                 # Note: start points to first image token, so text is [prev_image_end, start)
                 text_length = start - prev_image_end
-                logger.debug(f"get_mrope_input_positions: text_length={text_length} (from {prev_image_end} to {start})")
+                logger.debug(
+                    f"get_mrope_input_positions: text_length={text_length} (from {prev_image_end} to {start})"
+                )
                 if text_length > 0:
                     # Text tokens get sequential 1D positions
-                    text_positions = torch.arange(current_pos, current_pos + text_length, dtype=torch.long)
+                    text_positions = torch.arange(
+                        current_pos, current_pos + text_length, dtype=torch.long
+                    )
                     text_pos_3d = text_positions.unsqueeze(0).expand(3, -1)
                     llm_pos_ids_list.append(text_pos_3d)
                     current_pos += text_length
@@ -2803,31 +2931,43 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # - width: cycles [current_pos, ..., current_pos+w-1] repeated h times
 
                 # Temporal: all tokens have same position
-                position_temporal = torch.full((actual_image_tokens,), current_pos, dtype=torch.long)
+                position_temporal = torch.full(
+                    (actual_image_tokens,), current_pos, dtype=torch.long
+                )
 
                 # Height: repeat_interleave pattern (clip to actual_image_tokens)
-                position_height = torch.arange(current_pos, current_pos + h, dtype=torch.long).repeat_interleave(w)
+                position_height = torch.arange(
+                    current_pos, current_pos + h, dtype=torch.long
+                ).repeat_interleave(w)
                 if len(position_height) != actual_image_tokens:
                     position_height = (
                         position_height[:actual_image_tokens]
                         if len(position_height) > actual_image_tokens
                         else F.pad(
-                            position_height, (0, actual_image_tokens - len(position_height)), value=current_pos + h - 1
+                            position_height,
+                            (0, actual_image_tokens - len(position_height)),
+                            value=current_pos + h - 1,
                         )
                     )
 
                 # Width: repeat pattern (clip to actual_image_tokens)
-                position_width = torch.arange(current_pos, current_pos + w, dtype=torch.long).repeat(h)
+                position_width = torch.arange(
+                    current_pos, current_pos + w, dtype=torch.long
+                ).repeat(h)
                 if len(position_width) != actual_image_tokens:
                     position_width = (
                         position_width[:actual_image_tokens]
                         if len(position_width) > actual_image_tokens
                         else F.pad(
-                            position_width, (0, actual_image_tokens - len(position_width)), value=current_pos + w - 1
+                            position_width,
+                            (0, actual_image_tokens - len(position_width)),
+                            value=current_pos + w - 1,
                         )
                     )
 
-                vision_position_ids = torch.stack([position_temporal, position_height, position_width], dim=0)
+                vision_position_ids = torch.stack(
+                    [position_temporal, position_height, position_width], dim=0
+                )
                 llm_pos_ids_list.append(vision_position_ids)
 
                 # Advance position by max(h, w) to maintain spatial coherence
@@ -2844,7 +2984,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 f"(seq_len={seq_len} - prev_image_end={prev_image_end})"
             )
             if remaining_length > 0:
-                text_positions = torch.arange(current_pos, current_pos + remaining_length, dtype=torch.long)
+                text_positions = torch.arange(
+                    current_pos, current_pos + remaining_length, dtype=torch.long
+                )
                 text_pos_3d = text_positions.unsqueeze(0).expand(3, -1)
                 llm_pos_ids_list.append(text_pos_3d)
                 current_pos += remaining_length
@@ -2875,15 +3017,27 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                     total_tokens = h * w
 
                     # Build 2D positions following reference implementation
-                    position_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
-                    position_height = torch.arange(decode_pos, decode_pos + h, dtype=torch.long).repeat_interleave(w)
-                    position_width = torch.arange(decode_pos, decode_pos + w, dtype=torch.long).repeat(h)
+                    position_temporal = torch.full(
+                        (total_tokens,), decode_pos, dtype=torch.long
+                    )
+                    position_height = torch.arange(
+                        decode_pos, decode_pos + h, dtype=torch.long
+                    ).repeat_interleave(w)
+                    position_width = torch.arange(
+                        decode_pos, decode_pos + w, dtype=torch.long
+                    ).repeat(h)
 
-                    decode_pos_lists.append(torch.stack([position_temporal, position_height, position_width], dim=0))
+                    decode_pos_lists.append(
+                        torch.stack(
+                            [position_temporal, position_height, position_width], dim=0
+                        )
+                    )
                     decode_pos += max(h, w)
 
                 # Add position for EOS token
-                decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))
+                decode_pos_lists.append(
+                    torch.tensor([[decode_pos], [decode_pos], [decode_pos]])
+                )
 
                 decode_positions = torch.cat(decode_pos_lists, dim=1)
 
@@ -2898,7 +3052,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             current_pos = 0
 
             # All prefill tokens get sequential 1D positions
-            prefill_positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(3, -1)
+            prefill_positions = (
+                torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(3, -1)
+            )
             current_pos = seq_len
 
             # Pre-compute decode positions for all grids (all for generation)
@@ -2916,15 +3072,27 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 total_tokens = h * w
 
                 # Build 2D positions following reference implementation
-                position_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
-                position_height = torch.arange(decode_pos, decode_pos + h, dtype=torch.long).repeat_interleave(w)
-                position_width = torch.arange(decode_pos, decode_pos + w, dtype=torch.long).repeat(h)
+                position_temporal = torch.full(
+                    (total_tokens,), decode_pos, dtype=torch.long
+                )
+                position_height = torch.arange(
+                    decode_pos, decode_pos + h, dtype=torch.long
+                ).repeat_interleave(w)
+                position_width = torch.arange(
+                    decode_pos, decode_pos + w, dtype=torch.long
+                ).repeat(h)
 
-                decode_pos_lists.append(torch.stack([position_temporal, position_height, position_width], dim=0))
+                decode_pos_lists.append(
+                    torch.stack(
+                        [position_temporal, position_height, position_width], dim=0
+                    )
+                )
                 decode_pos += max(h, w)
 
             # Add position for EOS token
-            decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))
+            decode_pos_lists.append(
+                torch.tensor([[decode_pos], [decode_pos], [decode_pos]])
+            )
 
             decode_positions = torch.cat(decode_pos_lists, dim=1)
 
@@ -3011,7 +3179,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             # Retrieve cached prior_token_info from embed_multimodal
             multimodal_outputs = self._prior_token_cache
             self._prior_token_cache = None  # Clear after use
-            logger.debug("forward: got prior_token_info from cache (embed_multimodal path)")
+            logger.debug(
+                "forward: got prior_token_info from cache (embed_multimodal path)"
+            )
 
         return OmniOutput(
             text_hidden_states=hidden_states,

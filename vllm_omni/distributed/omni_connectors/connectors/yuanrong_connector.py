@@ -30,7 +30,9 @@ class YuanrongConnector(OmniConnectorBase):
         self.client = None
         self.set_param = SetParam()
         self.set_param.write_mode = WriteMode.NONE_L2_CACHE_EVICT
-        self.get_sub_timeout_ms = max(0, int(self.config.get("get_sub_timeout_ms", 1000)))
+        self.get_sub_timeout_ms = max(
+            0, int(self.config.get("get_sub_timeout_ms", 1000))
+        )
 
         self._metrics = {
             "puts": 0,
@@ -59,7 +61,9 @@ class YuanrongConnector(OmniConnectorBase):
             logger.error("Failed to initialize Datasystem client: %s", e)
             raise
 
-    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+    def put(
+        self, from_stage: str, to_stage: str, put_key: str, data: Any
+    ) -> tuple[bool, int, dict[str, Any] | None]:
         if not self.client:
             logger.error("Datasystem client not initialized")
             return False, 0, None
@@ -87,7 +91,11 @@ class YuanrongConnector(OmniConnectorBase):
             return False, 0, None
 
     def get(
-        self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
         if not self.client:
             logger.error("Datasystem client not initialized")
@@ -126,7 +134,12 @@ class YuanrongConnector(OmniConnectorBase):
         if not self.client:
             return {"status": "unhealthy", "error": "Datasystem client not initialized"}
 
-        return {"status": "healthy", "host": self.host, "port": self.port, **self._metrics}
+        return {
+            "status": "healthy",
+            "host": self.host,
+            "port": self.port,
+            **self._metrics,
+        }
 
     def close(self) -> None:
         if not self.client:

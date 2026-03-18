@@ -11,10 +11,17 @@ from diffusers.models.embeddings import (
     get_1d_rotary_pos_embed,
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from diffusers.models.normalization import (
+    AdaLayerNormContinuous,
+    AdaLayerNormZero,
+    AdaLayerNormZeroSingle,
+)
 from diffusers.utils import is_torch_npu_available
 from torch import nn
-from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -74,13 +81,17 @@ class FeedForward(nn.Module):
     ) -> None:
         super().__init__()
 
-        assert activation_fn == "gelu-approximate", "Only gelu-approximate is supported."
+        assert (
+            activation_fn == "gelu-approximate"
+        ), "Only gelu-approximate is supported."
 
         inner_dim = inner_dim or int(dim * mult)
         dim_out = dim_out or dim
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config),
+            ColumnParallelApproxGELU(
+                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config
+            ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
                 inner_dim,
@@ -213,9 +224,13 @@ class FluxAttention(torch.nn.Module):
                 [add_q_size, add_kv_size, add_kv_size], dim=-1
             )
 
-            encoder_query = encoder_query.unflatten(-1, (self.add_kv_proj.num_heads, -1))
+            encoder_query = encoder_query.unflatten(
+                -1, (self.add_kv_proj.num_heads, -1)
+            )
             encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
+            encoder_value = encoder_value.unflatten(
+                -1, (self.add_kv_proj.num_kv_heads, -1)
+            )
 
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
@@ -224,7 +239,9 @@ class FluxAttention(torch.nn.Module):
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
 
-        query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
+        query, key = apply_rope_to_qk(
+            self.rope, query, key, image_rotary_emb
+        )  # [S, D/2]
 
         hidden_states = self.attn(
             query,
@@ -236,7 +253,11 @@ class FluxAttention(torch.nn.Module):
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+                [
+                    encoder_hidden_states.shape[1],
+                    hidden_states.shape[1] - encoder_hidden_states.shape[1],
+                ],
+                dim=1,
             )
             hidden_states = self.to_out[0](hidden_states)
             hidden_states = self.to_out[1](hidden_states)
@@ -291,10 +312,12 @@ class FluxTransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
+        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+            hidden_states, emb=temb
+        )
 
-        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-            encoder_hidden_states, emb=temb
+        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = (
+            self.norm1_context(encoder_hidden_states, emb=temb)
         )
         joint_attention_kwargs = joint_attention_kwargs or {}
 
@@ -316,7 +339,9 @@ class FluxTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm_hidden_states = (
+            norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        )
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -330,10 +355,15 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+        norm_encoder_hidden_states = (
+            norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
+            + c_shift_mlp[:, None]
+        )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        encoder_hidden_states = (
+            encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
@@ -354,11 +384,19 @@ class FluxSingleTransformerBlock(nn.Module):
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = ReplicatedLinear(
-            dim, self.mlp_hidden_dim, bias=True, return_bias=False, quant_config=quant_config
+            dim,
+            self.mlp_hidden_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
         )
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = ReplicatedLinear(
-            dim + self.mlp_hidden_dim, dim, bias=True, return_bias=False, quant_config=quant_config
+            dim + self.mlp_hidden_dim,
+            dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
         )
 
         self.attn = FluxAttention(
@@ -400,7 +438,10 @@ class FluxSingleTransformerBlock(nn.Module):
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
-        encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+        encoder_hidden_states, hidden_states = (
+            hidden_states[:, :text_seq_len],
+            hidden_states[:, text_seq_len:],
+        )
         return encoder_hidden_states, hidden_states
 
 
@@ -473,7 +514,9 @@ class FluxTransformer2DModel(nn.Module):
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
-        return ("transformer_blocks" in name or "single_transformer_blocks" in name) and name.split(".")[-1].isdigit()
+        return (
+            "transformer_blocks" in name or "single_transformer_blocks" in name
+        ) and name.split(".")[-1].isdigit()
 
     _hsdp_shard_conditions = [_is_transformer_block]
     packed_modules_mapping = {
@@ -508,7 +551,9 @@ class FluxTransformer2DModel(nn.Module):
 
         self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
         text_time_guidance_cls = (
-            CombinedTimestepGuidanceTextProjEmbeddings if guidance_embeds else CombinedTimestepTextProjEmbeddings
+            CombinedTimestepGuidanceTextProjEmbeddings
+            if guidance_embeds
+            else CombinedTimestepTextProjEmbeddings
         )
         self.time_text_embed = text_time_guidance_cls(
             embedding_dim=self.inner_dim, pooled_projection_dim=pooled_projection_dim
@@ -541,8 +586,12 @@ class FluxTransformer2DModel(nn.Module):
             ]
         )
 
-        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+        self.norm_out = AdaLayerNormContinuous(
+            self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
+        )
+        self.proj_out = nn.Linear(
+            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
+        )
 
     def forward(
         self,
@@ -588,10 +637,15 @@ class FluxTransformer2DModel(nn.Module):
         """
 
         hidden_states = self.x_embedder(hidden_states)
-        timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
+        timestep = (
+            timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
+        )
 
         if guidance is not None:
-            guidance = guidance.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
+            guidance = (
+                guidance.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                * 1000
+            )
 
         temb = (
             self.time_text_embed(timestep, pooled_projections)

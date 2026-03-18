@@ -39,14 +39,30 @@ def get_cuda_graph_config():
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
 if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
+    stage_configs = [
+        str(
+            Path(__file__).parent.parent
+            / "stage_configs"
+            / "rocm"
+            / "qwen3_omni_ci.yaml"
+        )
+    ]
 elif current_omni_platform.is_xpu():
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
+    stage_configs = [
+        str(
+            Path(__file__).parent.parent
+            / "stage_configs"
+            / "xpu"
+            / "qwen3_omni_ci.yaml"
+        )
+    ]
 else:
     stage_configs = [get_cuda_graph_config()]
 
 # Create parameter combinations for model and stage config
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+test_params = [
+    (model, stage_config) for model in models for stage_config in stage_configs
+]
 
 
 def get_question(prompt_type="video"):
@@ -64,7 +80,11 @@ def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
     """Test processing video, generating audio output."""
     video = generate_synthetic_video(224, 224, 300)["np_array"]
 
-    request_config = {"prompts": get_question(), "videos": video, "modalities": ["audio"]}
+    request_config = {
+        "prompts": get_question(),
+        "videos": video,
+        "modalities": ["audio"],
+    }
 
     # Test single completion
     omni_runner_handler.send_request(request_config)

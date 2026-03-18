@@ -80,8 +80,16 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
     def pre_process_func(request: OmniDiffusionRequest):
         """Pre-process condition images for Image Edit mode."""
         for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            multi_modal_data = (
+                prompt.get("multi_modal_data", {})
+                if not isinstance(prompt, str)
+                else None
+            )
+            raw_image = (
+                multi_modal_data.get("image", None)
+                if multi_modal_data is not None
+                else None
+            )
             if isinstance(prompt, str):
                 prompt = OmniTextPrompt(prompt=prompt)
             if "additional_information" not in prompt:
@@ -94,7 +102,11 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
             if not isinstance(raw_image, list):
                 raw_image = [raw_image]
             images = [
-                PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
+                (
+                    PIL.Image.open(im)
+                    if isinstance(im, str)
+                    else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
+                )
                 for im in raw_image
             ]
 
@@ -183,8 +195,12 @@ def retrieve_timesteps(
     Calls the scheduler's `set_timesteps` method and retrieves timesteps.
     Handles custom timesteps and sigmas schedules.
     """
-    accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-    accepts_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+    accepts_timesteps = "timesteps" in set(
+        inspect.signature(scheduler.set_timesteps).parameters.keys()
+    )
+    accepts_sigmas = "sigmas" in set(
+        inspect.signature(scheduler.set_timesteps).parameters.keys()
+    )
 
     if timesteps is not None and sigmas is not None:
         # Both provided - check if scheduler supports both
@@ -193,7 +209,9 @@ def retrieve_timesteps(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep or sigma schedules. Please check whether you are using the correct scheduler."
             )
-        scheduler.set_timesteps(timesteps=timesteps, sigmas=sigmas, device=device, **kwargs)
+        scheduler.set_timesteps(
+            timesteps=timesteps, sigmas=sigmas, device=device, **kwargs
+        )
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif timesteps is not None:
@@ -271,7 +289,9 @@ class GlmImagePipeline(nn.Module):
         if local_files_only:
             model_path = model
         else:
-            model_path = download_weights_from_hf_specific(model, od_config.revision, ["*"])
+            model_path = download_weights_from_hf_specific(
+                model, od_config.revision, ["*"]
+            )
 
         # Load scheduler
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -289,12 +309,17 @@ class GlmImagePipeline(nn.Module):
         self.text_encoder.eval()
 
         # Load tokenizer for glyph encoding
-        self.tokenizer = ByT5Tokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
+        self.tokenizer = ByT5Tokenizer.from_pretrained(
+            model_path, subfolder="tokenizer", local_files_only=True
+        )
 
         # Load VAE
         logger.info("Loading AutoencoderKL (VAE)...")
         self.vae = AutoencoderKL.from_pretrained(
-            model_path, subfolder="vae", local_files_only=True, torch_dtype=torch.bfloat16
+            model_path,
+            subfolder="vae",
+            local_files_only=True,
+            torch_dtype=torch.bfloat16,
         ).to(self.device)
         self.vae.eval()
 
@@ -350,11 +375,15 @@ class GlmImagePipeline(nn.Module):
                 "Please provide only one of the two."
             )
         if prompt is None and prompt_embeds is None:
-            raise ValueError("Provide either `prompt` or `prompt_embeds`. Cannot leave both undefined.")
+            raise ValueError(
+                "Provide either `prompt` or `prompt_embeds`. Cannot leave both undefined."
+            )
 
         # Check prompt type
         if prompt is not None and not isinstance(prompt, (str, list)):
-            raise ValueError(f"`prompt` must be of type `str` or `list` but is {type(prompt)}")
+            raise ValueError(
+                f"`prompt` must be of type `str` or `list` but is {type(prompt)}"
+            )
 
     # ==================== Text Encoding Methods ====================
 
@@ -388,7 +417,10 @@ class GlmImagePipeline(nn.Module):
         ).input_ids
 
         # Pad to even length
-        input_ids = [[self.tokenizer.pad_token_id] * ((len(ids) + 1) % 2) + ids for ids in input_ids]
+        input_ids = [
+            [self.tokenizer.pad_token_id] * ((len(ids) + 1) % 2) + ids
+            for ids in input_ids
+        ]
         max_length = max(len(ids) for ids in input_ids)
 
         attention_mask = torch.tensor(
@@ -396,7 +428,10 @@ class GlmImagePipeline(nn.Module):
             device=device,
         )
         input_ids = torch.tensor(
-            [ids + [self.tokenizer.pad_token_id] * (max_length - len(ids)) for ids in input_ids],
+            [
+                ids + [self.tokenizer.pad_token_id] * (max_length - len(ids))
+                for ids in input_ids
+            ],
             device=device,
         )
 
@@ -422,19 +457,29 @@ class GlmImagePipeline(nn.Module):
         batch_size = len(prompt) if prompt_embeds is None else prompt_embeds.shape[0]
 
         if prompt_embeds is None:
-            prompt_embeds = self._get_glyph_embeds(prompt, max_sequence_length, device, dtype)
+            prompt_embeds = self._get_glyph_embeds(
+                prompt, max_sequence_length, device, dtype
+            )
 
         seq_len = prompt_embeds.size(1)
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
+        )
 
         negative_prompt_embeds = None
         if do_classifier_free_guidance:
             negative_prompt = [""] * batch_size
-            negative_prompt_embeds = self._get_glyph_embeds(negative_prompt, max_sequence_length, device, dtype)
+            negative_prompt_embeds = self._get_glyph_embeds(
+                negative_prompt, max_sequence_length, device, dtype
+            )
             seq_len = negative_prompt_embeds.size(1)
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+            negative_prompt_embeds = negative_prompt_embeds.repeat(
+                1, num_images_per_prompt, 1
+            )
+            negative_prompt_embeds = negative_prompt_embeds.view(
+                batch_size * num_images_per_prompt, seq_len, -1
+            )
 
         return prompt_embeds, negative_prompt_embeds
 
@@ -462,7 +507,9 @@ class GlmImagePipeline(nn.Module):
             int(width) // self.vae_scale_factor,
         )
         if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(f"Passed {len(generator)} generators but batch size is {batch_size}.")
+            raise ValueError(
+                f"Passed {len(generator)} generators but batch size is {batch_size}."
+            )
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
@@ -499,12 +546,17 @@ class GlmImagePipeline(nn.Module):
         """
         # Prepare conditional/unconditional drop flags
         prior_token_drop_cond = torch.full_like(prior_token_id, False, dtype=torch.bool)
-        prior_token_drop_uncond = torch.full_like(prior_token_id, True, dtype=torch.bool)
+        prior_token_drop_uncond = torch.full_like(
+            prior_token_id, True, dtype=torch.bool
+        )
 
         transformer_dtype = self.transformer.dtype
 
         # Enable CFG-parallel: rank0 computes positive, rank1 computes negative
-        cfg_parallel_ready = do_classifier_free_guidance and get_classifier_free_guidance_world_size() > 1
+        cfg_parallel_ready = (
+            do_classifier_free_guidance
+            and get_classifier_free_guidance_world_size() > 1
+        )
 
         for i, t in enumerate(timesteps):
             latent_model_input = latents.to(transformer_dtype)
@@ -548,9 +600,13 @@ class GlmImagePipeline(nn.Module):
                     # Rank 0: Combine predictions and apply CFG
                     noise_pred_cond = gathered[0]
                     noise_pred_uncond = gathered[1]
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_cond - noise_pred_uncond
+                    )
                     # Scheduler step
-                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    latents = self.scheduler.step(
+                        noise_pred, t, latents, return_dict=False
+                    )[0]
 
                 # Broadcast updated latents to all ranks
                 cfg_group.broadcast(latents, src=0)
@@ -584,12 +640,16 @@ class GlmImagePipeline(nn.Module):
                         return_dict=False,
                     )[0].float()
 
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_cond - noise_pred_uncond
+                    )
                 else:
                     noise_pred = noise_pred_cond
 
                 # Scheduler step
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                latents = self.scheduler.step(
+                    noise_pred, t, latents, return_dict=False
+                )[0]
 
         return latents
 
@@ -633,16 +693,24 @@ class GlmImagePipeline(nn.Module):
         )
 
         # Process each condition image through transformer to populate KV cache
-        for condition_image, condition_prior_token_id in zip(condition_images, prior_token_image_ids):
-            condition_image = condition_image.to(device=self.device, dtype=prompt_embeds.dtype)
+        for condition_image, condition_prior_token_id in zip(
+            condition_images, prior_token_image_ids
+        ):
+            condition_image = condition_image.to(
+                device=self.device, dtype=prompt_embeds.dtype
+            )
             # Move prior token ids to device (may come from CPU due to serialization)
             if isinstance(condition_prior_token_id, torch.Tensor):
-                condition_prior_token_id = condition_prior_token_id.to(device=self.device)
+                condition_prior_token_id = condition_prior_token_id.to(
+                    device=self.device
+                )
 
             # Encode condition image to latent space
             # Use argmax (mode) for deterministic encoding of condition images
             condition_latent = retrieve_latents(
-                self.vae.encode(condition_image.unsqueeze(0)), generator=generator, sample_mode="argmax"
+                self.vae.encode(condition_image.unsqueeze(0)),
+                generator=generator,
+                sample_mode="argmax",
             )
             condition_latent = (condition_latent - latents_mean) / latents_std
 
@@ -652,10 +720,18 @@ class GlmImagePipeline(nn.Module):
                 hidden_states=condition_latent,
                 encoder_hidden_states=torch.zeros_like(prompt_embeds)[:1, :0, ...],
                 prior_token_id=condition_prior_token_id,
-                prior_token_drop=torch.full_like(condition_prior_token_id, False, dtype=torch.bool),
+                prior_token_drop=torch.full_like(
+                    condition_prior_token_id, False, dtype=torch.bool
+                ),
                 timestep=torch.zeros((1,), device=self.device),
-                target_size=torch.tensor([condition_image.shape[-2:]], device=self.device, dtype=prompt_embeds.dtype),
-                crop_coords=torch.zeros((1, 2), device=self.device, dtype=prompt_embeds.dtype),
+                target_size=torch.tensor(
+                    [condition_image.shape[-2:]],
+                    device=self.device,
+                    dtype=prompt_embeds.dtype,
+                ),
+                crop_coords=torch.zeros(
+                    (1, 2), device=self.device, dtype=prompt_embeds.dtype
+                ),
                 kv_cache=kv_caches,
                 return_dict=False,
             )
@@ -679,7 +755,11 @@ class GlmImagePipeline(nn.Module):
                 """Taking only the first image for now.""",
             )
         first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        prompt = (
+            first_prompt
+            if isinstance(first_prompt, str)
+            else (first_prompt.get("prompt") or "")
+        )
 
         # NOTE: DiffusionEngine does an internal warmup "dummy run" during
         # initialization. That request has no request_id and does not carry
@@ -704,7 +784,9 @@ class GlmImagePipeline(nn.Module):
         # Use pre-processed images from pre_process_func
         preprocessed_images = None
         if not isinstance(first_prompt, str):
-            img = first_prompt.get("additional_information", {}).get("preprocessed_image")
+            img = first_prompt.get("additional_information", {}).get(
+                "preprocessed_image"
+            )
             if img is not None:
                 preprocessed_images = [img]
 
@@ -716,26 +798,40 @@ class GlmImagePipeline(nn.Module):
         is_image_edit = (preprocessed_images is not None) and (not is_dummy_warmup)
 
         # Use image dimensions as default if available
-        height = req.sampling_params.height or img_height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or img_width or self.default_sample_size * self.vae_scale_factor
+        height = (
+            req.sampling_params.height
+            or img_height
+            or self.default_sample_size * self.vae_scale_factor
+        )
+        width = (
+            req.sampling_params.width
+            or img_width
+            or self.default_sample_size * self.vae_scale_factor
+        )
         num_inference_steps = req.sampling_params.num_inference_steps or 50
         guidance_scale = req.sampling_params.guidance_scale or 1.5
 
-        self.check_inputs(prompt=prompt, height=height, width=width, prompt_embeds=prompt_embeds)
+        self.check_inputs(
+            prompt=prompt, height=height, width=width, prompt_embeds=prompt_embeds
+        )
 
         batch_size = 1
         do_classifier_free_guidance = guidance_scale > 1.0
 
         generator = None
         if req.sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            generator = torch.Generator(device=self.device).manual_seed(
+                req.sampling_params.seed
+            )
 
         # 1. Get prior tokens - either from external source (multistage) or generate internally
         # Check if prior_token_ids are provided externally (from AR stage in multistage mode)
         # First try sampling_params.extra_args (for direct API usage)
         # Then try prompt["extra"] (for multistage ar2diffusion output)
         external_prior_tokens = req.sampling_params.extra_args.get("prior_token_ids")
-        external_prior_image_ids = req.sampling_params.extra_args.get("prior_token_image_ids")
+        external_prior_image_ids = req.sampling_params.extra_args.get(
+            "prior_token_image_ids"
+        )
         if external_prior_tokens is None and isinstance(first_prompt, dict):
             prompt_extra = first_prompt.get("extra", {})
             external_prior_tokens = prompt_extra.get("prior_token_ids")
@@ -744,7 +840,9 @@ class GlmImagePipeline(nn.Module):
         if external_prior_tokens is not None:
             prior_token_id = external_prior_tokens
             if isinstance(prior_token_id, list):
-                prior_token_id = torch.tensor(prior_token_id, dtype=torch.long, device=self.device)
+                prior_token_id = torch.tensor(
+                    prior_token_id, dtype=torch.long, device=self.device
+                )
             elif isinstance(prior_token_id, torch.Tensor):
                 prior_token_id = prior_token_id.to(device=self.device, dtype=torch.long)
             if prior_token_id.dim() == 1:
@@ -761,7 +859,9 @@ class GlmImagePipeline(nn.Module):
                     if isinstance(item, torch.Tensor):
                         tensor_item = item.to(device=self.device, dtype=torch.long)
                     else:
-                        tensor_item = torch.tensor(item, dtype=torch.long, device=self.device)
+                        tensor_item = torch.tensor(
+                            item, dtype=torch.long, device=self.device
+                        )
                     if tensor_item.dim() == 1:
                         tensor_item = tensor_item.unsqueeze(0)
                     normalized.append(tensor_item)
@@ -773,7 +873,9 @@ class GlmImagePipeline(nn.Module):
             h_lat = height // self.vae_scale_factor
             w_lat = width // self.vae_scale_factor
             seq_len = (h_lat * w_lat) // (self._patch_size**2)
-            prior_token_id = torch.zeros((1, seq_len), dtype=torch.long, device=self.device)
+            prior_token_id = torch.zeros(
+                (1, seq_len), dtype=torch.long, device=self.device
+            )
             prior_token_image_ids = None
         else:
             raise ValueError(
@@ -819,8 +921,12 @@ class GlmImagePipeline(nn.Module):
         )
 
         # 5. Prepare timesteps
-        image_seq_len = ((height // self.vae_scale_factor) * (width // self.vae_scale_factor)) // (self._patch_size**2)
-        timesteps_array = np.linspace(self.scheduler.config.num_train_timesteps, 1.0, num_inference_steps + 1)[:-1]
+        image_seq_len = (
+            (height // self.vae_scale_factor) * (width // self.vae_scale_factor)
+        ) // (self._patch_size**2)
+        timesteps_array = np.linspace(
+            self.scheduler.config.num_train_timesteps, 1.0, num_inference_steps + 1
+        )[:-1]
         timesteps_array = timesteps_array.astype(np.int64).astype(np.float32)
         sigmas = timesteps_array / self.scheduler.config.num_train_timesteps
 
@@ -831,11 +937,18 @@ class GlmImagePipeline(nn.Module):
             self.scheduler.config.get("max_shift", 0.75),
         )
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, self.device, timesteps_array.tolist(), sigmas.tolist(), mu=mu
+            self.scheduler,
+            num_inference_steps,
+            self.device,
+            timesteps_array.tolist(),
+            sigmas.tolist(),
+            mu=mu,
         )
 
         # 6. Prepare conditioning tensors
-        target_size = torch.tensor([[height, width]], dtype=prompt_embeds.dtype, device=self.device)
+        target_size = torch.tensor(
+            [[height, width]], dtype=prompt_embeds.dtype, device=self.device
+        )
         crop_coords = torch.zeros((1, 2), dtype=prompt_embeds.dtype, device=self.device)
 
         # 7. Denoising loop
@@ -872,7 +985,9 @@ class GlmImagePipeline(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load transformer weights."""
         transformer_weights = (
-            (name.replace("transformer.", "", 1), weight) for name, weight in weights if name.startswith("transformer.")
+            (name.replace("transformer.", "", 1), weight)
+            for name, weight in weights
+            if name.startswith("transformer.")
         )
         loaded = self.transformer.load_weights(transformer_weights)
         return {f"transformer.{name}" for name in loaded}

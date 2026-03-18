@@ -44,7 +44,9 @@ def inference(model_name: str, offload: bool = True):
             width=width,
             num_inference_steps=9,
             guidance_scale=0.0,
-            generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
+            generator=torch.Generator(
+                device=current_omni_platform.device_type
+            ).manual_seed(42),
         ),
     )
     peak = monitor.peak_used_mb

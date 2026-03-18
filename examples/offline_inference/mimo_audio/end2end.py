@@ -50,11 +50,15 @@ def get_codes_query_from_json(codes_path: str) -> QueryResult:
             "Expect a JSON list[int] or {{'code_final': list[int]}}."
         )
 
-    if not isinstance(code_final, list) or not all(isinstance(x, int) for x in code_final):
+    if not isinstance(code_final, list) or not all(
+        isinstance(x, int) for x in code_final
+    ):
         raise ValueError("code_final must be a list[int].")
 
     if len(code_final) > MAX_CODE2WAV_TOKENS:
-        print(f"[Warn] code_final len={len(code_final)} > {MAX_CODE2WAV_TOKENS}, truncating.")
+        print(
+            f"[Warn] code_final len={len(code_final)} > {MAX_CODE2WAV_TOKENS}, truncating."
+        )
         code_final = code_final[:MAX_CODE2WAV_TOKENS]
 
     return QueryResult(
@@ -112,7 +116,9 @@ def get_audio_understanding_sft(audio_path, text="", thinking=False, use_sostm=F
     return final_prompt
 
 
-def get_spoken_dialogue_sft_multiturn(message_list, system_prompt=None, ref_audio_path=None, audio_list=None):
+def get_spoken_dialogue_sft_multiturn(
+    message_list, system_prompt=None, ref_audio_path=None, audio_list=None
+):
     res = get_spoken_dialogue_sft_multiturn_prompt(
         message_list, system_prompt=system_prompt, prompt_speech=ref_audio_path
     )
@@ -126,7 +132,9 @@ def get_spoken_dialogue_sft_multiturn(message_list, system_prompt=None, ref_audi
     return final_prompt
 
 
-def get_speech2text_dialogue_sft_multiturn(message_list, thinking=False, audio_list=None):
+def get_speech2text_dialogue_sft_multiturn(
+    message_list, thinking=False, audio_list=None
+):
     res = get_s2t_dialogue_sft_multiturn_prompt(
         message_list,
         thinking=thinking,
@@ -227,7 +235,12 @@ def main(args):
     elif args.query_type == "tts_sft_with_audio":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_audio --audio_path "./spoken_dialogue_assistant_turn_1.wav"
         audio_list = [get_audio_data(audio_path)]
-        query_result = query_func(text=text, read_text_only=True, prompt_speech=audio_path, audio_list=audio_list)
+        query_result = query_func(
+            text=text,
+            read_text_only=True,
+            prompt_speech=audio_path,
+            audio_list=audio_list,
+        )
     elif args.query_type == "tts_sft_with_natural_instruction":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_natural_instruction --text "In a panting young male voice, he said: I can't run anymore, wait for me!"
         query_result = query_func(text=text, read_text_only=False)
@@ -256,10 +269,18 @@ def main(args):
 
         message_list = [
             {"role": "user", "content": s1_audio_path},
-            {"role": "assistant", "content": {"text": first_turn_text_response, "audio": s2_audio_path}},
+            {
+                "role": "assistant",
+                "content": {"text": first_turn_text_response, "audio": s2_audio_path},
+            },
             {"role": "user", "content": s3_audio_path},
         ]
-        query_result = query_func(message_list, system_prompt=None, ref_audio_path=audio_path, audio_list=audio_list)
+        query_result = query_func(
+            message_list,
+            system_prompt=None,
+            ref_audio_path=audio_path,
+            audio_list=audio_list,
+        )
     elif args.query_type == "speech2text_dialogue_sft_multiturn":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type speech2text_dialogue_sft_multiturn
         s1_audio_path = "weather_of_today.mp3"
@@ -279,8 +300,14 @@ def main(args):
     elif args.query_type == "text_dialogue_sft_multiturn":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type text_dialogue_sft_multiturn
         message_list = [
-            {"role": "user", "content": "Could you recommend some tourist attractions in China?"},
-            {"role": "assistant", "content": "Hello, which city would you like to travel to?"},
+            {
+                "role": "user",
+                "content": "Could you recommend some tourist attractions in China?",
+            },
+            {
+                "role": "assistant",
+                "content": "Hello, which city would you like to travel to?",
+            },
             {"role": "user", "content": "Beijing"},
         ]
         query_result = query_func(message_list=message_list)
@@ -292,7 +319,9 @@ def main(args):
     print("prompts", prompts)
     omni_outputs = omni_llm.generate(prompts, sampling_params_list)
 
-    output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    output_dir = (
+        args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    )
     if args.query_type is not None:
         output_dir = os.path.join(output_dir, args.query_type)
     os.makedirs(output_dir, exist_ok=True)
@@ -340,7 +369,9 @@ def main(args):
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = FlexibleArgumentParser(
+        description="Demo on using vLLM for offline inference with audio language models"
+    )
     parser.add_argument(
         "--model-name",
         "-m",

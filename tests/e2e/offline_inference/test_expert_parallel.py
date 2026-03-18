@@ -63,7 +63,9 @@ def _cleanup_distributed():
     time.sleep(5)
 
 
-def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float, float, float, float]:
+def _diff_metrics(
+    a: Image.Image, b: Image.Image
+) -> tuple[float, float, float, float, float]:
     """Return (mean_abs_diff, max_abs_diff) over RGB pixels in [0, 1]."""
     ta = torch.from_numpy(np.asarray(a.convert("RGB"), dtype=np.float32) / 255.0)
     tb = torch.from_numpy(np.asarray(b.convert("RGB"), dtype=np.float32) / 255.0)
@@ -74,7 +76,13 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float, float, 
     vec_b = tb.reshape(-1)
     cos_sim = torch.nn.functional.cosine_similarity(vec_a, vec_b, dim=0, eps=1e-8)
     mse = torch.nn.functional.mse_loss(ta, tb)
-    return abs_diff.mean().item(), abs_diff.max().item(), cos_sim.mean().item(), cos_sim.max().item(), mse.item()
+    return (
+        abs_diff.mean().item(),
+        abs_diff.max().item(),
+        cos_sim.mean().item(),
+        cos_sim.max().item(),
+        mse.item(),
+    )
 
 
 def _run_inference(
@@ -108,7 +116,9 @@ def _run_inference(
                     width=width,
                     num_inference_steps=DEFAULT_STEPS,
                     guidance_scale=guidance_scale,
-                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
+                    generator=torch.Generator(
+                        current_omni_platform.device_type
+                    ).manual_seed(seed),
                     num_outputs_per_prompt=1,
                 ),
             )
@@ -122,7 +132,9 @@ def _run_inference(
                 width=width,
                 num_inference_steps=DEFAULT_STEPS,
                 guidance_scale=guidance_scale,
-                generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
+                generator=torch.Generator(
+                    current_omni_platform.device_type
+                ).manual_seed(seed),
                 num_outputs_per_prompt=1,
             ),
         )
@@ -166,7 +178,17 @@ def test_ep(model_name):
     print("=" * 90)
 
     for tensor_parallel_size, enable_ep, height, width, is_perf_test in EP_TEST_CONFIG:
-        cache_key = PROMPT + "_" + str(height) + "*" + str(width) + "_" + str(DEFAULT_SEED) + "_" + str(DEFAULT_STEPS)
+        cache_key = (
+            PROMPT
+            + "_"
+            + str(height)
+            + "*"
+            + str(width)
+            + "_"
+            + str(DEFAULT_SEED)
+            + "_"
+            + str(DEFAULT_STEPS)
+        )
         if cache_key not in baseline_cache:
             print(
                 f"\n--- Running baseline{{ prompt: {PROMPT}, resolution: {height}x{width}, seed: {DEFAULT_SEED}, steps: {DEFAULT_STEPS} }}---"
@@ -191,7 +213,9 @@ def test_ep(model_name):
             warmup=is_perf_test,
         )
         assert len(infer_result.images) == 1
-        mean_diff, max_diff, cos_sim_mean, cos_sim_max, mse = _diff_metrics(baseline.images[0], infer_result.images[0])
+        mean_diff, max_diff, cos_sim_mean, cos_sim_max, mse = _diff_metrics(
+            baseline.images[0], infer_result.images[0]
+        )
         print(f"{cos_sim_mean}, {cos_sim_max}, {mse}")
 
         # Build result entry
@@ -213,7 +237,11 @@ def test_ep(model_name):
 
         # Output based on test type
         if is_perf_test:
-            speedup = baseline.elapsed_ms / infer_result.elapsed_ms if infer_result.elapsed_ms > 0 else 0
+            speedup = (
+                baseline.elapsed_ms / infer_result.elapsed_ms
+                if infer_result.elapsed_ms > 0
+                else 0
+            )
             result["speedup"] = speedup
             print(
                 f"[enable_ep: {enable_ep}] {tensor_parallel_size} GPUs | "
@@ -228,14 +256,16 @@ def test_ep(model_name):
         print(
             f"[enable_ep: {enable_ep}] diff: [mean={mean_diff:.6e}, max={max_diff:.6e}], cos_sim: [mean={cos_sim_mean:.6e}, max={cos_sim_max:.6e}], mse: {mse:.6e}"
         )
-        assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD, (
-            f"[enable_ep: {enable_ep}] output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
-        )
+        assert (
+            mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD
+        ), f"[enable_ep: {enable_ep}] output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
 
     print("\n" + "=" * 90)
     print("SUMMARY")
     print("=" * 90)
-    print(f"{'Mode':<15} {'GPUs':<6} {'Size':<10} {'Baseline':<12} {'EP':<12} {'Speedup':<10} {'Status'}")
+    print(
+        f"{'Mode':<15} {'GPUs':<6} {'Size':<10} {'Baseline':<12} {'EP':<12} {'Speedup':<10} {'Status'}"
+    )
     print("-" * 90)
     for r in results:
         speedup_str = f"{r['speedup']:.2f}x" if r.get("speedup") else "N/A"

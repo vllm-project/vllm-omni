@@ -31,7 +31,9 @@ class TorchProfiler(ProfilerBase):
         """
         # 1. Cleanup any existing profiler
         if cls._profiler is not None:
-            logger.warning("[Rank %s] Stopping existing Torch profiler", cls._get_rank())
+            logger.warning(
+                "[Rank %s] Stopping existing Torch profiler", cls._get_rank()
+            )
             cls._profiler.stop()
             cls._profiler = None
 
@@ -59,11 +61,15 @@ class TorchProfiler(ProfilerBase):
 
                 try:
                     subprocess.Popen(["gzip", "-f", json_file])
-                    logger.info(f"[Rank {rank}] Triggered background compression for {json_file}")
+                    logger.info(
+                        f"[Rank {rank}] Triggered background compression for {json_file}"
+                    )
                     # Update variable to point to the eventual file
                     json_file = f"{json_file}.gz"
                 except Exception as compress_err:
-                    logger.warning(f"[Rank {rank}] Background gzip failed to start: {compress_err}")
+                    logger.warning(
+                        f"[Rank {rank}] Background gzip failed to start: {compress_err}"
+                    )
 
             except Exception as e:
                 logger.warning(f"[Rank {rank}] Failed to export trace: {e}")

@@ -34,7 +34,9 @@ def _init_mc2_group_for_diffusion(
 
     if getattr(vllm_ascend_parallel_state, "_MC2", None) is not None:
         return
-    all_ranks = torch.arange(world_size).reshape(-1, data_parallel_size * tensor_parallel_size)
+    all_ranks = torch.arange(world_size).reshape(
+        -1, data_parallel_size * tensor_parallel_size
+    )
     group_ranks = all_ranks.unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
 
@@ -48,7 +50,10 @@ def _init_mc2_group_for_diffusion(
 
 def _select_moe_comm_method(vllm_config: VllmConfig) -> MoECommType | None:
     soc_version = get_ascend_device_type()
-    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+    if (
+        not vllm_config.parallel_config.enable_expert_parallel
+        or get_ep_group().world_size == 1
+    ):
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A2}:
         moe_comm_type = MoECommType.ALLGATHER
@@ -81,8 +86,12 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
         _vllm_fc.ForwardContext.__annotations__["in_profile_run"] = bool
         _vllm_fc.ForwardContext.in_profile_run = False
 
-    _vllm_fc.ForwardContext.moe_comm_type = _select_moe_comm_method(vllm_config=omni_get_ctx().vllm_config)
-    _vllm_fc.ForwardContext.moe_comm_method = _MoECommMethods.get(_vllm_fc.ForwardContext.moe_comm_type)
+    _vllm_fc.ForwardContext.moe_comm_type = _select_moe_comm_method(
+        vllm_config=omni_get_ctx().vllm_config
+    )
+    _vllm_fc.ForwardContext.moe_comm_method = _MoECommMethods.get(
+        _vllm_fc.ForwardContext.moe_comm_type
+    )
     _vllm_fc.ForwardContext.flash_comm_v1_enabled = False
 
 
@@ -90,7 +99,9 @@ class AscendHunyuanFusedMoE(AscendSharedFusedMoE):
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
         super().__init__(prefix=prefix, **kwargs)
         self._prefix = prefix
-        self._init_hook_handle = self.register_forward_pre_hook(self._initialize_kernel_hook, with_kwargs=True)
+        self._init_hook_handle = self.register_forward_pre_hook(
+            self._initialize_kernel_hook, with_kwargs=True
+        )
 
     def _initialize_kernel_hook(self, module: Any, args: Any, kwargs: Any) -> None:
         if self.quant_method:

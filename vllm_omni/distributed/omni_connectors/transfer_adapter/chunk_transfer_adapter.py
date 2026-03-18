@@ -42,7 +42,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
         self.custom_process_next_stage_input_func = None
-        custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
+        custom_process_next_stage_input_func = getattr(
+            model_config, "custom_process_next_stage_input_func", None
+        )
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
@@ -133,7 +135,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 connector_get_key,
             )
         except Exception as e:
-            logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
+            logger.error(
+                f"SharedMemoryConnector get failed for req {connector_get_key}: {e}"
+            )
             return False
 
         if result is None:
@@ -159,7 +163,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # Only pass chunk context metadata in additional_information
                 request.additional_information = {}
                 if "left_context_size" in payload_data:
-                    request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                    request.additional_information["left_context_size"] = payload_data[
+                        "left_context_size"
+                    ]
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
@@ -168,12 +174,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
-            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+            logger.debug(
+                f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}"
+            )
             return True
 
         return False
 
-    def _update_request_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
+    def _update_request_payload(
+        self, req_id: str, payload_data: dict[str, Any]
+    ) -> dict[str, Any]:
         """Update the payload data for a request in the connector.
 
         Args:
@@ -220,7 +230,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 )
 
             except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                logger.error(
+                    f"Failed to use custom_process_input_func for payload extraction: {e}"
+                )
 
         if not payload_data:
             return
@@ -268,7 +280,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
 
-        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
+        remaining = deque(
+            r
+            for r in self._pending_load_reqs
+            if getattr(r, "request_id", None) != request_id
+        )
         self._pending_load_reqs = remaining
         self._finished_load_reqs.discard(request_id)
 
@@ -295,10 +311,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if self.connector.stage_id == 0:
             return
         self._process_chunk_queue(
-            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
+            waiting_queue,
+            self.waiting_for_chunk_waiting_requests,
+            RequestStatus.WAITING,
+            self._finished_load_reqs,
         )
         self._process_chunk_queue(
-            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
+            running_queue,
+            self.waiting_for_chunk_running_requests,
+            RequestStatus.RUNNING,
+            self._finished_load_reqs,
         )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
@@ -331,7 +353,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._clear_chunk_ready(scheduler_output)
 
     @staticmethod
-    def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:
+    def attach_cached_additional_information(
+        scheduler_output: Any, requests: dict[str, Request]
+    ) -> None:
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if not cached_reqs:
             return
@@ -339,7 +363,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             cached_reqs.additional_information = {}
         for req_id in cached_reqs.req_ids:
             request = requests.get(req_id) if req_id else None
-            additional_info = getattr(request, "additional_information", None) if request else None
+            additional_info = (
+                getattr(request, "additional_information", None) if request else None
+            )
             cached_reqs.additional_information[req_id] = additional_info
 
     def _process_chunk_queue(

@@ -35,13 +35,19 @@ def get_cuda_graph_config():
 
 # CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
 if current_omni_platform.is_npu():
-    stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
+    stage_config = str(
+        Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml"
+    )
 elif current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
-    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
+    stage_config = str(
+        Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml"
+    )
 elif current_omni_platform.is_xpu():
     # Intel XPU stage config optimized for B60 GPU
-    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")
+    stage_config = str(
+        Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml"
+    )
 else:
     stage_config = get_cuda_graph_config()
 
@@ -59,7 +65,10 @@ def get_question(prompt_type="mix"):
 
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
+@hardware_test(
+    res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"},
+    num_cards={"cuda": 4, "rocm": 2, "xpu": 3},
+)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     """
@@ -90,7 +99,10 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
+@hardware_test(
+    res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"},
+    num_cards={"cuda": 4, "rocm": 2, "xpu": 3},
+)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     """

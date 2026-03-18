@@ -18,7 +18,11 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
+from transformers import (
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen2Tokenizer,
+    Qwen2VLProcessor,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -58,7 +62,11 @@ def get_qwen_image_layered_pre_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+        vae_scale_factor = (
+            2 ** len(vae_config["temporal_downsample"])
+            if "temporal_downsample" in vae_config
+            else 8
+        )
         latent_channels = vae_config.get("z_dim", 16)
 
     # QwenImage latents are turned into 2x2 patches and packed.
@@ -72,15 +80,25 @@ def get_qwen_image_layered_pre_process_func(
     ):
         """Pre-process requests for QwenImageLayeredPipeline."""
         for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            multi_modal_data = (
+                prompt.get("multi_modal_data", {})
+                if not isinstance(prompt, str)
+                else None
+            )
+            raw_image = (
+                multi_modal_data.get("image", None)
+                if multi_modal_data is not None
+                else None
+            )
             if isinstance(prompt, str):
                 prompt = OmniTextPrompt(prompt=prompt)
             if "additional_information" not in prompt:
                 prompt["additional_information"] = {}
 
             if not raw_image:  # None or empty list
-                raise ValueError("""Received no input image. This model requires one input image to run.""")
+                raise ValueError(
+                    """Received no input image. This model requires one input image to run."""
+                )
             elif isinstance(raw_image, list):
                 if len(raw_image) > 1:
                     raise ValueError(
@@ -96,11 +114,13 @@ def get_qwen_image_layered_pre_process_func(
 
             # 1. calculate dimensions
             image_size = image.size
-            assert request.sampling_params.resolution in [640, 1024], (
-                f"resolution must be either 640 or 1024, but got {request.sampling_params.resolution}"
-            )
+            assert request.sampling_params.resolution in [
+                640,
+                1024,
+            ], f"resolution must be either 640 or 1024, but got {request.sampling_params.resolution}"
             calculated_width, calculated_height = calculate_dimensions(
-                request.sampling_params.resolution * request.sampling_params.resolution, image_size[0] / image_size[1]
+                request.sampling_params.resolution * request.sampling_params.resolution,
+                image_size[0] / image_size[1],
             )
             height = calculated_height
             width = calculated_width
@@ -116,10 +136,16 @@ def get_qwen_image_layered_pre_process_func(
             request.sampling_params.width = width
 
             # 2. Preprocess image
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
-                image = image_processor.resize(image, calculated_height, calculated_width)
+            if image is not None and not (
+                isinstance(image, torch.Tensor) and image.size(1) == latent_channels
+            ):
+                image = image_processor.resize(
+                    image, calculated_height, calculated_width
+                )
                 prompt_image = image
-                image = image_processor.preprocess(image, calculated_height, calculated_width)
+                image = image_processor.preprocess(
+                    image, calculated_height, calculated_width
+                )
                 image = image.unsqueeze(2)
                 # image = image.to(dtype=self.text_encoder.dtype)  # do it later
 
@@ -153,9 +179,13 @@ def retrieve_timesteps(
     **kwargs,
 ):
     if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+        raise ValueError(
+            "Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values"
+        )
     if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accepts_timesteps = "timesteps" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accepts_timesteps:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -165,7 +195,9 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        accept_sigmas = "sigmas" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
         if not accept_sigmas:
             raise ValueError(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
@@ -181,7 +213,9 @@ def retrieve_timesteps(
 
 
 def retrieve_latents(
-    encoder_output: torch.Tensor, generator: torch.Generator | None = None, sample_mode: str = "sample"
+    encoder_output: torch.Tensor,
+    generator: torch.Generator | None = None,
+    sample_mode: str = "sample",
 ):
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
@@ -216,10 +250,12 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
+        self.vae = AutoencoderKLQwenImage.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
+        self.tokenizer = Qwen2Tokenizer.from_pretrained(
+            model, subfolder="tokenizer", local_files_only=local_files_only
         )
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="processor", local_files_only=local_files_only
         )
@@ -235,17 +271,27 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
             )
         ]
 
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
-        self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
+        transformer_kwargs = get_transformer_config_kwargs(
+            od_config.tf_model_config, QwenImageTransformer2DModel
+        )
+        self.transformer = QwenImageTransformer2DModel(
+            od_config=od_config, **transformer_kwargs
+        )
 
         # Pipeline configuration & processing parameters
-        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
-        self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16
+        self.vae_scale_factor = (
+            2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+        )
+        self.latent_channels = (
+            self.vae.config.z_dim if getattr(self, "vae", None) else 16
+        )
         # QwenImage latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible
         # by the patch size. So the vae scale factor is multiplied
         # by the patch size to account for this
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.image_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor * 2
+        )
         self.vl_processor = self.processor
         self.tokenizer_max_length = 1024
 
@@ -296,7 +342,10 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         negative_prompt_embeds_mask=None,
         max_sequence_length=None,
     ):
-        if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
+        if (
+            height % (self.vae_scale_factor * 2) != 0
+            or width % (self.vae_scale_factor * 2) != 0
+        ):
             logger.warning(
                 f"`height` and `width` have to be divisible by {self.vae_scale_factor * 2} "
                 f"but are {height} and {width}. Dimensions will be resized accordingly"
@@ -311,8 +360,12 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+        elif prompt is not None and (
+            not isinstance(prompt, str) and not isinstance(prompt, list)
+        ):
+            raise ValueError(
+                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
+            )
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(
@@ -333,7 +386,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             )
 
         if max_sequence_length is not None and max_sequence_length > 1024:
-            raise ValueError(f"`max_sequence_length` cannot be greater than 1024 but is {max_sequence_length}")
+            raise ValueError(
+                f"`max_sequence_length` cannot be greater than 1024 but is {max_sequence_length}"
+            )
 
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
         bool_mask = mask.bool()
@@ -368,15 +423,26 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             output_hidden_states=True,
         )
         hidden_states = encoder_hidden_states.hidden_states[-1]
-        split_hidden_states = self._extract_masked_hidden(hidden_states, txt_tokens.attention_mask)
+        split_hidden_states = self._extract_masked_hidden(
+            hidden_states, txt_tokens.attention_mask
+        )
         split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
-        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+        attn_mask_list = [
+            torch.ones(e.size(0), dtype=torch.long, device=e.device)
+            for e in split_hidden_states
+        ]
         max_seq_len = max([e.size(0) for e in split_hidden_states])
         prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+            [
+                torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))])
+                for u in split_hidden_states
+            ]
         )
         encoder_attention_mask = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
+            [
+                torch.cat([u, u.new_zeros(max_seq_len - u.size(0))])
+                for u in attn_mask_list
+            ]
         )
 
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
@@ -418,21 +484,31 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            batch_size * num_images_per_prompt, seq_len, -1
+        )
         prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds_mask = prompt_embeds_mask.view(batch_size * num_images_per_prompt, seq_len)
+        prompt_embeds_mask = prompt_embeds_mask.view(
+            batch_size * num_images_per_prompt, seq_len
+        )
 
         return prompt_embeds, prompt_embeds_mask
 
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
         if isinstance(generator, list):
             image_latents = [
-                retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i], sample_mode="argmax")
+                retrieve_latents(
+                    self.vae.encode(image[i : i + 1]),
+                    generator=generator[i],
+                    sample_mode="argmax",
+                )
                 for i in range(image.shape[0])
             ]
             image_latents = torch.cat(image_latents, dim=0)
         else:
-            image_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
+            image_latents = retrieve_latents(
+                self.vae.encode(image), generator=generator, sample_mode="argmax"
+            )
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.latent_channels, 1, 1, 1)
@@ -480,11 +556,19 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 image_latents = self._encode_vae_image(image=image, generator=generator)
             else:
                 image_latents = image
-            if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
+            if (
+                batch_size > image_latents.shape[0]
+                and batch_size % image_latents.shape[0] == 0
+            ):
                 # expand init_latents for batch_size
                 additional_image_per_prompt = batch_size // image_latents.shape[0]
-                image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
-            elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
+                image_latents = torch.cat(
+                    [image_latents] * additional_image_per_prompt, dim=0
+                )
+            elif (
+                batch_size > image_latents.shape[0]
+                and batch_size % image_latents.shape[0] != 0
+            ):
                 raise ValueError(
                     f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
                 )
@@ -492,9 +576,16 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 image_latents = torch.cat([image_latents], dim=0)
 
             image_latent_height, image_latent_width = image_latents.shape[3:]
-            image_latents = image_latents.permute(0, 2, 1, 3, 4)  # (b, c, f, h, w) -> (b, f, c, h, w)
+            image_latents = image_latents.permute(
+                0, 2, 1, 3, 4
+            )  # (b, c, f, h, w) -> (b, f, c, h, w)
             image_latents = self._pack_latents(
-                image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width, 1
+                image_latents,
+                batch_size,
+                num_channels_latents,
+                image_latent_height,
+                image_latent_width,
+                1,
             )
 
         if isinstance(generator, list) and len(generator) != batch_size:
@@ -503,8 +594,12 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-            latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width, layers + 1)
+            latents = randn_tensor(
+                shape, generator=generator, device=device, dtype=dtype
+            )
+            latents = self._pack_latents(
+                latents, batch_size, num_channels_latents, height, width, layers + 1
+            )
         else:
             latents = latents.to(device=device, dtype=dtype)
 
@@ -523,18 +618,25 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         ).to(device)
         generated_ids = self.text_encoder.generate(**model_inputs, max_new_tokens=512)
         generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
         ]
         output_text = self.vl_processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
         )[0]
         return output_text.strip()
 
     @staticmethod
     def _pack_latents(latents, batch_size, num_channels_latents, height, width, layers):
-        latents = latents.view(batch_size, layers, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.view(
+            batch_size, layers, num_channels_latents, height // 2, 2, width // 2, 2
+        )
         latents = latents.permute(0, 1, 3, 5, 2, 4, 6)
-        latents = latents.reshape(batch_size, layers * (height // 2) * (width // 2), num_channels_latents * 4)
+        latents = latents.reshape(
+            batch_size, layers * (height // 2) * (width // 2), num_channels_latents * 4
+        )
 
         return latents
 
@@ -547,10 +649,14 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         height = 2 * (int(height) // (vae_scale_factor * 2))
         width = 2 * (int(width) // (vae_scale_factor * 2))
 
-        latents = latents.view(batch_size, layers + 1, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.view(
+            batch_size, layers + 1, height // 2, width // 2, channels // 4, 2, 2
+        )
         latents = latents.permute(0, 1, 4, 2, 5, 3, 6)
 
-        latents = latents.reshape(batch_size, layers + 1, channels // (2 * 2), height, width)
+        latents = latents.reshape(
+            batch_size, layers + 1, channels // (2 * 2), height, width
+        )
         latents = latents.permute(0, 2, 1, 3, 4)  # (b, c, f, h, w)
 
         return latents
@@ -612,19 +718,43 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 """Taking only the first image for now.""",
             )
         first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-        negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
+        prompt = (
+            first_prompt
+            if isinstance(first_prompt, str)
+            else (first_prompt.get("prompt") or "")
+        )
+        negative_prompt = (
+            None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("negative_prompt")
+        )
 
-        layers = req.sampling_params.layers if req.sampling_params.layers is not None else layers
-        resolution = req.sampling_params.resolution if req.sampling_params.resolution is not None else resolution
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        layers = (
+            req.sampling_params.layers
+            if req.sampling_params.layers is not None
+            else layers
+        )
+        resolution = (
+            req.sampling_params.resolution
+            if req.sampling_params.resolution is not None
+            else resolution
+        )
+        max_sequence_length = (
+            req.sampling_params.max_sequence_length or max_sequence_length
+        )
         cfg_normalize = (
-            req.sampling_params.cfg_normalize if req.sampling_params.cfg_normalize is not None else cfg_normalize
+            req.sampling_params.cfg_normalize
+            if req.sampling_params.cfg_normalize is not None
+            else cfg_normalize
         )
         use_en_prompt = (
-            req.sampling_params.use_en_prompt if req.sampling_params.use_en_prompt is not None else use_en_prompt
+            req.sampling_params.use_en_prompt
+            if req.sampling_params.use_en_prompt is not None
+            else use_en_prompt
         )
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps
+        )
         sigmas = req.sampling_params.sigmas or sigmas
         generator = req.sampling_params.generator or generator
         true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
@@ -649,7 +779,10 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         else:
             # fallback to run pre-processing in pipeline (debug only)
             image_size = image[0].size if isinstance(image, list) else image.size
-            assert resolution in [640, 1024], f"resolution must be either 640 or 1024, but got {resolution}"
+            assert resolution in [
+                640,
+                1024,
+            ], f"resolution must be either 640 or 1024, but got {resolution}"
             calculated_width, calculated_height = calculate_dimensions(
                 resolution * resolution, image_size[0] / image_size[1]
             )
@@ -660,10 +793,17 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             width = width // multiple_of * multiple_of
             height = height // multiple_of * multiple_of
 
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
-                image = self.image_processor.resize(image, calculated_height, calculated_width)
+            if image is not None and not (
+                isinstance(image, torch.Tensor)
+                and image.size(1) == self.latent_channels
+            ):
+                image = self.image_processor.resize(
+                    image, calculated_height, calculated_width
+                )
                 prompt_image = image
-                image = self.image_processor.preprocess(image, calculated_height, calculated_width)
+                image = self.image_processor.preprocess(
+                    image, calculated_height, calculated_width
+                )
                 image = image.unsqueeze(2)
                 image = image.to(dtype=self.text_encoder.dtype)
 
@@ -687,7 +827,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         # 3. encode prompot & negative prompt
         if prompt is None or prompt == "" or prompt == " ":
-            prompt = self.get_image_caption(prompt_image, use_en_prompt=use_en_prompt, device=self.device)
+            prompt = self.get_image_caption(
+                prompt_image, use_en_prompt=use_en_prompt, device=self.device
+            )
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -696,7 +838,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             batch_size = prompt_embeds.shape[0]
 
         has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+            negative_prompt_embeds is not None
+            and negative_prompt_embeds_mask is not None
         )
 
         if true_cfg_scale > 1 and not has_neg_prompt:
@@ -747,15 +890,27 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         img_shapes = [
             [
                 *[
-                    (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2)
+                    (
+                        1,
+                        height // self.vae_scale_factor // 2,
+                        width // self.vae_scale_factor // 2,
+                    )
                     for _ in range(layers + 1)
                 ],
-                (1, calculated_height // self.vae_scale_factor // 2, calculated_width // self.vae_scale_factor // 2),
+                (
+                    1,
+                    calculated_height // self.vae_scale_factor // 2,
+                    calculated_width // self.vae_scale_factor // 2,
+                ),
             ]
         ] * batch_size
 
         # 5. Prepare timesteps
-        sigmas = np.linspace(1.0, 0, num_inference_steps + 1)[:-1] if sigmas is None else sigmas
+        sigmas = (
+            np.linspace(1.0, 0, num_inference_steps + 1)[:-1]
+            if sigmas is None
+            else sigmas
+        )
         base_seqlen = 256 * 256 / 16 / 16
         mu = (image_latents.shape[1] / base_seqlen) ** 0.5
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -771,7 +926,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         if self.transformer.guidance_embeds and guidance_scale is None:
             raise ValueError("guidance_scale is required for guidance-distilled model.")
         elif self.transformer.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, device=self.device, dtype=torch.float32)
+            guidance = torch.full(
+                [1], guidance_scale, device=self.device, dtype=torch.float32
+            )
             guidance = guidance.expand(latents.shape[0])
         elif not self.transformer.guidance_embeds and guidance_scale is not None:
             logger.warning(
@@ -784,9 +941,15 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
+        txt_seq_lens = (
+            prompt_embeds_mask.sum(dim=1).tolist()
+            if prompt_embeds_mask is not None
+            else None
+        )
         negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+            negative_prompt_embeds_mask.sum(dim=1).tolist()
+            if negative_prompt_embeds_mask is not None
+            else None
         )
         is_rgb = torch.tensor([0] * batch_size).to(device=self.device, dtype=torch.long)
 
@@ -816,21 +979,25 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         if output_type == "latent":
             image = latents
         else:
-            latents = self._unpack_latents(latents, height, width, layers, self.vae_scale_factor)
+            latents = self._unpack_latents(
+                latents, height, width, layers, self.vae_scale_factor
+            )
             latents = latents.to(self.vae.dtype)
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
                 .view(1, self.vae.config.z_dim, 1, 1, 1)
                 .to(latents.device, latents.dtype)
             )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.z_dim, 1, 1, 1
+            ).to(latents.device, latents.dtype)
             latents = latents / latents_std + latents_mean
 
             b, c, f, h, w = latents.shape
 
-            latents = latents[:, :, 1:]  # remove the first frame as it is the origin input
+            latents = latents[
+                :, :, 1:
+            ]  # remove the first frame as it is the origin input
 
             latents = latents.permute(0, 2, 1, 3, 4).view(-1, c, 1, h, w)
 

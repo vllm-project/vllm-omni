@@ -100,7 +100,9 @@ class AttentionImpl(ABC, Generic[T]):
         elif current_omni_platform.is_xpu():
             return self.forward_xpu(query, key, value, attn_metadata)
         else:
-            raise NotImplementedError(f"No forward implementation for platform: {current_omni_platform}")
+            raise NotImplementedError(
+                f"No forward implementation for platform: {current_omni_platform}"
+            )
 
     def forward_cuda(
         self,

@@ -127,10 +127,14 @@ class OmniCustomPrompt(TypedDict, total=False):
 # Must ensure that all additional prompt types are inherited from vLLM prompt types
 # Because TypedDict doesn't support isinstance and are dict. Cannot distinguish them in runtime.
 # Inheritance ensure that there are only additional fields but not removing fields--safe to route to LLM.generate()
-OmniSingletonPrompt: TypeAlias = str | list[int] | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
+OmniSingletonPrompt: TypeAlias = (
+    str | list[int] | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
+)
 """Omni singleton prompt type extending vLLM's SingletonPrompt."""
 
-OmniPromptType: TypeAlias = PromptType | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt | OmniCustomPrompt
+OmniPromptType: TypeAlias = (
+    PromptType | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt | OmniCustomPrompt
+)
 
 
 def token_inputs_omni(
@@ -218,13 +222,19 @@ class OmniDiffusionSamplingParams:
     height_latents: list[int] | int | None = None
     width_latents: list[int] | int | None = None
     num_frames: int = 1  # Default for image models
-    num_frames_round_down: bool = False  # Whether to round down num_frames if it's not divisible by num_gpus
+    num_frames_round_down: bool = (
+        False  # Whether to round down num_frames if it's not divisible by num_gpus
+    )
 
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None
-    fps: int | None = None  # Integer FPS kept for request compatibility and output encoding.
-    frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
+    fps: int | None = (
+        None  # Integer FPS kept for request compatibility and output encoding.
+    )
+    frame_rate: float | None = (
+        None  # Floating-point rate used by the diffusion model when it differs from `fps`.
+    )
     height_not_provided: bool = False
     width_not_provided: bool = False
 
@@ -252,7 +262,9 @@ class OmniDiffusionSamplingParams:
 
     # [Omni] KV Cache Transfer, for bagel model now
     past_key_values: Any | None = None  # Injected KV Cache
-    kv_metadata: dict[str, Any] | None = None  # Metadata for KV Cache (e.g., kv_lens, ropes)
+    kv_metadata: dict[str, Any] | None = (
+        None  # Metadata for KV Cache (e.g., kv_lens, ropes)
+    )
     need_kv_receive: bool = True  # Flag to indicate if this request expects KV transfer
 
     # [Omni] Multi-KV for CFG: populated by model-specific cfg_kv_collect_func

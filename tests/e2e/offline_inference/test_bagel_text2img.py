@@ -61,7 +61,9 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_steps: int = 15) -> list:
+def _configure_sampling_params(
+    omni: Omni, max_tokens: int = 1, num_inference_steps: int = 15
+) -> list:
     """Configure sampling parameters for Bagel text2img generation.
 
     Args:
@@ -121,9 +123,9 @@ def _validate_pixels(
         x, y = ref["position"]
         expected = ref["rgb"]
         actual = image.getpixel((x, y))[:3]
-        assert all(abs(a - e) <= tolerance for a, e in zip(actual, expected)), (
-            f"Pixel mismatch at ({x}, {y}): expected {expected}, got {actual}"
-        )
+        assert all(
+            abs(a - e) <= tolerance for a, e in zip(actual, expected)
+        ), f"Pixel mismatch at ({x}, {y}): expected {expected}, got {actual}"
 
 
 def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Image:
@@ -150,7 +152,10 @@ def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Ima
 
     generated_image = _extract_generated_image(omni_outputs)
     assert generated_image is not None, "No images generated"
-    assert generated_image.size == (1024, 1024), f"Expected 1024x1024, got {generated_image.size}"
+    assert generated_image.size == (
+        1024,
+        1024,
+    ), f"Expected 1024x1024, got {generated_image.size}"
 
     return generated_image
 
@@ -160,8 +165,14 @@ def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Ima
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_text2img_shared_memory_connector():
     """Test Bagel text2img with shared memory connector."""
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
+    config_path = str(
+        Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml"
+    )
+    omni = Omni(
+        model="ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+        stage_init_timeout=300,
+    )
 
     try:
         generated_image = _generate_bagel_image(omni)
@@ -231,7 +242,9 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
     Returns:
         Path to the temporary config file with substituted values.
     """
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_mooncake_ci.yaml")
+    config_path = str(
+        Path(__file__).parent / "stage_configs" / "bagel_mooncake_ci.yaml"
+    )
     with open(config_path) as f:
         config_content = f.read()
 
@@ -279,7 +292,9 @@ def test_bagel_text2img_mooncake_connector():
             preexec_fn=os.setsid,
         )
 
-        assert _wait_for_port(MOONCAKE_HOST, MOONCAKE_RPC_PORT), "mooncake_master failed to start"
+        assert _wait_for_port(
+            MOONCAKE_HOST, MOONCAKE_RPC_PORT
+        ), "mooncake_master failed to start"
 
         # Create temp config and initialize Omni
         temp_config_file = _load_mooncake_config(
@@ -288,7 +303,11 @@ def test_bagel_text2img_mooncake_connector():
             http_port=MOONCAKE_HTTP_PORT,
         )
 
-        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file, stage_init_timeout=300)
+        omni = Omni(
+            model="ByteDance-Seed/BAGEL-7B-MoT",
+            stage_configs_path=temp_config_file,
+            stage_init_timeout=300,
+        )
 
         generated_image = _generate_bagel_image(omni)
         _validate_pixels(generated_image)

@@ -49,7 +49,9 @@ class FlashAttentionImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
 
     @staticmethod
-    def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+    def _unwrap_flash_output(
+        out: torch.Tensor | tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
         # FA3 may return (out, lse), FA2 returns out
         return out[0] if isinstance(out, tuple) else out
 
@@ -67,11 +69,18 @@ class FlashAttentionImpl(AttentionImpl):
             flash_attn_varlen_func,
         )
 
-        assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
+        assert (
+            attention_mask.ndim == 2
+        ), "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
-        )
+        (
+            q,
+            k,
+            v,
+            indices_q,
+            (cu_seq_lens_q, cu_seq_lens_k),
+            (max_length_q, max_length_k),
+        ) = _upad_input(query, key, value, attention_mask, query_length, _unpad_input)
 
         out_unpad = flash_attn_varlen_func(
             q,
@@ -159,7 +168,13 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         batch_size, q_len = query.size()[:2]
-        cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+        cu_seqlens = torch.arange(
+            0,
+            (batch_size + 1) * q_len,
+            step=q_len,
+            dtype=torch.int32,
+            device=query.device,
+        )
         # b s ... -> (b s) ...
         query = query.flatten(0, 1)
         key = key.flatten(0, 1)

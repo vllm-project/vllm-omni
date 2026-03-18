@@ -160,7 +160,8 @@ def get_system_prompt():
 
 def get_text_query(custom_prompt: str | None = None):
     question = (
-        custom_prompt or "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words."
+        custom_prompt
+        or "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words."
     )
     prompt = {
         "role": "user",
@@ -181,7 +182,8 @@ def get_mixed_modalities_query(
     custom_prompt: str | None = None,
 ):
     question = (
-        custom_prompt or "What is recited in the audio? What is the content of this image? Why is this video funny?"
+        custom_prompt
+        or "What is recited in the audio? What is the content of this image? Why is this video funny?"
     )
     video_url = get_video_url_from_path(video_path)
     image_url = get_image_url_from_path(image_path)
@@ -211,8 +213,13 @@ def get_mixed_modalities_query(
     return prompt
 
 
-def get_use_audio_in_video_query(video_path: str | None = None, custom_prompt: str | None = None):
-    question = custom_prompt or "Describe the content of the video, then convert what the baby say into text."
+def get_use_audio_in_video_query(
+    video_path: str | None = None, custom_prompt: str | None = None
+):
+    question = (
+        custom_prompt
+        or "Describe the content of the video, then convert what the baby say into text."
+    )
     video_url = get_video_url_from_path(video_path)
 
     prompt = {
@@ -235,7 +242,9 @@ def get_use_audio_in_video_query(video_path: str | None = None, custom_prompt: s
     return prompt
 
 
-def get_multi_audios_query(audio_path: str | None = None, custom_prompt: str | None = None):
+def get_multi_audios_query(
+    audio_path: str | None = None, custom_prompt: str | None = None
+):
     question = custom_prompt or "Are these two audio clips the same?"
     audio_url = get_audio_url_from_path(audio_path)
     prompt = {
@@ -313,7 +322,10 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
     query_func = query_map[args.query_type]
     if args.query_type == "mixed_modalities":
         prompt = query_func(
-            video_path=video_path, image_path=image_path, audio_path=audio_path, custom_prompt=custom_prompt
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+            custom_prompt=custom_prompt,
         )
     elif args.query_type == "use_audio_in_video":
         prompt = query_func(video_path=video_path, custom_prompt=custom_prompt)
@@ -384,7 +396,9 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = FlexibleArgumentParser(
+        description="Demo on using vLLM for offline inference with audio language models"
+    )
     parser.add_argument(
         "--query-type",
         "-q",

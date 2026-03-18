@@ -31,7 +31,9 @@ class ZmqQueue:
             raise ValueError("Either bind or connect must be specified")
         bind_mode = bind is not None
 
-        self._socket = make_zmq_socket(ctx, path, socket_type, bind=bind_mode, linger=5000)
+        self._socket = make_zmq_socket(
+            ctx, path, socket_type, bind=bind_mode, linger=5000
+        )
 
         # Reusable poller for efficient polling operations
         self._poller = zmq.Poller()

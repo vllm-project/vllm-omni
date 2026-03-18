@@ -113,7 +113,9 @@ class SharedMemoryConnector(OmniConnectorBase):
                     obj = self.deserialize_obj(metadata["inline_bytes"])
                     return obj, int(metadata.get("size", 0))
                 except Exception as e:
-                    logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
+                    logger.error(
+                        f"SharedMemoryConnector inline get failed for req {get_key}: {e}"
+                    )
                     return None
 
             if "shm" in metadata:

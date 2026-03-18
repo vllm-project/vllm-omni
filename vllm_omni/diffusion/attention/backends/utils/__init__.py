@@ -4,7 +4,11 @@
 Utils for attention backends.
 """
 
-from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input, _unpad_input, _upad_input
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    _pad_input,
+    _unpad_input,
+    _upad_input,
+)
 
 __all__ = [
     "_pad_input",

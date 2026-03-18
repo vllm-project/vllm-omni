@@ -10,7 +10,9 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.v1.request import RequestStatus
 
-from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
+from vllm_omni.distributed.omni_connectors.transfer_adapter.base import (
+    OmniTransferAdapterBase,
+)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
@@ -65,7 +67,9 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         model_config = SimpleNamespace(worker_type=model_mode)
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
-            SimpleNamespace(model_config=model_config, scheduler_config=scheduler_config)
+            SimpleNamespace(
+                model_config=model_config, scheduler_config=scheduler_config
+            )
         )
         return adapter, connector
 
@@ -76,10 +80,16 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
     ("raw_cfg", "expected_name", "expected_extra"),
     [
         (None, "SharedMemoryConnector", {}),
-        (SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}), "YuanrongConnector", {"k": "v"}),
+        (
+            SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}),
+            "YuanrongConnector",
+            {"k": "v"},
+        ),
     ],
 )
-def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, expected_extra):
+def test_create_connector_config_parsing(
+    monkeypatch, raw_cfg, expected_name, expected_extra
+):
     captured = {}
 
     def _fake_create(spec):
@@ -92,7 +102,11 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
         _fake_create,
     )
 
-    model_config = SimpleNamespace(stage_connector_config=raw_cfg) if raw_cfg is not None else SimpleNamespace()
+    model_config = (
+        SimpleNamespace(stage_connector_config=raw_cfg)
+        if raw_cfg is not None
+        else SimpleNamespace()
+    )
     connector = OmniChunkTransferAdapter.create_connector(model_config)
 
     assert connector == "ok"
@@ -106,7 +120,11 @@ def test_load_poll(build_adapter):
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
     adapter.load_async(request)
-    payload = {"code_predictor_codes": [[1]], "hidden_states": torch.tensor([[2.0]]), "finished": True}
+    payload = {
+        "code_predictor_codes": [[1]],
+        "hidden_states": torch.tensor([[2.0]]),
+        "finished": True,
+    }
     connector.get.return_value = (payload, 16)
     adapter._poll_single_request(request)
 
@@ -121,7 +139,10 @@ def test_save_async(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": False}
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {
+        "x": [1],
+        "finished": False,
+    }
     adapter.save_async(pooling_output=None, request=request)
     adapter.custom_process_next_stage_input_func = lambda **kwargs: {}
     adapter.save_async(pooling_output=None, request=request)
@@ -133,8 +154,12 @@ def test_save_async(build_adapter):
 def test_update_request_payload(build_adapter):
     adapter, _ = build_adapter()
 
-    adapter._update_request_payload("ext", {"h": torch.tensor([[1.0]]), "codes": [1], "finished": False})
-    merged = adapter._update_request_payload("ext", {"h": torch.tensor([[2.0]]), "codes": [2], "finished": True})
+    adapter._update_request_payload(
+        "ext", {"h": torch.tensor([[1.0]]), "codes": [1], "finished": False}
+    )
+    merged = adapter._update_request_payload(
+        "ext", {"h": torch.tensor([[2.0]]), "codes": [2], "finished": True}
+    )
 
     assert torch.equal(merged["h"], torch.tensor([[1.0], [2.0]]))
     assert merged["codes"] == [1, 2]
@@ -210,7 +235,9 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping
-    assert all(getattr(r, "request_id", None) != req_id for r in adapter._pending_load_reqs)
+    assert all(
+        getattr(r, "request_id", None) != req_id for r in adapter._pending_load_reqs
+    )
     assert req_id not in adapter._finished_load_reqs
 
     assert ext_id not in adapter.put_req_chunk
@@ -331,7 +358,9 @@ class _HashableRequest(SimpleNamespace):
         return getattr(other, "request_id", None) == self.request_id
 
 
-def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: MockerFixture):
+def test_generation_scheduler_calls_cleanup_on_finished(
+    monkeypatch, mocker: MockerFixture
+):
     """OmniGenerationScheduler must call adapter.cleanup when request finishes."""
     cleanup_calls = []
 
@@ -400,7 +429,9 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         req_id_to_index={"req-s1": 0},
     )
 
-    OmniGenerationScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+    OmniGenerationScheduler.update_from_output(
+        scheduler, scheduler_output, model_runner_output
+    )
 
     assert len(cleanup_calls) == 1
     args, _ = cleanup_calls[0]

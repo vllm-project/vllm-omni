@@ -5,7 +5,9 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms.xpu import XPUPlatform
 
-from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.attention.backends.registry import (
+    DiffusionAttentionBackendEnum,
+)
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
@@ -26,7 +28,9 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
-        return "vllm_omni.platforms.xpu.worker.xpu_generation_worker.XPUGenerationWorker"
+        return (
+            "vllm_omni.platforms.xpu.worker.xpu_generation_worker.XPUGenerationWorker"
+        )
 
     @classmethod
     def get_diffusion_attn_backend_cls(

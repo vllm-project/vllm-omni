@@ -140,10 +140,14 @@ class _FakeStage:
         # set default sampling params
         self.default_sampling_params = SamplingParams(temperature=1.0)
         # Allow configuring final_output and final_output_type
-        self.final_output = config.final_output if hasattr(config, "final_output") else False
+        self.final_output = (
+            config.final_output if hasattr(config, "final_output") else False
+        )
         self.final_output_type = getattr(config, "final_output_type", None)
         # Configurable processing logic, default returns placeholder
-        processed_input = getattr(config, "_config_dict", {}).get("processed_input", ["processed"])
+        processed_input = getattr(config, "_config_dict", {}).get(
+            "processed_input", ["processed"]
+        )
         self._processed_input = processed_input
         # Queue references (set by attach_queues)
         self._in_q = None
@@ -178,7 +182,9 @@ class _FakeStage:
         # Send stage_ready message to output queue
         if self._out_q is not None:
             try:
-                self._out_q.put_nowait({"type": "stage_ready", "stage_id": self.stage_id})
+                self._out_q.put_nowait(
+                    {"type": "stage_ready", "stage_id": self.stage_id}
+                )
             except Exception:
                 pass
 
@@ -252,7 +258,9 @@ def _setup_engine_mocks(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     fake_engine.model_config.io_processor_plugin = None
     # Add registry with resolve_model_cls method
     fake_registry = mocker.MagicMock()
-    fake_registry.resolve_model_cls = mocker.MagicMock(return_value=(mocker.MagicMock(), "test_arch"))
+    fake_registry.resolve_model_cls = mocker.MagicMock(
+        return_value=(mocker.MagicMock(), "test_arch")
+    )
     fake_engine.model_config.registry = fake_registry
     fake_engine.vllm_config.model_config.registry = fake_registry
 
@@ -301,7 +309,9 @@ def _setup_engine_mocks(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     )
 
 
-def _setup_multiprocessing_mocks(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
+def _setup_multiprocessing_mocks(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+):
     """Helper function to set up multiprocessing mocks."""
     import multiprocessing as mp
 
@@ -354,7 +364,9 @@ def _setup_ipc_mocks(monkeypatch: pytest.MonkeyPatch):
     def _fake_set(obj):
         return str(obj).encode()
 
-    monkeypatch.setattr("vllm_omni.entrypoints.omni._encode", _fake_encode, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni._encode", _fake_encode, raising=False
+    )
     monkeypatch.setattr("vllm_omni.entrypoints.omni._load", _fake_load, raising=False)
     monkeypatch.setattr("vllm_omni.entrypoints.omni._set", _fake_set, raising=False)
 
@@ -397,7 +409,9 @@ def _setup_connector_mocks(monkeypatch, mocker, omni_module=None):
     """
 
     # Mock initialize_orchestrator_connectors to return fake connectors
-    def _fake_initialize_orchestrator_connectors(config_path, worker_backend=None, shm_threshold_bytes=None):
+    def _fake_initialize_orchestrator_connectors(
+        config_path, worker_backend=None, shm_threshold_bytes=None
+    ):
         # Create fake connectors for all stage-to-stage edges
         # Each connector is just a mock object that will be passed to try_send_via_connector
         fake_connectors = {}
@@ -408,7 +422,11 @@ def _setup_connector_mocks(monkeypatch, mocker, omni_module=None):
 
     if omni_module is not None:
         # Mock directly on the omni module where it's used (after import)
-        monkeypatch.setattr(omni_module, "initialize_orchestrator_connectors", _fake_initialize_orchestrator_connectors)
+        monkeypatch.setattr(
+            omni_module,
+            "initialize_orchestrator_connectors",
+            _fake_initialize_orchestrator_connectors,
+        )
     else:
         # Mock via string path (before import)
         monkeypatch.setattr(
@@ -446,7 +464,9 @@ def _setup_connector_adapter_mock(monkeypatch, omni_module):
         return True
 
     # Mock directly on the omni module where it's used
-    monkeypatch.setattr(omni_module, "try_send_via_connector", _fake_try_send_via_connector)
+    monkeypatch.setattr(
+        omni_module, "try_send_via_connector", _fake_try_send_via_connector
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -476,19 +496,27 @@ def mock_get_config(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     tokenizer_module_path = "vllm.transformers_utils.tokenizer"
     if tokenizer_module_path in sys.modules:
         tokenizer_module = sys.modules[tokenizer_module_path]
-        setattr(tokenizer_module, "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
+        setattr(
+            tokenizer_module,
+            "init_tokenizer_from_configs",
+            _mock_init_tokenizer_from_configs,
+        )
 
     # CRITICAL: Mock length_from_prompt_token_ids_or_embeds BEFORE trying to mock async_omni
 
     # This is because async_omni imports processor.py, which imports this function at module level
     # Mock length_from_prompt_token_ids_or_embeds (used in processor.py)
-    def _mock_length_from_prompt_token_ids_or_embeds(prompt_token_ids=None, prompt_embeds=None):
+    def _mock_length_from_prompt_token_ids_or_embeds(
+        prompt_token_ids=None, prompt_embeds=None
+    ):
         # Return a reasonable default length
         if prompt_token_ids is not None:
             if isinstance(prompt_token_ids, list):
                 return len(prompt_token_ids)
             elif hasattr(prompt_token_ids, "shape"):
-                return prompt_token_ids.shape[-1] if len(prompt_token_ids.shape) > 0 else 1
+                return (
+                    prompt_token_ids.shape[-1] if len(prompt_token_ids.shape) > 0 else 1
+                )
         if prompt_embeds is not None:
             if hasattr(prompt_embeds, "shape"):
                 return prompt_embeds.shape[-2] if len(prompt_embeds.shape) > 1 else 1
@@ -511,7 +539,9 @@ def mock_get_config(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     if processor_module_path in sys.modules:
         processor_module = sys.modules[processor_module_path]
         setattr(
-            processor_module, "length_from_prompt_token_ids_or_embeds", _mock_length_from_prompt_token_ids_or_embeds
+            processor_module,
+            "length_from_prompt_token_ids_or_embeds",
+            _mock_length_from_prompt_token_ids_or_embeds,
         )
 
     # Strategy 3: Now mock async_omni AFTER length_from_prompt_token_ids_or_embeds is mocked
@@ -526,7 +556,11 @@ def mock_get_config(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     async_omni_path = "vllm_omni.entrypoints.async_omni"
     if async_omni_path in sys.modules:
         async_omni_module = sys.modules[async_omni_path]
-        setattr(async_omni_module, "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
+        setattr(
+            async_omni_module,
+            "init_tokenizer_from_configs",
+            _mock_init_tokenizer_from_configs,
+        )
 
     # Now mock get_config and other functions
     fake_hf_config = mocker.MagicMock()
@@ -628,7 +662,11 @@ def test_initialize_stage_configs_called_when_none(
 
     # Patch the imported function and class in the module
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
+    monkeypatch.setattr(
+        omni_module,
+        "OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+    )
     # Apply connector and adapter mocks after importing omni module
     _setup_connector_mocks(monkeypatch, mocker, omni_module)
 
@@ -650,7 +688,9 @@ def test_initialize_stage_configs_called_when_none(
     assert len(omni._stages_ready) == 2
 
 
-def test_generate_raises_on_length_mismatch(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
+def test_generate_raises_on_length_mismatch(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config
+):
     """Test that generate raises ValueError when sampling_params_list length doesn't match."""
 
     def _fake_loader(
@@ -693,7 +733,11 @@ def test_generate_raises_on_length_mismatch(monkeypatch: pytest.MonkeyPatch, moc
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
+    monkeypatch.setattr(
+        omni_module,
+        "OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+    )
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -702,7 +746,9 @@ def test_generate_raises_on_length_mismatch(monkeypatch: pytest.MonkeyPatch, moc
         omni.generate(prompts=["hi"], sampling_params_list=[])
 
 
-def test_generate_pipeline_and_final_outputs(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
+def test_generate_pipeline_and_final_outputs(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config
+):
     """Test multi-stage generation pipeline with queue polling."""
     stage_cfg0 = dict(fake_stage_config)
     stage_cfg0["stage_id"] = 0
@@ -748,7 +794,11 @@ def test_generate_pipeline_and_final_outputs(monkeypatch: pytest.MonkeyPatch, mo
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
+    monkeypatch.setattr(
+        omni_module,
+        "OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+    )
     # Apply connector and adapter mocks after importing omni module
     _setup_connector_mocks(monkeypatch, mocker, omni_module)
     _setup_connector_adapter_mock(monkeypatch, omni_module)
@@ -856,7 +906,11 @@ def test_generate_no_final_output_returns_empty(
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
+    monkeypatch.setattr(
+        omni_module,
+        "OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+    )
     # Apply connector and adapter mocks after importing omni module
     _setup_connector_mocks(monkeypatch, mocker, omni_module)
     _setup_connector_adapter_mock(monkeypatch, omni_module)
@@ -948,7 +1002,11 @@ def test_generate_sampling_params_none_use_default(
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
+    monkeypatch.setattr(
+        omni_module,
+        "OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+    )
     # Apply connector and adapter mocks after importing omni module
     _setup_connector_mocks(monkeypatch, mocker, omni_module)
     _setup_connector_adapter_mock(monkeypatch, omni_module)
@@ -984,7 +1042,9 @@ def test_generate_sampling_params_none_use_default(
     omni.generate(prompts=["p"], sampling_params_list=None)
 
 
-def test_wait_for_stages_ready_timeout(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
+def test_wait_for_stages_ready_timeout(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config
+):
     """Test that _wait_for_stages_ready handles timeout correctly."""
 
     def _fake_loader(
@@ -1038,7 +1098,11 @@ def test_wait_for_stages_ready_timeout(monkeypatch: pytest.MonkeyPatch, mocker: 
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStageNoReady(mocker, cfg, **kwargs))
+    monkeypatch.setattr(
+        omni_module,
+        "OmniStage",
+        lambda cfg, **kwargs: _FakeStageNoReady(mocker, cfg, **kwargs),
+    )
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -1048,7 +1112,9 @@ def test_wait_for_stages_ready_timeout(monkeypatch: pytest.MonkeyPatch, mocker: 
     assert len(omni._stages_ready) == 0
 
 
-def test_generate_handles_error_messages(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
+def test_generate_handles_error_messages(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config
+):
     """Test that generate handles error messages from stages correctly."""
 
     def _fake_loader(
@@ -1091,7 +1157,11 @@ def test_generate_handles_error_messages(monkeypatch: pytest.MonkeyPatch, mocker
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
+    monkeypatch.setattr(
+        omni_module,
+        "OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+    )
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -1131,7 +1201,9 @@ def test_generate_handles_error_messages(monkeypatch: pytest.MonkeyPatch, mocker
     assert len(outputs) == 1
 
 
-def test_close_sends_shutdown_signal(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
+def test_close_sends_shutdown_signal(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config
+):
     """Test that close() sends shutdown signal to all input queues."""
 
     def _fake_loader(
@@ -1174,7 +1246,11 @@ def test_close_sends_shutdown_signal(monkeypatch: pytest.MonkeyPatch, mocker: Mo
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
+    monkeypatch.setattr(
+        omni_module,
+        "OmniStage",
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
+    )
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -1221,7 +1297,9 @@ def _import_class(module_path: str, class_name: str):
     _INHERITANCE_PAIRS,
     ids=[f"{pair[3]}({pair[1]})" for pair in _INHERITANCE_PAIRS],
 )
-def test_overridden_method_signatures_compatible(up_mod: str, up_cls: str, omni_mod: str, omni_cls: str):
+def test_overridden_method_signatures_compatible(
+    up_mod: str, up_cls: str, omni_mod: str, omni_cls: str
+):
     """All params accepted by a base-class method must also be accepted by
     the overriding method in the vllm-omni subclass.  This prevents
     TypeError at runtime when upstream callers pass new arguments."""
@@ -1244,7 +1322,10 @@ def test_overridden_method_signatures_compatible(up_mod: str, up_cls: str, omni_
         except (ValueError, TypeError):
             continue
 
-        omni_has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in omni_sig.parameters.values())
+        omni_has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in omni_sig.parameters.values()
+        )
 
         base_params = base_sig.parameters
         omni_params = set(omni_sig.parameters.keys())
@@ -1261,6 +1342,10 @@ def test_overridden_method_signatures_compatible(up_mod: str, up_cls: str, omni_
             missing.append(pname)
 
         if missing:
-            failures.append(f"{omni_cls}.{name}() missing params {sorted(missing)}; base={base_sig}, omni={omni_sig}")
+            failures.append(
+                f"{omni_cls}.{name}() missing params {sorted(missing)}; base={base_sig}, omni={omni_sig}"
+            )
 
-    assert not failures, f"Signature mismatches found ({len(failures)}):\n" + "\n".join(f"  - {f}" for f in failures)
+    assert not failures, f"Signature mismatches found ({len(failures)}):\n" + "\n".join(
+        f"  - {f}" for f in failures
+    )

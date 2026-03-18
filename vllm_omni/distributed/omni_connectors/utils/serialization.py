@@ -17,7 +17,9 @@ _NDARRAY_MARKER = "__ndarray__"
 _PIL_IMAGE_MARKER = "__pil_image__"
 
 # Keys that identify a RequestOutput dict (for reconstruction)
-_REQUEST_OUTPUT_KEYS = frozenset({"request_id", "prompt", "prompt_token_ids", "outputs", "finished"})
+_REQUEST_OUTPUT_KEYS = frozenset(
+    {"request_id", "prompt", "prompt_token_ids", "outputs", "finished"}
+)
 
 # Keys that identify a CompletionOutput dict (for reconstruction)
 _COMPLETION_OUTPUT_KEYS = frozenset({"index", "text", "token_ids", "finish_reason"})

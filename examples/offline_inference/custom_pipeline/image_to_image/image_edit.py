@@ -62,10 +62,18 @@ from vllm_omni.platforms import current_omni_platform
 # Argument Parser
 # ===========================
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Edit or generate images using Qwen-Image-Edit.")
-    parser.add_argument("--model", default="Qwen/Qwen-Image-Edit", help="Model name or local path.")
-    parser.add_argument("--image", type=str, nargs="+", required=True, help="Input image file(s).")
-    parser.add_argument("--prompt", type=str, required=True, help="Edit description prompt.")
+    parser = argparse.ArgumentParser(
+        description="Edit or generate images using Qwen-Image-Edit."
+    )
+    parser.add_argument(
+        "--model", default="Qwen/Qwen-Image-Edit", help="Model name or local path."
+    )
+    parser.add_argument(
+        "--image", type=str, nargs="+", required=True, help="Input image file(s)."
+    )
+    parser.add_argument(
+        "--prompt", type=str, required=True, help="Edit description prompt."
+    )
     parser.add_argument("--negative-prompt", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
@@ -73,7 +81,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="output.png")
     parser.add_argument("--num-outputs-per-prompt", type=int, default=1)
     parser.add_argument("--num-inference-steps", type=int, default=50)
-    parser.add_argument("--cache-backend", type=str, default=None, choices=["cache_dit", "tea_cache"])
+    parser.add_argument(
+        "--cache-backend", type=str, default=None, choices=["cache_dit", "tea_cache"]
+    )
     parser.add_argument("--ulysses-degree", type=int, default=1)
     parser.add_argument("--ring-degree", type=int, default=1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -87,12 +97,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dit-max-warmup-steps", type=int, default=4)
     parser.add_argument("--cache-dit-residual-diff-threshold", type=float, default=0.24)
     parser.add_argument("--cache-dit-max-continuous-cached-steps", type=int, default=3)
-    parser.add_argument("--cache-dit-enable-taylorseer", action="store_true", default=False)
+    parser.add_argument(
+        "--cache-dit-enable-taylorseer", action="store_true", default=False
+    )
     parser.add_argument("--cache-dit-taylorseer-order", type=int, default=1)
     parser.add_argument(
-        "--cache-dit-scm-steps-mask-policy", type=str, default=None, choices=[None, "slow", "medium", "fast", "ultra"]
+        "--cache-dit-scm-steps-mask-policy",
+        type=str,
+        default=None,
+        choices=[None, "slow", "medium", "fast", "ultra"],
     )
-    parser.add_argument("--cache-dit-scm-steps-policy", type=str, default="dynamic", choices=["dynamic", "static"])
+    parser.add_argument(
+        "--cache-dit-scm-steps-policy",
+        type=str,
+        default="dynamic",
+        choices=["dynamic", "static"],
+    )
     parser.add_argument("--tea-cache-rel-l1-thresh", type=float, default=0.2)
     parser.add_argument("--cfg-parallel-size", type=int, default=1, choices=[1, 2])
     parser.add_argument("--enforce-eager", action="store_true")
@@ -117,10 +137,14 @@ async def main():
         input_images.append(Image.open(image_path).convert(args.color_format))
 
     # Single or multi-image input
-    input_image: Image.Image | list[Image.Image] = input_images[0] if len(input_images) == 1 else input_images
+    input_image: Image.Image | list[Image.Image] = (
+        input_images[0] if len(input_images) == 1 else input_images
+    )
 
     # ---- Torch setup ----
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(
+        args.seed
+    )
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
@@ -220,9 +244,9 @@ async def main():
     print(f"  ✓ trajectory_latents dtype: {req_out.latents.dtype}")
     print(f"  ✓ trajectory_latents mean: {req_out.latents.mean().item():.6f}")
     print(f"  ✓ trajectory_latents std: {req_out.latents.std().item():.6f}")
-    assert req_out.latents.shape[0] == args.num_inference_steps, (
-        f"Expected {args.num_inference_steps} latent snapshots, got {req_out.latents.shape[0]}"
-    )
+    assert (
+        req_out.latents.shape[0] == args.num_inference_steps
+    ), f"Expected {args.num_inference_steps} latent snapshots, got {req_out.latents.shape[0]}"
     print(f"{'=' * 60}\n")
 
     # ---- Save images ----

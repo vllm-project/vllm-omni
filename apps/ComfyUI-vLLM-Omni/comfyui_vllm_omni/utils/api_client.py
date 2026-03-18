@@ -32,7 +32,9 @@ from .types import AudioFormat
 logger = get_logger(__name__)
 
 
-async def url_json(session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs) -> dict[str, Any]:
+async def url_json(
+    session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs
+) -> dict[str, Any]:
     try:
         async with getattr(session, verb)(url, **kwargs) as response:
             if not response.ok:
@@ -48,7 +50,9 @@ async def url_json(session: aiohttp.ClientSession, url: str, verb: str = "get", 
         raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
 
 
-async def url_bytes(session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs) -> bytes:
+async def url_bytes(
+    session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs
+) -> bytes:
     try:
         async with getattr(session, verb)(url, **kwargs) as response:
             if not response.ok:
@@ -63,7 +67,11 @@ async def url_bytes(session: aiohttp.ClientSession, url: str, verb: str = "get",
 
 class VLLMOmniClient:
     def __init__(
-        self, base_url: str, timeout: float | None = None, poll_interval: float = 5.0, max_poll_duration: float = 60 * 5
+        self,
+        base_url: str,
+        timeout: float | None = None,
+        poll_interval: float = 5.0,
+        max_poll_duration: float = 60 * 5,
     ):
         self.base_url = base_url
         self.timeout = aiohttp.ClientTimeout(total=timeout)
@@ -118,25 +126,33 @@ class VLLMOmniClient:
                     except aiohttp.ContentTypeError as e:
                         raise RuntimeError(f"Invalid JSON response from vLLM-Omni: {e}")
                     if "data" not in data:
-                        raise RuntimeError("API response missing 'data' field - expected OpenAI DALL-E format")
+                        raise RuntimeError(
+                            "API response missing 'data' field - expected OpenAI DALL-E format"
+                        )
                     if not data["data"]:
                         raise RuntimeError("API returned empty data array")
 
                     image_tensors = []
                     for idx, img in enumerate(data["data"]):
                         if "b64_json" not in img:
-                            raise RuntimeError(f"API returned image #{idx} without 'b64_json' field")
+                            raise RuntimeError(
+                                f"API returned image #{idx} without 'b64_json' field"
+                            )
                         base64_str = img["b64_json"]
                         tensor = base64_to_image_tensor(base64_str)
                         image_tensors.append(tensor)
                         logger.debug("Image #%d has shape %s", idx, tensor.shape)
 
                     batch_tensor = torch.stack(image_tensors, dim=0)
-                    logger.debug("batch_tensor output has shape: %s", batch_tensor.shape)
+                    logger.debug(
+                        "batch_tensor output has shape: %s", batch_tensor.shape
+                    )
                     return batch_tensor
 
             except aiohttp.ClientError as e:
-                raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
+                raise RuntimeError(
+                    f"Network error connecting to vLLM-Omni at {url}: {e}"
+                )
 
     async def edit_image(
         self,
@@ -198,14 +214,18 @@ class VLLMOmniClient:
                         raise RuntimeError(f"Invalid JSON response from vLLM-Omni: {e}")
 
                     if "data" not in data:
-                        raise RuntimeError("API response missing 'data' field - expected OpenAI DALL-E format")
+                        raise RuntimeError(
+                            "API response missing 'data' field - expected OpenAI DALL-E format"
+                        )
                     if not data["data"]:
                         raise RuntimeError("API returned empty data array")
 
                     image_tensors = []
                     for idx, img in enumerate(data["data"]):
                         if "b64_json" not in img:
-                            raise RuntimeError(f"API returned image #{idx} without 'b64_json' field")
+                            raise RuntimeError(
+                                f"API returned image #{idx} without 'b64_json' field"
+                            )
                         base64_str = img["b64_json"]
                         tensor = base64_to_image_tensor(base64_str)
                         image_tensors.append(tensor)
@@ -213,7 +233,9 @@ class VLLMOmniClient:
                     return torch.stack(image_tensors, dim=0)
 
             except aiohttp.ClientError as e:
-                raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
+                raise RuntimeError(
+                    f"Network error connecting to vLLM-Omni at {url}: {e}"
+                )
 
     async def generate_image_chat_completion(
         self,
@@ -301,9 +323,13 @@ class VLLMOmniClient:
             url = f"{self.base_url}/videos"
             data = await url_json(session, url, "post", data=form)
             if (job_id := data.get("id", None)) is None:
-                raise RuntimeError("API response missing job 'id' field - expected OpenAI compliant format")
+                raise RuntimeError(
+                    "API response missing job 'id' field - expected OpenAI compliant format"
+                )
             if (job_status := data.get("status", None)) is None:
-                raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
+                raise RuntimeError(
+                    "API response missing job 'status' field - expected OpenAI compliant format"
+                )
 
             # Poll for video generation job completion
             deadline = asyncio.get_running_loop().time() + self.max_poll_duration
@@ -313,9 +339,13 @@ class VLLMOmniClient:
 
                 data = await url_json(session, url)
                 if (job_status := data.get("status", None)) is None:
-                    raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
+                    raise RuntimeError(
+                        "API response missing job 'status' field - expected OpenAI compliant format"
+                    )
                 if asyncio.get_running_loop().time() >= deadline:
-                    raise RuntimeError(f"Timed out waiting for video job {job_id} to complete")
+                    raise RuntimeError(
+                        f"Timed out waiting for video job {job_id} to complete"
+                    )
 
             if job_status == "failed":
                 raise RuntimeError(f"Video job failed: {data}")
@@ -446,9 +476,13 @@ class VLLMOmniClient:
                     return audio
 
             except aiohttp.ClientError as e:
-                raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
+                raise RuntimeError(
+                    f"Network error connecting to vLLM-Omni at {url}: {e}"
+                )
 
-    async def _generate_base_chat_completion(self, model: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _generate_base_chat_completion(
+        self, model: str, payload: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         logger.debug("Omni payload: %s", pretty_printer.pformat(payload))
         await self._check_model_exist(model)
 
@@ -479,10 +513,14 @@ class VLLMOmniClient:
                     try:
                         return data["choices"]
                     except (KeyError, TypeError):
-                        raise RuntimeError("Invalid JSON response from vLLM-Omni: missing 'choices' field")
+                        raise RuntimeError(
+                            "Invalid JSON response from vLLM-Omni: missing 'choices' field"
+                        )
 
             except aiohttp.ClientError as e:
-                raise RuntimeError(f"Network error connecting to vLLM-Omni at {self.base_url}: {e}")
+                raise RuntimeError(
+                    f"Network error connecting to vLLM-Omni at {self.base_url}: {e}"
+                )
 
     async def _check_model_exist(self, model: str):
         url = self.base_url + "/models"
@@ -502,15 +540,21 @@ class VLLMOmniClient:
                     try:
                         data = await response.json()
                     except aiohttp.ContentTypeError as e:
-                        raise RuntimeError(f"Invalid JSON response when getting hosted model list from vLLM-Omni: {e}")
+                        raise RuntimeError(
+                            f"Invalid JSON response when getting hosted model list from vLLM-Omni: {e}"
+                        )
 
             except aiohttp.ClientError as e:
-                raise RuntimeError(f"Network error connecting to vLLM-Omni at {self.base_url}: {e}")
+                raise RuntimeError(
+                    f"Network error connecting to vLLM-Omni at {self.base_url}: {e}"
+                )
         try:
             model_list = data["data"]
             model_found = next((True for m in model_list if m["id"] == model), False)
         except (KeyError, TypeError):
-            raise RuntimeError(f"Invalid JSON response of the hosted model list: {data}")
+            raise RuntimeError(
+                f"Invalid JSON response of the hosted model list: {data}"
+            )
 
         if not model_found:
             raise ValueError(f"Model {model} not served at {self.base_url}.")
@@ -537,9 +581,13 @@ class VLLMOmniClient:
                 }
             )
         if audio is not None:
-            message_content.append({"type": "audio_url", "audio_url": {"url": audio_to_base64(audio)}})
+            message_content.append(
+                {"type": "audio_url", "audio_url": {"url": audio_to_base64(audio)}}
+            )
         if video is not None:
-            message_content.append({"type": "video_url", "video_url": {"url": video_to_base64(video)}})
+            message_content.append(
+                {"type": "video_url", "video_url": {"url": video_to_base64(video)}}
+            )
         messages = [{"role": "user", "content": message_content}]
 
         payload: dict[str, Any] = {"messages": messages, "model": model}
@@ -549,20 +597,34 @@ class VLLMOmniClient:
         combined_extra_body: dict[str, Any] = {}
         if sampling_params is not None:
             spec, _ = lookup_model_spec(model)
-            is_single_sampling_param = isinstance(sampling_params, dict) or len(sampling_params) == 1
+            is_single_sampling_param = (
+                isinstance(sampling_params, dict) or len(sampling_params) == 1
+            )
 
-            if (spec is None and is_single_sampling_param) or (spec is not None and spec["stages"] == ["diffusion"]):
+            if (spec is None and is_single_sampling_param) or (
+                spec is not None and spec["stages"] == ["diffusion"]
+            ):
                 # Diffusion format: extra_body directly contains sampling params.
                 # Validation has already taken care of matching sampling params' types and length. Safe to take [0].
                 # * Use this mode if the model is a simple one-stage diffusion model.
                 # * Fallback to this mode if model is not registered and a single sampling param is provided.
-                sampling_params = sampling_params if isinstance(sampling_params, dict) else sampling_params[0]
+                sampling_params = (
+                    sampling_params
+                    if isinstance(sampling_params, dict)
+                    else sampling_params[0]
+                )
                 combined_extra_body: dict[str, Any] = sampling_params.copy()
                 if "n" in combined_extra_body:
-                    combined_extra_body["num_outputs_per_prompt"] = combined_extra_body.pop("n")
+                    combined_extra_body["num_outputs_per_prompt"] = (
+                        combined_extra_body.pop("n")
+                    )
             else:
                 # AR format: the payload has a sampling_params_list field, containing a list.
-                sampling_params_list = sampling_params if isinstance(sampling_params, list) else [sampling_params]
+                sampling_params_list = (
+                    sampling_params
+                    if isinstance(sampling_params, list)
+                    else [sampling_params]
+                )
                 payload["sampling_params_list"] = sampling_params_list
 
         if negative_prompt:

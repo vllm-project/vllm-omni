@@ -77,7 +77,9 @@ class TestWorkerWrapperBaseInitialization:
 
     def test_basic_initialization(self, mocker: MockerFixture, mock_od_config):
         """Test basic initialization without extensions."""
-        mock_worker_init = mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
+        mock_worker_init = mocker.patch.object(
+            DiffusionWorker, "__init__", return_value=None
+        )
 
         wrapper = WorkerWrapperBase(
             gpu_id=0,
@@ -108,7 +110,9 @@ class TestWorkerWrapperBaseInitialization:
 class TestWorkerWrapperBaseExtension:
     """Test WorkerWrapperBase worker extension functionality."""
 
-    def test_prepare_worker_class_without_extension(self, mocker: MockerFixture, mock_od_config):
+    def test_prepare_worker_class_without_extension(
+        self, mocker: MockerFixture, mock_od_config
+    ):
         """Test _prepare_worker_class without a worker extension."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
         wrapper = WorkerWrapperBase(
@@ -119,7 +123,9 @@ class TestWorkerWrapperBaseExtension:
         worker_class = wrapper._prepare_worker_class()
         assert worker_class == DiffusionWorker
 
-    def test_prepare_worker_class_with_extension_class(self, mocker: MockerFixture, mock_od_config):
+    def test_prepare_worker_class_with_extension_class(
+        self, mocker: MockerFixture, mock_od_config
+    ):
         """Test _prepare_worker_class with an explicit extension class."""
 
         class TestExtension:
@@ -137,7 +143,9 @@ class TestWorkerWrapperBaseExtension:
         assert hasattr(wrapper.worker.__class__, "custom_method")
         assert TestExtension in wrapper.worker.__class__.__bases__
 
-    def test_prepare_worker_class_with_extension_string(self, mocker: MockerFixture, mock_od_config):
+    def test_prepare_worker_class_with_extension_string(
+        self, mocker: MockerFixture, mock_od_config
+    ):
         """Test _prepare_worker_class with worker extension as string."""
         mock_resolve = mocker.patch("vllm.utils.import_utils.resolve_obj_by_qualname")
         mock_resolve.return_value = TestExtension
@@ -164,7 +172,9 @@ class TestWorkerWrapperBaseDelegation:
     def test_generate_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that generate() delegates to worker.generate()."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         mock_output = mocker.Mock()
         wrapper.worker.generate = mocker.Mock(return_value=mock_output)
 
@@ -177,7 +187,9 @@ class TestWorkerWrapperBaseDelegation:
     def test_execute_model_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that execute_model() delegates to worker.execute_model()."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         mock_output = mocker.Mock()
         wrapper.worker.execute_model = mocker.Mock(return_value=mock_output)
 
@@ -190,7 +202,9 @@ class TestWorkerWrapperBaseDelegation:
     def test_load_weights_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that load_weights() delegates to worker.load_weights()."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         expected_result = {"weight1", "weight2"}
         wrapper.worker.load_weights = mocker.Mock(return_value=expected_result)
 
@@ -203,7 +217,9 @@ class TestWorkerWrapperBaseDelegation:
     def test_sleep_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that sleep() delegates to worker.sleep()."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         wrapper.worker.sleep = mocker.Mock(return_value=True)
         result = wrapper.sleep(level=1)
 
@@ -213,7 +229,9 @@ class TestWorkerWrapperBaseDelegation:
     def test_wake_up_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that wake_up() delegates to worker.wake_up()."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         wrapper.worker.wake_up = mocker.Mock(return_value=True)
 
         result = wrapper.wake_up(tags=["weights"])
@@ -223,7 +241,9 @@ class TestWorkerWrapperBaseDelegation:
     def test_shutdown_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test that shutdown() delegates to worker.shutdown()."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         wrapper.worker.shutdown = mocker.Mock(return_value=None)
 
         result = wrapper.shutdown()
@@ -242,7 +262,9 @@ class TestWorkerWrapperBaseExecuteMethod:
     def test_execute_method_success(self, mocker: MockerFixture, mock_od_config):
         """Test execute_method successfully calls worker method."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         wrapper.worker.test_method = mocker.Mock(return_value="method_result")
 
         result = wrapper.execute_method("test_method", "arg1", kwarg1="value1")
@@ -253,7 +275,9 @@ class TestWorkerWrapperBaseExecuteMethod:
     def test_execute_method_with_no_args(self, mocker: MockerFixture, mock_od_config):
         """Test execute_method with no arguments."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         wrapper.worker.no_args_method = mocker.Mock(return_value="no_args_result")
 
         result = wrapper.execute_method("no_args_method")
@@ -263,8 +287,12 @@ class TestWorkerWrapperBaseExecuteMethod:
     def test_execute_method_error(self, mocker: MockerFixture, mock_od_config):
         """Test execute_method raises exception on error."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
-        wrapper.worker.error_method = mocker.Mock(side_effect=RuntimeError("Test error"))
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
+        wrapper.worker.error_method = mocker.Mock(
+            side_effect=RuntimeError("Test error")
+        )
 
         with pytest.raises(RuntimeError, match="Test error"):
             wrapper.execute_method("error_method")
@@ -272,7 +300,9 @@ class TestWorkerWrapperBaseExecuteMethod:
     def test_execute_method_invalid_type(self, mocker: MockerFixture, mock_od_config):
         """Test execute_method with invalid method type."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
 
         with pytest.raises(AssertionError, match="Method must be str"):
             wrapper.execute_method(b"bytes_method")
@@ -289,14 +319,18 @@ class TestWorkerWrapperBaseGetAttr:
     def test_getattr_delegation(self, mocker: MockerFixture, mock_od_config):
         """Test __getattr__ delegates to worker attributes."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         wrapper.worker.custom_attribute = "test_value"
         assert wrapper.custom_attribute == "test_value"
 
     def test_getattr_method_access(self, mocker: MockerFixture, mock_od_config):
         """Test __getattr__ delegates to worker methods."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         wrapper.worker.custom_method = mocker.Mock(return_value="method_result")
 
         result = wrapper.custom_method()
@@ -306,7 +340,9 @@ class TestWorkerWrapperBaseGetAttr:
     def test_getattr_missing_attribute(self, mocker: MockerFixture, mock_od_config):
         """Test __getattr__ raises AttributeError for missing attributes."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
-        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
+        wrapper = WorkerWrapperBase(
+            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
+        )
         with pytest.raises(AttributeError):
             _ = wrapper.nonexistent_attribute
 
@@ -319,7 +355,9 @@ class TestWorkerWrapperBaseGetAttr:
 class TestWorkerWrapperBaseEdgeCases:
     """Test WorkerWrapperBase edge cases and special scenarios."""
 
-    def test_extension_conflict_warning(self, mocker: MockerFixture, mock_od_config, caplog):
+    def test_extension_conflict_warning(
+        self, mocker: MockerFixture, mock_od_config, caplog
+    ):
         """Test a warning is logged when an extension conflicts with worker."""
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
 
@@ -336,7 +374,9 @@ class TestWorkerWrapperBaseEdgeCases:
         )
         assert wrapper.worker is not None
 
-    def test_multiple_extensions_same_class(self, mocker: MockerFixture, mock_od_config):
+    def test_multiple_extensions_same_class(
+        self, mocker: MockerFixture, mock_od_config
+    ):
         """Test that applying same extension twice doesn't duplicate it."""
 
         class TestExtension:
@@ -390,7 +430,9 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
-        custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
+        custom_args = {
+            "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
+        }
 
         # Call re_init_pipeline
         wrapper.worker.re_init_pipeline(custom_args)
@@ -423,7 +465,9 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
-        custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
+        custom_args = {
+            "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
+        }
 
         # Call re_init_pipeline
         wrapper.worker.re_init_pipeline(custom_args)
@@ -432,7 +476,9 @@ class TestCustomPipelineWorkerExtension:
         mock_gc_collect.assert_called_once()
         mock_empty_cache.assert_called_once()
 
-    def test_re_init_pipeline_none_pipeline(self, mocker: MockerFixture, mock_od_config):
+    def test_re_init_pipeline_none_pipeline(
+        self, mocker: MockerFixture, mock_od_config
+    ):
         """Test re_init_pipeline when pipeline is None."""
         mocker.patch("torch.cuda.empty_cache")
         mocker.patch("gc.collect")
@@ -452,7 +498,9 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
-        custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
+        custom_args = {
+            "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
+        }
 
         # Should not raise an error
         wrapper.worker.re_init_pipeline(custom_args)
@@ -460,9 +508,13 @@ class TestCustomPipelineWorkerExtension:
         # Verify load_model was still called
         wrapper.worker.load_model.assert_called_once()
 
-    def test_custom_pipeline_args_initialization(self, mocker: MockerFixture, mock_od_config):
+    def test_custom_pipeline_args_initialization(
+        self, mocker: MockerFixture, mock_od_config
+    ):
         """Test initialization with custom_pipeline_args calls re_init_pipeline."""
-        custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
+        custom_args = {
+            "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
+        }
 
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
         mock_prepare = mocker.patch.object(WorkerWrapperBase, "_prepare_worker_class")
@@ -483,7 +535,9 @@ class TestCustomPipelineWorkerExtension:
         # Verify re_init_pipeline was called with custom_pipeline_args
         mock_worker_instance.re_init_pipeline.assert_called_once_with(custom_args)
 
-    def test_custom_pipeline_with_explicit_extension(self, mocker: MockerFixture, mock_od_config):
+    def test_custom_pipeline_with_explicit_extension(
+        self, mocker: MockerFixture, mock_od_config
+    ):
         """Test that explicit worker_extension_cls is preserved when custom_pipeline_args is provided."""
 
         class CustomExtension:
@@ -493,7 +547,9 @@ class TestCustomPipelineWorkerExtension:
             def custom_extension_method(self):
                 return "custom_extension_method"
 
-        custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
+        custom_args = {
+            "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
+        }
 
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
         wrapper = WorkerWrapperBase(
@@ -508,7 +564,9 @@ class TestCustomPipelineWorkerExtension:
         assert CustomExtension in wrapper.worker.__class__.__bases__
         assert hasattr(wrapper.worker, "custom_extension_method")
 
-    def test_re_init_pipeline_multiple_calls(self, mocker: MockerFixture, mock_od_config):
+    def test_re_init_pipeline_multiple_calls(
+        self, mocker: MockerFixture, mock_od_config
+    ):
         """Test calling re_init_pipeline multiple times."""
         mocker.patch("torch.cuda.empty_cache")
         mocker.patch("gc.collect")
@@ -531,14 +589,18 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.load_model = mocker.Mock()
 
         # First call
-        custom_args1 = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
+        custom_args1 = {
+            "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
+        }
         wrapper.worker.re_init_pipeline(custom_args1)
 
         # Update pipeline for second call
         mock_model_runner.pipeline = mock_pipeline2
 
         # Second call
-        custom_args2 = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
+        custom_args2 = {
+            "pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"
+        }
         wrapper.worker.re_init_pipeline(custom_args2)
 
         # Verify load_model was called twice with different pipelines

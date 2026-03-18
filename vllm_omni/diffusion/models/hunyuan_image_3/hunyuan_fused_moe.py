@@ -13,7 +13,9 @@ class HunyuanFusedMoEDefault(SharedFusedMoE):
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
         super().__init__(prefix=prefix, **kwargs)
         self._prefix = prefix
-        self._init_hook_handle = self.register_forward_pre_hook(self._initialize_kernel_hook, with_kwargs=True)
+        self._init_hook_handle = self.register_forward_pre_hook(
+            self._initialize_kernel_hook, with_kwargs=True
+        )
 
     def _initialize_kernel_hook(self, module: Any, args: Any, kwargs: Any) -> None:
         if self.quant_method:
@@ -44,7 +46,9 @@ class HunyuanFusedMoE:
         num_redundant_experts: int = 0,
     ) -> list[tuple[str, str, int, str]]:
         impl = resolve_obj_by_qualname(
-            current_omni_platform.get_diffusion_model_impl_qualname("hunyuan_fused_moe"),
+            current_omni_platform.get_diffusion_model_impl_qualname(
+                "hunyuan_fused_moe"
+            ),
         )
         return impl.make_expert_params_mapping(
             model,

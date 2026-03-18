@@ -40,7 +40,10 @@ from tests.utils import hardware_test
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 STAGE_CONFIGS_PATH = str(
-    Path(__file__).parent.parent / "offline_inference" / "stage_configs" / "bagel_sharedmemory_ci.yaml"
+    Path(__file__).parent.parent
+    / "offline_inference"
+    / "stage_configs"
+    / "bagel_sharedmemory_ci.yaml"
 )
 
 TEXT2IMG_PROMPT = "A cute cat"
@@ -98,7 +101,9 @@ class BagelOmniServer:
         try:
             if not _wait_for_port(self.host, self.port, timeout=600, proc=self.proc):
                 self.terminate()
-                raise RuntimeError(f"Server failed to start within 600 seconds on {self.host}:{self.port}")
+                raise RuntimeError(
+                    f"Server failed to start within 600 seconds on {self.host}:{self.port}"
+                )
         except Exception:
             self.terminate()
             raise
@@ -134,7 +139,9 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_port(host: str, port: int, timeout: int = 600, proc: subprocess.Popen | None = None) -> bool:
+def _wait_for_port(
+    host: str, port: int, timeout: int = 600, proc: subprocess.Popen | None = None
+) -> bool:
     start = time.time()
     while time.time() - start < timeout:
         if proc is not None and proc.poll() is not None:
@@ -160,7 +167,9 @@ def _send_chat_request(
     timeout: int = 300,
 ) -> dict[str, Any]:
     """Send a chat completion request matching the openai_chat_client.py format."""
-    content: list[dict[str, Any]] = [{"type": "text", "text": f"<|im_start|>{prompt}<|im_end|>"}]
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": f"<|im_start|>{prompt}<|im_end|>"}
+    ]
 
     if image is not None:
         buffer = BytesIO()
@@ -229,7 +238,9 @@ def test_bagel_text2img_online():
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_img2img_online():
     """Test Bagel img2img via OpenAI-compatible chat completions API."""
-    input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
+    input_image = ImageAsset(
+        "2560px-Gfp-wisconsin-madison-the-nature-boardwalk"
+    ).pil_image.convert("RGB")
 
     with BagelOmniServer() as server:
         response_data = _send_chat_request(

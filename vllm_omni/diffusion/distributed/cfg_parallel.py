@@ -71,7 +71,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 if cfg_rank == 0:
                     noise_pred = gathered[0]
                     neg_noise_pred = gathered[1]
-                    noise_pred = self.combine_cfg_noise(noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize)
+                    noise_pred = self.combine_cfg_noise(
+                        noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize
+                    )
                     return noise_pred
                 else:
                     return None
@@ -86,7 +88,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     negative_noise_pred = negative_noise_pred[:, :output_slice]
 
                 noise_pred = self.combine_cfg_noise(
-                    positive_noise_pred, negative_noise_pred, true_cfg_scale, cfg_normalize
+                    positive_noise_pred,
+                    negative_noise_pred,
+                    true_cfg_scale,
+                    cfg_normalize,
                 )
                 return noise_pred
         else:
@@ -96,7 +101,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 pred = pred[:, :output_slice]
             return pred
 
-    def cfg_normalize_function(self, noise_pred: torch.Tensor, comb_pred: torch.Tensor) -> torch.Tensor:
+    def cfg_normalize_function(
+        self, noise_pred: torch.Tensor, comb_pred: torch.Tensor
+    ) -> torch.Tensor:
         """
         Normalize the combined noise prediction.
 
@@ -113,7 +120,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
         return noise_pred
 
     def combine_cfg_noise(
-        self, noise_pred: torch.Tensor, neg_noise_pred: torch.Tensor, true_cfg_scale: float, cfg_normalize: bool = False
+        self,
+        noise_pred: torch.Tensor,
+        neg_noise_pred: torch.Tensor,
+        true_cfg_scale: float,
+        cfg_normalize: bool = False,
     ) -> torch.Tensor:
         """
         Combine conditional and unconditional noise predictions with CFG.
@@ -182,7 +193,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         raise NotImplementedError("Subclasses must implement diffuse")
 
-    def scheduler_step(self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
+    def scheduler_step(
+        self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor
+    ) -> torch.Tensor:
         """
         Step the scheduler.
 
@@ -197,7 +210,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
         return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
     def scheduler_step_maybe_with_cfg(
-        self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor, do_true_cfg: bool
+        self,
+        noise_pred: torch.Tensor,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        do_true_cfg: bool,
     ) -> torch.Tensor:
         """
         Step the scheduler with (maybe) automatic CFG parallel synchronization.
@@ -215,7 +232,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
             Updated latents (synchronized across all CFG ranks)
         """
         # Automatically detect CFG parallel configuration
-        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        cfg_parallel_ready = (
+            do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        )
 
         if cfg_parallel_ready:
             cfg_group = get_cfg_group()

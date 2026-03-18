@@ -44,14 +44,18 @@ def modify_stage(default_path, updates, deletes):
     return path
 
 
-def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+def create_unique_server_params(
+    configs: list[dict[str, Any]],
+) -> list[tuple[str, str, str]]:
     unique_params = []
     seen = set()
     for config in configs:
         test_name = config["test_name"]
         model = config["server_params"]["model"]
         stage_config_name = config["server_params"]["stage_config_name"]
-        stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / stage_config_name)
+        stage_config_path = str(
+            Path(__file__).parent.parent / "stage_configs" / stage_config_name
+        )
         delete = config["server_params"].get("delete", None)
         update = config["server_params"].get("update", None)
         stage_config_path = modify_stage(stage_config_path, update, delete)
@@ -98,7 +102,10 @@ def omni_server(request):
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+        with OmniServer(
+            model,
+            ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"],
+        ) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
             yield server
@@ -116,7 +123,9 @@ def run_benchmark(
 ) -> Any:
     """Run a single benchmark iteration and return the parsed result JSON."""
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
+    result_filename = (
+        f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
+    )
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -131,7 +140,12 @@ def run_benchmark(
         ]
     )
     process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
     )
 
     for line in iter(process.stdout.readline, ""):
@@ -180,7 +194,9 @@ def benchmark_params(request, omni_server):
     test_name, param_index = request.param
 
     if test_name != omni_server.test_name:
-        pytest.skip(f"Skipping parameter for {test_name} - current server is {omni_server.test_name}")
+        pytest.skip(
+            f"Skipping parameter for {test_name} - current server is {omni_server.test_name}"
+        )
 
     all_params = get_benchmark_params_for_server(test_name)
 
@@ -188,7 +204,9 @@ def benchmark_params(request, omni_server):
         raise ValueError(f"No benchmark parameters found for test: {test_name}")
 
     if param_index >= len(all_params):
-        raise ValueError(f"No benchmark parameters found for index {param_index} in test: {test_name}")
+        raise ValueError(
+            f"No benchmark parameters found for index {param_index} in test: {test_name}"
+        )
 
     if all_params[param_index]["dataset_name"] == "random-mm":
         # TODO: Due to known issues, skip the random-mm dataset.
@@ -210,9 +228,13 @@ def assert_result(result, params, num_prompt):
     for metric_name, baseline_value in baseline_data.items():
         current_value = result[metric_name]
         if "throughput" in metric_name:
-            assert current_value >= baseline_value, f"{metric_name}: {current_value} < {baseline_value}"
+            assert (
+                current_value >= baseline_value
+            ), f"{metric_name}: {current_value} < {baseline_value}"
         else:
-            assert current_value <= baseline_value, f"{metric_name}: {current_value} > {baseline_value}"
+            assert (
+                current_value <= baseline_value
+            ), f"{metric_name}: {current_value} > {baseline_value}"
 
 
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -248,7 +270,9 @@ def test_performance_benchmark(omni_server, benchmark_params):
             max_concurrency_list = max_concurrency_list * len(num_prompt_list)
         max_len = max(len(qps_list), len(max_concurrency_list))
     elif len(num_prompt_list) != max_len and max_len > 0:
-        raise ValueError("The number of prompts does not match the QPS or max_concurrency")
+        raise ValueError(
+            "The number of prompts does not match the QPS or max_concurrency"
+        )
 
     args = ["--host", host, "--port", str(port)]
     exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency"}
@@ -281,7 +305,14 @@ def test_performance_benchmark(omni_server, benchmark_params):
 
     # concurrency test
     for concurrency, num_prompt in zip(max_concurrency_list, num_prompt_list):
-        args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
+        args = args + [
+            "--max-concurrency",
+            str(concurrency),
+            "--num-prompts",
+            str(num_prompt),
+            "--request-rate",
+            "inf",
+        ]
         result = run_benchmark(
             args=args,
             test_name=test_name,

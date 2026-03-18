@@ -74,7 +74,9 @@ def _extract_single_image(outputs) -> Image.Image:
 
     images = req_out.images
     if images is None or len(images) != 1:
-        raise ValueError(f"Expected 1 image, got {0 if images is None else len(images)}")
+        raise ValueError(
+            f"Expected 1 image, got {0 if images is None else len(images)}"
+        )
     return images[0]
 
 
@@ -161,7 +163,10 @@ def _run_zimage_generate(
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
-    if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
+    if (
+        not current_omni_platform.is_available()
+        or current_omni_platform.device_count() < 2
+    ):
         pytest.skip("Z-Image TP=2 requires >= 2 devices.")
 
     enforce_eager = False
@@ -210,20 +215,31 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
         f"(thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e})"
     )
 
-    print(f"Z-Image TP perf (lower is better): tp1_time_s={tp1_time_s:.6f}, tp2_time_s={tp2_time_s:.6f}")
-    assert tp2_time_s < tp1_time_s, f"Expected TP=2 to be faster than TP=1 (tp1={tp1_time_s}, tp2={tp2_time_s})"
-
-    print(f"Z-Image TP peak memory (MB): tp1_peak_mem={tp1_peak_mem:.2f}, tp2_peak_mem={tp2_peak_mem:.2f}")
-    assert tp2_peak_mem < tp1_peak_mem, (
-        f"Expected TP=2 to use less peak memory than TP=1 (tp1={tp1_peak_mem}, tp2={tp2_peak_mem})"
+    print(
+        f"Z-Image TP perf (lower is better): tp1_time_s={tp1_time_s:.6f}, tp2_time_s={tp2_time_s:.6f}"
     )
+    assert (
+        tp2_time_s < tp1_time_s
+    ), f"Expected TP=2 to be faster than TP=1 (tp1={tp1_time_s}, tp2={tp2_time_s})"
+
+    print(
+        f"Z-Image TP peak memory (MB): tp1_peak_mem={tp1_peak_mem:.2f}, tp2_peak_mem={tp2_peak_mem:.2f}"
+    )
+    assert (
+        tp2_peak_mem < tp1_peak_mem
+    ), f"Expected TP=2 to use less peak memory than TP=1 (tp1={tp1_peak_mem}, tp2={tp2_peak_mem})"
 
 
 @pytest.mark.integration
 def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
-        pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
-    if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
+        pytest.skip(
+            "Z-Image VAE patch parallel e2e test is only supported on CUDA for now."
+        )
+    if (
+        not current_omni_platform.is_available()
+        or current_omni_platform.device_count() < 2
+    ):
         pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 devices.")
 
     enforce_eager = False

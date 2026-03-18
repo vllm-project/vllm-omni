@@ -10,13 +10,18 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
-from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FA3, HAS_FLASH_ATTN
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import (
+    HAS_FA3,
+    HAS_FLASH_ATTN,
+)
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
     # ParallelAttentionStrategy, # Not used in type hint below currently
 )
-from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.distributed.group_coordinator import (
+    SequenceParallelGroupCoordinator,
+)
 
 # from vllm_omni.diffusion.attention.backends.ring_selector import AttnType # Already imported above
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -90,7 +95,9 @@ class RingParallelAttention:
         ctx = _RingCtx(name=self.name)
         return query, key, value, attn_metadata, ctx
 
-    def post_attention(self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None) -> torch.Tensor:
+    def post_attention(
+        self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None
+    ) -> torch.Tensor:
         # Ring attention output is already sharded correctly along sequence dimension.
         return attn_output
 
@@ -123,7 +130,9 @@ class RingParallelAttention:
         elif not HAS_FA3 and not HAS_FLASH_ATTN:
             if backend_pref != "sdpa":
                 logger = init_logger(__name__)
-                logger.warning_once("Flash Attention (FA2/FA3) is not available! Force enabling SDPA.")
+                logger.warning_once(
+                    "Flash Attention (FA2/FA3) is not available! Force enabling SDPA."
+                )
             backend_pref = "sdpa"
 
         # Extract joint tensors
@@ -136,7 +145,9 @@ class RingParallelAttention:
                 joint_strategy = attn_metadata.joint_strategy
 
         if backend_pref == "sdpa" or backend_pref == "torch":
-            from vllm_omni.diffusion.attention.backends.ring_pytorch_attn import ring_pytorch_attn_func
+            from vllm_omni.diffusion.attention.backends.ring_pytorch_attn import (
+                ring_pytorch_attn_func,
+            )
 
             return ring_pytorch_attn_func(
                 query,
@@ -151,7 +162,9 @@ class RingParallelAttention:
                 joint_strategy=joint_strategy,
             )
 
-        from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
+        from vllm_omni.diffusion.attention.backends.ring_flash_attn import (
+            ring_flash_attn_func,
+        )
 
         # Prefer FA3 over FA2 for better performance (FA3 supports Ampere/Ada/Hopper)
         attn_type = AttnType.FA3 if HAS_FA3 else AttnType.FA

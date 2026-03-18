@@ -69,7 +69,9 @@ class OmniGPUWorkerBase(GPUWorker):
 
         if process_memory is not None:
             # NVML available: use per-process memory
-            self.available_kv_cache_memory_bytes = max(0, self.requested_memory - process_memory)
+            self.available_kv_cache_memory_bytes = max(
+                0, self.requested_memory - process_memory
+            )
             logger.debug(
                 "Process-scoped memory (PID %d, GPU %d): requested=%s, used=%s, available=%s",
                 os.getpid(),
@@ -90,7 +92,9 @@ class OmniGPUWorkerBase(GPUWorker):
                 + profile_result.torch_peak_increase
                 + profile_result.non_torch_increase
             )
-            self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
+            self.available_kv_cache_memory_bytes = max(
+                0, self.requested_memory - profiled_usage
+            )
             logger.debug(
                 "Profiling fallback (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
                 os.getpid(),
