@@ -54,6 +54,8 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             self._pending_save_reqs = deque()
             self._finished_save_reqs = set()
             self.stop_event = threading.Event()
+            self._recv_cond = threading.Condition()
+            self._save_cond = threading.Condition()
 
         monkeypatch.setattr(OmniTransferAdapterBase, "__init__", _fake_base_init)
         monkeypatch.setattr(

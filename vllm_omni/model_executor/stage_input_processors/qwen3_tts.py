@@ -93,7 +93,6 @@ def talker2code2wav_async_chunk(
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
     elif not finished:
-        # Some steps may not produce pooling_output. Only flush on finish.
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -150,7 +149,7 @@ def talker2code2wav_async_chunk(
         if finished:
             return {
                 "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "finished": True,
             }
         return None
 
@@ -191,10 +190,12 @@ def talker2code2wav_async_chunk(
         window_frames = ref_frames + window_frames
         left_context_size += len(ref_frames)
 
-    code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    num_quantizers = len(window_frames[0])
+    num_frames = len(window_frames)
+    code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
 
     return {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,
-        "finished": torch.tensor(finished, dtype=torch.bool),
+        "finished": finished,
     }
