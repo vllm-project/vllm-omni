@@ -6,6 +6,7 @@ The image generation part is derived from dougbtv/comfyui-vllm-omni by Doug (@do
 Original source at https://github.com/dougbtv/comfyui-vllm-omni, distributed under the MIT License.
 """
 
+import asyncio
 import json
 from typing import Any
 
@@ -18,8 +19,8 @@ from .format import (
     audio_to_base64,
     base64_to_audio,
     base64_to_image_tensor,
-    base64_to_video,
     bytes_to_audio,
+    bytes_to_video,
     image_tensor_to_base64,
     image_tensor_to_png_bytes,
     video_to_base64,
@@ -31,10 +32,43 @@ from .types import AudioFormat
 logger = get_logger(__name__)
 
 
+async def url_json(session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs) -> dict[str, Any]:
+    try:
+        async with getattr(session, verb)(url, **kwargs) as response:
+            if not response.ok:
+                error_text = await response.text()
+                raise (ValueError if response.status < 500 else RuntimeError)(
+                    f"vLLM-Omni API returned status {response.status}: {error_text}"
+                )
+            try:
+                return await response.json()
+            except aiohttp.ContentTypeError as e:
+                raise RuntimeError(f"Invalid JSON response from vLLM-Omni: {e}")
+    except aiohttp.ClientError as e:
+        raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
+
+
+async def url_bytes(session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs) -> bytes:
+    try:
+        async with getattr(session, verb)(url, **kwargs) as response:
+            if not response.ok:
+                error_text = await response.text()
+                raise (ValueError if response.status < 500 else RuntimeError)(
+                    f"vLLM-Omni API returned status {response.status}: {error_text}"
+                )
+            return await response.read()
+    except aiohttp.ClientError as e:
+        raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
+
+
 class VLLMOmniClient:
-    def __init__(self, base_url: str, timeout: float | None = None):
+    def __init__(
+        self, base_url: str, timeout: float | None = None, poll_interval: float = 5.0, max_poll_duration: float = 60 * 5
+    ):
         self.base_url = base_url
         self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.poll_interval = poll_interval
+        self.max_poll_duration = max_poll_duration
 
     async def generate_image(
         self,
@@ -262,33 +296,41 @@ class VLLMOmniClient:
                 content_type="image/png",
             )
 
-        url = self.base_url + "/videos"
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            # Start the video generation job
+            url = f"{self.base_url}/videos"
+            data = await url_json(session, url, "post", data=form)
+            if (job_id := data.get("id", None)) is None:
+                raise RuntimeError("API response missing job 'id' field - expected OpenAI compliant format")
+            if (job_status := data.get("status", None)) is None:
+                raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
+
+            # Poll for video generation job completion
+            deadline = asyncio.get_running_loop().time() + self.max_poll_duration
+            url = f"{self.base_url}/videos/{job_id}"
+            while job_status not in {"completed", "failed"}:
+                await asyncio.sleep(self.poll_interval)
+
+                data = await url_json(session, url)
+                if (job_status := data.get("status", None)) is None:
+                    raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeError(f"Timed out waiting for video job {job_id} to complete")
+
+            if job_status == "failed":
+                raise RuntimeError(f"Video job failed: {data}")
+
+            # Retrieve completed content
+            video_bytes = await url_bytes(session, f"{url}/content")
+
+            # Decode video and make a best effort at cleaning up server resources
             try:
-                async with session.post(url, data=form) as response:
-                    if not response.ok:
-                        error_text = await response.text()
-                        raise (ValueError if response.status < 500 else RuntimeError)(
-                            f"vLLM-Omni API returned status {response.status}: {error_text}"
-                        )
-
-                    try:
-                        data = await response.json()
-                    except aiohttp.ContentTypeError as e:
-                        raise RuntimeError(f"Invalid JSON response from vLLM-Omni: {e}")
-            except aiohttp.ClientError as e:
-                raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
-
-        if "data" not in data:
-            raise RuntimeError("API response missing 'data' field - expected OpenAI DALL-E format")
-        if not data["data"]:
-            raise RuntimeError("API returned empty data array")
-        try:
-            base64_str = data["data"][0]["b64_json"]
-        except (KeyError, IndexError):
-            raise RuntimeError("API response missing 'b64_json' field in first data item")
-
-        return base64_to_video(base64_str)
+                return bytes_to_video(video_bytes)
+            finally:
+                try:
+                    await url_json(session, url, "delete")
+                except Exception as exc:
+                    logger.warning("Failed to clean up video job %s: %s", job_id, exc)
 
     async def generate_understanding_chat_completion(
         self,

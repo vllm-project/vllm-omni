@@ -322,6 +322,7 @@ class OmniDiffusionConfig:
 
     dtype: torch.dtype = torch.bfloat16
 
+    model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
@@ -513,12 +514,11 @@ class OmniDiffusionConfig:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
-        # Convert parallel_config dict to DiffusionParallelConfig if needed
-        # This must be done before accessing parallel_config.world_size
-        if isinstance(self.parallel_config, dict):
-            self.parallel_config = DiffusionParallelConfig.from_dict(self.parallel_config)
+        # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
+        # Use Mapping to handle both plain dicts and OmegaConf DictConfig
+        if isinstance(self.parallel_config, Mapping):
+            self.parallel_config = DiffusionParallelConfig.from_dict(dict(self.parallel_config))
         elif not isinstance(self.parallel_config, DiffusionParallelConfig):
-            # If it's neither dict nor DiffusionParallelConfig, use default config
             self.parallel_config = DiffusionParallelConfig()
 
         if self.num_gpus is None:

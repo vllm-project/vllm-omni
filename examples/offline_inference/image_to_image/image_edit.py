@@ -463,12 +463,12 @@ def main():
         raise ValueError("No output generated from omni.generate()")
 
     # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0].images
+    # omni.generate() returns list[OmniRequestOutput], extract images from request_output.images
     first_output = outputs[0]
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 
