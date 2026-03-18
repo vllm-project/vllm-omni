@@ -337,7 +337,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = "audio_codes"
-        self.gpu_resident_buffer_keys: set[str] = {"audio_codes", "last_talker_hidden"}
 
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
@@ -397,6 +396,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
         self.gpu_resident_buffer_keys: set[str] = {
+            "audio_codes",
             "last_talker_hidden",
             "tts_pad_embed",
             "tailing_text_hidden",
