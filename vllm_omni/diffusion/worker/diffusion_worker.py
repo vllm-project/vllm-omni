@@ -206,15 +206,18 @@ class DiffusionWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
 
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        # Respect existing MASTER_ADDR/PORT (e.g., set by Ray executor)
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = "localhost"
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Setup device
-        self.device = current_omni_platform.get_torch_device(rank)
+        # Use local_rank (not rank) for device selection to support
+        # Ray's per-actor CUDA_VISIBLE_DEVICES remapping
+        self.device = current_omni_platform.get_torch_device(self.local_rank)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config

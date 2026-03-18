@@ -436,6 +436,9 @@ class OmniDiffusionConfig:
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
 
+    # Ray executor configuration
+    ray_address: str | None = None  # Ray cluster address (e.g., "auto", "ray://host:port")
+
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
@@ -909,11 +912,11 @@ class DiffusionOutput:
     """
 
     # Fields may be replaced with SHM handle dicts by ipc.pack_diffusion_output_shm
-    output: torch.Tensor | dict | None = None
-    trajectory_timesteps: torch.Tensor | dict | None = None
-    trajectory_latents: torch.Tensor | dict | None = None
-    trajectory_log_probs: torch.Tensor | dict | None = None
-    trajectory_decoded: list[Image.Image] | None = None
+    output: torch.Tensor | tuple[torch.Tensor, ...] | dict | None = None
+    trajectory_timesteps: torch.Tensor | list[torch.Tensor] | dict | None = None
+    trajectory_latents: torch.Tensor | list[torch.Tensor] | dict | None = None
+    trajectory_log_probs: torch.Tensor | list[torch.Tensor] | dict | None = None
+    trajectory_decoded: list[Image.Image | torch.Tensor] | None = None
     error: str | None = None
     aborted: bool = False
     abort_message: str | None = None
@@ -932,6 +935,24 @@ class DiffusionOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    def to_cpu(self) -> "DiffusionOutput":
+        """Move all tensors to CPU (e.g. before Ray serialization)."""
+
+        def _to_cpu(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.cpu()
+            if isinstance(value, tuple):
+                return tuple(_to_cpu(v) for v in value)
+            if isinstance(value, list):
+                return [_to_cpu(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _to_cpu(v) for k, v in value.items()}
+            return value
+
+        for f in fields(self):
+            setattr(self, f.name, _to_cpu(getattr(self, f.name)))
+        return self
 
 
 class DiffusionRequestAbortedError(RuntimeError):
