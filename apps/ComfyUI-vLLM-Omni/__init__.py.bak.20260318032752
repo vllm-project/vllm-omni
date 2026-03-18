@@ -22,7 +22,6 @@ from .comfyui_vllm_omni.nodes import (
     VLLMOmniUnderstanding,
     VLLMOmniVoiceClone,
     VLLMOmniWanParams,
-    VLLMOmniVoXtream2,  # Add VoXtream2 to the list of imported classes
 )
 
 # A dictionary that contains all nodes you want to export with their names
@@ -40,7 +39,6 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniRemoteLoRA": VLLMOmniRemoteLoRA,
     "VLLMOmniQwenTTSParams": VLLMOmniQwenTTSParams,
     "VLLMOmniWanParams": VLLMOmniWanParams,
-    "VLLMOmniVoXtream2": VLLMOmniVoXtream2,  # Add VoXtream2 to the list of supported models
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -58,18 +56,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniRemoteLoRA": "LoRA",
     "VLLMOmniQwenTTSParams": "Qwen TTS Params",
     "VLLMOmniWanParams": "Wan Video Params",
-    "VLLMOmniVoXtream2": "VoXtream2 TTS",  # Add VoXtream2 to the list of supported models
 }
 
 # New model: VoXtream2
 # https://huggingface.co/herimor/voxtream2
 # A 0.5B parameter zero-shot full-stream Text-to-Speech model with dynamic speaking-rate control.
 
-# Warning: When installing vLLM 0.17.0, using `--torch-backend=auto` may resolve to a newer torch CUDA backend,
-# which can lead to a mismatch with the prebuilt vLLM wheel. Consider using `--torch-backend=cu129` instead.
-
 # Add VoXtream2 to the list of supported models
-WEB_DIRECTORY = "./web"
+NODE_CLASS_MAPPINGS["VLLMOmniVoXtream2"] = "VLLMOmniVoXtream2"
+NODE_DISPLAY_NAME_MAPPINGS["VLLMOmniVoXtream2"] = "VoXtream2 TTS"
 
 
 # Define the VoXtream2 class
@@ -83,3 +78,7 @@ class VLLMOmniVoXtream2:
     def generate(self, text, speaking_rate=1.0):
         # Generate audio from text with dynamic speaking rate
         pass
+
+
+# Add the VoXtream2 model to the list of supported models
+WEB_DIRECTORY = "./web"

@@ -66,17 +66,6 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 - [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
 - [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
 
-### Installation Notes
-
-When installing vLLM-Omni version 0.17.0, we recommend using the following command to ensure compatibility:
-```bash
-uv pip install vllm==0.17.0 --torch-backend=cu129
-```
-Alternatively, you can use the `--torch-backend=auto` flag, but be aware that this may lead to a mismatch with the prebuilt vLLM wheel on newer driver setups. If you encounter issues, you can try the above command or refer to the upstream vLLM documentation for more information:
-- https://github.com/vllm-project/vllm/blob/main/docs/getting_started/installation/gpu.cuda.inc.md
-- https://github.com/vllm-project/vllm/issues/31018
-- https://github.com/vllm-project/vllm/issues/30435
-
 ## Contributing
 
 We welcome and value any contributions and collaborations.
@@ -120,4 +109,29 @@ VoXtream2 uses a fully autoregressive, codec-based TTS architecture with three t
 
 #### Audio Codec
 
-VoXtream2 uses the Mimi (Kyut
+VoXtream2 uses the Mimi (Kyutai) audio codec with 16 codebooks.
+
+#### Speaker Encoder
+
+VoXtream2 uses the ReDimNet speaker encoder for zero-shot voice cloning from 3-10s audio prompt.
+
+#### Output
+
+VoXtream2 generates 24kHz streaming WAV audio.
+
+#### VRAM and Latency
+
+VoXtream2 requires 2.2-4.2 GB VRAM and has a latency of 74ms first-packet.
+
+#### Key Features
+
+VoXtream2 has the following key features:
+
+- Dynamic mid-utterance speaking-rate control via distribution matching + classifier-free guidance
+- Textless voice prompting (prompt-text masking)
+
+#### Paper
+
+The paper for VoXtream2 can be found at [arXiv:2603.13518](https://arxiv.org/abs/2603.13518).
+
+#### License

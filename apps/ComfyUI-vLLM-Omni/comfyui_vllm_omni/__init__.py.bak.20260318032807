@@ -35,16 +35,6 @@ The model requires 2.2-4.2 GB of VRAM and has a latency of 74ms first-packet, 4x
 * Dynamic mid-utterance speaking-rate control via distribution matching + classifier-free guidance
 * Textless voice prompting (prompt-text masking)
 
-### Installation Notes
-
-When installing vLLM 0.17.0, if you encounter issues due to CUDA version mismatches, you can use the following command:
-
-```bash
-uv pip install "vllm==0.17.0" --torch-backend=cu129
-```
-
-This command explicitly specifies the CUDA version, which may resolve compatibility issues.
-
 ### Paper
 
 The model is described in the paper [arXiv:2603.13518](https://arxiv.org/abs/2603.13518) (Interspeech 2026 submission).
@@ -63,9 +53,6 @@ import rimenet  # Speaker encoder
 # Define the VoXtream2 model class
 class VoXtream2:
     def __init__(self):
-        """
-        Initialize the VoXtream2 model components.
-        """
         # Initialize the model components
         self.phoneme_transformer = IncrementalPhonemeTransformer()
         self.temporal_transformer = TemporalTransformer()
@@ -74,16 +61,6 @@ class VoXtream2:
         self.re_dim_net = rimenet.ReDimNet()
 
     def process(self, text, audio_prompt):
-        """
-        Process the input text and audio prompt.
-
-        Args:
-            text (str): The input text.
-            audio_prompt (str): The audio prompt.
-
-        Returns:
-            output_audio (str): The generated output audio.
-        """
         # Preprocess the input text and audio prompt
         phonemes = self.phoneme_transformer.process(text)
         semantic_tokens = self.temporal_transformer.process(phonemes)
@@ -102,15 +79,6 @@ class VoXtream2:
 # Define the IncrementalPhonemeTransformer class
 class IncrementalPhonemeTransformer:
     def process(self, text):
-        """
-        Implement the incremental phoneme processing.
-
-        Args:
-            text (str): The input text.
-
-        Returns:
-            phonemes (str): The processed phonemes.
-        """
         # Implement the incremental phoneme processing
         pass
 
@@ -118,16 +86,6 @@ class IncrementalPhonemeTransformer:
 # Define the TemporalTransformer class
 class TemporalTransformer:
     def process(self, phonemes):
-        """
-        Implement the temporal processing.
-
-        Args:
-            phonemes (str): The input phonemes.
-
-        Returns:
-            semantic_tokens (str): The processed semantic tokens.
-            duration_tokens (str): The processed duration tokens.
-        """
         # Implement the temporal processing
         pass
 
@@ -135,16 +93,6 @@ class TemporalTransformer:
 # Define the DepthTransformer class
 class DepthTransformer:
     def process(self, semantic_tokens, duration_tokens):
-        """
-        Implement the depth processing.
-
-        Args:
-            semantic_tokens (str): The input semantic tokens.
-            duration_tokens (str): The input duration tokens.
-
-        Returns:
-            acoustic_codec_tokens (str): The processed acoustic codec tokens.
-        """
         # Implement the depth processing
         pass
 
@@ -152,26 +100,10 @@ class DepthTransformer:
 # Define the MimiCodec class
 class MimiCodec:
     def __init__(self, num_codebooks):
-        """
-        Initialize the Mimi codec.
-
-        Args:
-            num_codebooks (int): The number of codebooks.
-        """
         # Initialize the Mimi codec
         pass
 
     def decode(self, acoustic_codec_tokens, speaker_embedding):
-        """
-        Implement the decoding process.
-
-        Args:
-            acoustic_codec_tokens (str): The input acoustic codec tokens.
-            speaker_embedding (str): The speaker embedding.
-
-        Returns:
-            output_audio (str): The generated output audio.
-        """
         # Implement the decoding process
         pass
 
@@ -179,14 +111,5 @@ class MimiCodec:
 # Define the ReDimNet class
 class ReDimNet:
     def process(self, audio_prompt):
-        """
-        Implement the speaker encoding process.
-
-        Args:
-            audio_prompt (str): The audio prompt.
-
-        Returns:
-            speaker_embedding (str): The speaker embedding.
-        """
         # Implement the speaker encoding process
         pass
