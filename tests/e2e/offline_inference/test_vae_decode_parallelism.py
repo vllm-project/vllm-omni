@@ -72,6 +72,7 @@ def is_nextstep_model(model_name: str) -> bool:
 
 
 def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, vae_patch_parallel_size=1):
+    m = None
     try:
         parallel_config = DiffusionParallelConfig(
             tensor_parallel_size=tp,
@@ -105,7 +106,7 @@ def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, 
         )
         end = time.perf_counter()
         first_output = outputs[0]
-        req_out = first_output.request_output[0]
+        req_out = first_output.request_output
         frames = req_out.images[0]
         if isinstance(frames, torch.Tensor):
             frames = frames.detach().cpu().numpy()
@@ -115,7 +116,8 @@ def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, 
         cost = (end - start) * 1000
         return frames, cost
     finally:
-        m.close()
+        if m is not None:
+            m.close()
         cleanup_dist_env_and_memory()
 
 

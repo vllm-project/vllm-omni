@@ -197,12 +197,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return None
 
     def _find_tts_stage(self):
-        """Find and return the TTS stage from the stage list, or None if not found."""
-        stage_list = getattr(self.engine_client, "stage_list", None)
-        if stage_list is None:
-            return None
-        for stage in stage_list:
-            if getattr(stage, "model_stage", None) in _TTS_MODEL_STAGES:
+        """Find and return the TTS stage config, or None if not found."""
+        for stage in self.engine_client.stage_configs:
+            if stage.engine_args.model_stage in _TTS_MODEL_STAGES:
                 return stage
         return None
 
@@ -496,13 +493,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
-        stage_list = getattr(self.engine_client, "stage_list", None)
-        if stage_list:
-            for stage in stage_list:
-                model_stage = getattr(stage, "model_stage", None)
-                if model_stage in _TTS_MODEL_STAGES:
-                    return True
-        return False
+        return any(stage.engine_args.model_stage in _TTS_MODEL_STAGES for stage in self.engine_client.stage_configs)
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
