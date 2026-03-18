@@ -350,9 +350,9 @@ class AsyncOmniEngine:
                     )
                 finally:
                     if previous_visible_devices is None:
-                        os.environ.pop(device_control_env, None)
+                        current_omni_platform.unset_device_control_env_var()
                     else:
-                        os.environ[device_control_env] = previous_visible_devices
+                        current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
             logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
             launch_cm.__exit__(None, None, None)
