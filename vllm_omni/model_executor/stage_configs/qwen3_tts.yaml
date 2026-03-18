@@ -2,6 +2,7 @@ async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm
+    is_comprehension: true
     runtime:
       devices: "0"
       max_batch_size: 10
@@ -53,7 +54,7 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
       # Must be divisible by num_code_groups and cover (left_context + chunk).
       max_num_batched_tokens: 8192

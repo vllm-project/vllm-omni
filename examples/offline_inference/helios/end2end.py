@@ -293,12 +293,11 @@ def main():
                 )
 
             if hasattr(first_item, "is_pipeline_output") and first_item.is_pipeline_output:
-                if isinstance(first_item.request_output, list) and len(first_item.request_output) > 0:
-                    inner_output = first_item.request_output[0]
-                    if isinstance(inner_output, OmniRequestOutput) and hasattr(inner_output, "images"):
-                        frames = inner_output.images[0] if inner_output.images else None
-                        if frames is None:
-                            raise ValueError("No video frames found in output.")
+                inner_output = first_item.request_output
+                if isinstance(inner_output, OmniRequestOutput) and hasattr(inner_output, "images"):
+                    frames = inner_output.images[0] if inner_output.images else None
+                    if frames is None:
+                        raise ValueError("No video frames found in output.")
             elif hasattr(first_item, "images") and first_item.images:
                 frames = first_item.images
             else:

@@ -129,8 +129,14 @@ def main(args):
 
     t_start = time.perf_counter()
     for stage_outputs in omni.generate(inputs):
-        for output in stage_outputs.request_output:
-            _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+        request_output = stage_outputs.request_output
+        if request_output is None or not request_output.outputs:
+            continue
+        _save_wav(
+            output_dir,
+            request_output.request_id,
+            request_output.outputs[0].multimodal_output,
+        )
     t_end = time.perf_counter()
     logger.info("Total inference time: %.1f ms", (t_end - t_start) * 1000)
 

@@ -1,10 +1,10 @@
-# Stage config for running Hunyuan-Image3.0 with architecture of OmniLLM.
+# Stage config for running Hunyuan-Image3.0 for multi-stage omni runtime.
 # Stage 0: AR Model (vLLM implementation)
 
 # The following config has been verified on 8x L40S-48G GPU.
 stage_args:
   - stage_id: 0
-    stage_type: llm  # Use llm stage type to launch OmniLLM
+    stage_type: llm  # Use llm stage type for AR stages
     runtime:
       process: true  # Run this stage in a separate process
       devices: "0,1,2,3,4,5,6,7"  # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
