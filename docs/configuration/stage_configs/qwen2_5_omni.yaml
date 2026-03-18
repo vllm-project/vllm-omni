@@ -1,4 +1,4 @@
-# stage config for running qwen2.5-omni with architecture of OmniLLM.
+# stage config for running qwen2.5-omni with AsyncOmniEngine + Orchestrator runtime.
 stage_args:
   - stage_id: 0
     runtime:

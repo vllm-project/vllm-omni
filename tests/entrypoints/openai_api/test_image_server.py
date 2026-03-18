@@ -10,6 +10,7 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 import base64
 import io
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -115,7 +116,10 @@ class FakeAsyncOmni:
     """Fake AsyncOmni that yields a single diffusion output."""
 
     def __init__(self):
-        self.stage_list = ["llm", "diffusion"]
+        self.stage_configs = [
+            SimpleNamespace(stage_type="llm"),
+            SimpleNamespace(stage_type="diffusion"),
+        ]
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
@@ -129,21 +133,25 @@ class FakeAsyncOmni:
 
 @pytest.fixture
 def mock_async_diffusion(mocker: MockerFixture):
-    """Mock AsyncOmniDiffusion instance that returns fake images"""
-    mock = mocker.Mock()
-    mock.is_running = True  # For health endpoint
-    mock.check_health = mocker.AsyncMock()  # For LLM mode health check
+    """Mock diffusion engine that matches the current async-generator API."""
 
-    async def generate(**kwargs):
-        # Return n PIL images wrapped in result object
-        n = kwargs["sampling_params_list"][0].num_outputs_per_prompt
-        mock.captured_sampling_params_list = kwargs["sampling_params_list"]
-        mock.captured_prompt = kwargs["prompt"]
-        images = [Image.new("RGB", (64, 64), color="blue") for _ in range(n)]
-        return MockGenerationResult(images)
+    class MockAsyncDiffusion:
+        def __init__(self) -> None:
+            self.is_running = True
+            self.check_health = mocker.AsyncMock()
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self.generate_calls = 0
 
-    mock.generate = mocker.AsyncMock(side_effect=generate)
-    return mock
+        async def generate(self, **kwargs):
+            self.generate_calls += 1
+            n = kwargs["sampling_params_list"][0].num_outputs_per_prompt
+            self.captured_sampling_params_list = kwargs["sampling_params_list"]
+            self.captured_prompt = kwargs["prompt"]
+            images = [Image.new("RGB", (64, 64), color="blue") for _ in range(n)]
+            yield MockGenerationResult(images)
+
+    return MockAsyncDiffusion()
 
 
 @pytest.fixture
@@ -159,7 +167,7 @@ def test_client(mock_async_diffusion):
     # Set up app state with diffusion engine
     app.state.engine_client = mock_async_diffusion
     app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
-    app.state.stage_configs = [{"stage_type": "diffusion"}]
+    app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
     app.state.diffusion_model_name = "Qwen/Qwen-Image"  # For models endpoint
     app.state.args = Namespace(
         default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5}}',
@@ -180,7 +188,32 @@ def async_omni_test_client():
     app.include_router(router)
 
     app.state.engine_client = FakeAsyncOmni()
-    app.state.stage_configs = [{"stage_type": "llm"}, {"stage_type": "diffusion"}]
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="diffusion"),
+    ]
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        max_generated_image_size=4096,  # 64*64
+    )
+    return TestClient(app)
+
+
+@pytest.fixture
+def async_omni_stage_configs_only_client():
+    """Create test client with refactored AsyncOmni compatibility surface only."""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    engine = FakeAsyncOmni()
+    assert not hasattr(engine, "stage_list")
+    app.state.engine_client = engine
+    # Intentionally do not populate app.state.stage_configs. Refactored
+    # AsyncOmni exposes stage_configs on the engine instance.
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
         max_generated_image_size=4096,  # 64*64
@@ -289,6 +322,45 @@ def test_generate_images_async_omni_sampling_params(async_omni_test_client):
     assert captured[1].height == 256
     assert captured[1].width == 256
     assert captured[1].seed == 7
+
+
+def test_generate_images_async_omni_stage_configs_only(async_omni_stage_configs_only_client):
+    """Regression: image generation accepts refactored AsyncOmni without stage_list."""
+    response = async_omni_stage_configs_only_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a castle",
+            "n": 1,
+            "size": "256x256",
+            "seed": 11,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["data"]) == 1
+    engine = async_omni_stage_configs_only_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    assert captured[1].seed == 11
+
+
+def test_image_edits_async_omni_stage_configs_only(async_omni_stage_configs_only_client):
+    """Regression: image edits accepts refactored AsyncOmni without stage_list."""
+    img_bytes = make_test_image_bytes((16, 16))
+    response = async_omni_stage_configs_only_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit me",
+            "size": "auto",
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_stage_configs_only_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
 
 
 def test_generate_multiple_images(test_client):
@@ -538,13 +610,12 @@ def test_parameters_passed_through(test_client, mock_async_diffusion):
     )
     assert response.status_code == 200
 
-    # Ensure generate() was called exactly once
-    mock_async_diffusion.generate.assert_awaited_once()
-    call_kwargs = mock_async_diffusion.generate.call_args[1]["sampling_params_list"][0]
-    assert call_kwargs.num_inference_steps == 100
-    assert call_kwargs.guidance_scale == 7.5
-    assert call_kwargs.true_cfg_scale == 3.0
-    assert call_kwargs.seed == 42
+    assert mock_async_diffusion.generate_calls == 1
+    captured = mock_async_diffusion.captured_sampling_params_list[0]
+    assert captured.num_inference_steps == 100
+    assert captured.guidance_scale == 7.5
+    assert captured.true_cfg_scale == 3.0
+    assert captured.seed == 42
 
 
 def test_model_field_omitted_works(test_client):

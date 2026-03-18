@@ -171,7 +171,8 @@ def main():
 
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 
-    for i, req_output in enumerate(omni_outputs):
+    img_idx = 0
+    for req_output in omni_outputs:
         images = getattr(req_output, "images", None)
         if not images and hasattr(req_output, "output"):
             if isinstance(req_output.output, list):
