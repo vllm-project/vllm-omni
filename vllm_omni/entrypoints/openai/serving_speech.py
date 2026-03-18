@@ -572,8 +572,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         task_type = request.task_type or "CustomVoice"
 
         # Normalize voice to lowercase for case-insensitive matching
-        if request.voice is not None:
-            request.voice = request.voice.lower()
+        if request.speaker is not None:
+            request.speaker = request.speaker.lower()
 
         # Validate input is not empty
         if not request.input or not request.input.strip():
@@ -591,12 +591,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
                     "or use a CustomVoice model."
                 )
-            if request.voice is not None and request.voice not in self.supported_speakers:
-                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
+            if request.speaker is not None and request.speaker not in self.supported_speakers:
+                return f"Invalid speaker '{request.speaker}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate Base task requirements
         if task_type == "Base":
-            if request.voice is None:
+            if request.speaker is None:
                 if request.ref_audio is None:
                     return "Base task requires 'ref_audio' for voice cloning"
                 fmt_err = self._validate_ref_audio_format(request.ref_audio)
@@ -612,19 +612,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         )
             else:
                 # voice is not None
-                voice_lower = request.voice.lower()
+                voice_lower = request.speaker.lower()
                 if voice_lower in self.uploaded_speakers:
                     # Check if audio file exists for uploaded speaker
                     speaker_info = self.uploaded_speakers[voice_lower]
                     file_path = Path(speaker_info["file_path"])
                     if not file_path.exists():
-                        return f"Audio file for uploaded speaker '{request.voice}' not found on disk"
+                        return f"Audio file for uploaded speaker '{request.speaker}' not found on disk"
                 else:
                     # need ref_audio for built-in speaker
                     if request.ref_audio is None:
-                        return (
-                            f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
-                        )
+                        return f"Base task with built-in speaker '{request.speaker}' requires 'ref_audio' for voice cloning"
                     fmt_err = self._validate_ref_audio_format(request.ref_audio)
                     if fmt_err:
                         return fmt_err
@@ -790,18 +788,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["language"] = ["Auto"]
 
         # Speaker (voice)
-        if request.voice is not None:
-            params["speaker"] = [request.voice]
+        if request.speaker is not None:
+            params["speaker"] = [request.speaker]
 
             # If voice is an uploaded speaker and no ref_audio provided, auto-set it
-            if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
-                audio_data = self._get_uploaded_audio_data(request.voice)
+            if request.speaker.lower() in self.uploaded_speakers and request.ref_audio is None:
+                audio_data = self._get_uploaded_audio_data(request.speaker)
                 if audio_data:
                     params["ref_audio"] = [audio_data]
                     params["x_vector_only_mode"] = [True]
-                    logger.info(f"Auto-set ref_audio for uploaded voice: {request.voice}")
+                    logger.info(f"Auto-set ref_audio for uploaded voice: {request.speaker}")
                 else:
-                    raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
+                    raise ValueError(f"Audio file for uploaded voice '{request.speaker}' is missing or corrupted")
 
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice

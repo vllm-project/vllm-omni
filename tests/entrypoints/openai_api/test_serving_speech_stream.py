@@ -47,7 +47,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "speaker": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
 
                 start = ws.receive_json()
@@ -94,7 +94,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
-                        "voice": "Vivian",
+                        "speaker": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
                         "initial_codec_chunk_frames": 12,
@@ -128,7 +128,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "speaker": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world without punctuation"})
                 ws.send_json({"type": "input.done"})
 
@@ -150,7 +150,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
-                        "voice": "Vivian",
+                        "speaker": "Vivian",
                         "stream_audio": True,
                         "response_format": "wav",
                     }
@@ -164,7 +164,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "speaker": "Vivian"})
                 ws.send_json({"type": "input.text", "text": ""})
                 ws.send_json({"type": "input.done"})
 
@@ -177,7 +177,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "speaker": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "First sentence. Second sentence. "})
 
                 first_start = ws.receive_json()
@@ -208,7 +208,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "speaker": "Vivian"})
                 ws.send_json({"type": "unknown"})
 
                 error = ws.receive_json()
@@ -246,7 +246,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "speaker": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
 
                 assert ws.receive_json()["type"] == "audio.start"
@@ -275,7 +275,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
-                        "voice": "Vivian",
+                        "speaker": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
                     }
@@ -303,7 +303,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "speaker": "Vivian"})
                 ws.send_json({"type": "input.text", "text": 123})
 
                 assert ws.receive_json() == {
@@ -322,7 +322,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "speaker": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "x" * 128})
 
                 assert ws.receive_json() == {
@@ -341,7 +341,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian", "ref_audio": "x" * 512})
+                ws.send_json({"type": "session.config", "speaker": "Vivian", "ref_audio": "x" * 512})
 
                 assert ws.receive_json() == {
                     "type": "error",
@@ -367,7 +367,7 @@ class TestStreamingSpeechWebSocket:
 
         config = MagicMock()
         config.model = None
-        config.voice = "Vivian"
+        config.speaker = "Vivian"
         config.task_type = None
         config.language = None
         config.instructions = None

@@ -16,6 +16,14 @@ class QueryResult(NamedTuple):
     limit_mm_per_prompt: dict[str, int]
 
 
+def make_audio_output_filename(request_id: str | None, index: int) -> str:
+    """Build a stable output filename using request ID when available."""
+    if not request_id:
+        request_id = f"unknown_{index}"
+    safe_request_id = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in request_id)
+    return f"audio_{safe_request_id}_{index}.wav"
+
+
 def encode_base64_content_from_url(content_url: str) -> str:
     """Encode a content retrieved from a remote url to base64 format."""
 
@@ -404,8 +412,8 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
     if args.query_type == "use_audio_in_video":
         extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
 
-    if getattr(args, "voice", None) and args.voice.strip():
-        extra_body["voice"] = args.voice.strip()
+    if getattr(args, "speaker", None) and args.speaker.strip():
+        extra_body["speaker"] = args.speaker.strip()
 
     if args.modalities is not None:
         output_modalities = args.modalities.split(",")
@@ -440,10 +448,11 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
     if not args.stream:
         # Verify all completions succeeded
         for chat_completion in chat_completions:
+            request_id = getattr(chat_completion, "id", None)
             for choice in chat_completion.choices:
                 if choice.message.audio:
                     audio_data = base64.b64decode(choice.message.audio.data)
-                    audio_file_path = f"audio_{count}.wav"
+                    audio_file_path = make_audio_output_filename(request_id=request_id, index=count)
                     with open(audio_file_path, "wb") as f:
                         f.write(audio_data)
                     print(f"Audio saved to {audio_file_path}")
@@ -462,7 +471,8 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
 
                     if getattr(chunk, "modality", None) == "audio" and content:
                         audio_data = base64.b64decode(content)
-                        audio_file_path = f"audio_{count}.wav"
+                        request_id = getattr(chunk, "id", None)
+                        audio_file_path = make_audio_output_filename(request_id=request_id, index=count)
                         with open(audio_file_path, "wb") as f:
                             f.write(audio_data)
                         print(f"\nAudio saved to {audio_file_path}")
@@ -550,7 +560,7 @@ def parse_args():
         help="Host/IP of the vLLM Omni API server.",
     )
     parser.add_argument(
-        "--voice",
+        "--speaker",
         type=str,
         default=None,
         help="TTS speaker/voice for audio output (e.g. Ethan, Vivian). Passed via extra_body to the talker stage.",

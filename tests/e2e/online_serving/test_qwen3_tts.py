@@ -58,7 +58,7 @@ def make_speech_request(
     host: str,
     port: int,
     text: str,
-    voice: str = "vivian",
+    speaker: str = "vivian",
     language: str = "English",
     task_type: str | None = None,
     instructions: str | None = None,
@@ -68,7 +68,7 @@ def make_speech_request(
     url = f"http://{host}:{port}/v1/audio/speech"
     payload = {
         "input": text,
-        "voice": voice,
+        "speaker": speaker,
         "language": language,
     }
     if task_type:
@@ -104,7 +104,7 @@ class TestQwen3TTSCustomVoice:
             host=omni_server.host,
             port=omni_server.port,
             text="Hello, how are you?",
-            voice="vivian",
+            speaker="vivian",
             language="English",
         )
 
@@ -124,7 +124,7 @@ class TestQwen3TTSCustomVoice:
             host=omni_server.host,
             port=omni_server.port,
             text="你好，我是通义千问",
-            voice="vivian",
+            speaker="vivian",
             language="Chinese",
         )
 
@@ -146,7 +146,7 @@ class TestQwen3TTSCustomVoice:
                 host=omni_server.host,
                 port=omni_server.port,
                 text="Testing voice selection.",
-                voice=voice,
+                speaker=voice,
                 language="English",
             )
 
@@ -168,7 +168,7 @@ class TestQwen3TTSCustomVoice:
             host=omni_server.host,
             port=omni_server.port,
             text="This should return binary audio, not a JSON error.",
-            voice="vivian",
+            speaker="vivian",
             language="English",
         )
 
@@ -257,7 +257,7 @@ class TestQwen3TTSNoAsyncChunk:
             host=omni_server_no_async_chunk.host,
             port=omni_server_no_async_chunk.port,
             text="Hello, how are you?",
-            voice="vivian",
+            speaker="vivian",
             language="English",
         )
 
@@ -275,7 +275,7 @@ class TestQwen3TTSNoAsyncChunk:
             host=omni_server_no_async_chunk.host,
             port=omni_server_no_async_chunk.port,
             text="你好，我是通义千问",
-            voice="vivian",
+            speaker="vivian",
             language="Chinese",
         )
 

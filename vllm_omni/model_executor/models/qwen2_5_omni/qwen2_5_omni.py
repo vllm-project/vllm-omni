@@ -40,6 +40,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerMultiModalProcessor,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
+from vllm_omni.model_executor.stage_input_processors.tts_utils import extract_speaker_from_runtime_info
 from vllm_omni.platforms import current_omni_platform
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
@@ -303,9 +304,7 @@ class Qwen2_5OmniForConditionalGeneration(
                 input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
                 self.thinker_reply_part = torch.zeros_like(inputs_embeds)
 
-            # TODO(Peiqi): temporal hack here to support voice_type.
-            if not hasattr(self, "voice_type"):
-                self.voice_type = voice_type
+            runtime_info = kwargs.get("runtime_additional_information")
 
             # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
             if positions.ndim == 2 and positions.shape[0] == 3:
@@ -344,7 +343,9 @@ class Qwen2_5OmniForConditionalGeneration(
             code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
             code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
 
-            audio_tensor = self.generate_audio(code, voice_type)
+            runtime_info = kwargs.get("runtime_additional_information")
+            effective_voice_type = extract_speaker_from_runtime_info(runtime_info) or voice_type
+            audio_tensor = self.generate_audio(code, effective_voice_type)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
 
         return OmniOutput(
@@ -695,9 +696,20 @@ class Qwen2_5OmniForConditionalGeneration(
         if not isinstance(thinker_output_token_ids, (list, torch.Tensor)):
             thinker_output_token_ids = []
 
-        # TODO(Peiqi): add voice_type support
+        speaker_val = info_dict.get("speaker")
+        if isinstance(speaker_val, (list, tuple)) and speaker_val:
+            speaker_val = speaker_val[0]
+        # Use per-request speaker from info_dict; fall back to model default.
+        # Do NOT read from self.default_tts_text_spk_type alone — speaker is per-request.
+        effective_speaker = (
+            str(speaker_val).lower().strip()
+            if isinstance(speaker_val, str) and speaker_val.strip()
+            else self.default_tts_text_spk_type
+        )
+        if not effective_speaker:
+            effective_speaker = "chelsie"
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
-            voice_type=self.voice_type,
+            speaker=effective_speaker,
             output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
             output_token_ids=thinker_output_token_ids,
             thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
@@ -711,7 +723,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
     def _thinker_to_talker_prefill(
         self,
-        voice_type: str,
+        speaker: str,
         output_prompt_embeds,
         output_token_ids,
         thinker_prompt_embeds,
@@ -726,7 +738,7 @@ class Qwen2_5OmniForConditionalGeneration(
         prompt_embeds = torch.cat(
             [
                 thinker_prompt_embeds,
-                self._get_embed_text_spk_token(voice_type) + self.embed_codec_pad_token,
+                self._get_embed_text_spk_token(speaker) + self.embed_codec_pad_token,
                 output_prompt_embeds[:1] + self.embed_codec_bos_token,
             ],
             dim=0,

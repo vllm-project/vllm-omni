@@ -38,6 +38,9 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_speaker_from_runtime_info,
+)
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -62,25 +65,6 @@ TALKER_CODEC_THINK_BOS_ID = 4204  # Think mode start
 TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 
 logger = init_logger(__name__)
-
-
-def _voice_type_from_runtime_info(
-    runtime_additional_information: list[dict[str, Any]] | None,
-) -> str | None:
-    """Extract voice_type from the first per-request info that has it (from additional_information)."""
-    if not runtime_additional_information:
-        return None
-    for info in runtime_additional_information:
-        vt = info.get("voice_type")
-        if vt is None:
-            continue
-        if isinstance(vt, (list, tuple)) and len(vt) > 0:
-            vt = vt[0]
-        if isinstance(vt, str) and vt.strip():
-            return vt.strip()
-        if vt is not None:
-            return str(vt).strip()
-    return None
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -297,11 +281,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             OmniOutput with text_hidden_states and optional audio
         """
-        # update voice type for each request
-        effective_voice_type = _voice_type_from_runtime_info(runtime_additional_information)
+        effective_voice_type = extract_speaker_from_runtime_info(runtime_additional_information)
         if effective_voice_type is None:
             effective_voice_type = "ethan"
-        self.voice_type = effective_voice_type
 
         # ========== Stage 1: Thinker ==========
         if self.model_stage == "thinker":
@@ -397,7 +379,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                         left_context_size.append(info["left_context_size"])
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
-            audio_tensors = self.generate_audio(codes, self.voice_type, left_context_size, seq_token_counts)
+            audio_tensors = self.generate_audio(codes, effective_voice_type, left_context_size, seq_token_counts)
 
             return audio_tensors
 
@@ -486,7 +468,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         Args:
             code: [batch, num_quantizers, T] - RVQ codec codes
-            voice_type: Voice type (not used in Qwen3, kept for compatibility)
+            speaker: Speaker name (not used in Qwen3, kept for compatibility)
             left_context_size: Left context size for streaming decode
             seq_token_counts: Token count for each request in batch
 
@@ -699,14 +681,15 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: dict[str, dict] = {}
 
-        voice_type = info_dict.get("voice_type")
-        logger.info(f"voice_type: {voice_type}")
+        voice_type = info_dict.get("speaker")
+        logger.info("talker_preprocess_prefill speaker: %s", voice_type)
         if voice_type is not None and isinstance(voice_type, (list, tuple)) and len(voice_type) > 0:
             voice_type = voice_type[0]
         if not isinstance(voice_type, str) or not voice_type.strip():
-            voice_type = getattr(self, "voice_type", None) or self.default_tts_text_spk_type
+            # Fall back to model default; speaker is per-request.
+            voice_type = self.default_tts_text_spk_type
         else:
-            voice_type = str(voice_type).strip()
+            voice_type = str(voice_type).lower().strip()
         start_index = info_dict.get("num_processed_tokens", 0)
         end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill

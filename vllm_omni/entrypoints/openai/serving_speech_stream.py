@@ -213,7 +213,7 @@ class OmniStreamingSpeechHandler:
         request = OpenAICreateSpeechRequest(
             input=sentence_text,
             model=config.model,
-            voice=config.voice,
+            speaker=config.speaker,
             task_type=config.task_type,
             language=config.language,
             instructions=config.instructions,

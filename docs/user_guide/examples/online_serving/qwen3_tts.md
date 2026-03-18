@@ -103,13 +103,13 @@ cd examples/online_serving/qwen3_tts
 # CustomVoice: Use predefined speaker
 python openai_speech_client.py \
     --text "你好，我是通义千问" \
-    --voice vivian \
+    --speaker vivian \
     --language Chinese
 
 # CustomVoice with style instruction
 python openai_speech_client.py \
     --text "今天天气真好" \
-    --voice ryan \
+    --speaker ryan \
     --instructions "用开心的语气说"
 
 # VoiceDesign: Describe the voice style
@@ -134,7 +134,7 @@ The Python client supports the following command-line arguments:
 - `--model` (or `-m`): Model name/path (default: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`)
 - `--task-type` (or `-t`): TTS task type. Options: `CustomVoice`, `VoiceDesign`, `Base`
 - `--text`: Text to synthesize (required)
-- `--voice`: Speaker/voice name (default: `vivian`). Options: `vivian`, `ryan`, `aiden`, etc.
+- `--speaker`: Speaker name (default: `vivian`). Options: `vivian`, `ryan`, `aiden`, etc.
 - `--language`: Language. Options: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, `Italian`
 - `--instructions`: Voice style/emotion instructions
 - `--ref-audio`: Reference audio file path or URL for voice cloning (Base task)
@@ -150,7 +150,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
-        "voice": "vivian",
+        "speaker": "vivian",
         "language": "English"
     }' --output output.wav
 
@@ -159,7 +159,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "I am so excited!",
-        "voice": "vivian",
+        "speaker": "vivian",
         "instructions": "Speak with great enthusiasm"
     }' --output excited.wav
 
@@ -176,7 +176,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
 
 response = client.audio.speech.create(
     model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    voice="vivian",
+    speaker="vivian",
     input="Hello, how are you?",
 )
 
@@ -192,7 +192,7 @@ response = httpx.post(
     "http://localhost:8091/v1/audio/speech",
     json={
         "input": "Hello, how are you?",
-        "voice": "vivian",
+        "speaker": "vivian",
         "language": "English",
     },
     timeout=300.0,
@@ -279,7 +279,7 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
 ```json
 {
     "input": "Text to synthesize",
-    "voice": "vivian",
+    "speaker": "vivian",
     "response_format": "wav",
     "task_type": "CustomVoice",
     "language": "Auto",
@@ -297,6 +297,12 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
 
 Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/wav`).
 
+### Voice and language (summary)
+
+- **Speaker**: Use the `speaker` request field to select the speaker (e.g., `vivian`, `ryan`, `aiden`). List available speakers with `GET /v1/audio/voices`.
+- **Language**: Use the `language` field for the codec language tag (`Auto`, `Chinese`, `English`, etc.). Default is `Auto` for automatic detection.
+- **CustomVoice**: Requires a valid `voice` from the model’s speaker set. **VoiceDesign**: Use `instructions` to describe the voice. **Base**: Use `ref_audio` and `ref_text` for voice cloning.
+
 ## Parameters
 
 ### OpenAI Standard Parameters
@@ -305,7 +311,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | ----------------- | ------ | -------------- | ----------------------------------------------------------- |
 | `input`           | string | **required**   | Text to synthesize                                          |
 | `model`           | string | server's model | Model to use (optional, should match server if specified)   |
-| `voice`           | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                    |
+| `speaker`         | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                    |
 | `response_format` | string | "wav"          | Audio format: wav, mp3, flac, pcm, aac, opus                |
 | `speed`           | float  | 1.0            | Playback speed (0.25-4.0, not supported with `stream=true`) |
 
@@ -340,7 +346,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
-        "voice": "vivian",
+        "speaker": "vivian",
         "language": "English",
         "stream": true,
         "response_format": "pcm"

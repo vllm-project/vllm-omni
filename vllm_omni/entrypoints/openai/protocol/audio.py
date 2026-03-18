@@ -7,9 +7,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
     model: str | None = None
-    voice: str | None = Field(
+    speaker: str | None = Field(
         default=None,
-        description="Voice to use. For OpenAI: alloy, echo, etc. For Qwen3-TTS: Vivian, Ryan, etc.",
+        description="Speaker/voice to use. For Qwen3-TTS: vivian, ryan, aiden, etc.",
     )
     instructions: str | None = Field(
         default=None,
@@ -106,7 +106,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
     model: str | None = None
-    voice: str | None = None
+    speaker: str | None = None
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None

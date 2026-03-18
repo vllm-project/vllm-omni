@@ -90,6 +90,43 @@ Examples:
 python end2end.py --query-type Base --mode-tag icl
 ```
 
+## Voice and Language Control
+
+### Supported Voices (CustomVoice)
+
+Predefined speaker voices are set via the `speaker` (or `voice_type`) field in `additional_information`. Available speakers depend on the loaded checkpoint; check `talker_config.spk_id` in the model config for the full list. Common voices include `vivian`, `ryan`, `aiden`, `ethan`, `serena` (case-insensitive).
+
+Pass the speaker name in your request:
+
+```python
+additional_information = {
+    "text": ["你好，我是通义千问"],
+    "task_type": ["CustomVoice"],
+    "speaker": ["Vivian"],  
+    "language": ["Chinese"],
+}
+```
+
+### Supported Languages
+
+The `language` field controls the codec-level language tag. Use `"Auto"` (default) for automatic detection.
+
+Supported values: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, `Italian`.
+
+```python
+additional_information = {
+    "text": ["Hello, nice to meet you."],
+    "task_type": ["CustomVoice"],
+    "speaker": ["Aiden"],
+    "language": ["English"],
+}
+```
+
+### VoiceDesign and Base
+
+- **VoiceDesign**: Use `instruct` for natural-language voice description; no `speaker` needed.
+- **Base**: Use `ref_audio` and `ref_text` for voice cloning; `language` is optional.
+
 ## Streaming Mode
 
 Add `--streaming` to stream audio chunks progressively via `AsyncOmni` (requires `async_chunk: true` in the stage config):

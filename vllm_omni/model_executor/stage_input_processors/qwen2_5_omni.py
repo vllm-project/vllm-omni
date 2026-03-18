@@ -2,6 +2,10 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_language_from_prompt,
+    extract_speaker_from_prompt,
+)
 
 TALKER_CODEC_PAD_TOKEN_ID = 8292
 TALKER_CODEC_START_TOKEN_ID = 8293
@@ -44,6 +48,12 @@ def thinker2talker(
             "thinker_result_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
             "prompt_embeds_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
         }
+        speaker = extract_speaker_from_prompt(prompt, index=i)
+        if speaker is not None:
+            additional_information["speaker"] = speaker
+        language = extract_language_from_prompt(prompt, index=i)
+        if language is not None:
+            additional_information["language"] = language
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID]

@@ -11,6 +11,12 @@ from vllm.platforms import current_platform
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_language_from_prompt,
+    extract_language_from_request,
+    extract_speaker_from_prompt,
+    extract_speaker_from_request,
+)
 
 
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
@@ -83,46 +89,6 @@ def _validate_stage_inputs(stage_list, engine_input_source):
 # =========================
 
 
-def _extract_voice_type_from_request(request: Any) -> str | None:
-    """Extract voice_type from a request's additional_information field.
-
-    Returns the voice_type as a single-element list (for serialization
-    compatibility), or None if not present.
-    """
-    additional_information = getattr(request, "additional_information", None)
-    if additional_information is None:
-        return None
-    entries = getattr(additional_information, "entries", None)
-    if not isinstance(entries, dict):
-        return None
-    entry = entries.get("voice_type")
-    if entry is None:
-        return None
-    list_data = getattr(entry, "list_data", None)
-    if isinstance(list_data, list) and list_data:
-        return list_data[0]
-    return None
-
-
-def _extract_voice_type_from_prompt(
-    prompt: OmniTokensPrompt | TextPrompt | list[Any] | None,
-    index: int = 0,
-) -> str | None:
-    if prompt is None:
-        return None
-    p = prompt[index] if isinstance(prompt, list) and index < len(prompt) else prompt
-    if p is None:
-        return None
-    print(f"_extract_voice_type_from_prompt p: {p}")
-    add_info = p.get("additional_information")
-    if not isinstance(add_info, dict):
-        return None
-    voice_type = add_info.get("voice_type")
-    if isinstance(voice_type, list) and voice_type:
-        return voice_type
-    return None
-
-
 def thinker2talker_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
@@ -155,9 +121,12 @@ def thinker2talker_async_chunk(
             "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
-        voice_type = _extract_voice_type_from_request(request)
-        if voice_type is not None:
-            talker_additional_info["voice_type"] = voice_type
+        speaker = extract_speaker_from_request(request)
+        if speaker is not None:
+            talker_additional_info["speaker"] = speaker
+        language = extract_language_from_request(request)
+        if language is not None:
+            talker_additional_info["language"] = language
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
                 transfer_manager.request_payload[request_id] = talker_additional_info
@@ -183,9 +152,12 @@ def thinker2talker_async_chunk(
         talker_additional_info = {
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
-        voice_type = _extract_voice_type_from_request(request)
-        if voice_type is not None:
-            talker_additional_info["voice_type"] = voice_type
+        speaker = extract_speaker_from_request(request)
+        if speaker is not None:
+            talker_additional_info["speaker"] = speaker
+        language = extract_language_from_request(request)
+        if language is not None:
+            talker_additional_info["language"] = language
 
         if output_token_ids:
             talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
@@ -243,9 +215,12 @@ def thinker2talker(
             "tts_eos_embed": output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
             "tts_pad_embed": output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
         }
-        voice_type = _extract_voice_type_from_prompt(prompt, index=i)
-        if voice_type is not None:
-            info["voice_type"] = voice_type
+        speaker = extract_speaker_from_prompt(prompt, index=i)
+        if speaker is not None:
+            info["speaker"] = speaker
+        language = extract_language_from_prompt(prompt, index=i)
+        if language is not None:
+            info["language"] = language
 
         prompt_len = _compute_talker_prompt_ids_length(info, device=device)
 

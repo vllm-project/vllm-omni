@@ -48,7 +48,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
-        "voice": "vivian",
+        "speaker": "vivian",
         "language": "English"
     }' --output output.wav
 ```
@@ -62,7 +62,7 @@ response = httpx.post(
     "http://localhost:8091/v1/audio/speech",
     json={
         "input": "Hello, how are you?",
-        "voice": "vivian",
+        "speaker": "vivian",
         "language": "English",
     },
     timeout=300.0,
@@ -81,7 +81,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
 
 response = client.audio.speech.create(
     model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    voice="vivian",
+    speaker="vivian",
     input="Hello, how are you?",
 )
 
@@ -105,7 +105,7 @@ Content-Type: application/json
 |-----------|------|---------|-------------|
 | `input` | string | **required** | The text to synthesize into speech |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
-| `voice` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
+| `speaker` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
 | `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
 | `speed` | float | 1.0 | Playback speed (0.25-4.0) |
 
@@ -267,7 +267,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "I am so excited!",
-        "voice": "vivian",
+        "speaker": "vivian",
         "instructions": "Speak with great enthusiasm"
     }' --output excited.wav
 ```
@@ -332,7 +332,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -d '{
         "input": "Hello, this is a cloned voice",
         "task_type": "Base",
-        "voice": "custom_voice_1"
+        "speaker": "custom_voice_1"
     }' --output cloned.wav
 ```
 
@@ -354,7 +354,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 |-------|-------------|
 | `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
 
-Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech online serving example](../user_guide/examples/online_serving/fish_speech.md) for details.
+Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `speaker` field should be set to `"default"`. See the [Fish Speech online serving example](../user_guide/examples/online_serving/fish_speech.md) for details.
 
 ### Voxtral TTS
 

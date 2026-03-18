@@ -64,6 +64,39 @@ If media file paths are not provided, the script will use default assets. Suppor
 - `use_audio_in_video`: Extract audio from video
 - `text`: Text-only query
 
+### Voice and Language (TTS output)
+
+When requesting audio output (`modalities: ["audio"]`), you can control the TTS voice and language via the chat API request body.
+
+**Speaker**
+
+Pass a `speaker` field in `additional_information` to select the speaker for the generated speech. Supported values depend on the Qwen2.5-Omni checkpoint; typical built-in voices include:
+
+| Value     | Description |
+| --------- | ----------- |
+| `Chelsie` | Female voice (f030) |
+| `Ethan`   | Male voice (m02) |
+| `m02`     | Male, standard Mandarin |
+| `f030`    | Female, anime-style |
+
+**Language**
+
+The model uses the conversation language by default. You can pass a `language` field in the request for explicit control when supported by the pipeline.
+
+Example (curl):
+
+```bash
+curl http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-Omni-7B",
+    "messages": [{"role": "user", "content": "Describe vLLM in brief."}],
+    "modalities": ["audio"],
+    "speaker": "chelsie",
+    "language": "English"
+  }'
+```
+
 ### FAQ
 
 If you encounter error about backend of librosa, try to install ffmpeg with command below.
