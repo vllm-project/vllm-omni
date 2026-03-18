@@ -826,7 +826,6 @@ This tool automatically measures the execution time of selected pipeline modules
 
 **Enabling Diffusion Timing**
 
-Diffusion timing is controlled by environment variables.
 
 Enable timing by setting:
 ```
