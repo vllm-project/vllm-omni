@@ -938,7 +938,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 wav_candidates.append(obj)
                 return
             if isinstance(obj, dict):
-                # Inlined ndarray/tensor payloads from OmniInputProcessor.
+                # Inlined ndarray/tensor payloads from the input processor.
                 if obj.get("__ndarray__") and "data" in obj and "dtype" in obj and "shape" in obj:
                     try:
                         data = obj["data"]
