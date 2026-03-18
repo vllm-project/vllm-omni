@@ -152,8 +152,7 @@
     {
         "test_name": "test_qwen3_tts",
         "server_params": {
-            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-            "stage_config_name": "qwen3_tts.yaml"
+            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
         },
         "benchmark_params": [
             {

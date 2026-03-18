@@ -57,7 +57,7 @@ def test_stable_audio_model(model_name: str):
     assert first_output.final_output_type == "image"
     assert hasattr(first_output, "request_output") and first_output.request_output
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     assert isinstance(req_out, OmniRequestOutput)
     assert req_out.final_output_type == "audio"
     assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output
