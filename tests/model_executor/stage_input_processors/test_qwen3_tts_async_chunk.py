@@ -227,12 +227,14 @@ def test_first_streaming_chunk_prepends_ref_code_context():
     assert len(payload["code_predictor_codes"]) == _Q * 12
 
 
-def test_ref_code_context_only_applies_to_first_streaming_chunk():
+def test_ref_code_context_applies_to_all_streaming_chunks():
+    """ref_code is prepended as decoder context on every chunk, not just the first."""
     tm = _tm()
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(20)]
     tm.put_req_chunk[rid] = 1
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    tm.request_payload[rid] = ref_code
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=tm,
@@ -242,8 +244,9 @@ def test_ref_code_context_only_applies_to_first_streaming_chunk():
     )
 
     assert payload is not None
-    assert payload["left_context_size"] == 10
-    assert len(payload["code_predictor_codes"]) == _Q * 20
+    # ref_code (2 frames) prepended as left context on second chunk too
+    assert payload["left_context_size"] == 10 + 2
+    assert len(payload["code_predictor_codes"]) == _Q * (20 + 2)
 
 
 def test_ref_code_context_can_be_buffered_before_first_emit():
@@ -276,9 +279,10 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     )
 
     assert payload is not None
+    # ref_code (2 frames) is kept (not popped) for subsequent chunks
     assert payload["left_context_size"] == 2
     assert len(payload["code_predictor_codes"]) == _Q * 12
-    assert rid not in tm.request_payload
+    assert rid in tm.request_payload
 
 
 def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
@@ -317,3 +321,27 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
         4,
         8,
     ]
+
+
+def test_non_async_processor_filters_out_of_range_codec_values():
+    """Frames with values >= codebook_size (e.g. stop_token_id=2150) are filtered."""
+    ref_code = torch.tensor([[9, 9, 9, 9]], dtype=torch.long)
+    audio_codes = torch.tensor(
+        [
+            [0, 0, 0, 0],  # zero-padded (filtered)
+            [1, 2, 3, 4],  # valid
+            [2150, 0, 0, 0],  # stop token (filtered)
+            [5, 6, 7, 8],  # valid
+        ],
+        dtype=torch.long,
+    )
+    output = SimpleNamespace(multimodal_output={"audio_codes": audio_codes, "ref_code": ref_code})
+    stage = SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])
+
+    prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
+
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    # Only ref_code (1 frame) + 2 valid frames = 3 frames * 4 quantizers = 12 codes
+    assert len(prompt["prompt_token_ids"]) == 4 * 3
+    assert prompt["additional_information"] == {"left_context_size": [1]}
