@@ -767,10 +767,6 @@ class AsyncOmniEngine:
     def _detect_pd_config(self) -> dict[str, Any] | None:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
 
-        Scans stage_configs for is_prefill_only / is_decode_only flags,
-        extracts the bootstrap address, and applies the MooncakeConnector
-        monkey patch if a PD pair is found.
-
         Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
         """
         prefill_idx: int | None = None
@@ -784,15 +780,6 @@ class AsyncOmniEngine:
 
         if prefill_idx is None or decode_idx is None:
             return None
-
-        # Apply MooncakeConnector monkey patch before vLLM internals load it
-        try:
-            from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
-
-            apply_mooncake_connector_patch()
-            logger.info("[AsyncOmniEngine] MooncakeConnector monkey patch applied for PD disaggregation")
-        except Exception as exc:
-            logger.warning("[AsyncOmniEngine] Failed to apply MooncakeConnector patch: %s", exc)
 
         # Extract bootstrap address from prefill stage engine_args
         bootstrap_addr: str | None = None
