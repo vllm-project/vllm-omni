@@ -58,6 +58,11 @@ def parse_args():
         help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
 
     args = parser.parse_args()
     return args
@@ -103,6 +108,7 @@ def main():
             "shm_threshold_bytes": args.shm_threshold_bytes,
             "worker_backend": args.worker_backend,
             "ray_address": args.ray_address,
+            "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         }
     )
 

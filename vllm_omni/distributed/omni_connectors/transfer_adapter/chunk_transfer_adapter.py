@@ -95,6 +95,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not hasattr(request, "additional_information"):
             request.additional_information = None
         self._pending_load_reqs.append(request)
+        with self._recv_cond:
+            self._recv_cond.notify()
 
     def save_async(
         self,
@@ -116,6 +118,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_finished": request.is_finished(),
         }
         self._pending_save_reqs.append(task)
+        with self._save_cond:
+            self._save_cond.notify()
 
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id

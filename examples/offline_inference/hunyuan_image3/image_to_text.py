@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Pretrain template prompt: <|startoftext|>{system}<img>{question}",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -52,7 +57,10 @@ def load_image(image_path: str) -> Image.Image:
 
 
 def main(args: argparse.Namespace) -> None:
-    omni = Omni(model=args.model)
+    omni = Omni(
+        model=args.model,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+    )
 
     prompt_dict = {
         "prompt": args.prompt,
