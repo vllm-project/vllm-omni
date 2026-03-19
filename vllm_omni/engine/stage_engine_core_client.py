@@ -25,13 +25,13 @@ logger = init_logger(__name__)
 class StageEngineCoreClient(AsyncMPClient):
     """Stage async client that inherits from vLLM's AsyncMPClient.
 
-    Fully reuses AsyncMPClient.__init__ for:
+    Fully reuses AsyncMPClient for:
     - ZMQ setup, sockets
-    - launch_core_engines() -> EngineCoreProc
     - outputs_queue, output_queue_task
-    - All utility methods (shutdown, get_output_async, abort_requests_async, etc.)
+    - All utility methods (get_output_async, abort_requests_async, etc.)
 
-    This is the async version of StageMPClient, designed for use with AsyncOmniEngine.
+    The subprocess is spawned externally via ``spawn_stage_core`` /
+    ``complete_stage_handshake`` from *stage_engine_core_proc.py*.
     """
 
     def __init__(
@@ -40,8 +40,7 @@ class StageEngineCoreClient(AsyncMPClient):
         executor_class: type,
         metadata: StageMetadata,
         client_addresses: dict[str, str] | None = None,
-        engine_manager: Any = None,
-        coordinator: Any = None,
+        proc: Any = None,
     ):
         """Create an async EngineCore client for a single stage.
 
@@ -49,6 +48,11 @@ class StageEngineCoreClient(AsyncMPClient):
         engine args building, device locking) is done by the Orchestrator
         via helpers in stage_init_utils.py. This constructor just stores metadata
         and calls super().__init__().
+
+        The subprocess is spawned externally via ``spawn_stage_core`` /
+        ``complete_stage_handshake`` (see *stage_engine_core_proc.py*).
+        The resulting ``proc`` handle is passed in so this client can
+        manage the process lifecycle on shutdown.
         """
         # -------- Stage metadata (public fields used at runtime) --------
         self.stage_id = metadata.stage_id
@@ -64,6 +68,7 @@ class StageEngineCoreClient(AsyncMPClient):
         self.model_stage = metadata.model_stage
 
         self.engine_outputs: Any = None
+        self._proc = proc
 
         logger.info(
             "[StageEngineCoreClient] Stage-%s initializing EngineCore",
@@ -76,10 +81,6 @@ class StageEngineCoreClient(AsyncMPClient):
                 log_stats=False,
                 client_addresses=client_addresses,
             )
-            if engine_manager is not None:
-                self.resources.engine_manager = engine_manager
-            if coordinator is not None:
-                self.resources.coordinator = coordinator
         except Exception:
             logger.exception(
                 "[StageEngineCoreClient] Stage-%s EngineCore init failed",
@@ -166,3 +167,12 @@ class StageEngineCoreClient(AsyncMPClient):
             args=args,
             kwargs=kwargs,
         )
+
+    def shutdown(self) -> None:
+        """Shutdown ZMQ connections and the subprocess."""
+        super().shutdown()
+        if self._proc is not None and self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=5)
+            if self._proc.is_alive():
+                self._proc.kill()

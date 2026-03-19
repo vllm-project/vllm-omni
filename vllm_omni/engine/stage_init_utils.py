@@ -122,8 +122,7 @@ class StartedLlmStage:
     metadata: Any
     vllm_config: Any
     executor_class: type
-    engine_manager: Any
-    coordinator: Any
+    proc: Any
     addresses: Any
 
 
@@ -456,23 +455,21 @@ def initialize_diffusion_stage(model: str, stage_cfg: Any, metadata: StageMetada
 
 
 def close_started_llm_stage(started: StartedLlmStage) -> None:
-    """Close managers owned by a launched stage that never attached."""
-    resources = (
-        ("engine manager", started.engine_manager),
-        ("coordinator", started.coordinator),
-    )
-    for resource_name, resource in resources:
-        if resource is None:
-            continue
-        try:
-            resource.close()
-        except Exception as cleanup_error:
-            logger.warning(
-                "[stage_init] Failed to close launched %s for stage %s: %s",
-                resource_name,
-                started.stage_id,
-                cleanup_error,
-            )
+    """Terminate the subprocess owned by a launched stage that never attached."""
+    if started.proc is None:
+        return
+    try:
+        if started.proc.is_alive():
+            started.proc.terminate()
+            started.proc.join(timeout=5)
+            if started.proc.is_alive():
+                started.proc.kill()
+    except Exception as cleanup_error:
+        logger.warning(
+            "[stage_init] Failed to terminate process for stage %s: %s",
+            started.stage_id,
+            cleanup_error,
+        )
 
 
 def finalize_initialized_stages(

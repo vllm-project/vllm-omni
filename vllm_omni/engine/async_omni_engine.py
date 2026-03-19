@@ -31,7 +31,10 @@ from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
-from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
+from vllm_omni.engine.stage_engine_core_proc import (
+    complete_stage_handshake,
+    spawn_stage_core,
+)
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
@@ -331,21 +334,17 @@ class AsyncOmniEngine:
                         engine_args_dict,
                         stage_init_timeout,
                     )
-                    addresses = get_engine_zmq_addresses(vllm_config)
-                    launch_cm = launch_core_engines(
+                    addresses, proc, handshake_address = spawn_stage_core(
                         vllm_config=vllm_config,
                         executor_class=executor_class,
                         log_stats=False,
-                        addresses=addresses,
                     )
-                    engine_manager, coordinator, addresses = launch_cm.__enter__()
                     started_stage = StartedLlmStage(
                         stage_id=metadata.stage_id,
                         metadata=metadata,
                         vllm_config=vllm_config,
                         executor_class=executor_class,
-                        engine_manager=engine_manager,
-                        coordinator=coordinator,
+                        proc=proc,
                         addresses=addresses,
                     )
                 finally:
@@ -355,7 +354,7 @@ class AsyncOmniEngine:
                         current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
             logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
-            launch_cm.__exit__(None, None, None)
+            complete_stage_handshake(proc, handshake_address, addresses, vllm_config)
             logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
             assert started_stage is not None
             return started_stage
@@ -386,11 +385,9 @@ class AsyncOmniEngine:
                 executor_class=started.executor_class,
                 metadata=started.metadata,
                 client_addresses=client_addresses,
-                engine_manager=started.engine_manager,
-                coordinator=started.coordinator,
+                proc=started.proc,
             )
-            started.engine_manager = None
-            started.coordinator = None
+            started.proc = None
         except Exception:
             close_started_llm_stage(started)
             raise
