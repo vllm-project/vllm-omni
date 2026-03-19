@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import uuid
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 import zmq
@@ -119,13 +119,33 @@ class StageDiffusionClient:
                         "reason": error_msg,
                     }
 
+    # Fields that are subprocess-local and cannot be serialized across
+    # process boundaries.  They are recreated in the subprocess with
+    # their default values.
+    _NON_SERIALIZABLE_FIELDS = frozenset({
+        "generator",  # torch.Generator — recreated from seed
+        "modules",    # model components — loaded in subprocess
+    })
+
     @staticmethod
     def _sampling_params_to_dict(sampling_params: Any) -> dict[str, Any]:
-        """Convert sampling params to a plain dict for serialization."""
+        """Convert sampling params to a plain dict for serialization.
+
+        Uses ``dataclasses.fields`` + ``getattr`` instead of ``asdict``
+        to avoid deep-copying large tensors, and skips fields that
+        cannot cross process boundaries.
+        """
         if is_dataclass(sampling_params) and not isinstance(sampling_params, type):
-            return asdict(sampling_params)
+            return {
+                f.name: getattr(sampling_params, f.name)
+                for f in fields(sampling_params)
+                if f.name not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS
+            }
         if isinstance(sampling_params, dict):
-            return sampling_params
+            return {
+                k: v for k, v in sampling_params.items()
+                if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS
+            }
         return dict(sampling_params)
 
     # ------------------------------------------------------------------
