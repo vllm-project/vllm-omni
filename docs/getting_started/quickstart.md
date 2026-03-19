@@ -42,7 +42,7 @@ if __name__ == "__main__":
     omni = Omni(model="Tongyi-MAI/Z-Image-Turbo")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output[0].images
+    images = outputs[0].request_output.images
     images[0].save("coffee.png")
 ```
 
@@ -70,7 +70,7 @@ if __name__ == "__main__":
     ]
     omni_outputs = omni.generate(prompts)
     for i_prompt, prompt_output in enumerate(omni_outputs):
-        this_request_output = prompt_output.request_output[0]
+        this_request_output = prompt_output.request_output
         this_images = this_request_output.images
         for i_image, image in enumerate(this_images):
             image.save(f"p{i_prompt}-img{i_image}.jpg")

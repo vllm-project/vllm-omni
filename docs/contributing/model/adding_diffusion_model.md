@@ -815,6 +815,107 @@ class WanTransformer3DModel(nn.Module):
 
 ---
 
+### Diffusion Timing (Performance Profiling)
+When adapting a new diffusion model, it is often useful to analyze the latency of key components such as text encoding, diffusion denoising, and VAE decoding.
+vLLM-Omni provides a timing utility via `DiffusionPipelineProfilerMixin` to help developers quickly identify performance bottlenecks.
+
+!!! info
+      `DiffusionPipelineProfilerMixin` is different from using `torch.profiler` for diffusion models, as introduced in this [tutorial](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/profiling.md#3-profiling-diffusion-models). `DiffusionPipelineProfilerMixin` only prints the timing information of multiple functions (such as `vae.decode`), while `torch.profiler` saves detailed GPU/CPU computation time, call/execution steps.
+
+This tool automatically measures the execution time of selected pipeline modules and prints the results in the logs.
+
+**Enabling Diffusion Timing**
+
+
+Enable timing by setting:
+```
+vllm serve Qwen/Qwen-Image --omni --port 8091 --enable-diffusion-pipeline-profiler
+```
+You can optionally specify which modules to profile:
+```
+class YourPipeline(xxx, DiffusionPipelineProfilerMixin):
+    def __init__(self, xxx):
+        ...
+        self.setup_diffusion_pipeline_profiler(profiler_targets=["diffuse"], enable_diffusion_pipeline_profiler)
+```
+If not specified, the default targets are used:
+```
+["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
+```
+**Adding DiffusionPipelineProfilerMixin to a Pipeline**
+To enable timing support in your pipeline, inherit from DiffusionPipelineProfilerMixin.
+```python
+from vllm_omni.diffusion.utils.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+
+class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
+    # Optional: Specify custom timing targets
+    _PROFILER_TARGETS = ["vae.encode", "vae.decode", "diffuse", "text_encoder.forward", "tokenizer.forward"]
+
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
+        # initialize pipeline components
+        ...
+
+        # initialize timing profiler
+        self.setup_diffusion_pipeline_profiler(enable_diffusion_pipeline_profiler)
+```
+The mixin dynamically wraps selected methods and records their execution time during inference.
+
+If you need to fetch the execution time of different modules, you will need to pass `self.stage_durations` to `DiffusionOutput`, as shown below:
+
+```diff
+-   return DiffusionOutput(output=img)
++   return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
+```
+
+**Pipeline Design for Timing**
+The current diffusion timing utility is function-based, meaning it measures the execution time of individual methods.
+
+When implementing a new pipeline, avoid putting all logic inside a single function (e.g., forward). Instead, structure the pipeline in a modular way by separating key stages into independent methods, such as the diffusion loop.
+
+For example:
+```
+def forward(self, req: OmniDiffusionRequest):
+    prompt_embeds = self.encode_prompt(req)
+    latents = self.diffuse(prompt_embeds, req)
+    images = self.vae.decode(latents)
+    return DiffusionOutput(output=images)
+```
+This allows the timing utility to measure each stage (e.g., encode_prompt, diffuse, vae.decode) separately and helps identify performance bottlenecks more easily.
+
+
+**Default Profiled Modules**
+
+By default, the following pipeline modules are timed:
+```
+vae.encode
+vae.decode
+diffuse
+text_encoder.forward
+tokenizer.forward
+```
+
+**Example Output**
+
+When enabled, timing logs appear like this:
+```
+[DiffusionTiming] text_encoder.forward took 0.018s
+[DiffusionTiming] diffuse took 2.412s
+[DiffusionTiming] vae.decode took 0.063s
+```
+These measurements help identify bottlenecks during model adaptation and optimization
+
+
+
 ## Troubleshooting
 
 

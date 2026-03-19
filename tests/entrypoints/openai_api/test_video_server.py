@@ -44,7 +44,7 @@ class MockVideoResult:
 
 class FakeAsyncOmni:
     def __init__(self):
-        self.stage_list = ["diffusion"]
+        self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
         self.captured_prompt = None
         self.captured_sampling_params_list = None
 

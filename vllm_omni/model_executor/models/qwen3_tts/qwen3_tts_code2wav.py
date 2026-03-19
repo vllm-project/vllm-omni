@@ -284,11 +284,11 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
-            expected_len = actual_frames * upsample
-            if wav.shape[0] > expected_len:
-                wav = wav[:expected_len]
             if ctx_frames > 0:
-                cut = ctx_frames * upsample
+                # Proportional trim matching the official HF implementation:
+                # the decoder output length may not be exactly frames * upsample
+                # so compute cut as a proportion of total decoded length.
+                cut = int(ctx_frames / max(actual_frames, 1) * wav.shape[0])
                 if cut < wav.shape[0]:
                     wav = wav[cut:]
                 else:
@@ -298,6 +298,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                         wav.shape[0],
                     )
                     continue
+            else:
+                expected_len = actual_frames * upsample
+                if wav.shape[0] > expected_len:
+                    wav = wav[:expected_len]
             if wav.shape[0] > 0:
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 
