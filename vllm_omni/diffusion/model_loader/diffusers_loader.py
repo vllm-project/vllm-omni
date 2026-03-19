@@ -335,7 +335,7 @@ class DiffusersPipelineLoader:
                 raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
             if weights_scale_not_loaded:
                 logger.warning(
-                    f"Following weights scale were not initialized from checkpoint: {weights_scale_not_loaded}"
+                    f"Following weight_scale weights were not initialized from checkpoint: {weights_scale_not_loaded}"
                 )
 
     def _is_gguf_quantization(self, od_config: OmniDiffusionConfig) -> bool:
