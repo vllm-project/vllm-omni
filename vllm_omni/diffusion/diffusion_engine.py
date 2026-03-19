@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import PIL.Image
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -106,8 +107,19 @@ class DiffusionEngine:
                 for i, prompt in enumerate(request.prompts)
             ]
 
+        # When CPU offload is enabled, move output to CPU before
+        # post-processing to avoid device OOM — model weights may still
+        # reside on the device and leave no headroom for intermediates.
+        output_data = output.output
+        if (
+            self.od_config.enable_cpu_offload
+            and isinstance(output_data, torch.Tensor)
+            and output_data.device.type != "cpu"
+        ):
+            output_data = output_data.cpu()
+
         postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
         audio_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
