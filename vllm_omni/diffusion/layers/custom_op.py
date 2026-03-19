@@ -25,8 +25,6 @@ class CustomOp(nn.Module):
             return self.forward_npu
         elif current_omni_platform.is_xpu():
             return self.forward_xpu
-        elif current_omni_platform.is_musa():
-            return self.forward_musa
         else:
             return self.forward_native
 
@@ -52,8 +50,4 @@ class CustomOp(nn.Module):
 
     def forward_hip(self, *args, **kwargs):
         # By default, we assume that HIP ops are compatible with CUDA ops.
-        return self.forward_cuda(*args, **kwargs)
-
-    def forward_musa(self, *args, **kwargs):
-        # By default, we assume that MUSA ops are compatible with CUDA ops.
         return self.forward_cuda(*args, **kwargs)

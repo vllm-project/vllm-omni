@@ -29,7 +29,6 @@ from PIL import Image
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni import Omni
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -118,7 +117,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out", type=str, default="output.png", help="Path to save the generated image.")
     p.add_argument("--trust-remote-code", action="store_true", help="Trust remote code when loading the model.")
-    nullify_stage_engine_defaults(p)
     args = p.parse_args()
     if not args.prompt:
         args.prompt = ["A stylish woman with sunglasses riding a motorcycle in NYC."]
@@ -150,16 +148,19 @@ def _collect_images(outputs: list) -> list[torch.Tensor]:
     """Extract all image tensors produced by the final (DiT) stage."""
     images: list[torch.Tensor] = []
     for out in outputs:
-        ro_item = getattr(out, "request_output", out)
-        for completion in getattr(ro_item, "outputs", None) or []:
-            mm = getattr(completion, "multimodal_output", None)
-            if not isinstance(mm, dict) or "image" not in mm:
-                raise RuntimeError(f"Missing image in multimodal output: {mm}")
-            payload = mm["image"]
-            for tensor in payload if isinstance(payload, list) else [payload]:
-                if not isinstance(tensor, torch.Tensor):
-                    raise TypeError(f"Expected image tensor, got {type(tensor)}")
-                images.append(tensor)
+        ro_list = getattr(out, "request_output", out)
+        if not isinstance(ro_list, list):
+            ro_list = [ro_list]
+        for ro_item in ro_list:
+            for completion in getattr(ro_item, "outputs", None) or []:
+                mm = getattr(completion, "multimodal_output", None)
+                if not isinstance(mm, dict) or "image" not in mm:
+                    raise RuntimeError(f"Missing image in multimodal output: {mm}")
+                payload = mm["image"]
+                for tensor in payload if isinstance(payload, list) else [payload]:
+                    if not isinstance(tensor, torch.Tensor):
+                        raise TypeError(f"Expected image tensor, got {type(tensor)}")
+                    images.append(tensor)
     return images
 
 

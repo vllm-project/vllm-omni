@@ -114,8 +114,6 @@ class NextStepConfig(LlamaConfig):
 
 
 class NextStepModel(nn.Module):
-    _layerwise_offload_blocks_attrs = ["layers"]
-
     def __init__(self, config: NextStepConfig):
         super().__init__()
         self.config = config

@@ -83,9 +83,6 @@ target/
 profile_default/
 ipython_config.py
 
-# uv
-uv.lock
-
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:
@@ -158,23 +155,10 @@ cython_debug/
 
 # Claude
 CLAUDE.md
-/.claude/*
-!.claude/skills/
-!.claude/skills/readme.md
-!.claude/skills/add-diffusion-model/
-!.claude/skills/add-diffusion-model/SKILL.md
-!.claude/skills/add-diffusion-model/references/
-!.claude/skills/add-diffusion-model/references/*.md
-!.claude/skills/add-tts-model/
-!.claude/skills/add-tts-model/SKILL.md
-!.claude/skills/review-pr/
-!.claude/skills/review-pr/SKILL.md
-!.claude/skills/review-pr/references/
-!.claude/skills/review-pr/references/*.md
+.claude/
 
 # Codex
 AGENTS.md
-.codex
 .codex/
 
 # cursor
@@ -204,7 +188,6 @@ checkpoints/
 # Cache directories
 cache/
 !vllm_omni/diffusion/cache/
-!tests/diffusion/cache/
 .cache/
 diffusion_cache/
 kv_cache/
@@ -239,7 +222,6 @@ data/
 datasets/
 *.csv
 *.json
-!tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
 *.parquet
@@ -265,8 +247,3 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
-# Vendored test reference audio (small, intentionally checked in)
-!tests/assets/**/*.wav
-.worktrees/
-# CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
-tests/.ci_generated/

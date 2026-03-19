@@ -27,7 +27,6 @@
 *.mov binary
 *.mp4 binary
 *.mp3 binary
-*.wav binary
 *.flv binary
 *.fla binary
 *.swf binary

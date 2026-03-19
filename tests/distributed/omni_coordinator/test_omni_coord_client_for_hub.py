@@ -12,8 +12,6 @@ from vllm_omni.distributed.omni_coordinator import (
     OmniCoordClientForHub,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
 
 def _bind_pub() -> tuple[zmq.Context, zmq.Socket, str]:
     ctx = zmq.Context.instance()

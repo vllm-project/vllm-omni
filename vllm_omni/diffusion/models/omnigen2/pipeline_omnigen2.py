@@ -8,7 +8,7 @@ import os
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any
 
 import numpy as np
 import PIL.Image
@@ -29,16 +29,13 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -621,7 +618,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
+class OmniGen2Pipeline(nn.Module):
     """
     Pipeline for text-to-image generation using OmniGen2.
 
@@ -634,10 +631,6 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
     Args:
         od_config (OmniDiffusionConfig): The OmniDiffusion configuration.
     """
-
-    _dit_modules: ClassVar[list[str]] = ["transformer"]
-    _encoder_modules: ClassVar[list[str]] = ["mllm"]
-    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,
@@ -680,11 +673,42 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
             self.device
         )
 
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, OmniGen2Transformer2DModel)
-        self.transformer = OmniGen2Transformer2DModel(
-            **transformer_kwargs,
-            quant_config=od_config.quantization_config,
-        )
+        transformer_config_path = os.path.join(model, "transformer", "config.json")
+        transformer_kwargs = {}
+
+        if os.path.exists(transformer_config_path):
+            with open(transformer_config_path) as f:
+                transformer_config = json.load(f)
+
+            param_mapping = {
+                "patch_size": "patch_size",
+                "in_channels": "in_channels",
+                "out_channels": "out_channels",
+                "hidden_size": "hidden_size",
+                "num_layers": "num_layers",
+                "num_refiner_layers": "num_refiner_layers",
+                "num_attention_heads": "num_attention_heads",
+                "num_kv_heads": "num_kv_heads",
+                "multiple_of": "multiple_of",
+                "ffn_dim_multiplier": "ffn_dim_multiplier",
+                "norm_eps": "norm_eps",
+                "axes_dim_rope": "axes_dim_rope",
+                "axes_lens": "axes_lens",
+                "text_feat_dim": "text_feat_dim",
+                "timestep_scale": "timestep_scale",
+            }
+
+            for config_key, param_name in param_mapping.items():
+                if config_key in transformer_config:
+                    value = transformer_config[config_key]
+                    # Handle tuple parameters (axes_dim_rope, axes_lens)
+                    if isinstance(value, list) and param_name in (
+                        "axes_dim_rope",
+                        "axes_lens",
+                    ):
+                        value = tuple(value)
+                    transformer_kwargs[param_name] = value
+        self.transformer = OmniGen2Transformer2DModel(**transformer_kwargs)
         self.mllm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="mllm", local_files_only=local_files_only
         ).to(self.device)
@@ -1180,14 +1204,7 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
         self._num_timesteps = len(timesteps)
 
         for i, t in enumerate(timesteps):
-            text_guidance_scale = (
-                self.text_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
-            )
-            image_guidance_scale = (
-                self.image_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
-            )
-
-            positive_kwargs = dict(
+            model_pred = self.predict(
                 t=t,
                 latents=latents,
                 prompt_embeds=prompt_embeds,
@@ -1195,18 +1212,15 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
                 prompt_attention_mask=prompt_attention_mask,
                 ref_image_hidden_states=ref_latents,
             )
-            uncond_kwargs = dict(
-                t=t,
-                latents=latents,
-                prompt_embeds=negative_prompt_embeds,
-                freqs_cis=freqs_cis,
-                prompt_attention_mask=negative_prompt_attention_mask,
-                ref_image_hidden_states=None,
+            text_guidance_scale = (
+                self.text_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
+            )
+            image_guidance_scale = (
+                self.image_guidance_scale if self.cfg_range[0] <= i / len(timesteps) <= self.cfg_range[1] else 1.0
             )
 
             if text_guidance_scale > 1.0 and image_guidance_scale > 1.0:
-                # 3-branch CFG: pos + ref_neg + uncond
-                ref_neg_kwargs = dict(
+                model_pred_ref = self.predict(
                     t=t,
                     latents=latents,
                     prompt_embeds=negative_prompt_embeds,
@@ -1214,24 +1228,31 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
                     prompt_attention_mask=negative_prompt_attention_mask,
                     ref_image_hidden_states=ref_latents,
                 )
-                model_pred = self.predict_noise_with_multi_branch_cfg(
-                    do_true_cfg=True,
-                    true_cfg_scale={
-                        "text": text_guidance_scale,
-                        "image": image_guidance_scale,
-                    },
-                    branches_kwargs=[positive_kwargs, ref_neg_kwargs, uncond_kwargs],
+
+                model_pred_uncond = self.predict(
+                    t=t,
+                    latents=latents,
+                    prompt_embeds=negative_prompt_embeds,
+                    freqs_cis=freqs_cis,
+                    prompt_attention_mask=negative_prompt_attention_mask,
+                    ref_image_hidden_states=None,
+                )
+
+                model_pred = (
+                    model_pred_uncond
+                    + image_guidance_scale * (model_pred_ref - model_pred_uncond)
+                    + text_guidance_scale * (model_pred - model_pred_ref)
                 )
             elif text_guidance_scale > 1.0:
-                # 2-branch CFG: pos + uncond
-                model_pred = self.predict_noise_with_multi_branch_cfg(
-                    do_true_cfg=True,
-                    true_cfg_scale=text_guidance_scale,
-                    branches_kwargs=[positive_kwargs, uncond_kwargs],
+                model_pred_uncond = self.predict(
+                    t=t,
+                    latents=latents,
+                    prompt_embeds=negative_prompt_embeds,
+                    freqs_cis=freqs_cis,
+                    prompt_attention_mask=negative_prompt_attention_mask,
+                    ref_image_hidden_states=None,
                 )
-            else:
-                # No CFG
-                model_pred = self.predict_noise(**positive_kwargs)
+                model_pred = model_pred_uncond + text_guidance_scale * (model_pred - model_pred_uncond)
 
             latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
 
@@ -1261,39 +1282,21 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
+        batch_size, num_channels_latents, height, width = latents.shape
+
         optional_kwargs = {}
         if "ref_image_hidden_states" in set(inspect.signature(self.transformer.forward).parameters.keys()):
             optional_kwargs["ref_image_hidden_states"] = ref_image_hidden_states
 
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            model_pred = self.transformer(
-                latents,
-                timestep,
-                prompt_embeds,
-                freqs_cis,
-                prompt_attention_mask,
-                **optional_kwargs,
-            )
+        model_pred = self.transformer(
+            latents,
+            timestep,
+            prompt_embeds,
+            freqs_cis,
+            prompt_attention_mask,
+            **optional_kwargs,
+        )
         return model_pred
-
-    def predict_noise(self, **kwargs):
-        """Override CFGParallelMixin.predict_noise to use self.predict."""
-        return self.predict(**kwargs)
-
-    def combine_multi_branch_cfg_noise(self, predictions, true_cfg_scale, cfg_normalize=False):
-        """Override: 3-branch dual scale or 2-branch standard CFG."""
-        if len(predictions) == 3:
-            text_scale = true_cfg_scale["text"]
-            image_scale = true_cfg_scale["image"]
-            pos, ref, uncond = predictions[0], predictions[1], predictions[2]
-            return uncond + image_scale * (ref - uncond) + text_scale * (pos - ref)
-        # 2-branch: standard CFG
-        pos, neg = predictions[0], predictions[1]
-        return neg + true_cfg_scale * (pos - neg)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

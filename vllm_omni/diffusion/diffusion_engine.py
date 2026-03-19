@@ -1,29 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from __future__ import annotations
-
-import asyncio
-import concurrent.futures
-import inspect
-import queue
-import threading
+import os
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import PIL.Image
-import torch
 from vllm.logger import init_logger
-from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import (
-    DiffusionOutput,
-    DiffusionRequestAbortedError,
-    OmniDiffusionConfig,
-)
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
@@ -31,44 +18,24 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
 
-@dataclass
-class _RpcTask:
-    """A pending collective_rpc invocation queued for the busy loop."""
-
-    method: str
-    args: tuple
-    kwargs: dict | None
-    deadline: float | None
-    unique_reply_rank: int | None
-    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
+def supports_image_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_image_input", False))
 
 
-def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
-    if od_config.diffusion_load_format == "diffusers" and (pipe_cls := od_config.diffusers_pipeline_cls) is not None:
-        signature = inspect.signature(pipe_cls.__call__)
-        support_image_input = "image" in signature.parameters
-        support_audio_input = (
-            "audio" in signature.parameters or "audio_latents" in signature.parameters
-        )  # ref. LTX-2 format
-        return support_image_input, support_audio_input
-
-    supports_image_input = False
-    supports_audio_input = False
-
-    model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
-    if model_cls is not None:
-        supports_image_input = bool(getattr(model_cls, "support_image_input", False))
-        supports_audio_input = bool(getattr(model_cls, "support_audio_input", False))
-    return supports_image_input, supports_audio_input
+def supports_audio_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_audio_input", False))
 
 
 def image_color_format(model_class_name: str) -> str:
@@ -83,42 +50,10 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
-def get_extra_body_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of extra_body keys accepted by a pipeline.
-
-    Each pipeline can declare ``EXTRA_BODY_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which request-level parameters should be forwarded from
-    ``extra_body`` to ``OmniDiffusionSamplingParams.extra_args``.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_BODY_PARAMS", frozenset()))
-
-
-def get_extra_output_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of custom_output keys to expose in API response metrics.
-
-    Each pipeline can declare ``EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which ``DiffusionOutput.custom_output`` keys should be
-    copied into the response ``metrics`` dict.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
-
-
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
-    def __init__(
-        self,
-        od_config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ):
+    def __init__(self, od_config: OmniDiffusionConfig):
         """Initialize the diffusion engine.
 
         Args:
@@ -128,38 +63,9 @@ class DiffusionEngine:
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
-        # Cache whether the model-specific postprocess accepts request-level
-        # sampling params so step() can support both legacy and extended hooks.
-        self._post_process_accepts_sampling_params = bool(
-            self.post_process_func is not None
-            and "sampling_params" in inspect.signature(self.post_process_func).parameters
-        )
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.step_execution = bool(getattr(od_config, "step_execution", False))
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
-        self.scheduler.initialize(od_config)
-        if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
-            max_num_seqs = self.scheduler.max_num_running_reqs
-            self.scheduler.max_num_running_reqs = 1
-            logger.warning(f"Non-stepwise-execution does not support max-num-seqs={max_num_seqs}, set it to 1.")
-        self.main_loop: asyncio.AbstractEventLoop | None = None
-        self.stop_event: threading.Event | None = None
-        self._loop_started = False
-        self._init_lock = asyncio.Lock()
-        # _rpc_lock is retained solely as the underlying lock for self._cv,
-        # which is used to signal the busy loop. Worker-call serialization is
-        # now handled structurally by routing all executor calls through the
-        # busy loop rather than via mutual exclusion.
-        self._rpc_lock = threading.RLock()
-        self._cv = threading.Condition(self._rpc_lock)
-        self._out_queue: dict[str, asyncio.Future] = {}
-        self.abort_queue: queue.Queue[str] = queue.Queue()
-        self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
         try:
             self._dummy_run()
@@ -168,24 +74,7 @@ class DiffusionEngine:
             self.close()
             raise e
 
-    async def _check_and_start_background_loop(self):
-        if self._loop_started:
-            return
-
-        async with self._init_lock:
-            # double check, in case of lock queue issue
-            if self._loop_started:
-                return
-
-            self.main_loop = asyncio.get_running_loop()
-            self.stop_event = threading.Event()
-            self.worker_thread = threading.Thread(target=self._busy_loop)
-            self.worker_thread.start()
-            self._loop_started = True
-
-    async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
-        await self._check_and_start_background_loop()
-
+    def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         diffusion_engine_start_time = time.perf_counter()
 
         # Apply pre-processing if available
@@ -194,17 +83,15 @@ class DiffusionEngine:
             preprocess_start_time = time.perf_counter()
             request = self.pre_process_func(request)
             preprocess_time = time.perf_counter() - preprocess_start_time
-            logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
+            logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
         exec_start_time = time.perf_counter()
-        output = await self.async_add_req_and_wait_for_response(request)
+        output = self.add_req_and_wait_for_response(request)
         exec_total_time = time.perf_counter() - exec_start_time
 
-        if output.aborted:
-            raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise RuntimeError(output.error)
-        logger.debug("Generation completed successfully.")
+            raise Exception(f"{output.error}")
+        logger.info("Generation completed successfully.")
 
         if output.output is None:
             logger.warning("Output is None, returning empty OmniRequestOutput")
@@ -219,42 +106,17 @@ class DiffusionEngine:
                 for i, prompt in enumerate(request.prompts)
             ]
 
-        # When CPU offload is enabled, move output to CPU before
-        # post-processing to avoid device OOM — model weights may still
-        # reside on the device and leave no headroom for intermediates.
-        output_data = output.output
-        if (
-            self.od_config.enable_cpu_offload
-            and isinstance(output_data, torch.Tensor)
-            and output_data.device.type != "cpu"
-        ):
-            output_data = output_data.cpu()
-
         postprocess_start_time = time.perf_counter()
-        if self.post_process_func is not None:
-            # Some video pipelines need request-level controls during
-            # postprocess (for example worker-side frame interpolation).
-            if self._post_process_accepts_sampling_params:
-                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
-            else:
-                outputs = self.post_process_func(output_data)
-        else:
-            outputs = output_data
+        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
         audio_payload = None
-        custom_output = output.custom_output or {}
-        model_audio_sample_rate = None
-        model_fps = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
-            custom_output.update(outputs.get("custom_output") or {})
-            model_audio_sample_rate = outputs.get("audio_sample_rate")
-            model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
         postprocess_time = time.perf_counter() - postprocess_start_time
-        logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
+        logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
 
         step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
-        logger.debug(
+        logger.info(
             "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
             "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
             preprocess_time * 1000,
@@ -270,49 +132,22 @@ class DiffusionEngine:
 
         metrics = {
             "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-            "diffusion_engine_total_time_ms": step_total_ms,
+            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
+            "diffusion_engine_total_time_ms": exec_total_time * 1000,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
         }
-
-        # Detect text output: when the pipeline returns a string (e.g.,
-        # SenseNova-U1 / BAGEL single-stage img2text / text2text), wrap it
-        # as a text-type response instead of an image.
-        is_text_output = isinstance(output_data, str) and custom_output.get("text_output") is not None
+        if self.pre_process_func is not None:
+            metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
         # Handle single request or multiple requests
-        is_audio_output = supports_audio_output(self.od_config.model_class_name)
-        if is_audio_output and model_audio_sample_rate is None:
-            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
-            model_audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
-
-        def _audio_mm(payload: Any) -> dict[str, Any]:
-            mm: dict[str, Any] = {"audio": payload}
-            if model_audio_sample_rate is not None:
-                mm["audio_sample_rate"] = model_audio_sample_rate
-            return mm
-
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
             prompt = request.prompts[0]
             request_id = request.request_ids[0] if request.request_ids else ""
 
-            if is_text_output:
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics=metrics,
-                        custom_output=custom_output,
-                        final_output_type="text",
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
-            if is_audio_output:
+            if supports_audio_output(self.od_config.model_class_name):
                 request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
                 return [
                     OmniRequestOutput.from_diffusion(
@@ -321,24 +156,14 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
-                        trajectory_latents=output.trajectory_latents,
-                        trajectory_timesteps=output.trajectory_timesteps,
-                        trajectory_log_probs=output.trajectory_log_probs,
-                        trajectory_decoded=output.trajectory_decoded,
-                        multimodal_output=_audio_mm(request_audio_payload),
+                        multimodal_output={"audio": request_audio_payload},
                         final_output_type="audio",
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
                     ),
                 ]
             else:
                 mm_output = {}
                 if audio_payload is not None:
                     mm_output["audio"] = audio_payload
-                if model_audio_sample_rate is not None:
-                    mm_output["audio_sample_rate"] = model_audio_sample_rate
-                if model_fps is not None:
-                    mm_output["fps"] = model_fps
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -346,14 +171,8 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
-                        trajectory_latents=output.trajectory_latents,
-                        trajectory_timesteps=output.trajectory_timesteps,
-                        trajectory_log_probs=output.trajectory_log_probs,
-                        trajectory_decoded=output.trajectory_decoded,
-                        custom_output=custom_output,
+                        custom_output=output.custom_output or {},
                         multimodal_output=mm_output,
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
                     ),
                 ]
         else:
@@ -372,7 +191,7 @@ class DiffusionEngine:
                 request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
                 output_idx = end_idx
 
-                if is_audio_output:
+                if supports_audio_output(self.od_config.model_class_name):
                     request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
                     results.append(
                         OmniRequestOutput.from_diffusion(
@@ -381,14 +200,8 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
-                            multimodal_output=_audio_mm(request_audio_payload),
+                            multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
                         ),
                     )
                 else:
@@ -405,10 +218,6 @@ class DiffusionEngine:
                                 if num_outputs == 1:
                                     sliced_audio = sliced_audio[0]
                         mm_output["audio"] = sliced_audio
-                    if model_audio_sample_rate is not None:
-                        mm_output["audio_sample_rate"] = model_audio_sample_rate
-                    if model_fps is not None:
-                        mm_output["fps"] = model_fps
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -416,146 +225,15 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
-                            custom_output=custom_output,
+                            custom_output=output.custom_output or {},
                             multimodal_output=mm_output,
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
                         ),
                     )
 
             return results
 
-    def _busy_loop(self):
-        while not self.stop_event.is_set():
-            self._process_aborts_queue()
-            self._process_rpc_queue()
-
-            with self._cv:
-                while (
-                    not self.scheduler.has_requests()
-                    and self._rpc_queue.empty()
-                    and self.abort_queue.empty()
-                    and not self.stop_event.is_set()
-                ):
-                    self._cv.wait(timeout=1.0)
-
-                if self.stop_event.is_set():
-                    break
-
-                if not self.scheduler.has_requests():
-                    # Only RPC / abort work pending; loop back to drain it.
-                    continue
-
-                sched_output = self.scheduler.schedule()
-
-            if sched_output.is_empty:
-                self._handle_finished_requests(sched_output.finished_req_ids, None)
-                continue
-
-            try:
-                runner_output = self.execute_fn(sched_output)
-            except Exception as exc:
-                logger.error(
-                    "Execution failed for diffusion requests %s", sched_output.scheduled_req_ids, exc_info=True
-                )
-                runner_output = BatchRunnerOutput.from_list(
-                    [
-                        RunnerOutput(
-                            req_id=req_id,
-                            step_index=None,
-                            finished=True,
-                            result=DiffusionOutput(error=str(exc)),
-                        )
-                        for req_id in sched_output.scheduled_req_ids
-                    ]
-                )
-
-            self._process_aborts_queue()
-            self._process_rpc_queue()
-            finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-            self._handle_finished_requests(finished_req_ids, runner_output)
-
-        # Engine is stopping: fail any RPCs still queued so callers don't hang.
-        self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
-
-    def _process_rpc_queue(self) -> None:
-        """Execute pending collective_rpc tasks from the busy-loop thread.
-
-        Running these here means executor calls are naturally serialized
-        against execute_fn() without any mutual-exclusion locking.
-        """
-        while True:
-            try:
-                task = self._rpc_queue.get_nowait()
-            except queue.Empty:
-                return
-
-            fut = task.future
-            if fut.cancelled() or fut.done():
-                continue
-
-            remaining: float | None = None
-            if task.deadline is not None:
-                remaining = task.deadline - time.monotonic()
-                if remaining <= 0:
-                    if not fut.done():
-                        fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
-                    continue
-
-            try:
-                result = self.executor.collective_rpc(
-                    method=task.method,
-                    timeout=remaining,
-                    args=task.args,
-                    kwargs=task.kwargs,
-                    unique_reply_rank=task.unique_reply_rank,
-                )
-            except BaseException as exc:  # noqa: BLE001 - propagate to caller
-                # The future may have been cancelled (e.g. by a sync timeout
-                # or asyncio cancellation) while the executor call was
-                # running. Setting state on a cancelled/done future raises
-                # InvalidStateError, which would kill the busy loop.
-                if not fut.done():
-                    fut.set_exception(exc)
-            else:
-                if not fut.done():
-                    fut.set_result(result)
-
-    def _fail_pending_rpcs(self, exc: BaseException) -> None:
-        while True:
-            try:
-                task = self._rpc_queue.get_nowait()
-            except queue.Empty:
-                return
-            if not task.future.done():
-                task.future.set_exception(exc)
-
-    def _handle_finished_requests(
-        self,
-        finished_ids: set[str],
-        runner_output: RunnerOutput | None = None,
-        missing_result_error: str = "Diffusion execution finished without a final output",
-    ):
-        for rid in finished_ids:
-            if rid in self._out_queue:
-                fut = self._out_queue.pop(rid)
-                if runner_output is not None:
-                    _output = runner_output.get_req_output(rid)
-                else:
-                    _output = None
-                out = self._finalize_finished_request(rid, _output, missing_result_error)
-                if not fut.done():
-                    self.main_loop.call_soon_threadsafe(fut.set_result, out)
-
     @staticmethod
-    def make_engine(
-        config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ) -> DiffusionEngine:
+    def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
         """Factory method to create a DiffusionEngine instance.
 
         Args:
@@ -564,124 +242,156 @@ class DiffusionEngine:
         Returns:
             An instance of DiffusionEngine.
         """
-        return DiffusionEngine(config, scheduler=scheduler)
+        return DiffusionEngine(config)
 
-    def add_request(self, request: OmniDiffusionRequest) -> str:
-        fut = self.main_loop.create_future()
-        with self._cv:
-            sched_req_id = self.scheduler.add_request(request)
-            self._out_queue[sched_req_id] = fut
-            self._cv.notify_all()
+    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
+        return self.executor.add_req(request)
 
-        return sched_req_id
+    def start_profile(self, trace_filename: str | None = None) -> None:
+        """
+        Start torch profiling on all diffusion workers.
 
-    async def get_result(self, request_id: str) -> DiffusionOutput:
-        fut = self._out_queue.get(request_id)
-
-        if fut is None:
-            raise RuntimeError(f"Request {request_id} not found in output queue.")
-        try:
-            return await fut
-        except Exception as e:
-            logger.error(f"Wait for response failed: {e}")
-            raise
-
-    async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        # No lock needed: add_request is already protected by self._cv, and
-        # all executor calls are serialized inside the busy loop.
-        sched_req_id = self.add_request(request)
-        return await self.get_result(sched_req_id)
-
-    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        with self._rpc_lock:
-            target_sched_req_id = self.scheduler.add_request(request)
-
-            # keep scheduling and executing until the target request is finished
-            while True:
-                self._process_aborts_queue()
-                sched_output = self.scheduler.schedule()
-                if sched_output.is_empty:
-                    if target_sched_req_id in sched_output.finished_req_ids:
-                        return self._finalize_finished_request(target_sched_req_id)
-                    if not self.scheduler.has_requests():
-                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
-                    continue
-
-                # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
-                # within _dummy_run, only one request will be scheduled
-                sched_req_id = sched_output.scheduled_req_ids[0]
-                try:
-                    runner_output = self.execute_fn(sched_output)
-                except EngineDeadError:
-                    raise
-                except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
-                    runner_output = RunnerOutput(
-                        req_id=sched_req_id,
-                        step_index=None,
-                        finished=True,
-                        result=DiffusionOutput(error=str(exc)),
-                    )
-
-                self._process_aborts_queue()
-
-                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-
-                # sync func should receive one result
-                if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
-                    raise ValueError("Sync func should receive one result at one time")
-                if target_sched_req_id in finished_req_ids:
-                    runner_output = runner_output.get_req_output(target_sched_req_id)
-                    return self._finalize_finished_request(
-                        target_sched_req_id,
-                        runner_output=runner_output,
-                        missing_result_error="Diffusion execution finished without a final output.",
-                    )
-
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
-        """Start or stop profiling on all diffusion workers.
+        Creates a directory (if needed) and sets up a base filename template
+        for per-rank profiler traces (typically saved as <template>_rank<N>.json).
 
         Args:
-            is_start: True to start profiling, False to stop.
-            profile_prefix: Optional prefix for trace filename.
+            trace_filename: Optional base filename (without extension or rank suffix).
+                            If None, generates one using current timestamp.
         """
-        if is_start:
-            if profile_prefix is None:
-                profile_prefix = f"diffusion_{int(time.time())}"
-            logger.info(f"Starting diffusion profiling with prefix: {profile_prefix}")
-        else:
-            logger.info("Stopping diffusion profiling...")
+        if trace_filename is None:
+            trace_filename = f"stage_0_diffusion_{int(time.time())}_rank"
+
+        trace_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
+
+        # Expand ~ and ~user, then make absolute (robust against cwd changes)
+        trace_dir = os.path.expanduser(trace_dir)
+        trace_dir = os.path.abspath(trace_dir)
 
         try:
-            self.collective_rpc(method="profile", args=(is_start, profile_prefix))
+            os.makedirs(trace_dir, exist_ok=True)
+        except OSError as exc:
+            logger.error(f"Failed to create profiler directory {trace_dir}: {exc}")
+            raise
+
+        # Build final template path (without rank or extension — torch.profiler appends those)
+        full_template = os.path.join(trace_dir, trace_filename)
+
+        expected_pattern = f"{full_template}*.json"
+        logger.info(f"Starting diffusion profiling → {expected_pattern}")
+
+        # Also log the absolute directory once (useful in multi-node or containers)
+        logger.debug(f"Profiler output directory: {trace_dir}")
+
+        # Propagate to all workers
+        try:
+            self.collective_rpc(method="start_profile", args=(full_template,))
         except Exception as e:
-            action = "start" if is_start else "stop"
-            logger.error(f"Failed to {action} profiling on workers", exc_info=True)
-            if is_start:
-                raise RuntimeError(f"Could not {action} profiler: {e}") from e
+            logger.error("Failed to start profiling on workers", exc_info=True)
+            raise RuntimeError(f"Could not start profiler: {e}") from e
+
+    def stop_profile(self) -> dict:
+        """
+        Stop profiling on all workers and collect the final trace/table paths.
+
+        The worker (torch_profiler.py) now handles trace export, compression to .gz,
+        and deletion of the original .json file. This method only collects and
+        reports the paths returned by the workers.
+
+        Returns:
+            dict with keys:
+            - "traces": list of final trace file paths (usually .json.gz)
+            - "tables": list of table strings (one per rank)
+        """
+        logger.info("Stopping diffusion profiling and collecting results...")
+
+        try:
+            # Give worker enough time — export + compression + table can be slow
+            results = self.collective_rpc(method="stop_profile", timeout=600)
+        except Exception:
+            logger.error("Failed to stop profiling on workers", exc_info=True)
+            return {"traces": [], "tables": []}
+
+        output_files = {"traces": [], "tables": []}
+        successful_traces = 0
+
+        if not results:
+            logger.warning("No profiling results returned from any rank")
+            return output_files
+
+        for rank, res in enumerate(results):
+            if not isinstance(res, dict):
+                logger.warning(f"Rank {rank}: invalid result format (got {type(res)})")
+                continue
+
+            # 1. Trace file — should be .json.gz if compression succeeded
+            trace_path = res.get("trace")
+            if trace_path:
+                # We trust the worker — it created/compressed the file
+                logger.info(f"[Rank {rank}] Final trace: {trace_path}")
+                output_files["traces"].append(trace_path)
+                successful_traces += 1
+
+                # Optional: warn if path looks suspicious (e.g. still .json)
+                if not trace_path.endswith((".json.gz", ".json")):
+                    logger.warning(f"Rank {rank}: unusual trace path extension: {trace_path}")
+
+            # 2. Table file — plain text
+            table = res.get("table")
+            if table:
+                output_files["tables"].append(table)
+
+        # Final summary logging
+        num_ranks = len(results)
+        if successful_traces > 0:
+            final_paths_str = ", ".join(output_files["traces"][:3])
+            if len(output_files["traces"]) > 3:
+                final_paths_str += f" ... (+{len(output_files['traces']) - 3} more)"
+
+            logger.info(
+                f"Profiling stopped. Collected {successful_traces} trace file(s) "
+                f"from {num_ranks} rank(s). "
+                f"Final trace paths: {final_paths_str}"
+            )
+        elif output_files["traces"]:
+            logger.info(
+                f"Profiling stopped but no traces were successfully collected. "
+                f"Reported paths: {', '.join(output_files['traces'][:3])}"
+                f"{' ...' if len(output_files['traces']) > 3 else ''}"
+            )
+        else:
+            logger.info("Profiling stopped — no trace files were collected from any rank.")
+
+        if output_files["tables"]:
+            logger.debug(f"Collected {len(output_files['tables'])} profiling table(s)")
+
+        return output_files
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         num_inference_steps = 1
-        height = 512
-        width = 512
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
-
-        supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
-        if supports_image_input:
+        height = 1024
+        width = 1024
+        if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
             dummy_image = PIL.Image.new(color_format, (width, height))
-            prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
+        else:
+            dummy_image = None
 
-        if supports_audio_input:
+        if supports_audio_input(self.od_config.model_class_name):
             audio_sr = 16000
-            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
-            prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
+            audio_duration_sec = 4
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+        else:
+            dummy_audio = None
 
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
+        }
         req = OmniDiffusionRequest(
             prompts=[prompt],
-            request_ids=["dummy_req_id"],
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
@@ -698,31 +408,7 @@ class DiffusionEngine:
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
-        if output.error:
-            raise RuntimeError(f"Dummy run failed: {output.error}")
-
-    def _submit_rpc(
-        self,
-        method: str,
-        timeout: float | None,
-        args: tuple,
-        kwargs: dict | None,
-        unique_reply_rank: int | None,
-    ) -> _RpcTask:
-        assert isinstance(method, str), "Only string method names are supported for now"
-        deadline = None if timeout is None else time.monotonic() + timeout
-        task = _RpcTask(
-            method=method,
-            args=args,
-            kwargs=kwargs,
-            deadline=deadline,
-            unique_reply_rank=unique_reply_rank,
-        )
-        with self._cv:
-            self._rpc_queue.put(task)
-            self._cv.notify_all()
-        return task
+        self.add_req_and_wait_for_response(request)
 
     def collective_rpc(
         self,
@@ -733,10 +419,6 @@ class DiffusionEngine:
         unique_reply_rank: int | None = None,
     ) -> Any:
         """Call a method on worker processes and get results immediately.
-
-        The call is enqueued and executed by the engine's busy loop between
-        scheduler steps, so it is naturally serialized against per-request
-        execute_fn() invocations without any explicit mutual-exclusion lock.
 
         Args:
             method: The method name (str) to execute on workers
@@ -749,127 +431,19 @@ class DiffusionEngine:
             Single result if unique_reply_rank is provided, otherwise list of results
         """
         assert isinstance(method, str), "Only string method names are supported for now"
-
-        # If the busy loop hasn't started yet (e.g. during _dummy_run in
-        # __init__, or before the first async request after construction),
-        # there is no busy-loop thread to drain the RPC queue. Fall back to
-        # calling the executor directly, but serialize concurrent callers
-        # via self._cv's underlying lock so multiple threads in this window
-        # cannot race on the shared broadcast_mq / result_mq transport.
-        if not self._loop_started:
-            with self._cv:
-                # Re-check under the lock: the busy loop may have started
-                # between the outer check and acquiring the lock, in which
-                # case we should use the queued path for proper ordering.
-                if not self._loop_started:
-                    return self.executor.collective_rpc(
-                        method=method,
-                        timeout=timeout,
-                        args=args,
-                        kwargs=kwargs,
-                        unique_reply_rank=unique_reply_rank,
-                    )
-
-        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
-        try:
-            return task.future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError as exc:
-            task.future.cancel()
-            raise TimeoutError(f"RPC call to {method} timed out.") from exc
-
-    async def async_collective_rpc(
-        self,
-        method: str,
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict | None = None,
-        unique_reply_rank: int | None = None,
-    ) -> Any:
-        """Async variant of :meth:`collective_rpc` for event-loop callers.
-
-        Mirrors :meth:`async_add_req_and_wait_for_response`: enqueue a task
-        keyed by a future and ``await`` the result without blocking the loop.
-        """
-        await self._check_and_start_background_loop()
-        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
-        aio_fut = asyncio.wrap_future(task.future)
-        try:
-            if timeout is None:
-                return await aio_fut
-            return await asyncio.wait_for(aio_fut, timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            task.future.cancel()
-            raise TimeoutError(f"RPC call to {method} timed out.") from exc
+        return self.executor.collective_rpc(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            unique_reply_rank=unique_reply_rank,
+        )
 
     def close(self) -> None:
-        if hasattr(self, "scheduler"):
-            self.scheduler.close()
-        if hasattr(self, "stop_event") and self.stop_event is not None:
-            with self._cv:
-                self.stop_event.set()
-                self._cv.notify_all()
-        if hasattr(self, "worker_thread") and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=10)
-            if self.worker_thread.is_alive():
-                logger.warning("Worker thread did not terminate within 10s, resources may not be released.")
-            else:
-                self._loop_started = False
         if hasattr(self, "executor"):
             self.executor.shutdown()
 
     def abort(self, request_id: str | Iterable[str]) -> None:
-        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
-
-        with self._cv:
-            for req_id in request_ids:
-                self.abort_queue.put(req_id)
-            self._cv.notify_all()
-
-    def _process_aborts_queue(self) -> None:
-        if self.abort_queue.empty():
-            return
-
-        request_ids: list[str] = []
-        while not self.abort_queue.empty():
-            ids = self.abort_queue.get_nowait()
-            request_ids.extend((ids,) if isinstance(ids, str) else ids)
-
-        self._abort_requests(request_ids)
-
-    def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
-        request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
-
-        sched_req_ids: list[str] = []
-        for request_id in dict.fromkeys(request_ids):
-            sched_req_id = self.scheduler.get_sched_req_id(request_id)
-            if sched_req_id is not None:
-                sched_req_ids.append(sched_req_id)
-
-        for sched_req_id in dict.fromkeys(sched_req_ids):
-            if self.scheduler.get_request_state(sched_req_id) is not None:
-                self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
-
-    def _finalize_finished_request(
-        self,
-        sched_req_id: str,
-        runner_output: RunnerOutput | None = None,
-        missing_result_error: str = "Diffusion scheduler finished target request without execution output.",
-    ) -> DiffusionOutput:
-        state = self.scheduler.get_request_state(sched_req_id)
-        popped_state = self.scheduler.pop_request_state(sched_req_id)
-        state = state or popped_state
-
-        if state is None:
-            raise RuntimeError(f"Diffusion scheduler lost state for request {sched_req_id}.")
-
-        if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-            request_id = state.req.request_ids[0] if state.req.request_ids else sched_req_id
-            return DiffusionOutput(
-                aborted=True,
-                abort_message=f"Request {request_id} aborted.",
-            )
-
-        if runner_output is not None and runner_output.result is not None:
-            return runner_output.result
-
-        return DiffusionOutput(error=missing_result_error)
+        # TODO implement it
+        logger.warning("DiffusionEngine abort is not implemented yet")
+        pass

@@ -7,7 +7,6 @@ INPUT_IMAGE="${INPUT_IMAGE:-../../offline_inference/image_to_video/qwen-bear.png
 BASE_URL="${BASE_URL:-http://localhost:8099}"
 OUTPUT_PATH="${OUTPUT_PATH:-wan22_i2v_output.mp4}"
 NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-}"
-SAMPLE_SOLVER="${SAMPLE_SOLVER:-}"
 POLL_INTERVAL="${POLL_INTERVAL:-2}"
 
 if [ ! -f "$INPUT_IMAGE" ]; then
@@ -33,10 +32,6 @@ create_cmd=(
 
 if [ -n "${NEGATIVE_PROMPT}" ]; then
   create_cmd+=(-F "negative_prompt=${NEGATIVE_PROMPT}")
-fi
-
-if [ -n "${SAMPLE_SOLVER}" ]; then
-  create_cmd+=(-F "extra_params={\"sample_solver\":\"${SAMPLE_SOLVER}\"}")
 fi
 
 create_response="$("${create_cmd[@]}")"

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
-    DiffusionPipelineProfilerMixin,
-)
+from .torch_profiler import TorchProfiler
 
-__all__ = ["DiffusionPipelineProfilerMixin"]
+# Default profiler – can be changed later via config
+CurrentProfiler = TorchProfiler
+
+__all__ = ["CurrentProfiler", "TorchProfiler"]

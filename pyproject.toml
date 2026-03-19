@@ -32,6 +32,7 @@ classifiers = [
 # Dependencies are now managed dynamically via setup.py based on detected hardware platform.
 # This allows automatic installation of the correct platform-specific dependencies (CUDA/ROCm/CPU/XPU/NPU)
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
+# Note: vllm is intentionally excluded due to entrypoints overwrite issue.
 
 [project.optional-dependencies]
 
@@ -40,7 +41,6 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
-    "datasets>=2.14.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
     "openai-whisper>=20250625",
@@ -48,27 +48,10 @@ dev = [
     "soundfile>=0.13.1",
     "imageio[ffmpeg]>=0.6.0",
     "opencv-python>=4.12.0.88",
-    "mooncake-transfer-engine-cuda13>=0.3.9",
+    "mooncake-transfer-engine==0.3.8.post1",
     "av", # for ComfyUI tests
     "openpyxl>=3.0.0", # for nightly CI
-    "pyttsx3>=2.99",
-    "opencc>=1.2.0",
-    "mistune>=3.2.0", # for example tests
-    "torchmetrics>=1.4.0", # for accuracy similarity metrics
-    "ray[default]", # for RL test
-    "jiwer>=3.0.0",
-    "zhon>=2.0.0",
-    "zhconv>=1.4.2",
-    "scipy>=1.10.0",
-    "funasr>=1.0.0",
-    "lpips>=0.1.4", # for quantization fp8
-    "orjson>=3.11.7", # to make v1/embeddings API fast
-    "voxcpm>=2.0.2", # for voxcpm model Test
-    "torchdiffeq>=0.2.5" # for covo_audio Test
-]
-
-demo = [
-    "gradio>=6.7.0",
+    "pyttsx3>=2.99"
 ]
 
 docs = [
@@ -94,6 +77,7 @@ Documentation = "https://vllm-omni.readthedocs.io"
 "Bug Tracker" = "https://github.com/vllm-project/vllm-omni/issues"
 
 [project.scripts]
+vllm = "vllm_omni.entrypoints.cli.main:main"
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
 
@@ -124,13 +108,12 @@ exclude = [
 
 [tool.ruff.lint]
 select = [
-    "E",      # pycodestyle errors
-    "W",      # pycodestyle warnings
-    "F",      # pyflakes
-    "I",      # isort (handled separately, but included for compatibility)
-    "N",      # pep8-naming
-    "UP",     # pyupgrade
-    "TID251", # flake8-tidy-imports.banned-api
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort (handled separately, but included for compatibility)
+    "N",  # pep8-naming
+    "UP", # pyupgrade
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
@@ -144,15 +127,6 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
-
-[tool.ruff.lint.flake8-tidy-imports.banned-api]
-"librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
-"torch.cuda.max_memory_allocated".msg = "Use torch.accelerator.max_memory_allocated"
-"torch.cuda.reset_peak_memory_stats".msg = "Use torch.accelerator.reset_peak_memory_stats"
-"torch.cuda.device_count".msg = "Use torch.accelerator.device_count"
-"torch.cuda.current_device".msg = "Use torch.accelerator.current_device_index"
-"torch.cuda.empty_cache".msg  = "Use torch.accelerator.empty_cache"
-"torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"
 
 [tool.mypy]
 python_version = "3.12, 3.13"
@@ -182,15 +156,12 @@ addopts = [
 markers = [
     # ci/cd required
     "core_model: L1&L2 tests (run in each PR)",
-    "advanced_model: L3 level tests (run on each merge)",
-    "full_model: L4 level tests (run nightly)",
+    "advanced_model: L3&L4 level tests (run in each merge or nightly)",
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
-    "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
-    "example: Doc example code tests",
     # platform markers
     "cpu: Tests that run on CPU",
     "gpu: Tests that run on GPU (auto-added)",
@@ -198,25 +169,20 @@ markers = [
     "rocm: Tests that run on AMD/ROCm (auto-added)",
     "xpu: Tests that run on XPU (auto-added)",
     "npu: Tests that run on NPU/Ascend (auto-added)",
-    "musa: Tests that run on MUSA/Moore Threads (auto-added)",
     # specified computation resources marks (auto-added)
     "H100: Tests that require H100 GPU",
     "L4: Tests that require L4 GPU",
     "MI325: Tests that require MI325 GPU (AMD/ROCm)",
-    "B60: Tests that require Intel Arc Pro B60 XPU",
-    "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: Tests that require A2 NPU",
     "A3: Tests that require A3 NPU",
     "distributed_cuda: Tests that require multi cards on CUDA platform",
     "distributed_rocm: Tests that require multi cards on ROCm platform",
     "distributed_xpu: Tests that require multi cards on XPU platform",
     "distributed_npu: Tests that require multi cards on NPU platform",
-    "distributed_musa: Tests that require multi cards on MUSA platform",
     "skipif_cuda: Skip if the num of CUDA cards is less than the required",
     "skipif_rocm: Skip if the num of ROCm cards is less than the required",
     "skipif_xpu: Skip if the num of XPU cards is less than the required",
     "skipif_npu: Skip if the num of NPU cards is less than the required",
-    "skipif_musa: Skip if the num of MUSA cards is less than the required",
     # more detailed markers
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
@@ -240,15 +206,6 @@ extend-ignore-identifiers-re = [
     ".*nin.*",
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
-    ".*[Nn][Dd]3.*",
-]
-extend-ignore-re = [
-    "\\.\\.\\.n,d->\\.\\.\\.nd",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
-semantics = "semantics"
-fullset = "fullset"
-Vai = "Vai"
-tockens = "tockens"
-CANN = "CANN"

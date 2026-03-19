@@ -23,7 +23,6 @@ from message_convert import (
 from vllm import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -181,11 +180,11 @@ def main(args):
     # Get the query function and call it with appropriate parameters
     query_func = query_map[args.query_type]
 
-    omni = Omni(
+    omni_llm = Omni(
         model=model_name,
-        deploy_config=args.deploy_config,
+        stage_configs_path=args.stage_configs_path,
         log_stats=args.enable_stats,
-        log_file=("omni_pipeline.log" if args.enable_stats else None),
+        log_file=("omni_llm_pipeline.log" if args.enable_stats else None),
         init_sleep_seconds=args.init_sleep_seconds,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
@@ -291,7 +290,7 @@ def main(args):
     prompts = [copy.deepcopy(query_result) for _ in range(args.num_prompts)]
 
     print("prompts", prompts)
-    omni_outputs = omni.generate(prompts, sampling_params_list)
+    omni_outputs = omni_llm.generate(prompts, sampling_params_list)
 
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     if args.query_type is not None:
@@ -299,47 +298,45 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
 
     for stage_outputs in omni_outputs:
-        output = stage_outputs.request_output
         if stage_outputs.final_output_type == "text":
-            request_id = output.request_id
-            text_output = output.outputs[0].text
-            # Save aligned text file per request
-            prompt_text = output.prompt
-            out_txt = os.path.join(output_dir, f"{request_id}.txt")
-            lines = []
-            lines.append("Prompt:\n")
-            lines.append(str(prompt_text) + "\n")
-            lines.append("vllm_text_output:\n")
-            output_text = str(text_output)
-            if "<chinese>" in output_text or "<english>" in output_text:
-                output_text = output_text.replace("<chinese>", "").replace("<english>", "").strip()
-            lines.append(output_text + "\n")
-            try:
-                with open(out_txt, "w", encoding="utf-8") as f:
-                    print("lines", lines)
-                    f.writelines(lines)
-            except Exception as e:
-                print(f"[Warn] Failed writing text file {out_txt}: {e}")
-            print(f"Request ID: {request_id}, Text saved to {out_txt}\n")
+            for output in stage_outputs.request_output:
+                request_id = output.request_id
+                text_output = output.outputs[0].text
+                # Save aligned text file per request
+                prompt_text = output.prompt
+                out_txt = os.path.join(output_dir, f"{request_id}.txt")
+                lines = []
+                lines.append("Prompt:\n")
+                lines.append(str(prompt_text) + "\n")
+                lines.append("vllm_text_output:\n")
+                lines.append(str(text_output).strip() + "\n")
+                try:
+                    with open(out_txt, "w", encoding="utf-8") as f:
+                        print("lines", lines)
+                        f.writelines(lines)
+                except Exception as e:
+                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
+                print(f"Request ID: {request_id}, Text saved to {out_txt}\n")
         elif stage_outputs.final_output_type == "audio":
-            request_id = output.request_id
-            audio_tensor = output.outputs[0].multimodal_output.get("audio")
+            for output in stage_outputs.request_output:
+                request_id = output.request_id
+                audio_tensor = output.outputs[0].multimodal_output.get("audio")
 
-            if audio_tensor is None:
-                continue
+                if audio_tensor is None:
+                    continue
 
-            output_wav = os.path.join(output_dir, f"{request_id}.wav")
+                output_wav = os.path.join(output_dir, f"{request_id}.wav")
 
-            # Convert to numpy array and ensure correct format
-            audio_numpy = audio_tensor.float().detach().cpu().numpy()
+                # Convert to numpy array and ensure correct format
+                audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
-            # Ensure audio is 1D (flatten if needed)
-            if audio_numpy.ndim > 1:
-                audio_numpy = audio_numpy.flatten()
+                # Ensure audio is 1D (flatten if needed)
+                if audio_numpy.ndim > 1:
+                    audio_numpy = audio_numpy.flatten()
 
-            # Save audio file with explicit WAV format
-            sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
-            print(f"Request ID: {request_id}, Audio saved to {output_wav}")
+                # Save audio file with explicit WAV format
+                sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
+                print(f"Request ID: {request_id}, Audio saved to {output_wav}")
 
 
 def parse_args():
@@ -355,7 +352,7 @@ def parse_args():
         "--text",
         "-t",
         type=str,
-        default="",
+        default="The weather is so nice today.",
         help="input text",
     )
     parser.add_argument(
@@ -432,14 +429,12 @@ def parse_args():
         help="Sampling rate for audio.",
     )
     parser.add_argument(
-        "--deploy-config",
+        "--stage-configs-path",
         type=str,
-        default=None,
-        help="Override the deploy config path. If unset, auto-loads "
-        "vllm_omni/deploy/mimo_audio.yaml based on the HF model_type.",
+        default="../../../model_executor/stage_configs/mimo_audio.yaml",
+        help="Path to a stage configs file.",
     )
 
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

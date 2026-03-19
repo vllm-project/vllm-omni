@@ -5,8 +5,6 @@
 import pytest
 import torch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
 
 class TestMakePadMask:
     """Tests for make_pad_mask utility."""

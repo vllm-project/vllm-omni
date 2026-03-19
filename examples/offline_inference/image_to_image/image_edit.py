@@ -87,11 +87,9 @@ For more options, run:
 """
 
 import argparse
-import json
 import os
 import time
 from pathlib import Path
-from typing import Any
 
 import torch
 from PIL import Image
@@ -101,16 +99,6 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
-
-
-def parse_profiler_config(value: str) -> dict[str, Any]:
-    try:
-        config = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
-    if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
-    return config
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,13 +195,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
-    )
-    parser.add_argument(
-        "--ulysses-mode",
-        type=str,
-        default="strict",
-        choices=["strict", "advanced_uaa"],
-        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
     )
     parser.add_argument(
         "--ring-degree",
@@ -316,8 +297,8 @@ def parse_args() -> argparse.Namespace:
         "--cfg-parallel-size",
         type=int,
         default=1,
-        choices=[1, 2, 3],
-        help="Number of GPUs used for classifier free guidance parallel size (max 3 branches).",
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
         "--enforce-eager",
@@ -343,40 +324,6 @@ def parse_args() -> argparse.Namespace:
         "--enable-layerwise-offload",
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
-    )
-    parser.add_argument(
-        "--vae-patch-parallel-size",
-        type=int,
-        default=1,
-        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
-    )
-    parser.add_argument(
-        "--use-hsdp",
-        action="store_true",
-        help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models.",
-    )
-    parser.add_argument(
-        "--hsdp-shard-size",
-        type=int,
-        default=1,
-        help="Number of GPUs to shard weights across for HSDP.",
-    )
-    parser.add_argument(
-        "--hsdp-replicate-size",
-        type=int,
-        default=1,
-        help="Number of HSDP replica groups.",
-    )
-    parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
-    )
-    parser.add_argument(
-        "--profiler-config",
-        type=parse_profiler_config,
-        default=None,
-        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     return parser.parse_args()
 
@@ -442,12 +389,11 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
-        profiler_config=args.profiler_config,
     )
     print("Pipeline loaded")
 
-    profiler_enabled = args.profiler_config is not None
+    # Check if profiling is requested via environment variable
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
     # Time profiling for generation
     print(f"\n{'=' * 60}")
@@ -517,12 +463,12 @@ def main():
         raise ValueError("No output generated from omni.generate()")
 
     # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from request_output.images
+    # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0].images
     first_output = outputs[0]
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output
+    req_out = first_output.request_output[0]
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 

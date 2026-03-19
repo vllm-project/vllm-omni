@@ -9,7 +9,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import torch
@@ -27,14 +27,8 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.base_config import (
-        QuantizationConfig,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +47,6 @@ def calculate_shift(
 
 
 def optimized_scale(positive_flat, negative_flat):
-    positive_flat = positive_flat.float()
-    negative_flat = negative_flat.float()
     dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
     squared_norm = torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
     st_star = dot_product / squared_norm
@@ -87,9 +79,7 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return load_json_config(model_path, subfolder, "config.json", local_files_only)
 
 
-def create_transformer_from_config(
-    config: dict, quant_config: QuantizationConfig | None = None
-) -> HeliosTransformer3DModel:
+def create_transformer_from_config(config: dict) -> HeliosTransformer3DModel:
     kwargs = {}
 
     key_map = [
@@ -121,7 +111,7 @@ def create_transformer_from_config(
                 val = tuple(val)
             kwargs[key] = val
 
-    return HeliosTransformer3DModel(quant_config=quant_config, **kwargs)
+    return HeliosTransformer3DModel(**kwargs)
 
 
 def get_helios_post_process_func(
@@ -151,7 +141,7 @@ def get_helios_pre_process_func(
     return pre_process_func
 
 
-class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
+class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
 
     Supports T2V, I2V (with image input), and V2V (with video input).
@@ -201,9 +191,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(
-            transformer_config, quant_config=od_config.quantization_config
-        )
+        self.transformer = create_transformer_from_config(transformer_config)
 
         # Read scheduler config to determine scheduler type
         sched_cfg = load_json_config(model, "scheduler", "scheduler_config.json", local_files_only)
@@ -240,9 +228,6 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
-        self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
-        )
 
     @property
     def guidance_scale(self):
@@ -662,9 +647,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         else:
             output = history_video
 
-        return DiffusionOutput(
-            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        return DiffusionOutput(output=output)
 
     def _stage1_sample(
         self,
@@ -908,15 +891,13 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         _, ph, pw = patch_size
         block_size = ph * pw
 
-        device = generator.device if generator is not None else self.device
-
         cov = torch.eye(block_size) * (1 + gamma) - torch.ones(block_size, block_size) * gamma
         cov += torch.eye(block_size) * 1e-8
         cov = cov.float()  # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
 
-        L = torch.linalg.cholesky(cov).to(device)
+        L = torch.linalg.cholesky(cov)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
-        z = torch.randn(block_number, block_size, generator=generator, device=device)
+        z = torch.randn(block_number, block_size, generator=generator)
         noise = z @ L.T
 
         noise = noise.view(batch_size, channel, num_frames, height // ph, width // pw, ph, pw)

@@ -1,9 +1,10 @@
 from typing import Any
 
 from typing_extensions import assert_never
-from vllm.inputs import EmbedsInput, MultiModalInput, SingletonInput
+from vllm.inputs.data import EmbedsInputs, SingletonInputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
+from vllm.multimodal.inputs import MultiModalInputs
 from vllm.renderers.inputs import SingletonDictPrompt
 
 from vllm_omni.inputs.data import (
@@ -29,9 +30,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         parsed_content: OmniTextPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
-        *,
-        mm_uuids: Any | None = None,
-    ) -> OmniTokenInputs | MultiModalInput:
+    ) -> OmniTokenInputs | MultiModalInputs:
         """Process text prompts with support for mm_processor_kwargs.
 
         Extends base class to support mm_processor_kwargs without multi_modal_data.
@@ -40,19 +39,14 @@ class OmniInputPreprocessor(InputPreprocessor):
         """
         prompt_text = parsed_content["prompt"]
         mm_processor_kwargs = parsed_content.get("mm_processor_kwargs") or {}
-        # When the deprecated raw-prompt path is used, process_inputs does
-        # not pass mm_uuids to preprocess().  Fall back to reading it from
-        # the prompt dict so the Renderer's _validate_mm_uuids can see it.
-        effective_mm_uuids = mm_uuids or parsed_content.get("multi_modal_uuids")
 
-        inputs: OmniTokenInputs | MultiModalInput
+        inputs: OmniTokenInputs | MultiModalInputs
         if multi_modal_data := parsed_content.get("multi_modal_data"):
             inputs = self._process_multimodal(
                 prompt_text,
                 multi_modal_data,
                 mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=effective_mm_uuids,
             )
             prompt_embeds = parsed_content.get("prompt_embeds")
             if prompt_embeds is not None:
@@ -60,17 +54,12 @@ class OmniInputPreprocessor(InputPreprocessor):
             additional_information = parsed_content.get("additional_information")
             if additional_information is not None:
                 inputs["additional_information"] = additional_information
-        elif "mm_processor_kwargs" in parsed_content:
-            # Presence — not truthiness. An explicitly-set empty dict still
-            # signals "route through the multimodal processor" (needed for
-            # AR-based image-gen where the HF processor supplies its own
-            # defaults and scaffold).
+        elif mm_processor_kwargs:
             inputs = self._process_multimodal(
                 prompt_text,
                 {},
                 mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=effective_mm_uuids,
             )
         else:
             prompt_token_ids = self._tokenize_prompt(
@@ -97,14 +86,14 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         parsed_content: OmniTokensPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
-    ) -> OmniTokenInputs | MultiModalInput:
+    ) -> OmniTokenInputs | MultiModalInputs:
         prompt_token_ids = self._truncate_inputs(parsed_content["prompt_token_ids"], tokenization_kwargs)
         prompt_embeds = parsed_content.get("prompt_embeds")
         additional_information = parsed_content.get("additional_information")
 
         multi_modal_data = parsed_content.get("multi_modal_data")
 
-        inputs: OmniTokenInputs | MultiModalInput
+        inputs: OmniTokenInputs | MultiModalInputs
         if multi_modal_data:
             inputs = self._process_multimodal(
                 prompt_token_ids,
@@ -134,7 +123,7 @@ class OmniInputPreprocessor(InputPreprocessor):
     def _process_embeds(
         self,
         parsed_content: OmniEmbedsPrompt,
-    ) -> EmbedsInput:
+    ) -> EmbedsInputs:
         """Process embeddings prompt with omni-specific extensions.
 
         Extends base _process_embeds to handle additional_information payload
@@ -154,9 +143,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         prompt: SingletonDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
-        *,
-        mm_uuids: Any | None = None,
-    ) -> SingletonInput:
+    ) -> SingletonInputs:
         """
         Extract the singleton inputs from a prompt.
 
@@ -166,7 +153,7 @@ class OmniInputPreprocessor(InputPreprocessor):
 
         Returns:
 
-        * [`SingletonInput`][vllm.inputs.engine.SingletonInput] instance
+        * [`SingletonInputs`][vllm.inputs.data.SingletonInputs] instance
         """
         if "prompt_embeds" in prompt:
             return self._process_embeds(prompt)  # type: ignore[arg-type]
@@ -180,7 +167,6 @@ class OmniInputPreprocessor(InputPreprocessor):
             return self._process_text(
                 prompt,  # type: ignore[arg-type]
                 tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
             )
 
         assert_never(prompt)  # type: ignore[arg-type]

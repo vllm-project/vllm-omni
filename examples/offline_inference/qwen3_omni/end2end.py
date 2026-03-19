@@ -9,6 +9,7 @@ import os
 import time
 from typing import NamedTuple
 
+import librosa
 import numpy as np
 import soundfile as sf
 import vllm
@@ -18,10 +19,8 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
-from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -130,7 +129,7 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -184,7 +183,7 @@ def get_mixed_modalities_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -264,7 +263,7 @@ query_map = {
 
 
 def main(args):
-    model_name = args.model
+    model_name = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     print("=" * 20, "\n", f"vllm version: {vllm.__version__}", "\n", "=" * 20)
 
     # Get paths from args
@@ -295,10 +294,12 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni_kwargs = vars(args).copy()
-    # Override CLI --model with the derived model_name.
-    omni_kwargs["model"] = model_name
-    omni = Omni(**omni_kwargs)
+    omni_llm = Omni(
+        model=model_name,
+        stage_configs_path=args.stage_configs_path,
+        log_stats=args.log_stats,
+        stage_init_timeout=args.stage_init_timeout,
+    )
 
     thinker_sampling_params = SamplingParams(
         temperature=0.9,
@@ -331,14 +332,11 @@ def main(args):
         repetition_penalty=1.1,
     )
 
-    all_sampling_params = [
+    sampling_params_list = [
         thinker_sampling_params,
         talker_sampling_params,  # code predictor is integrated into talker for Qwen3 Omni
         code2wav_sampling_params,
     ]
-    # Match sampling params to the number of configured stages
-    num_stages = omni.num_stages
-    sampling_params_list = all_sampling_params[:num_stages]
 
     if args.txt_prompts is None:
         prompts = [query_result.inputs for _ in range(args.num_prompts)]
@@ -354,10 +352,10 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    profiler_enabled = args.enable_profiler
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
     if profiler_enabled:
-        omni.start_profile(stages=args.profiler_stages)
-    omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
+        omni_llm.start_profile(stages=[0])
+    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
@@ -368,67 +366,55 @@ def main(args):
     print(f"query type: {args.query_type}")
 
     for stage_outputs in omni_generator:
-        output = stage_outputs.request_output
         if stage_outputs.final_output_type == "text":
-            request_id = output.request_id
-            text_output = output.outputs[0].text
-            # Save aligned text file per request
-            prompt_text = output.prompt
-            out_txt = os.path.join(output_dir, f"{request_id}.txt")
-            lines = []
-            lines.append("Prompt:\n")
-            lines.append(str(prompt_text) + "\n")
-            lines.append("vllm_text_output:\n")
-            lines.append(str(text_output).strip() + "\n")
-            try:
-                with open(out_txt, "w", encoding="utf-8") as f:
-                    f.writelines(lines)
-            except Exception as e:
-                print(f"[Warn] Failed writing text file {out_txt}: {e}")
-            print(f"Request ID: {request_id}, Text saved to {out_txt}")
+            for output in stage_outputs.request_output:
+                request_id = output.request_id
+                text_output = output.outputs[0].text
+                # Save aligned text file per request
+                prompt_text = output.prompt
+                out_txt = os.path.join(output_dir, f"{request_id}.txt")
+                lines = []
+                lines.append("Prompt:\n")
+                lines.append(str(prompt_text) + "\n")
+                lines.append("vllm_text_output:\n")
+                lines.append(str(text_output).strip() + "\n")
+                try:
+                    with open(out_txt, "w", encoding="utf-8") as f:
+                        f.writelines(lines)
+                except Exception as e:
+                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
+                print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
-            request_id = output.request_id
-            audio_tensor = output.outputs[0].multimodal_output["audio"]
-            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+            for output in stage_outputs.request_output:
+                request_id = output.request_id
+                audio_tensor = output.outputs[0].multimodal_output["audio"]
+                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
-            # Convert to numpy array and ensure correct format
-            # In async_chunk mode, audio may arrive as a list of chunks
-            if isinstance(audio_tensor, list):
-                import torch
+                # Convert to numpy array and ensure correct format
+                audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
-                audio_tensor = torch.cat(
-                    [(t if isinstance(t, torch.Tensor) else torch.tensor(t)).flatten() for t in audio_tensor]
-                )
-            audio_numpy = audio_tensor.float().detach().cpu().numpy()
+                # Ensure audio is 1D (flatten if needed)
+                if audio_numpy.ndim > 1:
+                    audio_numpy = audio_numpy.flatten()
 
-            # Ensure audio is 1D (flatten if needed)
-            if audio_numpy.ndim > 1:
-                audio_numpy = audio_numpy.flatten()
+                # Save audio file with explicit WAV format
+                sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
+                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
-            # Save audio file with explicit WAV format
-            sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
-            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
-
-        processed_count += 1
+        processed_count += len(stage_outputs.request_output)
         if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
-            omni.stop_profile(stages=args.profiler_stages)
+            omni_llm.stop_profile()
 
             print("[Info] Waiting 30s for workers to write trace files to disk...")
             time.sleep(30)
             print("[Info] Trace export wait time finished.")
-    omni.close()
+    omni_llm.close()
 
 
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        help="Model name or path.",
-    )
     parser.add_argument(
         "--query-type",
         "-q",
@@ -541,27 +527,7 @@ def parse_args():
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
-    parser.add_argument(
-        "--enable-profiler",
-        action="store_true",
-        default=False,
-        help="Enables profiling when set.",
-    )
-    parser.add_argument(
-        "--profiler-stages",
-        type=int,
-        nargs="*",
-        default=None,
-        help="List of stage IDs to profile. If not set, profiles all stages.",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="auto",
-        help="Model dtype (auto, half, float16, bfloat16, float, float32).",
-    )
 
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-import vllm.ir
 from vllm.config import VllmConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -22,7 +21,6 @@ class ForwardContext:
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
     split_text_embed_in_sp: bool = False
-    denoise_step_idx: int | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -82,36 +80,17 @@ def is_forward_context_available() -> bool:
     return _forward_context is not None
 
 
-def get_ulysses_mode(*, default: str = "strict") -> str:
-    """Resolve the Ulysses-SP mode from the current ForwardContext.
-
-    Returns `default` when ForwardContext is unavailable or the diffusion
-    config is not set.
-    """
-    if not is_forward_context_available():
-        return default
-
-    cfg = get_forward_context().omni_diffusion_config
-    if cfg is None:
-        return default
-
-    parallel_config = cfg.parallel_config
-    return str(getattr(parallel_config, "ulysses_mode", default))
-
-
 def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
-    denoise_step_idx: int | None = None,
 ):
     return ForwardContext(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
-        denoise_step_idx=denoise_step_idx,
     )
 
 
@@ -136,7 +115,6 @@ def set_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
-    denoise_step_idx: int | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, split_text_embed_in_sp, etc.
@@ -147,11 +125,9 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
-        denoise_step_idx=denoise_step_idx,
     )
     # vLLM CustomOp dispatch (e.g. QKVParallelLinear) requires a global
     # vLLM config set via set_current_vllm_config().
-    # Also set priority for vLLM IR ops (e.g. RMSNorm), copied from vllm/forward_context.py
     with override_forward_context(forward_context):
         if vllm_config is None:
             yield
@@ -159,15 +135,5 @@ def set_forward_context(
             # Local import to avoid importing vllm.config.vllm at module import time.
             from vllm.config.vllm import set_current_vllm_config
 
-            with (
-                set_current_vllm_config(vllm_config),
-                vllm_config.kernel_config.ir_op_priority.set_priority(),
-                vllm.ir.enable_torch_wrap(vllm_config.compilation_config.ir_enable_torch_wrap),
-            ):
+            with set_current_vllm_config(vllm_config):
                 yield
-
-
-def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
-    """Set the current diffusion denoise step on the active ForwardContext."""
-    if _forward_context is not None:
-        _forward_context.denoise_step_idx = step_idx

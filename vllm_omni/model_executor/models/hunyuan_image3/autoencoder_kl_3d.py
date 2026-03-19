@@ -21,8 +21,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from torch import Tensor, nn
 
-from vllm_omni.diffusion.distributed.utils import get_local_device
-
 
 class DiagonalGaussianDistribution:
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
@@ -508,7 +506,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         self.use_compile = False
 
-        self.empty_cache = torch.empty(0, device=get_local_device())
+        self.empty_cache = torch.empty(0, device="cuda")
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (Encoder, Decoder)):

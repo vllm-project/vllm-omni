@@ -106,7 +106,7 @@ class _FastARAttention(nn.Module):
             q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(q.shape)
             k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
 
-        q, k = self.rotary_emb(position_ids.reshape(-1), q, k)
+        q, k = self.rotary_emb(position_ids, q, k)
 
         q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -308,9 +308,6 @@ class FishSpeechFastAR(nn.Module):
         self._embed_buf: torch.Tensor | None = None
         self._pos_ids: torch.Tensor | None = None
         self._compiled_model_fwd: object | None = None
-        self._compile_attempted = False
-        self._compile_failed = False
-        self._disable_compile_for_graph = False
 
     def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
         max_seq = self._num_codebooks + 1  # hidden_state + num_codebooks codes
@@ -325,70 +322,11 @@ class FishSpeechFastAR(nn.Module):
         self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device)
 
     def _setup_compile(self) -> None:
-        if self._compile_attempted:
+        if self._compiled_model_fwd is not None:
             return
-        self._compile_attempted = True
-        if self._disable_compile_for_graph:
-            try:
-                self._compiled_model_fwd = torch.compile(
-                    self.model.forward,
-                    dynamic=True,
-                    options={"epilogue_fusion": False},
-                )
-            except Exception as exc:
-                logger.warning("Fast AR torch.compile (graph mode) failed: %s", exc)
-                self._compiled_model_fwd = self.model.forward
-            return
-        try:
-            self._compiled_model_fwd = torch.compile(
-                self.model.forward,
-                mode="default",
-                dynamic=True,
-                fullgraph=False,
-            )
-        except Exception as exc:
-            self._compile_failed = True
-            logger.warning("Failed to enable torch.compile for Fish Speech Fast AR: %s", exc)
-            self._compiled_model_fwd = self.model.forward
-        else:
-            logger.info("Enabled torch.compile for Fish Speech Fast AR forward (mode=default)")
-
-    @torch.inference_mode()
-    def warmup_compile(
-        self,
-        device: torch.device,
-        dtype: torch.dtype,
-        batch_sizes: tuple[int, ...] = (1,),
-    ) -> None:
-        self._setup_compile()
-        if self._compiled_model_fwd is self.model.forward or self._compile_failed:
-            return
-        for batch_size in batch_sizes:
-            hidden = torch.zeros((batch_size, self.slow_ar_config.hidden_size), device=device, dtype=dtype)
-            semantic = torch.full(
-                (batch_size,),
-                self.slow_ar_config.semantic_begin_id,
-                device=device,
-                dtype=torch.long,
-            )
-            self(hidden, semantic, do_sample=False)
-        torch.accelerator.synchronize(device)
-
-    @torch.inference_mode()
-    def _run_model(self, step_input: torch.Tensor, step_pos_ids: torch.Tensor, bsz: int) -> torch.Tensor:
-        if self._disable_compile_for_graph:
-            model_fwd = self._compiled_model_fwd or self.model.forward
-        else:
-            model_fwd = self._compiled_model_fwd if bsz == 1 else self.model.forward
-        try:
-            return model_fwd(step_input, step_pos_ids)
-        except Exception as exc:
-            if model_fwd is self.model.forward or self._compile_failed:
-                raise
-            self._compile_failed = True
-            self._compiled_model_fwd = self.model.forward
-            logger.warning("Fish Speech Fast AR torch.compile fallback to eager after runtime failure: %s", exc)
-            return self.model.forward(step_input, step_pos_ids)
+        # TODO: Enable torch.compile for performance.  Eager for now to avoid
+        # potential graph-break issues during initial bring-up.
+        self._compiled_model_fwd = self.model.forward
 
     @torch.inference_mode()
     def forward(
@@ -400,7 +338,6 @@ class FishSpeechFastAR(nn.Module):
         temperature: float = 0.8,
         top_k: int = 30,
         top_p: float = 0.9,
-        seed: int | None = None,
     ) -> torch.Tensor:
         """Predict residual codebook codes 0..num_codebooks-1 autoregressively.
 
@@ -432,6 +369,7 @@ class FishSpeechFastAR(nn.Module):
 
         embed_buf = self._embed_buf
         pos_ids = self._pos_ids
+        model_fwd = self._compiled_model_fwd
 
         # Position 0: projected Slow AR hidden state.
         projected = self.fast_project_in(slow_ar_hidden.reshape(bsz, -1))
@@ -444,12 +382,6 @@ class FishSpeechFastAR(nn.Module):
         use_sampling = do_sample and temperature > 0
         inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
 
-        # Create a seeded generator for deterministic residual codebook sampling.
-        generator = None
-        if seed is not None and use_sampling:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(seed)
-
         # Residual codebook size (1024) vs semantic codebook size (4096).
         # The fast_output head has codebook_size (4096) outputs, but residual
         # codebooks only have 1024 entries.  Truncate logits for steps > 0.
@@ -458,11 +390,9 @@ class FishSpeechFastAR(nn.Module):
         for step in range(1, num_cb):
             seq_len = step + 1
             step_input = embed_buf[:bsz, :seq_len, :]
-            # Use a dense 2D position tensor for every batch size; stride-0
-            # views from expand() were fragile under compiled execution.
-            step_pos_ids = pos_ids[:seq_len].unsqueeze(0).repeat(bsz, 1)
+            step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
 
-            hidden_out = self._run_model(step_input, step_pos_ids, bsz)
+            hidden_out = model_fwd(step_input, step_pos_ids)
             logits = self.fast_output(self.fast_norm(hidden_out[:, -1, :]))
 
             # Residual codebooks (step >= 1) only have 1024 entries.
@@ -481,7 +411,7 @@ class FishSpeechFastAR(nn.Module):
                     sorted_logits[sorted_indices_to_remove] = float("-inf")
                     scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
                 probs = F.softmax(scaled, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1, generator=generator)
+                next_ids = torch.multinomial(probs, num_samples=1)
             else:
                 next_ids = logits.argmax(dim=-1, keepdim=True)
 

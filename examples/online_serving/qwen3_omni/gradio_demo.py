@@ -6,10 +6,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-try:
-    import gradio as gr
-except ImportError:
-    raise ImportError("gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'") from None
+import gradio as gr
 import numpy as np
 import soundfile as sf
 import torch
