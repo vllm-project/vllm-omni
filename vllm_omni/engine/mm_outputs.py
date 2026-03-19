@@ -68,6 +68,7 @@ class MultimodalPayload:
             return None
         return cls(tensors=tensors, metadata=metadata)
 
+
 @dataclass
 class MultimodalCompletionOutput(CompletionOutput):
     """CompletionOutput with multimodal support.
