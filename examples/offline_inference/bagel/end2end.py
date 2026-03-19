@@ -115,7 +115,6 @@ def main():
 
     parallel_config = DiffusionParallelConfig(
         cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
     )
 
@@ -132,12 +131,9 @@ def main():
             "shm_threshold_bytes": args.shm_threshold_bytes,
             "worker_backend": args.worker_backend,
             "ray_address": args.ray_address,
-<<<<<<< HEAD
             "parallel_config": parallel_config,
             "vae_use_tiling": args.vae_use_tiling,
-=======
             "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
->>>>>>> 9372622349bcf7f3a5ae994cb4a0fa72615f7330
         }
     )
 
@@ -199,7 +195,6 @@ def main():
     print(
         "[Info] Parallel configuration:"
         f" cfg_parallel_size={args.cfg_parallel_size},"
-        f" tensor_parallel_size={args.tensor_parallel_size},"
         f" vae_patch_parallel_size={args.vae_patch_parallel_size},"
         f" vae_use_tiling={args.vae_use_tiling}"
     )
