@@ -804,9 +804,18 @@ class AsyncOmniEngine:
             decode_idx,
             bootstrap_addr,
         )
+        prefill_engine_id: str | None = None
+        try:
+            prefill_client = self.stage_clients[prefill_idx]
+            kv_cfg = getattr(getattr(prefill_client, "vllm_config", None), "kv_transfer_config", None)
+            prefill_engine_id = getattr(kv_cfg, "engine_id", None)
+        except Exception as exc:
+            logger.warning("[AsyncOmniEngine] Could not extract prefill engine_id: %s", exc)
+
         return {
             "pd_pair": (prefill_idx, decode_idx),
             "bootstrap_addr": bootstrap_addr,
+            "prefill_engine_id": prefill_engine_id,   # ← 新增
         }
 
     @staticmethod

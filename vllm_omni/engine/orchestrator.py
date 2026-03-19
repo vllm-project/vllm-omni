@@ -138,10 +138,12 @@ class Orchestrator:
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
         self._pd_bootstrap_addr: str | None = None
+        self._pd_prefill_engine_id: str | None = None
         self._pd_kv_params: dict[str, Any] = {}
         if pd_config is not None:
             self._pd_pair = pd_config.get("pd_pair")
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
+            self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
 
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
@@ -378,7 +380,7 @@ class Orchestrator:
                     list(self._pd_kv_params[req_id].keys()),
                 )
             else:
-                logger.warning(
+                logger.debug(
                     "[Orchestrator][PD] prefill stage output for req=%s has no kv_transfer_params; "
                     "KV transfer may fail. Ensure apply_mooncake_connector_patch() was called.",
                     req_id,
@@ -443,6 +445,9 @@ class Orchestrator:
         if self._pd_bootstrap_addr:
             decode_kv_params["remote_bootstrap_addr"] = self._pd_bootstrap_addr
 
+        if self._pd_prefill_engine_id:
+            decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
+
         # Overlay any params from the prefill side (includes remote_request_id set by monkey patch)
         if kv_prefill_params:
             decode_kv_params.update(kv_prefill_params)
@@ -454,13 +459,6 @@ class Orchestrator:
             decode_kv_params["transfer_id"] = f"xfer-{req_id}"
 
         sp.extra_args["kv_transfer_params"] = decode_kv_params
-
-        if "remote_request_id" not in decode_kv_params:
-            logger.warning(
-                "[Orchestrator][PD] remote_request_id NOT SET for req %s. "
-                "Apply mooncake_connector patch to fix KV lookup.",
-                req_id,
-            )
 
         logger.debug(
             "[Orchestrator][PD] decode kv_transfer_params for req=%s: %s",
