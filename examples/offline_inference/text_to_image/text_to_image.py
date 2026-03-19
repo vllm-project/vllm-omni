@@ -217,6 +217,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -304,6 +309,7 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
+        "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         **lora_args,
         **quant_kwargs,
     }

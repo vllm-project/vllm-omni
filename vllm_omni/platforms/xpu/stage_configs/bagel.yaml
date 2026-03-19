@@ -1,5 +1,4 @@
-# stage config for running BAGEL with Mooncake connector for CI e2e tests.
-# This config is optimized for single GPU tests with Mooncake inter-stage communication.
+# stage config for running bagel-7b-mot with architecture of OmniLLM.
 
 stage_args:
   - stage_id: 0
@@ -7,25 +6,26 @@ stage_args:
     prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
     runtime:
       devices: "0"
-      max_batch_size: 1
+      # 3 = 1 user prompt + 2 CFG companions (text-unconditional + image-unconditional).
+      max_batch_size: 3
     engine_args:
       model_stage: thinker
-      model_arch: BagelForConditionalGeneration
+      model_arch: OmniBagelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.45
+      gpu_memory_utilization: 0.9
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: text
-      distributed_executor_backend: mp
+      distributed_executor_backend: "mp"
       enable_prefix_caching: false
-      max_num_batched_tokens: 32768
+      max_num_batched_tokens: 16384
       tensor_parallel_size: 1
-      load_format: dummy
+      quantization: fp8
       omni_kv_config:
         need_send_cache: true
         kv_transfer_criteria:
-          type: prefill_finished
+          type: prefill_finished #or special token generated
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -35,54 +35,51 @@ stage_args:
       top_k: 1
       max_tokens: 2048
       seed: 52
-      detokenize: true
+      detokenize: True
       repetition_penalty: 1.05
-    output_connectors:
-      to_stage_1: mooncake_connector
+
   - stage_id: 1
     stage_type: diffusion
     cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.bagel.collect_cfg_kv_caches
     runtime:
-      devices: "0"
+      devices: "1"
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      gpu_memory_utilization: 0.45
+      gpu_memory_utilization: 0.9
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: image
-      distributed_executor_backend: mp
+      distributed_executor_backend: "mp"
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       tensor_parallel_size: 1
-      load_format: dummy
       omni_kv_config:
         need_recv_cache: true
     engine_input_source: [0]
+
     final_output: true
     final_output_type: image
     is_comprehension: false
     default_sampling_params:
       seed: 52
-    input_connectors:
-      from_stage_0: mooncake_connector
 
-# Top-level runtime config with Mooncake connector
+# Runtime edges
 runtime:
   enabled: true
   defaults:
     window_size: -1
     max_inflight: 1
+
+  # Distributed connectors configuration (optional)
+  # More connectors will be supported in the future.
   connectors:
-    mooncake_connector:
-      name: MooncakeConnector
+    shared_memory_connector:
+      name: SharedMemoryConnector
       extra:
-        host: "${MOONCAKE_HOST}"
-        metadata_server: "http://${MOONCAKE_HOST}:${MOONCAKE_HTTP_PORT}/metadata"
-        master: "${MOONCAKE_HOST}:${MOONCAKE_RPC_PORT}"
-        segment: 64000000
-        localbuf: 64000000
-        proto: tcp
+        shm_threshold_bytes: 65536 # 64KB threshold
+
+
   edges:
     - from: 0
       to: 1
