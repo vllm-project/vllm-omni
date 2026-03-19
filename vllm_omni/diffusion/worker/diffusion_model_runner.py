@@ -221,6 +221,7 @@ class DiffusionModelRunner:
                 not getattr(req, "skip_cache_refresh", False)
                 and self.cache_backend is not None
                 and self.cache_backend.is_enabled()
+                and req.sampling_params.num_inference_steps is not None
             ):
                 self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 

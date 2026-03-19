@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from tests.conftest import modify_stage_config
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.omni import Omni
 
@@ -158,17 +159,39 @@ def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Ima
     return generated_image
 
 
+def _resolve_stage_config(config_path: str, run_level: str) -> str:
+    """Resolve stage config based on run level.
+
+    For advanced_model (real weights), strip load_format: dummy so the model
+    falls back to loading real weights from HuggingFace.
+    """
+    if run_level == "advanced_model":
+        return modify_stage_config(
+            config_path,
+            deletes={
+                "stage_args": {
+                    0: ["engine_args.load_format"],
+                    1: ["engine_args.load_format"],
+                }
+            },
+        )
+    return config_path
+
+
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_bagel_text2img_shared_memory_connector():
+def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+    config_path = _resolve_stage_config(config_path, run_level)
     omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
 
     try:
         generated_image = _generate_bagel_image(omni)
-        _validate_pixels(generated_image)
+        if run_level == "advanced_model":
+            _validate_pixels(generated_image)
     finally:
         omni.close()
 
@@ -251,9 +274,10 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
 
 
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_bagel_text2img_mooncake_connector():
+def test_bagel_text2img_mooncake_connector(run_level):
     """Test Bagel text2img with Mooncake connector for inter-stage communication."""
     MOONCAKE_HOST = "127.0.0.1"
     MOONCAKE_RPC_PORT = _find_free_port()
@@ -291,10 +315,12 @@ def test_bagel_text2img_mooncake_connector():
             http_port=MOONCAKE_HTTP_PORT,
         )
 
+        temp_config_file = _resolve_stage_config(temp_config_file, run_level)
         omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file, stage_init_timeout=300)
 
         generated_image = _generate_bagel_image(omni)
-        _validate_pixels(generated_image)
+        if run_level == "advanced_model":
+            _validate_pixels(generated_image)
 
     finally:
         if omni:
