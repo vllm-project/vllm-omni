@@ -97,7 +97,7 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bagel_img2img_online(omni_server, openai_client) -> None:
     """Test Bagel img2img via OpenAI-compatible chat completions API."""
