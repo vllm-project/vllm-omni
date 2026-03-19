@@ -2176,11 +2176,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
-            for img in images:
+            flat_images = []
+            for item in images:
+                if isinstance(item, list):
+                    flat_images.extend(item)
+                else:
+                    flat_images.append(item)
+
+            for img in flat_images:
                 with BytesIO() as buffer:
                     img.save(buffer, format="PNG")
-                    img_bytes = buffer.getvalue()
-                img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                    img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
                 image_contents.append(
                     {
                         "type": "image_url",
