@@ -19,11 +19,11 @@ def _build_test_app(speech_service=None, *, idle_timeout=30.0, config_timeout=10
         speech_service._generate_audio_bytes = AsyncMock(return_value=(b"RIFF" + b"\x00" * 32, "audio/wav"))
         speech_service._prepare_speech_generation = AsyncMock(return_value=("req-1", object(), {}))
 
-        async def mock_generate_pcm_chunks(_generator, _request_id):
+        async def mock_generate_audio_chunks(_generator, _request_id):
             for chunk in (b"\x01\x02", b"\x03\x04\x05"):
                 yield chunk
 
-        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
 
@@ -82,11 +82,11 @@ class TestStreamingSpeechWebSocket:
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
 
-        async def mock_generate_pcm_chunks(_generator, _request_id):
+        async def mock_generate_audio_chunks(_generator, _request_id):
             for chunk in (b"\x01\x02", b"\x03\x04\x05", b"\x06"):
                 yield chunk
 
-        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
         app, _ = _build_test_app(speech_service)
 
         with TestClient(app) as client:
@@ -239,7 +239,7 @@ class TestStreamingSpeechWebSocket:
         speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = AsyncMock(side_effect=RuntimeError("boom"))
         speech_service._prepare_speech_generation = AsyncMock(return_value=("req-err", object(), {}))
-        speech_service._generate_pcm_chunks = AsyncMock()
+        speech_service._generate_audio_chunks = AsyncMock()
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
         app, _ = _build_test_app(speech_service)
@@ -263,11 +263,11 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
 
-        async def mock_generate_pcm_chunks(_generator, _request_id):
+        async def mock_generate_audio_chunks(_generator, _request_id):
             yield b"\x01\x02"
             raise RuntimeError("stream boom")
 
-        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
         app, _ = _build_test_app(speech_service)
 
         with TestClient(app) as client:
@@ -355,10 +355,10 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client = MagicMock()
         speech_service.engine_client.abort = AsyncMock()
 
-        async def mock_generate_pcm_chunks(_generator, _request_id):
+        async def mock_generate_audio_chunks(_generator, _request_id):
             yield b"\x01\x02"
 
-        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
+        speech_service._generate_audio_chunks = mock_generate_audio_chunks
         handler = OmniStreamingSpeechHandler(speech_service=speech_service)
 
         websocket = MagicMock()
