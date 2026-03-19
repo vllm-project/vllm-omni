@@ -46,7 +46,7 @@ def create_unique_server_params(
         model = config["server_params"]["model"]
         stage_config_name = config["server_params"].get("stage_config_name")
         if stage_config_name:
-            stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / stage_config_name)
+            stage_config_path = str(stage_configs_dir / stage_config_name)
             delete = config["server_params"].get("delete", None)
             update = config["server_params"].get("update", None)
             stage_config_path = modify_stage(stage_config_path, update, delete)
