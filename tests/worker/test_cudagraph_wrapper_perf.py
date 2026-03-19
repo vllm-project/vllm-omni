@@ -150,8 +150,8 @@ def test_attribute_error_message_does_not_contain_runnable_repr():
 
     try:
         _ = wrapper.nonexistent_attr
-    except AttributeError as e:
-        error_msg = str(e)
+    except AttributeError:
+        pass
 
     # __repr__ should not have been called during error construction
     assert model.repr_call_count == 0, (
