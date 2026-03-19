@@ -457,12 +457,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for classifier free guidance parallelism.",
     )
     parser.add_argument(
-        "--tensor-parallel-size",
-        type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism inside the GLM-Image transformer.",
-    )
-    parser.add_argument(
         "--vae-use-tiling",
         action="store_true",
         help="Enable VAE tiling for memory optimization.",
