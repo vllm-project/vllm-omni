@@ -107,6 +107,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._output_sample_rate = out_sr
         self._total_upsample = int(decoder.total_upsample)
 
+        # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
+        if hasattr(decoder, "precompute_snake_caches"):
+            decoder.precompute_snake_caches()
+
         if hasattr(decoder, "enable_cudagraph"):
             device = self._module_device(decoder)
             if device.type == "cuda":
