@@ -1,4 +1,4 @@
-# stage config for running qwen2.5-omni with architecture of OmniLLM.
+# stage config for running qwen2.5-omni for multi-stage omni runtime.
 
 # This config is optimized for CI e2e tests.
 stage_args:
