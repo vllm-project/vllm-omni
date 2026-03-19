@@ -59,12 +59,6 @@ def parse_args():
         help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
     )
     parser.add_argument(
-        "--tensor-parallel-size",
-        type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism inside the Bagel transformer.",
-    )
-    parser.add_argument(
         "--vae-use-tiling",
         action="store_true",
         help="Enable VAE tiling for memory optimization.",
