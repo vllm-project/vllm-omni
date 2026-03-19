@@ -396,6 +396,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
         self.gpu_resident_buffer_keys: set[str] = {
+            "audio_codes",
             "last_talker_hidden",
             "tts_pad_embed",
             "tailing_text_hidden",
@@ -650,7 +651,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Stays on GPU - gpu_resident_buffer_keys avoids the CPU round-trip.
         if hidden_states.numel() == 0:
             return {}
-        return {"last_talker_hidden": hidden_states[-1, :].detach()}
+        last = hidden_states[-1, :].detach()
+        return {"last_talker_hidden": last}
 
     # -------------------- prompt construction helpers --------------------
 

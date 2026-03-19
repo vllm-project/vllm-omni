@@ -133,6 +133,11 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
         "--log-stats",
         action="store_true",
         help="Enable vLLM-Omni statistics logging.",
@@ -189,6 +194,7 @@ def main():
         enforce_eager=args.enforce_eager,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         log_stats=args.log_stats,
     )
 
