@@ -330,6 +330,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for VAE patch parallelism.",
+    )
     return parser.parse_args()
 
 
