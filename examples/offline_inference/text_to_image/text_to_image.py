@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
         help="Diffusion model name or local path. Supported models: "
         "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, stepfun-ai/NextStep-1.1",
     )
+    parser.add_argument(
+        "--stage-configs-path",
+        type=str,
+        default=None,
+        help="Path to a YAML file containing stage configurations for Omni.",
+    )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
         "--negative-prompt",
@@ -307,6 +313,8 @@ def main():
         **lora_args,
         **quant_kwargs,
     }
+    if args.stage_configs_path:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
@@ -334,6 +342,8 @@ def main():
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
+    if args.stage_configs_path:
+        print(f"  stage-configs-path: {args.stage_configs_path}")
     print(f"{'=' * 60}\n")
 
     # Build LoRA request when --lora-path is set
