@@ -84,8 +84,8 @@ from vllm.utils.collection_utils import as_list
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.utils import parse_lora_request
 from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -2106,27 +2106,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
             if lora_body and isinstance(lora_body, dict):
                 try:
-                    lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
-                    lora_path = (
-                        lora_body.get("local_path")
-                        or lora_body.get("path")
-                        or lora_body.get("lora_path")
-                        or lora_body.get("lora_local_path")
-                    )
-                    # using "or" directly here may be buggy if `scale=0`
-                    lora_scale = lora_body.get("scale")
-                    if lora_scale is None:
-                        lora_scale = lora_body.get("lora_scale")
-                    lora_int_id = lora_body.get("int_id")
-                    if lora_int_id is None:
-                        lora_int_id = lora_body.get("lora_int_id")
-                    if lora_int_id is None and lora_path:
-                        lora_int_id = stable_lora_int_id(str(lora_path))
-                    if lora_name and lora_path:
-                        lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+                    lora_req, lora_scale = parse_lora_request(lora_body)
+                    if lora_req is not None:
                         gen_params.lora_request = lora_req
                         if lora_scale is not None:
-                            gen_params.lora_scale = float(lora_scale)
+                            gen_params.lora_scale = lora_scale
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 

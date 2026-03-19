@@ -19,10 +19,9 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationResponse,
 )
+from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import encode_video_base64
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 
@@ -172,38 +171,20 @@ class OmniOpenAIServingVideo:
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
-        if lora_body is None:
+        try:
+            lora_request, lora_scale = parse_lora_request(lora_body)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=str(e),
+            ) from e
+
+        if lora_request is None:
             return
-        if not isinstance(lora_body, dict):
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="Invalid lora field: expected an object.",
-            )
-        lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
-        lora_path = (
-            lora_body.get("local_path")
-            or lora_body.get("path")
-            or lora_body.get("lora_path")
-            or lora_body.get("lora_local_path")
-        )
-        lora_scale = lora_body.get("scale")
-        if lora_scale is None:
-            lora_scale = lora_body.get("lora_scale")
-        lora_int_id = lora_body.get("int_id")
-        if lora_int_id is None:
-            lora_int_id = lora_body.get("lora_int_id")
-        if lora_int_id is None and lora_path:
-            lora_int_id = stable_lora_int_id(str(lora_path))
 
-        if not lora_name or not lora_path:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="Invalid lora object: both name and path are required.",
-            )
-
-        gen_params.lora_request = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+        gen_params.lora_request = lora_request
         if lora_scale is not None:
-            gen_params.lora_scale = float(lora_scale)
+            gen_params.lora_scale = lora_scale
 
     async def _run_generation(
         self,
@@ -221,7 +202,7 @@ class OmniOpenAIServingVideo:
 
         # Video generation endpoint only supports diffusion stages.
         for stage in stage_configs:
-            stage_type = _get_stage_type(stage)
+            stage_type = get_stage_type(stage)
             if stage_type != "diffusion":
                 raise HTTPException(
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,

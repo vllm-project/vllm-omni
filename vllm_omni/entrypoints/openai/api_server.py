@@ -111,10 +111,9 @@ from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpee
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
+from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 router = APIRouter()
@@ -167,17 +166,6 @@ async def _get_vllm_config(engine_client: EngineClient) -> Any:
     if hasattr(engine_client, "get_vllm_config"):
         return await engine_client.get_vllm_config()
     return getattr(engine_client, "vllm_config", None)
-
-
-def _get_stage_type(stage_cfg: Any) -> str:
-    if isinstance(stage_cfg, dict):
-        return stage_cfg.get("stage_type", "llm")
-    if hasattr(stage_cfg, "get"):
-        try:
-            return stage_cfg.get("stage_type", "llm")
-        except Exception:
-            pass
-    return getattr(stage_cfg, "stage_type", "llm")
 
 
 def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
@@ -462,7 +450,7 @@ async def omni_init_app_state(
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
         if len(stage_configs) == 1:
-            stage_type = _get_stage_type(stage_configs[0])
+            stage_type = get_stage_type(stage_configs[0])
             if stage_type == "diffusion":
                 is_pure_diffusion = True
                 logger.info("Detected pure diffusion mode (single diffusion stage)")
@@ -1360,7 +1348,7 @@ async def edit_images(
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
         # Currently only have one diffusion stage.
-        diffusion_stage_ids = [i for i, cfg in enumerate(stage_configs) if _get_stage_type(cfg) == "diffusion"]
+        diffusion_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
         if not diffusion_stage_ids:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
@@ -1473,7 +1461,7 @@ def _get_engine_and_model(raw_request: Request):
         )
 
     normalized_stage_configs = list(stage_configs)
-    has_diffusion_stage = any(_get_stage_type(stage_cfg) == "diffusion" for stage_cfg in normalized_stage_configs)
+    has_diffusion_stage = any(get_stage_type(stage_cfg) == "diffusion" for stage_cfg in normalized_stage_configs)
 
     if not has_diffusion_stage:
         raise HTTPException(
@@ -1507,36 +1495,13 @@ def _get_lora_from_json_str(lora_body):
 
 
 def _parse_lora_request(lora_body: dict[str, Any]):
-    if lora_body is not None:
-        if not isinstance(lora_body, dict):
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="Invalid lora field: expected an object.",
-            )
-        lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
-        lora_path = (
-            lora_body.get("local_path")
-            or lora_body.get("path")
-            or lora_body.get("lora_path")
-            or lora_body.get("lora_local_path")
-        )
-        lora_scale = lora_body.get("scale")
-        if lora_scale is None:
-            lora_scale = lora_body.get("lora_scale")
-        lora_int_id = lora_body.get("int_id")
-        if lora_int_id is None:
-            lora_int_id = lora_body.get("lora_int_id")
-        if lora_int_id is None and lora_path:
-            lora_int_id = stable_lora_int_id(str(lora_path))
-
-        if not lora_name or not lora_path:
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="Invalid lora object: both name and path are required.",
-            )
-
-        return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), lora_scale
-    return None, None
+    try:
+        return parse_lora_request(lora_body)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=str(e),
+        ) from e
 
 
 async def _generate_with_async_omni(
@@ -1547,7 +1512,12 @@ async def _generate_with_async_omni(
 ):
     engine_client = cast(AsyncOmni, engine_client)
     result = None
-    normalized_stage_configs = list(stage_configs or [])
+    normalized_stage_configs = list(stage_configs)
+    if not normalized_stage_configs:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Stage configs not found. Start server with a multi-stage omni model.",
+        )
     default_params_list: list[OmniSamplingParams] | None = getattr(
         engine_client,
         "default_sampling_params_list",
@@ -1558,27 +1528,24 @@ async def _generate_with_async_omni(
     else:
         default_params_list = list(default_params_list)
 
-    if normalized_stage_configs:
-        sampling_params_list: list[OmniSamplingParams] = []
-        for idx, stage_cfg in enumerate(normalized_stage_configs):
-            stage_type = _get_stage_type(stage_cfg)
-            if stage_type == "diffusion":
-                sampling_params_list.append(gen_params)
-                continue
+    sampling_params_list: list[OmniSamplingParams] = []
+    for idx, stage_cfg in enumerate(normalized_stage_configs):
+        stage_type = get_stage_type(stage_cfg)
+        if stage_type == "diffusion":
+            sampling_params_list.append(gen_params)
+            continue
 
-            if idx < len(default_params_list):
-                default_stage_params = default_params_list[idx]
-            else:
-                default_stage_params = SamplingParams()
+        if idx < len(default_params_list):
+            default_stage_params = default_params_list[idx]
+        else:
+            default_stage_params = SamplingParams()
 
-            if hasattr(default_stage_params, "clone"):
-                try:
-                    default_stage_params = default_stage_params.clone()
-                except Exception:
-                    pass
-            sampling_params_list.append(default_stage_params)
-    else:
-        sampling_params_list = [gen_params]
+        if hasattr(default_stage_params, "clone"):
+            try:
+                default_stage_params = default_stage_params.clone()
+            except Exception:
+                pass
+        sampling_params_list.append(default_stage_params)
 
     async for output in engine_client.generate(
         sampling_params_list=sampling_params_list,
