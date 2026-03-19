@@ -243,7 +243,7 @@ class OmniStreamingSpeechHandler:
         try:
             if config.stream_audio:
                 request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
-                async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+                async with aclosing(self._speech_service._generate_audio_chunks(generator, request_id)) as stream:
                     async for chunk in stream:
                         total_bytes += len(chunk)
                         await websocket.send_bytes(chunk)

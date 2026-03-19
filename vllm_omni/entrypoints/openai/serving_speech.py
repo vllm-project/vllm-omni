@@ -917,7 +917,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
-        async for chunk in self._generate_pcm_chunks(generator, request_id):
+        async for chunk in self._generate_audio_chunks(generator, request_id):
             yield chunk
 
     async def _generate_audio_bytes(
