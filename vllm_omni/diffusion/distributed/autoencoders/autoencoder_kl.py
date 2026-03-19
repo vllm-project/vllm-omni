@@ -15,6 +15,8 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 
+# from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import AutoencoderKL as Next_Step_AutoencoderKL
+
 logger = init_logger(__name__)
 
 
@@ -200,3 +202,9 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
 class DistributedAutoencoderKL(DistributedAutoencoderKL_base, Diffusers_AutoencoderKL):
     pass
+
+
+# Next_Step_AutoencoderKL not support tiling now, so we currently disable it.
+
+# class DistributedAutoencoderKL_NextStep(DistributedAutoencoderKL_base, Next_Step_AutoencoderKL):
+#    pass
