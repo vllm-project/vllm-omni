@@ -84,8 +84,8 @@ from vllm.utils.collection_utils import as_list
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.utils import parse_lora_request
 from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -311,17 +311,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 negative_prompt = extra_body.get("negative_prompt")
 
                 engine_prompt_image: dict[str, Any] | None = None
+                is_img2img = False
                 if reference_images:
                     # Best-effort decode first reference image for i2i.
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
                         img = Image.open(BytesIO(img_bytes))
-                        engine_prompt_image = {"image": img}
+                        engine_prompt_image = {"img2img": img}
+                        is_img2img = True
                     except Exception:
                         engine_prompt_image = None
 
                 # Override the prompts produced by chat-template preprocessing.
                 tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
+                if is_img2img:
+                    tprompt["modalities"] = ["img2img"]
+                else:
+                    tprompt["modalities"] = ["image"]
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
@@ -490,10 +496,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
 
         # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
-        # For /v1/chat/completions, `request_prompt` is often the rendered chat template.
-        # Diffusion models generally want the raw user caption instead.
-        output_modalities = getattr(self.engine_client, "output_modalities", None)
-        if output_modalities and ("image" in output_modalities):
+        # For image generation, we want the raw user caption instead of a rendered template.
+        # But for multimodal comprehension (img2text), we MUST keep the rendered prompt
+        # containing image tokens.
+        req_modalities = getattr(request, "modalities", [])
+        if req_modalities and ("image" in req_modalities):
             messages_as_dicts: list[dict[str, Any]] = []
             for msg in messages:
                 if hasattr(msg, "model_dump"):
@@ -621,10 +628,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return final_sampling_params_list
 
     def _get_comprehension_stage_index(self) -> int:
-        for idx, stage in enumerate(self.engine_client.stage_list):
+        for idx, stage in enumerate(self.engine_client.stage_configs):
             if stage.is_comprehension:
                 return idx
-        raise ValueError("No comprehension stage (is_comprehension=True) found in stage_list")
+        raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
 
     # OpenAI API standard sampling parameters that can be safely overridden.
     # These are the most commonly used parameters with compatible types
@@ -2103,27 +2110,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
             if lora_body and isinstance(lora_body, dict):
                 try:
-                    lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
-                    lora_path = (
-                        lora_body.get("local_path")
-                        or lora_body.get("path")
-                        or lora_body.get("lora_path")
-                        or lora_body.get("lora_local_path")
-                    )
-                    # using "or" directly here may be buggy if `scale=0`
-                    lora_scale = lora_body.get("scale")
-                    if lora_scale is None:
-                        lora_scale = lora_body.get("lora_scale")
-                    lora_int_id = lora_body.get("int_id")
-                    if lora_int_id is None:
-                        lora_int_id = lora_body.get("lora_int_id")
-                    if lora_int_id is None and lora_path:
-                        lora_int_id = stable_lora_int_id(str(lora_path))
-                    if lora_name and lora_path:
-                        lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+                    lora_req, lora_scale = parse_lora_request(lora_body)
+                    if lora_req is not None:
                         gen_params.lora_request = lora_req
                         if lora_scale is not None:
-                            gen_params.lora_scale = float(lora_scale)
+                            gen_params.lora_scale = lora_scale
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 
@@ -2151,8 +2142,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Generate image
             # Handle both AsyncOmniDiffusion (returns OmniRequestOutput) and AsyncOmni (returns AsyncGenerator)
-            if hasattr(self._diffusion_engine, "stage_list"):
-                # AsyncOmni: iterate through async generator to get final output
+            if isinstance(self._diffusion_engine, AsyncOmni):
                 diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
                 result = None
                 async for output in diffusion_engine.generate(

@@ -4,9 +4,11 @@
 import math
 import time
 from collections import OrderedDict
+from typing import get_args
 
 import torch
 import torch.nn as nn
+from vllm.config.lora import MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
@@ -37,6 +39,9 @@ class DiffusionLoRAManager:
     Reuses vLLM's LoRA infrastructure, adapted for diffusion pipelines.
     Uses LRU cache management similar to LRUCacheLoRAModelManager.
     """
+
+    # Valid max allowed ranks for LoRA in vLLM
+    _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
 
     def __init__(
         self,
@@ -413,11 +418,10 @@ class DiffusionLoRAManager:
         if min_rank <= self._max_lora_rank:
             return
 
-        if min_rank <= 0:
-            raise ValueError(f"Invalid LoRA rank: {min_rank}")
+        valid_max_rank = self._get_smallest_valid_max_rank(min_rank)
 
-        logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, min_rank)
-        self._max_lora_rank = min_rank
+        logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
+        self._max_lora_rank = valid_max_rank
 
         if not self._lora_modules:
             return
@@ -440,6 +444,18 @@ class DiffusionLoRAManager:
             active_scale = self._adapter_scales[active_id]
             self._active_adapter_id = None
             self._activate_adapter(active_id, active_scale)
+
+    @classmethod
+    def _get_smallest_valid_max_rank(cls, min_rank: int) -> int:
+        """Given a LoRA rank, get the smallest max rank that can support it."""
+        if min_rank <= 0:
+            raise ValueError(f"Invalid LoRA rank: {min_rank}")
+
+        allowed_ranks = [rank for rank in cls._VALID_MAX_RANKS if rank >= min_rank]
+        if not allowed_ranks:
+            raise ValueError(f"LoRA rank of {min_rank} exceeds max allowed rank of {max(cls._VALID_MAX_RANKS)}")
+
+        return min(allowed_ranks)
 
     def _get_lora_weights(
         self,

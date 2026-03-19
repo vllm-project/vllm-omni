@@ -219,7 +219,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             model,
             subfolder="text_encoder",
             local_files_only=local_files_only,
-        )
+        ).to(self._execution_device)
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             model,
             subfolder="tokenizer",
