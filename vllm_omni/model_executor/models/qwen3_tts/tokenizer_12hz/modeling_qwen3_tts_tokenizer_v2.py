@@ -987,7 +987,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             logger.warning("Cannot enable CUDA Graph: decoder is not on a CUDA device (got %s)", device)
             return
 
-        self.precompute_snake_caches()
         self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
             capture_sizes=capture_sizes,
