@@ -546,7 +546,7 @@ class AsyncOmni(EngineClient, OmniBase):
     @property
     def errored(self) -> bool:
         """Whether orchestrator thread has stopped unexpectedly."""
-        return hasattr(self.engine, "orchestrator_thread") and not self.engine.orchestrator_thread.is_alive()
+        return not self.engine.is_alive()
 
     @property
     def is_stopped(self) -> bool:

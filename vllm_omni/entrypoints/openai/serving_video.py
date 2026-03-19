@@ -26,17 +26,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 logger = init_logger(__name__)
 
 
-def _get_stage_type(stage_cfg: Any) -> str:
-    if isinstance(stage_cfg, dict):
-        return stage_cfg.get("stage_type", "llm")
-    if hasattr(stage_cfg, "get"):
-        try:
-            return stage_cfg.get("stage_type", "llm")
-        except Exception:
-            pass
-    return getattr(stage_cfg, "stage_type", "llm")
-
-
 @dataclass
 class ReferenceImage:
     """Reference class for tracking additional metadata if needed"""
