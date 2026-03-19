@@ -2050,19 +2050,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 except ValueError:
                     logger.warning("Invalid size format: %s", extra_body.get("size"))
 
-            # Get request parameters from extra_body
-            # Text-to-image parameters (ref: text_to_image.py)
-            num_inference_steps = extra_body.get("num_inference_steps", 50)
+            # Get request parameters from extra_body.
+            # Avoid hardcoded defaults here — let each pipeline's forward()
+            # method apply its own model-specific default when the user does
+            # not provide a value.
+            num_inference_steps = extra_body.get("num_inference_steps")
             guidance_scale = extra_body.get("guidance_scale")
-            true_cfg_scale = extra_body.get("true_cfg_scale")  # Qwen-Image specific
+            true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
             seed = extra_body.get("seed")
             negative_prompt = extra_body.get("negative_prompt")
             num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
-            guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
+            guidance_scale_2 = extra_body.get("guidance_scale_2")
             lora_body = extra_body.get("lora")
+
+            # Qwen-Image-Layered parameters
+            layers = extra_body.get("layers")
+            resolution = extra_body.get("resolution")
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
@@ -2087,25 +2093,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "negative_prompt": negative_prompt,
             }
             gen_params = OmniDiffusionSamplingParams(
-                num_inference_steps=num_inference_steps,
                 height=height,
                 width=width,
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
 
+            # Only override defaults when the user explicitly provides values
+            if num_inference_steps is not None:
+                gen_params.num_inference_steps = num_inference_steps
             if guidance_scale is not None:
                 gen_params.guidance_scale = guidance_scale
-
-            # Add Qwen-Image specific parameter
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
-
-            # Add video generation parameters if set
             if num_frames is not None:
                 gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:
                 gen_params.guidance_scale_2 = guidance_scale_2
+            if layers is not None:
+                gen_params.layers = layers
+            if resolution is not None:
+                gen_params.resolution = resolution
 
             # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
             if lora_body and isinstance(lora_body, dict):
