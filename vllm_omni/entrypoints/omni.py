@@ -12,7 +12,13 @@ from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniBase
-from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
+from vllm_omni.metrics import (
+    OrchestratorAggregator as OrchestratorMetrics,
+)
+from vllm_omni.metrics import (
+    infer_request_output_type,
+    omni_prometheus_metrics,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -123,10 +129,12 @@ class Omni(OmniBase):
                 req_final_stage_ids[req_id] = final_stage_id
 
                 metrics = OrchestratorMetrics(
-                    self.num_stages,
-                    self.log_stats,
-                    wall_start_ts,
-                    final_stage_id,
+                    num_stages=self.num_stages,
+                    log_stats=self.log_stats,
+                    wall_start_ts=wall_start_ts,
+                    final_stage_id_for_e2e=final_stage_id,
+                    prometheus_metrics=omni_prometheus_metrics if self.enable_metrics else None,
+                    model_name=self.model_name if self.enable_metrics else None,
                 )
                 req_state = ClientRequestState(req_id)
                 req_state.metrics = metrics
@@ -146,6 +154,11 @@ class Omni(OmniBase):
                     final_stage_id=final_stage_id,
                 )
                 submit_ts = time.time()
+                metrics.on_request_started(
+                    req_id=req_id,
+                    req_start_ts=submit_ts,
+                    final_output_type=infer_request_output_type(prompt_modalities),
+                )
                 req_state.metrics.stage_first_ts[0] = submit_ts
                 req_start_ts[req_id] = submit_ts
 
@@ -198,6 +211,9 @@ class Omni(OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         self.engine.abort(request_ids)
         for req_id in request_ids:
+            req_state = self.request_states.get(req_id)
+            if req_state is not None and req_state.metrics is not None:
+                req_state.metrics.on_request_aborted(req_id)
             self.request_states.pop(req_id, None)
         if self.log_stats:
             logger.info("[Omni] Aborted request(s) %s", ",".join(request_ids))

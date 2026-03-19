@@ -32,6 +32,10 @@ from vllm_omni.entrypoints.omni_base import (
     OmniEngineDeadError,
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
+from vllm_omni.metrics import (
+    infer_request_output_type,
+    omni_prometheus_metrics,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -267,6 +271,7 @@ class AsyncOmni(EngineClient, OmniBase):
         logger.debug(f"[AsyncOmni] generate() called for request {request_id}")
 
         input_stream_task: asyncio.Task | None = None
+        req_state: ClientRequestState | None = None
         try:
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
@@ -283,15 +288,16 @@ class AsyncOmni(EngineClient, OmniBase):
             # Track per-request metrics
             wall_start_ts = time.time()
             req_start_ts: dict[str, float] = {}
-
             # Determine the final stage for E2E stats
             final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
 
             metrics = OrchestratorMetrics(
-                self.num_stages,
-                self.log_stats,
-                wall_start_ts,
-                final_stage_id_for_e2e,
+                num_stages=self.num_stages,
+                log_stats=self.log_stats,
+                wall_start_ts=wall_start_ts,
+                final_stage_id_for_e2e=final_stage_id_for_e2e,
+                prometheus_metrics=omni_prometheus_metrics if self.enable_metrics else None,
+                model_name=self.model_name if self.enable_metrics else None,
             )
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
@@ -321,6 +327,11 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                 )
             submit_ts = time.time()
+            metrics.on_request_started(
+                req_id=request_id,
+                req_start_ts=submit_ts,
+                final_output_type=infer_request_output_type(output_modalities),
+            )
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
 
@@ -338,12 +349,13 @@ class AsyncOmni(EngineClient, OmniBase):
                 yield output
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
-
             self._log_summary_and_cleanup(request_id)
 
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
+            if req_state is not None and req_state.metrics is not None:
+                req_state.metrics.on_request_aborted(request_id)
             await self.abort(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
@@ -580,7 +592,6 @@ class AsyncOmni(EngineClient, OmniBase):
                         continue
 
                     req_state.stage_id = stage_id
-
                     # Route to the per-request queue
                     await req_state.queue.put(msg)
 
@@ -673,6 +684,9 @@ class AsyncOmni(EngineClient, OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         await self.engine.abort_async(request_ids)
         for req_id in request_ids:
+            req_state = self.request_states.get(req_id)
+            if req_state is not None and req_state.metrics is not None:
+                req_state.metrics.on_request_aborted(req_id)
             self.request_states.pop(req_id, None)
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))

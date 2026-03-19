@@ -9,6 +9,7 @@ from typing import Any
 
 from vllm.logger import init_logger
 
+from vllm_omni.metrics.prometheus import OmniPrometheusMetrics, normalize_output_type
 from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
 
 logger = init_logger(__name__)
@@ -119,10 +120,14 @@ class OrchestratorAggregator:
         log_stats: bool,
         wall_start_ts: float,
         final_stage_id_for_e2e: dict[str, int] | int,
+        prometheus_metrics: OmniPrometheusMetrics | None = None,
+        model_name: str | None = None,
     ) -> None:
         self.num_stages = int(num_stages)
         self.log_stats = bool(log_stats)
         self.final_stage_id_for_e2e = final_stage_id_for_e2e
+        self.prometheus_metrics = prometheus_metrics
+        self.model_name = model_name
         self.init_run_state(wall_start_ts)
         self.stage_events: dict[str, list[StageRequestStats]] = {}
         self.transfer_events: dict[
@@ -147,6 +152,58 @@ class OrchestratorAggregator:
         self.diffusion_metrics: defaultdict[str, defaultdict[str, float]] = defaultdict(
             lambda: defaultdict(float)
         )  # {request_id: {diffusion_metrics_key: accumulated_metrics_data}}
+        self.request_start_ts: dict[str, float] = {}
+        self.request_output_types: dict[str, str] = {}
+        self.request_finalized: set[str] = set()
+
+    def _prometheus_enabled(self) -> bool:
+        return self.prometheus_metrics is not None and self.model_name is not None
+
+    def _resolve_output_type(self, req_id: str, final_output_type: str | None = None) -> str:
+        if final_output_type:
+            return normalize_output_type(final_output_type)
+        if req_id in self.request_output_types:
+            return self.request_output_types[req_id]
+        if req_id in self.stage_events:
+            for evt in reversed(self.stage_events[req_id]):
+                if evt.final_output_type:
+                    return normalize_output_type(evt.final_output_type)
+        return normalize_output_type(None)
+
+    def on_request_started(
+        self,
+        req_id: Any,
+        req_start_ts: float,
+        final_output_type: str | None = None,
+    ) -> bool:
+        rid_key = str(req_id)
+        if rid_key in self.request_start_ts:
+            return False
+        self.request_start_ts[rid_key] = float(req_start_ts)
+        self.request_output_types[rid_key] = self._resolve_output_type(rid_key, final_output_type)
+        if self._prometheus_enabled():
+            self.prometheus_metrics.on_request_started(
+                model_name=self.model_name,
+                final_output_type=self.request_output_types[rid_key],
+            )
+        return True
+
+    def set_request_output_type(self, req_id: Any, final_output_type: str | None) -> None:
+        if final_output_type:
+            self.request_output_types[str(req_id)] = normalize_output_type(final_output_type)
+
+    def on_request_aborted(self, req_id: Any, final_output_type: str | None = None) -> bool:
+        rid_key = str(req_id)
+        if rid_key in self.request_finalized:
+            return False
+        self.request_finalized.add(rid_key)
+        self.request_output_types[rid_key] = self._resolve_output_type(rid_key, final_output_type)
+        if self._prometheus_enabled():
+            self.prometheus_metrics.on_request_aborted(
+                model_name=self.model_name,
+                final_output_type=self.request_output_types[rid_key],
+            )
+        return True
 
     def _get_or_create_transfer_event(
         self,
@@ -189,6 +246,14 @@ class OrchestratorAggregator:
             evt.size_bytes += int(size_bytes)
             evt.tx_time_ms += float(tx_time_ms)
             evt.used_shm = evt.used_shm or bool(used_shm)
+            if self._prometheus_enabled() and size_bytes > 0:
+                self.prometheus_metrics.on_transfer_recorded(
+                    model_name=self.model_name,
+                    from_stage=int(from_stage),
+                    to_stage=int(to_stage),
+                    used_shm=bool(used_shm),
+                    size_bytes=int(size_bytes),
+                )
             return evt
         except Exception:
             return None
@@ -347,6 +412,13 @@ class OrchestratorAggregator:
         if stats.stage_id == 0:
             self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_in)
         self.stage_events.setdefault(str(stats.request_id), []).append(stats)
+        if self._prometheus_enabled():
+            self.prometheus_metrics.on_stage_completed(
+                model_name=self.model_name,
+                stage_id=stage_id,
+                final_output_type=stats.final_output_type,
+                generation_seconds=max(0.0, float(stats.stage_gen_time_ms) / 1000.0),
+            )
 
         self.record_transfer_rx(stats)
 
@@ -355,6 +427,13 @@ class OrchestratorAggregator:
             for stats in self.stage_events[req_id]:
                 if stats.stage_id == stage_id:
                     stats.postprocess_time_ms = float(postproc_time_ms)
+                    if self._prometheus_enabled():
+                        self.prometheus_metrics.on_stage_postprocessed(
+                            model_name=self.model_name,
+                            stage_id=stage_id,
+                            final_output_type=stats.final_output_type,
+                            postprocess_seconds=max(0.0, float(postproc_time_ms) / 1000.0),
+                        )
                     break
         else:
             logger.warning(
@@ -423,12 +502,14 @@ class OrchestratorAggregator:
         stage_id: int,
         req_id: Any,
         req_start_ts: float,
-    ) -> None:
+        finished_at: float | None = None,
+    ) -> bool:
         rid_key = str(req_id)
-        if rid_key in self.e2e_done:
-            return  # Already finalized
-        _t0 = float(req_start_ts)
-        _t1 = time.time()
+        if rid_key in self.request_finalized:
+            return False
+        self.request_finalized.add(rid_key)
+        _t0 = float(self.request_start_ts.get(rid_key, req_start_ts))
+        _t1 = time.time() if finished_at is None else float(finished_at)
         # Update last output time for this stage
         prev_last = self.stage_last_ts[stage_id]
         self.stage_last_ts[stage_id] = _t1 if prev_last is None else max(prev_last, _t1)
@@ -460,6 +541,14 @@ class OrchestratorAggregator:
             ),
         )
         self.e2e_events.append(per_req_record)
+        self.request_output_types[rid_key] = self._resolve_output_type(rid_key)
+        if self._prometheus_enabled():
+            self.prometheus_metrics.on_request_succeeded(
+                model_name=self.model_name,
+                final_output_type=self.request_output_types[rid_key],
+                latency_seconds=max(0.0, e2e_ms / 1000.0),
+            )
+        return True
 
     def build_and_log_summary(self) -> dict[str, Any]:
         if not self.log_stats:

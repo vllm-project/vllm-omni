@@ -152,6 +152,8 @@ class OmniBase(PDDisaggregationMixin):
         model = omni_snapshot_download(model)
         self.__dict__["_name"] = self.__class__.__name__
         self.model = model
+        self.model_name = model
+        self.enable_metrics = bool(kwargs.get("enable_metrics", False))
         self.log_stats = log_stats
         # Provisional value (mirrors the CLI/caller kwarg); the engine resolves
         # pipeline + deploy YAML + CLI precedence below and the final value is
@@ -400,16 +402,16 @@ class OmniBase(PDDisaggregationMixin):
             metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
+        stage_meta = self.engine.get_stage_metadata(stage_id)
         _m = result.get("metrics")
         if finished and _m is not None:
-            metrics.on_stage_metrics(stage_id, req_id, _m)
-
-        stage_meta = self.engine.get_stage_metadata(stage_id)
+            metrics.on_stage_metrics(stage_id, req_id, _m, stage_meta["final_output_type"])
         if not stage_meta["final_output"]:
             return None
 
         try:
             rid_key = str(req_id)
+            metrics.set_request_output_type(req_id, stage_meta["final_output_type"])
             if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done and finished:
                 metrics.on_finalize_request(
                     stage_id,

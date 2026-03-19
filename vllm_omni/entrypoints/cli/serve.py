@@ -99,6 +99,11 @@ class OmniServeCommand(CLISubcommand):
         # stage-config factory can give YAML precedence over argparse defaults.
         args._cli_explicit_keys = detect_explicit_cli_keys(sys.argv[1:], OmniServeCommand._parser)
 
+        if args.enable_metrics:
+            logger.info("vLLM-Omni Prometheus metrics enabled")
+        else:
+            logger.info("vLLM-Omni Prometheus metrics disabled")
+
         if args.headless:
             run_headless(args)
         else:
@@ -214,6 +219,11 @@ class OmniServeCommand(CLISubcommand):
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",
+        )
+        omni_config_group.add_argument(
+            "--enable-metrics",
+            action="store_true",
+            help="Enable vLLM-Omni Prometheus request metrics in the shared /metrics endpoint.",
         )
         omni_config_group.add_argument(
             "--log-file",
