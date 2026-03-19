@@ -135,14 +135,12 @@ class OmniRequestOutput:
         if self.request_output is None:
             return self._multimodal_output
 
-        request_outputs = self.request_output if isinstance(self.request_output, list) else [self.request_output]
-        for req_out in request_outputs:
-            # Check completion outputs first (where multimodal_output is attached)
-            for output in getattr(req_out, "outputs", []):
-                if mm := getattr(output, "multimodal_output", None):
-                    return mm
-            if mm := getattr(req_out, "multimodal_output", None):
+        # Check completion outputs first (where multimodal_output is attached)
+        for output in getattr(self.request_output, "outputs", []):
+            if mm := getattr(output, "multimodal_output", None):
                 return mm
+        if mm := getattr(self.request_output, "multimodal_output", None):
+            return mm
         return self._multimodal_output
 
     @property

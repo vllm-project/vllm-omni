@@ -112,7 +112,7 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         )
         images_outputs = []
         for output in outputs:
-            req_out = output.request_output[0]
+            req_out = output.request_output
             if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
                 raise ValueError("Invalid request_output structure or missing 'images' key")
             images = req_out.images

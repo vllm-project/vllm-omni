@@ -1,9 +1,9 @@
-# stage config for running qwen2.5-omni with architecture of OmniLLM.
+# stage config for running qwen2.5-omni for multi-stage omni runtime.
 
 # The following config is verified with 2 * Intel Arc Pro B60 XPU.
 stage_args:
   - stage_id: 0
-    stage_type: llm # Use llm stage type to launch OmniLLM
+    stage_type: llm # Use llm stage type for AR stages
     runtime:
       process: true # Run this stage in a separate process
       devices: "0" # Visible devices for this stage
@@ -30,7 +30,7 @@ stage_args:
       detokenize: True
       repetition_penalty: 1.1
   - stage_id: 1
-    stage_type: llm # Use llm stage type to launch OmniLLM
+    stage_type: llm # Use llm stage type for AR stages
     runtime:
       process: true
       devices: "1"
@@ -58,7 +58,7 @@ stage_args:
       stop_token_ids: [8294]
 
   - stage_id: 2
-    stage_type: llm # Use llm stage type to launch OmniLLM
+    stage_type: llm # Use llm stage type for AR stages
     runtime:
       process: true
       devices: "1"
