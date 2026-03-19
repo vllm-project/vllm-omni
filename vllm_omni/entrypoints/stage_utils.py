@@ -72,7 +72,7 @@ def set_stage_devices(
                 else:
                     mapped_devices.append(str(idx))
             mapped_devices_str = ",".join(mapped_devices)
-            os.environ[env_var] = mapped_devices_str
+            current_omni_platform.set_device_control_env_var(mapped_devices_str)
             if toks:
                 try:
                     selected_physical = int(mapped_devices[0])
@@ -99,7 +99,7 @@ def set_stage_devices(
                     selected_physical = None
             if selected_physical is None:
                 selected_physical = int(logical_idx)
-            os.environ[env_var] = str(selected_physical)
+            current_omni_platform.set_device_control_env_var(str(selected_physical))
             logger.debug(
                 "[Stage-%s] Logical index %d -> physical %s; set %s to single device",
                 stage_id,
@@ -111,7 +111,7 @@ def set_stage_devices(
             logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
         else:
             selected_physical = int(str(devices))
-            os.environ[env_var] = str(selected_physical)
+            current_omni_platform.set_device_control_env_var(str(selected_physical))
             logger.debug("[Stage-%s] Set %s to single device %s (fallback)", stage_id, env_var, selected_physical)
     except Exception as e:
         logger.warning("Failed to interpret devices for stage %s: %s", stage_id, e)

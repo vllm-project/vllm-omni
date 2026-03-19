@@ -1906,6 +1906,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
 
+        # Handle profiling data
+        stage_durations = omni_outputs.stage_durations
+
         # Handle different image output formats
         images = []
 
@@ -1959,6 +1962,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "image_url": {
                         "url": f"data:image/png;base64,{img_base64}",
                     },
+                    "stage_durations": stage_durations,
                 }
             )
 
@@ -2160,6 +2164,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])
+            stage_durations = result.stage_durations
 
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
@@ -2174,6 +2179,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         "image_url": {
                             "url": f"data:image/png;base64,{img_base64}",
                         },
+                        "stage_durations": stage_durations,
                     }
                 )
 

@@ -247,6 +247,7 @@ def main(args: argparse.Namespace) -> None:
         stage_configs_path=config_path,
         log_stats=args.enable_stats,
         stage_init_timeout=args.stage_init_timeout,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     init_time = time.time() - start_time
@@ -462,6 +463,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Enable verbose output",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
 
     return parser.parse_args()
