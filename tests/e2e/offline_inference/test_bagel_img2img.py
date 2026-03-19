@@ -22,6 +22,7 @@ import pytest
 from PIL import Image
 from vllm.assets.image import ImageAsset
 
+from tests.conftest import modify_stage_config
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.omni import Omni
 
@@ -168,17 +169,39 @@ def _generate_bagel_img2img(
     return generated_image
 
 
+def _resolve_stage_config(config_path: str, run_level: str) -> str:
+    """Resolve stage config based on run level.
+
+    For advanced_model (real weights), strip load_format: dummy so the model
+    falls back to loading real weights from HuggingFace.
+    """
+    if run_level == "advanced_model":
+        return modify_stage_config(
+            config_path,
+            deletes={
+                "stage_args": {
+                    0: ["engine_args.load_format"],
+                    1: ["engine_args.load_format"],
+                }
+            },
+        )
+    return config_path
+
+
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_bagel_img2img_shared_memory_connector():
+def test_bagel_img2img_shared_memory_connector(run_level):
     """Test Bagel img2img with shared memory connector."""
     input_image = _load_input_image()
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+    config_path = _resolve_stage_config(config_path, run_level)
     omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
 
     try:
         generated_image = _generate_bagel_img2img(omni, input_image)
-        _validate_pixels(generated_image)
+        if run_level == "advanced_model":
+            _validate_pixels(generated_image)
     finally:
         omni.close()

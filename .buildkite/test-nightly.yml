@@ -30,6 +30,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
@@ -58,6 +63,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -86,6 +92,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
@@ -116,6 +127,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -149,6 +161,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
