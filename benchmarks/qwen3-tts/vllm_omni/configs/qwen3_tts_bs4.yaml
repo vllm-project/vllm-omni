@@ -11,8 +11,6 @@ stage_args:
     engine_args:
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
-      hf_overrides:
-        architectures: [Qwen3TTSTalkerForConditionalGeneration]
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
@@ -44,8 +42,6 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
-      hf_overrides:
-        architectures: [Qwen3TTSCode2Wav]
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true

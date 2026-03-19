@@ -168,11 +168,6 @@ vllm_omni/                                    tests/
 │   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
 │
 ├── entrypoints/                        →     ├── entrypoints/
-│   ├── omni.py                                 │   ├── test_omni.py                    ⬜  (E2E covered by e2e/offline, e2e/online)
-│   ├── omni_llm.py                             │   ├── test_omni_llm.py                ✅
-│   ├── omni_stage.py                            │   ├── test_omni_stage.py              ⬜  (partial in test_omni_stage_diffusion_config.py)
-│   ├── omni_diffusion.py                       │   ├── test_omni_diffusion.py          ✅
-│   ├── async_omni.py                            │   ├── test_async_omni.py              ✅ actually in e2e/online_serving/test_async_omni.py
 │   ├── async_omni_diffusion.py                 │   ├── test_async_omni_diffusion_config.py  ✅
 │   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
 │   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
