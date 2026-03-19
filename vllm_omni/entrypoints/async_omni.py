@@ -22,18 +22,6 @@ from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni import OmniBase
-from vllm_omni.entrypoints.omni_stage import OmniStage, make_request_stats
-from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
-from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
-from vllm_omni.entrypoints.utils import (
-    get_final_stage_id_for_e2e,
-)
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
-
-# Internal imports (our code)
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.metrics import OrchestratorAggregator
 from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -247,17 +235,6 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== Processing Methods ====================
 
-        try:
-            loop = asyncio.get_running_loop()
-            gen_start_time = time.perf_counter()
-            results = await loop.run_in_executor(
-                None,
-                self._inline_engine.generate,
-                prompt,
-                sp0,
-                [request_id],
-            )
-            gen_total_ms = (time.perf_counter() - gen_start_time) * 1000.0
     async def _process_orchestrator_results(
         self,
         request_id: str,
@@ -279,27 +256,6 @@ class AsyncOmni(EngineClient, OmniBase):
         while True:
             result = await req_state.queue.get()
 
-                metrics.stage_last_ts[0] = time.time()
-                inline_stage_metrics = make_request_stats(
-                    [result],
-                    gen_total_ms,
-                    batch_id=0,
-                    batch_size=max(len(results), 1),
-                    rx_decode_time_ms=0.0,
-                    rx_transfer_bytes=0,
-                    rx_in_flight_time_ms=0.0,
-                )
-                metrics.process_stage_metrics(
-                    result={"metrics": inline_stage_metrics},
-                    stage_type=stage.stage_type,
-                    stage_id=0,
-                    req_id=request_id,
-                    engine_outputs=result,
-                    finished=finished,
-                    final_output_type=stage.final_output_type,
-                    output_to_yield=output_to_yield,
-                )
-                yield output_to_yield
             stage_id = result.get("stage_id", 0)
 
             # Check for errors

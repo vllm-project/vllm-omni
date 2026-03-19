@@ -239,6 +239,7 @@ class OmniBase:
         req_id = result.get("request_id")
         engine_outputs = result.get("engine_outputs")
         finished = engine_outputs.finished
+        stage_meta = self.engine.get_stage_metadata(stage_id)
 
         submit_ts = result.get("stage_submit_ts")
         now = time.time()
@@ -246,11 +247,27 @@ class OmniBase:
             metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
-        _m = result.get("metrics")
-        if finished and _m is not None:
-            metrics.on_stage_metrics(stage_id, req_id, _m)
+        output_to_yield: OmniRequestOutput | None = None
+        if stage_meta["final_output"]:
+            images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
+            output_to_yield = OmniRequestOutput(
+                stage_id=stage_id,
+                final_output_type=stage_meta["final_output_type"],
+                request_output=engine_outputs,
+                images=images,
+            )
 
-        stage_meta = self.engine.get_stage_metadata(stage_id)
+        metrics.process_stage_metrics(
+            result=result,
+            stage_type=stage_meta["stage_type"],
+            stage_id=stage_id,
+            req_id=req_id,
+            engine_outputs=engine_outputs,
+            finished=finished,
+            final_output_type=stage_meta["final_output_type"],
+            output_to_yield=output_to_yield,
+        )
+
         if not stage_meta["final_output"]:
             return None
 
@@ -265,13 +282,7 @@ class OmniBase:
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
-        images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
-        return OmniRequestOutput(
-            stage_id=stage_id,
-            final_output_type=stage_meta["final_output_type"],
-            request_output=engine_outputs,
-            images=images,
-        )
+        return output_to_yield
 
     def shutdown(self) -> None:
         logger.info("[%s] Shutting down", self.__class__.__name__)
