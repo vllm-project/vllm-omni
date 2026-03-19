@@ -259,12 +259,9 @@ def main(args: argparse.Namespace) -> None:
         stage_configs_path=config_path,
         log_stats=args.enable_stats,
         stage_init_timeout=args.stage_init_timeout,
-<<<<<<< HEAD
         parallel_config=parallel_config,
         vae_use_tiling=args.vae_use_tiling,
-=======
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
->>>>>>> 9372622349bcf7f3a5ae994cb4a0fa72615f7330
     )
 
     init_time = time.time() - start_time
