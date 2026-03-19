@@ -1,8 +1,9 @@
+import sys
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
-from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.compilation.cuda_graph import CUDAGraphWrapper as _OriginalCUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
@@ -34,6 +35,22 @@ else:
     )
 
 logger = init_logger(__name__)
+
+
+class CUDAGraphWrapper(_OriginalCUDAGraphWrapper):
+    def __getattr__(self, key: str) -> Any:
+        # allow accessing the attributes of the runnable.
+        if hasattr(self.runnable, key):
+            return getattr(self.runnable, key)
+        raise AttributeError(f"Attribute {key} not exists in the runnable of cudagraph wrapper")
+
+
+# Patch vLLM's CUDAGraphWrapper with our optimized version
+for _module_name, _module in sys.modules.items():
+    if "vllm" not in _module_name:
+        continue
+    if hasattr(_module, "CUDAGraphWrapper") and _module.CUDAGraphWrapper is _OriginalCUDAGraphWrapper:
+        _module.CUDAGraphWrapper = CUDAGraphWrapper
 
 
 class OmniGPUModelRunner(GPUModelRunner):
@@ -1341,17 +1358,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         req_state = self.requests.get(req_id)
         if req_state is None:
             return
-        # Check if the model declares keys that should stay on GPU
-        gpu_keys: set[str] = set()
-        if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
-            gpu_keys = self.model.gpu_resident_buffer_keys
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
         for k, v in upd.items():
             if isinstance(v, torch.Tensor):
-                if k in gpu_keys:
-                    existing[k] = v.detach().clone()
-                else:
-                    existing[k] = v.detach().to("cpu").contiguous()
+                existing[k] = v.detach().to("cpu").contiguous()
             elif isinstance(v, list):
                 existing[k] = [
                     (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in v
