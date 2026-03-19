@@ -135,7 +135,7 @@ steps:
     key: nightly-performance
     timeout_in_minutes: 180
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1"
+    # if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - export BENCHMARK_DIR=tests
