@@ -238,6 +238,7 @@ class OmniBase:
     ) -> OmniRequestOutput | None:
         req_id = result.get("request_id")
         engine_outputs = result.get("engine_outputs")
+        stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")
@@ -271,6 +272,7 @@ class OmniBase:
             final_output_type=stage_meta["final_output_type"],
             request_output=engine_outputs,
             images=images,
+            stage_durations=stage_durations,
         )
 
     def shutdown(self) -> None:

@@ -189,6 +189,7 @@ def main(args):
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -432,6 +433,11 @@ def parse_args():
         type=str,
         default="../../../model_executor/stage_configs/mimo_audio.yaml",
         help="Path to a stage configs file.",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
 
     return parser.parse_args()

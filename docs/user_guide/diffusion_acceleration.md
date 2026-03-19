@@ -16,7 +16,7 @@ Both methods can provide significant speedups (typically **1.5x-2.0x**) while ma
 
 vLLM-Omni also supports quantization methods:
 
-3. **[FP8 Quantization](diffusion/quantization/overview.md)** - Reduces DiT linear layers from BF16 to FP8, providing ~1.28x speedup with minimal quality loss. Supports per-layer skip for sensitive layers.
+3. **[Quantization](diffusion/quantization/overview.md)** - Reduces DiT linear layers from BF16 to FP8 or Int8, providing ~1.28x speedup with minimal quality loss. Supports per-layer skip for sensitive layers.
 
 vLLM-Omni also supports parallelism methods for diffusion models, including:
 
@@ -46,6 +46,7 @@ vLLM-Omni also supports parallelism methods for diffusion models, including:
 | Method | Configuration | Description | Best For |
 |--------|--------------|-------------|----------|
 | **FP8** | `quantization="fp8"` | FP8 W8A8 on Ada/Hopper, weight-only on older GPUs | Memory reduction, inference speedup |
+| **Int8** | `quantization="int8"` | Int8 W8A8 | Memory reduction, inference speedup |
 
 ## Supported Models
 
@@ -81,11 +82,11 @@ The following table shows which models are currently supported by each accelerat
 
 ### Quantization
 
-| Model | Model Identifier | FP8 |
-|-------|------------------|:---:|
-| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ |
-| **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ |
+| Model | Model Identifier | FP8 | Int8 |
+|-------|------------------|:---:|:---:|
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ |
+| **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ |
 
 
 ## Performance Benchmarks
@@ -338,13 +339,30 @@ outputs = omni.generate(
 )
 ```
 
+### Using Int8 Quantization
+
+```python
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+omni = Omni(
+    model="<your-model>",
+    quantization="int8",
+)
+
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50),
+)
+```
+
 ## Documentation
 
 For detailed information on each acceleration method:
 
 - **[TeaCache Guide](diffusion/teacache.md)** - Complete TeaCache documentation, configuration options, and best practices
 - **[Cache-DiT Acceleration Guide](diffusion/cache_dit_acceleration.md)** - Comprehensive Cache-DiT guide covering DBCache, TaylorSeer, SCM, and configuration parameters
-- **[FP8 Quantization Guide](diffusion/quantization/overview.md)** - FP8 quantization for DiT models with per-layer control
+- **[Quantization Guide](diffusion/quantization/overview.md)** - Quantization for DiT models with per-layer control
 - **[Tensor Parallelism](diffusion/parallelism_acceleration.md#tensor-parallelism)** - Guidance on how to enable TP for diffusion models.
 - **[Sequence Parallelism](diffusion/parallelism_acceleration.md#sequence-parallelism)** - Guidance on how to set sequence parallelism with configuration.
 - **[CFG-Parallel](diffusion/parallelism_acceleration.md#cfg-parallel)** - Guidance on how to set CFG-Parallel to run positive/negative branches across ranks.
