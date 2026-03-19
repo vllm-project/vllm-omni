@@ -79,6 +79,7 @@ class StageDiffusionProc:
 
         except SystemExit:
             logger.debug("StageDiffusionProc exiting.")
+            raise
         except Exception:
             logger.exception("StageDiffusionProc encountered a fatal error.")
             raise
@@ -198,7 +199,7 @@ async def _run_loop(
                         encoder.encode(
                             {
                                 "type": "error",
-                                "request_id": rpc_id,
+                                "rpc_id": rpc_id,
                                 "error": str(e),
                             }
                         )

@@ -96,7 +96,7 @@ class StageEngineCoreProc(EngineCoreProc):
             else:
                 logger.exception("StageEngineCoreProc encountered a fatal error.")
                 engine_core._send_engine_dead()
-            raise e
+            raise
         finally:
             if engine_core is not None:
                 engine_core.shutdown()

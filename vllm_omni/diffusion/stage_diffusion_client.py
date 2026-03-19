@@ -104,17 +104,17 @@ class StageDiffusionClient:
                 self._rpc_results[msg["rpc_id"]] = msg["result"]
             elif msg_type == "error":
                 req_id = msg.get("request_id")
+                rpc_id = msg.get("rpc_id")
                 error_msg = msg.get("error")
                 logger.error(
-                    "[StageDiffusionClient] Stage-%s subprocess error for req %s: %s",
+                    "[StageDiffusionClient] Stage-%s subprocess error for %s: %s",
                     self.stage_id,
-                    req_id,
+                    rpc_id or req_id,
                     error_msg,
                 )
-                # RPC error responses use request_id = rpc_id; route
-                # the error so collective_rpc_async can unblock.
-                if req_id is not None and req_id in self._pending_rpcs:
-                    self._rpc_results[req_id] = {
+                # Route RPC errors so collective_rpc_async can unblock.
+                if rpc_id is not None and rpc_id in self._pending_rpcs:
+                    self._rpc_results[rpc_id] = {
                         "error": True,
                         "reason": error_msg,
                     }
