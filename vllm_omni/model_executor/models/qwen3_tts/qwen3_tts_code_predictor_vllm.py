@@ -488,9 +488,6 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         lm_heads = self._lm_heads_list
         codec_embeds = self._codec_embeds_list
 
-        proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1)).reshape(bsz, -1)
-        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
-
         use_sampling = do_sample and temperature > 0
         inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
         if use_sampling and top_p != 1.0:
@@ -499,6 +496,10 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             )
 
         padded_bsz = self._padded_bsz(bsz)
+        proj_buf[:padded_bsz].zero_()
+
+        proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1)).reshape(bsz, -1)
+        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
         full_pos_ids = self._bucket_pos_ids.get(padded_bsz)
         if full_pos_ids is None:
             base_pos = torch.arange(max_seq, device=device, dtype=torch.long)
