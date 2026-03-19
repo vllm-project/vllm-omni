@@ -1,38 +1,79 @@
-import subprocess
-from pathlib import Path
+import json
+import sys
+from dataclasses import dataclass
 
 import pytest
+from pytest_mock import MockerFixture
 
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
-from vllm_omni.platforms import current_omni_platform
+from vllm_omni.entrypoints.cli.main import main as omni_cli_main
 
-models = ["Qwen/Qwen2.5-Omni-7B"]
-stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
 
-if current_omni_platform.is_xpu():
-    stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")]
+class MockResponse:
+    def __init__(self, status: int, chunks: list[bytes]):
+        self.status = status
+        self.reason = "OK" if status == 200 else "Error"
+        self._chunks = chunks
+        self.content = self
 
-# Create parameter combinations for model and stage config
-test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
-]
+    async def iter_any(self):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return None
+
+
+@dataclass
+class _PostCall:
+    url: str
+
+
+class MockClientSession:
+    def __init__(self, response: MockResponse):
+        self._response = response
+        self.post_calls: list[_PostCall] = []
+
+    def post(self, url: str, *args, **kwargs):
+        self.post_calls.append(_PostCall(url=url))
+        return self._response
+
+    async def close(self):
+        return None
 
 
 @pytest.mark.core_model
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=3)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_bench_serve_chat(omni_server):
-    command = [
+@pytest.mark.cpu
+def test_bench_serve_cli_mocks_http_request(mocker: MockerFixture, tmp_path):
+    num_prompts = 5
+    result_filename = "bench-result.json"
+    result_path = tmp_path / result_filename
+
+    chunks = [
+        b'data: {"choices":[{"delta":{"content":"hi"}}],"modality":"text"}\n\n',
+        b'data: {"choices":[{"delta":{"content":" there"}}],"modality":"text","metrics":{"num_tokens_out":4,"num_tokens_in":5}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    mock_response = MockResponse(200, chunks)
+    mock_session = MockClientSession(mock_response)
+
+    # Patch the aiohttp session used by vllm-omni's benchmark implementation.
+    # We keep benchmark logic intact but intercept outbound HTTP calls.
+    mocker.patch("vllm_omni.benchmarks.patch.patch.aiohttp.ClientSession", return_value=mock_session)
+    mocker.patch("vllm_omni.benchmarks.patch.patch.aiohttp.TCPConnector", return_value=mocker.Mock())
+
+    argv = [
         "vllm",
         "bench",
         "serve",
         "--omni",
         "--model",
-        omni_server.model,
+        "Qwen/Qwen2.5-Omni-7B",
         "--port",
-        str(omni_server.port),
+        "18000",
         "--dataset-name",
         "random",
         "--random-input-len",
@@ -40,14 +81,29 @@ def test_bench_serve_chat(omni_server):
         "--random-output-len",
         "4",
         "--num-prompts",
-        "5",
+        str(num_prompts),
         "--endpoint",
         "/v1/chat/completions",
         "--backend",
         "openai-chat-omni",
+        "--disable-tqdm",
+        "--num-warmups",
+        "0",
+        "--ready-check-timeout-sec",
+        "0",
+        "--save-result",
+        "--result-dir",
+        str(tmp_path),
+        "--result-filename",
+        result_filename,
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    print(result.stdout)
-    print(result.stderr)
+    mocker.patch.object(sys, "argv", argv)
 
-    assert result.returncode == 0, f"Benchmark failed: {result.stderr}"
+    omni_cli_main()
+
+    assert result_path.exists()
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+
+    sent_requests = len(mock_session.post_calls)
+    assert result["completed"] == sent_requests == num_prompts
+    assert any(call.url.endswith("/v1/chat/completions") for call in mock_session.post_calls)
