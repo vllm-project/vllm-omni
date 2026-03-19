@@ -259,8 +259,12 @@ def main(args: argparse.Namespace) -> None:
         stage_configs_path=config_path,
         log_stats=args.enable_stats,
         stage_init_timeout=args.stage_init_timeout,
+<<<<<<< HEAD
         parallel_config=parallel_config,
         vae_use_tiling=args.vae_use_tiling,
+=======
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+>>>>>>> 9372622349bcf7f3a5ae994cb4a0fa72615f7330
     )
 
     init_time = time.time() - start_time
@@ -324,36 +328,35 @@ def main(args: argparse.Namespace) -> None:
 
     output_count = 0
     for stage_outputs in omni.generate(prompts, sampling_params_list, py_generator=True):
+        output = stage_outputs.request_output
         if stage_outputs.final_output_type == "image":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
+            request_id = output.request_id
 
-                # Get generated images
-                images = output.images if hasattr(output, "images") else []
-                if not images and hasattr(output, "multimodal_output"):
-                    images = output.multimodal_output.get("images", [])
+            # Get generated images
+            images = output.images if hasattr(output, "images") else []
+            if not images and hasattr(output, "multimodal_output"):
+                images = output.multimodal_output.get("images", [])
 
-                # Save each generated image
-                for idx, img in enumerate(images):
-                    if args.num_prompts == 1 and len(images) == 1:
-                        output_path = args.output
-                    else:
-                        base, ext = os.path.splitext(args.output)
-                        output_path = f"{base}_{request_id}_{idx}{ext}"
+            # Save each generated image
+            for idx, img in enumerate(images):
+                if args.num_prompts == 1 and len(images) == 1:
+                    output_path = args.output
+                else:
+                    base, ext = os.path.splitext(args.output)
+                    output_path = f"{base}_{request_id}_{idx}{ext}"
 
-                    if isinstance(img, Image.Image):
-                        save_image(img, output_path)
-                    else:
-                        print(f"Warning: Unexpected image type for request {request_id}: {type(img)}")
+                if isinstance(img, Image.Image):
+                    save_image(img, output_path)
+                else:
+                    print(f"Warning: Unexpected image type for request {request_id}: {type(img)}")
 
-                    output_count += 1
+                output_count += 1
 
         elif stage_outputs.final_output_type == "text":
             # AR stage output (intermediate, for debugging)
             if args.verbose:
-                for output in stage_outputs.request_output:
-                    print(f"AR output for request {output.request_id}:")
-                    print(f"  Token count: {len(output.outputs[0].token_ids)}")
+                print(f"AR output for request {output.request_id}:")
+                print(f"  Token count: {len(output.outputs[0].token_ids)}")
 
     gen_time = time.time() - gen_start_time
     print(f"\nGeneration completed in {gen_time:.2f}s")
@@ -501,6 +504,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Enable verbose output",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
 
     return parser.parse_args()
