@@ -44,6 +44,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -242,11 +243,24 @@ def main(args: argparse.Namespace) -> None:
     print("\nInitializing Omni with multistage pipeline...")
     start_time = time.time()
 
+    parallel_config = DiffusionParallelConfig(
+        cfg_parallel_size=args.cfg_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
+    )
+
+    print(
+        "Parallel configuration:"
+        f" vae_patch_parallel_size={args.vae_patch_parallel_size},"
+        f" vae_use_tiling={args.vae_use_tiling}"
+    )
+
     omni = Omni(
         model=args.model_path,
         stage_configs_path=config_path,
         log_stats=args.enable_stats,
         stage_init_timeout=args.stage_init_timeout,
+        parallel_config=parallel_config,
+        vae_use_tiling=args.vae_use_tiling,
     )
 
     init_time = time.time() - start_time
@@ -434,6 +448,30 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16384,
         help="Maximum tokens for AR generation (default: 16384)",
+    )
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallelism.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism inside the GLM-Image transformer.",
+    )
+    parser.add_argument(
+        "--vae-use-tiling",
+        action="store_true",
+        help="Enable VAE tiling for memory optimization.",
+    )
+    parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
 
     # Batch processing

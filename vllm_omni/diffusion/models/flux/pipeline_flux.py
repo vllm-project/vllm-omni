@@ -12,7 +12,6 @@ import numpy as np
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import TextualInversionLoaderMixin
-from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -22,6 +21,9 @@ from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokeniz
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import (
+    DistributedAutoencoderKL,
+)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -164,9 +166,9 @@ class FluxPipeline(nn.Module, CFGParallelMixin):
         self.text_encoder_2 = T5EncoderModel.from_pretrained(
             model, subfolder="text_encoder_2", local_files_only=local_files_only
         ).to(self.device)
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = DistributedAutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
         quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
         self.transformer = FluxTransformer2DModel(od_config=od_config, quant_config=quant_config)
 
