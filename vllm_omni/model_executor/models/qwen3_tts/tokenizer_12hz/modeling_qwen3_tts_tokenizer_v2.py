@@ -671,11 +671,7 @@ class SnakeBeta(nn.Module):
         self.register_buffer("_inv_beta", None, persistent=False)
 
     def precompute_exp_cache(self):
-        """Materialize exp(alpha) and 1/(exp(beta)+eps) as frozen buffers.
-
-        Call once after weight loading to eliminate transcendental ops at
-        inference time. Saves 2 exp() calls per element across every forward.
-        """
+        """Materialize exp(alpha) and 1/(exp(beta)+eps) as frozen buffers."""
         with torch.no_grad():
             self._exp_alpha = torch.exp(self.alpha).contiguous()
             self._inv_beta = (1.0 / (torch.exp(self.beta) + self.no_div_by_zero)).contiguous()
