@@ -32,7 +32,7 @@ from tests.conftest import OmniServerParams
 from tests.utils import hardware_test
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 STAGE_CONFIGS_PATH = str(
