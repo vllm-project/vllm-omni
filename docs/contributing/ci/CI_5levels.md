@@ -734,7 +734,7 @@ All other optional parameters follow the same rules as the in Chapter 3.4.
 
 </details>
 
--   -   ***Stability***: `pytest -s -v tests/e2e/dfx/stability/scripts/test_{model_name}.py`
+-   -   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_{model_name}.py`
     -   ***Reliability***: `pytest -s -v tests/e2e/reliability/test_{model_name}.py`
 
 ## Summary

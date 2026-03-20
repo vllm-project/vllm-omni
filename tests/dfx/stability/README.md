@@ -24,7 +24,7 @@ All functionality is provided by a single script and should be run from the repo
 
 | Environment Variable | Description | Default |
 |----------|------|--------|
-| `RESOURCE_MONITOR_DATA_ROOT` | Root directory for monitoring data | `tests/e2e/stability/gpu_monitor_data` |
+| `RESOURCE_MONITOR_DATA_ROOT` | Root directory for monitoring data | `tests/dfx/stability/gpu_monitor_data` |
 | `RESOURCE_MONITOR_INTERVAL` | Sampling interval (seconds) | 5 |
 | `RESOURCE_MONITOR_LOG_INTERVAL` | Log print interval (seconds) | 15 |
 | `GPU_MONITOR_DEVICES` | [GPU backend] GPU device IDs to monitor, such as `0,1` or `all` | all |
@@ -38,20 +38,20 @@ Run this in **finally** or **after script** blocks so cleanup still happens even
 ```bash
 # Monitor + run any command, then automatically bundle results and generate report.html
 # If --backend is omitted, gpu is used by default; use --backend cpu or --backend npu for other backends
-bash tests/e2e/stability/scripts/resource_monitor.sh run [--backend gpu|cpu|npu] -- <your-command>
+bash tests/dfx/stability/scripts/resource_monitor.sh run [--backend gpu|cpu|npu] -- <your-command>
 ```
 
 Examples (from the repository root):
 
 ```bash
 # Example: run a pytest case (gpu backend by default, so --backend can be omitted)
-bash tests/e2e/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py -k test_xxx
+bash tests/dfx/stability/scripts/resource_monitor.sh run -- pytest -s -v tests/e2e/online_serving/test_foo.py -k test_xxx
 
 # Explicitly select the gpu backend, customize the sampling interval and GPUs 0,1, and print one log line every 30s
 export RESOURCE_MONITOR_INTERVAL=10
 export GPU_MONITOR_DEVICES=0,1
 export RESOURCE_MONITOR_LOG_INTERVAL=30
-bash tests/e2e/stability/scripts/resource_monitor.sh run --backend gpu -- pytest -s -v tests/e2e/online_serving/test_foo.py
+bash tests/dfx/stability/scripts/resource_monitor.sh run --backend gpu -- pytest -s -v tests/e2e/online_serving/test_foo.py
 ```
 
 During execution, the log will show `[GPU] ...` every few seconds. When the run ends, the log prints the bundle path, for example: `Line chart: open in browser: .../report.html`.
@@ -64,7 +64,7 @@ If you need to start monitoring first and then manually run a long task, you can
 
 ```bash
 # 1. Start monitoring (run from the `scripts` directory or set `DATA_ROOT`; gpu is the default if `--backend` is omitted)
-cd tests/e2e/stability/scripts
+cd tests/dfx/stability/scripts
 ./resource_monitor.sh start [--backend gpu] all 5 &
 MONITOR_PID=$!
 
@@ -81,8 +81,8 @@ echo "Report directory: $GPU_MONITOR_BUNDLE_DIR"
 
 ## Directories and Outputs (monitoring only)
 
-- **Scripts**: `tests/e2e/stability/scripts/resource_monitor.sh` (entry point) and `scripts/generate_report.py` (called by `finalize` to generate HTML).
-- **Data directory**: `tests/e2e/stability/gpu_monitor_data/` by default (can be overridden with `RESOURCE_MONITOR_DATA_ROOT`).  
+- **Scripts**: `tests/dfx/stability/scripts/resource_monitor.sh` (entry point) and `scripts/generate_report.py` (called by `finalize` to generate HTML).
+- **Data directory**: `tests/dfx/stability/gpu_monitor_data/` by default (can be overridden with `RESOURCE_MONITOR_DATA_ROOT`).  
   - Each run generates `run_<run_id>/gpu_metrics.csv`.  
   - After `finalize`, you get `gpu_monitor_bundle_<run_id>/` containing `gpu_metrics.csv`, `report.html`, and `README.txt`.
 - **View the report**: open `report.html` in the bundle directory with a browser to inspect memory usage curves and statistics.

@@ -11,7 +11,7 @@ The overall flow matches the perf logic: `load_configs`, `modify_stage`,
 
 All test-specific parameters, such as `duration_sec`, `request_rate` /
 `max_concurrency`, and `num_prompts_per_batch`, are configured in
-`tests/e2e/stability/tests/test.json` and are no longer overridden
+`tests/dfx/stability/tests/test.json` and are no longer overridden
 through environment variables.
 """
 
