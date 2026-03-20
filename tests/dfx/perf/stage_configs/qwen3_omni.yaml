@@ -12,7 +12,7 @@ stage_args:
       devices: "0"
     engine_args:
       model_stage: thinker
-      max_batch_size: 64
+      max_num_seqs: 64
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -43,7 +43,7 @@ stage_args:
       devices: "1"
     engine_args:
       model_stage: talker
-      max_batch_size: 64
+      max_num_seqs: 64
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -74,7 +74,7 @@ stage_args:
       devices: "1"
     engine_args:
       model_stage: code2wav
-      max_batch_size: 64
+      max_num_seqs: 64
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
