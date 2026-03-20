@@ -182,7 +182,13 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         raise NotImplementedError("Subclasses must implement diffuse")
 
-    def scheduler_step(self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
+    def scheduler_step(
+        self,
+        noise_pred: torch.Tensor,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        per_request_scheduler: Any | None = None,
+    ) -> torch.Tensor:
         """
         Step the scheduler.
 
@@ -190,14 +196,30 @@ class CFGParallelMixin(metaclass=ABCMeta):
             noise_pred: Predicted noise
             t: Current timestep
             latents: Current latents
+            per_request_scheduler: Optional request-scoped scheduler that
+                overrides ``self.scheduler`` for this call. This is
+                primarily used by step-wise execution, where each request
+                may keep scheduler state in its own runner-managed state
+                object. Request-level execution should usually leave this
+                as ``None`` and continue using ``self.scheduler``.
 
         Returns:
             Updated latents after scheduler step
         """
-        return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        sched = per_request_scheduler if per_request_scheduler is not None else getattr(self, "scheduler", None)
+        if sched is None:
+            raise ValueError("No scheduler is available. Set self.scheduler or pass per_request_scheduler.")
+        if not callable(getattr(sched, "step", None)):
+            raise TypeError("per_request_scheduler must provide a callable step(...) method.")
+        return sched.step(noise_pred, t, latents, return_dict=False)[0]
 
     def scheduler_step_maybe_with_cfg(
-        self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor, do_true_cfg: bool
+        self,
+        noise_pred: torch.Tensor,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        do_true_cfg: bool,
+        per_request_scheduler: Any | None = None,
     ) -> torch.Tensor:
         """
         Step the scheduler with (maybe) automatic CFG parallel synchronization.
@@ -210,6 +232,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
             t: Current timestep
             latents: Current latents
             do_true_cfg: Whether CFG is enabled
+            per_request_scheduler: Optional request-scoped scheduler that
+                overrides ``self.scheduler`` for this call. This is mainly
+                needed by step-wise execution, where scheduler state may be
+                stored per request. Request-level execution should normally
+                leave this as ``None``.
 
         Returns:
             Updated latents (synchronized across all CFG ranks)
@@ -223,13 +250,23 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
             # Only rank 0 computes the scheduler step
             if cfg_rank == 0:
-                latents = self.scheduler_step(noise_pred, t, latents)
+                latents = self.scheduler_step(
+                    noise_pred,
+                    t,
+                    latents,
+                    per_request_scheduler=per_request_scheduler,
+                )
 
             # Broadcast the updated latents to all ranks
             latents = latents.contiguous()
             cfg_group.broadcast(latents, src=0)
         else:
             # No CFG parallel: directly compute scheduler step
-            latents = self.scheduler_step(noise_pred, t, latents)
+            latents = self.scheduler_step(
+                noise_pred,
+                t,
+                latents,
+                per_request_scheduler=per_request_scheduler,
+            )
 
         return latents
