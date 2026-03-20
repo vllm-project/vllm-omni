@@ -279,6 +279,7 @@ class ZImageAttention(nn.Module):
             total_num_kv_heads=num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix="to_qkv",
         )
 
         assert qk_norm is True
@@ -297,6 +298,7 @@ class ZImageAttention(nn.Module):
                     input_is_parallel=True,
                     return_bias=False,
                     quant_config=quant_config,
+                    prefix="to_out",
                 )
             ]
         )
@@ -361,6 +363,7 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.w13 = MergedColumnParallelLinear(
@@ -369,6 +372,7 @@ class FeedForward(nn.Module):
             bias=False,
             return_bias=False,
             quant_config=quant_config,
+            prefix=prefix,
         )
         self.act = SiluAndMul()
         self.w2 = RowParallelLinear(
@@ -378,6 +382,7 @@ class FeedForward(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
+            prefix=prefix,
         )
 
     def forward(self, x):
@@ -409,9 +414,7 @@ class ZImageTransformerBlock(nn.Module):
         )
 
         self.feed_forward = FeedForward(
-            dim=dim,
-            hidden_dim=int(dim / 3 * 8),
-            quant_config=quant_config,
+            dim=dim, hidden_dim=int(dim / 3 * 8), quant_config=quant_config, prefix="feed_forward"
         )
         self.layer_id = layer_id
 

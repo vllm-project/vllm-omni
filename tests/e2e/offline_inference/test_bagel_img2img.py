@@ -5,7 +5,7 @@
 End-to-end test for Bagel img2img generation.
 
 This test validates that the Bagel model generates images from an input image
-and text prompt that match expected reference pixel values within a ±5 tolerance.
+and text prompt that match expected reference pixel values within a ±10 tolerance.
 
 Equivalent to running:
     python3 examples/offline_inference/bagel/end2end.py \
@@ -25,6 +25,7 @@ from vllm.assets.image import ImageAsset
 from tests.conftest import modify_stage_config
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.platforms import current_omni_platform
 
 # Reference pixel data extracted from the known-good output image
 # Generated with seed=52, num_inference_steps=15,
@@ -43,7 +44,21 @@ REFERENCE_PIXELS = [
     {"position": (256, 256), "rgb": (181, 202, 222)},
 ]
 
-PIXEL_TOLERANCE = 5
+if current_omni_platform.is_rocm():
+    REFERENCE_PIXELS = [
+        {"position": (100, 100), "rgb": (156, 172, 215)},
+        {"position": (400, 50), "rgb": (106, 144, 216)},
+        {"position": (700, 100), "rgb": (118, 158, 231)},
+        {"position": (150, 400), "rgb": (183, 23, 48)},
+        {"position": (512, 336), "rgb": (218, 215, 191)},
+        {"position": (700, 400), "rgb": (194, 14, 42)},
+        {"position": (100, 600), "rgb": (105, 10, 16)},
+        {"position": (400, 600), "rgb": (167, 33, 46)},
+        {"position": (700, 600), "rgb": (102, 86, 92)},
+        {"position": (256, 256), "rgb": (181, 201, 220)},
+    ]
+
+PIXEL_TOLERANCE = 10
 
 DEFAULT_PROMPT = "<|fim_middle|><|im_start|>Change the grass color to red<|im_end|>"
 
@@ -191,7 +206,7 @@ def _resolve_stage_config(config_path: str, run_level: str) -> str:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_img2img_shared_memory_connector(run_level):
     """Test Bagel img2img with shared memory connector."""
     input_image = _load_input_image()

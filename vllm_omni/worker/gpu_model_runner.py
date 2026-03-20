@@ -92,9 +92,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # TODO move this model specific logic to a separate class
         # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
+        self.has_talker_mtp = False
         talker_mtp = getattr(self.model, "talker_mtp", None)
         if talker_mtp is not None:
             self.talker_mtp = talker_mtp  # type: ignore[assignment]
+            self.has_talker_mtp = True
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
             # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
@@ -790,7 +792,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     slot_mapping=slot_mappings,
                 ),
             ):
-                if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
+                if getattr(self.model, "talker", None) is not None and self.has_talker_mtp:
                     num_tokens_padded_talker_mtp = num_tokens_padded
                     if num_tokens_padded_talker_mtp == self.max_num_tokens:
                         num_tokens_padded_talker_mtp = self.talker_mtp_input_ids.gpu.shape[0]
@@ -1034,7 +1036,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                     s, e = start_offset, start_offset + sched_tokens
                     # only consider to store data into update dict.
                     hidden_states_slice = hidden_states[s:e]
-                    update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
+                    update_dict = self.model.postprocess(
+                        hidden_states_slice, multimodal_outputs=multimodal_outputs, **req_infos
+                    )
                     self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
             logger.error(
@@ -1261,7 +1265,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         dtype=req_embeds.dtype,
                     )
 
-                if hasattr(self.model, "talker_mtp") and span_len == 1:
+                if self.has_talker_mtp and span_len == 1:
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
                     decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
                     self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
@@ -1280,7 +1284,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_ids[s : s + seg_len] = req_input_ids
 
             # run talker mtp decode
-            if hasattr(self.model, "talker_mtp"):
+            if self.has_talker_mtp:
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
         return (
@@ -1347,7 +1351,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs_extra,
         )
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
-            model_output = self.model.make_omni_output(model_output, **model_kwargs_extra)
+            model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output
