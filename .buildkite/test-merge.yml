@@ -374,20 +374,3 @@ steps:
   #               hostPath:
   #                 path: /mnt/hf-cache
   #                 type: DirectoryOrCreate
-
-  - label: "CUDA Unit Test"
-    timeout_in_minutes: 10
-    depends_on: upload-merge-pipeline
-    commands:
-      - pytest -v -s -m 'core_model and cuda'
-    agents:
-      queue: "gpu_1_queue"
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"

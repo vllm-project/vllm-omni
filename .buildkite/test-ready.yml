@@ -16,6 +16,23 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - label: "Voxtral TTS CUDA Unit Test"
+    timeout_in_minutes: 10
+    depends_on: upload-ready-pipeline
+    commands:
+      - "timeout 10m pytest -s -v tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py"
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Diffusion Model Test"
     depends_on: upload-ready-pipeline
     commands:
