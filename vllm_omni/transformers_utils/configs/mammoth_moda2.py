@@ -127,7 +127,7 @@ class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
         else:
             self.gen_vocab_start_index = gen_vocab_start_index
 
-        # NOTE: vLLM V1 uses `hf_text_config.vocab_size` for sampling parameter validation
+        # NOTE: vLLM uses `hf_text_config.vocab_size` for sampling parameter validation
         # (e.g., allowed_token_ids). Although MammothModa2's gen vocab is implemented via
         # independent gen_embed/gen_head, the overall vocab size should still cover the
         # gen vocab token ID range from the perspective of "output logits dimension".

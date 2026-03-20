@@ -51,16 +51,68 @@ def _estimate_prompt_len(
 
             tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
             cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
-            _cache[model_name] = (tok, getattr(cfg, "talker_config", None))
 
-        tok, tcfg = _cache[model_name]
+            # Load speech tokenizer (codec encoder) for exact ref_code_len.
+            speech_tok = None
+            try:
+                import os
+
+                from transformers.utils import cached_file
+
+                from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+
+                st_cfg_path = cached_file(model_name, "speech_tokenizer/config.json")
+                if st_cfg_path:
+                    speech_tok = Qwen3TTSTokenizer.from_pretrained(
+                        os.path.dirname(st_cfg_path), torch_dtype=torch.bfloat16
+                    )
+                    logger.info("Loaded speech tokenizer for exact ref_code_len estimation")
+            except Exception as e:
+                logger.debug("Could not load speech tokenizer: %s", e)
+
+            _cache[model_name] = (tok, getattr(cfg, "talker_config", None), speech_tok)
+
+        tok, tcfg, speech_tok = _cache[model_name]
         task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
+
+        def _estimate_ref_code_len(ref_audio: object) -> int | None:
+            """Encode ref_audio with the actual codec to get exact frame count."""
+            if not isinstance(ref_audio, (str, list)):
+                return None
+            audio_path = ref_audio[0] if isinstance(ref_audio, list) else ref_audio
+            if not isinstance(audio_path, str) or not audio_path.strip():
+                return None
+            try:
+                from vllm.multimodal.media import MediaConnector
+
+                connector = MediaConnector(allowed_local_media_path="/")
+                audio, sr = connector.fetch_audio(audio_path)
+                import numpy as np
+
+                wav_np = np.asarray(audio, dtype=np.float32)
+
+                if speech_tok is not None:
+                    enc = speech_tok.encode(wav_np, sr=int(sr), return_dict=True)
+                    ref_code = getattr(enc, "audio_codes", None)
+                    if isinstance(ref_code, list):
+                        ref_code = ref_code[0] if ref_code else None
+                    if ref_code is not None and hasattr(ref_code, "shape"):
+                        shape = ref_code.shape
+                        return int(shape[0]) if len(shape) == 2 else int(shape[1]) if len(shape) == 3 else None
+
+                # Fallback: estimate from duration
+                codec_hz = getattr(tcfg, "codec_frame_rate", None) or 12
+                return int(len(audio) / sr * codec_hz)
+            except Exception:
+                return None
+
         return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
             additional_information=additional_information,
             task_type=task_type,
             tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
             codec_language_id=getattr(tcfg, "codec_language_id", None),
             spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
+            estimate_ref_code_len=_estimate_ref_code_len,
         )
     except Exception as exc:
         logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
@@ -319,14 +371,15 @@ def main(args):
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     batch_size = args.batch_size
     for batch_start in range(0, len(inputs), batch_size):
         batch = inputs[batch_start : batch_start + batch_size]
         for stage_outputs in omni.generate(batch):
-            for output in stage_outputs.request_output:
-                _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+            output = stage_outputs.request_output
+            _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
 
 
 async def main_streaming(args):
@@ -340,6 +393,7 @@ async def main_streaming(args):
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     for i, prompt in enumerate(inputs):
@@ -480,6 +534,11 @@ def parse_args():
         type=int,
         default=1,
         help="Number of prompts per batch (default: 1, sequential).",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
 
     return parser.parse_args()
