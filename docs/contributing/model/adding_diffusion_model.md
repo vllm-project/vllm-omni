@@ -967,7 +967,7 @@ hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
 
 1. **Reduce batch size:**
    ```python
-   omni.generate(prompts=[...], max_batch_size=2)
+   omni.generate(prompts=[...], max_num_seqs=2)
    ```
 
 2. **Use smaller image size:**
