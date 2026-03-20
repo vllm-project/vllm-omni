@@ -11,6 +11,9 @@ steps:
         EXIT1=$$?
         pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "advanced_model" --run-level "advanced_model"
         EXIT2=$$?
+        # TODO: uncomment when mistralai/tts-model is public
+        # pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
+        # EXIT3=$$?
         exit $$((EXIT1 | EXIT2))
     agents:
       queue: "mithril-h100-pool"
@@ -30,6 +33,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
@@ -58,6 +66,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -86,6 +95,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
@@ -116,6 +130,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -149,6 +164,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:

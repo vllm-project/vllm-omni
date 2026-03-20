@@ -825,9 +825,9 @@ class AsyncOmniEngine:
                 "runtime": {
                     "process": True,
                     "devices": devices,
-                    "max_batch_size": 1,
                 },
                 "engine_args": {
+                    "max_num_seqs": 1,
                     "parallel_config": parallel_config,
                     "model_class_name": kwargs.get("model_class_name", None),
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
@@ -844,6 +844,8 @@ class AsyncOmniEngine:
                     "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
+                    "quantization": kwargs.get("quantization", None),
+                    "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
                 },
                 "final_output": True,
                 "final_output_type": "image",

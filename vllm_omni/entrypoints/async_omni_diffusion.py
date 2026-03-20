@@ -172,9 +172,6 @@ class AsyncOmniDiffusion:
         if request_id is None:
             request_id = f"diff-{uuid.uuid4().hex[:16]}"
 
-        if sampling_params.guidance_scale:
-            sampling_params.guidance_scale_provided = True
-
         if lora_request is not None:
             sampling_params.lora_request = lora_request
 

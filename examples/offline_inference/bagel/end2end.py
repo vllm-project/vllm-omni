@@ -34,7 +34,14 @@ def parse_args():
         help="Path to input image for img2img.",
     )
 
-    # Omni runtime init args
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=".",
+        help="Output directory to save images.",
+    )
+
+    # OmniLLM init args
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
     parser.add_argument("--batch-timeout", type=int, default=5)
@@ -58,6 +65,11 @@ def parse_args():
         help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
 
     args = parser.parse_args()
     return args
@@ -65,6 +77,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    os.makedirs(args.output, exist_ok=True)
     model_name = args.model
     prompts: list[OmniPromptType] = []
     try:
@@ -103,6 +116,7 @@ def main():
             "shm_threshold_bytes": args.shm_threshold_bytes,
             "worker_backend": args.worker_backend,
             "ray_address": args.ray_address,
+            "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         }
     )
 
@@ -166,13 +180,13 @@ def main():
     img_idx = 0
     for req_output in omni_outputs:
         images = getattr(req_output, "images", None)
+
         if not images:
             continue
 
         for j, img in enumerate(images):
-            save_path = f"output_{img_idx}_{j}.png"
+            save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
             img.save(save_path)
-            print(f"[Info] Saved image to {save_path}")
         img_idx += 1
 
     print(omni_outputs)

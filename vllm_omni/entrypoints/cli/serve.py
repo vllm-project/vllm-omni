@@ -351,6 +351,13 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
         )
+
+        # Enable diffusion pipeline profiling
+        omni_config_group.add_argument(
+            "--enable-diffusion-pipeline-profiler",
+            action="store_true",
+            help="Enable diffusion pipeline profiler to display stage durations.",
+        )
         return serve_parser
 
 
