@@ -6,37 +6,44 @@ When `mistral_common` has `SpeechRequest` support, prompt token IDs are built vi
 
 ## Usage Examples
 
-```bash
-# Basic single-prompt with reference audio
-python3 examples/offline_inference/voxtral_tts/end2end.py \
-    --write-audio \
-    --model mistralai/tts-model \
-    --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?" \
-    --audio-path path/to/reference_audio.wav
 
-# 32 replicate prompts with reference audio
+```bash
+# Basic single-prompt with cheerful_female voice preset
 python3 examples/offline_inference/voxtral_tts/end2end.py \
-    --num-prompts 32 --write-audio \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
+    --write-audio --voice cheerful_female \
     --model mistralai/tts-model \
-    --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?" \
-    --audio-path path/to/reference_audio.wav
+    --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?"
+
+# 32 replicate prompts with cheerful_female voice preset
+python3 examples/offline_inference/voxtral_tts/end2end.py \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
+    --num-prompts 32 --write-audio --voice cheerful_female \
+    --model mistralai/tts-model \
+    --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?"
+
+# Streaming with neutral_female voice preset
+python3 examples/offline_inference/voxtral_tts/end2end.py \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
+    --streaming --write-audio --voice neutral_female \
+    --model mistralai/tts-model \
+    --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?"
+
+# 32 prompts, 8 concurrent requests per wave, streaming with neutral_female voice
+python3 examples/offline_inference/voxtral_tts/end2end.py \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
+    --num-prompts 32 --concurrency 8 --streaming --write-audio --voice neutral_female \
+    --model mistralai/tts-model \
+    --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?"
 
 # Short debug prompt with reference audio
+# Note: Reference audio capability is not yet released.
 python3 examples/offline_inference/voxtral_tts/end2end.py \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
     --write-audio \
     --model mistralai/tts-model \
     --text "This is a test message." \
     --audio-path path/to/reference_audio.wav
-
-# Streaming with neutral_female voice preset
-python3 examples/offline_inference/voxtral_tts/end2end.py \
-    --streaming --write-audio --voice neutral_female \
-    --model mistralai/tts-model
-
-# 32 prompts, 8 concurrent requests per wave, streaming with casual_male voice
-python3 examples/offline_inference/voxtral_tts/end2end.py \
-    --num-prompts 32 --concurrency 8 --streaming --write-audio --voice casual_male \
-    --model mistralai/tts-model
 ```
 
 ## Arguments
@@ -47,7 +54,7 @@ python3 examples/offline_inference/voxtral_tts/end2end.py \
 | `--text TEXT` | Text to synthesize (default: `"This is a test message."`) |
 | `--audio-path PATH` | Path to reference audio file for voice cloning |
 | `--output-dir DIR` | Directory to write output WAV files (default: `output_audio`) |
-| `--stage-configs-path PATH` | Path to stage configs YAML (auto-resolved from model if not set) |
+| `--stage-configs-path PATH` | Path to stage configs YAML (currently it must be set for VoxtralTTS) |
 | `--num-prompts N` | Number of replicate prompts to run for measuring performance (default: 1) |
 | `--streaming` | Use streaming generation via `AsyncOmni` (default: blocking `Omni`) |
 | `--concurrency N` | Max concurrent requests per wave (must be used with `--streaming`, must evenly divide `--num-prompts`) |
