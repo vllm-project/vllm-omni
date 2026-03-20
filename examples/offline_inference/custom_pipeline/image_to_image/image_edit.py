@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-use-slicing", action="store_true")
     parser.add_argument("--vae-use-tiling", action="store_true")
     parser.add_argument("--enable-cpu-offload", action="store_true")
-    parser.add_argument("--log-stats", action="store_true", default=False)
+    parser.add_argument("--log-stats", action="store_true")
     return parser.parse_args()
 
 
