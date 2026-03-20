@@ -222,6 +222,7 @@ class StageConfigFactory:
         "qwen2_5_omni": "qwen2_5_omni",
         "bagel": "bagel",
         "qwen3_tts": "qwen3_tts",
+        "voxtral_tts": "voxtral_tts",
         "mimo_audio": "mimo_audio",
         "glm-image": "glm_image",
         "cosyvoice3": "cosyvoice3",
