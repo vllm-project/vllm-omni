@@ -132,6 +132,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable expert parallelism for MoE layers.",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -184,6 +189,7 @@ def main():
         enforce_eager=args.enforce_eager,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     if profiler_enabled:
@@ -240,8 +246,6 @@ def main():
             audio = frames.multimodal_output["audio"]
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
-            if isinstance(inner_output, list):
-                inner_output = inner_output[0] if inner_output else None
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]

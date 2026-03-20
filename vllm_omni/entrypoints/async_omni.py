@@ -1,108 +1,64 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import asyncio
-import copy
-import time
-import weakref
-from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
-from typing import Any, TypeVar
+"""
+AsyncOmni - Refactored async orchestrator using AsyncOmniEngine.
 
-from vllm.config import VllmConfig
-from vllm.inputs.preprocess import InputPreprocessor
+This is the new implementation that uses AsyncOmniEngine (which manages
+StageEngineCoreClient instances) instead of OmniStage with worker processes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import AsyncGenerator, Iterable, Sequence
+from typing import TYPE_CHECKING, Any
+
+from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
+from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.io_processors import get_io_processor
-from vllm.sampling_params import SamplingParams
-from vllm.tokenizers import TokenizerLike
+from vllm.pooling_params import PoolingParams
+from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.config import OmniModelConfig
-from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length, try_send_via_connector
-from vllm_omni.distributed.ray_utils.utils import try_close_ray
-from vllm_omni.engine.input_processor import OmniInputProcessor
-from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni import OmniBase
-from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
-from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
-from vllm_omni.entrypoints.utils import (
-    get_final_stage_id_for_e2e,
-)
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
-
-# Internal imports (our code)
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.metrics import OrchestratorAggregator
+from vllm_omni.entrypoints.omni_base import OmniBase
+from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
-_R = TypeVar("_R")
+if TYPE_CHECKING:
+    from vllm.inputs.preprocess import InputPreprocessor
+    from vllm.tokenizers import TokenizerLike
+
+    from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 logger = init_logger(__name__)
+_FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
 
 
-def _weak_close_cleanup_async(
-    stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None, inline_engine=None
-):
-    """Weak reference cleanup function for AsyncOmni instances."""
-    if inline_engine is not None:
-        try:
-            inline_engine.close()
-        except Exception as e:
-            logger.warning("Failed to close inline diffusion engine: %s", e)
-    if stage_list:
-        for q in stage_in_queues:
-            try:
-                q.put_nowait(SHUTDOWN_TASK)
-            except Exception as e:
-                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
-            close_fn = getattr(q, "close", None)
-            if callable(close_fn):
-                close_fn()
-        for q in stage_out_queues:
-            close_fn = getattr(q, "close", None)
-            if callable(close_fn):
-                close_fn()
-        for stage in stage_list:
-            try:
-                stage.stop_stage_worker()
-            except Exception as e:
-                logger.warning(f"Failed to stop stage worker: {e}")
-    try_close_ray(ray_pg)
-    # Cancel output handler
-    if output_handler is not None:
-        output_handler.cancel()
-    if zmq_ctx is not None:
-        zmq_ctx.term()
+class AsyncOmni(EngineClient, OmniBase):
+    """Asynchronous unified entry point for multi-stage pipelines using AsyncOmniEngine.
 
-
-class AsyncOmni(OmniBase):
-    """Asynchronous unified entry point supporting multi-stage pipelines for LLM and Diffusion models.
-
-    Similar to the Omni class, but provides an asynchronous interface supporting
-    asynchronous LLM and Diffusion models.
+    This is the refactored version that uses AsyncOmniEngine instead of
+    OmniStage workers. It provides the same interface as AsyncOmni but with
+    a cleaner architecture.
 
     Args:
         model: Model name or path to load.
-        **kwargs: Arbitrary keyword arguments.
+        **kwargs: Additional keyword arguments.
             - stage_configs_path: Optional path to YAML file containing stage
-              configurations. If None, configurations are loaded from the model.
-            - log_stats: Whether to enable statistics logging
-              be written to files with stage-specific suffixes.
-            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
-              when the previous stage finished (possibly a prior Omni run with GPU
-              reuse/overlap) to when the current stage starts to initialize.
-            - shm_threshold_bytes: Threshold in bytes for using shared memory
-              for IPC. Objects larger than this threshold will use shared memory.
-            - worker_backend: Backend for worker processes. Default is "multi_process".
-            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
-            - batch_timeout: Timeout in seconds for batching requests within a stage
-            - init_timeout: Timeout in seconds for waiting for all stages to initialize
+              configurations. If None, configurations are resolved from model
+              pipeline factory.
+            - log_stats: Whether to enable statistics logging.
+            - stage_init_timeout: Timeout for per-stage initialization.
+            - init_timeout: Total timeout for orchestrator startup.
+            - async_chunk: Whether to enable async chunk mode.
+            - output_modalities: Requested output modalities.
             - Additional keyword arguments passed to stage engines.
 
     Example:
-        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
-        >>> async for output in async_llm.generate(
+        >>> async_omni = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> async for output in async_omni.generate(
         ...     prompt="Hello",
         ...     request_id="req-1",
         ...     sampling_params_list=[SamplingParams(), SamplingParams()]
@@ -110,212 +66,66 @@ class AsyncOmni(OmniBase):
         ...     print(output)
     """
 
-    def __init__(self, model: str, **kwargs: dict[str, Any]) -> None:
-        # Pause/resume control attributes
+    def __init__(self, model: str, **kwargs: Any) -> None:
+        OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
-
-        # Sleep mode tracking
         self._is_sleeping: bool = False
+        self.final_output_task: asyncio.Task | None = None
 
-        # Request state tracking
-        self.request_states: dict[str, ClientRequestState] = {}
-        self.output_handler: asyncio.Task | None = None
+        self.config_path = self.engine.config_path
+        self.stage_configs = self.engine.stage_configs
+        self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
+        self.input_processor = self.engine.input_processor
 
-        # RPC results storage: {stage_id: {rpc_id: result}}
-        # Used to avoid race condition between output_handler and collective_rpc
-        self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
-
-        # CFG companion → parent request ID mapping for output routing
-        self._companion_to_parent: dict[str, str] = {}
-
-        super().__init__(model, **kwargs)
-
-        # Register weak reference cleanup (called on garbage collection)
-        self._weak_finalizer = weakref.finalize(
-            self,
-            _weak_close_cleanup_async,
-            self.stage_list,
-            self._stage_in_queues,
-            self._stage_out_queues,
-            self._ray_pg,
-            self.output_handler,
-            self._zmq_ctx,
-            getattr(self, "_inline_engine", None),
-        )
-
-    async def get_supported_tasks(self) -> set[str]:
-        """Return supported tasks based on stage output modalities and capabilities."""
-        tasks: set[str] = set()
-        if "text" in self.output_modalities or any(stage.is_comprehension for stage in self.stage_list):
-            tasks.add("generate")
-        if "audio" in self.output_modalities:
-            tasks.add("speech")
-        return tasks
-
-    def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Create default diffusion stage configuration."""
-        # TODO: here is different from the Omni class. We should merge the two in the future.
-        cache_backend = kwargs.get("cache_backend", "none")
-        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
-
-        devices = "0"
-        if "parallel_config" in kwargs:
-            parallel_config = kwargs["parallel_config"]
-            num_devices = kwargs["parallel_config"].world_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
-        else:
-            ulysses_degree = kwargs.get("ulysses_degree") or 1
-            ring_degree = kwargs.get("ring_degree") or 1
-            sequence_parallel_size = kwargs.get("sequence_parallel_size")
-            tensor_parallel_size = kwargs.get("tensor_parallel_size") or 1
-            enable_expert_parallel = kwargs.get("enable_expert_parallel") or False
-            cfg_parallel_size = kwargs.get("cfg_parallel_size") or 1
-            vae_patch_parallel_size = kwargs.get("vae_patch_parallel_size") or 1
-            use_hsdp = kwargs.get("use_hsdp", False)
-            hsdp_shard_size = kwargs.get("hsdp_shard_size", -1)
-            hsdp_replicate_size = kwargs.get("hsdp_replicate_size", 1)
-            if sequence_parallel_size is None:
-                sequence_parallel_size = ulysses_degree * ring_degree
-
-            # Calculate num_devices: consider standalone HSDP
-            other_parallel_size = sequence_parallel_size * tensor_parallel_size * cfg_parallel_size
-            if use_hsdp and other_parallel_size == 1 and hsdp_shard_size > 0:
-                # Standalone HSDP: num_devices is determined by HSDP dimensions
-                num_devices = hsdp_shard_size * hsdp_replicate_size
-            else:
-                num_devices = other_parallel_size
-
-            for i in range(1, num_devices):
-                devices += f",{i}"
-            parallel_config = DiffusionParallelConfig(
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                tensor_parallel_size=tensor_parallel_size,
-                enable_expert_parallel=enable_expert_parallel,
-                sequence_parallel_size=sequence_parallel_size,
-                ulysses_degree=ulysses_degree,
-                ring_degree=ring_degree,
-                cfg_parallel_size=cfg_parallel_size,
-                vae_patch_parallel_size=vae_patch_parallel_size,
-                use_hsdp=use_hsdp,
-                hsdp_shard_size=hsdp_shard_size,
-                hsdp_replicate_size=hsdp_replicate_size,
-            )
-        default_stage_cfg = [
-            {
-                "stage_id": 0,
-                "stage_type": "diffusion",
-                "runtime": {
-                    "process": True,
-                    "devices": devices,
-                    "max_batch_size": 1,
-                },
-                "engine_args": {
-                    "parallel_config": parallel_config,
-                    "model_class_name": kwargs.get("model_class_name", None),
-                    "vae_use_slicing": kwargs.get("vae_use_slicing", False),
-                    "vae_use_tiling": kwargs.get("vae_use_tiling", False),
-                    "cache_backend": cache_backend,
-                    "cache_config": cache_config,
-                    "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
-                    "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
-                    "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-                    "enforce_eager": kwargs.get("enforce_eager", False),
-                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
-                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
-                    "quantization": kwargs.get("quantization", None),
-                    "worker_extension_cls": kwargs.get("worker_extension_cls", None),
-                    "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
-                    "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
-                    "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
-                },
-                "final_output": True,
-                "final_output_type": "image",
-            }
-        ]
-        default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
-        return default_stage_cfg
-
-    def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
-        # Store vllm_config received from worker process (may be None for diffusion stages)
-        vllm_config = result.get("vllm_config")
-        if vllm_config is not None:
-            stage.set_vllm_config(vllm_config)
-        tokenizer = result.get("tokenizer")
-        if tokenizer is not None:
-            stage.set_tokenizer(tokenizer)
-        is_tracing_enabled = result.get("is_tracing_enabled")
-        if is_tracing_enabled is not None:
-            stage.set_is_tracing_enabled(is_tracing_enabled)
-        super()._process_stage_ready(stage, stage_id, result)
-
-    def _wait_for_stages_ready(self, timeout: int = 120) -> None:
-        """Wait for all stages to report readiness."""
-        super()._wait_for_stages_ready(timeout)
-        for stage in self.stage_list:
-            if stage.vllm_config is not None and stage.tokenizer is not None:
-                try:
-                    vllm_config = stage.vllm_config
-                    # Initialize input_processor
-                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
-                    self.input_processor = OmniInputProcessor(
-                        vllm_config=vllm_config,
-                    )
-                    # Initialize model_config
-                    self.model_config = vllm_config.model_config
-                    # Initialize io_processor
-                    io_processor_plugin = self.model_config.io_processor_plugin
-                    self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
-
-                    logger.info(
-                        f"[{self._name}] Initialized input_processor, "
-                        f"io_processor, and model_config from stage-{stage.stage_id}",
-                    )
-                    break
-                except Exception as e:
-                    logger.warning(
-                        f"[{self._name}] Failed to initialize processors from stage-{stage.stage_id}: {e}",
-                    )
-        # If no LLM stage found, set processors to None
-        if not hasattr(self, "input_processor") or self.input_processor is None:
-            logger.warning(
-                f"[{self._name}] No LLM stage found, processors will not be available. "
-                "This may cause issues with OpenAIServingModels."
-            )
-            self.input_processor = None
+        stage_index = self._get_comprehension_stage_index()
+        if stage_index is None:
             self.io_processor = None
-            self.model_config = None
+        else:
+            vllm_config = self.engine.stage_vllm_configs[stage_index]
+            io_processor_plugin = vllm_config.model_config.io_processor_plugin
+            self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
 
-    def _setup_rpc_result_checkers(self) -> None:
-        """Override base class to use async-friendly RPC result checkers.
+    def _get_comprehension_stage_index(self) -> int | None:
+        fallback_idx: int | None = None
+        for idx, stage_client in enumerate(self.engine.stage_clients):
+            stage_vllm_config = self.engine.stage_vllm_configs[idx]
+            if stage_vllm_config is None:
+                continue
+            if fallback_idx is None:
+                fallback_idx = idx
+            if stage_client.is_comprehension:
+                return idx
+        return fallback_idx
 
-        In the async path the output_handler task drains the output queues
-        and stashes collective_rpc results into ``_rpc_results``.  The
-        checker therefore only needs to look there (no queue draining).
-        """
-        for stage in self.stage_list:
-            sid = stage.stage_id
+    @property
+    def renderer(self):
+        """Return the renderer from the engine input processor when available."""
+        if self.input_processor is None:
+            return None
+        return self.input_processor.renderer
 
-            def make_rpc_checker(stage_id: int):
-                def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
-                    if stage_id in self._rpc_results and rpc_id in self._rpc_results[stage_id]:
-                        return self._rpc_results[stage_id].pop(rpc_id)
-                    return None
+    @property
+    def vllm_config(self):
+        """Return the vLLM config for the comprehension stage when present."""
+        stage_index = self._get_comprehension_stage_index()
+        if stage_index is None:
+            return None
+        return self.engine.stage_vllm_configs[stage_index]
 
-                return rpc_checker
+    async def get_vllm_config(self) -> Any:
+        """Compatibility helper for call sites expecting async vllm config access."""
+        return self.vllm_config
 
-            stage._rpc_result_checker = make_rpc_checker(sid)
+    @property
+    def model_config(self):
+        """Return the model config for the comprehension stage when present."""
+        vllm_config = self.vllm_config
+        if vllm_config is None:
+            return None
+        return vllm_config.model_config
 
-    def shutdown(self):
-        """Shutdown, cleaning up the background proc and IPC.
-
-        Alias for close() method. Cleans up all stage processes
-        and inter-process communication resources.
-        """
-        if hasattr(self, "_weak_finalizer"):
-            self._weak_finalizer()
+    # ==================== Generate Method ====================
 
     async def generate(
         self,
@@ -327,11 +137,8 @@ class AsyncOmni(OmniBase):
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt asynchronously.
 
-        Coordinates multi-stage pipeline through YAML configuration.
-        Each stage will use AsyncOmniLLM or AsyncOmniDiffusion based on stage_type.
-        Processes the prompt through all stages in the pipeline and yields
-        outputs as they become available. Each stage uses its corresponding
-        sampling parameters from the sampling_params_list.
+        Coordinates multi-stage pipeline execution. Processes the prompt through
+        all stages in the pipeline and yields outputs as they become available.
 
         Args:
             prompt: Prompt to process. Can be a text string, token IDs,
@@ -344,731 +151,247 @@ class AsyncOmni(OmniBase):
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
-            Each output contains the stage_id, final_output_type, and
-            the request_output from that stage.
 
         Raises:
             ValueError: If sampling_params_list has incorrect length.
         """
-        # Wait until generation is resumed if the engine is paused.
+        # Wait until generation is resumed if the engine is paused
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
 
-        if self._inline_diffusion:
-            async for output in self._generate_inline(prompt, request_id, sampling_params_list, output_modalities):
-                yield output
-            return
+        logger.debug(f"[AsyncOmni] generate() called for request {request_id}")
 
-        logger.debug(f"[{self._name}] generate() called")
         try:
-            # Start output handler on the first call to generate()
-            self._run_output_handler()
+            # Start final output dispatcher on the first call to generate()
+            self._final_output_handler()
 
-            # TODO: lora_request, trace_headers, priority are not supported yet
-            if sampling_params_list is None:
-                sampling_params_list = self.default_sampling_params_list
+            sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
 
-            if len(sampling_params_list) != len(self.stage_list):
-                raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
+            # Track per-request metrics
+            wall_start_ts = time.time()
+            req_start_ts: dict[str, float] = {}
 
-            # Orchestrator keeps stage objects for input derivation
-            num_stages = len(self.stage_list)
-            # Track per-request start time for end-to-end timing
-            _req_start_ts: dict[int, float] = {}
-            _wall_start_ts: float = time.time()
-            # _last_finish_ts: float = _wall_start_ts
+            # Determine the final stage for E2E stats
+            final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
 
-            # Determine the final stage for E2E stats (highest stage_id with
-            # final_output=True; fallback to last stage)
-            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
-                output_modalities, self.output_modalities, self.stage_list
-            )
-
-            # Metrics/aggregation helper
-            metrics = OrchestratorAggregator(
-                num_stages=num_stages,
-                log_stats=self.log_stats,
-                wall_start_ts=_wall_start_ts,
-                final_stage_id_for_e2e=final_stage_id_for_e2e,
+            metrics = OrchestratorMetrics(
+                self.num_stages,
+                self.log_stats,
+                wall_start_ts,
+                final_stage_id_for_e2e,
             )
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
 
-            # Ensure modalities is in the prompt dict for CFG expansion
-            # (offline path includes it; online serving passes it separately)
-            if isinstance(prompt, dict) and output_modalities and "modalities" not in prompt:
-                prompt["modalities"] = output_modalities
-
-            # CFG companion tracking (prompt expansion + lifecycle management)
-            cfg = CfgCompanionTracker(
-                prompt_expand_func=getattr(self.stage_list[0], "prompt_expand_func", None),
-                stage0_sampling_params=sampling_params_list[0],
+            # Add request to stage 0 (Orchestrator handles all stage transitions)
+            await self.engine.add_request_async(
+                request_id=request_id,
+                prompt=prompt,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id_for_e2e,
             )
-            expanded_companions = cfg.expand_prompts({request_id: prompt})
+            submit_ts = time.time()
+            req_state.metrics.stage_first_ts[0] = submit_ts
+            req_start_ts[request_id] = submit_ts
 
-            sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
-            task = {
-                "request_id": request_id,
-                "engine_inputs": prompt,
-                "sampling_params": sp0,
-            }
-            self.stage_list[0].submit(task)
+            # Process results based on mode
+            # Both sequential and async_chunk modes read the same message stream
+            # from Orchestrator; stage-transfer behavior differs inside
+            # Orchestrator._route_output().
+            async for output in self._process_orchestrator_results(
+                request_id,
+                metrics,
+                final_stage_id_for_e2e,
+                req_start_ts,
+                wall_start_ts,
+            ):
+                yield output
 
-            # Submit CFG companion requests to stage-0
-            if cfg.is_active:
-                for companion_id, companion_prompt in expanded_companions:
-                    self._companion_to_parent[companion_id] = request_id
-                    companion_task = {
-                        "request_id": companion_id,
-                        "engine_inputs": companion_prompt,
-                        "sampling_params": cfg.stage0_sampling_params,
-                    }
-                    self.stage_list[0].submit(companion_task)
+            logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
-            metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
-            _req_start_ts[request_id] = time.time()
-            logger.info(
-                f"[{self._name}] Entering scheduling loop: stages={num_stages}, final_stage={final_stage_id_for_e2e}"
-            )
-            if self.async_chunk:
-                stage_queues = {stage_id: asyncio.Queue() for stage_id in range(num_stages)}
-                req_state.stage_queues = stage_queues
-                async for output in self._process_async_results(
-                    request_id,
-                    prompt,
-                    sampling_params_list,
-                    req_state,
-                    metrics,
-                    final_stage_id_for_e2e,
-                ):
-                    yield output
-            else:
-                async for output in self._process_sequential_results(
-                    request_id,
-                    req_state,
-                    metrics,
-                    final_stage_id_for_e2e,
-                    sampling_params_list,
-                    prompt,
-                    cfg=cfg,
-                ):
-                    yield output
+            self._log_summary_and_cleanup(request_id)
 
-            logger.debug(f"[{self._name}] Request {request_id} finalized at stage-{final_stage_id_for_e2e}")
-            try:
-                # Finalize E2E metrics if not already done
-                metrics.on_finalize_request(
-                    final_stage_id_for_e2e,
-                    request_id,
-                    _req_start_ts.get(request_id, _wall_start_ts),
-                )
-
-                logger.debug(f"[{self._name}] All requests completed")
-                # Summarize and print stats
-                metrics.build_and_log_summary()
-            except Exception as e:
-                logger.exception(f"[{self._name}] Request {request_id} Failed to finalized/build/log summary: {e}")
-            finally:
-                self.request_states.pop(request_id, None)
-                if cfg.is_active:
-                    for cid in cfg.get_companion_request_ids(request_id).values():
-                        self._companion_to_parent.pop(cid, None)
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
-            logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
+            logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
-
-    async def _generate_inline(
-        self,
-        prompt: OmniPromptType,
-        request_id: str,
-        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
-        output_modalities: list[str] | None = None,
-    ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Generate using inline diffusion engine (no stage worker subprocess).
-
-        Eliminates Hop3 IPC overhead by running OmniDiffusion directly in the
-        orchestrator process.  The blocking generate() call is offloaded to a
-        thread executor so the asyncio event loop remains responsive.
-        """
-        _wall_start_ts = time.time()
-
-        if sampling_params_list is None:
-            sampling_params_list = self.default_sampling_params_list
-        sp0 = sampling_params_list[0]
-
-        stage = self.stage_list[0]
-        final_stage_id_for_e2e = 0
-
-        metrics = OrchestratorAggregator(
-            num_stages=1,
-            log_stats=self.log_stats,
-            wall_start_ts=_wall_start_ts,
-            final_stage_id_for_e2e=final_stage_id_for_e2e,
-        )
-        metrics.stage_first_ts[0] = time.time()
-
-        logger.info(
-            "[%s] Inline diffusion generate for request %s",
-            self._name,
-            request_id,
-        )
-
-        try:
-            loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(
-                None,
-                self._inline_engine.generate,
-                prompt,
-                sp0,
-                [request_id],
-            )
-
-            for result in results:
-                images = getattr(result, "images", None) or []
-                finished = getattr(result, "finished", True)
-
-                output_to_yield = OmniRequestOutput(
-                    stage_id=0,
-                    final_output_type=stage.final_output_type,
-                    request_output=result,
-                    images=images,
-                    finished=finished,
-                )
-
-                metrics.stage_last_ts[0] = time.time()
-                yield output_to_yield
-
-            try:
-                metrics.on_finalize_request(
-                    final_stage_id_for_e2e,
-                    request_id,
-                    _wall_start_ts,
-                )
-                metrics.build_and_log_summary()
-            except Exception as e:
-                logger.exception(
-                    "[%s] Failed to finalize inline metrics: %s",
-                    self._name,
-                    e,
-                )
-
-        except (asyncio.CancelledError, GeneratorExit):
-            logger.info(
-                "[%s] Inline request %s cancelled.",
-                self._name,
-                request_id,
-            )
-            raise
-        except Exception as e:
-            logger.exception(
-                "[%s] Inline diffusion failed for request %s: %s",
-                self._name,
-                request_id,
-                e,
-            )
-            raise
-
-    async def _process_async_results(
-        self,
-        request_id: str,
-        prompt: Any,
-        sampling_params_list: list[SamplingParams],
-        req_state: ClientRequestState,
-        metrics: OrchestratorAggregator,
-        final_stage_id_for_e2e: int,
-    ) -> AsyncGenerator[OmniRequestOutput, None]:
-        all_stages_finished = {stage_id: False for stage_id in range(final_stage_id_for_e2e + 1)}
-        submit_flag = True
-        _loop_iter = 0
-        _last_progress_ts = time.time()
-        while not all(all_stages_finished.values()):
-            _loop_iter += 1
-            for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
-                if all_stages_finished[stage_id]:
-                    continue
-                try:
-                    result = req_state.stage_queues[stage_id].get_nowait()
-                except asyncio.QueueEmpty:
-                    await asyncio.sleep(0.001)
-                    continue
-                _last_progress_ts = time.time()
-                engine_outputs, finished, output_to_yield = self._process_single_result(
-                    result,
-                    stage,
-                    stage_id,
-                    metrics,
-                )
-                if submit_flag and stage_id == 0:
-                    submit_flag = False
-                    prompt_token_ids = getattr(engine_outputs, "prompt_token_ids", None)
-                    if prompt_token_ids is None:
-                        prompt_token_ids = []
-                    engine_input = copy.deepcopy(prompt)
-                    try:
-                        next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
-                    except Exception:
-                        raise
-                    engine_input["prompt_token_ids"] = [0] * next_prompt_len
-                    engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
-                    for _mm_key in ("mm_kwargs", "mm_hashes", "mm_placeholders", "multi_modal_uuids"):
-                        engine_input.pop(_mm_key, None)
-                    if engine_input.get("type") == "multimodal":
-                        engine_input["type"] = "token"
-                    for i in range(1, len(self.stage_list)):
-                        task = {
-                            "request_id": request_id,
-                            "engine_inputs": engine_input,
-                            "sampling_params": sampling_params_list[i],
-                        }
-                        self.stage_list[i].submit(task)
-                        metrics.stage_first_ts[i] = time.time()
-                all_stages_finished[stage_id] = finished
-
-                if output_to_yield:
-                    yield output_to_yield
-
-    async def _process_sequential_results(
-        self,
-        request_id: str,
-        req_state: ClientRequestState,
-        metrics: OrchestratorAggregator,
-        final_stage_id_for_e2e: int,
-        sampling_params_list: list[SamplingParams],
-        prompt: Any,
-        cfg: CfgCompanionTracker | None = None,
-    ) -> AsyncGenerator[OmniRequestOutput, None]:
-        for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
-            cfg_stage0 = stage_id == 0 and cfg is not None and cfg.is_active
-            finished = False
-
-            while True:
-                if finished and (
-                    not cfg_stage0 or cfg.all_companions_done(request_id) or cfg.is_parent_failed(request_id)
-                ):
-                    break
-
-                result = await req_state.queue.get()
-
-                if cfg is not None and cfg.is_companion(result.get("request_id", "")):
-                    if cfg_stage0:
-                        rid = result.get("request_id")
-                        if "error" in result:
-                            cfg.on_companion_error(rid)
-                        else:
-                            cfg.on_companion_completed(rid)
-                    continue
-
-                engine_outputs, finished, output_to_yield = self._process_single_result(
-                    result,
-                    stage,
-                    stage_id,
-                    metrics,
-                )
-                if output_to_yield:
-                    yield output_to_yield
-            if not isinstance(engine_outputs, list):
-                engine_outputs = [engine_outputs]
-            stage.set_engine_outputs(engine_outputs)
-            # Forward to next stage if there is one
-            next_stage_id = stage_id + 1
-            if next_stage_id <= final_stage_id_for_e2e:
-                next_stage: OmniStage = self.stage_list[next_stage_id]
-                # Derive inputs for the next stage, record postprocess time
-                with metrics.stage_postprocess_timer(stage_id, request_id):
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
-                sp_next: SamplingParams = sampling_params_list[next_stage_id]
-
-                if cfg is not None and cfg.is_active and not cfg.is_parent_failed(request_id):
-                    if isinstance(sp_next, OmniDiffusionSamplingParams):
-                        sp_next = copy.deepcopy(sp_next)
-                        sp_next.cfg_kv_request_ids = cfg.get_companion_request_ids(request_id)
-                        logger.info(
-                            "Attaching cfg_kv_request_ids=%s to request %s",
-                            sp_next.cfg_kv_request_ids,
-                            request_id,
-                        )
-
-                # Check if we have a connector for this edge
-                connector_key = (str(stage_id), str(next_stage_id))
-                connector = self.connectors.get(connector_key)
-
-                sent_via_connector = False
-                if connector:
-                    sent_via_connector = try_send_via_connector(
-                        connector=connector,
-                        stage_id=stage_id,
-                        next_stage_id=next_stage_id,
-                        req_id=request_id,
-                        next_inputs=next_inputs,
-                        sampling_params=sp_next,
-                        original_prompt=prompt,
-                        next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
-                        metrics=metrics,
-                    )
-
-                if not sent_via_connector:
-                    # Fallback logic removed as we now enforce connector usage.
-                    # If no connector is found or send fails, we log an error and raise,
-                    # because continuing would cause the request to be silently dropped
-                    # and the orchestrator to hang waiting for completion.
-                    error_msg = (
-                        f"[{self._name}] Failed to send request {request_id} to stage-{next_stage_id} via connector. "
-                        "Configure a connector for this edge or inspect connector logs for details."
-                    )
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-                logger.debug(f"[{self._name}] Forwarded request {request_id} to stage-{next_stage_id}")
-            else:
-                logger.debug(f"[{self._name}] Request {request_id} fully completed")
-
-    def _process_single_result(
-        self,
-        result: dict[str, Any],
-        stage: OmniStage,
-        stage_id: int,
-        metrics: OrchestratorAggregator,
-    ) -> tuple[Any, bool, OmniRequestOutput | None]:
-        """
-        Process a single result dictionary from a stage.
-        Returns:
-            engine_outputs: The decoded outputs.
-            finished: Whether the stage processing is finished for this request.
-            output_to_yield: An OmniRequestOutput to yield, or None.
-        """
-        req_id = result.get("request_id")
-        if "error" in result:
-            logger.error(
-                f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
-            )
-            raise RuntimeError(result)
-
-        engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-
-        if isinstance(engine_outputs, list):
-            engine_outputs = engine_outputs[0]
-
-        finished = engine_outputs.finished
-
-        output_to_yield = None
-
-        if getattr(stage, "final_output", False):
-            # Construct output to yield
-            images = []
-            if stage.final_output_type == "image":
-                if isinstance(engine_outputs, OmniRequestOutput) and engine_outputs.images:
-                    images = engine_outputs.images
-                elif hasattr(engine_outputs, "images") and engine_outputs.images:
-                    images = engine_outputs.images
-
-            if stage.final_output_type == "image":
-                # Propagate custom_output from inner diffusion output
-                custom_output = {}
-                if isinstance(engine_outputs, OmniRequestOutput):
-                    custom_output = engine_outputs.custom_output or {}
-                output_to_yield = OmniRequestOutput(
-                    stage_id=stage_id,
-                    final_output_type=stage.final_output_type,
-                    request_output=engine_outputs,
-                    images=images,
-                    finished=finished,
-                    _custom_output=custom_output,
-                )
-            else:
-                output_to_yield = OmniRequestOutput(
-                    stage_id=stage_id,
-                    final_output_type=stage.final_output_type,
-                    request_output=engine_outputs,
-                    finished=finished,
-                )
-        # Mark last output time
-        metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
-
-        metrics.process_stage_metrics(
-            result=result,
-            stage_type=stage.stage_type,
-            stage_id=stage_id,
-            req_id=req_id,
-            engine_outputs=engine_outputs,
-            finished=finished,
-            final_output_type=stage.final_output_type,
-            output_to_yield=output_to_yield,
-        )
-
-        logger.debug(
-            f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
-        )
-
-        return engine_outputs, finished, output_to_yield
-
-    def _run_output_handler(self) -> None:
-        if self.output_handler is not None:
-            return
-
-        stage_list = self.stage_list
-        request_states = self.request_states
-        companion_to_parent = self._companion_to_parent
-
-        async def output_handler():
-            try:
-                while True:
-                    idle = True
-                    for stage_id, stage in enumerate(stage_list):
-                        result = stage.try_collect()
-                        if result is None:
-                            continue
-                        idle = False
-                        if result.get("type") == "stage_ready":
-                            # Only happens when stage is initialized slower than expected,
-                            # so we wait for a short time and try again
-                            await asyncio.sleep(0.05)
-                            continue
-                        # Handle collective_rpc results separately to avoid
-                        # race condition with the polling in collective_rpc
-                        if result.get("type") == "collective_rpc_result":
-                            rpc_id = result.get("rpc_id")
-                            if rpc_id:
-                                if stage_id not in self._rpc_results:
-                                    self._rpc_results[stage_id] = {}
-                                self._rpc_results[stage_id][rpc_id] = result
-                            continue
-                        req_id = result.get("request_id")
-                        req_state = request_states.get(req_id)
-                        if req_state is None:
-                            parent_id = companion_to_parent.get(req_id)
-                            if parent_id is not None:
-                                req_state = request_states.get(parent_id)
-                        if req_state is None:
-                            logger.debug(
-                                f"[{self._name}] Request may have been aborted; \
-                                dropping output for req {req_id} at stage-{stage_id}"
-                            )
-                            continue
-                        if hasattr(req_state, "stage_queues") and stage_id in req_state.stage_queues:
-                            await req_state.stage_queues[stage_id].put(result)
-                        else:
-                            # Fallback to old behavior for compatibility
-                            await req_state.queue.put(result)
-                            req_state.stage_id = stage_id
-                    if idle:
-                        await asyncio.sleep(0.001)  # Avoid CPU overload when idle
-                    else:
-                        await asyncio.sleep(0)
-            except Exception as e:
-                logger.exception("AsyncOmni output_handler failed.")
-                for req_state in request_states.values():
-                    error_msg = {"request_id": req_state.request_id, "error": str(e)}
-                    # Send error to all stage queues
-                    if hasattr(req_state, "stage_queues"):
-                        for queue in req_state.stage_queues.values():
-                            await queue.put(error_msg)
-                    else:
-                        await req_state.queue.put(error_msg)
-                    error_msg = {"request_id": req_state.request_id, "error": str(e)}
-                self.output_handler = None  # Make possible for restart
-
-        self.output_handler = asyncio.create_task(output_handler())
-
-    @property
-    def is_running(self) -> bool:
-        if self._inline_diffusion:
-            return self._inline_engine is not None
-        return len(self._stage_in_queues) > 0
-
-    @property
-    def is_stopped(self) -> bool:
-        return self.errored
-
-    @property
-    def errored(self) -> bool:
-        return not self.is_running
-
-    @property
-    def _name(self) -> str:
-        return "AsyncOrchestrator"
-
-    @property
-    def is_async(self) -> bool:
-        return True
-
-    @property
-    def dead_error(self) -> BaseException:
-        return EngineDeadError()
-
-    async def abort(self, request_id: str | Iterable[str]) -> None:
-        if self._inline_diffusion:
-            if self._inline_engine is not None:
-                self._inline_engine.engine.abort(request_id)
-            return None
-        abort_task = {"type": OmniStageTaskType.ABORT, "request_id": request_id}
-        for stage in self.stage_list:
-            stage.submit(abort_task)
-        return None
-
-    async def get_vllm_config(self) -> VllmConfig:
-        for stage in self.stage_list:
-            if stage.is_comprehension:
-                # Use the vllm_config received from worker process
-                if stage.vllm_config is not None:
-                    return stage.vllm_config
-        return None
-
-    async def get_model_config(self) -> OmniModelConfig:
-        for stage in self.stage_list:
-            if stage.is_comprehension:
-                # Use the vllm_config received from worker process
-                if stage.vllm_config is not None:
-                    return stage.vllm_config.model_config
-        return None
-
-    async def get_input_preprocessor(self) -> InputPreprocessor:
-        return None
-
-    async def get_tokenizer(self) -> TokenizerLike:
-        for stage in self.stage_list:
-            if stage.is_comprehension:
-                return stage.tokenizer
-        return None
-
-    async def is_tracing_enabled(self) -> bool:
-        for stage in self.stage_list:
-            if stage.is_comprehension:
-                return stage.is_tracing_enabled
-        return False
-
-    @property
-    def renderer(self):
-        """Return the renderer from input_processor if available.
-
-        OMNI: Required by upstream OpenAIServingModels.__init__ which
-        accesses engine_client.renderer.
-        """
-        if self.input_processor is None:
-            return None
-        return self.input_processor.renderer
-
-    async def do_log_stats(self) -> None:
-        pass
-
-    async def check_health(self) -> None:
-        pass
-
-    async def reset_mm_cache(self) -> None:
-        pass
-
-    async def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
-        pass
-
-    async def collective_rpc(
-        self,
-        method: str | Callable[..., _R],
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> list[_R]:
-        """Execute an RPC call on all stages asynchronously.
-
-        Args:
-            method: Name of the method to execute or callable
-            timeout: Optional timeout in seconds
-            args: Positional arguments for the method
-            kwargs: Keyword arguments for the method
-
-        Returns:
-            List of results from each stage
-        """
-        self._run_output_handler()
-        # Run synchronous collective_rpc in thread pool to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-
-        async def run_stage_rpc(stage: OmniStage) -> _R:
-            return await loop.run_in_executor(
-                None,
-                stage.collective_rpc,
-                method,
-                timeout,
-                args,
-                kwargs,
-            )
-
-        # Run all stages concurrently
-        results = await asyncio.gather(*[run_stage_rpc(stage) for stage in self.stage_list])
-        return list(results)
-
-    async def sleep(self, level: int = 1) -> None:
-        self._is_sleeping = True
-        await self.collective_rpc(method="sleep", args=(level,))
-
-    async def wake_up(self, tags: list[str] | None = None) -> None:
-        self._is_sleeping = False
-        await self.collective_rpc(method="wake_up", args=(tags,))
-
-    async def is_sleeping(self) -> bool:
-        """Check whether the engine is sleeping"""
-        return getattr(self, "_is_sleeping", False)
-
-    async def add_lora(self, lora_request: LoRARequest) -> bool:
-        """Load a new LoRA adapter into the engine for future requests."""
-        result = await self.collective_rpc(method="add_lora", args=(lora_request,))
-        return result[0][0]
-
-    async def remove_lora(self, adapter_id: int) -> bool:
-        """Remove a LoRA adapter from the engine."""
-        result = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
-        return result[0][0]
-
-    async def list_loras(self) -> list[int]:
-        """List all loaded LoRA adapter IDs."""
-        result = await self.collective_rpc(method="list_loras")
-        return result[0][0]
-
-    async def pin_lora(self, adapter_id: int) -> bool:
-        """Pin a LoRA adapter so it is not evicted from the cache."""
-        result = await self.collective_rpc(method="pin_lora", args=(adapter_id,))
-        return result[0][0]
 
     async def encode(
         self,
-        *args,
-        **kwargs,
-    ):
-        """Generate outputs for a request from a pooling model."""
-        raise NotImplementedError("encode() is not implemented for AsyncOmni")
+        prompt: Any,
+        pooling_params: PoolingParams,
+        request_id: str,
+        lora_request: LoRARequest | None = None,
+        trace_headers: dict[str, str] | None = None,
+        priority: int = 0,
+        tokenization_kwargs: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[PoolingRequestOutput, None]:
+        """EngineClient.encode() stub.
 
-    async def start_profile(self, stages: list[int] | None = None) -> None:
-        """Start profiling for specified stages.
-
-        Async wrapper around the base implementation for API consistency.
-
-        Args:
-            stages: List of stage IDs to start profiling. If None, starts
-                profiling for all stages that have profiling enabled.
-
-        Example:
-            >>> await async_omni.start_profile()
-            >>> async for output in async_omni.generate(...):
-            ...     pass
-            >>> await async_omni.stop_profile()
+        Omni pipeline currently exposes only generate() API at orchestrator level.
         """
-        super().start_profile(stages)
+        raise NotImplementedError("AsyncOmni.encode is not implemented.")
 
-    async def stop_profile(self, stages: list[int] | None = None) -> None:
-        """Stop profiling for specified stages.
+    # ==================== Processing Methods ====================
 
-        Async wrapper around the base implementation for API consistency.
+    async def _process_orchestrator_results(
+        self,
+        request_id: str,
+        metrics: OrchestratorMetrics,
+        final_stage_id_for_e2e: int,
+        req_start_ts: dict[str, float],
+        wall_start_ts: float,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Read results from the Orchestrator (via the request's asyncio.Queue)
+        and yield OmniRequestOutput objects.
 
-        Args:
-            stages: List of stage IDs to stop profiling. If None, stops
-                profiling for all stages.
-
-        Example:
-            >>> await async_omni.start_profile()
-            >>> async for output in async_omni.generate(...):
-            ...     pass
-            >>> await async_omni.stop_profile()
+        The Orchestrator handles all stage-to-stage transfers. This method
+        only processes final outputs that arrive on the per-request queue.
         """
-        super().stop_profile(stages)
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            return
+
+        while True:
+            result = await req_state.queue.get()
+
+            stage_id = result.get("stage_id", 0)
+
+            # Check for errors
+            if "error" in result:
+                logger.error(
+                    "[AsyncOmni] Orchestrator error for req=%s stage-%s: %s",
+                    request_id,
+                    stage_id,
+                    result["error"],
+                )
+                raise RuntimeError(result)
+
+            # Process the result (constructs OmniRequestOutput)
+            output_to_yield = self._process_single_result(
+                result,
+                stage_id,
+                metrics,
+                req_start_ts,
+                wall_start_ts,
+                final_stage_id_for_e2e,
+            )
+
+            if output_to_yield:
+                logger.debug(
+                    "[AsyncOmni] req=%s stage-%s yielding final_output_type=%s",
+                    request_id,
+                    stage_id,
+                    getattr(output_to_yield, "final_output_type", None),
+                )
+                yield output_to_yield
+
+            # The Orchestrator sets "finished" when the final stage is done
+            if result.get("finished"):
+                break
+
+    # ==================== Output Handler ====================
+
+    def _final_output_handler(self) -> None:
+        """Start the final output handler if not already running.
+
+        This handler reads messages from the Orchestrator output queue and
+        routes them to per-request asyncio.Queues.
+        """
+        if self.final_output_task is not None:
+            return
+
+        engine = self.engine
+
+        async def _final_output_loop():
+            """Background coroutine that dispatches final outputs to request queues."""
+            try:
+                while True:
+                    msg = await engine.try_get_output_async()
+                    if msg is None:
+                        await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
+                        continue
+
+                    should_continue, _, stage_id, req_state = self._handle_output_message(msg)
+                    if should_continue:
+                        continue
+
+                    req_state.stage_id = stage_id
+
+                    # Route to the per-request queue
+                    await req_state.queue.put(msg)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("[AsyncOmni] final_output_loop failed.")
+                for req_state in list(self.request_states.values()):
+                    error_msg = {"request_id": req_state.request_id, "error": str(e)}
+                    await req_state.queue.put(error_msg)
+                self.final_output_task = None
+
+        self.final_output_task = asyncio.create_task(_final_output_loop())
+        logger.debug("[AsyncOmni] Final output handler started")
+
+    # ==================== Control Methods ====================
+
+    async def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        stage_ids: list[int] | None = None,
+    ) -> list[Any]:
+        """Execute a best-effort control RPC on selected stages.
+
+        Unsupported stages currently return a TODO-style result dict instead of
+        failing the entire call. This keeps AsyncOmni usable while the orchestrator
+        control plane is still being filled out.
+        """
+        results = await self.engine.collective_rpc_async(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            stage_ids=stage_ids,
+        )
+
+        unsupported_stage_ids: list[int] = []
+        effective_stage_ids = stage_ids or list(range(len(results)))
+        for index, result in enumerate(results):
+            if isinstance(result, dict) and result.get("todo"):
+                unsupported_stage_ids.append(effective_stage_ids[index])
+
+        if unsupported_stage_ids:
+            logger.warning(
+                "[AsyncOmni] collective_rpc(%s) has TODO support on stage(s): %s",
+                method,
+                unsupported_stage_ids,
+            )
+
+        return results
+
+    @staticmethod
+    def _coerce_stage_bool(result: Any) -> bool:
+        """Reduce a stage RPC result to a boolean.
+
+        Some stage RPCs may return worker-level lists like ``[True]``;
+        diffusion wrappers usually return a plain bool.
+        """
+        if isinstance(result, list):
+            return all(bool(item) for item in result)
+        return bool(result)
+
+    async def abort(self, request_id: str | Iterable[str]) -> None:
+        """Abort request(s) via the Orchestrator."""
+        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+        await self.engine.abort_async(request_ids)
+        for req_id in request_ids:
+            self.request_states.pop(req_id, None)
+        if self.log_stats:
+            logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
     async def pause_generation(
         self,
@@ -1076,44 +399,194 @@ class AsyncOmni(OmniBase):
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
     ) -> None:
-        """
-        Pause generation to allow model weight updates.
-
-        New generation/encoding requests are blocked until resume.
-
-        Args:
-            wait_for_inflight_requests: When ``True`` waits for in-flight
-                requests to finish before pausing. When ``False`` (default),
-                immediately aborts any in-flight requests.
-            clear_cache: Whether to clear KV cache and prefix cache after
-                draining. Set to ``False`` to preserve cache for faster resume.
-                Default is ``True`` (clear caches).
-        """
-
+        """Pause generation."""
         async with self._pause_cond:
             if self._paused:
                 return
             self._paused = True
 
-        # Note: AsyncOmni uses a stage-based architecture without a central
-        # output_processor. For now, we simply set the pause flag and let
-        # new requests wait. In-flight requests will complete naturally.
-        # TODO: Implement request abortion for stages if needed.
+        # TODO: Implement request draining if wait_for_inflight_requests
 
-        # Clear cache if requested
         if clear_cache:
-            await self.reset_prefix_cache()
+            # Clear caches for all stages.
+            await self.reset_prefix_cache(
+                reset_running_requests=not wait_for_inflight_requests,
+                reset_connector=True,
+            )
             await self.reset_mm_cache()
+            await self.reset_encoder_cache()
 
     async def resume_generation(self) -> None:
-        """Resume generation after :meth:`pause_generation`."""
-
+        """Resume generation."""
         async with self._pause_cond:
             self._paused = False
-            self._pause_cond.notify_all()  # Wake up all waiting requests
+            self._pause_cond.notify_all()
 
     async def is_paused(self) -> bool:
-        """Return whether the engine is currently paused."""
-
+        """Check if paused."""
         async with self._pause_cond:
             return self._paused
+
+    async def start_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Start profiling specified stages.
+
+        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
+        """
+        return await self.collective_rpc(method="start_profile", stage_ids=stages)
+
+    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages.
+
+        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
+        """
+        return await self.collective_rpc(method="stop_profile", stage_ids=stages)
+
+    async def reset_mm_cache(self) -> None:
+        """Reset the multi-modal cache for all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmni] reset_mm_cache not yet supported with Orchestrator process")
+
+    async def reset_encoder_cache(self) -> None:
+        """Reset the encoder cache for all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmni] reset_encoder_cache not yet supported with Orchestrator process")
+
+    async def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        """Reset the prefix cache for all stages.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
+        return True
+
+    async def sleep(self, level: int = 1) -> None:
+        """Sleep all stages.
+
+        Best-effort: unsupported stages will emit a TODO result.
+        """
+        self._is_sleeping = True
+        await self.collective_rpc(method="sleep", args=(level,))
+
+    async def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up all stages.
+
+        Best-effort: unsupported stages will emit a TODO result.
+        """
+        self._is_sleeping = False
+        await self.collective_rpc(method="wake_up", args=(tags,))
+
+    async def is_sleeping(self) -> bool:
+        """Return whether all stages are sleeping.
+
+        TODO(AsyncOmni): query the orchestrator once all stage backends expose
+        a real sleeping-state RPC. For now we track the requested state locally.
+        """
+        return self._is_sleeping
+
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        """Load a new LoRA adapter into all stages.
+
+        Returns True only if all concretely-implemented stages report success.
+        """
+        results = await self.collective_rpc(method="add_lora", args=(lora_request,))
+        concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
+        return all(self._coerce_stage_bool(r) for r in concrete_results) if concrete_results else False
+
+    async def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA adapter from all stages.
+
+        TODO(AsyncOmni): add richer per-stage error reporting to the public API.
+        """
+        results = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
+        concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
+        return all(self._coerce_stage_bool(r) for r in concrete_results) if concrete_results else False
+
+    async def list_loras(self) -> list[int]:
+        """List all loaded LoRA adapter IDs across stages."""
+        results = await self.collective_rpc(method="list_loras")
+        merged: set[int] = set()
+        for result in results:
+            if isinstance(result, dict) and result.get("todo"):
+                continue
+            if isinstance(result, list):
+                merged.update(result)
+        return sorted(merged)
+
+    async def pin_lora(self, adapter_id: int) -> bool:
+        """Pin a LoRA adapter across stages."""
+        results = await self.collective_rpc(method="pin_lora", args=(adapter_id,))
+        concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
+        return all(self._coerce_stage_bool(r) for r in concrete_results) if concrete_results else False
+
+    # ==================== Properties ====================
+
+    @property
+    def is_running(self) -> bool:
+        """Check if the engine is running."""
+        return self.final_output_task is not None and not self.final_output_task.done()
+
+    @property
+    def errored(self) -> bool:
+        """Whether orchestrator thread has stopped unexpectedly."""
+        return not self.engine.is_alive()
+
+    @property
+    def is_stopped(self) -> bool:
+        """EngineClient abstract property implementation."""
+        return self.errored
+
+    @property
+    def dead_error(self) -> BaseException:
+        """EngineClient abstract property implementation."""
+        return EngineDeadError()
+
+    # ==================== EngineClient Interface ====================
+
+    async def get_input_preprocessor(self) -> InputPreprocessor:
+        """Get input preprocessor."""
+        return self.input_processor
+
+    async def get_tokenizer(self) -> TokenizerLike:
+        """Get tokenizer for the comprehension stage."""
+        stage_index = self._get_comprehension_stage_index()
+        if stage_index is not None:
+            tokenizer = self.engine.output_processors[stage_index].tokenizer
+            if tokenizer is not None:
+                return tokenizer
+        return self.input_processor.tokenizer  # type: ignore[return-value]
+
+    async def is_tracing_enabled(self) -> bool:
+        """Check if tracing is enabled."""
+        return False
+
+    async def do_log_stats(self) -> None:
+        """Log statistics.
+
+        TODO: Forward to Orchestrator process via message.
+        """
+        pass
+
+    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        """Return the task set exposed by the orchestrator-backed engine."""
+        return tuple(self.engine.supported_tasks)
+
+    async def check_health(self) -> None:
+        """Check engine health by verifying the Orchestrator process is alive."""
+        OmniBase.check_health(self)
+
+    # ==================== Shutdown ====================
+
+    def shutdown(self) -> None:
+        """Shutdown the engine."""
+        if self.final_output_task is not None:
+            self.final_output_task.cancel()
+            self.final_output_task = None
+        OmniBase.shutdown(self)

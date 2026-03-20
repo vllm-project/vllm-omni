@@ -167,27 +167,26 @@ def run_e2e():
     print(f"Received {len(outputs)} outputs.")
     for i, output in enumerate(outputs):
         try:
-            ro_list = output.request_output or []
-            if not ro_list:
+            ro = output.request_output
+            if ro is None:
                 print("No request_output found.")
                 continue
 
-            for ro in ro_list:
-                # Multimodal output may be attached to RequestOutput or CompletionOutput.
-                mm = getattr(ro, "multimodal_output", None)
-                if not mm and ro.outputs:
-                    mm = getattr(ro.outputs[0], "multimodal_output", None)
+            # Multimodal output may be attached to RequestOutput or CompletionOutput.
+            mm = getattr(ro, "multimodal_output", None)
+            if not mm and ro.outputs:
+                mm = getattr(ro.outputs[0], "multimodal_output", None)
 
-                if mm:
-                    print(f"Multimodal output keys: {mm.keys()}")
-                    if "audio" in mm:
-                        audio_out = mm["audio"]
-                        print(f"Generated Audio Shape: {audio_out.shape}")
-                        out_path = f"output_{i}.wav"
-                        sf.write(out_path, audio_out.cpu().numpy().squeeze(), 22050)
-                        print(f"Saved audio to {out_path}")
-                else:
-                    print("No multimodal output found.")
+            if mm:
+                print(f"Multimodal output keys: {mm.keys()}")
+                if "audio" in mm:
+                    audio_out = mm["audio"]
+                    print(f"Generated Audio Shape: {audio_out.shape}")
+                    out_path = f"output_{i}.wav"
+                    sf.write(out_path, audio_out.cpu().numpy().squeeze(), 22050)
+                    print(f"Saved audio to {out_path}")
+            else:
+                print("No multimodal output found.")
         except Exception as e:
             print(f"Error inspecting output: {e}")
     omni.close()
