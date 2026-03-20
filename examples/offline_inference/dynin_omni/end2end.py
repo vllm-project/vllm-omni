@@ -1371,7 +1371,7 @@ def main() -> None:
     omni = Omni(model=model_source, stage_configs_path=stage_config_path, dtype=args.dtype)
     sampling_params_list = [
         SamplingParams(max_tokens=int(args.max_tokens_per_stage), temperature=0.0, top_p=1.0, detokenize=False)
-        for _ in range(len(omni.stage_list))
+        for _ in range(omni.num_stages)
     ]
 
     try:
