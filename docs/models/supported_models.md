@@ -55,6 +55,7 @@ th {
 |`VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/tts-model` |
 |`DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` |
 
+
 ## List of Supported Models for NPU
 
 <style>

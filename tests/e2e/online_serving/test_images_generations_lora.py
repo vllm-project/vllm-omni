@@ -147,7 +147,7 @@ def _basic_payload() -> dict:
 
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 def test_images_generations_per_request_lora_switching(omni_server: OmniServer, tmp_path: Path) -> None:
     # Base generation.
     base_img = _post_images(omni_server, _basic_payload())
