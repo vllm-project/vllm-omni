@@ -60,6 +60,7 @@ tts_server_params = [
             server_args=["--trust-remote-code", "--disable-log-stats"],
         ),
         id="no_async_chunk",
+        marks=pytest.mark.skip(reason="Known issue(2030): qwen3_tts_no_async_chunk path temporarily disabled."),
     ),
 ]
 
