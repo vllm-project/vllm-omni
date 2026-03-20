@@ -238,7 +238,7 @@ class OmniBase:
     ) -> OmniRequestOutput | None:
         req_id = result.get("request_id")
         engine_outputs = result.get("engine_outputs")
-        stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
+        stage_durations = getattr(engine_outputs, "stage_durations", {})
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")
@@ -248,21 +248,29 @@ class OmniBase:
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
         stage_meta = self.engine.get_stage_metadata(stage_id)
-        _m = result.get("metrics")
-        if finished and _m is not None:
-            metrics.accumulate_diffusion_metrics(
-                stage_meta["stage_type"],
-                req_id,
-                engine_outputs,
-            )
-            metrics.on_stage_metrics(
-                stage_id,
-                req_id,
-                _m,
-                stage_meta["final_output_type"],
+        output_to_yield = None
+        if stage_meta["final_output"]:
+            images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
+            output_to_yield = OmniRequestOutput(
+                stage_id=stage_id,
+                final_output_type=stage_meta["final_output_type"],
+                request_output=engine_outputs,
+                images=images,
+                stage_durations=stage_durations,
             )
 
-        if not stage_meta["final_output"]:
+        metrics.process_stage_metrics(
+            result=result,
+            stage_type=stage_meta["stage_type"],
+            stage_id=stage_id,
+            final_output_type=stage_meta["final_output_type"],
+            req_id=req_id,
+            engine_outputs=engine_outputs,
+            finished=finished,
+            output_to_yield=output_to_yield,
+        )
+
+        if output_to_yield is None:
             return None
 
         try:
@@ -276,14 +284,7 @@ class OmniBase:
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
-        images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
-        return OmniRequestOutput(
-            stage_id=stage_id,
-            final_output_type=stage_meta["final_output_type"],
-            request_output=engine_outputs,
-            images=images,
-            stage_durations=stage_durations,
-        )
+        return output_to_yield
 
     def shutdown(self) -> None:
         logger.info("[%s] Shutting down", self.__class__.__name__)
