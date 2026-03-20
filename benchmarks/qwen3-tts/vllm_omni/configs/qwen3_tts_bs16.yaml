@@ -21,7 +21,7 @@ stage_args:
       engine_output_type: latent
       gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 2048
+      max_num_batched_tokens: 4096
       max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     output_connectors:
