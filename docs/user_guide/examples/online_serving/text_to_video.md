@@ -100,6 +100,11 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o wan22_output.mp
 
 ## Request Format
 
+!!! note
+    The `POST /v1/videos` endpoint accepts **multipart/form-data** (`-F` flags
+    in curl), not a JSON request body. See the [Response Format](#response-format)
+    section below for the JSON returned after a job is created.
+
 ### Simple Text-to-Video Generation
 
 ```bash
@@ -145,9 +150,9 @@ curl -X POST http://localhost:8091/v1/videos \
 | `seed`                | int    | None    | Random seed (reproducible)                       |
 | `lora`                | object | None    | LoRA configuration                               |
 
-## Create Response Format
+## Response Format
 
-`POST /v1/videos` returns a job record.
+`POST /v1/videos` returns a JSON job record (not a video file).
 
 ```json
 {
