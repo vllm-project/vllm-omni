@@ -419,6 +419,7 @@ def load_and_resolve_stage_configs(
         stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
 
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
+    logger.debug(f"stage_configs: {stage_configs}")
 
     return config_path, stage_configs
 
