@@ -297,7 +297,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
-                extra_body = getattr(request, "extra_body", None) or {}
+                # vLLM internally merges extra_body fields into top-level attributes of
+                #   vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionRequest
+                #   and there is no more extra_body attribute.
+                # In addition, these extra attrs are hidden per default behavior of Pydantic BaseModel
+                #   (which ChatCompletionRequest inherits from).
+                # They are accessible via model_extra property.
+                extra_body = request.model_extra or {}
                 height = extra_body.get("height")
                 width = extra_body.get("width")
                 if "size" in extra_body:
@@ -2036,7 +2042,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Extract generation parameters from extra_body (preferred)
             # Reference: text_to_image.py and text_to_video.py for supported parameters
-            extra_body = getattr(request, "extra_body", None) or {}
+            # vLLM internally merges extra_body fields into top-level attributes of
+            #   vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionRequest
+            #   and there is no more extra_body attribute.
+            # In addition, these extra attrs are hidden per default behavior of Pydantic BaseModel
+            #   (which ChatCompletionRequest inherits from).
+            # They are accessible via model_extra property.
+            extra_body = request.model_extra or {}
 
             # Parse size if provided (supports "1024x1024" format)
             height = extra_body.get("height")
