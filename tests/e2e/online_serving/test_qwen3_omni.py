@@ -44,13 +44,9 @@ def get_chunk_config():
     return path
 
 
-# CI stage config for 2xH100-80G GPUs or AMD GPU MI325
-if current_omni_platform.is_rocm():
-    # ROCm stage config optimized for MI325 GPU
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
-elif current_omni_platform.is_xpu():
+if current_omni_platform.is_xpu():
     stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
-else:
+else:  # MI325 GPU should share the same config as H100
     stage_configs = [get_chunk_config()]
 
 # Create parameter combinations for model and stage config

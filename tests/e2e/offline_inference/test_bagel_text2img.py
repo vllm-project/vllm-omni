@@ -31,6 +31,7 @@ from PIL import Image
 from tests.conftest import modify_stage_config
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.platforms import current_omni_platform
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
@@ -48,6 +49,20 @@ REFERENCE_PIXELS = [
     {"position": (700, 700), "rgb": (247, 205, 146)},
     {"position": (256, 256), "rgb": (171, 160, 153)},
 ]
+
+if current_omni_platform.is_rocm():
+    REFERENCE_PIXELS = [
+        {"position": (100, 100), "rgb": (123, 119, 100)},
+        {"position": (400, 50), "rgb": (162, 161, 142)},
+        {"position": (700, 100), "rgb": (171, 156, 127)},
+        {"position": (150, 400), "rgb": (131, 128, 112)},
+        {"position": (512, 512), "rgb": (134, 61, 59)},
+        {"position": (700, 400), "rgb": (204, 107, 43)},
+        {"position": (100, 700), "rgb": (201, 180, 165)},
+        {"position": (400, 700), "rgb": (140, 108, 87)},
+        {"position": (700, 700), "rgb": (247, 205, 145)},
+        {"position": (256, 256), "rgb": (171, 160, 153)},
+    ]
 
 # Maximum allowed difference per color channel
 PIXEL_TOLERANCE = 5
@@ -181,7 +196,7 @@ def _resolve_stage_config(config_path: str, run_level: str) -> str:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
