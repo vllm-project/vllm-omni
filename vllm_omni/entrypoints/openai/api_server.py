@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import base64
+import inspect
 import io
 import json
 import multiprocessing
@@ -68,7 +69,10 @@ from vllm.entrypoints.openai.speech_to_text.serving import (
 )
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
-from vllm.entrypoints.pooling.embed.serving import OpenAIServingEmbedding
+try:
+    from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
+except ImportError:
+    from vllm.entrypoints.pooling.embed.serving import OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
 from vllm.entrypoints.pooling.score.serving import ServingScores
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
@@ -118,6 +122,20 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 logger = init_logger(__name__)
 router = APIRouter()
 profiler_router = APIRouter()
+
+
+def _construct_with_supported_kwargs(constructor: Any, *args: Any, **kwargs: Any) -> Any:
+    """Construct upstream serving helpers while tolerating kwarg drift across vLLM rebases."""
+    supported = inspect.signature(constructor).parameters
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in supported}
+    dropped = sorted(set(kwargs) - set(filtered_kwargs))
+    if dropped:
+        logger.debug(
+            "Dropping unsupported kwargs for %s: %s",
+            getattr(constructor, "__qualname__", constructor),
+            dropped,
+        )
+    return constructor(*args, **filtered_kwargs)
 
 
 def _should_enable_profiler_endpoints(args: Namespace) -> bool:
@@ -592,7 +610,8 @@ async def omni_init_app_state(
     await state.openai_serving_models.init_static_loras()
 
     state.openai_serving_responses = (
-        OpenAIServingResponses(
+        _construct_with_supported_kwargs(
+            OpenAIServingResponses,
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
@@ -612,7 +631,8 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_chat = (
-        OmniOpenAIServingChat(
+        _construct_with_supported_kwargs(
+            OmniOpenAIServingChat,
             engine_client,
             state.openai_serving_models,
             args.response_role,
@@ -637,10 +657,13 @@ async def omni_init_app_state(
     )
     # Warm up chat template processing to avoid first-request latency
     if state.openai_serving_chat is not None:
-        await state.openai_serving_chat.warmup()
+        warmup_result = state.openai_serving_chat.warmup()
+        if inspect.isawaitable(warmup_result):
+            await warmup_result
 
     state.openai_serving_completion = (
-        OpenAIServingCompletion(
+        _construct_with_supported_kwargs(
+            OpenAIServingCompletion,
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
@@ -653,7 +676,8 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_pooling = (
-        OpenAIServingPooling(
+        _construct_with_supported_kwargs(
+            OpenAIServingPooling,
             engine_client,
             state.openai_serving_models,
             supported_tasks=supported_tasks,
@@ -667,7 +691,8 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_embedding = (
-        OpenAIServingEmbedding(
+        _construct_with_supported_kwargs(
+            OpenAIServingEmbedding,
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
@@ -680,7 +705,8 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_classification = (
-        ServingClassification(
+        _construct_with_supported_kwargs(
+            ServingClassification,
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
@@ -693,7 +719,8 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_scores = (
-        ServingScores(
+        _construct_with_supported_kwargs(
+            ServingScores,
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
@@ -703,7 +730,8 @@ async def omni_init_app_state(
         if ("embed" in supported_tasks or "score" in supported_tasks)
         else None
     )
-    state.openai_serving_tokenization = OpenAIServingTokenization(
+    state.openai_serving_tokenization = _construct_with_supported_kwargs(
+        OpenAIServingTokenization,
         engine_client,
         state.openai_serving_models,
         request_logger=request_logger,
@@ -713,7 +741,8 @@ async def omni_init_app_state(
         log_error_stack=args.log_error_stack,
     )
     state.openai_serving_transcription = (
-        OpenAIServingTranscription(
+        _construct_with_supported_kwargs(
+            OpenAIServingTranscription,
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
@@ -724,7 +753,8 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_translation = (
-        OpenAIServingTranslation(
+        _construct_with_supported_kwargs(
+            OpenAIServingTranslation,
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
@@ -735,7 +765,8 @@ async def omni_init_app_state(
         else None
     )
     state.anthropic_serving_messages = (
-        AnthropicServingMessages(
+        _construct_with_supported_kwargs(
+            AnthropicServingMessages,
             engine_client,
             state.openai_serving_models,
             args.response_role,
@@ -753,7 +784,8 @@ async def omni_init_app_state(
         else None
     )
     state.serving_tokens = (
-        ServingTokens(
+        _construct_with_supported_kwargs(
+            ServingTokens,
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
