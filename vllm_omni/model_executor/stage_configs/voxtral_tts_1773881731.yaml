@@ -2,8 +2,8 @@ async_chunk: true
 stage_args:
 - stage_id: 0
   stage_type: llm
-  runtime: {process: true, devices: '0', max_batch_size: 32}
-  engine_args: {model_stage: audio_generation, model_arch: VoxtralTTSForConditionalGeneration,
+  runtime: {process: true, devices: '0'}
+  engine_args: {max_num_seqs: 32, model_stage: audio_generation, model_arch: VoxtralTTSForConditionalGeneration,
     worker_type: ar, worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker, scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler,
     gpu_memory_utilization: 0.8, enforce_eager: false, trust_remote_code: true, async_scheduling: true,
     engine_output_type: latent, enable_prefix_caching: false, tokenizer_mode: mistral,
@@ -17,8 +17,8 @@ stage_args:
     seed: 42, detokenize: true, repetition_penalty: 1.1}
 - stage_id: 1
   stage_type: llm
-  runtime: {process: true, devices: '0', max_batch_size: 32}
-  engine_args: {model_stage: audio_tokenizer, model_arch: VoxtralTTSForConditionalGeneration,
+  runtime: {process: true, devices: '0'}
+  engine_args: {max_num_seqs: 32, model_stage: audio_tokenizer, model_arch: VoxtralTTSForConditionalGeneration,
     worker_type: generation, worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker,
     scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler,
     async_scheduling: false, gpu_memory_utilization: 0.1, enforce_eager: true, trust_remote_code: true,

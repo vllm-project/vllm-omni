@@ -361,9 +361,9 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 64
     engine_args:
       model_stage: ar_stage
+      max_num_seqs: 64
       model_arch: YourTTSModelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -403,9 +403,9 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 64
     engine_args:
       model_stage: ar_stage
+      max_num_seqs: 64
       model_arch: YourTTSModelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler

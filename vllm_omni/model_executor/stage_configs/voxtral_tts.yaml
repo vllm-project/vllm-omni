@@ -5,8 +5,8 @@ stage_args:
     runtime:
       process: true            # Run this stage in a separate process
       devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
-      max_batch_size: 32
     engine_args:
+      max_num_seqs: 32
       model_stage: audio_generation
       model_arch: VoxtralTTSForConditionalGeneration
       worker_type: ar
@@ -43,8 +43,8 @@ stage_args:
     runtime:
       process: true
       devices: "0"
-      max_batch_size: 32
     engine_args:
+      max_num_seqs: 32
       model_stage: audio_tokenizer
       model_arch: VoxtralTTSForConditionalGeneration
       worker_type: generation
