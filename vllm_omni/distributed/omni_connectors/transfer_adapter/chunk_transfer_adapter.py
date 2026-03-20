@@ -246,6 +246,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(request_id, None)
+            # Clean up remaining per-request state (receiver-side dicts,
+            # pending load queue entries, etc.) that is not covered above.
+            self.cleanup(request.request_id, request_id)
 
     ########################################################################
     # Cleanup
