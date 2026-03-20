@@ -52,10 +52,97 @@ DEFAULT_VQ_AUDIO_SOURCE = "snu-aidas/emova_speech_tokenizer_vllm"
 DEFAULT_MAGVIT_REMOTE_CODE_REPO = "snu-aidas/magvitv2"
 DEFAULT_DYNIN_REMOTE_CODE_REPO = "snu-aidas/Dynin-Omni"
 
+DYNIN_TASK_DEFAULT_RUNTIME = {
+    "t2t": ("mmu", "mmu", 0, "text"),
+    "t2i": ("t2i", "t2i_gen", 2, "image"),
+    "t2s": ("t2s_mmu_like", "t2s_gen", 1, "audio"),
+    "i2i": ("i2i", "i2i", 2, "image"),
+}
+
+DYNIN_TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
+    "t2t": {
+        "prompt_max_text_len": 1024,
+        "max_new_tokens": 1024,
+        "steps": 1024,
+        "block_length": 16,
+        "temperature": 0.0,
+        "cfg_scale": 0.0,
+    },
+    "t2i": {
+        "prompt_max_text_len": 128,
+        "image_token_count": 1024,
+        "mask_token_id": 126336,
+        "codebook_size": 8192,
+        "timesteps": 20,
+        "guidance_scale": 3.5,
+        "temperature": 1.0,
+    },
+    "i2i": {
+        "prompt_max_text_len": 128,
+        "mask_token_id": 126336,
+        "codebook_size": 8192,
+        "timesteps": 64,
+        "guidance_scale": 3.5,
+        "temperature": 1.0,
+        "image_resolution": 336,
+        "use_train_i2i_prompt": True,
+    },
+    "t2s": {
+        "runtime_task": "t2s_mmu_like",
+        "prompting_task": "t2s_gen",
+        "prompt_max_text_len": 1024,
+        "t2s_token_length": 512,
+        "mask_token_id": 126336,
+        "codebook_size": 8192,
+        "audio_codebook_size": 4096,
+        "steps": 512,
+        "block_length": 128,
+        "temperature": 1.0,
+        "cfg_scale": 2.5,
+        "t2s_condition": "gender-female_emotion-neutral_speed-normal_pitch-normal",
+    },
+}
+
+DEFAULT_DYNIN_T2S_INSTRUCTION = "Please read the following text naturally."
+
+DYNIN_SPECIAL_TOKENS = (
+    "<|soi|>",
+    "<|eoi|>",
+    "<|sov|>",
+    "<|eov|>",
+    "<|t2i|>",
+    "<|mmu|>",
+    "<|t2v|>",
+    "<|v2v|>",
+    "<|lvg|>",
+    "<|i2i|>",
+    "<|ti2ti|>",
+    "<|v2t|>",
+    "<|v2s|>",
+    "<|s2t|>",
+    "<|t2s|>",
+    "<|s2s|>",
+    "<|soa|>",
+    "<|eoa|>",
+)
+
+_DYNIN_ONLINE_PROMPT_TOKEN_BY_TASK = {
+    "t2i": "<|t2i|>",
+    "i2i": "<|i2i|>",
+    "t2s": "<|t2s|>",
+}
+
+_DYNIN_MODALITY_PLACEHOLDERS = (
+    "<|soi|><|image|><|eoi|>",
+    "<|sov|><|video|><|eov|>",
+    "<|soa|><|audio|><|eoa|>",
+)
+
 _DYNIN_CONFIG_CANDIDATE_RELPATHS = (
     "configs/dynin_omni.yaml",
     "models/configs/dynin_omni.yaml",
     "vllm_omni/model_executor/models/dynin_omni/configs/dynin_omni.yaml",
+    "vllm_omni/model_executor/stage_configs/dynin_omni.yaml",
     "dynin_omni.yaml",
 )
 
@@ -128,6 +215,24 @@ def normalize_runtime_info(runtime_additional_information: Any) -> dict[str, Any
     if isinstance(runtime_additional_information, dict):
         return runtime_additional_information
     return {}
+
+
+def logical_dynin_task(task: Any) -> str:
+    task_text = str(unwrap_first_value(task, "") or "").strip().lower()
+    if task_text in ("t2s", "t2s_mmu_like", "t2s_fixed"):
+        return "t2s"
+    if task_text in ("t2i", "i2i"):
+        return task_text
+    return "t2t"
+
+
+def dynin_runtime_fallback(task: str, key: str, value: Any = None) -> Any:
+    if isinstance(value, str):
+        if value.strip() != "":
+            return value
+    elif value is not None:
+        return value
+    return DYNIN_TASK_RUNTIME_FALLBACKS.get(task, {}).get(key)
 
 
 def coerce_token_ids_1d(
@@ -375,6 +480,7 @@ def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) 
     for bundled in (
         module_root / "configs" / "dynin_omni.yaml",
         module_root / "models" / "configs" / "dynin_omni.yaml",
+        module_root.parent / "stage_configs" / "dynin_omni.yaml",
     ):
         if bundled.exists():
             return str(bundled)
@@ -900,3 +1006,234 @@ def get_dynin_magvit_attr(
     raise ImportError(
         f"Failed to resolve MAGVIT attr '{attr_name}' from source={resolved_source!r} (revision={resolved_revision!r})."
     )
+
+
+def build_dynin_chat_prompt(content: str) -> str:
+    return (
+        f"<|start_header_id|>user<|end_header_id|>\n{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+    )
+
+
+def extract_dynin_user_prompt_text(decoded_prompt: str) -> str:
+    text = str(decoded_prompt or "")
+    assistant_marker = "<|start_header_id|>assistant<|end_header_id|>"
+    user_marker = "<|start_header_id|>user<|end_header_id|>"
+    end_header_marker = "<|end_header_id|>"
+    eot_marker = "<|eot_id|>"
+
+    if assistant_marker in text:
+        text = text.rsplit(assistant_marker, 1)[0]
+    if eot_marker in text:
+        text = text.rsplit(eot_marker, 1)[0]
+    if user_marker in text:
+        text = text.rsplit(user_marker, 1)[-1]
+    if end_header_marker in text:
+        text = text.split(end_header_marker, 1)[-1]
+    return text.strip()
+
+
+def normalize_dynin_online_prompt_text(task: str, decoded_prompt: str) -> str:
+    text = extract_dynin_user_prompt_text(decoded_prompt)
+    if not text:
+        text = str(decoded_prompt or "")
+
+    for placeholder in _DYNIN_MODALITY_PLACEHOLDERS:
+        text = text.replace(placeholder, " ")
+
+    task_token = _DYNIN_ONLINE_PROMPT_TOKEN_BY_TASK.get(task)
+    if task_token:
+        text = text.replace(task_token, " ", 1)
+
+    text = " ".join(text.split()).strip()
+
+    if task == "t2s":
+        if not text:
+            text = "Hello. This is a default text-to-speech sample."
+        text = build_dynin_chat_prompt(f"{DEFAULT_DYNIN_T2S_INSTRUCTION}\n{text}")
+    elif task in {"t2i", "i2i"} and not text:
+        text = "A high quality detailed image."
+
+    return text
+
+
+def infer_dynin_online_task(
+    *,
+    decoded_prompt: str,
+    has_image: bool = False,
+    has_audio: bool = False,
+    has_video: bool = False,
+) -> str:
+    prompt = str(decoded_prompt or "")
+    if "<|i2i|>" in prompt:
+        return "i2i"
+    if "<|t2i|>" in prompt and not has_audio and not has_video:
+        return "t2i"
+    if "<|t2s|>" in prompt and not has_audio and not has_video:
+        return "t2s"
+    return "t2t"
+
+
+def build_dynin_prompt_payload(
+    *,
+    task: str,
+    text: str,
+    image_tokens: torch.Tensor | None,
+    image_placeholder_tokens: int,
+    audio_placeholder_tokens: int,
+    image_token_offset: int,
+    mask_token_id: int,
+    use_train_i2i_prompt: bool,
+) -> tuple[Any, str]:
+    _, prompting_task, _, _ = DYNIN_TASK_DEFAULT_RUNTIME[task]
+
+    if task == "t2t":
+        payload = ([[]], [build_dynin_chat_prompt(text)])
+        return payload, prompting_task
+
+    if task == "t2i":
+        image_placeholder = torch.full(
+            (1, int(image_placeholder_tokens)),
+            fill_value=int(mask_token_id),
+            dtype=torch.long,
+        )
+        payload = ([text], image_placeholder)
+        return payload, prompting_task
+
+    if task == "i2i":
+        if image_tokens is None:
+            raise ValueError("i2i requires image tokens")
+        src = image_tokens.view(1, -1).long() + int(image_token_offset)
+        target_len = int(image_placeholder_tokens) if image_placeholder_tokens > 0 else int(src.shape[1])
+        image_placeholder = torch.full(
+            (1, target_len),
+            fill_value=int(mask_token_id),
+            dtype=torch.long,
+        )
+        if use_train_i2i_prompt:
+            labels_placeholder = torch.full(
+                (1, target_len),
+                fill_value=-100,
+                dtype=torch.long,
+            )
+            payload = ([text], src, image_placeholder, labels_placeholder)
+            return payload, "i2i"
+        payload = ([text], src, image_placeholder)
+        return payload, "i2i_gen"
+
+    if task == "t2s":
+        audio_placeholder = torch.full(
+            (1, int(audio_placeholder_tokens)),
+            fill_value=int(mask_token_id),
+            dtype=torch.long,
+        )
+        payload = ([text], audio_placeholder)
+        return payload, prompting_task
+
+    raise ValueError(f"Unsupported Dynin online bootstrap task: {task}")
+
+
+def _wrap_runtime_field(value: Any) -> list[Any]:
+    return [value]
+
+
+def build_dynin_online_runtime_info(
+    *,
+    task: str,
+    text_vocab_size: int,
+    infer_sources: DyninInferSources,
+    dynin_config_path: str | None = None,
+    prompting_input: Any | None = None,
+    attention_mask: list[int] | None = None,
+    prompt_length: int | None = None,
+    uncond_prompting_input: Any | None = None,
+    image_token_count: int = 0,
+    t2s_token_length: int | None = None,
+    use_train_i2i_prompt: bool | None = None,
+) -> dict[str, Any]:
+    runtime_task, prompting_task, detok_id, _ = DYNIN_TASK_DEFAULT_RUNTIME[task]
+
+    prompt_max_text_len = int(dynin_runtime_fallback(task, "prompt_max_text_len", None) or 1024)
+    max_new_tokens = int(dynin_runtime_fallback(task, "max_new_tokens", None) or 256)
+    steps = int(dynin_runtime_fallback(task, "steps", None) or 256)
+    block_length = int(dynin_runtime_fallback(task, "block_length", None) or 2)
+    temperature = float(dynin_runtime_fallback(task, "temperature", None) or 0.0)
+    cfg_scale = float(dynin_runtime_fallback(task, "cfg_scale", None) or 0.0)
+    remasking = str(dynin_runtime_fallback(task, "remasking", None) or "low_confidence")
+    timesteps = int(dynin_runtime_fallback(task, "timesteps", None) or 20)
+    guidance_scale = float(dynin_runtime_fallback(task, "guidance_scale", None) or 0.0)
+    mask_token_id = int(dynin_runtime_fallback(task, "mask_token_id", None) or 126336)
+    codebook_size = int(dynin_runtime_fallback(task, "codebook_size", None) or 8192)
+    audio_codebook_size = int(dynin_runtime_fallback(task, "audio_codebook_size", None) or 4096)
+    image_resolution = int(dynin_runtime_fallback(task, "image_resolution", None) or 336)
+    if image_token_count <= 0 and task in {"t2i", "i2i"}:
+        fallback_count = dynin_runtime_fallback(task, "image_token_count", None)
+        if fallback_count is not None:
+            image_token_count = int(fallback_count)
+        else:
+            image_token_count = max(1, (image_resolution // 16) ** 2)
+
+    if t2s_token_length is None:
+        t2s_token_length = int(dynin_runtime_fallback(task, "t2s_token_length", None) or 383)
+    t2s_condition = str(
+        dynin_runtime_fallback(
+            task,
+            "t2s_condition",
+            None,
+        )
+        or "gender-female_emotion-neutral_speed-normal_pitch-normal"
+    )
+    if use_train_i2i_prompt is None:
+        use_train_i2i_prompt = bool(dynin_runtime_fallback(task, "use_train_i2i_prompt", task == "i2i"))
+
+    runtime_info: dict[str, Any] = {
+        "task": _wrap_runtime_field(runtime_task),
+        "prompting_task": _wrap_runtime_field(prompting_task),
+        "detok_id": _wrap_runtime_field(int(detok_id)),
+        "prompt_max_text_len": _wrap_runtime_field(prompt_max_text_len),
+        "prompting_max_text_len": _wrap_runtime_field(prompt_max_text_len),
+        "cond_dropout_prob": _wrap_runtime_field(0.0),
+        "prompting_cond_dropout_prob": _wrap_runtime_field(0.0),
+        "tokenizer_path": _wrap_runtime_field(str(infer_sources.tokenizer_source)),
+        "text_vocab_size": _wrap_runtime_field(int(text_vocab_size)),
+        "model_local_files_only": _wrap_runtime_field(bool(infer_sources.model_local_files_only)),
+        "max_new_tokens": _wrap_runtime_field(int(t2s_token_length if task == "t2s" else max_new_tokens)),
+        "steps": _wrap_runtime_field(steps),
+        "block_length": _wrap_runtime_field(block_length),
+        "temperature": _wrap_runtime_field(temperature),
+        "cfg_scale": _wrap_runtime_field(cfg_scale),
+        "remasking": _wrap_runtime_field(remasking),
+        "mask_id": _wrap_runtime_field(mask_token_id),
+        "mask_token_id": _wrap_runtime_field(mask_token_id),
+        "codebook_size": _wrap_runtime_field(codebook_size),
+        "audio_codebook_size": _wrap_runtime_field(audio_codebook_size),
+        "timesteps": _wrap_runtime_field(timesteps),
+        "guidance_scale": _wrap_runtime_field(guidance_scale),
+        "noise_type": _wrap_runtime_field("mask"),
+        "noise_schedule_name": _wrap_runtime_field("cosine"),
+        "noise_schedule_params": _wrap_runtime_field({}),
+        "seq_len": _wrap_runtime_field(int(image_token_count)),
+        "condition": _wrap_runtime_field(t2s_condition),
+        "t2s_condition": _wrap_runtime_field(t2s_condition),
+        "vq_model_image_path": _wrap_runtime_field(str(infer_sources.vq_image_source)),
+        "vq_model_image_local_files_only": _wrap_runtime_field(bool(infer_sources.vq_image_local_files_only)),
+        "vq_model_audio_path": _wrap_runtime_field(str(infer_sources.vq_audio_source)),
+        "vq_model_audio_local_files_only": _wrap_runtime_field(bool(infer_sources.vq_audio_local_files_only)),
+        "image_resolution": _wrap_runtime_field(image_resolution),
+        "t2s_token_length": _wrap_runtime_field(int(t2s_token_length)),
+        "use_train_i2i_prompt": _wrap_runtime_field(bool(use_train_i2i_prompt)),
+    }
+
+    if dynin_config_path:
+        runtime_info["dynin_config_path"] = _wrap_runtime_field(str(dynin_config_path))
+    if prompting_input is not None:
+        runtime_info["prompting_input"] = _wrap_runtime_field(prompting_input)
+    if uncond_prompting_input is not None:
+        runtime_info["uncond_prompting_input"] = _wrap_runtime_field(uncond_prompting_input)
+    if attention_mask:
+        runtime_info["attention_mask"] = _wrap_runtime_field(list(attention_mask))
+    if prompt_length is None and attention_mask:
+        prompt_length = len(attention_mask)
+    if prompt_length is not None:
+        runtime_info["prompt_length"] = _wrap_runtime_field(int(prompt_length))
+
+    return runtime_info

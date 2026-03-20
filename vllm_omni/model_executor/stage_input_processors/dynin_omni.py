@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import torch
@@ -59,6 +60,32 @@ def _normalize_additional_info(value: Any) -> dict[str, Any]:
     return normalized
 
 
+def _decode_runtime_bridge_info(value: Any) -> dict[str, Any]:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().to("cpu").reshape(-1).to(torch.uint8)
+        raw = bytes(tensor.tolist())
+    elif isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    elif isinstance(value, list):
+        try:
+            raw = bytes(int(item) for item in value)
+        except Exception:
+            return {}
+    elif value is None:
+        return {}
+    else:
+        return value if isinstance(value, dict) else {}
+
+    if not raw:
+        return {}
+
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
 def _bridge_tokens(
     stage_list,
     engine_input_source,
@@ -99,8 +126,12 @@ def _bridge_tokens(
         detok_id = _to_int(mm_out.get("detok_id"), default=0)
         src_prompt = prompt_meta_by_reqid.get(source_output.request_id, {})
         src_additional_info = src_prompt.get("additional_information", {}) or {}
+        runtime_bridge_info = _decode_runtime_bridge_info(mm_out.get("runtime_info_json"))
+        if not runtime_bridge_info:
+            runtime_bridge_info = mm_out.get("runtime_info", {}) or {}
 
         additional_information: dict[str, Any] = _normalize_additional_info(src_additional_info)
+        additional_information.update(_normalize_additional_info(runtime_bridge_info))
         additional_information["detok_id"] = [detok_id]
 
         next_inputs.append(

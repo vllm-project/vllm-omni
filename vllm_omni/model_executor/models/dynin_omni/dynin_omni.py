@@ -471,6 +471,7 @@ class DyninOmniStageBase(nn.Module):
     dummy_inputs=DyninOmniDummyInputsBuilder,
 )
 class DyninOmniForConditionalGeneration(nn.Module, SupportsMultiModal):
+    supports_multimodal_raw_input_only = True
     STAGE_ALIAS = {
         "tokenizer": "token2text",
         "token2token": "token2text",

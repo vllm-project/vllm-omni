@@ -5,27 +5,23 @@ from __future__ import annotations
 
 import argparse
 import base64
-import importlib.util
 import json
 import mimetypes
 import os
 import time
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 DEFAULT_MODEL = "snu-aidas/Dynin-Omni"
 DEFAULT_OUTPUT_DIR = "/tmp/dynin_online_outputs"
 
-QUERY_CHOICES = ("t2t", "t2i", "t2s", "i2i")
+QUERY_CHOICES = ("t2i", "t2s", "i2i")
 DEFAULT_PROMPT_BY_QUERY = {
-    "t2t": "Explain multimodal LLM inference in 3 sentences.",
     "t2i": "A high quality detailed living room interior photo.",
     "t2s": "Please read this sentence naturally: Hello from Dynin-Omni online serving.",
     "i2i": "Transform this image into a realistic indoor living room while preserving layout.",
 }
 DEFAULT_MODALITIES_BY_QUERY = {
-    "t2t": ["text"],
     "t2i": ["image"],
     "t2s": ["audio"],
     "i2i": ["image"],
@@ -37,7 +33,6 @@ OFFLINE_PARITY_STAGE_SAMPLING = {
     "top_p": 1.0,
     "detokenize": False,
 }
-END2END_PARITY_TASKS = {"t2i", "t2s", "i2i"}
 
 
 def _infer_mime_type(path: Path) -> str:
@@ -63,9 +58,6 @@ def _to_image_url(path_or_url: str) -> str:
 
 
 def _build_user_content(query_type: str, prompt: str, image_path: str | None) -> list[dict[str, Any]]:
-    if query_type == "t2t":
-        return [{"type": "text", "text": prompt}]
-
     if query_type == "t2i":
         return [{"type": "text", "text": f"<|t2i|> {prompt}"}]
 
@@ -81,243 +73,6 @@ def _build_user_content(query_type: str, prompt: str, image_path: str | None) ->
         ]
 
     raise ValueError(f"Unsupported query_type: {query_type}")
-
-
-@lru_cache(maxsize=1)
-def _load_offline_end2end_module() -> Any:
-    path = Path(__file__).resolve().parents[2] / "offline_inference" / "dynin_omni" / "end2end.py"
-    spec = importlib.util.spec_from_file_location("dynin_end2end_offline", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load end2end module spec from: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _to_jsonable(value: Any) -> Any:
-    # Convert tensors/ndarrays in prompting payloads to JSON-serializable forms.
-    if isinstance(value, dict):
-        return {str(k): _to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_jsonable(v) for v in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-
-    detach = getattr(value, "detach", None)
-    if callable(detach):
-        value = detach()
-    cpu = getattr(value, "cpu", None)
-    if callable(cpu):
-        value = cpu()
-    tolist = getattr(value, "tolist", None)
-    if callable(tolist):
-        try:
-            return _to_jsonable(tolist())
-        except Exception:
-            pass
-    return value
-
-
-def _build_end2end_style_inputs(
-    *,
-    query_type: str,
-    prompt: str,
-    image_path: str | None,
-    model: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    if query_type not in END2END_PARITY_TASKS:
-        return _build_user_content(query_type=query_type, prompt=prompt, image_path=image_path), {}
-
-    offline = _load_offline_end2end_module()
-
-    task_name = query_type
-    default_runtime_task, default_prompting_task, default_detok_id, _ = offline.TASK_DEFAULT_RUNTIME[task_name]
-    runtime_task = str(offline._runtime_fallback(task_name, "runtime_task", None) or default_runtime_task)
-    prompting_task = str(offline._runtime_fallback(task_name, "prompting_task", None) or default_prompting_task)
-    detok_id_default = offline._runtime_fallback(task_name, "detok_id", None)
-    if detok_id_default is None:
-        detok_id_default = default_detok_id
-    detok_id = int(detok_id_default)
-
-    image_resolution = int(offline._runtime_fallback(task_name, "image_resolution", None) or 336)
-    prompt_max_text_len = int(offline._runtime_fallback(task_name, "prompt_max_text_len", None) or 1024)
-    max_new_tokens = int(offline._runtime_fallback(task_name, "max_new_tokens", None) or 256)
-    steps = int(offline._runtime_fallback(task_name, "steps", None) or 256)
-    block_length = int(offline._runtime_fallback(task_name, "block_length", None) or 2)
-    temperature = float(offline._runtime_fallback(task_name, "temperature", None) or 0.0)
-    cfg_scale = float(offline._runtime_fallback(task_name, "cfg_scale", None) or 0.0)
-    remasking = str(offline._runtime_fallback(task_name, "remasking", None) or "low_confidence")
-    timesteps = int(offline._runtime_fallback(task_name, "timesteps", None) or 20)
-    guidance_scale = float(offline._runtime_fallback(task_name, "guidance_scale", None) or 0.0)
-    mask_token_id = int(offline._runtime_fallback(task_name, "mask_token_id", None) or 126336)
-    codebook_size = int(offline._runtime_fallback(task_name, "codebook_size", None) or 8192)
-    audio_codebook_size = int(offline._runtime_fallback(task_name, "audio_codebook_size", None) or 4096)
-
-    image_token_count_value = offline._runtime_fallback(task_name, "image_token_count", None)
-    image_token_count = int(image_token_count_value) if image_token_count_value is not None else 0
-    t2s_token_length = int(offline._runtime_fallback(task_name, "t2s_token_length", None) or 383)
-    t2s_condition = str(
-        offline._runtime_fallback(task_name, "t2s_condition", None)
-        or "gender-female_emotion-neutral_speed-normal_pitch-normal"
-    )
-    use_train_i2i_prompt = offline._runtime_fallback(task_name, "use_train_i2i_prompt", None)
-    if use_train_i2i_prompt is None:
-        use_train_i2i_prompt = bool(task_name == "i2i")
-    use_train_i2i_prompt = bool(use_train_i2i_prompt)
-
-    text = prompt.strip()
-    if task_name == "t2s":
-        if not text:
-            text = "Hello. This is a default text-to-speech sample."
-        instruction = str(offline._runtime_fallback(task_name, "instruction", None) or "").strip()
-        if not instruction:
-            instruction = str(offline.DEFAULT_T2S_INSTRUCTION)
-        text = offline.build_chat_prompt(f"{instruction}\n{text}")
-    elif task_name in {"t2i", "i2i"} and not text:
-        text = "A high quality detailed image."
-
-    model_source = str(model).strip()
-    tokenizer_source = model_source
-    model_local_only = offline.resolve_local_only(None, model_source, default=Path(model_source).expanduser().is_dir())
-    tokenizer_local_only = offline.resolve_local_only(
-        None,
-        tokenizer_source,
-        default=bool(model_local_only),
-    )
-    tokenizer = offline.load_text_tokenizer(tokenizer_source, local_files_only=bool(tokenizer_local_only))
-    text_vocab_size = int(len(tokenizer))
-
-    image_tokens = None
-    vq_image_source = "snu-aidas/magvitv2"
-    vq_audio_source = "snu-aidas/emova_speech_tokenizer_vllm"
-    vq_image_local_only = offline.resolve_local_only(None, vq_image_source, default=False)
-    vq_audio_local_only = offline.resolve_local_only(None, vq_audio_source, default=False)
-
-    if task_name == "i2i":
-        if not image_path:
-            raise ValueError("--image-path is required for query type i2i")
-        torch_mod = offline.torch
-        device = torch_mod.device("cuda" if torch_mod.cuda.is_available() else "cpu")
-        vq_image = offline.load_vq_image_encoder(vq_image_source, bool(vq_image_local_only), device)
-        image_tokens = offline.encode_image_tokens(
-            Path(image_path).expanduser().resolve(),
-            vq_model=vq_image,
-            device=device,
-            resolution=int(image_resolution),
-        )
-        if hasattr(vq_image, "cpu"):
-            vq_image = vq_image.cpu()
-
-    if image_token_count <= 0:
-        if image_tokens is not None:
-            image_token_count = int(image_tokens.numel())
-        else:
-            image_token_count = max(1, (int(image_resolution) // 16) ** 2)
-
-    max_audio_len_for_prompt = int(max(t2s_token_length, 512))
-    max_audio_len_short_for_prompt = max(256, max_audio_len_for_prompt // 2)
-    cond_dropout_prob = 0.0
-    uni_prompting = offline.load_universal_prompting(
-        tokenizer=tokenizer,
-        tokenizer_source=tokenizer_source,
-        max_text_len=int(prompt_max_text_len),
-        cond_dropout_prob=float(cond_dropout_prob),
-        local_files_only=bool(tokenizer_local_only),
-        max_audio_len=int(max_audio_len_for_prompt),
-        max_audio_len_short=int(max_audio_len_short_for_prompt),
-    )
-
-    prompt_payload, prompting_task = offline.make_prompt_payload(
-        task=task_name,
-        text=text,
-        image_tokens=image_tokens,
-        audio_tokens=None,
-        video_tokens=None,
-        image_placeholder_tokens=int(image_token_count),
-        audio_placeholder_tokens=int(t2s_token_length),
-        image_token_offset=int(text_vocab_size),
-        speech_token_offset=int(text_vocab_size) + int(codebook_size),
-        mask_token_id=int(mask_token_id),
-        use_train_i2i_prompt=bool(use_train_i2i_prompt),
-    )
-    _prompt_token_ids, prompt_attention_mask = offline._run_uni_prompting(uni_prompting, prompt_payload, prompting_task)
-    if not prompt_attention_mask:
-        prompt_attention_mask = [1] * len(_prompt_token_ids)
-
-    uncond_payload = None
-    if task_name in {"t2i", "i2i"} and guidance_scale > 0:
-        uncond_payload, uncond_prompting_task = offline.make_prompt_payload(
-            task=task_name,
-            text="",
-            image_tokens=image_tokens,
-            audio_tokens=None,
-            video_tokens=None,
-            image_placeholder_tokens=int(image_token_count),
-            audio_placeholder_tokens=int(t2s_token_length),
-            image_token_offset=int(text_vocab_size),
-            speech_token_offset=int(text_vocab_size) + int(codebook_size),
-            mask_token_id=int(mask_token_id),
-            use_train_i2i_prompt=bool(use_train_i2i_prompt),
-        )
-
-    dynin_config_default = (
-        Path(__file__).resolve().parents[3]
-        / "vllm_omni"
-        / "model_executor"
-        / "models"
-        / "dynin_omni"
-        / "configs"
-        / "dynin_omni.yaml"
-    )
-    dynin_config_path = os.environ.get("DYNIN_CONFIG_PATH", str(dynin_config_default))
-
-    runtime_info: dict[str, Any] = {
-        "task": [runtime_task],
-        "prompting_task": [prompting_task],
-        "prompting_input": [_to_jsonable(prompt_payload)],
-        "detok_id": [int(detok_id)],
-        "dynin_config_path": [str(dynin_config_path)],
-        "attention_mask": [prompt_attention_mask],
-        "prompt_max_text_len": [int(prompt_max_text_len)],
-        "prompting_max_text_len": [int(prompt_max_text_len)],
-        "cond_dropout_prob": [float(cond_dropout_prob)],
-        "prompting_cond_dropout_prob": [float(cond_dropout_prob)],
-        "tokenizer_path": [str(tokenizer_source)],
-        "text_vocab_size": [int(text_vocab_size)],
-        "model_local_files_only": [bool(model_local_only)],
-        "max_new_tokens": [int(max_new_tokens)],
-        "steps": [int(steps)],
-        "block_length": [int(block_length)],
-        "temperature": [float(temperature)],
-        "cfg_scale": [float(cfg_scale)],
-        "remasking": [str(remasking)],
-        "mask_id": [int(mask_token_id)],
-        "mask_token_id": [int(mask_token_id)],
-        "codebook_size": [int(codebook_size)],
-        "audio_codebook_size": [int(audio_codebook_size)],
-        "timesteps": [int(timesteps)],
-        "guidance_scale": [float(guidance_scale)],
-        "noise_type": ["mask"],
-        "noise_schedule_name": ["cosine"],
-        "noise_schedule_params": [{}],
-        "seq_len": [int(image_token_count)],
-        "condition": [str(t2s_condition)],
-        "vq_model_image_path": [str(vq_image_source)],
-        "vq_model_image_local_files_only": [bool(vq_image_local_only)],
-        "vq_model_audio_path": [str(vq_audio_source)],
-        "vq_model_audio_local_files_only": [bool(vq_audio_local_only)],
-    }
-    if uncond_payload is not None:
-        runtime_info["uncond_prompting_input"] = [_to_jsonable(uncond_payload)]
-    if task_name == "t2s":
-        runtime_info["max_new_tokens"] = [int(t2s_token_length)]
-
-    user_content = _build_user_content(
-        query_type=query_type,
-        prompt=text,
-        image_path=image_path,
-    )
-    return user_content, runtime_info
 
 
 def _collect_text_from_content(content: Any) -> list[str]:
@@ -491,24 +246,12 @@ def run_request(args: argparse.Namespace) -> None:
         api_key="EMPTY",
         base_url=f"http://{args.host}:{args.port}/v1",
     )
-
     prompt = args.prompt.strip() if args.prompt else DEFAULT_PROMPT_BY_QUERY[args.query_type]
-    try:
-        user_content, runtime_info = _build_end2end_style_inputs(
-            query_type=args.query_type,
-            prompt=prompt,
-            image_path=args.image_path,
-            model=args.model,
-        )
-    except Exception as exc:
-        print(f"[dynin-online] warning: end2end-style input build failed, fallback to simple mode: {exc}")
-        user_content = _build_user_content(
-            query_type=args.query_type,
-            prompt=prompt,
-            image_path=args.image_path,
-        )
-        runtime_info = {}
-
+    user_content = _build_user_content(
+        query_type=args.query_type,
+        prompt=prompt,
+        image_path=args.image_path,
+    )
     if args.modalities:
         modalities = [item.strip() for item in args.modalities.split(",") if item.strip()]
     else:
@@ -517,18 +260,12 @@ def run_request(args: argparse.Namespace) -> None:
     extra_body = {
         "sampling_params_list": _build_offline_parity_sampling_params_list(),
     }
-    if runtime_info:
-        # Carry offline-style runtime information in OpenAI request body.
-        # Server-side path must forward this into engine prompt as additional_information.
-        extra_body["additional_information"] = runtime_info
-
     chat_completion = client.chat.completions.create(
         model=args.model,
         messages=[{"role": "user", "content": user_content}],
         modalities=modalities,
         extra_body=extra_body,
     )
-
     _save_outputs(
         query_type=args.query_type,
         chat_completion=chat_completion,
