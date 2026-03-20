@@ -40,16 +40,19 @@ def make_output_msg(
     stage_id: int,
     *,
     payload: str,
-    finished: bool,
+    output_finished: bool,
+    finished: bool | None = None,
     images: list[str] | None = None,
 ) -> dict[str, Any]:
+    if finished is None:
+        finished = output_finished
     return {
         "type": "output",
         "request_id": request_id,
         "stage_id": stage_id,
         "engine_outputs": FakeEngineOutput(
             payload=payload,
-            finished=finished,
+            finished=output_finished,
             images=images,
         ),
         "finished": finished,
@@ -60,7 +63,7 @@ def make_output_msg(
 class FakeAsyncOmniEngine:
     def __init__(
         self,
-        model: str,
+        model: str = "dummy-model",
         *,
         stage_metadata: list[dict[str, Any]] | None = None,
         default_sampling_params_list: list[Any] | None = None,
@@ -154,6 +157,7 @@ def _enqueue_async_three_stage_outputs(engine: FakeAsyncOmniEngine, msg: dict[st
                 request_id,
                 0,
                 payload=f"{request_id}-stage0-{idx}",
+                output_finished=(idx == 2),
                 finished=False,
             )
         )
@@ -163,6 +167,7 @@ def _enqueue_async_three_stage_outputs(engine: FakeAsyncOmniEngine, msg: dict[st
                 request_id,
                 1,
                 payload=f"{request_id}-stage1-{idx}",
+                output_finished=(idx == 2),
                 finished=False,
             )
         )
@@ -172,6 +177,7 @@ def _enqueue_async_three_stage_outputs(engine: FakeAsyncOmniEngine, msg: dict[st
                 request_id,
                 2,
                 payload=f"{request_id}-stage2-{idx}",
+                output_finished=(idx == 2),
                 finished=(idx == 2),
                 images=[f"{request_id}-img-{idx}"],
             )
@@ -185,6 +191,7 @@ def _enqueue_async_finish_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, An
             request_id,
             0,
             payload=f"{request_id}-stage0",
+            output_finished=True,
             finished=False,
         )
     )
@@ -193,6 +200,7 @@ def _enqueue_async_finish_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, An
             request_id,
             2,
             payload=f"{request_id}-stage2-final",
+            output_finished=True,
             finished=True,
             images=[f"{request_id}-img-final"],
         )
@@ -215,6 +223,7 @@ def _enqueue_omni_final_only_outputs(engine: FakeAsyncOmniEngine, msg: dict[str,
                 request_id,
                 0,
                 payload=f"{request_id}-stage0-{idx}",
+                output_finished=(idx == stage0_count - 1),
                 finished=False,
             )
         )
@@ -225,6 +234,7 @@ def _enqueue_omni_final_only_outputs(engine: FakeAsyncOmniEngine, msg: dict[str,
                 request_id,
                 1,
                 payload=f"{request_id}-stage1-{idx}",
+                output_finished=(idx == stage1_count - 1),
                 finished=False,
             )
         )
@@ -234,6 +244,7 @@ def _enqueue_omni_final_only_outputs(engine: FakeAsyncOmniEngine, msg: dict[str,
             request_id,
             2,
             payload=f"{request_id}-stage2-final",
+            output_finished=True,
             finished=True,
             images=[f"{request_id}-img-final"],
         )
@@ -245,10 +256,17 @@ async def test_async_omni_yields_only_final_stage_outputs(monkeypatch: pytest.Mo
     engine = FakeAsyncOmniEngine(
         stage_metadata=THREE_STAGE_META,
         on_add_request=lambda eng, msg: eng.output_q.put_nowait(
-            make_output_msg(msg["request_id"], 1, payload="non-final", finished=False)
+            make_output_msg(msg["request_id"], 1, payload="non-final", output_finished=True, finished=False)
         )
         or eng.output_q.put_nowait(
-            make_output_msg(msg["request_id"], 2, payload="final", finished=True, images=["final-img"])
+            make_output_msg(
+                msg["request_id"],
+                2,
+                payload="final",
+                output_finished=True,
+                finished=True,
+                images=["final-img"],
+            )
         ),
     )
     _patch_engine(monkeypatch, engine)
