@@ -95,6 +95,9 @@ def get_qwen_image_layered_pre_process_func(
             else:
                 image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
 
+            if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
+                image = image.convert("RGBA")
+
             # 1. calculate dimensions
             image_size = image.size
             assert request.sampling_params.resolution in [640, 1024], (
@@ -652,6 +655,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             width = req.sampling_params.width
         else:
             # fallback to run pre-processing in pipeline (debug only)
+            if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
+                image = image.convert("RGBA")
             image_size = image[0].size if isinstance(image, list) else image.size
             assert resolution in [640, 1024], f"resolution must be either 640 or 1024, but got {resolution}"
             calculated_width, calculated_height = calculate_dimensions(

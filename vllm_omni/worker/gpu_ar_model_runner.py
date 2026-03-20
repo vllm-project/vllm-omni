@@ -575,10 +575,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         if sub_dict:
                             mm_cpu[k] = sub_dict
                     elif isinstance(v, list):
-                        element = v[0]
-                        if isinstance(element, torch.Tensor):
-                            element = element.detach().to("cpu").contiguous()
-                        mm_cpu[k] = element
+                        if len(v) == 0:
+                            continue
+                        cpu_list = []
+                        for elem in v:
+                            if isinstance(elem, torch.Tensor):
+                                cpu_list.append(elem.detach().to("cpu").contiguous())
+                            else:
+                                cpu_list.append(elem)
+                        mm_cpu[k] = cpu_list
                 except Exception as e:
                     logger.error(f"Error in merge multimodal outputs: {e}")
 
@@ -597,6 +602,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         mm_payload[k] = v[start:end].contiguous()
                     elif isinstance(v, dict):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
+                    elif isinstance(v, list):
+                        element = v[idx] if idx < len(v) else v[0]
+                        # Clone tensors to avoid cross-request aliasing
+                        if isinstance(element, torch.Tensor):
+                            element = element.clone()
+                        mm_payload[k] = element
                     elif isinstance(v, torch.Tensor):
                         # List-derived tensor payloads are request-invariant; clone to
                         # avoid accidental cross-request aliasing on downstream mutation.
