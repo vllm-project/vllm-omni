@@ -281,7 +281,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
+                scheduler_output, defer_finalize=not clear_kv_metadata
             ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
@@ -353,7 +353,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         # Clear KV connector metadata after draft model runs (if spec decode).
         if self.speculative_config is not None:
-            self.clear_kv_connector_metadata()
+            self.finalize_kv_connector()
 
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
