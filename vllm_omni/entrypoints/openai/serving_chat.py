@@ -300,7 +300,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # vLLM internally merges extra_body fields into top-level attributes of
                 #   vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionRequest
                 #   and there is no more extra_body attribute.
-                # In addition, these extra attrs are hidden per default behavior of Pydantic BaseModel
+                # In addition, these extra attrs are hidden as the default behavior of Pydantic BaseModel
                 #   (which ChatCompletionRequest inherits from).
                 # They are accessible via model_extra property.
                 extra_body = request.model_extra or {}
@@ -2045,7 +2045,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # vLLM internally merges extra_body fields into top-level attributes of
             #   vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionRequest
             #   and there is no more extra_body attribute.
-            # In addition, these extra attrs are hidden per default behavior of Pydantic BaseModel
+            # In addition, these extra attrs are hidden as the default behavior of Pydantic BaseModel
             #   (which ChatCompletionRequest inherits from).
             # They are accessible via model_extra property.
             extra_body = request.model_extra or {}
