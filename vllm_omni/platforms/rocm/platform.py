@@ -99,3 +99,17 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.cuda.mem_get_info(device)
         return free
+
+    @classmethod
+    def set_device_control_env_var(cls, devices: str | int | None) -> None:
+        import os
+
+        os.environ["HIP_VISIBLE_DEVICES"] = devices
+        os.environ["CUDA_VISIBLE_DEVICES"] = devices
+
+    @classmethod
+    def unset_device_control_env_var(cls) -> None:
+        import os
+
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)

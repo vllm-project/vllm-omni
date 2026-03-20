@@ -127,6 +127,7 @@ class DiffusionModelRunner:
                     load_device=load_device,
                     load_format=load_format,
                     custom_pipeline_name=custom_pipeline_name,
+                    device=self.device,
                 )
         time_after_load = time.perf_counter()
 
@@ -220,6 +221,7 @@ class DiffusionModelRunner:
                 not getattr(req, "skip_cache_refresh", False)
                 and self.cache_backend is not None
                 and self.cache_backend.is_enabled()
+                and req.sampling_params.num_inference_steps is not None
             ):
                 self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 
