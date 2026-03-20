@@ -235,6 +235,15 @@ async def _handle_collective_rpc(
         "start_profile",
         "stop_profile",
     }:
+        # Reconstruct LoRARequest after IPC if needed.
+        # LoRARequest is a msgspec.Struct with array_like=True,
+        # so msgpack deserializes it as a plain list.
+        if method == "add_lora" and args:
+            from vllm.lora.request import LoRARequest
+
+            if not isinstance(args[0], LoRARequest):
+                args = (msgspec.convert(args[0], LoRARequest), *args[1:])
+
         target = getattr(engine, method, None)
         if target is None:
             return {
