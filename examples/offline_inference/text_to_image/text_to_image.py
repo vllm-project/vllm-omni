@@ -131,12 +131,10 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "gguf"],
-        help=(
-            "Quantization method for the transformer. "
-            "Options: 'fp8' (FP8 W8A8), 'gguf' (GGUF quantized weights). "
-            "Default: None (no quantization, uses BF16)."
-        ),
+        choices=["fp8", "int8", "gguf"],
+        help="Quantization method for the transformer. "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
+        "Default: None (no quantization, uses BF16).",
     )
     parser.add_argument(
         "--gguf-model",

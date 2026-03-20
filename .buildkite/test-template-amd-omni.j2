@@ -40,9 +40,14 @@
           {% else %}
           queue: amd_mi325_1
           {% endif %}
-        command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh "(command rocm-smi || true) && cd {{ (step.working_dir or default_working_dir) | safe  }} ; {{ step.command  or (step.commands | join(" && ")) | safe }}"
+{% set cmd_body = (step.command or (step.commands | join("\n"))) | trim %}
+{% set indented_cmd = cmd_body | replace("\n", "\n            ") %}
+        command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh
         env:
           DOCKER_BUILDKIT: "1"
+          TEST_COMMAND: |-
+            (command rocm-smi || true) && cd {{ (step.working_dir or default_working_dir) | safe }}
+            {{ indented_cmd | safe }}
         priority: 100
         {% if step.grade and step.grade == "Blocking" %}
         soft_fail: false

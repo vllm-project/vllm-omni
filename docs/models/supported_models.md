@@ -52,6 +52,7 @@ th {
 |`Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` |
 |`FishSpeechSlowARForConditionalGeneration` | Fish Speech S2 Pro | `fishaudio/s2-pro` |
 |`DreamIDOmniPipeline`| DreamID-Omni | `XuGuo699/DreamID-Omni` |
+|`VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/tts-model` |
 
 
 ## List of Supported Models for NPU
