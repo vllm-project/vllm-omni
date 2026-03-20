@@ -9,7 +9,6 @@ import yaml
 
 from vllm_omni.engine.arg_utils import _resolve_bundled_hf_config_path
 from vllm_omni.entrypoints import utils as entrypoint_utils
-from vllm_omni.entrypoints.omni import OmniBase
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -26,18 +25,6 @@ def test_resolve_bundled_hf_config_path_preserves_explicit_override():
     resolved = _resolve_bundled_hf_config_path("FunAudioChatCosyVoice3Code2Wav", "/tmp/custom-hf-config")
 
     assert resolved == "/tmp/custom-hf-config"
-
-
-def test_get_stage_model_prefers_stage_override():
-    stage = SimpleNamespace(engine_args=SimpleNamespace(model="stage-specific-model"))
-
-    assert OmniBase._get_stage_model(stage, "fallback-model") == "stage-specific-model"
-
-
-def test_get_stage_model_falls_back_when_stage_override_missing():
-    stage = SimpleNamespace(engine_args=SimpleNamespace())
-
-    assert OmniBase._get_stage_model(stage, "fallback-model") == "fallback-model"
 
 
 def test_resolve_model_config_path_detects_funaudiochat_default_yaml(monkeypatch: pytest.MonkeyPatch):

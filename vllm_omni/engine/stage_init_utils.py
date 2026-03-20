@@ -246,7 +246,11 @@ def build_engine_args_dict(
     engine_args_dict = _to_dict(engine_args)
     # Respect stage-specific model overrides from the stage config.
     # The top-level CLI model is only a fallback for single-stage/implicit configs.
-    stage_model = engine_args_dict.get("model", model)
+    stage_model = engine_args_dict.get("model")
+    if stage_model is None:
+        stage_model = getattr(engine_args, "model", None)
+    if stage_model is None:
+        stage_model = model
     stage_model = _resolve_model_tokenizer_paths(stage_model, engine_args_dict)
     engine_args_dict["model"] = stage_model
     # Stage id must come from stage config instead of inherited CLI kwargs
