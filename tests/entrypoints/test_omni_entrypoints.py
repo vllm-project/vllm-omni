@@ -43,6 +43,7 @@ def make_output_msg(
     output_finished: bool,
     finished: bool | None = None,
     images: list[str] | None = None,
+    metrics: Any = None,
 ) -> dict[str, Any]:
     if finished is None:
         finished = output_finished
@@ -56,7 +57,7 @@ def make_output_msg(
             images=images,
         ),
         "finished": finished,
-        "metrics": {},
+        "metrics": metrics,
     }
 
 
