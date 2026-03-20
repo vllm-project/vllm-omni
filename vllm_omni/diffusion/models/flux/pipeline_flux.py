@@ -17,7 +17,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoConfig, CLIPTextModel, CLIPTokenizer, T5TokenizerFast
+from transformers import CLIPTextModel, CLIPTokenizer, T5TokenizerFast
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
