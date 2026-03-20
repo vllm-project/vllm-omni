@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import queue
+from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -77,7 +78,7 @@ class FakeAsyncOmniEngine:
         *,
         stage_metadata: list[dict[str, Any]] | None = None,
         default_sampling_params_list: list[Any] | None = None,
-        on_add_request: Callable[["FakeAsyncOmniEngine", dict[str, Any]], None] | None = None,
+        on_add_request: Callable[[FakeAsyncOmniEngine, dict[str, Any]], None] | None = None,
         rpc_results: list[Any] | None = None,
         **_: Any,
     ) -> None:
@@ -259,9 +260,7 @@ def _enqueue_async_llm_diffusion_outputs(engine: FakeAsyncOmniEngine, msg: dict[
 def _enqueue_omni_final_only_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
     request_id = msg["request_id"]
     sampling_params_list = msg["sampling_params_list"]
-    llm_streaming = any(
-        params.output_kind != RequestOutputKind.FINAL_ONLY for params in sampling_params_list[:2]
-    )
+    llm_streaming = any(params.output_kind != RequestOutputKind.FINAL_ONLY for params in sampling_params_list[:2])
 
     stage0_count = 3 if llm_streaming else 1
     stage1_count = 3 if llm_streaming else 1
