@@ -295,7 +295,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
+                scheduler_output, defer_finalize=not clear_kv_metadata
             ) as kv_connector_output,
         ):
             model_output = self._model_forward(
@@ -659,7 +659,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # This was deferred from target model forward to allow draft model
         # to also save its KV cache.
         if self.speculative_config is not None:
-            self.clear_kv_connector_metadata()
+            self.finalize_kv_connector()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
