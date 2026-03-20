@@ -2044,7 +2044,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # In addition, these extra attrs are hidden as the default behavior of Pydantic `BaseModel`
             #   (which `ChatCompletionRequest` inherits from, and these fields are not explicitly defined).
             # They are ONLY accessible via model_extra property. Cannot get via getattr(request, "num_inference_steps")
-            extra_body = request.model_extra or {}
+            extra_body = getattr(request, "extra_body", None)
+            if not extra_body:
+                extra_body = request.model_extra or {}
 
             # Parse size if provided (supports "1024x1024" format)
             height = extra_body.get("height")
