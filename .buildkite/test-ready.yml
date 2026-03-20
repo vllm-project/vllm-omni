@@ -18,9 +18,9 @@ steps:
 
   - label: "CUDA Unit Test"
     timeout_in_minutes: 10
-    depends_on: upload-merge-pipeline
+    depends_on: upload-ready-pipeline
     commands:
-      - "timeout 20m pytest -v -s -m 'core_model and cuda and not distributed_cuda'"
+      - "timeout 20m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda'"
     agents:
       queue: "gpu_1_queue"
     plugins:
