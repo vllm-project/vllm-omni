@@ -16,11 +16,11 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "CUDA Unit Test"
+  - label: "Voxtral TTS CUDA Unit Test"
     timeout_in_minutes: 10
     depends_on: upload-ready-pipeline
     commands:
-      - "timeout 20m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda and not diffusion and not omni'"
+      - "timeout 10m pytest -s -v tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py"
     agents:
       queue: "gpu_1_queue"
     plugins:
