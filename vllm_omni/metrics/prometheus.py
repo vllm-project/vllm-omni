@@ -23,6 +23,8 @@ E2E_LATENCY_BUCKETS = (
     300.0,
 )
 
+_omni_prometheus_metrics: OmniPrometheusMetrics | None = None
+
 
 def normalize_output_type(output_type: str | None) -> str:
     if not output_type:
@@ -145,4 +147,9 @@ class OmniPrometheusMetrics:
         ).inc()
 
 
-omni_prometheus_metrics = OmniPrometheusMetrics()
+def get_omni_prometheus_metrics(registry: CollectorRegistry | None = None) -> OmniPrometheusMetrics:
+    global _omni_prometheus_metrics
+
+    if _omni_prometheus_metrics is None:
+        _omni_prometheus_metrics = OmniPrometheusMetrics(registry=registry)
+    return _omni_prometheus_metrics

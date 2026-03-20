@@ -16,8 +16,8 @@ from vllm_omni.metrics import (
     OrchestratorAggregator as OrchestratorMetrics,
 )
 from vllm_omni.metrics import (
+    get_omni_prometheus_metrics,
     infer_request_output_type,
-    omni_prometheus_metrics,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -133,7 +133,7 @@ class Omni(OmniBase):
                     log_stats=self.log_stats,
                     wall_start_ts=wall_start_ts,
                     final_stage_id_for_e2e=final_stage_id,
-                    prometheus_metrics=omni_prometheus_metrics if self.enable_metrics else None,
+                    prometheus_metrics=get_omni_prometheus_metrics() if self.enable_metrics else None,
                     model_name=self.model_name if self.enable_metrics else None,
                 )
                 req_state = ClientRequestState(req_id)
