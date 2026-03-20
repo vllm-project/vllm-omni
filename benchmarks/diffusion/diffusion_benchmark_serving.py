@@ -9,6 +9,7 @@ If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 Supports multiple backends:
     - vllm-omni: Uses /v1/chat/completions endpoint (default)
     - openai: Uses /v1/images/generations endpoint
+    - v1/videos: Use /v1/videos endpoint
 
 Usage:
     # Video (vllm-omni backend)
@@ -812,18 +813,29 @@ async def benchmark(args):
     VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
     IMAGE_TASKS = {"t2i", "i2i", "ti2i"}
 
-    if args.task in VIDEO_TASKS and args.backend != "v1/videos":
-        logger.warning(
-            f"Video task '{args.task}' requires backend 'v1/videos', "
-            f"but got '{args.backend}'. Overriding backend to 'v1/videos'."
+    if args.task in VIDEO_TASKS:
+        task_type = "2v"
+    elif args.task in IMAGE_TASKS:
+        task_type = "2i"
+    else:
+        raise ValueError(
+            f"Unsupported task: '{args.task}'. "
+            f"Valid video tasks: {sorted(VIDEO_TASKS)}, "
+            f"Valid image tasks: {sorted(IMAGE_TASKS)}"
         )
-        args.backend = "v1/videos"
-    elif args.task in IMAGE_TASKS and args.backend == "v1/videos":
-        logger.warning(f"Image task '{args.task}' can not use backend 'v1/videos', Overriding backend to 'vllm-omni'.")
-        args.backend = "vllm-omni"
+
+    valid_backends = sorted(backends_function_mapping[task_type].keys())
+
+    if args.backend not in valid_backends:
+        logger.error(
+            f"Invalid backend '{args.backend}' for task '{args.task}' (task type: '{task_type}').\n"
+            f"Valid backends for this task type: {valid_backends}\n"
+            f"Example usage: --task {args.task} --backend {valid_backends[0]}"
+        )
+        raise ValueError("Backend validation failed. See log above for valid options.")
 
     # Setup API URL and request function based on backend
-    request_func, api_url = backends_function_mapping[args.backend]
+    request_func, api_url = backends_function_mapping[task_type][args.backend]
     api_url = f"{args.base_url}{api_url}"
 
     if args.dataset == "vbench":

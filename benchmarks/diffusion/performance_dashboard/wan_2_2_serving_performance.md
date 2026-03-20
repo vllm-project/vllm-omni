@@ -133,7 +133,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 ---
 
-# 5. Performance Metrics
+# 6. Performance Metrics
 
 The following metrics are collected during benchmarking:
 
@@ -144,7 +144,7 @@ The following metrics are collected during benchmarking:
 
 ---
 
-# 6. Performance Results
+# 7. Performance Results
 
 | Dataset Configuration | Max Concur. | CFG | Usp | Tp | Hsdp | VAE Parallel | Mean Latency (s) | P99 Latency (s) |
 |-----------------------|-----|-----|-----|-----|----|--------------|------------------|------------------|
@@ -156,7 +156,7 @@ The following metrics are collected during benchmarking:
 | Dataset C | 1 | 2 | 2 | 1 | On | 4          | 74.4977        | 117.710 |
 ---
 
-# 7. Reproducibility Checklist
+# 8. Reproducibility Checklist
 
 To ensure consistent and comparable benchmark results:
 
@@ -167,4 +167,4 @@ To ensure consistent and comparable benchmark results:
 
 ---
 
-This document serves as the official Qwen-Image serving performance reference under vLLM-Omni.
+This document serves as the official Wan2.2 serving performance reference under vLLM-Omni.
