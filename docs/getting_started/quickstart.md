@@ -42,7 +42,7 @@ if __name__ == "__main__":
     omni = Omni(model="Tongyi-MAI/Z-Image-Turbo")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output[0].images
+    images = outputs[0].request_output.images
     images[0].save("coffee.png")
 ```
 
@@ -70,7 +70,7 @@ if __name__ == "__main__":
     ]
     omni_outputs = omni.generate(prompts)
     for i_prompt, prompt_output in enumerate(omni_outputs):
-        this_request_output = prompt_output.request_output[0]
+        this_request_output = prompt_output.request_output
         this_images = this_request_output.images
         for i_image, image in enumerate(this_images):
             image.save(f"p{i_prompt}-img{i_image}.jpg")
@@ -82,7 +82,7 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by default, and the input
+    For diffusion pipelines, the stage config field `stage_args.[].engine_args.max_num_seqs` is 1 by default, and the input
     list is sliced into single-item requests before feeding into the diffusion pipeline. For models that do internally support
     batched inputs, you can [modify this configuration](../configuration/stage_configs.md) to let the model accept a longer batch of prompts.
 

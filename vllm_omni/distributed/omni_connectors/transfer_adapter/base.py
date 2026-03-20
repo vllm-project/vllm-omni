@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
-import time
 from collections import deque
 from typing import Any
 
@@ -33,6 +32,8 @@ class OmniTransferAdapterBase:
         self._finished_save_reqs = set()
 
         self.stop_event = threading.Event()
+        self._recv_cond = threading.Condition()
+        self._save_cond = threading.Condition()
 
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
@@ -45,22 +46,37 @@ class OmniTransferAdapterBase:
         raise NotImplementedError
 
     def recv_loop(self):
-        """Loop to poll for incoming data."""
+        """Loop to poll for incoming data.
+
+        Process each pending request exactly once per pass.  When no request
+        made progress, back off 1 ms instead of tight-spinning on failed
+        shm_open syscalls (which can burn a full CPU core).
+        """
         while not self.stop_event.is_set():
-            # Iterate over a snapshot of pending requests
-            while self._pending_load_reqs:
+            n = len(self._pending_load_reqs)
+            any_success = False
+            for _ in range(n):
+                if not self._pending_load_reqs:
+                    break
                 request = self._pending_load_reqs.popleft()
                 request_id = request.request_id
                 self.request_ids_mapping[request_id] = request.external_req_id
                 try:
                     is_success = self._poll_single_request(request)
-                    if not is_success:
+                    if is_success:
+                        any_success = True
+                    else:
                         self._pending_load_reqs.append(request)
                 except Exception as e:
                     self._pending_load_reqs.append(request)
                     logger.warning(f"Error receiving data for {request_id}: {e}")
 
-            time.sleep(0.001)
+            # Timeout is the fallback for lock-free append/notify races.
+            with self._recv_cond:
+                if not self._pending_load_reqs and not self.stop_event.is_set():
+                    self._recv_cond.wait(timeout=0.1)
+                elif not any_success and not self.stop_event.is_set():
+                    self._recv_cond.wait(timeout=0.001)
 
     def save_loop(self):
         """Loop to send outgoing data."""
@@ -71,7 +87,10 @@ class OmniTransferAdapterBase:
                     self._send_single_request(task)
                 except Exception as e:
                     logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
-            time.sleep(0.001)
+
+            with self._save_cond:
+                if not self._pending_save_reqs and not self.stop_event.is_set():
+                    self._save_cond.wait(timeout=0.1)
 
     def _poll_single_request(self, *args, **kwargs):
         """Poll connector for a single request task.
@@ -105,4 +124,13 @@ class OmniTransferAdapterBase:
 
     def shutdown(self):
         """Stop background loops and close the connector."""
-        raise NotImplementedError
+        self.stop_event.set()
+        with self._recv_cond:
+            self._recv_cond.notify_all()
+        with self._save_cond:
+            self._save_cond.notify_all()
+        if self.connector is not None:
+            try:
+                self.connector.close()
+            except Exception:
+                pass

@@ -107,11 +107,17 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._output_sample_rate = out_sr
         self._total_upsample = int(decoder.total_upsample)
 
+        # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
+        if hasattr(decoder, "precompute_snake_caches"):
+            decoder.precompute_snake_caches()
+
         if hasattr(decoder, "enable_cudagraph"):
             device = self._module_device(decoder)
             if device.type == "cuda":
                 try:
-                    capture_sizes = None
+                    chunk_frames = 0
+                    left_frames = 0
+
                     model_cfg = getattr(self.vllm_config, "model_config", None)
                     connector_cfg = getattr(model_cfg, "stage_connector_config", None)
                     extra_cfg = (
@@ -122,12 +128,12 @@ class Qwen3TTSCode2Wav(nn.Module):
                     if isinstance(extra_cfg, dict):
                         chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
                         left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
-                        if chunk_frames > 0 and left_frames >= 0:
-                            from .cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
 
-                            steady_window = left_frames + chunk_frames
-                            capture_sizes = sorted({*CUDAGraphDecoderWrapper.DEFAULT_CAPTURE_SIZES, steady_window})
-                    decoder.enable_cudagraph(capture_sizes=capture_sizes, device=device)
+                    decoder.enable_cudagraph(
+                        device=device,
+                        codec_chunk_frames=chunk_frames,
+                        codec_left_context_frames=left_frames,
+                    )
                     logger.info("Code2Wav decoder CUDA Graph enabled")
                 except Exception:
                     logger.warning("Failed to enable CUDA Graph for Code2Wav decoder", exc_info=True)
@@ -265,18 +271,12 @@ class Qwen3TTSCode2Wav(nn.Module):
                 pass
 
         # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # For single request: no padding needed, fast path.
-        # For multiple requests: decode each individually to avoid padding overhead.
+        # Each request decoded individually with CUDA graph replay at bs=1.
         wav_tensors: list[torch.Tensor] = []
-        if len(valid_codes_qf) == 1:
-            codes_bqf = valid_codes_qf[0].unsqueeze(0)  # [1, Q, F]
+        for codes_qf in valid_codes_qf:
+            codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
             wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
             wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
-        else:
-            for codes_qf in valid_codes_qf:
-                codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-                wav = decoder.chunked_decode(codes_bqf)
-                wav_tensors.append(wav.squeeze(0).squeeze(0))
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
@@ -284,11 +284,11 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
-            expected_len = actual_frames * upsample
-            if wav.shape[0] > expected_len:
-                wav = wav[:expected_len]
             if ctx_frames > 0:
-                cut = ctx_frames * upsample
+                # Proportional trim matching the official HF implementation:
+                # the decoder output length may not be exactly frames * upsample
+                # so compute cut as a proportion of total decoded length.
+                cut = int(ctx_frames / max(actual_frames, 1) * wav.shape[0])
                 if cut < wav.shape[0]:
                     wav = wav[cut:]
                 else:
@@ -298,6 +298,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                         wav.shape[0],
                     )
                     continue
+            else:
+                expected_len = actual_frames * upsample
+                if wav.shape[0] > expected_len:
+                    wav = wav[:expected_len]
             if wav.shape[0] > 0:
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 

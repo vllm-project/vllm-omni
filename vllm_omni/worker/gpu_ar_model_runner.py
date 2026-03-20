@@ -670,6 +670,34 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
 
+        # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
+        # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
+        mm_cpu: dict[str, object] = {}
+        if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+            for k, v in multimodal_outputs.items():
+                try:
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                        mm_cpu[k] = v.detach().to("cpu").contiguous()
+                    elif isinstance(v, dict):
+                        sub_dict: dict[str, torch.Tensor] = {}
+                        for sk, sv in v.items():
+                            if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
+                                sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
+                        if sub_dict:
+                            mm_cpu[k] = sub_dict
+                    elif isinstance(v, list):
+                        if len(v) == 0:
+                            continue
+                        cpu_list = []
+                        for elem in v:
+                            if isinstance(elem, torch.Tensor):
+                                cpu_list.append(elem.detach().to("cpu").contiguous())
+                            else:
+                                cpu_list.append(elem)
+                        mm_cpu[k] = cpu_list
+                except Exception as e:
+                    logger.error(f"Error in merge multimodal outputs: {e}")
+
         pooler_output: list[dict[str, object]] = []
         buffer_payload_keys = tuple(getattr(self.model, "pooler_output_buffer_keys", ()) or ())
         pooler_buffer_source = overlay_intermediate_buffer or self.model_intermediate_buffer
@@ -680,28 +708,26 @@ class GPUARModelRunner(OmniGPUModelRunner):
             end = start + sched
             hidden_slice = hidden_states_cpu[start:end]
             payload: dict[str, object] = {"hidden": hidden_slice}
-            if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+            if mm_cpu:
                 mm_payload: dict[str, object] = {}
-                for k, v in multimodal_outputs.items():
-                    try:
-                        if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
-                            mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
-                        elif isinstance(v, dict):
-                            sub_dict: dict[str, torch.Tensor] = {}
-                            for sk, sv in v.items():
-                                if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
-                                    sub_dict[str(sk)] = sv.detach().to("cpu")[start:end].contiguous()
-                            if sub_dict:
-                                mm_payload[k] = sub_dict
-                        elif isinstance(v, list):
-                            element = v[0]
-                            if isinstance(element, torch.Tensor):
-                                element = element.detach().to("cpu").contiguous()
-                            mm_payload[k] = element
-                    except Exception as e:
-                        logger.error(f"Error in merge multimodal outputs: {e}")
-                if mm_payload:
-                    payload.update(mm_payload)
+                for k, v in mm_cpu.items():
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                        mm_payload[k] = v[start:end].contiguous()
+                    elif isinstance(v, dict):
+                        mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
+                    elif isinstance(v, list):
+                        element = v[idx] if idx < len(v) else v[0]
+                        # Clone tensors to avoid cross-request aliasing
+                        if isinstance(element, torch.Tensor):
+                            element = element.clone()
+                        mm_payload[k] = element
+                    elif isinstance(v, torch.Tensor):
+                        # List-derived tensor payloads are request-invariant; clone to
+                        # avoid accidental cross-request aliasing on downstream mutation.
+                        mm_payload[k] = v.clone()
+                    else:
+                        mm_payload[k] = v
+                payload.update(mm_payload)
             if buffer_payload_keys:
                 req_buffer = pooler_buffer_source.get(rid, {})
                 if isinstance(req_buffer, dict):

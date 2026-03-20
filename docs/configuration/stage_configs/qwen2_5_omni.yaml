@@ -1,12 +1,12 @@
-# stage config for running qwen2.5-omni with architecture of OmniLLM.
+# stage config for running qwen2.5-omni with AsyncOmniEngine + Orchestrator runtime.
 stage_args:
   - stage_id: 0
     runtime:
       process: true            # Run this stage in a separate process
       devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
-      max_batch_size: 1
     engine_args:
       model_stage: thinker
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -30,9 +30,9 @@ stage_args:
     runtime:
       process: true
       devices: "1"
-      max_batch_size: 1
     engine_args:
       model_stage: talker
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -56,9 +56,9 @@ stage_args:
     runtime:
       process: true
       devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
-      max_batch_size: 1
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler

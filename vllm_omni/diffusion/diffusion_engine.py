@@ -6,7 +6,9 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+import numpy as np
 import PIL.Image
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -28,6 +30,13 @@ def supports_image_input(model_class_name: str) -> bool:
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "support_image_input", False))
+
+
+def supports_audio_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_audio_input", False))
 
 
 def image_color_format(model_class_name: str) -> str:
@@ -98,8 +107,19 @@ class DiffusionEngine:
                 for i, prompt in enumerate(request.prompts)
             ]
 
+        # When CPU offload is enabled, move output to CPU before
+        # post-processing to avoid device OOM — model weights may still
+        # reside on the device and leave no headroom for intermediates.
+        output_data = output.output
+        if (
+            self.od_config.enable_cpu_offload
+            and isinstance(output_data, torch.Tensor)
+            and output_data.device.type != "cpu"
+        ):
+            output_data = output_data.cpu()
+
         postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
         audio_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
@@ -150,6 +170,7 @@ class DiffusionEngine:
                         latents=output.trajectory_latents,
                         multimodal_output={"audio": request_audio_payload},
                         final_output_type="audio",
+                        stage_durations=output.stage_durations,
                     ),
                 ]
             else:
@@ -165,6 +186,7 @@ class DiffusionEngine:
                         latents=output.trajectory_latents,
                         custom_output=output.custom_output or {},
                         multimodal_output=mm_output,
+                        stage_durations=output.stage_durations,
                     ),
                 ]
         else:
@@ -194,6 +216,7 @@ class DiffusionEngine:
                             latents=output.trajectory_latents,
                             multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
+                            stage_durations=output.stage_durations,
                         ),
                     )
                 else:
@@ -219,6 +242,7 @@ class DiffusionEngine:
                             latents=output.trajectory_latents,
                             custom_output=output.custom_output or {},
                             multimodal_output=mm_output,
+                            stage_durations=output.stage_durations,
                         ),
                     )
 
@@ -369,7 +393,19 @@ class DiffusionEngine:
             dummy_image = PIL.Image.new(color_format, (width, height))
         else:
             dummy_image = None
-        prompt: OmniTextPrompt = {"prompt": "dummy run", "multi_modal_data": {"image": dummy_image}}
+
+        if supports_audio_input(self.od_config.model_class_name):
+            audio_sr = 16000
+            audio_duration_sec = 4
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+        else:
+            dummy_audio = None
+
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
+        }
         req = OmniDiffusionRequest(
             prompts=[prompt],
             sampling_params=OmniDiffusionSamplingParams(
