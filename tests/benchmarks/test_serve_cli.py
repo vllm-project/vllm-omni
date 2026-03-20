@@ -1,71 +1,93 @@
 import json
-import sys
-from dataclasses import dataclass
+import os
+import subprocess
+import textwrap
+from pathlib import Path
 
 import pytest
-from pytest_mock import MockerFixture
-
-from vllm_omni.entrypoints.cli.main import main as omni_cli_main
-
-
-class MockResponse:
-    def __init__(self, status: int, chunks: list[bytes]):
-        self.status = status
-        self.reason = "OK" if status == 200 else "Error"
-        self._chunks = chunks
-        self.content = self
-
-    async def iter_any(self):
-        for chunk in self._chunks:
-            yield chunk
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return None
-
-
-@dataclass
-class _PostCall:
-    url: str
-
-
-class MockClientSession:
-    def __init__(self, response: MockResponse):
-        self._response = response
-        self.post_calls: list[_PostCall] = []
-
-    def post(self, url: str, *args, **kwargs):
-        self.post_calls.append(_PostCall(url=url))
-        return self._response
-
-    async def close(self):
-        return None
 
 
 @pytest.mark.core_model
 @pytest.mark.benchmark
 @pytest.mark.cpu
-def test_bench_serve_cli_mocks_http_request(mocker: MockerFixture, tmp_path):
+def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
     num_prompts = 5
+    port = 18000
     result_filename = "bench-result.json"
+    calls_filename = "http-post-calls.json"
     result_path = tmp_path / result_filename
+    calls_path = tmp_path / calls_filename
 
-    chunks = [
-        b'data: {"choices":[{"delta":{"content":"hi"}}],"modality":"text"}\n\n',
-        b'data: {"choices":[{"delta":{"content":" there"}}],"modality":"text","metrics":{"num_tokens_out":4,"num_tokens_in":5}}\n\n',
-        b"data: [DONE]\n\n",
-    ]
-    mock_response = MockResponse(200, chunks)
-    mock_session = MockClientSession(mock_response)
+    sitecustomize_path = tmp_path / "sitecustomize.py"
+    sitecustomize_path.write_text(
+        textwrap.dedent(
+            """
+            import atexit
+            import json
+            import os
 
-    # Patch the aiohttp session used by vllm-omni's benchmark implementation.
-    # We keep benchmark logic intact but intercept outbound HTTP calls.
-    mocker.patch("vllm_omni.benchmarks.patch.patch.aiohttp.ClientSession", return_value=mock_session)
-    mocker.patch("vllm_omni.benchmarks.patch.patch.aiohttp.TCPConnector", return_value=mocker.Mock())
+            POST_CALLS = []
+            SSE_CHUNKS = [
+                b'data: {"choices":[{"delta":{"content":"hi"}}],"modality":"text"}\\n\\n',
+                b'data: {"choices":[{"delta":{"content":" there"}}],"modality":"text","metrics":{"num_tokens_out":4,"num_tokens_in":5}}\\n\\n',
+                b"data: [DONE]\\n\\n",
+            ]
 
-    argv = [
+            class _Content:
+                def __init__(self, chunks):
+                    self._chunks = chunks
+
+                async def iter_any(self):
+                    for chunk in self._chunks:
+                        yield chunk
+
+            class MockResponse:
+                def __init__(self):
+                    self.status = 200
+                    self.reason = "OK"
+                    self.content = _Content(SSE_CHUNKS)
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+            class MockClientSession:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def post(self, url=None, *args, **kwargs):
+                    if url is not None:
+                        POST_CALLS.append(url)
+                    return MockResponse()
+
+                async def close(self):
+                    return None
+
+            import vllm_omni.benchmarks.patch.patch as patch_mod
+
+            patch_mod.aiohttp.ClientSession = MockClientSession
+            patch_mod.aiohttp.TCPConnector = lambda *args, **kwargs: object()
+
+            calls_file = os.environ.get("VLLM_OMNI_TEST_POST_CALLS_FILE")
+
+            if calls_file:
+                def _write_calls():
+                    with open(calls_file, "w", encoding="utf-8") as f:
+                        json.dump({"requested_urls": POST_CALLS}, f)
+
+                atexit.register(_write_calls)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env.get("PYTHONPATH", "")
+    env["VLLM_OMNI_TEST_POST_CALLS_FILE"] = str(calls_path)
+
+    cmd = [
         "vllm",
         "bench",
         "serve",
@@ -73,7 +95,7 @@ def test_bench_serve_cli_mocks_http_request(mocker: MockerFixture, tmp_path):
         "--model",
         "Qwen/Qwen2.5-Omni-7B",
         "--port",
-        "18000",
+        str(port),
         "--dataset-name",
         "random",
         "--random-input-len",
@@ -97,13 +119,25 @@ def test_bench_serve_cli_mocks_http_request(mocker: MockerFixture, tmp_path):
         "--result-filename",
         result_filename,
     ]
-    mocker.patch.object(sys, "argv", argv)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(Path(__file__).resolve().parents[2]),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
 
-    omni_cli_main()
-
+    assert proc.returncode == 0, f"CLI failed: stdout={proc.stdout}\nstderr={proc.stderr}"
+    print(f"CLI output: {proc.stdout}")
     assert result_path.exists()
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert calls_path.exists()
+    calls = json.loads(calls_path.read_text(encoding="utf-8"))
 
-    sent_requests = len(mock_session.post_calls)
+    expected_url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    requested_urls = calls["requested_urls"]
+    sent_requests = len(requested_urls)
+
     assert result["completed"] == sent_requests == num_prompts
-    assert any(call.url.endswith("/v1/chat/completions") for call in mock_session.post_calls)
+    assert requested_urls
+    assert all(url == expected_url for url in requested_urls), f"Unexpected target URLs: {requested_urls}"
