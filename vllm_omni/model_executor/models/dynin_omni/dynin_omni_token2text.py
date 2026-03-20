@@ -287,9 +287,13 @@ class DyninOmniToken2Text(DyninOmniStageBase):
         logical_task_name: str,
     ) -> bool:
         task = str(unwrap_first_value(runtime_info.get("task"), "") or "").lower()
+        prompt_length = unwrap_first_value(runtime_info.get("prompt_length"), None)
+        attention_mask = unwrap_first_value(runtime_info.get("attention_mask"), None)
+        has_prebuilt_prompt = bool(logical_task_name in {"t2i", "i2i", "t2s"} and attention_mask is not None)
+
         if not task or unwrap_first_value(runtime_info.get("detok_id"), None) is None:
             return True
-        if unwrap_first_value(runtime_info.get("prompt_length"), None) is None:
+        if prompt_length is None and not has_prebuilt_prompt:
             return True
         if (
             task in PROMPT_PAYLOAD_REQUIRED_TASKS
@@ -299,6 +303,7 @@ class DyninOmniToken2Text(DyninOmniStageBase):
                 keys=PROMPTING_PAYLOAD_KEYS,
             )
             is None
+            and not has_prebuilt_prompt
         ):
             return True
         if logical_task_name in {"t2i", "i2i"}:

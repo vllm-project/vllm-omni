@@ -121,7 +121,7 @@ DEFAULT_I2T_QUESTION = "Please describe this image in detail."
 DEFAULT_S2T_INSTRUCTION = "Transcribe the speech and summarize it briefly."
 DEFAULT_V2T_QUESTION = "Please describe this video in detail."
 DEFAULT_T2T_PROMPT = "Explain multimodal LLM inference in 3 sentences."
-DEFAULT_T2S_INSTRUCTION = "Please read the following text naturally."
+DEFAULT_T2S_PROMPT = "Hello. This is a default text-to-speech sample."
 
 DYNIN_SPECIAL_TOKENS = (
     "<|soi|>",
@@ -1143,14 +1143,8 @@ def main() -> None:
         text = DEFAULT_S2T_INSTRUCTION
     elif task_name == "v2t" and not text:
         text = DEFAULT_V2T_QUESTION
-    elif task_name == "t2s":
-        if not text:
-            text = "Hello. This is a default text-to-speech sample."
-        if not args.raw_prompt:
-            instruction = str(_runtime_fallback(task_name, "instruction", args.instruction) or "").strip()
-            if not instruction:
-                instruction = DEFAULT_T2S_INSTRUCTION
-            text = build_chat_prompt(f"{instruction}\n{text}")
+    elif task_name == "t2s" and not text:
+        text = DEFAULT_T2S_PROMPT
     elif task_name in {"t2i", "i2i"} and not text:
         text = "A high quality detailed image."
 
