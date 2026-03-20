@@ -1396,7 +1396,7 @@ async def edit_images(
         _update_if_not_none(gen_params, "generator_device", generator_device)
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
-        request_id = f"img_edit_{int(time.time())}"
+        request_id = f"img_edit_{uuid.uuid4().hex}"
         logger.info(f"Generating {n} image(s) {size_str}")
         result = await _generate_with_async_omni(
             engine_client=engine_client,
