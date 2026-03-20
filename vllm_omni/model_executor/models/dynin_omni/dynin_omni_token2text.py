@@ -16,6 +16,8 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .dynin_omni import DyninOmniStageBase
 from .dynin_omni_common import (
+    DYNIN_PROMPT_SOURCE_KEY,
+    DYNIN_PROMPT_SOURCE_OFFLINE_PREBUILT,
     DYNIN_REMOTE_SETTINGS,
     DYNIN_SPECIAL_TOKENS,
     TASK_TO_DETOK,
@@ -289,17 +291,10 @@ class DyninOmniToken2Text(DyninOmniStageBase):
         task = str(unwrap_first_value(runtime_info.get("task"), "") or "").lower()
         detok_id = unwrap_first_value(runtime_info.get("detok_id"), None)
         prompt_length = unwrap_first_value(runtime_info.get("prompt_length"), None)
-        attention_mask = unwrap_first_value(runtime_info.get("attention_mask"), None)
-        has_prebuilt_prompt = bool(
-            logical_task_name in {"t2i", "i2i", "t2s"}
-            and task
-            and detok_id is not None
-            and attention_mask is not None
-        )
 
         if not task or detok_id is None:
             return True
-        if prompt_length is None and not has_prebuilt_prompt:
+        if prompt_length is None:
             return True
         if (
             task in PROMPT_PAYLOAD_REQUIRED_TASKS
@@ -309,7 +304,6 @@ class DyninOmniToken2Text(DyninOmniStageBase):
                 keys=PROMPTING_PAYLOAD_KEYS,
             )
             is None
-            and not has_prebuilt_prompt
         ):
             return True
         if logical_task_name in {"t2i", "i2i"}:
@@ -343,6 +337,9 @@ class DyninOmniToken2Text(DyninOmniStageBase):
         runtime_info: dict[str, Any],
         kwargs: dict[str, Any],
     ) -> dict[str, Any]:
+        if unwrap_first_value(runtime_info.get(DYNIN_PROMPT_SOURCE_KEY), None) == DYNIN_PROMPT_SOURCE_OFFLINE_PREBUILT:
+            return runtime_info
+
         mm_inputs = self._collect_mm_inputs(**kwargs)
         decoded_prompt = ""
 

@@ -51,6 +51,8 @@ DEFAULT_VQ_IMAGE_SOURCE = "snu-aidas/magvitv2"
 DEFAULT_VQ_AUDIO_SOURCE = "snu-aidas/emova_speech_tokenizer_vllm"
 DEFAULT_MAGVIT_REMOTE_CODE_REPO = "snu-aidas/magvitv2"
 DEFAULT_DYNIN_REMOTE_CODE_REPO = "snu-aidas/Dynin-Omni"
+DYNIN_PROMPT_SOURCE_KEY = "dynin_prompt_source"
+DYNIN_PROMPT_SOURCE_OFFLINE_PREBUILT = "offline_prebuilt"
 
 DYNIN_TASK_DEFAULT_RUNTIME = {
     "t2t": ("mmu", "mmu", 0, "text"),

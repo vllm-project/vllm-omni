@@ -942,6 +942,11 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
 def main() -> None:
     repo_root = bootstrap_repo_path()
     ensure_safe_import_for_vllm()
+    from vllm_omni.model_executor.models.dynin_omni.dynin_omni_common import (
+        DYNIN_PROMPT_SOURCE_KEY,
+        DYNIN_PROMPT_SOURCE_OFFLINE_PREBUILT,
+    )
+
     args = parse_args(repo_root)
 
     if args.disable_hf_xet:
@@ -1309,6 +1314,7 @@ def main() -> None:
     runtime_info: dict[str, Any] = {
         "task": [runtime_task],
         "detok_id": [int(detok_id)],
+        DYNIN_PROMPT_SOURCE_KEY: [DYNIN_PROMPT_SOURCE_OFFLINE_PREBUILT],
         "dynin_config_path": [str(dynin_config_path)],
         "attention_mask": [prompt_attention_mask],
         "prompt_max_text_len": [int(prompt_max_text_len)],
