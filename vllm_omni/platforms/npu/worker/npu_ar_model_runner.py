@@ -26,6 +26,7 @@ from vllm.v1.outputs import (
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
@@ -237,6 +238,23 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+                # NOTE(Angazenn): According to https://github.com/vllm-project/vllm/pull/30877,
+                # there should be a corresponding 'postprocess_mamba'. However, it is called inside
+                # '_update_states_after_model_execute', which is not overridden in vLLM-Ascend.
+                # We simply utilize the implementation in vLLM.
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_copy_bufs(),
+                    )
+
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
@@ -339,7 +357,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 skip_compiled=has_encoder_input,
             ),
             self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
+                scheduler_output, defer_finalize=not clear_kv_metadata
             ) as kv_connector_output,
         ):
             hidden_states = self._model_forward(
@@ -606,6 +624,34 @@ class NPUARModelRunner(OmniNPUModelRunner):
             hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
         )
 
+        # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
+        # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
+        mm_cpu: dict[str, object] = {}
+        if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+            for k, v in multimodal_outputs.items():
+                try:
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                        mm_cpu[k] = v.detach().to("cpu").contiguous()
+                    elif isinstance(v, dict):
+                        sub_dict: dict[str, torch.Tensor] = {}
+                        for sk, sv in v.items():
+                            if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
+                                sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
+                        if sub_dict:
+                            mm_cpu[k] = sub_dict
+                    elif isinstance(v, list):
+                        if len(v) == 0:
+                            continue
+                        cpu_list = []
+                        for elem in v:
+                            if isinstance(elem, torch.Tensor):
+                                cpu_list.append(elem.detach().to("cpu").contiguous())
+                            else:
+                                cpu_list.append(elem)
+                        mm_cpu[k] = cpu_list
+                except Exception as e:
+                    logger.error(f"Error in merge multimodal outputs: {e}")
+
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:
             idx = req_id_to_index_output_copy[rid]
@@ -614,28 +660,26 @@ class NPUARModelRunner(OmniNPUModelRunner):
             end = start + sched
             hidden_slice = hidden_states_cpu[start:end]
             payload: dict[str, object] = {"hidden": hidden_slice}
-            if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+            if mm_cpu:
                 mm_payload: dict[str, object] = {}
-                for k, v in multimodal_outputs.items():
-                    try:
-                        if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
-                            mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
-                        elif isinstance(v, dict):
-                            sub_dict: dict[str, torch.Tensor] = {}
-                            for sk, sv in v.items():
-                                if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
-                                    sub_dict[str(sk)] = sv.detach().to("cpu")[start:end].contiguous()
-                            if sub_dict:
-                                mm_payload[k] = sub_dict
-                        elif isinstance(v, list):
-                            element = v[0]
-                            if isinstance(element, torch.Tensor):
-                                element = element.detach().to("cpu").contiguous()
-                            mm_payload[k] = element
-                    except Exception as e:
-                        logger.error(f"Error in merge multimodal outputs: {e}")
-                if mm_payload:
-                    payload.update(mm_payload)
+                for k, v in mm_cpu.items():
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                        mm_payload[k] = v[start:end].contiguous()
+                    elif isinstance(v, dict):
+                        mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
+                    elif isinstance(v, list):
+                        element = v[idx] if idx < len(v) else v[0]
+                        # Clone tensors to avoid cross-request aliasing
+                        if isinstance(element, torch.Tensor):
+                            element = element.clone()
+                        mm_payload[k] = element
+                    elif isinstance(v, torch.Tensor):
+                        # List-derived tensor payloads are request-invariant; clone to
+                        # avoid accidental cross-request aliasing on downstream mutation.
+                        mm_payload[k] = v.clone()
+                    else:
+                        mm_payload[k] = v
+                payload.update(mm_payload)
             pooler_output.append(payload)
 
         model_runner_output = OmniModelRunnerOutput(

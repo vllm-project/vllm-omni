@@ -29,6 +29,7 @@ from typing import Any, Literal, cast
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from packaging.version import Version
 from transformers import PretrainedConfig
 from transformers import __version__ as TRANSFORMERS_VERSION
@@ -139,44 +140,66 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw)
 
         if isinstance(grid_thw, torch.Tensor):
-            grid_thw_np = grid_thw.cpu().numpy().astype(np.int32)
+            grid_thw_tensor = grid_thw.to(self.device)
         else:
-            grid_thw_np = np.array(grid_thw, dtype=np.int32)
+            grid_thw_tensor = torch.as_tensor(grid_thw, dtype=torch.int32, device=self.device)
 
-        cu_seqlens = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(axis=0, dtype=np.int32)
-        cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
-
-        sequence_lengths = MMEncoderAttention.maybe_compute_sequence_lengths(self.attn_backend, cu_seqlens)
-        if sequence_lengths is not None:
-            sequence_lengths = torch.from_numpy(sequence_lengths).to(self.device, non_blocking=True)
-        max_seqlen = torch.tensor(
-            MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
-            self.attn_backend,
-            cu_seqlens,
-            self.hidden_size,
-            self.tp_size,
-        )
-        cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
+        try:
+            cu_seqlens = torch.repeat_interleave(
+                grid_thw_tensor[:, 1] * grid_thw_tensor[:, 2],
+                grid_thw_tensor[:, 0],
+            ).cumsum(
+                dim=0,
+                dtype=grid_thw_tensor.dtype if torch.jit.is_tracing() else torch.int32,
+            )
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        except RuntimeError:
+            logger.warning(
+                "torch.repeat_interleave not executable, switching to vectorized searchsorted implementation."
+            )
+            repeat_counts = grid_thw_tensor[:, 0]
+            values = grid_thw_tensor[:, 1] * grid_thw_tensor[:, 2]
+            repeat_cumsum = repeat_counts.cumsum(0)
+            total_items = repeat_cumsum[-1].item()
+            indices = torch.searchsorted(
+                repeat_cumsum,
+                torch.arange(total_items, device=grid_thw_tensor.device),
+                right=True,
+            )
+            cu_seqlens = values[indices].cumsum(
+                dim=0,
+                dtype=grid_thw_tensor.dtype if torch.jit.is_tracing() else torch.int32,
+            )
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         hidden_states = hidden_states.unsqueeze(1)
+        rotary_pos_emb_cos = rotary_pos_emb_cos.to(hidden_states.device)
+        rotary_pos_emb_sin = rotary_pos_emb_sin.to(hidden_states.device)
+        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+
+        grid_thw_np = grid_thw_tensor.cpu().numpy().astype(np.int32)
+        cu_seqlens_np = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(
+            axis=0, dtype=np.int32
+        )
+        cu_seqlens_np = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens_np])
+        sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
+            self.attn_backend,
+            cu_seqlens_np,
+            self.device,
+        )
 
         hidden_states_list = []
         deepstack_visual_indexes = self.deepstack_visual_indexes
 
         for layer_num, blk in enumerate(self.blocks):
-            hidden_states = hidden_states + blk.attn(
-                blk.norm1(hidden_states),
+            hidden_states = blk(
+                hidden_states,
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
             )
-            hidden_states = hidden_states + blk.mlp(blk.norm2(hidden_states))
 
             if deepstack_visual_indexes is not None and layer_num in deepstack_visual_indexes:
                 hidden_states_list.append(hidden_states)
@@ -475,6 +498,15 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 tokenizer = self.info.get_tokenizer()
                 audio_pad_id = tokenizer.convert_tokens_to_ids("<|audio_pad|>")
                 use_audio_in_video = audio_pad_id not in prompt_ids
+            # for mutilmodality cache
+            if any(item is None for item in mm_kwargs["video"]):
+                video_token_id = self.info.get_hf_config().video_token_id
+                audio_token_id = self.info.get_hf_config().audio_token_id
+                video_audio_item_num = sum(id in (video_token_id, audio_token_id) for id in prompt_ids)
+                audio_updates_num = len(mm_prompt_updates.get("audio", []))
+                video_updates_num = len(mm_prompt_updates.get("video", []))
+                if video_audio_item_num != video_updates_num + audio_updates_num:
+                    use_audio_in_video = True
 
         # normal case with `use_audio_in_video=False`
         if is_update_applied:
@@ -487,19 +519,13 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 mm_item_counts,
             )
         else:
-            if use_audio_in_video:
-                # When use_audio_in_video=True, audio is extracted from video and embedded
-                # in the video placeholder tokens. We should:
-                # 1. Filter out audio from prompt updates (audio has no separate placeholder)
-                # 2. Apply remaining updates (video, image, etc.)
-                # 3. Derive audio placeholders from video placeholders
+            if use_audio_in_video and "audio" in mm_prompt_updates:
                 filtered_updates = {k: v for k, v in mm_prompt_updates.items() if k != "audio"}
                 prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
                     filtered_updates,
                 )
-                # Derive audio placeholders from video placeholders
-                mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_item_counts)
+                mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_prompt_updates)
             else:
                 prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
@@ -618,7 +644,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
 
         def get_replacement_qwen2_use_audio_in_video(item_idx: int):
             nonlocal audio_in_video_item_idx
-            audio_num_features = audio_output_lengths[audio_in_video_item_idx + item_idx]
+            audio_num_features = audio_output_lengths[audio_in_video_item_idx]
             video_grid_thw = out_mm_data["video_grid_thw"][item_idx]
 
             audio_in_video_item_idx += 1
@@ -664,27 +690,17 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
     def _derive_audio_from_video_placeholders(
         self,
         placeholders: Mapping[str, list[PlaceholderFeaturesInfo]],
-        mm_item_counts: Mapping[str, int],
+        mm_prompt_updates: MultiModalPromptUpdates,
     ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
         """
         Helper to derive audio placeholders from video placeholders when
         use_audio_in_video=True.
-
-        In use_audio_in_video mode, audio is extracted from video and embedded
-        within the video placeholder tokens. This function creates audio placeholder
-        info by extracting the audio token positions from video placeholders.
-
-        Args:
-            placeholders: Current placeholders (should contain "video")
-            mm_item_counts: Counts of multimodal items from mm_items.get_all_counts()
         """
         if "video" not in placeholders:
             return placeholders
 
-        # Validate audio and video counts match
-        # In use_audio_in_video mode, audio count comes from mm_items (extracted from video)
         num_videos = len(placeholders["video"])
-        num_audios = mm_item_counts.get("audio", 0)
+        num_audios = len(mm_prompt_updates.get("audio", []))
         if num_audios != num_videos:
             raise ValueError(
                 f"use_audio_in_video requires equal number of audio and video items, got {num_audios=}, {num_videos=}"
@@ -942,7 +958,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             return []
 
         # The result multimodal_embeddings is tuple of tensors, with each
-        # tensor correspoending to a multimodal data item (image or video).
+        # tensor corresponding to a multimodal data item (image or video).
         multimodal_embeddings: tuple[torch.Tensor, ...] = ()
 
         # NOTE: It is important to iterate over the keys in this dictionary
@@ -966,13 +982,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         inputs_embeds = self._embed_text_input_ids(
             input_ids,
             self.language_model.embed_input_ids,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
@@ -1064,7 +1078,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
     def forward(
