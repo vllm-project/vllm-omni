@@ -119,9 +119,9 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
 
 DEFAULT_I2T_QUESTION = "Please describe this image in detail."
 DEFAULT_S2T_INSTRUCTION = "Transcribe the given audio."
-DEFAULT_V2T_QUESTION = ("Please provide a detailed description of the video.",)
+DEFAULT_V2T_QUESTION = "Please provide a detailed description of the video."
 DEFAULT_T2T_PROMPT = "Explain multimodal LLM inference in 3 sentences."
-DEFAULT_T2S_INSTRUCTION = ("Convert the given text into spoken audio.",)
+DEFAULT_T2S_INSTRUCTION = "Convert the given text into spoken audio."
 DEFAULT_T2S_PROMPT = "Hello. This is a default text-to-speech sample."
 
 DYNIN_SPECIAL_TOKENS = (
