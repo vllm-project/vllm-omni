@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import zmq
-
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
@@ -175,7 +174,7 @@ def _perform_handshake(
             parallel_config={},
         )
         handshake_socket.send_multipart([identity, msgspec.msgpack.encode(init_payload)])
-        
+
         identity, msg = _recv(poller, handshake_socket, proc, "READY")
         if msg.get("status") != "READY":
             raise RuntimeError(f"Expected READY, got: {msg}")

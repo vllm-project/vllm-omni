@@ -14,7 +14,6 @@ from dataclasses import fields, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 import zmq
-
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.stage_diffusion_proc import (

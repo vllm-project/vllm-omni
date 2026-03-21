@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import zmq
 import zmq.asyncio
-
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
