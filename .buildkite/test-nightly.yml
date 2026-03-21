@@ -164,6 +164,8 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+                    value: "120"
                   - name: HF_TOKEN
                     valueFrom:
                       secretKeyRef:
