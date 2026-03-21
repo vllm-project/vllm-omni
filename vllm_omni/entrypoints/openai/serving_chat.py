@@ -297,15 +297,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
-                # [NOTE] When sending request from openai client Python library (.chat.completions.create),
-                #   `extra_body` argument is flattented and merged into the payload's root.
-                #   and there is no more `extra_body` attribute in request.
-                # Since these fields are not declared in
-                #   vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionRequest, and this is a
-                #   Pydantic `BaseModel` with runtime validation, these fields are not directly accessible as
-                #   `request` attributes, but only via `model_extra` property.
-                # When sending raw request with curl, this flattening does not occur.
-                #   We directly get the `extra_body` dict.
+                # [NOTE] When sending request via openai client Python library,
+                #   `extra_body` is flattented and merged into the payload's root.
+                #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
+                #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
                 extra_body = getattr(request, "extra_body", None)
                 if not extra_body:
                     extra_body = request.model_extra or {}
@@ -2047,15 +2042,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Extract generation parameters from extra_body (preferred)
             # Reference: text_to_image.py and text_to_video.py for supported parameters
-            # [NOTE] When sending request from openai client Python library (.chat.completions.create),
-            #   `extra_body` argument is flattented and merged into the payload's root.
-            #   and there is no more `extra_body` attribute in request.
-            # Since these fields are not declared in
-            #   vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionRequest, and this is a
-            #   Pydantic `BaseModel` with runtime validation, these fields are not directly accessible as
-            #   `request` attributes, but only via `model_extra` property.
-            # When sending raw request with curl, this flattening does not occur.
-            #   We directly get the `extra_body` dict.
+            # [NOTE] When sending request via openai client Python library,
+            #   `extra_body` is flattented and merged into the payload's root.
+            #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
+            #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
             extra_body = getattr(request, "extra_body", None)
             if not extra_body:
                 extra_body = request.model_extra or {}
