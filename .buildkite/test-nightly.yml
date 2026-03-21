@@ -185,7 +185,7 @@ steps:
   - label: ":email: Nightly Collection & Email"
     key: nightly-perf-distribution
     depends_on:
-    - nightly-performance
+      - nightly-performance
     if: build.env("NIGHTLY") == "1"
     commands:
       - pip install openpyxl
