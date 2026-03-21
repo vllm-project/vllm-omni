@@ -118,9 +118,10 @@ TASK_RUNTIME_FALLBACKS: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_I2T_QUESTION = "Please describe this image in detail."
-DEFAULT_S2T_INSTRUCTION = "Transcribe the speech and summarize it briefly."
-DEFAULT_V2T_QUESTION = "Please describe this video in detail."
+DEFAULT_S2T_INSTRUCTION = "Transcribe the given audio."
+DEFAULT_V2T_QUESTION = ("Please provide a detailed description of the video.",)
 DEFAULT_T2T_PROMPT = "Explain multimodal LLM inference in 3 sentences."
+DEFAULT_T2S_INSTRUCTION = ("Convert the given text into spoken audio.",)
 DEFAULT_T2S_PROMPT = "Hello. This is a default text-to-speech sample."
 
 DYNIN_SPECIAL_TOKENS = (
@@ -359,6 +360,39 @@ def build_chat_prompt(content: str) -> str:
     return (
         f"<|start_header_id|>user<|end_header_id|>\n{content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
     )
+
+
+def resolve_task_text(
+    *,
+    task_name: str,
+    text: str,
+    instruction: str = "",
+    raw_prompt: bool = False,
+) -> str:
+    text = str(text or "").strip()
+
+    if task_name == "t2t" and not text:
+        return DEFAULT_T2T_PROMPT
+    if task_name == "i2t" and not text:
+        return DEFAULT_I2T_QUESTION
+    if task_name == "s2t" and not text:
+        return DEFAULT_S2T_INSTRUCTION
+    if task_name == "v2t" and not text:
+        return DEFAULT_V2T_QUESTION
+    if task_name in {"t2i", "i2i"} and not text:
+        return "A high quality detailed image."
+
+    if task_name != "t2s":
+        return text
+
+    if not text:
+        text = DEFAULT_T2S_PROMPT
+
+    if raw_prompt:
+        return text
+
+    instruction = str(instruction or "").strip() or DEFAULT_T2S_INSTRUCTION
+    return build_chat_prompt(f"{instruction}\n{text}")
 
 
 def load_universal_prompting(
@@ -1139,19 +1173,12 @@ def main() -> None:
     if task_name == "v2t" and not args.video:
         raise ValueError("--task v2t requires --video")
 
-    text = str(args.text or "").strip()
-    if task_name == "t2t" and not text:
-        text = DEFAULT_T2T_PROMPT
-    elif task_name == "i2t" and not text:
-        text = DEFAULT_I2T_QUESTION
-    elif task_name == "s2t" and not text:
-        text = DEFAULT_S2T_INSTRUCTION
-    elif task_name == "v2t" and not text:
-        text = DEFAULT_V2T_QUESTION
-    elif task_name == "t2s" and not text:
-        text = DEFAULT_T2S_PROMPT
-    elif task_name in {"t2i", "i2i"} and not text:
-        text = "A high quality detailed image."
+    text = resolve_task_text(
+        task_name=task_name,
+        text=args.text,
+        instruction=args.instruction,
+        raw_prompt=bool(args.raw_prompt),
+    )
 
     tokenizer_source = args.tokenizer_path.strip() or model_source
     model_local_only = resolve_local_only(
