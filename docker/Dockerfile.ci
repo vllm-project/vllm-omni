@@ -1,5 +1,5 @@
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.17.0
+ARG VLLM_BASE_TAG=v0.18.0
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
@@ -11,29 +11,10 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN uv pip uninstall --system -y vllm || true
+# Install vllm-omni into the same uv-managed Python environment used by the base image.
+# Use bash -c so that $(python3 -c ...) is expanded inside the container.
+RUN uv pip install --system --no-cache-dir ".[dev]"
 
-# Install vLLM from precompiled wheel at the selected commit.
-# Must use direct URL because the wheel has a PEP 440 local version identifier
-# (e.g. +g0a0a1a198) which pip/uv refuse to install from a PEP 503 package index.
-ENV VLLM_PRECOMPILED_WHEEL_COMMIT=89138b21cc246ae944c741d5c399c148e2b770ab
-RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
-    html=urllib.request.urlopen('https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm/').read().decode(); \
-    m=re.search(r'>(\S+x86_64\.whl)<',html); \
-    print('https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/'+m.group(1).replace('+','%2B'))") && \
-    echo "Installing vLLM from: ${VLLM_WHEEL_URL}" && \
-    uv pip install --system --force-reinstall "${VLLM_WHEEL_URL}"
-
-RUN uv pip install --system ".[dev]"
-
-RUN uv pip install --system --upgrade \
-        "flashinfer-cubin==0.6.6" \
-        "nvidia-cublas-cu12==12.9.1.4" \
-        "numpy==2.2.6"
-
-RUN uv pip install --system --upgrade \
-    "flashinfer-jit-cache==0.6.6" \
-    --index-url https://flashinfer.ai/whl/cu129
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []
