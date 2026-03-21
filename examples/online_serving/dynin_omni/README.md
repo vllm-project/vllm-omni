@@ -73,7 +73,7 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 ```bash
 python openai_chat_completion_client_for_multimodal_generation.py \
   --query-type t2s \
-  --prompt "Please read this sentence naturally: Hello from Dynin-Omni online serving."
+  --prompt "Hello. This is Dynin-omni."
 ```
 
 ## CLI Arguments
