@@ -54,6 +54,7 @@ th {
 |`DreamIDOmniPipeline`| DreamID-Omni | `XuGuo699/DreamID-Omni` |
 |`VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/tts-model` |
 |`DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` |
+|`VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` |
 
 
 ## List of Supported Models for NPU
