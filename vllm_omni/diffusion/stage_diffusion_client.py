@@ -8,7 +8,6 @@ from any stage client.
 from __future__ import annotations
 
 import asyncio
-import queue
 import uuid
 from dataclasses import fields, is_dataclass
 from typing import TYPE_CHECKING, Any
@@ -74,7 +73,7 @@ class StageDiffusionClient:
         self._decoder = OmniMsgpackDecoder()
 
         # Buffers for demultiplexing response messages.
-        self._output_queue: queue.Queue[OmniRequestOutput] = queue.Queue()
+        self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._rpc_results: dict[str, Any] = {}
         self._pending_rpcs: set[str] = set()
 
@@ -169,7 +168,7 @@ class StageDiffusionClient:
         self._drain_responses()
         try:
             return self._output_queue.get_nowait()
-        except queue.Empty:
+        except asyncio.QueueEmpty:
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
