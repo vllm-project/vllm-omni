@@ -229,7 +229,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="mistralai/tts-model",
+        default="mistralai/Voxtral-4B-TTS-2603",
         help="Model name or path.",
     )
     parser.add_argument(
