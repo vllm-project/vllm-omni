@@ -6,9 +6,9 @@ stage_args:
     prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
     runtime:
       devices: "0"
-      # 3 = 1 user prompt + 2 CFG companions (text-unconditional + image-unconditional).
-      max_batch_size: 3
     engine_args:
+      # 3 = 1 user prompt + 2 CFG companions (text-unconditional + image-unconditional).
+      max_num_seqs: 3
       model_stage: thinker
       model_arch: OmniBagelForConditionalGeneration
       worker_type: ar
@@ -43,8 +43,8 @@ stage_args:
     cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.bagel.collect_cfg_kv_caches
     runtime:
       devices: "1"
-      max_batch_size: 1
     engine_args:
+      max_num_seqs: 1
       model_stage: dit
       gpu_memory_utilization: 0.9
       enforce_eager: true

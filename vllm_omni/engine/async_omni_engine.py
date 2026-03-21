@@ -825,9 +825,9 @@ class AsyncOmniEngine:
                 "runtime": {
                     "process": True,
                     "devices": devices,
-                    "max_batch_size": 1,
                 },
                 "engine_args": {
+                    "max_num_seqs": 1,
                     "parallel_config": parallel_config,
                     "model_class_name": kwargs.get("model_class_name", None),
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),

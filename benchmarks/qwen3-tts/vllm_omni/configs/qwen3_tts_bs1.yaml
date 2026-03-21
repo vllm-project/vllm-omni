@@ -6,8 +6,8 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 1
     engine_args:
+      max_num_seqs: 1
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
       worker_type: ar
@@ -37,8 +37,8 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 1
     engine_args:
+      max_num_seqs: 1
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
