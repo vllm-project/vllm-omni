@@ -83,8 +83,8 @@ class StageEngineCoreProc(EngineCoreProc):
             parallel_config.data_parallel_index = dp_rank
 
             engine_core = StageEngineCoreProc(
-                *args, 
-                engine_index=dp_rank, 
+                *args,
+                engine_index=dp_rank,
                 **kwargs,
             )
             engine_core.run_busy_loop()
@@ -171,12 +171,11 @@ def _perform_handshake(
             raise RuntimeError(f"Expected HELLO, got: {msg}")
 
         init_payload = EngineHandshakeMetadata(
-+           addresses=addresses,
-+           parallel_config={},
+            addresses=addresses,
+            parallel_config={},
         )
-+       handshake_socket.send_multipart([identity, msgspec.msgpack.encode(init_payload)])
+        handshake_socket.send_multipart([identity, msgspec.msgpack.encode(init_payload)])
         
-
         identity, msg = _recv(poller, handshake_socket, proc, "READY")
         if msg.get("status") != "READY":
             raise RuntimeError(f"Expected READY, got: {msg}")

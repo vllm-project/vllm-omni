@@ -123,7 +123,7 @@ class StageDiffusionClient:
     _NON_SERIALIZABLE_FIELDS = frozenset(
         {
             "generator",  # torch.Generator — recreated from seed
-            "modules",    # model components — loaded in subprocess
+            "modules",  # model components — loaded in subprocess
         }
     )
 

@@ -121,9 +121,7 @@ async def _run_loop(
                 if not isinstance(lora_req, LoRARequest):
                     sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
 
-            sampling_params = OmniDiffusionSamplingParams(
-                **sampling_params_dict
-            )
+            sampling_params = OmniDiffusionSamplingParams(**sampling_params_dict)
             result = await engine.generate(prompt, sampling_params, request_id)
             await response_socket.send(encoder.encode({"type": "result", "output": result}))
         except Exception as e:
@@ -257,10 +255,7 @@ async def _handle_collective_rpc(
     return {
         "supported": False,
         "todo": True,
-        "reason": (
-            f"Diffusion stage collective_rpc method {method} "
-            "is not implemented yet"
-        ),
+        "reason": (f"Diffusion stage collective_rpc method {method} is not implemented yet"),
     }
 
 
