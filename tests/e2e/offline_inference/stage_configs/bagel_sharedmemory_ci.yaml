@@ -7,9 +7,9 @@ stage_args:
     prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
     runtime:
       devices: "0"
-      max_batch_size: 1
     engine_args:
       model_stage: thinker
+      max_num_seqs: 1
       model_arch: OmniBagelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -21,6 +21,7 @@ stage_args:
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       tensor_parallel_size: 1
+      load_format: dummy
       omni_kv_config:
         need_send_cache: true
         kv_transfer_criteria:
@@ -42,9 +43,9 @@ stage_args:
     cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.bagel.collect_cfg_kv_caches
     runtime:
       devices: "0"
-      max_batch_size: 1
     engine_args:
       model_stage: dit
+      max_num_seqs: 1
       gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
@@ -53,6 +54,7 @@ stage_args:
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       tensor_parallel_size: 1
+      load_format: dummy
       omni_kv_config:
         need_recv_cache: true
     engine_input_source: [0]

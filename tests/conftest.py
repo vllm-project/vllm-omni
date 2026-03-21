@@ -843,7 +843,7 @@ def modify_stage_config(
                     'async_chunk': True,
                     'stage_args': {
                         0: {'engine_args.max_model_len': 5800},
-                        1: {'runtime.max_batch_size': 2}
+                        1: {'engine_args.max_num_seqs': 2}
                     }
                 }
         deletes: Dictionary containing configurations to delete.
@@ -1236,15 +1236,12 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         port = params.port
         stage_config_path = params.stage_config_path
         if run_level == "advanced_model" and stage_config_path is not None:
+            with open(stage_config_path, encoding="utf-8") as f:
+                _cfg = yaml.safe_load(f) or {}
+            _stage_ids = [s["stage_id"] for s in _cfg.get("stage_args", []) if "stage_id" in s]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={
-                    "stage_args": {
-                        0: ["engine_args.load_format"],
-                        1: ["engine_args.load_format"],
-                        2: ["engine_args.load_format"],
-                    }
-                },
+                deletes={"stage_args": {sid: ["engine_args.load_format"] for sid in _stage_ids}},
             )
 
         server_args = params.server_args or []

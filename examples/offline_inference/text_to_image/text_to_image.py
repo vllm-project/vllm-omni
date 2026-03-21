@@ -131,12 +131,10 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "gguf"],
-        help=(
-            "Quantization method for the transformer. "
-            "Options: 'fp8' (FP8 W8A8), 'gguf' (GGUF quantized weights). "
-            "Default: None (no quantization, uses BF16)."
-        ),
+        choices=["fp8", "int8", "gguf"],
+        help="Quantization method for the transformer. "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
+        "Default: None (no quantization, uses BF16).",
     )
     parser.add_argument(
         "--gguf-model",
@@ -216,6 +214,11 @@ def parse_args() -> argparse.Namespace:
         "--use-norm",
         action="store_true",
         help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
     return parser.parse_args()
 
@@ -304,6 +307,7 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
+        "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         **lora_args,
         **quant_kwargs,
     }

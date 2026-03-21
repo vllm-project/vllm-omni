@@ -12,6 +12,24 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Voxtral TTS CUDA Unit Test"
+    timeout_in_minutes: 10
+    depends_on: upload-ready-pipeline
+    commands:
+      - "timeout 10m pytest -s -v tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py"
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -28,6 +46,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -44,6 +63,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -60,6 +80,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -76,6 +97,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -93,6 +115,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -110,22 +133,18 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
 
-  - label: "Benchmark & Engine Test"
+  - label: "Engine Test"
     depends_on: upload-ready-pipeline
     commands:
       - |
         timeout 15m bash -c '
                 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-                set +e
-                pytest -s -v tests/benchmarks/test_serve_cli.py
-                EXIT1=$$?
                 pytest -s -v tests/engine/test_async_omni_engine_abort.py
-                EXIT2=$$?
-                exit $$((EXIT1 | EXIT2))
         '
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
@@ -137,6 +156,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -159,6 +179,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -221,8 +242,48 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
+
+  # TODO: uncomment when mistralai/tts-model is public
+  # - label: "Voxtral-TTS E2E Test"
+  #   depends_on: upload-ready-pipeline
+  #   commands:
+  #     - |
+  #       timeout 20m bash -c '
+  #         export VLLM_LOGGING_LEVEL=DEBUG
+  #         export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  #         pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
+  #       '
+  #   agents:
+  #     queue: "mithril-h100-pool"
+  #   plugins:
+  #     - kubernetes:
+  #         podSpec:
+  #           containers:
+  #             - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+  #               resources:
+  #                 limits:
+  #                   nvidia.com/gpu: 1
+  #               volumeMounts:
+  #                 - name: devshm
+  #                   mountPath: /dev/shm
+  #                 - name: hf-cache
+  #                   mountPath: /root/.cache/huggingface
+  #               env:
+  #                 - name: HF_HOME
+  #                   value: /root/.cache/huggingface
+  #           nodeSelector:
+  #             node.kubernetes.io/instance-type: gpu-h100-sxm
+  #           volumes:
+  #             - name: devshm
+  #               emptyDir:
+  #                 medium: Memory
+  #             - name: hf-cache
+  #               hostPath:
+  #                 path: /mnt/hf-cache
+  #                 type: DirectoryOrCreate
 
   # - label: "Diffusion Image Edit Test with H100 (1 GPU)"
   #   depends_on: upload-ready-pipeline
@@ -268,7 +329,7 @@ steps:
         timeout 30m bash -c '
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
           export VLLM_TEST_CLEAN_GPU_MEMORY=1
-          pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py
+          pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py -m "core_model" --run-level "core_model"
         '
     agents:
       queue: "mithril-h100-pool"
@@ -288,6 +349,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
@@ -306,7 +372,7 @@ steps:
         timeout 30m bash -c '
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
           export VLLM_TEST_CLEAN_GPU_MEMORY=1
-          pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py
+          pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py -m "core_model" --run-level "core_model"
         '
     agents:
       queue: "mithril-h100-pool"
@@ -326,6 +392,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
@@ -345,7 +416,7 @@ steps:
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
           export VLLM_TEST_CLEAN_GPU_MEMORY=1
           export VLLM_IMAGE_FETCH_TIMEOUT=60
-          pytest -s -v tests/e2e/online_serving/test_bagel_online.py
+          pytest -s -v tests/e2e/online_serving/test_bagel_online.py -m "core_model" --run-level "core_model"
         '
     agents:
       queue: "mithril-h100-pool"
@@ -365,6 +436,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:

@@ -173,6 +173,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of initial denoising steps using zero prediction (default: 1).",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
 
     # Memory & parallelism
     parser.add_argument("--vae-use-slicing", action="store_true", help="Enable VAE slicing.")
@@ -207,6 +212,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     # Validate I2V / V2V arguments

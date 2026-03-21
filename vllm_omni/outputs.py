@@ -62,6 +62,9 @@ class OmniRequestOutput:
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
     _custom_output: dict[str, Any] = field(default_factory=dict)
 
+    # profiling data
+    stage_durations: dict[str, float] = field(default_factory=dict)
+
     @classmethod
     def from_pipeline(
         cls,
@@ -98,6 +101,7 @@ class OmniRequestOutput:
         multimodal_output: dict[str, Any] | None = None,
         custom_output: dict[str, Any] | None = None,
         final_output_type: str = "image",
+        stage_durations: dict[str, float] | None = None,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -122,6 +126,7 @@ class OmniRequestOutput:
             metrics=metrics or {},
             _multimodal_output=multimodal_output or {},
             _custom_output=custom_output or {},
+            stage_durations=stage_durations or {},
             finished=True,
         )
 
@@ -271,6 +276,7 @@ class OmniRequestOutput:
             f"metrics={self.metrics}",
             f"multimodal_output={self._multimodal_output}",
             f"custom_output={self._custom_output}",
+            f"stage_durations={self.stage_durations}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
