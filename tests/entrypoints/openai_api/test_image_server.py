@@ -123,10 +123,12 @@ class FakeAsyncOmni:
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
+        self.captured_request_ids = []
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_sampling_params_list = sampling_params_list
         self.captured_prompt = prompt
+        self.captured_request_ids.append(request_id)
         images = [Image.new("RGB", (64, 64), color="green")]
         yield MockGenerationResult(images)
 
@@ -957,3 +959,49 @@ def test_image_edit_with_seed_zero_single_stage(test_client):
         f"Expected seed=0, but got seed={captured_sampling_params.seed}. "
         "This indicates the bug where seed=0 is treated as falsy."
     )
+
+
+def test_image_edits_request_id_unique(async_omni_test_client):
+    """Regression test for request_id collision in /v1/images/edits.
+
+    Previously, request_id was generated using int(time.time()), which only has
+    second-level precision. Two concurrent requests in the same second would get
+    identical request_ids like 'img_edit_1234567890', causing request state
+    collisions where one request's result would overwrite the other's.
+
+    The fix uses uuid.uuid4().hex to generate globally unique request IDs.
+    This test verifies that two requests issued in the same second receive
+    distinct request_ids.
+    """
+    img_bytes_1 = make_test_image_bytes((16, 16))
+
+    # Issue two requests in rapid succession
+    response1 = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={"prompt": "edit this image"},
+    )
+    assert response1.status_code == 200
+
+    response2 = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={"prompt": "edit this image"},
+    )
+    assert response2.status_code == 200
+
+    # Verify both requests received distinct request_ids
+    engine = async_omni_test_client.app.state.engine_client
+    captured_request_ids = engine.captured_request_ids
+    assert len(captured_request_ids) == 2
+    assert captured_request_ids[0] != captured_request_ids[1], (
+        f"Expected two distinct request_ids, but got: {captured_request_ids}. "
+        "This indicates a request_id collision where two requests in the same "
+        "second share the same ID, which can cause state corruption."
+    )
+
+    # Verify request_ids have the expected prefix
+    for request_id in captured_request_ids:
+        assert request_id.startswith("img_edit_"), (
+            f"Expected request_id to start with 'img_edit_', got: {request_id}"
+        )
