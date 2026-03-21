@@ -149,7 +149,7 @@ PROMPTING_META_KEYS = (
 )
 
 MM_INPUT_ALIASES = {
-    "image": ("pixel_values", "image_embeds"),
+    "image": ("pixel_values", "image_embeds", "img2img"),
     "video": ("pixel_values_videos", "video_embeds"),
     "audio": ("input_audio_features", "audio_embeds"),
 }

@@ -45,6 +45,10 @@ except Exception:  # pragma: no cover
 
 _MODALITY_ORDER = ("image", "video", "audio")
 
+_MODALITY_ALIASES = {
+    "img2img": "image",
+}
+
 _MODALITY_INPUT_KEY_BY_NAME = {
     "image": "pixel_values",
     "video": "pixel_values_videos",
@@ -58,13 +62,42 @@ _MODALITY_PLACEHOLDER_BY_NAME = {
 }
 
 _MODALITY_INPUT_ALIASES = {
-    "image": ("pixel_values", "image_embeds"),
+    "image": ("pixel_values", "image_embeds", "img2img"),
     "video": ("pixel_values_videos", "video_embeds"),
     "audio": ("input_audio_features", "audio_embeds"),
 }
 
 
+def _normalize_modality_name(modality: str) -> str:
+    return _MODALITY_ALIASES.get(modality, modality)
+
+
+def _get_modality_count(mm_counts: Mapping[str, int], modality: str) -> int:
+    canonical = _normalize_modality_name(modality)
+    count = mm_counts.get(canonical, 0)
+    for alias, target in _MODALITY_ALIASES.items():
+        if target == canonical:
+            count += mm_counts.get(alias, 0)
+    return count
+
+
+def _normalize_mm_data_aliases(mm_data: MultiModalDataDict) -> MultiModalDataDict:
+    normalized: dict[str, Any] = {}
+    for modality, value in mm_data.items():
+        canonical = _normalize_modality_name(modality)
+        if canonical in normalized and normalized[canonical] is not None and value is not None:
+            raise ValueError(
+                "Dynin received duplicate multimodal inputs for "
+                f"{canonical!r} via {modality!r}. "
+                "Provide either the canonical modality or its alias, not both."
+            )
+        if canonical not in normalized or normalized[canonical] is None:
+            normalized[canonical] = value
+    return normalized
+
+
 def _get_placeholder_text(modality: str) -> str | None:
+    modality = _normalize_modality_name(modality)
     for base_modality, placeholder in _MODALITY_PLACEHOLDER_BY_NAME.items():
         if modality.startswith(base_modality):
             return placeholder
@@ -78,7 +111,11 @@ class DyninOmniProcessingInfo(BaseProcessingInfo):
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {modality: 1 for modality in _MODALITY_ORDER}
+        limits = {modality: 1 for modality in _MODALITY_ORDER}
+        for alias, target in _MODALITY_ALIASES.items():
+            if target in limits:
+                limits[alias] = limits[target]
+        return limits
 
     def get_mm_max_tokens_per_item(
         self,
@@ -86,7 +123,11 @@ class DyninOmniProcessingInfo(BaseProcessingInfo):
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int] | None:
         del seq_len, mm_counts
-        return {modality: 1 for modality in _MODALITY_ORDER}
+        limits = {modality: 1 for modality in _MODALITY_ORDER}
+        for alias, target in _MODALITY_ALIASES.items():
+            if target in limits:
+                limits[alias] = limits[target]
+        return limits
 
 
 class DyninOmniDummyInputsBuilder(BaseDummyInputsBuilder[DyninOmniProcessingInfo]):
@@ -96,7 +137,7 @@ class DyninOmniDummyInputsBuilder(BaseDummyInputsBuilder[DyninOmniProcessingInfo
             placeholder = _get_placeholder_text(modality)
             if placeholder is None:
                 continue
-            chunks.extend([placeholder] * mm_counts.get(modality, 0))
+            chunks.extend([placeholder] * _get_modality_count(mm_counts, modality))
         return " ".join(chunks)
 
     def get_dummy_mm_data(
@@ -109,7 +150,7 @@ class DyninOmniDummyInputsBuilder(BaseDummyInputsBuilder[DyninOmniProcessingInfo
 
         mm_data: dict[str, Any] = {}
 
-        num_images = mm_counts.get("image", 0)
+        num_images = _get_modality_count(mm_counts, "image")
         if num_images > 0:
             mm_data["image"] = self._get_dummy_images(
                 width=224,
@@ -118,7 +159,7 @@ class DyninOmniDummyInputsBuilder(BaseDummyInputsBuilder[DyninOmniProcessingInfo
                 overrides=mm_options.get("image") if mm_options else None,
             )
 
-        num_videos = mm_counts.get("video", 0)
+        num_videos = _get_modality_count(mm_counts, "video")
         if num_videos > 0:
             mm_data["video"] = self._get_dummy_videos(
                 width=224,
@@ -128,7 +169,7 @@ class DyninOmniDummyInputsBuilder(BaseDummyInputsBuilder[DyninOmniProcessingInfo
                 overrides=mm_options.get("video") if mm_options else None,
             )
 
-        num_audios = mm_counts.get("audio", 0)
+        num_audios = _get_modality_count(mm_counts, "audio")
         if num_audios > 0:
             mm_data["audio"] = self._get_dummy_audios(
                 length=16000,
@@ -140,6 +181,9 @@ class DyninOmniDummyInputsBuilder(BaseDummyInputsBuilder[DyninOmniProcessingInfo
 
 
 class DyninOmniMultiModalDataParser(MultiModalDataParser):
+    def parse_mm_data(self, mm_data: MultiModalDataDict) -> MultiModalDataItems:
+        return super().parse_mm_data(_normalize_mm_data_aliases(mm_data))
+
     def _get_audio_with_sr(self, audio: Any) -> tuple[np.ndarray, float | None]:
         audio_array, orig_sr = super()._get_audio_with_sr(audio)
         if self.audio_resampler.target_sr is None:
@@ -299,6 +343,7 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
         modality: str,
         modality_items: Sequence[Any],
     ) -> Sequence[Any]:
+        modality = _normalize_modality_name(modality)
         input_key = _MODALITY_INPUT_KEY_BY_NAME[modality]
         tensor_items = [self._convert_modality_item(modality, item) for item in modality_items]
         mm_kwargs = MultiModalKwargsItems.from_hf_inputs(
