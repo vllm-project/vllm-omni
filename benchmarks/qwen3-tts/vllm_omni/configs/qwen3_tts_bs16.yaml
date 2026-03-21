@@ -1,5 +1,5 @@
-# Qwen3-TTS batch_size=4 config (streaming with async_chunk)
-# Enables concurrent request processing
+# Qwen3-TTS max_num_seqs=16 config (streaming with async_chunk)
+# High-throughput concurrent request processing
 # 2-stage pipeline: Talker -> Code2Wav
 async_chunk: true
 stage_args:
@@ -9,7 +9,7 @@ stage_args:
     runtime:
       devices: "0"
     engine_args:
-      max_num_seqs: 4
+      max_num_seqs: 16
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
       worker_type: ar
@@ -21,7 +21,7 @@ stage_args:
       engine_output_type: latent
       gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 512
+      max_num_batched_tokens: 4096
       max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     output_connectors:
@@ -40,7 +40,7 @@ stage_args:
     runtime:
       devices: "0"
     engine_args:
-      max_num_seqs: 4
+      max_num_seqs: 16
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
@@ -52,7 +52,7 @@ stage_args:
       engine_output_type: audio
       gpu_memory_utilization: 0.2
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 8192
+      max_num_batched_tokens: 16384
       max_model_len: 32768
     engine_input_source: [0]
     final_output: true
@@ -74,7 +74,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 4
+    max_inflight: 16
 
   connectors:
     connector_of_shared_memory:
