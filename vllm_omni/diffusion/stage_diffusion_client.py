@@ -60,9 +60,7 @@ class StageDiffusionClient:
         self.engine_input_source = metadata.engine_input_source
 
         # Spawn StageDiffusionProc subprocess and wait for READY.
-        proc, handshake_address, request_address, response_address = (
-            spawn_diffusion_proc(model, od_config)
-        )
+        proc, handshake_address, request_address, response_address = spawn_diffusion_proc(model, od_config)
         complete_diffusion_handshake(proc, handshake_address)
         self._proc = proc
 
@@ -122,10 +120,12 @@ class StageDiffusionClient:
     # Fields that are subprocess-local and cannot be serialized across
     # process boundaries.  They are recreated in the subprocess with
     # their default values.
-    _NON_SERIALIZABLE_FIELDS = frozenset({
-        "generator",  # torch.Generator — recreated from seed
-        "modules",    # model components — loaded in subprocess
-    })
+    _NON_SERIALIZABLE_FIELDS = frozenset(
+        {
+            "generator",  # torch.Generator — recreated from seed
+            "modules",    # model components — loaded in subprocess
+        }
+    )
 
     @staticmethod
     def _sampling_params_to_dict(sampling_params: Any) -> dict[str, Any]:
@@ -142,10 +142,7 @@ class StageDiffusionClient:
                 if f.name not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS
             }
         if isinstance(sampling_params, dict):
-            return {
-                k: v for k, v in sampling_params.items()
-                if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS
-            }
+            return {k: v for k, v in sampling_params.items() if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS}
         return dict(sampling_params)
 
     # ------------------------------------------------------------------
@@ -228,9 +225,7 @@ class StageDiffusionClient:
 
     def shutdown(self) -> None:
         try:
-            self._request_socket.send(
-                self._encoder.encode({"type": "shutdown"})
-            )
+            self._request_socket.send(self._encoder.encode({"type": "shutdown"}))
         except Exception:
             pass
 

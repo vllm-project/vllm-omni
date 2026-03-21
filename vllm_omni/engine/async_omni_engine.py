@@ -31,10 +31,6 @@ from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
-from vllm_omni.engine.stage_engine_core_proc import (
-    complete_stage_handshake,
-    spawn_stage_core,
-)
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
@@ -47,6 +43,10 @@ from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage_engine_core_proc import (
+    complete_stage_handshake,
+    spawn_stage_core,
+)
 from vllm_omni.engine.stage_init_utils import (
     StartedLlmStage,
     acquire_device_locks,

@@ -83,14 +83,16 @@ class StageEngineCoreProc(EngineCoreProc):
             parallel_config.data_parallel_index = dp_rank
 
             engine_core = StageEngineCoreProc(
-                *args, engine_index=dp_rank, **kwargs,
+                *args, 
+                engine_index=dp_rank, 
+                **kwargs,
             )
             engine_core.run_busy_loop()
 
         except SystemExit:
             logger.debug("StageEngineCoreProc exiting.")
             raise
-        except Exception as e:
+        except Exception:
             if engine_core is None:
                 logger.exception("StageEngineCoreProc failed to start.")
             else:
@@ -159,9 +161,7 @@ def _perform_handshake(
     vllm_config: VllmConfig,
 ) -> None:
     """Run the HELLO / INIT / READY handshake with the subprocess."""
-    with zmq_socket_ctx(
-        handshake_address, zmq.ROUTER, bind=True
-    ) as handshake_socket:
+    with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
         poller = zmq.Poller()
         poller.register(handshake_socket, zmq.POLLIN)
         poller.register(proc.sentinel, zmq.POLLIN)
@@ -171,11 +171,11 @@ def _perform_handshake(
             raise RuntimeError(f"Expected HELLO, got: {msg}")
 
         init_payload = EngineHandshakeMetadata(
-            addresses=addresses, parallel_config={},
++           addresses=addresses,
++           parallel_config={},
         )
-        handshake_socket.send_multipart(
-            [identity, msgspec.msgpack.encode(init_payload)]
-        )
++       handshake_socket.send_multipart([identity, msgspec.msgpack.encode(init_payload)])
+        
 
         identity, msg = _recv(poller, handshake_socket, proc, "READY")
         if msg.get("status") != "READY":
@@ -196,14 +196,9 @@ def _recv(
     while True:
         events = dict(poller.poll(timeout=timeout_ms))
         if not events:
-            raise TimeoutError(
-                f"Timed out waiting for {expected} from StageEngineCoreProc"
-            )
+            raise TimeoutError(f"Timed out waiting for {expected} from StageEngineCoreProc")
         if handshake_socket in events:
             identity, raw = handshake_socket.recv_multipart()
             return identity, msgspec.msgpack.decode(raw)
         if proc.exitcode is not None:
-            raise RuntimeError(
-                f"StageEngineCoreProc died during {expected} "
-                f"(exit code {proc.exitcode})"
-            )
+            raise RuntimeError(f"StageEngineCoreProc died during {expected} (exit code {proc.exitcode})")

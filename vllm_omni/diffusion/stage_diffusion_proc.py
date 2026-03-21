@@ -73,9 +73,7 @@ class StageDiffusionProc:
             handshake_ctx.term()
 
             # Run async event loop
-            asyncio.run(
-                _run_loop(engine, request_address, response_address)
-            )
+            asyncio.run(_run_loop(engine, request_address, response_address))
 
         except SystemExit:
             logger.debug("StageDiffusionProc exiting.")
@@ -107,9 +105,7 @@ async def _run_loop(
 
     tasks: dict[str, asyncio.Task] = {}
 
-    async def process_request(
-        request_id: str, prompt: Any, sampling_params_dict: dict
-    ) -> None:
+    async def process_request(request_id: str, prompt: Any, sampling_params_dict: dict) -> None:
         """Process a single diffusion request."""
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -123,21 +119,15 @@ async def _run_loop(
                 from vllm.lora.request import LoRARequest
 
                 if not isinstance(lora_req, LoRARequest):
-                    sampling_params_dict["lora_request"] = (
-                        msgspec.convert(lora_req, LoRARequest)
-                    )
+                    sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
 
             sampling_params = OmniDiffusionSamplingParams(
                 **sampling_params_dict
             )
             result = await engine.generate(prompt, sampling_params, request_id)
-            await response_socket.send(
-                encoder.encode({"type": "result", "output": result})
-            )
+            await response_socket.send(encoder.encode({"type": "result", "output": result}))
         except Exception as e:
-            logger.exception(
-                "Diffusion request %s failed: %s", request_id, e
-            )
+            logger.exception("Diffusion request %s failed: %s", request_id, e)
             await response_socket.send(
                 encoder.encode(
                     {
@@ -160,9 +150,7 @@ async def _run_loop(
                 request_id = msg["request_id"]
                 prompt = msg["prompt"]
                 sampling_params_dict = msg["sampling_params"]
-                task = asyncio.create_task(
-                    process_request(request_id, prompt, sampling_params_dict)
-                )
+                task = asyncio.create_task(process_request(request_id, prompt, sampling_params_dict))
                 tasks[request_id] = task
 
             elif msg_type == "abort":
@@ -179,9 +167,7 @@ async def _run_loop(
                 args = tuple(msg.get("args", ()))
                 kwargs = msg.get("kwargs", {})
                 try:
-                    result = await _handle_collective_rpc(
-                        engine, method, timeout, args, kwargs
-                    )
+                    result = await _handle_collective_rpc(engine, method, timeout, args, kwargs)
                     await response_socket.send(
                         encoder.encode(
                             {
@@ -192,9 +178,7 @@ async def _run_loop(
                         )
                     )
                 except Exception as e:
-                    logger.exception(
-                        "Collective RPC %s failed: %s", method, e
-                    )
+                    logger.exception("Collective RPC %s failed: %s", method, e)
                     await response_socket.send(
                         encoder.encode(
                             {
@@ -249,9 +233,7 @@ async def _handle_collective_rpc(
             return {
                 "supported": False,
                 "todo": True,
-                "reason": (
-                    f"AsyncOmniDiffusion.{method} is not implemented"
-                ),
+                "reason": (f"AsyncOmniDiffusion.{method} is not implemented"),
             }
         result = target(*args, **kwargs)
         if asyncio.iscoroutine(result) or asyncio.isfuture(result):
@@ -330,9 +312,7 @@ def _perform_diffusion_handshake(
     handshake_address: str,
 ) -> None:
     """Run the handshake with the diffusion subprocess."""
-    with zmq_socket_ctx(
-        handshake_address, zmq.ROUTER, bind=True
-    ) as handshake_socket:
+    with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
         poller = zmq.Poller()
         poller.register(handshake_socket, zmq.POLLIN)
         poller.register(proc.sentinel, zmq.POLLIN)
@@ -341,9 +321,7 @@ def _perform_diffusion_handshake(
         while True:
             events = dict(poller.poll(timeout=timeout_ms))
             if not events:
-                raise TimeoutError(
-                    "Timed out waiting for READY from StageDiffusionProc"
-                )
+                raise TimeoutError("Timed out waiting for READY from StageDiffusionProc")
             if handshake_socket in events:
                 identity, raw = handshake_socket.recv_multipart()
                 msg = msgspec.msgpack.decode(raw)
@@ -351,7 +329,4 @@ def _perform_diffusion_handshake(
                     return
                 raise RuntimeError(f"Expected READY, got: {msg}")
             if proc.exitcode is not None:
-                raise RuntimeError(
-                    f"StageDiffusionProc died during handshake "
-                    f"(exit code {proc.exitcode})"
-                )
+                raise RuntimeError(f"StageDiffusionProc died during handshake (exit code {proc.exitcode})")
