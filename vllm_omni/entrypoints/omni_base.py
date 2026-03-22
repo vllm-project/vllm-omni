@@ -53,6 +53,11 @@ def omni_snapshot_download(model_id: str) -> str:
         )
     except huggingface_hub.errors.RepositoryNotFoundError:
         logger.warning("Repository not found for '%s'.", model_id)
+    except PermissionError:
+        logger.warning(
+            "Permission denied when downloading '%s'. Assuming the model is already cached locally.",
+            model_id,
+        )
 
     return model_id
 

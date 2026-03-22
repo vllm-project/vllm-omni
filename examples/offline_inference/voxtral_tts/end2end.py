@@ -69,7 +69,9 @@ async def run_streaming(inputs, sampling_params_list, model_name, args, output_d
         ttfa = None
         accumulated_sample = 0
 
-        async for stage_output in async_omni.generate(single_input, request_id, sampling_params_list):
+        async for stage_output in async_omni.generate(
+            single_input, request_id=request_id, sampling_params_list=sampling_params_list
+        ):
             mm_output = stage_output.multimodal_output
             finished = stage_output.finished
             if not mm_output or "audio" not in mm_output:
@@ -208,7 +210,7 @@ def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir
     output_audio_dur = 0.0
 
     for batch_idx, o in enumerate(outputs):
-        audio_tensor = torch.cat(o.request_output[0].outputs[0].multimodal_output["audio"])
+        audio_tensor = torch.cat(o.multimodal_output["audio"])
         audio_array = audio_tensor.tolist()
         output_audio_dur += float(len(audio_array)) / 24000
         if args.write_audio:
@@ -229,7 +231,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="mistralai/tts-model",
+        default="mistralai/Voxtral-4B-TTS-2603",
         help="Model name or path.",
     )
     parser.add_argument(

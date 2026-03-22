@@ -2,15 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Image-to-Video generation example using Wan2.2 I2V/TI2V models or LTX2.
+Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2, or HunyuanVideo-1.5.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
+- HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
 
 Usage:
-    # I2V-A14B (MoE)
+    # Wan I2V-A14B (MoE)
     python image_to_video.py --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
         --image input.jpg --prompt "A cat playing with yarn"
 
@@ -24,6 +25,11 @@ Usage:
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
         --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
+
+    # HunyuanVideo-1.5 I2V (480p)
+    python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
+        --image input.jpg --prompt "A cat playing with yarn" \
+        --flow-shift 5.0 --guidance-scale 6.0
 """
 
 import argparse
@@ -43,11 +49,11 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video from an image with Wan2.2 or LTX2.")
+    parser = argparse.ArgumentParser(description="Generate a video from an image (Wan2.2, LTX2, HunyuanVideo-1.5).")
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers Wan2.2 I2V model ID or local path.",
+        help="Diffusers I2V model ID or local path (Wan2.2 or HunyuanVideo-1.5).",
     )
     parser.add_argument(
         "--model-class-name",
