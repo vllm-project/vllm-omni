@@ -68,10 +68,15 @@ def extract_glyph_texts(prompt: str) -> str | None:
 def get_hunyuan_video_15_post_process_func(od_config: OmniDiffusionConfig):
     video_processor = VideoProcessor(vae_scale_factor=16)
 
-    def post_process_func(video: torch.Tensor, output_type: str = "np"):
+    def post_process_func(video: torch.Tensor, output_type: str = "pil"):
         if output_type == "latent":
             return video
-        return video_processor.postprocess_video(video, output_type=output_type)
+        result = video_processor.postprocess_video(video, output_type=output_type)
+        # postprocess_video returns List[List[PIL.Image]] (batch x frames).
+        # Flatten to a flat list of PIL Images for the serving endpoint.
+        if isinstance(result, list) and result and isinstance(result[0], list):
+            result = result[0]
+        return result
 
     return post_process_func
 

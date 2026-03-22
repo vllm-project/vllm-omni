@@ -5,7 +5,7 @@ Tests of common diffusion feature combinations in online serving mode
 for HunyuanVideo-1.5-T2V (480p).
 
 Coverage (H100, since model cannot fit L4):
-- TeaCache + Layerwise CPU offloading (1 GPU)
+- CacheDiT + Layerwise CPU offloading (1 GPU)
 - CacheDiT + TP=2 + VAE patch parallel=2 (2 GPUs)
 """
 
@@ -34,17 +34,17 @@ def _get_diffusion_feature_cases(model: str):
     Designed for 2x H100 environment per issue #1832.
     """
     return [
-        # (1 GPU) TeaCache + Layerwise CPU offloading
+        # (1 GPU) CacheDiT + Layerwise CPU offloading
         pytest.param(
             OmniServerParams(
                 model=model,
                 server_args=[
                     "--cache-backend",
-                    "tea_cache",
+                    "cache_dit",
                     "--enable-layerwise-offload",
                 ],
             ),
-            id="single_card_teacache_layerwise",
+            id="single_card_cachedit_layerwise",
             marks=SINGLE_CARD_MARKS,
         ),
         # (2 GPUs) CacheDiT + TP=2 + VAE patch parallel=2
