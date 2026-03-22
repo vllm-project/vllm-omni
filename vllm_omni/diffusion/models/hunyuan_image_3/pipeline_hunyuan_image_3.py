@@ -20,6 +20,7 @@ from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .autoencoder import AutoencoderKLConv3D
@@ -77,7 +78,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
                 fall_back_to_pt=True,
             )
         ]
-        self.model = HunyuanImage3Model(self.hf_config)
+        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
         self._pipeline = None
         self._tkwrapper = TokenizerWrapper(od_config.model)
