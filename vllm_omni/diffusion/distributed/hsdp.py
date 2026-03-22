@@ -194,9 +194,13 @@ def shard_model(
         if any(cond(name, module) for cond in hsdp_shard_conditions):
             fully_shard(module, **hsdp_kwargs)
             num_sharded += 1
+        else:
+            from vllm_omni.diffusion.distributed.utils import get_local_device
+
+            module.to(get_local_device())
 
     if num_sharded == 0:
         raise ValueError("No modules were sharded")
 
-    fully_shard(model, **hsdp_kwargs)
+    # fully_shard(model, **hsdp_kwargs)
     logger.info("Sharded %d modules + root", num_sharded)

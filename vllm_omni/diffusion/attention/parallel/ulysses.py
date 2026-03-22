@@ -163,8 +163,14 @@ class UlyssesParallelAttention:
             joint_len=joint_len,
             joint_strategy=joint_strategy,
         )
-
+        use_2d_mask = False
         if attn_metadata is not None:
+            if attn_metadata.attn_mask is not None and attn_metadata.attn_mask.ndim == 2:
+                use_2d_mask = True
+            if attn_metadata.joint_attn_mask is not None and attn_metadata.joint_attn_mask.ndim == 2:
+                use_2d_mask = True
+
+        if attn_metadata is not None and use_2d_mask:
             if is_joint:
                 if attn_metadata.joint_attn_mask is None and attn_metadata.attn_mask is None:
                     attn_metadata.attn_mask = None
