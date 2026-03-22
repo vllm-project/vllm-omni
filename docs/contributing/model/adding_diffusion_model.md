@@ -739,6 +739,22 @@ See detailed guide: [How to add Sequence Parallel support](../../design/feature/
 omni = Omni(model="your-model", ulysses_degree=2, ring_degree=2)
 ```
 
+### Step Execution
+
+See detailed design guide: [How to add step execution support](../../design/feature/diffusion_step_execution.md)
+
+Use this only when your pipeline can be split into stable request-scoped and
+step-scoped phases. The reference implementation is
+`QwenImagePipeline`, which maps its request-level `forward()` into:
+
+1. `prepare_encode()` for prompt encoding, latent init, timestep prep, and per-request scheduler setup.
+2. `denoise_step()` for one transformer/noise prediction.
+3. `step_scheduler()` for one scheduler update and `step_index` advance.
+4. `post_decode()` for the final VAE decode.
+
+Do not enable `step_execution=True` until those four methods are implemented
+and validated against the request-level path.
+
 ### Cache Acceleration
 
 #### TeaCache
@@ -967,7 +983,7 @@ hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
 
 1. **Reduce batch size:**
    ```python
-   omni.generate(prompts=[...], max_batch_size=2)
+   omni.generate(prompts=[...], max_num_seqs=2)
    ```
 
 2. **Use smaller image size:**
