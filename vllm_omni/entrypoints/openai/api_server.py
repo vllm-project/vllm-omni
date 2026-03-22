@@ -11,7 +11,6 @@ import os
 # Image generation API imports
 import random
 import time
-import uuid
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -79,6 +78,7 @@ from vllm.entrypoints.utils import (
 from vllm.logger import init_logger
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
+from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -1244,7 +1244,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
 
-        request_id = f"img_gen_{uuid.uuid4().hex}"
+        request_id = f"img_gen-{random_uuid()}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
@@ -1411,7 +1411,7 @@ async def edit_images(
         _update_if_not_none(gen_params, "generator_device", generator_device)
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
-        request_id = f"img_edit_{int(time.time())}"
+        request_id = f"img_edit-{random_uuid()}"
         logger.info(f"Generating {n} image(s) {size_str}")
         result = await _generate_with_async_omni(
             engine_client=engine_client,
