@@ -310,12 +310,17 @@ class OmniGenerationScheduler(VLLMScheduler):
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
 
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output)
 
         except Exception:
             # If anything goes wrong, leave the original output unchanged
             logger.exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
+        finally:
+            # Ensure chunk-waiting requests are restored even on error,
+            # otherwise they are permanently orphaned in the adapter's
+            # internal deques and never scheduled again.
+            if self.chunk_transfer_adapter:
+                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
 
         return scheduler_output
 
