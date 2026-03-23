@@ -20,7 +20,7 @@ import pytest
 from tests.conftest import OmniServerParams
 from tests.utils import hardware_test
 
-MODEL = "mistralai/tts-model"
+MODEL = "mistralai/Voxtral-4B-TTS-2603"
 
 STAGE_CONFIG = str(
     Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "voxtral_tts.yaml"

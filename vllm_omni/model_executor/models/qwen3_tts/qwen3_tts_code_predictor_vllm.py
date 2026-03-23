@@ -353,6 +353,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self._bucket_pos_ids: dict[int, torch.Tensor] = {}
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
+        self._cuda_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -398,12 +399,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         )
 
     def _setup_compile(self) -> None:
-        """Lazily set up torch.compiled model forward for kernel fusion.
-
-        Uses ``mode="reduce-overhead"`` with ``dynamic=False`` so Inductor
-        captures internal CUDA graphs for fixed shapes, eliminating kernel
-        launch overhead entirely.
-        """
+        """Lazily set up torch.compile with manual CUDA graph capture."""
         if self._compiled_model_fwd is not None:
             return
         self._lm_heads_list = list(self.lm_head)
@@ -412,13 +408,11 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             logger.warning_once("code_predictor: torch.compile disabled")
             self._compiled_model_fwd = self.model.forward
             return
-        self._compiled_model_fwd = torch.compile(
-            self.model.forward,
-            mode="reduce-overhead",
-            dynamic=False,
-        )
-        logger.info("code_predictor: torch.compile enabled (mode=reduce-overhead, dynamic=False)")
-        self._warmup_compile()
+
+        self._compiled_model_fwd = torch.compile(self.model.forward, mode="default", dynamic=False)
+        self._warmup_buckets()
+        self._capture_cuda_graphs()
+        logger.info("code_predictor: torch.compile (mode=default) + CUDA graphs")
 
     def _padded_bsz(self, bsz: int) -> int:
         for bucket in self._bucket_sizes:
@@ -426,8 +420,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
                 return bucket
         return bsz
 
-    def _warmup_compile(self) -> None:
-        """Warmup power-of-2 batch-size buckets to front-load compilation."""
+    def _warmup_buckets(self) -> None:
+        """Warmup power-of-2 batch-size buckets to front-load Inductor compilation."""
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
         bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
         if max_bsz not in bucket_sizes:
@@ -444,7 +438,28 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             self._bucket_pos_ids[bsz] = pos_ids
             for _ in range(3):
                 self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
-        logger.info("code_predictor: warmup done for bucket sizes %s", self._bucket_sizes)
+        logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
+
+    def _capture_cuda_graphs(self) -> None:
+        """Capture a CUDA graph per bucket using vLLM's global graph pool."""
+        from vllm.platforms import current_platform
+
+        pool = current_platform.get_global_graph_pool()
+
+        max_seq = self._num_groups + 1
+        proj_buf = self._proj_buf
+
+        for bsz in self._bucket_sizes:
+            static_input = proj_buf[:bsz, :max_seq, :]
+            pos_ids = self._bucket_pos_ids[bsz]
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool):
+                static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+            self._cuda_graphs[bsz] = (g, static_output)
+
+        logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
 
     # ------------------------------------------------------------------
     #  Optimized forward: re-prefill + torch.compile + projection cache
@@ -505,10 +520,15 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             base_pos = torch.arange(max_seq, device=device, dtype=torch.long)
             full_pos_ids = base_pos if padded_bsz == 1 else base_pos.repeat(padded_bsz)
 
-        for step in range(1, num_groups):
-            projected = proj_buf[:padded_bsz, :max_seq, :]
+        # Use captured CUDA graph if available, otherwise call compiled fn.
+        cuda_graph_entry = self._cuda_graphs.get(padded_bsz)
 
-            hidden_out = model_fwd(projected, full_pos_ids)
+        for step in range(1, num_groups):
+            if cuda_graph_entry is not None:
+                cuda_graph_entry[0].replay()
+                hidden_out = cuda_graph_entry[1]
+            else:
+                hidden_out = model_fwd(proj_buf[:padded_bsz, :max_seq, :], full_pos_ids)
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
             if use_sampling:
