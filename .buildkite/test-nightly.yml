@@ -184,7 +184,7 @@ steps:
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - export BENCHMARK_DIR=tests
-      - pytest -s -v tests/perf/scripts/run_benchmark.py
+      - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
       - buildkite-agent artifact upload "tests/*.json"
       - python tools/nightly/buildkite_testcase_statistics.py -o tests/buildkite_testcase_statistics.html
       - buildkite-agent artifact upload "tests/*.html"
