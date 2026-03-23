@@ -67,6 +67,9 @@ class HunYuanImageBenchmark:
             max_tokens=1024,
             temperature=0.7,
             top_p=0.9,
+            seed=seed,
+            # Diffusion-specific params passed via guidance_scale
+            guidance_scale=guidance_scale,
         )
 
         total_latency = 0.0
@@ -76,10 +79,12 @@ class HunYuanImageBenchmark:
             
             start_time = time.perf_counter()
             
-            # 生成图像
+            # 生成图像 - pass num_inference_steps via prompt metadata
+            # for diffusion models in vllm
             outputs = self.llm.generate(
                 prompts=[prompt],
                 sampling_params=sampling_params,
+                extra_body={"num_inference_steps": num_inference_steps},
             )
             
             end_time = time.perf_counter()
