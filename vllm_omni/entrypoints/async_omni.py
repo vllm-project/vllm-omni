@@ -354,8 +354,6 @@ class AsyncOmni(EngineClient, OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
-            if req_state is not None and req_state.metrics is not None:
-                req_state.metrics.on_request_aborted(request_id)
             await self.abort(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
