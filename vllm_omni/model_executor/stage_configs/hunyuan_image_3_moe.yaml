@@ -8,9 +8,9 @@ stage_args:
     runtime:
       process: true  # Run this stage in a separate process
       devices: "0,1,2,3,4,5,6,7"  # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
-      max_batch_size: 1
     engine_args:
       model_stage: AR
+      max_num_seqs: 1
       model_arch: HunyuanImage3ForCausalMM
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler

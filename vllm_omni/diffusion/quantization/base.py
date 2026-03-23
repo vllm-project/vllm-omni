@@ -31,14 +31,15 @@ class DiffusionQuantizationConfig(ABC):
     # The underlying vLLM config instance
     _vllm_config: "QuantizationConfig | None" = None
 
-    def get_name(self) -> str:
+    @classmethod
+    def get_name(cls) -> str:
         """Return the quantization method name (e.g., 'fp8', 'int8').
 
-        By default, delegates to the underlying vLLM config instance.
+        Delegates to the underlying vLLM config class's get_name().
         """
-        if self._vllm_config is not None:
-            return self._vllm_config.get_name()
-        raise NotImplementedError("Subclass must initialize _vllm_config or override get_name().")
+        if cls.quant_config_cls is not None:
+            return cls.quant_config_cls.get_name()
+        raise NotImplementedError("Subclass must set quant_config_cls or override get_name().")
 
     def get_vllm_quant_config(self) -> "QuantizationConfig | None":
         """Return the underlying vLLM QuantizationConfig for linear layers."""

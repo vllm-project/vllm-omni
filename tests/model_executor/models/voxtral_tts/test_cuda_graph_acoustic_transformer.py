@@ -23,6 +23,7 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.core_model,
     pytest.mark.cuda,
+    pytest.mark.L4,
 ]
 
 DEVICE = torch.device("cuda:0")
