@@ -23,6 +23,24 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import get_forward_context as omni_get_ctx
 
 
+def _ensure_forward_context_attr(name: str, annotation: Any, default: Any) -> None:
+    if name not in _vllm_fc.ForwardContext.__annotations__:
+        _vllm_fc.ForwardContext.__annotations__[name] = annotation
+    if not hasattr(_vllm_fc.ForwardContext, name):
+        setattr(_vllm_fc.ForwardContext, name, default)
+
+
+def _set_hunyuan_fused_moe_forward_context(num_tokens: int) -> None:
+    if not _vllm_fc.is_forward_context_available():
+        return
+
+    forward_context = _vllm_fc.get_forward_context()
+    forward_context.num_tokens = num_tokens
+    forward_context.moe_comm_type = _select_moe_comm_method(vllm_config=omni_get_ctx().vllm_config)
+    forward_context.moe_comm_method = _MoECommMethods.get(forward_context.moe_comm_type)
+    forward_context.flash_comm_v1_enabled = False
+
+
 def _init_mc2_group_for_diffusion(
     world_size: int,
     data_parallel_size: int,
@@ -77,13 +95,12 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
         local_rank=local_rank,
     )
 
-    if not hasattr(_vllm_fc.ForwardContext, "moe_comm_method"):
-        _vllm_fc.ForwardContext.__annotations__["in_profile_run"] = bool
-        _vllm_fc.ForwardContext.in_profile_run = False
-
-    _vllm_fc.ForwardContext.moe_comm_type = _select_moe_comm_method(vllm_config=omni_get_ctx().vllm_config)
-    _vllm_fc.ForwardContext.moe_comm_method = _MoECommMethods.get(_vllm_fc.ForwardContext.moe_comm_type)
-    _vllm_fc.ForwardContext.flash_comm_v1_enabled = False
+    moe_comm_type = _select_moe_comm_method(vllm_config=omni_get_ctx().vllm_config)
+    _ensure_forward_context_attr("num_tokens", int | None, None)
+    _ensure_forward_context_attr("in_profile_run", bool, False)
+    _ensure_forward_context_attr("moe_comm_type", MoECommType | None, moe_comm_type)
+    _ensure_forward_context_attr("moe_comm_method", Any, _MoECommMethods.get(moe_comm_type))
+    _ensure_forward_context_attr("flash_comm_v1_enabled", bool, False)
 
 
 class AscendHunyuanFusedMoE(AscendSharedFusedMoE):
@@ -98,6 +115,7 @@ class AscendHunyuanFusedMoE(AscendSharedFusedMoE):
         self._init_hook_handle.remove()
 
     def forward(self, hidden_states: Any, router_logits: Any) -> Any:
+        _set_hunyuan_fused_moe_forward_context(hidden_states.shape[0])
         return super().forward(hidden_states, router_logits)
 
     def __del__(self):
