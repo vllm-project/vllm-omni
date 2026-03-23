@@ -406,6 +406,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
+        # In-memory LRU cache for voice extraction artifacts (Base voice clone).
+        from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
+
+        self._voice_cache = VoiceEmbeddingCache()
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -1326,6 +1331,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
+
+            # --- Voice cache: check in-memory LRU ---
+            _voice_cache_hash = None
+            if voice_clone_prompt is None:
+                _ref_audio_list = info_dict.get("ref_audio")
+                if isinstance(_ref_audio_list, list) and _ref_audio_list:
+                    from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
+
+                    _wav, _sr = self._normalize_ref_audio(_ref_audio_list[0])
+                    _voice_cache_hash = VoiceEmbeddingCache.compute_audio_hash(_wav, _sr)
+                    _cached = self._voice_cache.get(_voice_cache_hash)
+                    if _cached is not None:
+                        voice_clone_prompt = {
+                            "ref_code": _cached.get("ref_code"),
+                            "ref_spk_embedding": _cached.get("ref_spk_embedding"),
+                            "icl_mode": _cached.get("icl_mode"),
+                        }
+                        _voice_cache_hash = None  # hit -> don't store again
+
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
                 icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
@@ -1368,6 +1392,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     raise ValueError("Base requires `ref_audio`.")
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+
+            # --- Voice cache: store on miss ---
+            if _voice_cache_hash is not None and speaker_embed is not None:
+                self._voice_cache.put(
+                    _voice_cache_hash,
+                    {
+                        "ref_code": ref_code_prompt.detach().cpu()
+                        if isinstance(ref_code_prompt, torch.Tensor)
+                        else None,
+                        "ref_spk_embedding": speaker_embed.detach().cpu().squeeze(),
+                        "icl_mode": in_context_mode,
+                    },
+                )
 
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
