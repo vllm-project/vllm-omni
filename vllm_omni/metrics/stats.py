@@ -290,8 +290,8 @@ class OrchestratorAggregator:
             # 1. Accumulate metrics from stage stats
             if _m is not None:
                 self.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
-                self.accumulate_diffusion_metrics(stage_type, req_id, engine_outputs)
                 if finished:
+                    self.accumulate_diffusion_metrics(stage_type, req_id, engine_outputs)
                     self.on_stage_metrics(stage_id, req_id, _m, final_output_type)
 
             # 2. No output to yield, nothing more to do
@@ -339,15 +339,21 @@ class OrchestratorAggregator:
         stats.stage_id = stage_id
         stats.request_id = req_id
         stats.final_output_type = final_output_type
-        stats.diffusion_metrics = (
-            {
-                k: normalized_value
-                for k, v in self.diffusion_metrics.pop(req_id, {}).items()
-                if (normalized_value := _normalize_diffusion_metric_value(v)) is not None
-            }
-            if req_id in self.diffusion_metrics
-            else None
-        )
+        if req_id in self.diffusion_metrics:
+            normalized_metrics: dict[str, int | float] = {}
+            for key, value in self.diffusion_metrics.pop(req_id, {}).items():
+                normalized_value = _normalize_diffusion_metric_value(value)
+                if normalized_value is None:
+                    logger.debug(
+                        "Skipping unsupported metric value type: %s for key %s",
+                        type(value).__name__,
+                        key,
+                    )
+                    continue
+                normalized_metrics[key] = normalized_value
+            stats.diffusion_metrics = normalized_metrics
+        else:
+            stats.diffusion_metrics = None
         return stats
 
     def on_stage_metrics(
@@ -411,8 +417,14 @@ class OrchestratorAggregator:
         if diffusion_metrics:
             for key, value in diffusion_metrics.items():
                 normalized_value = _normalize_diffusion_metric_value(value)
-                if normalized_value is not None:
-                    self.diffusion_metrics[req_id][key] += normalized_value
+                if normalized_value is None:
+                    logger.debug(
+                        "Skipping unsupported metric value type: %s for key %s",
+                        type(value).__name__,
+                        key,
+                    )
+                    continue
+                self.diffusion_metrics[req_id][key] += normalized_value
 
     def on_forward(
         self,

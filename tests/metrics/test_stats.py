@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+from fractions import Fraction
+from types import SimpleNamespace
+from unittest.mock import call, patch
+
 import pytest
 
 from vllm_omni.metrics import OrchestratorAggregator
-from vllm_omni.metrics.stats import RequestE2EStats, StageRequestStats, StageStats
+from vllm_omni.metrics.stats import (
+    RequestE2EStats,
+    StageRequestStats,
+    StageStats,
+    _normalize_diffusion_metric_value,
+    logger as stats_logger,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -13,6 +23,20 @@ def _get_request_entry(table: list[dict], request_id: str) -> dict:
         if entry.get("request_id") == request_id:
             return entry
     raise AssertionError(f"request_id={request_id} not found")
+
+
+def _make_stage_request_stats() -> StageRequestStats:
+    return StageRequestStats(
+        batch_id=1,
+        batch_size=1,
+        num_tokens_in=1,
+        num_tokens_out=2,
+        stage_gen_time_ms=10.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+    )
 
 
 def test_orchestrator_aggregator_builds_summary() -> None:
@@ -155,3 +179,117 @@ def test_build_and_log_summary_multiple_requests() -> None:
     r2_stage_entry = next(e for e in summary["stage_table"] if e["request_id"] == "r2")
     assert len(r1_stage_entry["stages"]) == 2
     assert len(r2_stage_entry["stages"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, 1),
+        (False, 0),
+        (Fraction(3, 2), 1.5),
+        (3.25, 3.25),
+        (7, 7),
+        ("bad", None),
+        (object(), None),
+        (None, None),
+    ],
+)
+def test_normalize_diffusion_metric_value(value: object, expected: int | float | None) -> None:
+    assert _normalize_diffusion_metric_value(value) == expected
+
+
+def test_accumulate_diffusion_metrics_normalizes_and_skips_invalid() -> None:
+    agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
+    with patch.object(stats_logger, "debug") as debug_mock:
+        agg.accumulate_diffusion_metrics(
+            "diffusion",
+            "r1",
+            [
+                SimpleNamespace(
+                    metrics=[
+                        {
+                            "bool_metric": True,
+                            "real_metric": Fraction(5, 2),
+                            "float_metric": 1.25,
+                            "int_metric": 2,
+                            "invalid_metric": "bad",
+                        }
+                    ]
+                )
+            ],
+        )
+
+    assert agg.diffusion_metrics["r1"] == {
+        "bool_metric": 1.0,
+        "real_metric": 2.5,
+        "float_metric": 1.25,
+        "int_metric": 2.0,
+    }
+    debug_mock.assert_called_once_with(
+        "Skipping unsupported metric value type: %s for key %s",
+        "str",
+        "invalid_metric",
+    )
+
+
+def test_as_stage_request_stats_filters_none_and_invalid_diffusion_metrics(
+) -> None:
+    agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
+    agg.diffusion_metrics["r1"]["bool_metric"] = True
+    agg.diffusion_metrics["r1"]["real_metric"] = Fraction(7, 2)
+    agg.diffusion_metrics["r1"]["none_metric"] = None
+    agg.diffusion_metrics["r1"]["invalid_metric"] = "bad"
+
+    with patch.object(stats_logger, "debug") as debug_mock:
+        stats = agg._as_stage_request_stats(0, "r1", _make_stage_request_stats(), "image")
+
+    assert stats.diffusion_metrics == {
+        "bool_metric": 1,
+        "real_metric": 3.5,
+    }
+    assert "r1" not in agg.diffusion_metrics
+    assert debug_mock.call_args_list == [
+        call(
+            "Skipping unsupported metric value type: %s for key %s",
+            "NoneType",
+            "none_metric",
+        ),
+        call(
+            "Skipping unsupported metric value type: %s for key %s",
+            "str",
+            "invalid_metric",
+        ),
+    ]
+
+
+def test_process_stage_metrics_only_accumulates_diffusion_metrics_when_finished() -> None:
+    agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
+    request_stats = _make_stage_request_stats()
+    engine_output = SimpleNamespace(metrics={"steps": 4})
+
+    agg.process_stage_metrics(
+        result={"metrics": request_stats},
+        stage_type="diffusion",
+        stage_id=0,
+        req_id="r1",
+        engine_outputs=engine_output,
+        finished=False,
+        final_output_type="image",
+        output_to_yield=None,
+    )
+
+    assert "r1" not in agg.diffusion_metrics
+    assert "r1" not in agg.stage_events
+
+    agg.process_stage_metrics(
+        result={"metrics": _make_stage_request_stats()},
+        stage_type="diffusion",
+        stage_id=0,
+        req_id="r1",
+        engine_outputs=engine_output,
+        finished=True,
+        final_output_type="image",
+        output_to_yield=None,
+    )
+
+    assert agg.stage_events["r1"][0].diffusion_metrics == {"steps": 4}
