@@ -3,7 +3,7 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_image>.
 
 
-This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
+This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` `stepfun-ai/NextStep-1.1` using vLLM-Omni, note that NextStep-1.1 has different architecture so we treat it differently regarding running arguments and pipeline.
 
 - `text_to_image.py`: command-line script for single image generation with advanced options.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
@@ -19,7 +19,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output[0].images
+    images = outputs[0].request_output.images
     images[0].save("coffee.png")
 ```
 
@@ -37,7 +37,7 @@ if __name__ == "__main__":
     ]
     outputs = omni.generate(prompts)
     for i, output in enumerate(outputs):
-      image = output.request_output[0].images[0].save(f"{i}.jpg")
+      image = output.request_output.images[0].save(f"{i}.jpg")
 ```
 
 !!! info
@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by default, and the input
+    For diffusion pipelines, the stage config field `stage_args.[].engine_args.max_num_seqs` is 1 by default, and the input
     list is sliced into single-item requests before feeding into the diffusion pipeline. For models that do internally support
     batched inputs, you can [modify this configuration](https://github.com/vllm-project/vllm-omni/tree/main/configuration/stage_configs.md) to let the model accept a longer batch of prompts.
 
@@ -72,10 +72,12 @@ if __name__ == "__main__":
       }
     ])
     for i, output in enumerate(outputs):
-      image = output.request_output[0].images[0].save(f"{i}.jpg")
+      image = output.request_output.images[0].save(f"{i}.jpg")
 ```
 
 ## Local CLI Usage
+
+### Qwen/Tongyi Models
 
 ```bash
 python text_to_image.py \
@@ -90,7 +92,26 @@ python text_to_image.py \
   --output outputs/coffee.png
 ```
 
-Key arguments:
+### NextStep Models
+
+NextStep-1.1 can have extra arguments
+```bash
+python text_to_image.py \
+  --model stepfun-ai/NextStep-1.1 \
+  --prompt "A baby panda wearing an Iron Man mask, holding a board with 'NextStep-1' written on it" \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 28 \
+  --guidance-scale 7.5 \
+  --guidance-scale-2 1.0 \
+  --cfg-schedule constant \
+  --output nextstep_output.png \
+  --seed 42
+```
+
+### Key Arguments
+
+**Common arguments:**
 
 - `--prompt`: text description (string).
 - `--seed`: integer seed for deterministic sampling.
@@ -101,12 +122,49 @@ Key arguments:
 - `--output`: path to save the generated PNG.
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
-- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion_acceleration.md#using-cfg-parallel).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
+- `--guidance-scale`: classifier-free guidance scale.
+
+**NextStep-1.1 specific:**
+- `--guidance-scale-2`: secondary guidance scale, e.g. image-level CFG (default: 1.0).
+- `--timesteps-shift`: timesteps shift parameter for sampling (default: 1.0).
+- `--cfg-schedule`: CFG schedule type, "constant" or "linear" (default: "constant").
+- `--use-norm`: apply layer normalization to sampled tokens.
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 
 > ℹ️ Qwen-Image currently publishes best-effort presets at `1328x1328`, `1664x928`, `928x1664`, `1472x1140`, `1140x1472`, `1584x1056`, and `1056x1584`. Adjust `--height/--width` accordingly for the most reliable outcomes.
+
+## LoRA
+
+This example supports Peft-compatible LoRA (Low-Rank Adaptation) adapters for diffusion models. Pass `--lora-path` to use a LoRA adapter and optionally `--lora-scale` (default 1.0); omit it to use the base model only.
+
+### Basic usage with LoRA
+
+```bash
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --prompt "A piece of cheesecake" \
+  --lora-path /path/to/lora/ \
+  --lora-scale 1.0 \
+  --output output.png
+```
+
+### LoRA parameters
+
+- `--lora-path`: Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.
+- `--lora-scale`: Scale factor for LoRA weights (default: 1.0). Higher values increase the influence of the LoRA adapter.
+
+### LoRA adapter format
+
+LoRA adapters must be in PEFT (Parameter-Efficient Fine-Tuning) format. A typical LoRA adapter directory structure:
+
+```
+lora_adapter/
+├── adapter_config.json
+└── adapter_model.safetensors
+```
 
 ## Web UI Demo
 

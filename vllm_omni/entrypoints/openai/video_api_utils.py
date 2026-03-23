@@ -7,32 +7,82 @@ Shared helper utilities for OpenAI-compatible video generation API.
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 import tempfile
 from io import BytesIO
 from typing import Any
 
+import httpx
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
+
+from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
+from vllm_omni.entrypoints.openai.protocol.videos import (
+    FileImageReference,
+    ImageReference,
+    UrlImageReference,
+)
 
 
-def decode_input_reference(input_reference: str | None, input_reference_bytes: bytes | None) -> Image.Image | None:
-    """Decode image input from multipart bytes or base64/data URL."""
-    if input_reference and input_reference_bytes:
-        raise ValueError("Provide input_reference either as file upload or base64, not both.")
-    if input_reference_bytes:
-        return Image.open(BytesIO(input_reference_bytes)).convert("RGB")
+def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
+    try:
+        return Image.open(BytesIO(image_bytes)).convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
+
+
+def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
     if input_reference:
         if input_reference.startswith("data:image"):
             _, b64_data = input_reference.split(",", 1)
         else:
             b64_data = input_reference
+
         try:
             image_bytes = base64.b64decode(b64_data)
-        except Exception as exc:  # pragma: no cover - malformed base64
-            raise ValueError("Invalid base64 input_reference.") from exc
-        return Image.open(BytesIO(image_bytes)).convert("RGB")
+        except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
+            raise InvalidInputReferenceError(f"Invalid {source}: image data is not valid base64.") from exc
+        return _decode_image_bytes(image_bytes, source=source)
+    raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
+
+
+async def decode_image_url(image_url: str) -> Image.Image:
+    if image_url.startswith("data:image"):
+        return _decode_base64_image(image_url, source="image_reference.image_url")
+
+    if image_url.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(image_url)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise InvalidInputReferenceError(
+                    "Invalid image_reference.image_url: failed to download image."
+                ) from exc
+        return _decode_image_bytes(response.content, source="image_reference.image_url")
+
+    raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
+
+
+async def decode_input_reference(
+    image_reference: ImageReference | None,
+    input_reference_bytes: bytes | None,
+) -> Image.Image | None:
+    """Decode image input from multipart bytes, base64/data URL, or image_reference."""
+
+    if input_reference_bytes is not None and image_reference is not None:
+        raise InvalidInputReferenceError("Provide either input_reference or image_reference, not both.")
+
+    if isinstance(input_reference_bytes, bytes):
+        return _decode_image_bytes(input_reference_bytes, source="input_reference")
+
+    if isinstance(image_reference, UrlImageReference):
+        return await decode_image_url(image_reference.image_url)
+    elif isinstance(image_reference, FileImageReference):
+        raise InvalidInputReferenceError("Invalid image_reference: file_id is not supported yet.")
+
     return None
 
 
@@ -136,8 +186,44 @@ def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
     raise ValueError(f"Unsupported video payload type: {type(video)}")
 
 
-def encode_video_base64(video: Any, fps: int) -> str:
-    """Encode a video (frames/array/tensor) to base64 MP4."""
+def _coerce_audio_to_waveform(audio: Any) -> torch.Tensor:
+    """Convert an audio payload into a 2-channel CPU float tensor for LTX2 export."""
+    if isinstance(audio, torch.Tensor):
+        waveform = audio.detach().cpu()
+    elif isinstance(audio, np.ndarray):
+        waveform = torch.from_numpy(audio)
+    elif isinstance(audio, list):
+        waveform = torch.tensor(audio)
+    else:
+        raise ValueError(f"Unsupported audio payload type: {type(audio)}")
+
+    waveform = waveform.squeeze()
+
+    if waveform.ndim == 0:
+        raise ValueError("Audio payload must contain at least one sample.")
+
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    elif waveform.ndim == 2:
+        if waveform.shape[0] in (1, 2):
+            pass
+        elif waveform.shape[1] in (1, 2):
+            waveform = waveform.transpose(0, 1)
+        else:
+            raise ValueError(f"Unsupported audio payload shape: {tuple(waveform.shape)}")
+    else:
+        raise ValueError(f"Unsupported audio payload rank: {waveform.ndim}")
+
+    if waveform.shape[0] == 1:
+        waveform = waveform.repeat(2, 1)
+    elif waveform.shape[0] != 2:
+        raise ValueError(f"Expected mono or stereo audio, got shape {tuple(waveform.shape)}")
+
+    return waveform.float().contiguous()
+
+
+def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None) -> bytes:
+    """Encode a video payload into MP4 bytes, optionally muxing audio."""
     try:
         from diffusers.utils import export_to_video
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -150,12 +236,34 @@ def encode_video_base64(video: Any, fps: int) -> str:
     tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp_file.close()
     try:
-        export_to_video(frames, tmp_file.name, fps=fps)
+        if audio is not None:
+            from diffusers.pipelines.ltx2.export_utils import encode_video as encode_ltx2_video
+
+            frames_np = np.stack(frames, axis=0)
+            if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
+                frames_np = frames_np[..., :3]
+            frames_np = np.clip(frames_np, 0.0, 1.0)
+            frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
+            video_tensor = torch.from_numpy(frames_u8)
+            encode_ltx2_video(
+                video_tensor,
+                fps=fps,
+                audio=_coerce_audio_to_waveform(audio),
+                audio_sample_rate=audio_sample_rate,
+                output_path=tmp_file.name,
+            )
+        else:
+            export_to_video(frames, tmp_file.name, fps=fps)
         with open(tmp_file.name, "rb") as f:
-            video_bytes = f.read()
-        return base64.b64encode(video_bytes).decode("utf-8")
+            return f.read()
     finally:
         try:
             os.remove(tmp_file.name)
         except OSError:
             pass
+
+
+def encode_video_base64(video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None) -> str:
+    """Encode a video (frames/array/tensor) to base64 MP4."""
+    video_bytes = _encode_video_bytes(video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate)
+    return base64.b64encode(video_bytes).decode("utf-8")

@@ -17,7 +17,6 @@ import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
 import signal
 import socket
 import subprocess
@@ -29,31 +28,47 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from tests.conftest import modify_stage_config
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.platforms import current_omni_platform
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
 # "Generated with seed=52, num_inference_steps=15,
 # prompt='A futuristic city skyline at twilight, cyberpunk style'"
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (68, 107, 134)},
-    {"position": (400, 50), "rgb": (95, 139, 166)},
-    {"position": (700, 100), "rgb": (99, 122, 151)},
-    {"position": (150, 400), "rgb": (111, 125, 153)},
-    {"position": (512, 512), "rgb": (97, 107, 131)},
-    {"position": (700, 400), "rgb": (48, 64, 98)},
-    {"position": (100, 700), "rgb": (79, 63, 84)},
-    {"position": (400, 700), "rgb": (40, 58, 79)},
-    {"position": (700, 700), "rgb": (60, 75, 103)},
-    {"position": (256, 256), "rgb": (97, 128, 156)},
+    {"position": (100, 100), "rgb": (121, 118, 100)},
+    {"position": (400, 50), "rgb": (163, 162, 143)},
+    {"position": (700, 100), "rgb": (170, 156, 127)},
+    {"position": (150, 400), "rgb": (129, 127, 112)},
+    {"position": (512, 512), "rgb": (135, 61, 59)},
+    {"position": (700, 400), "rgb": (205, 107, 43)},
+    {"position": (100, 700), "rgb": (197, 177, 157)},
+    {"position": (400, 700), "rgb": (139, 107, 86)},
+    {"position": (700, 700), "rgb": (247, 205, 146)},
+    {"position": (256, 256), "rgb": (171, 160, 153)},
 ]
+
+if current_omni_platform.is_rocm():
+    REFERENCE_PIXELS = [
+        {"position": (100, 100), "rgb": (123, 119, 100)},
+        {"position": (400, 50), "rgb": (162, 161, 142)},
+        {"position": (700, 100), "rgb": (171, 156, 127)},
+        {"position": (150, 400), "rgb": (131, 128, 112)},
+        {"position": (512, 512), "rgb": (134, 61, 59)},
+        {"position": (700, 400), "rgb": (204, 107, 43)},
+        {"position": (100, 700), "rgb": (201, 180, 165)},
+        {"position": (400, 700), "rgb": (140, 108, 87)},
+        {"position": (700, 700), "rgb": (247, 205, 145)},
+        {"position": (256, 256), "rgb": (171, 160, 153)},
+    ]
 
 # Maximum allowed difference per color channel
 PIXEL_TOLERANCE = 5
 
 # Default test prompt
-DEFAULT_PROMPT = "<|im_start|>A futuristic city skyline at twilight, cyberpunk style<|im_end|>"
+DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
 
 def _find_free_port() -> int:
@@ -80,6 +95,10 @@ def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_st
     params_list[0].max_tokens = max_tokens  # type: ignore
     if len(params_list) > 1:
         params_list[1].num_inference_steps = num_inference_steps  # type: ignore
+        params_list[1].extra_args = {  # type: ignore
+            "cfg_text_scale": 4.0,
+            "cfg_img_scale": 1.5,
+        }
     return params_list
 
 
@@ -96,9 +115,9 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
         if images := getattr(req_output, "images", None):
             return images[0]
         if hasattr(req_output, "request_output") and req_output.request_output:
-            for stage_out in req_output.request_output:
-                if hasattr(stage_out, "images") and stage_out.images:
-                    return stage_out.images[0]
+            stage_out = req_output.request_output
+            if hasattr(stage_out, "images") and stage_out.images:
+                return stage_out.images[0]
     return None
 
 
@@ -155,17 +174,39 @@ def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Ima
     return generated_image
 
 
+def _resolve_stage_config(config_path: str, run_level: str) -> str:
+    """Resolve stage config based on run level.
+
+    For advanced_model (real weights), strip load_format: dummy so the model
+    falls back to loading real weights from HuggingFace.
+    """
+    if run_level == "advanced_model":
+        return modify_stage_config(
+            config_path,
+            deletes={
+                "stage_args": {
+                    0: ["engine_args.load_format"],
+                    1: ["engine_args.load_format"],
+                }
+            },
+        )
+    return config_path
+
+
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
-def test_bagel_text2img_shared_memory_connector():
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+    config_path = _resolve_stage_config(config_path, run_level)
     omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
 
     try:
         generated_image = _generate_bagel_image(omni)
-        _validate_pixels(generated_image)
+        if run_level == "advanced_model":
+            _validate_pixels(generated_image)
     finally:
         omni.close()
 
@@ -248,9 +289,10 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
 
 
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_bagel_text2img_mooncake_connector():
+def test_bagel_text2img_mooncake_connector(run_level):
     """Test Bagel text2img with Mooncake connector for inter-stage communication."""
     MOONCAKE_HOST = "127.0.0.1"
     MOONCAKE_RPC_PORT = _find_free_port()
@@ -288,10 +330,12 @@ def test_bagel_text2img_mooncake_connector():
             http_port=MOONCAKE_HTTP_PORT,
         )
 
+        temp_config_file = _resolve_stage_config(temp_config_file, run_level)
         omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file, stage_init_timeout=300)
 
         generated_image = _generate_bagel_image(omni)
-        _validate_pixels(generated_image)
+        if run_level == "advanced_model":
+            _validate_pixels(generated_image)
 
     finally:
         if omni:

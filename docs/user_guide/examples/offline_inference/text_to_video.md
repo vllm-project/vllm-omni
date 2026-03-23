@@ -3,7 +3,10 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_video>.
 
 
-The `Wan-AI/Wan2.2-T2V-A14B-Diffusers` pipeline generates short videos from text prompts.
+The Wan T2V pipeline generates short videos from text prompts. Supported models include:
+
+- `Wan-AI/Wan2.2-T2V-A14B-Diffusers` (14B, requires ~48GB VRAM)
+- `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` (1.3B, requires ~16GB VRAM, use `--flow-shift 3.0 --boundary-ratio 0.0`)
 
 ## Local CLI Usage
 

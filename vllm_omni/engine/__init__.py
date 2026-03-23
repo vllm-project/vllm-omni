@@ -56,19 +56,19 @@ class AdditionalInformationPayload(msgspec.Struct):
 class OmniEngineCoreRequest(EngineCoreRequest):
     """Engine core request for omni models with embeddings support.
 
-    Extends the base EngineCoreRequest with support for prompt embeddings
-    and additional information payloads, enabling direct transfer of
-    pre-computed embeddings between pipeline stages.
+    Extends the base EngineCoreRequest with support for additional
+    information payloads, enabling direct transfer of pre-computed data
+    between pipeline stages.
+
+    Note: prompt_embeds is inherited from EngineCoreRequest
+    (torch.Tensor | None). PromptEmbedsPayload should be decoded to
+    torch.Tensor before constructing this request.
 
     Attributes:
-        prompt_embeds: Optional serialized prompt embeddings payload for
-            direct transfer between stages
         additional_information: Optional serialized additional information
             dictionary containing tensors or lists to pass along with the request
     """
 
-    # Optional prompt embeddings (direct-transfer version)
-    prompt_embeds: PromptEmbedsPayload | None = None
     # Optional additional information dictionary (serialized)
     additional_information: AdditionalInformationPayload | None = None
 

@@ -34,6 +34,7 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
     LongCatImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -220,7 +221,7 @@ def split_quotation(prompt, quote_pairs=None):
     return result
 
 
-class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
+class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,
@@ -279,6 +280,9 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         self.default_sample_size = 128
         self.tokenizer_max_length = 512
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def _encode_prompt(self, prompt, image):
         raw_vl_input = self.image_processor_vl(images=image, return_tensors="pt")
@@ -703,7 +707,9 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 latents = latents.to(dtype=self.vae.dtype)
 
             image = self.vae.decode(latents, return_dict=False)[0]
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

@@ -5,34 +5,38 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Iterable
 from typing import Any, cast
 
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     load_transformer_config,
     retrieve_latents,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
+DEBUG_PERF = False
 
 
 def _load_model_index(model: str, local_files_only: bool) -> dict:
@@ -138,7 +142,9 @@ def get_wan22_i2v_pre_process_func(
     return pre_process_func
 
 
-class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
+class Wan22I2VPipeline(
+    nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+):
     """
     Wan2.2 Image-to-Video Pipeline.
 
@@ -210,7 +216,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             self.image_encoder = None
 
         # VAE
-        self.vae = AutoencoderKLWan.from_pretrained(
+        self.vae = DistributedAutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
 
@@ -246,6 +252,9 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         self._guidance_scale_2 = None
         self._num_timesteps = None
         self._current_timestep = None
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):
@@ -387,7 +396,12 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
-        # Encode prompts
+        if DEBUG_PERF:
+            # Sync GPU before timing to ensure accurate measurements
+            current_omni_platform.synchronize()
+            _t_pipeline_start = time.perf_counter()
+            _t_text_enc_start = _t_pipeline_start
+
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
@@ -403,9 +417,14 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
 
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
+
         batch_size = prompt_embeds.shape[0]
 
-        # Encode image embeddings (for Wan2.1-style with CLIP)
+        if DEBUG_PERF:
+            _t_img_enc_start = time.perf_counter()
         if self.has_image_encoder and self.transformer.config.image_dim is not None:
             if image_embeds is None:
                 if last_image is None:
@@ -416,6 +435,10 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             image_embeds = image_embeds.to(dtype)
         else:
             image_embeds = None
+
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_img_enc_ms = (time.perf_counter() - _t_img_enc_start) * 1000
 
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)
@@ -429,7 +452,8 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         # Prepare latents (use out_channels=16 for VAE latent, not in_channels=36)
         num_channels_latents = self.transformer.config.out_channels
 
-        # Preprocess image for VAE
+        if DEBUG_PERF:
+            _t_latent_prep_start = time.perf_counter()
         from diffusers.video_processor import VideoProcessor
 
         video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
@@ -464,69 +488,77 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             last_image=last_image_tensor,
         )
 
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_latent_prep_ms = (time.perf_counter() - _t_latent_prep_start) * 1000
+
         if attention_kwargs is None:
             attention_kwargs = {}
 
-        # Denoising loop
-        for t in timesteps:
-            self._current_timestep = t
+        if DEBUG_PERF:
+            _t_denoise_start = time.perf_counter()
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for t in timesteps:
+                self._current_timestep = t
 
-            # Select model and guidance scale based on timestep
-            current_model = self.transformer
-            current_guidance_scale = guidance_low
-            if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                current_model = self.transformer_2
-                current_guidance_scale = guidance_high
+                # Select model and guidance scale based on timestep
+                current_model = self.transformer
+                current_guidance_scale = guidance_low
+                if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                    current_guidance_scale = guidance_high
 
-            # Prepare latent input
-            if self.expand_timesteps:
-                # TI2V-5B style: blend condition with latents using mask
-                latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
-                latent_model_input = latent_model_input.to(dtype)
+                # Prepare latent input
+                if self.expand_timesteps:
+                    # TI2V-5B style: blend condition with latents using mask
+                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
+                    latent_model_input = latent_model_input.to(dtype)
 
-                # Expand timesteps for each patch
-                temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
-                timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-            else:
-                # Wan2.1 style: concatenate condition with latents
-                latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                timestep = t.expand(latents.shape[0])
+                    # Expand timesteps for each patch
+                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
+                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                else:
+                    # Wan2.1 style: concatenate condition with latents
+                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                    timestep = t.expand(latents.shape[0])
 
-            do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-            # Prepare kwargs for positive and negative predictions
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep,
-                "encoder_hidden_states": prompt_embeds,
-                "encoder_hidden_states_image": image_embeds,
-                "attention_kwargs": attention_kwargs,
-                "return_dict": False,
-                "current_model": current_model,
-            }
-            if do_true_cfg:
-                negative_kwargs = {
+                do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                # Prepare kwargs for positive and negative predictions
+                positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
-                    "encoder_hidden_states": negative_prompt_embeds,
+                    "encoder_hidden_states": prompt_embeds,
                     "encoder_hidden_states_image": image_embeds,
                     "attention_kwargs": attention_kwargs,
                     "return_dict": False,
                     "current_model": current_model,
                 }
-            else:
-                negative_kwargs = None
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_hidden_states_image": image_embeds,
+                        "attention_kwargs": attention_kwargs,
+                        "return_dict": False,
+                        "current_model": current_model,
+                    }
+                else:
+                    negative_kwargs = None
 
-            # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_true_cfg,
-                true_cfg_scale=current_guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=False,
-            )
+                # Predict noise with automatic CFG parallel handling
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=current_guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
 
-            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                pbar.update()
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
@@ -534,11 +566,17 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             current_omni_platform.empty_cache()
         self._current_timestep = None
 
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_denoise_ms = (time.perf_counter() - _t_denoise_start) * 1000
+
         # For expand_timesteps mode, blend final latents with condition
         if self.expand_timesteps:
             latents = (1 - first_frame_mask) * condition + first_frame_mask * latents
 
-        # Decode
+        if DEBUG_PERF:
+            _t_decode_start = time.perf_counter()
+
         if output_type == "latent":
             output = latents
         else:
@@ -554,7 +592,33 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=output)
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
+            _t_pipeline_wall_ms = (time.perf_counter() - _t_pipeline_start) * 1000
+            _t_stages_sum = _t_text_enc_ms + _t_img_enc_ms + _t_latent_prep_ms + _t_denoise_ms + _t_decode_ms
+
+            if _is_rank_zero():
+                logger.info(
+                    "Pipeline stage timing summary: "
+                    "TextEncoding=%.2f ms, ImageEncoding=%.2f ms, "
+                    "LatentPreparation=%.2f ms, Denoising=%.2f ms (%d steps), "
+                    "Decoding=%.2f ms, StagesSum=%.2f ms, PipelineWall=%.2f ms, "
+                    "Unaccounted=%.2f ms",
+                    _t_text_enc_ms,
+                    _t_img_enc_ms,
+                    _t_latent_prep_ms,
+                    _t_denoise_ms,
+                    len(timesteps),
+                    _t_decode_ms,
+                    _t_stages_sum,
+                    _t_pipeline_wall_ms,
+                    _t_pipeline_wall_ms - _t_stages_sum,
+                )
+
+        return DiffusionOutput(
+            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """

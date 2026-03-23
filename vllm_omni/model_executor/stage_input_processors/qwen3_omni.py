@@ -87,6 +87,7 @@ def thinker2talker_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
+    is_finished: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Process thinker outputs to create talker inputs.
@@ -104,7 +105,7 @@ def thinker2talker_async_chunk(
         all_token_ids = _ensure_list(all_token_ids)
         prompt_token_ids = _ensure_list(prompt_token_ids)
         talker_additional_info = {
-            "thinker_embeddings": pooling_output.get("0").detach().cpu(),
+            "thinker_prefill_embeddings": pooling_output.get("0").detach().cpu(),
             "thinker_hidden_states": pooling_output.get("24").detach().cpu(),
             "thinker_sequences": all_token_ids,
             "thinker_input_ids": prompt_token_ids,
@@ -112,16 +113,20 @@ def thinker2talker_async_chunk(
             "tts_bos_embed": pooling_output.get("tts_bos_embed").detach().cpu(),
             "tts_eos_embed": pooling_output.get("tts_eos_embed").detach().cpu(),
             "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
-            "finished": torch.tensor(request.is_finished(), dtype=torch.bool),
+            "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
         if transfer_manager.request_payload.get(request_id) is None:
-            if not request.is_finished():
+            if not is_finished:
                 transfer_manager.request_payload[request_id] = talker_additional_info
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
-            talker_additional_info["thinker_embeddings"] = torch.cat(
-                (save_payload.get("thinker_embeddings"), talker_additional_info.get("thinker_embeddings")), dim=0
+            talker_additional_info["thinker_prefill_embeddings"] = torch.cat(
+                (
+                    save_payload.get("thinker_prefill_embeddings"),
+                    talker_additional_info.get("thinker_prefill_embeddings"),
+                ),
+                dim=0,
             )
             talker_additional_info["thinker_hidden_states"] = torch.cat(
                 (save_payload.get("thinker_hidden_states"), talker_additional_info.get("thinker_hidden_states")),
@@ -133,11 +138,16 @@ def thinker2talker_async_chunk(
         output_token_ids = _ensure_list(output_token_ids)
 
         talker_additional_info = {
-            "thinker_embeddings": pooling_output.get("0").detach().cpu(),
-            "thinker_hidden_states": pooling_output.get("24").detach().cpu(),
-            "thinker_sequences": output_token_ids,
-            "finished": torch.tensor(request.is_finished(), dtype=torch.bool),
+            "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
+        if output_token_ids:
+            talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
+            talker_additional_info["thinker_decode_embeddings"] = pooling_output.get("0").detach().cpu()
+            talker_additional_info["thinker_output_token_ids"] = output_token_ids
+        else:
+            # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
+            talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
+            talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
     return talker_additional_info
 
 
@@ -174,7 +184,7 @@ def thinker2talker(
         output = thinker_output.outputs[0]
 
         info = {
-            "thinker_embeddings": output.multimodal_output["0"].detach().to(device=device, dtype=torch.float),
+            "thinker_prefill_embeddings": output.multimodal_output["0"].detach().to(device=device, dtype=torch.float),
             "thinker_hidden_states": output.multimodal_output["24"].detach().to(device=device, dtype=torch.float),
             "thinker_sequences": (
                 thinker_output.prompt_token_ids + output.token_ids
@@ -209,12 +219,19 @@ def talker2code2wav_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
+    is_finished: bool = False,
 ):
     """
     Pooling version.
     """
     if "code_predictor_codes" not in pooling_output:
         return None
+
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
+    left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
 
     code_predictor_codes = pooling_output["code_predictor_codes"]
 
@@ -240,24 +257,28 @@ def talker2code2wav_async_chunk(
         return None
 
     request_id = request.external_req_id
-    chunk_size = left_context_size = 25
     transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
-    chunk_length = length % chunk_size
-    if chunk_length != 0 and not request.is_finished():
+    chunk_length = length % chunk_size_config
+    if chunk_length != 0 and not is_finished:
         return None
 
-    context_length = chunk_length if chunk_length != 0 else chunk_size
+    context_length = chunk_length if chunk_length != 0 else chunk_size_config
+    # ensure left context does not exceed available length
+    left_context_size = max(0, min(length - context_length, left_context_size_config))
     end_index = min(length, left_context_size + context_length)
 
+    codes = (
+        torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:])
+        .transpose(0, 1)
+        .reshape(-1)
+        .tolist()
+    )
+
     info = {
-        "code_predictor_codes": (
-            torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:])
-            .transpose(0, 1)
-            .reshape(-1)
-            .tolist()
-        ),
-        "finished": torch.tensor(request.is_finished(), dtype=torch.bool),
+        "code_predictor_codes": codes,
+        "left_context_size": left_context_size,
+        "finished": torch.tensor(is_finished, dtype=torch.bool),
     }
     return info
 

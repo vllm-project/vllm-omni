@@ -12,6 +12,11 @@ logger = get_connector_logger(__name__)
 class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
 
+    # Whether the connector can handle raw bytes/torch.Tensor natively
+    # without going through OmniSerializer.  Connectors that copy raw
+    # payloads directly (e.g. RDMA) should override this to True.
+    supports_raw_data: bool = False
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.
@@ -52,6 +57,29 @@ class OmniConnectorBase(ABC):
         """Return health status and metrics."""
         pass
 
+    @abstractmethod
+    def close(self) -> None:
+        """Release resources held by this connector.
+
+        Subclasses must implement this to clean up transport-specific
+        resources (connections, memory pools, threads, etc.).
+        Implementations should be idempotent (safe to call multiple times).
+        """
+        pass
+
+    # --- Default resource-management protocol ---
+    # Subclasses get context-manager and destructor support for free;
+    # they only need to implement close().
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     @staticmethod
     def serialize_obj(obj: Any) -> bytes:
         """Serialize a Python object to bytes using centralized serializer."""
@@ -65,3 +93,12 @@ class OmniConnectorBase(ABC):
         from ..utils.serialization import OmniSerializer
 
         return OmniSerializer.deserialize(data)
+
+    @staticmethod
+    def _make_key(key: str, from_stage: str, to_stage: str, separator: str = "@") -> str:
+        """Generate internal key with stage routing info.
+
+        Default format: ``{key}@{from_stage}_{to_stage}``.
+        Connectors with different key conventions can override this method.
+        """
+        return f"{key}{separator}{from_stage}_{to_stage}"

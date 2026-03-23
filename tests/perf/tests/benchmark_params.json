@@ -1,0 +1,57 @@
+[
+    {
+        "name": "512x512_steps20",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": 10,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true,
+        "baseline": {
+            "throughput_qps": 0.001,
+            "latency_p99": 1000.0,
+            "peak_memory_mb_max": 400000,
+            "peak_memory_mb_mean": 400000
+        }
+    },
+    {
+        "name": "1536x1536_steps35",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 1536,
+        "height": 1536,
+        "num-inference-steps": 35,
+        "num-prompts": 10,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true,
+        "baseline": {
+            "throughput_qps": 0.001,
+            "latency_p99": 1000.0,
+            "peak_memory_mb_max": 400000,
+            "peak_memory_mb_mean": 400000
+        }
+    },
+    {
+        "name": "mixed_resolution",
+        "dataset": "random",
+        "task": "t2i",
+        "num-inference-steps": 20,
+        "num-prompts": 10,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true,
+        "random-request-config": [
+            {"width": 512,  "height": 512,  "num_inference_steps": 20, "weight": 0.15},
+            {"width": 768,  "height": 768,  "num_inference_steps": 20, "weight": 0.25},
+            {"width": 1024, "height": 1024, "num_inference_steps": 25, "weight": 0.45},
+            {"width": 1536, "height": 1536, "num_inference_steps": 35, "weight": 0.15}
+        ],
+        "baseline": {
+            "throughput_qps": 0.001,
+            "latency_p99": 1000.0,
+            "peak_memory_mb_max": 400000,
+            "peak_memory_mb_mean": 400000
+        }
+    }
+]

@@ -2,7 +2,7 @@
 
 This section lists the most common options for running vLLM-Omni.
 
-For options within a vLLM Engine. Please refer to [vLLM Configuration](https://docs.vllm.ai/en/v0.14.0/configuration/index.html)
+For options within a vLLM Engine. Please refer to [vLLM Configuration](https://docs.vllm.ai/en/v0.16.0/configuration/index.html)
 
 Currently, the main options are maintained by stage configs for each model.
 
@@ -14,8 +14,13 @@ For introduction, please check [Introduction for stage config](./stage_configs.m
 
 - **[GPU Memory Calculation and Configuration](./gpu_memory_utilization.md)** - Guide on how to calculate memory requirements and set up `gpu_memory_utilization` for optimal performance
 
+## Multi-Stage Recipes
+
+- **[Prefill-Decode Disaggregation](./pd_disaggregation.md)** - How to derive a PD-aware Qwen3-Omni stage config from the default config without introducing another bundled YAML
+
 ## Optimization Features
 
 - **[TeaCache Configuration](../user_guide/diffusion/teacache.md)** - Enable TeaCache adaptive caching for DiT models to achieve 1.5x-2.0x speedup with minimal quality loss
 - **[Cache-DiT Configuration](../user_guide/diffusion/cache_dit_acceleration.md)** - Enable Cache-DiT as cache acceleration backends for DiT models
 - **[Parallelism Configuration](../user_guide/diffusion/parallelism_acceleration.md)** - Enable parallelism (e.g., sequence parallelism) for for DiT models
+- **[CPU Offloading](../user_guide/diffusion/cpu_offload_diffusion.md)** - Enable CPU offloading (model-level and layerwise) for for DiT models

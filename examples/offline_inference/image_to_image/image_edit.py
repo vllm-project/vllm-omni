@@ -2,6 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
+Example script for image editing with OmniGen2.
+
+    python image_edit.py \
+        --image input.png \
+        --model "OmniGen2/OmniGen2" \
+        --prompt "Change the background to classroom." \
+        --negative-prompt "(((deformed))), blurry, over saturation, bad anatomy, disfigured, poorly drawn face, mutation, mutated, (extra_limb), (ugly), (poorly drawn hands), fused fingers, messy drawing, broken legs censor, censored, censor_bar" \
+        --num-inference-steps 50 \
+        --seed 0 \
+        --guidance-scale 5.0 \
+        --guidance-scale-2 2.0 \
+        --output outputs/image_edit.png \
+        --num-outputs-per-prompt 2
+
+    Note: For OmniGen2, `guidance_scale` works as `text_guidance_scale`,
+    and `guidance_scale_2` works as `image_guidance_scale`.
+
 Example script for image editing with Qwen-Image-Edit.
 
 Usage (single image):
@@ -142,6 +159,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--guidance-scale-2", type=float, default=None, help="image guidance scale for image-to-image generation."
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="output_image_edit.png",
@@ -187,6 +207,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
     parser.add_argument(
@@ -300,6 +325,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -328,6 +358,7 @@ def main():
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Configure cache based on backend type
@@ -363,6 +394,7 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
     print("Pipeline loaded")
 
@@ -382,7 +414,7 @@ def main():
     else:
         print(f"  Input image size: {input_image.size}")
     print(
-        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}"
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}, enable_expert_parallel: {args.enable_expert_parallel}"
     )
     print(f"{'=' * 60}\n")
 
@@ -403,6 +435,7 @@ def main():
             generator=generator,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_2,
             num_inference_steps=args.num_inference_steps,
             num_outputs_per_prompt=args.num_outputs_per_prompt,
             layers=args.layers,
@@ -436,12 +469,12 @@ def main():
         raise ValueError("No output generated from omni.generate()")
 
     # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0].images
+    # omni.generate() returns list[OmniRequestOutput], extract images from request_output.images
     first_output = outputs[0]
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 

@@ -14,7 +14,7 @@
         soft_fail: false
         commands:
           - "source .buildkite/scripts/docker_login_ecr_public.sh && safe_docker_login_ecr_public"
-          - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --target final --progress plain ."
+          - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --target test --build-arg ARG_PYTORCH_ROCM_ARCH=gfx942 --progress plain ."
           - "docker push {{ docker_image_amd }}"
         key: "amd-build"
         env:
@@ -40,9 +40,14 @@
           {% else %}
           queue: amd_mi325_1
           {% endif %}
-        command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh "(command rocm-smi || true) && cd {{ (step.working_dir or default_working_dir) | safe  }} ; {{ step.command  or (step.commands | join(" && ")) | safe }}"
+{% set cmd_body = (step.command or (step.commands | join("\n"))) | trim %}
+{% set indented_cmd = cmd_body | replace("\n", "\n            ") %}
+        command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh
         env:
           DOCKER_BUILDKIT: "1"
+          TEST_COMMAND: |-
+            (command rocm-smi || true) && cd {{ (step.working_dir or default_working_dir) | safe }}
+            {{ indented_cmd | safe }}
         priority: 100
         {% if step.grade and step.grade == "Blocking" %}
         soft_fail: false

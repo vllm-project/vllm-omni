@@ -59,6 +59,7 @@ hooks:
   - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
   - docs/mkdocs/hooks/generate_examples.py
+  - docs/mkdocs/hooks/generate_argparse.py
 
 # Exclude include files from navigation warnings
 exclude_docs: |

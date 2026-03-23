@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 import torch.nn as nn
 
 from vllm_omni.diffusion.cache.teacache.extractors import CacheContext, get_extractor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 def test_sd3_extractor_returns_valid_context() -> None:
     class _DummyBlock(nn.Module):
         def norm1(self, hidden_states: torch.Tensor, emb: torch.Tensor):

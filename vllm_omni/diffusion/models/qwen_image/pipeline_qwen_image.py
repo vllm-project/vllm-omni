@@ -1,21 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import inspect
 import json
 import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
 import torch.distributed
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models.autoencoders.autoencoder_kl_qwenimage import (
-    AutoencoderKLQwenImage,
-)
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -25,6 +23,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
@@ -33,9 +32,14 @@ from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -238,7 +242,9 @@ def apply_rotary_emb_qwen(
         return x_out.type_as(x)
 
 
-class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
+class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
+    supports_step_execution: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
@@ -269,9 +275,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
         quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
         self.transformer = QwenImageTransformer2DModel(
@@ -293,6 +299,10 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         self.prompt_template_encode = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"  # noqa: E501
         self.prompt_template_encode_start_idx = 34
         self.default_sample_size = 128
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def check_inputs(
         self,
@@ -536,6 +546,372 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
     def interrupt(self):
         return self._interrupt
 
+    def _extract_prompts(self, prompts):
+        """Extract prompt and negative_prompt from OmniPromptType list."""
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in prompts] or None
+        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in prompts):
+            negative_prompt = None
+        elif prompts:
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in prompts]
+        else:
+            negative_prompt = None
+        return prompt, negative_prompt
+
+    def _prepare_generation_context(
+        self,
+        *,
+        prompt,
+        negative_prompt,
+        height,
+        width,
+        num_inference_steps,
+        sigmas,
+        guidance_scale,
+        num_images_per_prompt,
+        generator,
+        true_cfg_scale,
+        max_sequence_length,
+        prompt_embeds=None,
+        prompt_embeds_mask=None,
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        latents=None,
+        attention_kwargs=None,
+        callback_on_step_end_tensor_inputs=None,
+    ):
+        """Shared preparation logic for forward() and prepare_encode().
+
+        Validates inputs, encodes prompts, prepares latents, computes timesteps,
+        and returns all intermediate values as a dict.
+        """
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds_mask,
+            callback_on_step_end_tensor_inputs,
+            max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs or {}
+        self._current_timestep = None
+        self._interrupt = False
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        elif prompt_embeds is not None:
+            batch_size = prompt_embeds.shape[0]
+        else:
+            batch_size = 1
+
+        has_neg_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+        )
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            prompt=prompt,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+                prompt_embeds_mask=negative_prompt_embeds_mask,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+            )
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+
+        num_channels_latents = self.transformer.in_channels // 4
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            self.device,
+            generator,
+            latents,
+        )
+
+        img_shapes = [[(1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2)]] * batch_size
+
+        timesteps, num_inference_steps = self.prepare_timesteps(
+            num_inference_steps,
+            sigmas,
+            latents.shape[1],
+        )
+        self._num_timesteps = len(timesteps)
+
+        if self.transformer.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        else:
+            guidance = None
+
+        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
+        negative_txt_seq_lens = (
+            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+        )
+
+        return {
+            "prompt_embeds": prompt_embeds,
+            "prompt_embeds_mask": prompt_embeds_mask,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+            "latents": latents,
+            "img_shapes": img_shapes,
+            "timesteps": timesteps,
+            "do_true_cfg": do_true_cfg,
+            "guidance": guidance,
+            "txt_seq_lens": txt_seq_lens,
+            "negative_txt_seq_lens": negative_txt_seq_lens,
+        }
+
+    def prepare_encode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> "DiffusionRequestState":
+        """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
+        sampling = state.sampling
+        prompt, negative_prompt = self._extract_prompts(state.prompts or [])
+
+        ctx = self._prepare_generation_context(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=sampling.height or self.default_sample_size * self.vae_scale_factor,
+            width=sampling.width or self.default_sample_size * self.vae_scale_factor,
+            num_inference_steps=sampling.num_inference_steps or 50,
+            sigmas=sampling.sigmas,
+            guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
+            num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
+            generator=sampling.generator,
+            true_cfg_scale=sampling.true_cfg_scale or 4.0,
+            max_sequence_length=sampling.max_sequence_length or 512,
+            attention_kwargs=kwargs.get("attention_kwargs"),
+        )
+
+        # prepare_timesteps() has already materialized request-specific timestep
+        # state on self.scheduler, so deepcopy preserves dynamic-shifting state
+        # without replaying set_timesteps() on the per-request scheduler.
+        # Per-request scheduler (must not share state with self.scheduler)
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(0)
+
+        # Populate state from generation context
+        state.prompt_embeds = ctx["prompt_embeds"]
+        state.prompt_embeds_mask = ctx["prompt_embeds_mask"]
+        state.negative_prompt_embeds = ctx["negative_prompt_embeds"]
+        state.negative_prompt_embeds_mask = ctx["negative_prompt_embeds_mask"]
+        state.latents = ctx["latents"]
+        state.timesteps = ctx["timesteps"]
+        state.step_index = 0
+        state.scheduler = req_scheduler
+        state.do_true_cfg = ctx["do_true_cfg"]
+        state.guidance = ctx["guidance"]
+        state.img_shapes = ctx["img_shapes"]
+        state.txt_seq_lens = ctx["txt_seq_lens"]
+        state.negative_txt_seq_lens = ctx["negative_txt_seq_lens"]
+        # QwenImage always normalizes CFG output (matching forward())
+        state.sampling.cfg_normalize = True
+
+        return state
+
+    def _build_denoise_kwargs(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        img_shapes: list,
+        txt_seq_lens: list[int] | None,
+        do_true_cfg: bool,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds_mask: torch.Tensor | None,
+        negative_txt_seq_lens: list[int] | None,
+        image_latents: torch.Tensor | None = None,
+        extra_transformer_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
+        """Build positive/negative kwargs and output_slice for one denoise step.
+
+        Returns:
+            (positive_kwargs, negative_kwargs, output_slice)
+        """
+        extra_transformer_kwargs = extra_transformer_kwargs or {}
+
+        # Broadcast timestep to match batch size
+        t_for_model = timestep.expand(latents.shape[0]).to(
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+
+        # Concatenate image latents if available (editing pipelines)
+        latent_model_input = latents
+        if image_latents is not None:
+            latent_model_input = torch.cat([latents, image_latents], dim=1)
+
+        positive_kwargs = {
+            "hidden_states": latent_model_input,
+            "timestep": t_for_model / 1000,
+            "guidance": guidance,
+            "encoder_hidden_states_mask": prompt_embeds_mask,
+            "encoder_hidden_states": prompt_embeds,
+            "img_shapes": img_shapes,
+            "txt_seq_lens": txt_seq_lens,
+            **extra_transformer_kwargs,
+        }
+        if do_true_cfg:
+            negative_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": t_for_model / 1000,
+                "guidance": guidance,
+                "encoder_hidden_states_mask": negative_prompt_embeds_mask,
+                "encoder_hidden_states": negative_prompt_embeds,
+                "img_shapes": img_shapes,
+                "txt_seq_lens": negative_txt_seq_lens,
+                **extra_transformer_kwargs,
+            }
+        else:
+            negative_kwargs = None
+
+        output_slice = latents.size(1) if image_latents is not None else None
+        return positive_kwargs, negative_kwargs, output_slice
+
+    def _decode_latents(
+        self,
+        latents: torch.Tensor,
+        height: int,
+        width: int,
+        output_type: str = "pil",
+    ) -> DiffusionOutput:
+        """Unpack, normalize, and VAE-decode latents into a DiffusionOutput."""
+        if output_type == "latent":
+            return DiffusionOutput(
+                output=latents,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+
+        latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        return DiffusionOutput(
+            output=image,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
+
+    def denoise_step(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """One denoise step: read from *state*, delegate to CFGParallelMixin.
+
+        Reuses ``predict_noise_maybe_with_cfg`` so that CFG-parallel,
+        sequential-CFG, and no-CFG paths are handled identically to
+        ``diffuse()``.
+        """
+        if self.interrupt:
+            return None
+
+        t = state.current_timestep
+        self._current_timestep = t
+        self.transformer.do_true_cfg = state.do_true_cfg
+
+        # Normalize timestep to [batch_size] tensor
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, device=state.latents.device, dtype=state.latents.dtype)
+
+        positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
+            latents=state.latents,
+            timestep=t,
+            guidance=state.guidance,
+            prompt_embeds=state.prompt_embeds,
+            prompt_embeds_mask=state.prompt_embeds_mask,
+            img_shapes=state.img_shapes,
+            txt_seq_lens=state.txt_seq_lens,
+            do_true_cfg=state.do_true_cfg,
+            negative_prompt_embeds=state.negative_prompt_embeds,
+            negative_prompt_embeds_mask=state.negative_prompt_embeds_mask,
+            negative_txt_seq_lens=state.negative_txt_seq_lens,
+            image_latents=state.sampling.image_latent,
+            extra_transformer_kwargs={
+                "attention_kwargs": self.attention_kwargs,
+                "return_dict": False,
+            },
+        )
+
+        true_cfg_scale = state.sampling.true_cfg_scale or 4.0
+        cfg_normalize = state.sampling.cfg_normalize
+
+        return self.predict_noise_maybe_with_cfg(
+            state.do_true_cfg,
+            true_cfg_scale,
+            positive_kwargs,
+            negative_kwargs,
+            cfg_normalize,
+            output_slice,
+        )
+
+    def step_scheduler(
+        self,
+        state: "DiffusionRequestState",
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        """One scheduler step: update ``state.latents`` and advance ``step_index``."""
+        if self.interrupt:
+            return
+
+        t = state.current_timestep
+        state.latents = self.scheduler_step_maybe_with_cfg(
+            noise_pred,
+            t,
+            state.latents,
+            state.do_true_cfg,
+            per_request_scheduler=state.scheduler,
+        )
+
+        state.step_index += 1
+
+    def post_decode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Decode final latents from *state*."""
+        self._current_timestep = None
+
+        height = state.sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = state.sampling.width or self.default_sample_size * self.vae_scale_factor
+        output_type = kwargs.get("output_type", "pil")
+
+        return self._decode_latents(state.latents, height, width, output_type)
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -559,13 +935,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
-            negative_prompt = None
-        elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+        extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
+        prompt = extracted_prompt or prompt
 
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
@@ -581,113 +952,40 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
         )
-        # 1. check inputs
-        # 2. encode prompts
-        # 3. prepare latents and timesteps
-        # 4. diffusion process
-        # 5. decode latents
-        # 6. post-process outputs
-        self.check_inputs(
-            prompt,
-            height,
-            width,
-            negative_prompt,
-            prompt_embeds,
-            negative_prompt_embeds,
-            prompt_embeds_mask,
-            negative_prompt_embeds_mask,
-            callback_on_step_end_tensor_inputs,
-            max_sequence_length,
-        )
 
-        self._guidance_scale = guidance_scale
-        self._attention_kwargs = attention_kwargs
-        self._current_timestep = None
-        self._interrupt = False
-
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
-        )
-
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
-        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
-
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+        ctx = self._prepare_generation_context(
             prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            true_cfg_scale=true_cfg_scale,
+            max_sequence_length=max_sequence_length,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+            latents=latents,
+            attention_kwargs=attention_kwargs,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
         )
-        if do_true_cfg:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-                prompt_embeds_mask=negative_prompt_embeds_mask,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-            )
-
-        num_channels_latents = self.transformer.in_channels // 4
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            self.device,
-            generator,
-            latents,
-        )
-        img_shapes = [
-            [
-                (
-                    1,
-                    height // self.vae_scale_factor // 2,
-                    width // self.vae_scale_factor // 2,
-                )
-            ]
-        ] * batch_size
-
-        timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
-        # num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-        self._num_timesteps = len(timesteps)
-
-        # handle guidance
-        if self.transformer.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
-            guidance = guidance.expand(latents.shape[0])
-        else:
-            guidance = None
-
-        if self.attention_kwargs is None:
-            self._attention_kwargs = {}
-
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
-        )
-        # print inputp params
 
         latents = self.diffuse(
-            prompt_embeds,
-            prompt_embeds_mask,
-            negative_prompt_embeds,
-            negative_prompt_embeds_mask,
-            latents,
-            img_shapes,
-            txt_seq_lens,
-            negative_txt_seq_lens,
-            timesteps,
-            do_true_cfg,
-            guidance,
+            ctx["prompt_embeds"],
+            ctx["prompt_embeds_mask"],
+            ctx["negative_prompt_embeds"],
+            ctx["negative_prompt_embeds_mask"],
+            ctx["latents"],
+            ctx["img_shapes"],
+            ctx["txt_seq_lens"],
+            ctx["negative_txt_seq_lens"],
+            ctx["timesteps"],
+            ctx["do_true_cfg"],
+            ctx["guidance"],
             true_cfg_scale,
             image_latents=None,
             cfg_normalize=True,
@@ -698,24 +996,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         )
 
         self._current_timestep = None
-        if output_type == "latent":
-            image = latents
-        else:
-            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
-            # processed_image = self.image_processor.postprocess(image, output_type=output_type)
-
-        return DiffusionOutput(output=image)
+        return self._decode_latents(latents, height, width, output_type)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

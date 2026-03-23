@@ -23,14 +23,12 @@ from tests.utils import hardware_test
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
 
-def get_stage_config():
+def get_stage_config(name: str = "qwen3_tts.yaml"):
     """Get the stage config path for Qwen3-TTS."""
-    return str(
-        Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "qwen3_tts.yaml"
-    )
+    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def omni_server():
     """Start vLLM-Omni server with CustomVoice model."""
     stage_config_path = get_stage_config()
@@ -225,3 +223,63 @@ class TestQwen3TTSAPIEndpoints:
         data = response.json()
         assert "data" in data
         assert len(data["data"]) > 0
+
+
+@pytest.fixture(scope="class")
+def omni_server_no_async_chunk():
+    """Start vLLM-Omni server with non-async-chunk config."""
+    stage_config_path = get_stage_config("qwen3_tts_no_async_chunk.yaml")
+
+    with OmniServer(
+        MODEL,
+        [
+            "--stage-configs-path",
+            stage_config_path,
+            "--stage-init-timeout",
+            "120",
+            "--trust-remote-code",
+            "--enforce-eager",
+            "--disable-log-stats",
+        ],
+    ) as server:
+        yield server
+
+
+class TestQwen3TTSNoAsyncChunk:
+    """E2E tests for Qwen3-TTS in non-async-chunk (full decode) mode."""
+
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
+    def test_speech_english(self, omni_server_no_async_chunk) -> None:
+        """Test English TTS with non-async-chunk pipeline."""
+        response = make_speech_request(
+            host=omni_server_no_async_chunk.host,
+            port=omni_server_no_async_chunk.port,
+            text="Hello, how are you?",
+            voice="vivian",
+            language="English",
+        )
+
+        assert response.status_code == 200, f"Request failed: {response.text}"
+        assert response.headers.get("content-type") == "audio/wav"
+        assert verify_wav_audio(response.content), "Response is not valid WAV audio"
+        assert len(response.content) > MIN_AUDIO_BYTES
+
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "L4"}, num_cards=4)
+    def test_speech_chinese(self, omni_server_no_async_chunk) -> None:
+        """Test Chinese TTS with non-async-chunk pipeline."""
+        response = make_speech_request(
+            host=omni_server_no_async_chunk.host,
+            port=omni_server_no_async_chunk.port,
+            text="你好，我是通义千问",
+            voice="vivian",
+            language="Chinese",
+        )
+
+        assert response.status_code == 200, f"Request failed: {response.text}"
+        assert response.headers.get("content-type") == "audio/wav"
+        assert verify_wav_audio(response.content), "Response is not valid WAV audio"
+        assert len(response.content) > MIN_AUDIO_BYTES
