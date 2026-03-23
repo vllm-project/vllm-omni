@@ -962,10 +962,51 @@ def test_image_edit_with_seed_zero_single_stage(test_client):
 # Regression test for issue #2082: nested image lists from layered models
 
 
-def test_extract_images_from_result_nested():
-    """Layered models return nested lists like [[img1, img2], [img3]].
-    _extract_images_from_result must flatten them to avoid AttributeError
-    when downstream code calls .save() on each element."""
+def test_flatten_images_flat_list():
+    """Flat list passes through unchanged."""
+    from vllm_omni.entrypoints.openai.api_server import _flatten_images
+
+    img_a = Image.new("RGB", (8, 8), color="red")
+    img_b = Image.new("RGB", (8, 8), color="green")
+    assert _flatten_images([img_a, img_b]) == [img_a, img_b]
+
+
+def test_flatten_images_nested_list():
+    """One level of nesting is flattened."""
+    from vllm_omni.entrypoints.openai.api_server import _flatten_images
+
+    img_a = Image.new("RGB", (8, 8), color="red")
+    img_b = Image.new("RGB", (8, 8), color="green")
+    img_c = Image.new("RGB", (8, 8), color="blue")
+    assert _flatten_images([[img_a, img_b], [img_c]]) == [img_a, img_b, img_c]
+
+
+def test_flatten_images_deeply_nested():
+    """Multiple levels of nesting are recursively flattened."""
+    from vllm_omni.entrypoints.openai.api_server import _flatten_images
+
+    img = Image.new("RGB", (8, 8), color="red")
+    assert _flatten_images([[[img]]]) == [img]
+
+
+def test_flatten_images_empty():
+    """Empty list returns empty list."""
+    from vllm_omni.entrypoints.openai.api_server import _flatten_images
+
+    assert _flatten_images([]) == []
+
+
+def test_flatten_images_single_image():
+    """Single image in a list passes through unchanged."""
+    from vllm_omni.entrypoints.openai.api_server import _flatten_images
+
+    img = Image.new("RGB", (8, 8), color="red")
+    assert _flatten_images([img]) == [img]
+
+
+def test_extract_images_flattens_nested():
+    """_extract_images_from_result flattens nested lists from layered models
+    to avoid AttributeError when downstream code calls .save()."""
     from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
 
     img_a = Image.new("RGB", (8, 8), color="red")
@@ -975,15 +1016,3 @@ def test_extract_images_from_result_nested():
     result = MockGenerationResult([[img_a, img_b], [img_c]])
     images = _extract_images_from_result(result)
     assert images == [img_a, img_b, img_c]
-
-
-def test_extract_images_from_result_flat():
-    """Non-layered models return flat lists — verify no regression."""
-    from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
-
-    img_a = Image.new("RGB", (8, 8), color="red")
-    img_b = Image.new("RGB", (8, 8), color="green")
-
-    result = MockGenerationResult([img_a, img_b])
-    images = _extract_images_from_result(result)
-    assert images == [img_a, img_b]
