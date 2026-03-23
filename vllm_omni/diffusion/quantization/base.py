@@ -38,7 +38,17 @@ class DiffusionQuantizationConfig(ABC):
         Delegates to the underlying vLLM config class's get_name().
         """
         if cls.quant_config_cls is not None:
-            return cls.quant_config_cls.get_name()
+            try:
+                return cls.quant_config_cls.get_name()
+            except TypeError as exc:
+                # Upstream quantization configs are not fully consistent:
+                # some expose get_name as a classmethod (e.g. FP8), while
+                # others expose it as an instance method (e.g. GGUF in
+                # vLLM 0.18.0). Fall back to a default-constructed instance
+                # so diffusion wrappers work with both styles.
+                if "required positional argument" not in str(exc):
+                    raise
+                return cls.quant_config_cls().get_name()
         raise NotImplementedError("Subclass must set quant_config_cls or override get_name().")
 
     def get_vllm_quant_config(self) -> "QuantizationConfig | None":
