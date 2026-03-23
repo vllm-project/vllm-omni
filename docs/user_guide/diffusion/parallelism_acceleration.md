@@ -43,6 +43,7 @@ The following table shows which models are currently supported by parallelism me
 | **NextStep-1.1**         | `stepfun-ai/NextStep-1.1`            |     ❌      |    ❌    |      ✅       |        ✅        |         ✅          |      N/A        | ❌   |
 | **HunyuanImage3.0**      | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      ✅        | ❌   |
 | **DreamID-Omni**           | `XuGuo699/DreamID-Omni`       |     ❌      |    ❌    |      ✅       |        ❌        |         ❌          |      N/A        | ❌   |
+| **OmniGen2**               | `OmniGen2/OmniGen2`           |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      N/A        | ❌   |
 
 !!! note "TP Limitations for Diffusion Models"
     We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
