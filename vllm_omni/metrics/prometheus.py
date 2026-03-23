@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 
 from prometheus_client import CollectorRegistry, Counter, Histogram
@@ -24,6 +25,7 @@ E2E_LATENCY_BUCKETS = (
 )
 
 _omni_prometheus_metrics: OmniPrometheusMetrics | None = None
+_omni_prometheus_metrics_lock = threading.Lock()
 
 
 def normalize_output_type(output_type: str | None) -> str:
@@ -151,5 +153,7 @@ def get_omni_prometheus_metrics(registry: CollectorRegistry | None = None) -> Om
     global _omni_prometheus_metrics
 
     if _omni_prometheus_metrics is None:
-        _omni_prometheus_metrics = OmniPrometheusMetrics(registry=registry)
+        with _omni_prometheus_metrics_lock:
+            if _omni_prometheus_metrics is None:
+                _omni_prometheus_metrics = OmniPrometheusMetrics(registry=registry)
     return _omni_prometheus_metrics
