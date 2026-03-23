@@ -180,6 +180,7 @@ class DiffusionEngine:
                         multimodal_output={"audio": request_audio_payload},
                         final_output_type="audio",
                         stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
                     ),
                 ]
             else:
@@ -196,6 +197,7 @@ class DiffusionEngine:
                         custom_output=output.custom_output or {},
                         multimodal_output=mm_output,
                         stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
                     ),
                 ]
         else:
@@ -226,6 +228,7 @@ class DiffusionEngine:
                             multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
                             stage_durations=output.stage_durations,
+                            peak_memory_mb=output.peak_memory_mb,
                         ),
                     )
                 else:
@@ -252,6 +255,7 @@ class DiffusionEngine:
                             custom_output=output.custom_output or {},
                             multimodal_output=mm_output,
                             stage_durations=output.stage_durations,
+                            peak_memory_mb=output.peak_memory_mb,
                         ),
                     )
 

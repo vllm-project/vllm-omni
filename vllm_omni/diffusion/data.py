@@ -651,6 +651,9 @@ class DiffusionOutput:
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
 
+    # memory usage info
+    peak_memory_mb: float = 0.0
+
 
 class AttentionBackendEnum(enum.Enum):
     FA = enum.auto()
