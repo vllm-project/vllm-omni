@@ -224,13 +224,15 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             int(required_max_id + 1),
         )
 
-        self.language_model = Qwen2MoTForCausalLM(llm_config)
+        parallel_config = od_config.parallel_config if od_config else None
+        self.language_model = Qwen2MoTForCausalLM(llm_config, parallel_config=parallel_config)
         ae_params: AutoEncoderParams = default_ae_params()
         self.vae = AutoEncoder(ae_params)
 
         self.bagel = Bagel(
             language_model=self.language_model,
             vit_model=self.vit_model,
+            parallel_config=parallel_config,
             config=BagelConfig(
                 llm_config=llm_config,
                 vae_config=vae_cfg,

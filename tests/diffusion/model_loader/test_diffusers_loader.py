@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -71,3 +72,24 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
 
     with pytest.raises(ValueError, match="vae.weight"):
         loader.load_weights(model)
+
+
+def test_qwen_model_class_selects_qwen_gguf_adapter():
+    od_config = type(
+        "Config",
+        (),
+        {
+            "model_class_name": "QwenImagePipeline",
+            "tf_model_config": {"model_type": "qwen_image"},
+        },
+    )()
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="dummy",
+        subfolder="transformer",
+        revision=None,
+        prefix="transformer.",
+    )
+
+    adapter = get_gguf_adapter("dummy.gguf", object(), source, od_config)
+
+    assert adapter.__class__.__name__ == "QwenImageGGUFAdapter"
