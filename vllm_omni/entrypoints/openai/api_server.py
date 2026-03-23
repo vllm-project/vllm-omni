@@ -1581,8 +1581,24 @@ def _update_if_not_none(object: Any, key: str, val: Any) -> None:
         setattr(object, key, val)
 
 
+def _flatten_images(images: list) -> list:
+    """Flatten a potentially nested list of images into a flat list.
+
+    Some models (e.g. layered image models) return images as nested lists
+    like ``[[img1, img2], [img3]]``.  This helper recursively flattens them
+    so downstream code always receives individual image objects.
+    """
+    flat: list = []
+    for item in images:
+        if isinstance(item, list):
+            flat.extend(_flatten_images(item))
+        else:
+            flat.append(item)
+    return flat
+
+
 def _extract_images_from_result(result: Any) -> list[Any]:
-    images = []
+    images: list = []
     if hasattr(result, "images") and result.images:
         images = result.images
     elif hasattr(result, "request_output"):
@@ -1591,7 +1607,7 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             images = request_output["images"]
         elif hasattr(request_output, "images") and request_output.images:
             images = request_output.images
-    return images
+    return _flatten_images(images)
 
 
 async def _load_input_images(
