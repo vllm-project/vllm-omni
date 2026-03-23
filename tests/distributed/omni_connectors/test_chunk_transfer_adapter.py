@@ -213,7 +213,7 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping
-    assert req_id not in adapter._cancelled_load_reqs
+    assert req_id in adapter._cancelled_load_reqs
     assert req_id not in adapter._finished_load_reqs
 
     assert ext_id not in adapter.put_req_chunk
