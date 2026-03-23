@@ -12,6 +12,8 @@ from vllm_omni.metrics.stats import (
     StageRequestStats,
     StageStats,
     _normalize_diffusion_metric_value,
+)
+from vllm_omni.metrics.stats import (
     logger as stats_logger,
 )
 
@@ -232,8 +234,7 @@ def test_accumulate_diffusion_metrics_normalizes_and_skips_invalid() -> None:
     )
 
 
-def test_as_stage_request_stats_filters_none_and_invalid_diffusion_metrics(
-) -> None:
+def test_as_stage_request_stats_filters_none_and_invalid_diffusion_metrics() -> None:
     agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
     agg.diffusion_metrics["r1"]["bool_metric"] = True
     agg.diffusion_metrics["r1"]["real_metric"] = Fraction(7, 2)
