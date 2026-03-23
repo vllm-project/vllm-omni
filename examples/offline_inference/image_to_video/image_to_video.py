@@ -2,15 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Image-to-Video generation example using Wan2.2 I2V/TI2V models or LTX2.
+Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2, or HunyuanVideo-1.5.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
+- HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
 
 Usage:
-    # I2V-A14B (MoE)
+    # Wan I2V-A14B (MoE)
     python image_to_video.py --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
         --image input.jpg --prompt "A cat playing with yarn"
 
@@ -24,6 +25,11 @@ Usage:
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
         --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
+
+    # HunyuanVideo-1.5 I2V (480p)
+    python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
+        --image input.jpg --prompt "A cat playing with yarn" \
+        --flow-shift 5.0 --guidance-scale 6.0
 """
 
 import argparse
@@ -43,11 +49,11 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video from an image with Wan2.2 or LTX2.")
+    parser = argparse.ArgumentParser(description="Generate a video from an image (Wan2.2, LTX2, HunyuanVideo-1.5).")
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers Wan2.2 I2V model ID or local path.",
+        help="Diffusers I2V model ID or local path (Wan2.2 or HunyuanVideo-1.5).",
     )
     parser.add_argument(
         "--model-class-name",
@@ -176,6 +182,11 @@ def parse_args() -> argparse.Namespace:
             "Default 1 means pure sharding (no replication). "
         ),
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -281,6 +292,7 @@ def main():
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     if profiler_enabled:
@@ -338,8 +350,6 @@ def main():
             audio = frames.multimodal_output["audio"]
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
-            if isinstance(inner_output, list):
-                inner_output = inner_output[0] if inner_output else None
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]

@@ -294,11 +294,12 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni_llm = Omni(
+    omni = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -354,8 +355,8 @@ def main(args):
 
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
     if profiler_enabled:
-        omni_llm.start_profile(stages=[0])
-    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
+        omni.start_profile(stages=[0])
+    omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
@@ -366,51 +367,50 @@ def main(args):
     print(f"query type: {args.query_type}")
 
     for stage_outputs in omni_generator:
+        output = stage_outputs.request_output
         if stage_outputs.final_output_type == "text":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                text_output = output.outputs[0].text
-                # Save aligned text file per request
-                prompt_text = output.prompt
-                out_txt = os.path.join(output_dir, f"{request_id}.txt")
-                lines = []
-                lines.append("Prompt:\n")
-                lines.append(str(prompt_text) + "\n")
-                lines.append("vllm_text_output:\n")
-                lines.append(str(text_output).strip() + "\n")
-                try:
-                    with open(out_txt, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception as e:
-                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
-                print(f"Request ID: {request_id}, Text saved to {out_txt}")
+            request_id = output.request_id
+            text_output = output.outputs[0].text
+            # Save aligned text file per request
+            prompt_text = output.prompt
+            out_txt = os.path.join(output_dir, f"{request_id}.txt")
+            lines = []
+            lines.append("Prompt:\n")
+            lines.append(str(prompt_text) + "\n")
+            lines.append("vllm_text_output:\n")
+            lines.append(str(text_output).strip() + "\n")
+            try:
+                with open(out_txt, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+            except Exception as e:
+                print(f"[Warn] Failed writing text file {out_txt}: {e}")
+            print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                audio_tensor = output.outputs[0].multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+            request_id = output.request_id
+            audio_tensor = output.outputs[0].multimodal_output["audio"]
+            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
-                # Convert to numpy array and ensure correct format
-                audio_numpy = audio_tensor.float().detach().cpu().numpy()
+            # Convert to numpy array and ensure correct format
+            audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
-                # Ensure audio is 1D (flatten if needed)
-                if audio_numpy.ndim > 1:
-                    audio_numpy = audio_numpy.flatten()
+            # Ensure audio is 1D (flatten if needed)
+            if audio_numpy.ndim > 1:
+                audio_numpy = audio_numpy.flatten()
 
-                # Save audio file with explicit WAV format
-                sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
-                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+            # Save audio file with explicit WAV format
+            sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
+            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
-        processed_count += len(stage_outputs.request_output)
+        processed_count += 1
         if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
-            omni_llm.stop_profile()
+            omni.stop_profile()
 
             print("[Info] Waiting 30s for workers to write trace files to disk...")
             time.sleep(30)
             print("[Info] Trace export wait time finished.")
-    omni_llm.close()
+    omni.close()
 
 
 def parse_args():
@@ -526,6 +526,11 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
 
     return parser.parse_args()

@@ -288,9 +288,6 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
             base_engine_args_tmp = create_config(merge_configs(base_engine_args_tmp, stage_arg.engine_args))
         stage_type = getattr(stage_arg, "stage_type", "llm")
         if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
-            runtime_cfg = stage_arg.runtime
-            max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-            base_engine_args_tmp["max_num_seqs"] = max_batch_size
             base_engine_args_tmp.async_chunk = global_async_chunk
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args

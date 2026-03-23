@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
@@ -195,6 +196,23 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+                # NOTE(Angazenn): According to https://github.com/vllm-project/vllm/pull/30877,
+                # there should be a corresponding 'postprocess_mamba'. However, it is called inside
+                # '_update_states_after_model_execute', which is not overridden in vLLM-Ascend.
+                # We simply utilize the implementation in vLLM.
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_copy_bufs(),
+                    )
+
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
@@ -300,7 +318,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 skip_compiled=has_encoder_input,
             ),
             self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
+                scheduler_output, defer_finalize=not clear_kv_metadata
             ) as kv_connector_output,
         ):
             #  -------------------------------------- Omni-new -------------------------------------------------
@@ -503,6 +521,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        profile_seq_lens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -609,11 +628,14 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len
             # in inference. This will be removed once npu_fused_infer_attention_score
             # outperforms _npu_paged_attention on all cases.
-            seq_lens = (
-                SEQ_LEN_WITH_MAX_PA_WORKSPACE
-                if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
-                else max_query_len
-            )  # type: ignore[assignment]
+            if profile_seq_lens is not None:
+                seq_lens = profile_seq_lens
+            else:
+                seq_lens = (
+                    SEQ_LEN_WITH_MAX_PA_WORKSPACE
+                    if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
+                    else max_query_len
+                )  # type: ignore[assignment]
             self.seq_lens.np[:num_reqs_padded] = seq_lens
             self.seq_lens.np[num_reqs_padded:] = 0
             self.seq_lens.copy_to_gpu()

@@ -87,7 +87,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
-        if self.vllm_config.model_config.enable_return_routed_experts:
+        if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
                 capturer.clear_buffer()  # noqa
@@ -108,7 +108,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             if not scheduler_output.total_num_scheduled_tokens:
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
-            if has_ec_transfer() and get_ec_transfer().is_producer:
+            if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
                     encoder_cache=self.encoder_cache,
@@ -265,9 +265,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, delay clearing connector metadata
-        # until after draft model runs in sample_tokens.
-        clear_kv_metadata = self.speculative_config is None
+        # When spec decode is enabled, defer connector finalization
+        # (wait_for_save + clear metadata) until after draft model runs.
+        defer_kv_connector_finalize = self.speculative_config is not None
         with (
             set_forward_context(
                 attn_metadata,
@@ -281,7 +281,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
+                scheduler_output,
+                defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
@@ -351,9 +352,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         ) = self.execute_model_state
         self.execute_model_state = None
 
-        # Clear KV connector metadata after draft model runs (if spec decode).
+        # Finalize KV connector (wait_for_save + clear metadata) after
+        # draft model runs. Deferred from target model forward.
         if self.speculative_config is not None:
-            self.clear_kv_connector_metadata()
+            self.finalize_kv_connector()
 
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
@@ -476,6 +478,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        profile_seq_lens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -500,6 +503,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             num_active_loras: Number of distinct active LoRAs to capture for.
                 LoRA is activated when num_active_loras > 0.
+            profile_seq_lens: If provided, use this value for seq_lens instead
+                of max_query_len. Used to profile attention workspace that
+                scales with context length.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -621,11 +627,13 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # If force_attention is True, we always capture attention.
             # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
             if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
-                if create_mixed_batch:
+                if profile_seq_lens is not None:
+                    seq_lens = profile_seq_lens  # type: ignore[assignment]
+                elif create_mixed_batch:
                     # In the mixed batch mode (used for FI warmup), we use
                     # shorter sequence lengths to run faster.
                     # TODO(luka) better system for describing dummy batches
-                    seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
+                    seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]  # type: ignore[assignment]
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
                 self.seq_lens.np[:num_reqs] = seq_lens

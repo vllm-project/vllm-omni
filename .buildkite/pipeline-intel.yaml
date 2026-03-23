@@ -1,0 +1,16 @@
+# .buildkite/pipeline-intel.yaml
+steps:
+  - group: "INTEL Tests"
+    steps:
+      - label: "Intel: XPU Test"
+        command: "bash .buildkite/scripts/hardware_ci/run-xpu-test.sh"
+        agents:
+          queue: "intel-gpu-omni"
+        env:
+          DOCKER_BUILDKIT: "1"
+          # Buildkite will automatically replace this with the actual commit hash
+          VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
+          VLLM_VERSION: "v0.18.0"
+        priority: 100
+        timeout_in_minutes: 60
+        soft_fail: true
