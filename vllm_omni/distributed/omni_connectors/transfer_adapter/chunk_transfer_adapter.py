@@ -272,8 +272,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
 
-        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
-        self._pending_load_reqs = remaining
+        if request_id not in self._finished_load_reqs:
+            self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
 
         self.put_req_chunk.pop(external_req_id, None)
