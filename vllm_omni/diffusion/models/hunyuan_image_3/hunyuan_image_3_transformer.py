@@ -32,10 +32,8 @@ from transformers.modeling_utils import PreTrainedModel
 from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -63,6 +61,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe import HunyuanFusedMoE
 
 logger = logging.getLogger(__name__)
 
@@ -1417,7 +1416,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -1565,24 +1564,10 @@ class HunYuanAttention(nn.Module):
         return output, None, past_key_value
 
 
-class HunyuanFusedMoE(SharedFusedMoE):
-    def __init__(self, *, prefix: str = "", **kwargs):
-        super().__init__(prefix=prefix, **kwargs)
-        self._prefix = prefix
-
-        self._init_hook_handle = self.register_forward_pre_hook(self._initialize_kernel_hook, with_kwargs=True)
-
-    def _initialize_kernel_hook(self, module, args, kwargs):
-        if self.quant_method:
-            self.quant_method.process_weights_after_loading(self)
-        self._init_hook_handle.remove()
-
-    def forward(self, hidden_states, router_logits):
-        return super().forward(hidden_states, router_logits)
-
-
 class HunyuanImage3DecoderLayer(nn.Module):
-    def __init__(self, config: HunyuanImage3Config, layer_idx: int, prefix: str = ""):
+    def __init__(
+        self, config: HunyuanImage3Config, quant_config: QuantizationConfig | None, layer_idx: int, prefix: str = ""
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
@@ -1624,9 +1609,13 @@ class HunyuanImage3DecoderLayer(nn.Module):
             (isinstance(config.num_experts, int) and config.num_experts > 1)
             or (isinstance(config.num_experts, list) and max(config.num_experts) > 1)
         ) and layer_idx >= config.moe_layer_num_skipped:
-            self.mlp = HunYuanSparseMoeBlock(config, layer_id=layer_idx, prefix=f"{prefix}.mlp")
+            self.mlp = HunYuanSparseMoeBlock(
+                config, quant_config=quant_config, layer_id=layer_idx, prefix=f"{prefix}.mlp"
+            )
         else:
-            self.mlp = HunYuanMLP(self.hidden_size, self.intermediate_size, config.hidden_act)
+            self.mlp = HunYuanMLP(
+                self.hidden_size, self.intermediate_size, config.hidden_act, quant_config=quant_config
+            )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1721,14 +1710,15 @@ class HunyuanImage3PreTrainedModel(PreTrainedModel):
 
 
 class HunyuanImage3Model(nn.Module):
-    def __init__(self, config: HunyuanImage3Config, prefix: str = ""):
+    def __init__(self, config: HunyuanImage3Config, quant_config: QuantizationConfig | None, prefix: str = ""):
         super().__init__()
-        quant_config = None
         lora_config = None
         self.num_redundant_experts = 0
         self.config = config
         self.device = get_local_device()
+
         self.quant_config = quant_config
+        logger.debug(f"quant_config: {quant_config}")
         self.padding_idx = config.pad_token_id
         lora_vocab = (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1)) if lora_config else 0
         self.vocab_size = config.vocab_size + lora_vocab
@@ -1747,6 +1737,7 @@ class HunyuanImage3Model(nn.Module):
             config.num_hidden_layers,
             lambda prefix: HunyuanImage3DecoderLayer(
                 config=config,
+                quant_config=quant_config,
                 layer_idx=int(prefix.split(".")[-1]),
                 prefix=prefix,
             ),
@@ -2454,7 +2445,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
                     latents = callback_outputs.pop("latents", latents)
-
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()

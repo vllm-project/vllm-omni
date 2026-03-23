@@ -256,8 +256,14 @@ class DiffusersPipelineLoader:
         load_device: str,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
+        device: torch.device | None = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
+        # CPU offload + FP8: load weights on device for FP8 quantization
+        if load_device == "cpu" and od_config.quantization and od_config.quantization.lower() != "none":
+            load_device = device.type
+            logger.info(f"Quantization enabled with CPU offload, using {load_device} for weight loading")
+
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
             if od_config.parallel_config.use_hsdp:
@@ -322,8 +328,15 @@ class DiffusersPipelineLoader:
         # that have loaded weights tracking currently.
         if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
+            # NOTE: if the model is quantized, ignore not_loaded check for scale weights
+            weights_scale_not_loaded = {name for name in weights_not_loaded if name.endswith("weight_scale")}
+            weights_not_loaded = weights_not_loaded - weights_scale_not_loaded
             if weights_not_loaded:
                 raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
+            if weights_scale_not_loaded:
+                logger.warning(
+                    f"Following weight_scale weights were not initialized from checkpoint: {weights_scale_not_loaded}"
+                )
 
     def _is_gguf_quantization(self, od_config: OmniDiffusionConfig) -> bool:
         quant_config = od_config.quantization_config

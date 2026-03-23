@@ -137,6 +137,21 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2",
         "Flux2Pipeline",
     ),
+    "DreamIDOmniPipeline": (
+        "dreamid_omni",
+        "pipeline_dreamid_omni",
+        "DreamIDOmniPipeline",
+    ),
+    "HunyuanVideo15Pipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5",
+        "HunyuanVideo15Pipeline",
+    ),
+    "HunyuanVideo15ImageToVideoPipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5_i2v",
+        "HunyuanVideo15I2VPipeline",
+    ),
 }
 
 
@@ -196,9 +211,9 @@ def initialize_model(
             od_config.vae_use_tiling = True
 
         # Configure VAE memory optimization settings from config
-        if hasattr(model.vae, "use_slicing"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model.vae, "use_tiling"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
@@ -311,6 +326,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
     "Flux2Pipeline": "get_flux2_post_process_func",
+    "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -327,6 +344,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
 }
 
 

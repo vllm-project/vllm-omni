@@ -270,3 +270,63 @@ def test_deterministic_across_calls(decoder, wrapper):
         out1 = wrapper.decode(codes)
         out2 = wrapper.decode(codes)
     torch.testing.assert_close(out1, out2, atol=0, rtol=0)
+
+
+# ──────────────────────────────────────────────────────────────────
+# 6. compute_capture_sizes
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected_in,not_expected",
+    [
+        ({}, [2, 4, 8, 16, 32, 64, 128, 256, 325], [512]),
+        (
+            {"codec_chunk_frames": 33, "codec_left_context_frames": 25},
+            [2, 4, 8, 16, 32, 33, 58, 64, 128, 256, 325],
+            [512],
+        ),
+        (
+            {"codec_chunk_frames": 25, "codec_left_context_frames": 25},
+            [2, 4, 8, 16, 25, 32, 50, 64, 128, 256, 325],
+            [512],
+        ),
+    ],
+    ids=["default", "streaming_c33", "streaming_c25"],
+)
+def test_compute_capture_sizes(kwargs, expected_in, not_expected):
+    """compute_capture_sizes produces expected sizes capped by max useful size."""
+    sizes = CUDAGraphDecoderWrapper.compute_capture_sizes(**kwargs)
+    for val in expected_in:
+        assert val in sizes, f"{val} not in {sizes}"
+    for val in not_expected:
+        assert val not in sizes, f"{val} should not be in {sizes}"
+
+
+# ──────────────────────────────────────────────────────────────────
+# 7. SnakeBeta Triton kernel vs eager equivalence
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "batch,channels,seq_len",
+    [(2, 64, 1000), (1, 32, 1), (1, 32, 7), (1, 32, 128), (1, 32, 1024), (1, 32, 4096)],
+)
+def test_snakebeta_triton_vs_eager(batch, channels, seq_len):
+    """Fused Triton SnakeBeta kernel must match eager PyTorch output."""
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        SnakeBeta,
+    )
+
+    if not SnakeBeta._init_triton():
+        pytest.skip("Triton not available")
+
+    torch.manual_seed(42)
+    snake = SnakeBeta(in_features=channels).to(DEVICE).eval()
+    x = torch.randn(batch, channels, seq_len, device=DEVICE)
+
+    with torch.no_grad():
+        eager_out = snake._eager_forward(x)
+        triton_out = snake._triton_forward(x)
+
+    torch.testing.assert_close(triton_out, eager_out, atol=1e-5, rtol=1e-5)

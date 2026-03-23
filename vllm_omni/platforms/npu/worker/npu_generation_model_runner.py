@@ -14,11 +14,13 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
@@ -69,7 +71,13 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         self,
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> OmniModelRunnerOutput | IntermediateTensors:
+    ) -> OmniModelRunnerOutput | IntermediateTensors | None:
+        if self.vllm_config.model_config.enable_return_routed_experts:
+            capturer = RoutedExpertsCapturer.get_instance()
+            if capturer is not None:
+                capturer.clear_buffer()
+            else:
+                logger.warning("RoutedExpertsCapturer is not initialized.")
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
@@ -123,6 +131,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                         "logprobs for prompt tokens, tokens, please disable "
                         "it when the requests need prompt logprobs"
                     )
+
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -132,6 +141,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 (
                     logits_indices,
                     spec_decode_metadata,
+                    total_num_scheduled_tokens,
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
@@ -186,6 +196,23 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+                # NOTE(Angazenn): According to https://github.com/vllm-project/vllm/pull/30877,
+                # there should be a corresponding 'postprocess_mamba'. However, it is called inside
+                # '_update_states_after_model_execute', which is not overridden in vLLM-Ascend.
+                # We simply utilize the implementation in vLLM.
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_copy_bufs(),
+                    )
+
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
@@ -197,10 +224,19 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                     # Currently, Graph Mode and SP will both pad num_tokens,
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
                     # but this scope is way too big and the consequences are unpredictable
-                    num_reqs_padded = self._pad_query_start_loc_for_fia(num_tokens_padded, num_reqs_padded, num_reqs)
+                    old_num_reqs_padded = num_reqs_padded
+                    num_reqs_padded = self._pad_query_start_loc_for_fia(
+                        num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_mode, batch_desc.num_reqs
+                    )
+                    if enable_sp() and num_tokens_padded == num_tokens_unpadded:
+                        if num_reqs_padded > old_num_reqs_padded:
+                            num_reqs_padded = old_num_reqs_padded
+                            self.query_start_loc.np[num_reqs_padded + 1] = 0
 
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
+                    num_tokens=num_tokens_unpadded
+                    if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+                    else total_num_scheduled_tokens,
                     num_tokens_padded=num_tokens_padded,
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded,
@@ -220,13 +256,23 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 intermediate_tensors,
                 model_kwargs,
                 ec_connector_output,
-            ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+            ) = self._preprocess(
+                scheduler_output,
+                num_tokens_padded
+                if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+                else total_num_scheduled_tokens,
+                intermediate_tensors,
+            )
 
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
 
             # update global cos, sin
             update_cos_sin(positions)
+
+        if self.dynamic_eplb:
+            with record_function_or_nullcontext("EPLB weight D2D"):
+                self.eplb_updator.forward_before()
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -256,6 +302,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
+        clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -267,9 +314,12 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 batch_descriptor=batch_desc,
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
+                max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
             ),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+            self.maybe_get_kv_connector_output(
+                scheduler_output, defer_finalize=not clear_kv_metadata
+            ) as kv_connector_output,
         ):
             #  -------------------------------------- Omni-new -------------------------------------------------
             outputs = self._run_generation_model(
@@ -296,7 +346,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 positions,
                 ec_connector_output,
                 cudagraph_stats,
-                multimodal_outputs,  # Omni-new: pass multimodal_outputs to ExecuteModelState
+                multimodal_outputs,  # Omni-specific: pass multimodal_outputs to ExecuteModelState
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -310,6 +360,11 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
+            # receive sampled token ids from the last PP rank when using
+            # async scheduling + pipeline parallelism so downstream code
+            # (e.g., PCP input preparation) can access them.
+            if self.use_async_scheduling and get_pp_group().world_size > 1:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
@@ -334,7 +389,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             positions,
             ec_connector_output,
             cudagraph_stats,
-            multimodal_outputs,
+            multimodal_outputs,  # Omni-Specific
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -464,9 +519,9 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
         remove_lora: bool = True,
-        activate_lora: bool = False,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        profile_seq_lens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -505,6 +560,9 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
 
+        if not is_profile and self.dynamic_eplb:
+            self.eplb_updator.forward_before()
+
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
@@ -525,7 +583,8 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             # `force_has_lora` is used for cudagraph capture; because LoRA is
             # activated later in the context manager, but we need to know the
             # LoRA state when determining the batch descriptor for capture
-            force_has_lora=activate_lora,
+            force_has_lora=num_active_loras > 0,
+            force_num_active_loras=num_active_loras,
         )
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -551,9 +610,8 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
-        # If force_attention is True, we always capture attention. Otherwise,
-        # it only happens for cudagraph_runtime_mode=FULL.
-        if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+        # Build attention metadata for dummy_run
+        if self._should_build_dummy_attn_metadata(force_attention, is_profile, cudagraph_runtime_mode):
             if create_mixed_batch:
                 raise NotImplementedError(
                     "create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it"
@@ -570,11 +628,14 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len
             # in inference. This will be removed once npu_fused_infer_attention_score
             # outperforms _npu_paged_attention on all cases.
-            seq_lens = (
-                SEQ_LEN_WITH_MAX_PA_WORKSPACE
-                if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
-                else max_query_len
-            )  # type: ignore[assignment]
+            if profile_seq_lens is not None:
+                seq_lens = profile_seq_lens
+            else:
+                seq_lens = (
+                    SEQ_LEN_WITH_MAX_PA_WORKSPACE
+                    if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
+                    else max_query_len
+                )  # type: ignore[assignment]
             self.seq_lens.np[:num_reqs_padded] = seq_lens
             self.seq_lens.np[num_reqs_padded:] = 0
             self.seq_lens.copy_to_gpu()
@@ -582,8 +643,9 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
             self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
-
-            num_reqs_padded = self._pad_query_start_loc_for_fia(num_tokens_padded, num_reqs_padded, num_reqs)
+            num_reqs_padded = self._pad_query_start_loc_for_fia(
+                num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs
+            )
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             attn_metadata, _ = self._build_attention_metadata(
@@ -600,6 +662,11 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             self.lora_config,
             num_scheduled_tokens,
             num_sampled_tokens,
+            remove_lora,
+            # TODO: The next line is a temporary workaround
+            # to fix the accuracy issue of test_llama32_lora.py,
+            # which is introduced by vllm-project/vllm#32005
+            num_active_loras=(self.lora_config.max_loras if self.lora_config is not None else num_active_loras),
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
@@ -609,6 +676,19 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
+
+            # -------------------------------------- Omni-new -------------------------------------------------
+            model_kwargs = self._init_model_kwargs()
+            # Some generation-stage models (e.g. MammothModa2DiTPipeline) require
+            # model-specific runtime information (such as image size and conditioning
+            # embeddings) even during the dummy profiling run that vLLM uses to
+            # estimate KV-cache capacity.  get_dummy_runtime_additional_information
+            # provides placeholder values of the correct shape so that the profiling
+            # run does not raise an error due to missing inputs.
+            if hasattr(self.model, "get_dummy_runtime_additional_information"):
+                runtime_addi = self.model.get_dummy_runtime_additional_information(num_reqs)
+                model_kwargs["runtime_additional_information"] = runtime_addi
+            # -------------------------------------- Omni-new -------------------------------------------------
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
@@ -656,8 +736,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            model_kwargs = self._init_model_kwargs()
-
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -674,9 +752,8 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
-                    **model_kwargs,
+                    **model_kwargs,  # Omni-specific
                 )
-
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
@@ -698,7 +775,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             if is_profile and self.dynamic_eplb:
                 self.model.clear_all_moe_loads()
             if self.dynamic_eplb:
-                self.eplb_updator.take_update_info_from_eplb_process()
                 self.eplb_updator.forward_end()
 
             # -------------------------------------- Omni-new -------------------------------------------------

@@ -141,6 +141,7 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
                 "vllm_omni.diffusion.models.qwen_image",
                 "vllm_omni.entrypoints.async_diffusion",
                 "vllm_omni.entrypoints.openai",
+                "vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts",
             ]
             if any(module_path.startswith(prefix) for prefix in excluded_prefixes):
                 continue

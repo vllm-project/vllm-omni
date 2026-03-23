@@ -322,6 +322,7 @@ class OmniDiffusionConfig:
 
     dtype: torch.dtype = torch.bfloat16
 
+    model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
@@ -460,14 +461,22 @@ class OmniDiffusionConfig:
     quantization: str | None = None
     quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
 
+    # Diffusion pipeline Profiling config
+    enable_diffusion_pipeline_profiler: bool = False
+
+    # Step mode settings
+    step_execution: bool = False
+
     @property
     def is_moe(self) -> bool:
         num_experts = self.tf_model_config.get("num_experts", None)
+        if not isinstance(num_experts, (list, tuple, int)):
+            return False
         if isinstance(num_experts, int):
-            return num_experts > 1
+            return num_experts > 0
 
         if isinstance(num_experts, (list, tuple)):
-            return any(isinstance(n, int) and n > 1 for n in num_experts)
+            return any(isinstance(n, int) and n > 0 for n in num_experts)
 
         return False
 
@@ -511,12 +520,11 @@ class OmniDiffusionConfig:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
-        # Convert parallel_config dict to DiffusionParallelConfig if needed
-        # This must be done before accessing parallel_config.world_size
-        if isinstance(self.parallel_config, dict):
-            self.parallel_config = DiffusionParallelConfig.from_dict(self.parallel_config)
+        # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
+        # Use Mapping to handle both plain dicts and OmegaConf DictConfig
+        if isinstance(self.parallel_config, Mapping):
+            self.parallel_config = DiffusionParallelConfig.from_dict(dict(self.parallel_config))
         elif not isinstance(self.parallel_config, DiffusionParallelConfig):
-            # If it's neither dict nor DiffusionParallelConfig, use default config
             self.parallel_config = DiffusionParallelConfig()
 
         if self.num_gpus is None:
@@ -639,6 +647,9 @@ class DiffusionOutput:
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+    # logged duration of stages
+    stage_durations: dict[str, float] = field(default_factory=dict)
 
 
 class AttentionBackendEnum(enum.Enum):

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import Enum
+from typing import Any
 
 import torch
 from vllm.platforms import Platform
@@ -53,6 +54,16 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
+        if op_name == "hunyuan_fused_moe":
+            return "vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
+        raise NotImplementedError(f"Unsupported diffusion model op: {op_name}")
+
+    @classmethod
+    def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,
@@ -101,6 +112,18 @@ class OmniPlatform(Platform):
     @classmethod
     def supports_cpu_offload(cls) -> bool:
         return True
+
+    @classmethod
+    def set_device_control_env_var(cls, devices: str | int | None) -> None:
+        import os
+
+        os.environ[cls.device_control_env_var] = devices
+
+    @classmethod
+    def unset_device_control_env_var(cls) -> None:
+        import os
+
+        os.environ.pop(cls.device_control_env_var, None)
 
 
 class UnspecifiedOmniPlatform(OmniPlatform):

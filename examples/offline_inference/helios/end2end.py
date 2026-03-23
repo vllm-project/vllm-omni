@@ -173,6 +173,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of initial denoising steps using zero prediction (default: 1).",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
 
     # Memory & parallelism
     parser.add_argument("--vae-use-slicing", action="store_true", help="Enable VAE slicing.")
@@ -207,6 +212,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     # Validate I2V / V2V arguments
@@ -293,12 +299,11 @@ def main():
                 )
 
             if hasattr(first_item, "is_pipeline_output") and first_item.is_pipeline_output:
-                if isinstance(first_item.request_output, list) and len(first_item.request_output) > 0:
-                    inner_output = first_item.request_output[0]
-                    if isinstance(inner_output, OmniRequestOutput) and hasattr(inner_output, "images"):
-                        frames = inner_output.images[0] if inner_output.images else None
-                        if frames is None:
-                            raise ValueError("No video frames found in output.")
+                inner_output = first_item.request_output
+                if isinstance(inner_output, OmniRequestOutput) and hasattr(inner_output, "images"):
+                    frames = inner_output.images[0] if inner_output.images else None
+                    if frames is None:
+                        raise ValueError("No video frames found in output.")
             elif hasattr(first_item, "images") and first_item.images:
                 frames = first_item.images
             else:

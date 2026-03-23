@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -27,6 +27,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -141,7 +142,7 @@ def get_helios_pre_process_func(
     return pre_process_func
 
 
-class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
 
     Supports T2V, I2V (with image input), and V2V (with video input).
@@ -174,8 +175,17 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         ]
 
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        # Helios checkpoints store embed_tokens under ``shared.weight`` only,
+        # but the published config sets ``tie_word_embeddings=False``.  When
+        # transformers sees ``tie=False`` it creates a separate
+        # ``encoder.embed_tokens.weight`` that is never loaded from the
+        # checkpoint, leaving it as all-zeros.  This silently destroys prompt
+        # encoding and produces grey/meaningless video output.  Force tying so
+        # that ``embed_tokens`` shares ``shared.weight`` as intended.
+        text_enc_cfg = AutoConfig.from_pretrained(model, subfolder="text_encoder", local_files_only=local_files_only)
+        text_enc_cfg.tie_word_embeddings = True
         self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
         self.vae = AutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
@@ -219,6 +229,9 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):
@@ -638,7 +651,9 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         else:
             output = history_video
 
-        return DiffusionOutput(output=output)
+        return DiffusionOutput(
+            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def _stage1_sample(
         self,
@@ -882,13 +897,15 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         _, ph, pw = patch_size
         block_size = ph * pw
 
+        device = generator.device if generator is not None else self.device
+
         cov = torch.eye(block_size) * (1 + gamma) - torch.ones(block_size, block_size) * gamma
         cov += torch.eye(block_size) * 1e-8
         cov = cov.float()  # Upcast to fp32 for numerical stability — cholesky is unreliable in fp16/bf16.
 
-        L = torch.linalg.cholesky(cov)
+        L = torch.linalg.cholesky(cov).to(device)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
-        z = torch.randn(block_number, block_size, generator=generator)
+        z = torch.randn(block_number, block_size, generator=generator, device=device)
         noise = z @ L.T
 
         noise = noise.view(batch_size, channel, num_frames, height // ph, width // pw, ph, pw)

@@ -553,6 +553,12 @@ class Flux2Transformer2DModel(nn.Module):
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
 
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return ("transformer_blocks" in name or "single_transformer_blocks" in name) and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     def __init__(
         self,
         patch_size: int = 1,
