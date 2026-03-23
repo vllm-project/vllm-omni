@@ -160,171 +160,164 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) 
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
 
 
-def _enqueue_async_three_stage_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+def _stage_spec(
+    stage_id: int,
+    *,
+    payloads: list[str],
+    finished: bool = False,
+    image_payloads: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "stage_id": stage_id,
+        "payloads": payloads,
+        "finished": finished,
+        "image_payloads": image_payloads or [],
+    }
+
+
+def _enqueue_outputs(
+    engine: FakeAsyncOmniEngine,
+    msg: dict[str, Any],
+    *,
+    stage_specs: list[dict[str, Any]],
+) -> None:
     request_id = msg["request_id"]
-    for idx in range(3):
-        engine.output_q.put_nowait(
-            make_output_msg(
-                request_id,
-                0,
-                payload=f"{request_id}-stage0-{idx}",
-                output_finished=(idx == 2),
-                finished=False,
+    for spec in stage_specs:
+        payloads = spec["payloads"]
+        image_payloads = spec.get("image_payloads", [])
+        last_idx = len(payloads) - 1
+
+        for idx, payload_tmpl in enumerate(payloads):
+            images = []
+            if idx < len(image_payloads):
+                images = [image_payloads[idx].format(request_id=request_id, idx=idx)]
+
+            engine.output_q.put_nowait(
+                make_output_msg(
+                    request_id,
+                    spec["stage_id"],
+                    payload=payload_tmpl.format(request_id=request_id, idx=idx),
+                    output_finished=(idx == last_idx),
+                    finished=bool(spec.get("finished")) and idx == last_idx,
+                    images=images,
+                )
             )
-        )
-    for idx in range(3):
-        engine.output_q.put_nowait(
-            make_output_msg(
-                request_id,
-                1,
-                payload=f"{request_id}-stage1-{idx}",
-                output_finished=(idx == 2),
-                finished=False,
-            )
-        )
-    for idx in range(3):
-        engine.output_q.put_nowait(
-            make_output_msg(
-                request_id,
-                2,
-                payload=f"{request_id}-stage2-{idx}",
-                output_finished=(idx == 2),
-                finished=(idx == 2),
-                images=[f"{request_id}-img-{idx}"],
-            )
-        )
-
-
-def _enqueue_async_finish_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
-    request_id = msg["request_id"]
-    engine.output_q.put_nowait(
-        make_output_msg(
-            request_id,
-            0,
-            payload=f"{request_id}-stage0",
-            output_finished=True,
-            finished=False,
-        )
-    )
-    engine.output_q.put_nowait(
-        make_output_msg(
-            request_id,
-            2,
-            payload=f"{request_id}-stage2-final",
-            output_finished=True,
-            finished=True,
-            images=[f"{request_id}-img-final"],
-        )
-    )
-
-
-def _enqueue_async_diffusion_only_output(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
-    request_id = msg["request_id"]
-    engine.output_q.put_nowait(
-        make_output_msg(
-            request_id,
-            0,
-            payload=f"{request_id}-diffusion-final",
-            output_finished=True,
-            finished=True,
-            images=[f"{request_id}-image"],
-        )
-    )
-
-
-def _enqueue_async_llm_diffusion_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
-    request_id = msg["request_id"]
-    for idx in range(3):
-        engine.output_q.put_nowait(
-            make_output_msg(
-                request_id,
-                0,
-                payload=f"{request_id}-text-{idx}",
-                output_finished=(idx == 2),
-                finished=False,
-            )
-        )
-
-    engine.output_q.put_nowait(
-        make_output_msg(
-            request_id,
-            1,
-            payload=f"{request_id}-image-final",
-            output_finished=True,
-            finished=True,
-            images=[f"{request_id}-image"],
-        )
-    )
 
 
 def _enqueue_omni_final_only_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
-    request_id = msg["request_id"]
     sampling_params_list = msg["sampling_params_list"]
     llm_streaming = any(params.output_kind != RequestOutputKind.FINAL_ONLY for params in sampling_params_list[:2])
-
     stage0_count = 3 if llm_streaming else 1
     stage1_count = 3 if llm_streaming else 1
 
-    for idx in range(stage0_count):
-        engine.output_q.put_nowait(
-            make_output_msg(
-                request_id,
-                0,
-                payload=f"{request_id}-stage0-{idx}",
-                output_finished=(idx == stage0_count - 1),
-                finished=False,
-            )
-        )
-
-    for idx in range(stage1_count):
-        engine.output_q.put_nowait(
-            make_output_msg(
-                request_id,
-                1,
-                payload=f"{request_id}-stage1-{idx}",
-                output_finished=(idx == stage1_count - 1),
-                finished=False,
-            )
-        )
-
-    engine.output_q.put_nowait(
-        make_output_msg(
-            request_id,
-            2,
-            payload=f"{request_id}-stage2-final",
-            output_finished=True,
-            finished=True,
-            images=[f"{request_id}-img-final"],
-        )
+    _enqueue_outputs(
+        engine,
+        msg,
+        stage_specs=[
+            _stage_spec(0, payloads=[f"{{request_id}}-stage0-{idx}" for idx in range(stage0_count)]),
+            _stage_spec(1, payloads=[f"{{request_id}}-stage1-{idx}" for idx in range(stage1_count)]),
+            _stage_spec(
+                2,
+                payloads=["{request_id}-stage2-final"],
+                finished=True,
+                image_payloads=["{request_id}-img-final"],
+            ),
+        ],
     )
 
 
 def _enqueue_omni_llm_diffusion_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
-    request_id = msg["request_id"]
     sampling_params_list = msg["sampling_params_list"]
     llm_streaming = sampling_params_list[0].output_kind != RequestOutputKind.FINAL_ONLY
     stage0_count = 3 if llm_streaming else 1
 
-    for idx in range(stage0_count):
-        engine.output_q.put_nowait(
-            make_output_msg(
-                request_id,
-                0,
-                payload=f"{request_id}-text-{idx}",
-                output_finished=(idx == stage0_count - 1),
-                finished=False,
-            )
-        )
+    _enqueue_outputs(
+        engine,
+        msg,
+        stage_specs=[
+            _stage_spec(0, payloads=[f"{{request_id}}-text-{idx}" for idx in range(stage0_count)]),
+            _stage_spec(
+                1,
+                payloads=["{request_id}-image-final"],
+                finished=True,
+                image_payloads=["{request_id}-image"],
+            ),
+        ],
+    )
 
+
+def _enqueue_async_three_stage_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    _enqueue_outputs(
+        engine,
+        msg,
+        stage_specs=[
+            _stage_spec(0, payloads=[f"{{request_id}}-stage0-{idx}" for idx in range(3)]),
+            _stage_spec(1, payloads=[f"{{request_id}}-stage1-{idx}" for idx in range(3)]),
+            _stage_spec(
+                2,
+                payloads=[f"{{request_id}}-stage2-{idx}" for idx in range(3)],
+                finished=True,
+                image_payloads=[f"{{request_id}}-img-{idx}" for idx in range(3)],
+            ),
+        ],
+    )
+
+
+def _enqueue_async_finish_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    _enqueue_outputs(
+        engine,
+        msg,
+        stage_specs=[
+            _stage_spec(0, payloads=["{request_id}-stage0"]),
+            _stage_spec(
+                2,
+                payloads=["{request_id}-stage2-final"],
+                finished=True,
+                image_payloads=["{request_id}-img-final"],
+            ),
+        ],
+    )
+
+
+def _enqueue_async_diffusion_only_output(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    _enqueue_outputs(
+        engine,
+        msg,
+        stage_specs=[
+            _stage_spec(
+                0,
+                payloads=["{request_id}-diffusion-final"],
+                finished=True,
+                image_payloads=["{request_id}-image"],
+            )
+        ],
+    )
+
+
+def _enqueue_async_llm_diffusion_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    _enqueue_outputs(
+        engine,
+        msg,
+        stage_specs=[
+            _stage_spec(0, payloads=[f"{{request_id}}-text-{idx}" for idx in range(3)]),
+            _stage_spec(
+                1,
+                payloads=["{request_id}-image-final"],
+                finished=True,
+                image_payloads=["{request_id}-image"],
+            ),
+        ],
+    )
+
+
+def _enqueue_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
     engine.output_q.put_nowait(
-        make_output_msg(
-            request_id,
-            1,
-            payload=f"{request_id}-image-final",
-            output_finished=True,
-            finished=True,
-            images=[f"{request_id}-image"],
-        )
+        {
+            "type": "error",
+            "request_id": msg["request_id"],
+            "stage_id": 0,
+            "error": "engine boom",
+        }
     )
 
 
@@ -332,18 +325,13 @@ def _enqueue_omni_llm_diffusion_outputs(engine: FakeAsyncOmniEngine, msg: dict[s
 async def test_async_omni_yields_only_final_stage_outputs(monkeypatch: pytest.MonkeyPatch):
     engine = FakeAsyncOmniEngine(
         stage_metadata=THREE_STAGE_META,
-        on_add_request=lambda eng, msg: eng.output_q.put_nowait(
-            make_output_msg(msg["request_id"], 1, payload="non-final", output_finished=True, finished=False)
-        )
-        or eng.output_q.put_nowait(
-            make_output_msg(
-                msg["request_id"],
-                2,
-                payload="final",
-                output_finished=True,
-                finished=True,
-                images=["final-img"],
-            )
+        on_add_request=lambda eng, msg: _enqueue_outputs(
+            eng,
+            msg,
+            stage_specs=[
+                _stage_spec(1, payloads=["non-final"]),
+                _stage_spec(2, payloads=["final"], finished=True, image_payloads=["final-img"]),
+            ],
         ),
     )
     _patch_engine(monkeypatch, engine)
@@ -387,6 +375,8 @@ async def test_async_omni_accepts_multiple_final_stage_streams(monkeypatch: pyte
 
 @pytest.mark.asyncio
 async def test_async_omni_stops_on_final_stage_finished(monkeypatch: pytest.MonkeyPatch):
+    # Intentionally jump from stage 0 to stage 2: stage 1 is a non-final stage
+    # and should be filtered out from the client-visible output stream.
     engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_async_finish_outputs)
     _patch_engine(monkeypatch, engine)
 
@@ -470,6 +460,20 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
 
     assert engine.aborted == [["req-1"]]
     assert "req-1" not in app.request_states
+
+
+@pytest.mark.asyncio
+async def test_async_omni_propagates_engine_error(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_error_message)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(RuntimeError, match="engine boom"):
+            async for _ in app.generate(prompt="hello", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
 
 
 def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkeypatch: pytest.MonkeyPatch):
