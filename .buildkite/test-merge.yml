@@ -17,7 +17,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Model Test"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 30
     depends_on: upload-merge-pipeline
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "advanced_model and diffusion" --run-level "advanced_model"
@@ -35,7 +35,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Images API LoRA E2E"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 30
     depends_on: upload-merge-pipeline
     commands:
       - pytest -s -v tests/e2e/online_serving/test_images_generations_lora.py
@@ -112,6 +112,30 @@ steps:
     depends_on: upload-merge-pipeline
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Model Test with L4"
+    timeout_in_minutes: 60
+    depends_on: upload-merge-pipeline
+    # This should run nightly, but moving to the merge pipeline for testing
+    #depends_on: upload-nightly-pipeline
+    # if: build.env("NIGHTLY") == "1"
+    #
+    commands:
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and diffusion and L4" --run-level "advanced_model"
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:

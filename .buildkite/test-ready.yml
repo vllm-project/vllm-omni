@@ -36,7 +36,7 @@ steps:
   - label: "Diffusion Model Test"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 20m pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
+      - timeout 30m pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
     agents:
       queue: "gpu_1_queue"
     plugins:

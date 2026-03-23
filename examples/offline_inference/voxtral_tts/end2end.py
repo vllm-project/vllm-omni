@@ -69,7 +69,9 @@ async def run_streaming(inputs, sampling_params_list, model_name, args, output_d
         ttfa = None
         accumulated_sample = 0
 
-        async for stage_output in async_omni.generate(single_input, request_id, sampling_params_list):
+        async for stage_output in async_omni.generate(
+            single_input, request_id=request_id, sampling_params_list=sampling_params_list
+        ):
             mm_output = stage_output.multimodal_output
             finished = stage_output.finished
             if not mm_output or "audio" not in mm_output:
