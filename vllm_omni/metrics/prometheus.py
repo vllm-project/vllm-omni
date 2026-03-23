@@ -131,7 +131,7 @@ class OmniPrometheusMetrics:
             model_name=model_name,
             from_stage=str(from_stage),
             to_stage=str(to_stage),
-            used_shm=str(bool(used_shm)),
+            used_shm=str(bool(used_shm)).lower(),
         ).inc(size_bytes)
 
     def on_request_succeeded(self, model_name: str, final_output_type: str | None, latency_seconds: float) -> None:
