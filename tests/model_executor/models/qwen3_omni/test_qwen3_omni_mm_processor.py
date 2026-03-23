@@ -119,7 +119,7 @@ def test_maybe_apply_prompt_updates_normalizes_counts(monkeypatch):
     assert len(result_placeholders["audio"]) == 1
 
 
-def test_cached_apply_hf_processor_bypasses_cache_for_use_audio_in_video(monkeypatch):
+def test_cached_apply_hf_processor_bypasses_cache_for_use_audio_in_video_partial_cache(monkeypatch):
     processor = object.__new__(Qwen3OmniMoeThinkerMultiModalProcessor)
     called: dict[str, object] = {}
 
@@ -135,13 +135,23 @@ def test_cached_apply_hf_processor_bypasses_cache_for_use_audio_in_video(monkeyp
         return [2], "parent", False
 
     processor._apply_hf_processor = fake_apply_hf_processor
+    processor.cache = object()
+    processor.info = SimpleNamespace(model_id="dummy-model")
+    processor._get_hf_mm_data = lambda mm_data_items: ({}, {})
+    processor._get_cache_missing_items = (
+        lambda cache, mm_data_items, mm_hashes: ({"video": [True, False]}, object())
+    )
     monkeypatch.setattr(
         UpstreamQwen2_5OmniThinkerMultiModalProcessor,
         "_cached_apply_hf_processor",
         fake_parent_cached_apply_hf_processor,
     )
 
-    inputs = SimpleNamespace(hf_processor_mm_kwargs={"use_audio_in_video": [torch.tensor([True])]})
+    inputs = SimpleNamespace(
+        hf_processor_mm_kwargs={"use_audio_in_video": [torch.tensor([True])]},
+        mm_data_items=object(),
+        get_mm_hashes=lambda model_id: {"video": ["hash-0", "hash-1"]},
+    )
     output = processor._cached_apply_hf_processor(
         inputs=inputs,
         timing_ctx=TimingContext(enabled=False),
@@ -150,6 +160,44 @@ def test_cached_apply_hf_processor_bypasses_cache_for_use_audio_in_video(monkeyp
     assert output == ([1], "apply", False)
     assert "parent" not in called
     assert called["apply"]["inputs"] is inputs
+
+
+def test_cached_apply_hf_processor_preserves_full_cache_hit_for_use_audio_in_video(monkeypatch):
+    processor = object.__new__(Qwen3OmniMoeThinkerMultiModalProcessor)
+    called: dict[str, object] = {}
+
+    def fake_apply_hf_processor(*, inputs, timing_ctx):
+        raise AssertionError("_apply_hf_processor should not be called on full cache hit")
+
+    def fake_parent_cached_apply_hf_processor(self, inputs, timing_ctx):
+        called["inputs"] = inputs
+        called["timing_ctx"] = timing_ctx
+        return [2], "parent", True
+
+    processor._apply_hf_processor = fake_apply_hf_processor
+    processor.cache = object()
+    processor.info = SimpleNamespace(model_id="dummy-model")
+    processor._get_hf_mm_data = lambda mm_data_items: ({}, {})
+    processor._get_cache_missing_items = (
+        lambda cache, mm_data_items, mm_hashes: ({"video": [True, True]}, object())
+    )
+    monkeypatch.setattr(
+        UpstreamQwen2_5OmniThinkerMultiModalProcessor,
+        "_cached_apply_hf_processor",
+        fake_parent_cached_apply_hf_processor,
+    )
+
+    inputs = SimpleNamespace(
+        hf_processor_mm_kwargs={"use_audio_in_video": [torch.tensor([True])]},
+        mm_data_items=object(),
+        get_mm_hashes=lambda model_id: {"video": ["hash-0", "hash-1"]},
+    )
+    timing_ctx = TimingContext(enabled=False)
+    output = processor._cached_apply_hf_processor(inputs=inputs, timing_ctx=timing_ctx)
+
+    assert output == ([2], "parent", True)
+    assert called["inputs"] is inputs
+    assert called["timing_ctx"] is timing_ctx
 
 
 def test_cached_apply_hf_processor_uses_parent_when_not_use_audio_in_video(monkeypatch):

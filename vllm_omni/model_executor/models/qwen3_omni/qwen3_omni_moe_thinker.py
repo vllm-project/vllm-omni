@@ -576,8 +576,27 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
     ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
-        # Keep audio+video pairing stable by bypassing partial MM cache for this mode.
-        if self._use_audio_in_video_enabled(inputs.hf_processor_mm_kwargs.get("use_audio_in_video", False)):
+        if not self._use_audio_in_video_enabled(inputs.hf_processor_mm_kwargs.get("use_audio_in_video", False)):
+            return super()._cached_apply_hf_processor(inputs=inputs, timing_ctx=timing_ctx)
+
+        cache = self.cache
+        _, passthrough_data = self._get_hf_mm_data(inputs.mm_data_items)
+        if cache is None or passthrough_data:
+            return self._apply_hf_processor(inputs=inputs, timing_ctx=timing_ctx)
+
+        with timing_ctx.record("get_mm_hashes"):
+            mm_hashes = inputs.get_mm_hashes(self.info.model_id)
+        with timing_ctx.record("get_cache_missing_items"):
+            mm_is_cached, _ = self._get_cache_missing_items(
+                cache=cache,
+                mm_data_items=inputs.mm_data_items,
+                mm_hashes=mm_hashes,
+            )
+
+        # Keep audio+video pairing stable by bypassing cache only for
+        # partial hit/miss patterns in this mode. Preserve full-cache hits.
+        has_partial_cache = any(any(items) and not all(items) for items in mm_is_cached.values())
+        if has_partial_cache:
             return self._apply_hf_processor(inputs=inputs, timing_ctx=timing_ctx)
 
         return super()._cached_apply_hf_processor(inputs=inputs, timing_ctx=timing_ctx)
