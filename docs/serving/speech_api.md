@@ -4,7 +4,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
-- **Voxtral TTS** (`mistralai/tts-model`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -31,7 +31,7 @@ vllm-omni serve fishaudio/s2-pro \
     --gpu-memory-utilization 0.9
 
 # Voxtral TTS
-vllm serve mistralai/tts-model \
+vllm serve mistralai/Voxtral-4B-TTS-2603 \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
     --omni \
     --port 8091 \
@@ -360,7 +360,7 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 
 | Model | Description |
 |-------|-------------|
-| `mistralai/tts-model` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
+| `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
 
 ## Error Responses
 
