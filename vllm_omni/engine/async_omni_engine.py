@@ -203,9 +203,11 @@ class AsyncOmniEngine:
         engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 600,
+        diffusion_batch_size: int = 1,
         **kwargs: Any,
     ) -> None:
         self.model = model
+        self.diffusion_batch_size = diffusion_batch_size
         startup_timeout = int(init_timeout)
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
@@ -473,8 +475,17 @@ class AsyncOmniEngine:
 
                             inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
                         _inject_kv_stage_info(stage_cfg, stage_id)
-                        stage_clients[stage_id] = initialize_diffusion_stage(self.model, stage_cfg, metadata)
-                        logger.info("[AsyncOmniEngine] Stage %s initialized (diffusion)", stage_id)
+                        stage_clients[stage_id] = initialize_diffusion_stage(
+                            self.model,
+                            stage_cfg,
+                            metadata,
+                            batch_size=self.diffusion_batch_size,
+                        )
+                        logger.info(
+                            "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
+                            stage_id,
+                            self.diffusion_batch_size,
+                        )
                         continue
 
                     llm_stage_ids.append(stage_id)
@@ -825,9 +836,9 @@ class AsyncOmniEngine:
                 "runtime": {
                     "process": True,
                     "devices": devices,
-                    "max_batch_size": 1,
                 },
                 "engine_args": {
+                    "max_num_seqs": 1,
                     "parallel_config": parallel_config,
                     "model_class_name": kwargs.get("model_class_name", None),
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
@@ -844,6 +855,7 @@ class AsyncOmniEngine:
                     "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
+                    "quantization": kwargs.get("quantization", None),
                     "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
                 },
                 "final_output": True,

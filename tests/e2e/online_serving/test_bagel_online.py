@@ -32,7 +32,7 @@ from tests.conftest import OmniServerParams
 from tests.utils import hardware_test
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 STAGE_CONFIGS_PATH = str(
@@ -97,7 +97,7 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bagel_img2img_online(omni_server, openai_client) -> None:
     """Test Bagel img2img via OpenAI-compatible chat completions API."""

@@ -485,7 +485,14 @@ class Orchestrator:
                         req_id,
                     )
 
-            await next_client.add_request_async(req_id, diffusion_prompt, params)
+            if isinstance(diffusion_prompt, list):
+                await next_client.add_batch_request_async(
+                    req_id,
+                    diffusion_prompt,
+                    params,
+                )
+            else:
+                await next_client.add_request_async(req_id, diffusion_prompt, params)
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 
@@ -603,7 +610,14 @@ class Orchestrator:
         request = prompt
         stage_client = self.stage_clients[stage_id]
         if stage_client.stage_type == "diffusion":
-            await stage_client.add_request_async(request_id, prompt, params)
+            if isinstance(prompt, list):
+                await stage_client.add_batch_request_async(
+                    request_id,
+                    prompt,
+                    params,
+                )
+            else:
+                await stage_client.add_request_async(request_id, prompt, params)
         else:
             await stage_client.add_request_async(request)
 

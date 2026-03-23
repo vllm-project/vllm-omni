@@ -11,6 +11,7 @@ Runtime parameters (gpu_memory_utilization, tp_size, etc.) come from CLI.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -74,7 +75,7 @@ class StageConfig:
 
     # Per-stage engine args from pipeline YAML (defaults)
     yaml_engine_args: dict[str, Any] = field(default_factory=dict)
-    # Per-stage runtime config from pipeline YAML (devices, max_batch_size)
+    # Per-stage runtime config from pipeline YAML (devices, etc.)
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     # Pass-through fields from pipeline YAML (default_sampling_params,
     # output_connectors, input_connectors, tts_args, etc.)
@@ -109,13 +110,23 @@ class StageConfig:
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)
         runtime.setdefault("process", True)
-        runtime.setdefault("max_batch_size", self.runtime_overrides.get("max_batch_size", 1))
         if "devices" in self.runtime_overrides:
             runtime["devices"] = self.runtime_overrides["devices"]
 
-        # Inject max_num_seqs from max_batch_size (legacy compat)
-        max_batch_size = int(runtime.get("max_batch_size", 1) or 1)
-        engine_args.setdefault("max_num_seqs", max_batch_size)
+        # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
+        legacy_mbs = runtime.pop("max_batch_size", None)
+        cli_mbs = self.runtime_overrides.get("max_batch_size")
+        if legacy_mbs is not None or cli_mbs is not None:
+            warnings.warn(
+                "runtime.max_batch_size is deprecated and will be removed in a "
+                "future release. Use engine_args.max_num_seqs instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            effective_mbs = int(cli_mbs or legacy_mbs or 1)
+            engine_args.setdefault("max_num_seqs", effective_mbs)
+
+        engine_args.setdefault("max_num_seqs", 1)
 
         # Build full config dict
         config_dict: dict[str, Any] = {
@@ -222,6 +233,7 @@ class StageConfigFactory:
         "qwen2_5_omni": "qwen2_5_omni",
         "bagel": "bagel",
         "qwen3_tts": "qwen3_tts",
+        "voxtral_tts": "voxtral_tts",
         "mimo_audio": "mimo_audio",
         "glm-image": "glm_image",
         "cosyvoice3": "cosyvoice3",
@@ -321,13 +333,14 @@ class StageConfigFactory:
         if "dtype" in engine_args:
             engine_args["dtype"] = str(engine_args["dtype"])
 
+        engine_args.setdefault("max_num_seqs", 1)
+
         config_dict: dict[str, Any] = {
             "stage_id": 0,
             "stage_type": StageType.DIFFUSION.value,
             "runtime": {
                 "process": True,
                 "devices": devices,
-                "max_batch_size": 1,
             },
             "engine_args": create_config(engine_args),
             "final_output": True,
@@ -424,6 +437,16 @@ class StageConfigFactory:
             yaml_engine_args = to_dict(raw_ea) if raw_ea is not None else {}
             raw_rt = stage_data.get("runtime", None)
             yaml_runtime = to_dict(raw_rt) if raw_rt is not None else {}
+
+            # Migrate legacy runtime.max_batch_size → engine_args.max_num_seqs
+            if "max_batch_size" in yaml_runtime:
+                mbs = yaml_runtime.pop("max_batch_size")
+                yaml_engine_args.setdefault("max_num_seqs", int(mbs))
+                logger.debug(
+                    "Stage %s: migrated runtime.max_batch_size=%s to engine_args.max_num_seqs",
+                    stage_data.get("stage_id", "?"),
+                    mbs,
+                )
 
             # Topology-level fields that also live inside engine_args in legacy
             # YAMLs (worker_type, scheduler_cls, etc.) — read from both places.

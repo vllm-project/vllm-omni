@@ -52,7 +52,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()

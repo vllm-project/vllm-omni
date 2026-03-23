@@ -18,7 +18,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from transformers import AutoConfig, CLIPTextModel, CLIPTokenizer, T5TokenizerFast
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -27,6 +27,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_g
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
+from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -148,7 +149,14 @@ class FluxPipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
                 revision=None,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            )
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder_2",
+                revision=None,
+                prefix="text_encoder_2.",
+                fall_back_to_pt=True,
+            ),
         ]
 
         self.device = get_local_device()
@@ -162,9 +170,8 @@ class FluxPipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
         self.text_encoder = CLIPTextModel.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         ).to(self.device)
-        self.text_encoder_2 = T5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder_2", local_files_only=local_files_only
-        ).to(self.device)
+        t5_config = AutoConfig.from_pretrained(model, subfolder="text_encoder_2", local_files_only=local_files_only)
+        self.text_encoder_2 = T5EncoderModel(t5_config, prefix="text_encoder_2").to(self.device)
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
@@ -291,7 +298,7 @@ class FluxPipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
                 f" {max_sequence_length} tokens: {removed_text}"
             )
 
-        prompt_embeds = self.text_encoder_2(text_input_ids.to(self.device), output_hidden_states=False)[0]
+        prompt_embeds = self.text_encoder_2(text_input_ids.to(self.device))[0]
 
         dtype = self.text_encoder_2.dtype
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=self.device)

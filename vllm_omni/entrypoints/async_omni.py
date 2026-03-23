@@ -29,6 +29,7 @@ from vllm_omni.outputs import OmniRequestOutput
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
     from vllm.tokenizers import TokenizerLike
+    from vllm.v1.engine import PauseMode
 
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
@@ -66,7 +67,7 @@ class AsyncOmni(EngineClient, OmniBase):
         ...     print(output)
     """
 
-    def __init__(self, model: str, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
@@ -129,28 +130,40 @@ class AsyncOmni(EngineClient, OmniBase):
 
     async def generate(
         self,
-        prompt: OmniPromptType,
-        request_id: str,
-        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
+        prompt: OmniPromptType | list[OmniPromptType],
+        request_id: str = "",
         *,
+        prompt_text: str | None = None,
+        lora_request: Any = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         output_modalities: list[str] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Generate outputs for the given prompt asynchronously.
+        """Generate outputs for the given prompt(s) asynchronously.
 
-        Coordinates multi-stage pipeline execution. Processes the prompt through
-        all stages in the pipeline and yields outputs as they become available.
+        Coordinates multi-stage pipeline execution. Processes the prompt
+        through all stages in the pipeline and yields outputs as they become
+        available.
+
+        **Batch mode (diffusion only):**
+        When *prompt* is a ``list``, all prompts are dispatched in a single
+        ``DiffusionEngine.step()`` call at the diffusion stage.  The combined
+        result is yielded as one ``OmniRequestOutput`` with all generated
+        images.  Only a single *request_id* is used for the whole batch.
 
         Args:
-            prompt: Prompt to process. Can be a text string, token IDs,
-                or multimodal prompt.
-            request_id: Unique identifier for this request
-            sampling_params_list: List of SamplingParams, one for each stage.
+            prompt: A single prompt **or** a list of prompts.  A list
+                triggers batch mode when the diffusion stage is reached.
+            request_id: Unique identifier for this request.
+            sampling_params_list: List of SamplingParams, one per stage.
                 Must have the same length as the number of stages.
-                If None, uses default sampling params for each stage.
+                If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
+            In batch mode the diffusion stage yields one output containing
+            all generated images.
 
         Raises:
             ValueError: If sampling_params_list has incorrect length.
@@ -226,6 +239,7 @@ class AsyncOmni(EngineClient, OmniBase):
         trace_headers: dict[str, str] | None = None,
         priority: int = 0,
         tokenization_kwargs: dict[str, Any] | None = None,
+        reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
         """EngineClient.encode() stub.
 
@@ -396,6 +410,7 @@ class AsyncOmni(EngineClient, OmniBase):
     async def pause_generation(
         self,
         *,
+        mode: PauseMode = "abort",
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
     ) -> None:
@@ -467,7 +482,7 @@ class AsyncOmni(EngineClient, OmniBase):
         logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
         return True
 
-    async def sleep(self, level: int = 1) -> None:
+    async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         """Sleep all stages.
 
         Best-effort: unsupported stages will emit a TODO result.
@@ -584,7 +599,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== Shutdown ====================
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown the engine."""
         if self.final_output_task is not None:
             self.final_output_task.cancel()
