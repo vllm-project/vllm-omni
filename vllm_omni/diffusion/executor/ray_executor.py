@@ -4,6 +4,7 @@
 """Ray-based distributed executor for diffusion models."""
 
 import os
+import weakref
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -40,6 +41,37 @@ class RayWorkerMetaData:
     worker: ActorHandle
     rank: int = -1
     ip: str = ""
+
+
+@dataclass
+class BackgroundResources:
+    """Used as a weakref.finalize callback for clean shutdown."""
+
+    workers: list[RayWorkerMetaData] | None = None
+
+    def __call__(self):
+        if not self.workers:
+            return
+
+        # Graceful shutdown
+        graceful_futures = []
+        for meta in self.workers:
+            try:
+                graceful_futures.append(meta.worker.shutdown.remote())
+            except Exception:
+                pass  # actor may already be dead
+        if graceful_futures:
+            try:
+                ray.get(graceful_futures, timeout=30)
+            except Exception:
+                logger.warning("Some workers did not shut down gracefully, force-killing")
+
+        for meta in self.workers:
+            try:
+                ray.kill(meta.worker)
+            except Exception as e:
+                logger.warning(f"Failed to kill worker rank {meta.rank}: {e}")
+        self.workers.clear()
 
 
 class RayDiffusionWorkerWrapper:
@@ -106,6 +138,9 @@ class RayDiffusionWorkerWrapper:
 
 class RayDiffusionExecutor(DiffusionExecutor):
     def _init_executor(self) -> None:
+        if ray is None:
+            raise ImportError("Ray is required for the 'ray' distributed executor backend.")
+
         self._closed = False
         self.workers: list[RayWorkerMetaData] = []
 
@@ -117,6 +152,11 @@ class RayDiffusionExecutor(DiffusionExecutor):
             else:
                 logger.info("Initializing local Ray instance")
                 ray.init()
+
+        # Finalizer must exist before _init_workers_ray so shutdown()
+        # works if init fails partway through.
+        self._resources = BackgroundResources(workers=self.workers)
+        self._finalizer = weakref.finalize(self, self._resources)
 
         placement_group = self._create_placement_group()
         self._init_workers_ray(placement_group)
@@ -179,6 +219,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         for i, meta in enumerate(sorted_metadata):
             meta.rank = i
         self.workers = sorted_metadata
+        self._resources.workers = self.workers
 
         unique_ips = set(meta.ip for meta in self.workers)
         master_addr = "127.0.0.1" if len(unique_ips) == 1 else driver_ip
@@ -190,6 +231,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
                 "MASTER_ADDR": master_addr,
                 "MASTER_PORT": master_port,
                 "RANK": str(meta.rank),
+                # Ray remaps CUDA_VISIBLE_DEVICES per actor, so local device is always 0
                 "LOCAL_RANK": "0",
                 "WORLD_SIZE": str(num_gpus),
             }
@@ -262,16 +304,5 @@ class RayDiffusionExecutor(DiffusionExecutor):
                 raise RuntimeError(f"Worker rank {meta.rank} health check failed: {e}") from e
 
     def shutdown(self) -> None:
-        if self._closed:
-            return
-
         self._closed = True
-        for meta in self.workers:
-            try:
-                ray.kill(meta.worker)
-            except Exception as e:
-                logger.warning(f"Failed to kill worker rank {meta.rank}: {e}")
-        self.workers.clear()
-
-    def __del__(self):
-        self.shutdown()
+        self._finalizer()

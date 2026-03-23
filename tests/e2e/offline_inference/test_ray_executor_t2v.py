@@ -51,6 +51,7 @@ def _generate(num_gpus: int, ulysses_degree: int = 1):
 
 
 @pytest.mark.diffusion
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards={"cuda": 1})
 def test_ray_executor_single_gpu():
     """Single GPU inference via Ray executor."""
@@ -71,6 +72,7 @@ def test_ray_executor_single_gpu():
 
 
 @pytest.mark.diffusion
+@pytest.mark.advanced_model
 @pytest.mark.parallel
 @hardware_test(res={"cuda": "L4"}, num_cards={"cuda": 2})
 def test_ray_executor_parallel_ulysses():

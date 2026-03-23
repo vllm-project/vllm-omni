@@ -68,6 +68,40 @@ class TestRayDiffusionWorkerWrapper:
             wrapper.execute_method("any_method")
 
 
+class TestCollectiveRpc:
+    """Test collective_rpc on RayDiffusionExecutor."""
+
+    @pytest.fixture
+    def executor(self, mocker: MockerFixture):
+        from vllm_omni.diffusion.executor.ray_executor import RayWorkerMetaData
+
+        ex = object.__new__(RayDiffusionExecutor)
+        ex._closed = False
+        ex.workers = [RayWorkerMetaData(worker=mocker.Mock(), rank=i) for i in range(3)]
+        return ex
+
+    def test_returns_all_responses(self, mocker, executor):
+        """collective_rpc should aggregate responses from all workers."""
+        expected = ["r0", "r1", "r2"]
+        mocker.patch("ray.get", return_value=expected)
+        assert executor.collective_rpc("ping") == expected
+        for meta in executor.workers:
+            meta.worker.execute_method.remote.assert_called_once_with("ping")
+
+    def test_unique_reply_rank(self, mocker, executor):
+        """collective_rpc with unique_reply_rank should return single response."""
+        mocker.patch("ray.get", return_value=["r0", "r1", "r2"])
+        assert executor.collective_rpc("ping", unique_reply_rank=2) == "r2"
+
+    def test_timeout_raises(self, mocker, executor):
+        """collective_rpc should raise TimeoutError on timeout."""
+        mock_ray_get = mocker.patch("ray.get", side_effect=ray.exceptions.GetTimeoutError("pg"))
+        with pytest.raises(TimeoutError):
+            executor.collective_rpc("slow", timeout=1.0)
+        _, call_kwargs = mock_ray_get.call_args
+        assert call_kwargs.get("timeout") == 1.0
+
+
 class TestExecutorFactory:
     """Test executor class resolution."""
 
