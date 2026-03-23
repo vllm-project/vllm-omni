@@ -85,6 +85,7 @@ def get_prompt(prompt_type="text_only"):
         "text_video": "What is in this video? ",
         "text_image": "What is in this image? ",
         "text_audio": "What is in this audio? ",
+        "one_word": "What is the capital of France? Answer in one words.",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -391,5 +392,59 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {"audio": AUDIO_KEY, "image": IMAGE_KEY, "video": VIDEO_KEY},
+    }
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_audio_in_video_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
+    Output Modal: text, audio
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        content_text=get_prompt("text_video"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "use_audio_in_video": True,
+        "key_words": {"video": VIDEO_KEY},
+    }
+    openai_client.send_omni_request(request_config)
+
+
+@pytest.mark.skip(reason="There is a known issue: https://github.com/vllm-project/vllm-omni/pull/2019")
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_one_word_prompt_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (one-word answer constraint).
+    Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("one_word"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {"text": ["paris"]},
     }
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())

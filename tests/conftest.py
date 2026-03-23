@@ -499,8 +499,86 @@ def generate_synthetic_audio(
     return result
 
 
+def _mux_mp4_bytes_with_synthetic_audio(
+    video_mp4_bytes: bytes,
+    *,
+    num_frames: int,
+    fps: float = 30.0,
+    sample_rate: int = 48000,
+) -> bytes:
+    """
+    Mux a video-only MP4 with mono TTS audio from :func:`generate_synthetic_audio` (AAC).
+
+    Audio length is at least the video duration in whole seconds (rounded up); ffmpeg
+    ``-shortest`` trims to the video when the WAV is longer.
+
+    Uses ffmpeg from ``imageio_ffmpeg`` when available, else ``ffmpeg`` on PATH.
+    If TTS or mux fails, returns ``video_mp4_bytes`` unchanged.
+    """
+    duration_sec = num_frames / fps if fps > 0 else 0.0
+    # generate_synthetic_audio(duration=int) uses at least 1s of buffer internally
+    duration_int = max(1, int(math.ceil(duration_sec)))
+
+    try:
+        audio_result = generate_synthetic_audio(
+            duration=duration_int,
+            num_channels=1,
+            sample_rate=sample_rate,
+            save_to_file=False,
+        )
+        audio_pcm = audio_result["np_array"]
+    except Exception as e:
+        logger.warning("Synthetic video: generate_synthetic_audio failed (%s); using video-only MP4.", e)
+        return video_mp4_bytes
+
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_exe = "ffmpeg"
+
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="syn_vid_mux_") as tmp:
+            vid_path = os.path.join(tmp, "video.mp4")
+            wav_path = os.path.join(tmp, "audio.wav")
+            out_path = os.path.join(tmp, "out.mp4")
+            with open(vid_path, "wb") as f:
+                f.write(video_mp4_bytes)
+            sf.write(wav_path, audio_pcm, sample_rate, format="WAV", subtype="PCM_16")
+            cmd = [
+                ffmpeg_exe,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                vid_path,
+                "-i",
+                wav_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                out_path,
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            with open(out_path, "rb") as f:
+                return f.read()
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError) as e:
+        logger.warning("Synthetic video: audio mux failed (%s); using video-only MP4.", e)
+        return video_mp4_bytes
+
+
 def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> dict[str, Any]:
-    """Generate synthetic video with bouncing balls and return base64 string."""
+    """Generate synthetic video with bouncing balls, AAC audio from :func:`generate_synthetic_audio`, and base64."""
 
     import cv2
     import imageio
@@ -573,13 +651,13 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
     result = {
         "np_array": video_array,
     }
-    video_bytes = None
     saved_file_path = None
 
+    fps = 30
     buffer = io.BytesIO()
     writer_kwargs = {
         "format": "mp4",
-        "fps": 30,
+        "fps": fps,
         "codec": "libx264",
         "quality": 7,
         "pixelformat": "yuv420p",
@@ -598,32 +676,28 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
         ],
     }
 
-    if save_to_file:
-        import datetime
-
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"video_{width}x{height}_{timestamp}.mp4"
-        try:
-            with imageio.get_writer(output_path, **writer_kwargs) as writer:
-                for frame in video_frames:
-                    writer.append_data(frame)
-
-            saved_file_path = output_path
-            print(f"Video saved to: {saved_file_path}")
-            with open(output_path, "rb") as f:
-                video_bytes = f.read()
-
-        except Exception as e:
-            print(f"Warning: Failed to save video to file {output_path}: {e}")
-            save_to_file = False
-
-    if not save_to_file or video_bytes is None:
+    try:
         with imageio.get_writer(buffer, **writer_kwargs) as writer:
             for frame in video_frames:
                 writer.append_data(frame)
-
         buffer.seek(0)
-        video_bytes = buffer.read()
+        video_only_bytes = buffer.read()
+    except Exception as e:
+        print(f"Warning: Failed to encode synthetic video: {e}")
+        raise
+
+    video_bytes = _mux_mp4_bytes_with_synthetic_audio(video_only_bytes, num_frames=num_frames, fps=float(fps))
+
+    if save_to_file:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"video_{width}x{height}_{timestamp}.mp4"
+        try:
+            with open(output_path, "wb") as f:
+                f.write(video_bytes)
+            saved_file_path = output_path
+            print(f"Video saved to: {saved_file_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save video to file {output_path}: {e}")
 
     base64_video = base64.b64encode(video_bytes).decode("utf-8")
 
@@ -1553,7 +1627,11 @@ class OpenAIClientHandler:
         Send OpenAI requests.
 
         Args:
-            request_config: Request configuration dictionary containing parameters like model, messages, stream
+            request_config: Request configuration dictionary containing parameters like model, messages, stream.
+                Optional ``use_audio_in_video`` (bool): when true, sets
+                ``extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}`` for Qwen-Omni video+audio
+                extraction (merged with any existing ``extra_body`` / ``mm_processor_kwargs``).
+                Optional ``extra_body`` (dict): passed through to ``chat.completions.create`` after merge.
             request_num: Number of requests, defaults to 1 (single request)
 
         Returns:
@@ -1564,14 +1642,28 @@ class OpenAIClientHandler:
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
 
+        extra_body: dict[str, Any] = {}
+        raw_extra = request_config.get("extra_body")
+        if raw_extra:
+            extra_body.update(raw_extra)
+        if request_config.get("use_audio_in_video"):
+            mm = dict(extra_body.get("mm_processor_kwargs") or {})
+            mm["use_audio_in_video"] = True
+            extra_body["mm_processor_kwargs"] = mm
+        extra_body_arg: dict[str, Any] | None = extra_body if extra_body else None
+
+        create_kwargs: dict[str, Any] = {
+            "model": request_config.get("model"),
+            "messages": request_config.get("messages"),
+            "stream": stream,
+            "modalities": modalities,
+        }
+        if extra_body_arg is not None:
+            create_kwargs["extra_body"] = extra_body_arg
+
         if request_num == 1:
             # Send single request
-            chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"),
-                messages=request_config.get("messages"),
-                stream=stream,
-                modalities=modalities,
-            )
+            chat_completion = self.client.chat.completions.create(**create_kwargs)
 
             if stream:
                 response = self._process_stream_omni_response(chat_completion)
@@ -1590,10 +1682,7 @@ class OpenAIClientHandler:
                 for _ in range(request_num):
                     future = executor.submit(
                         self.client.chat.completions.create,
-                        model=request_config.get("model"),
-                        messages=request_config.get("messages"),
-                        modalities=modalities,
-                        stream=stream,
+                        **create_kwargs,
                     )
                     futures.append(future)
 
