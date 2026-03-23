@@ -109,10 +109,14 @@ class RayDiffusionWorkerWrapper:
         self.worker = wrapper.worker
         self.od_config = od_config
 
-    def execute_model(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+    def execute_model(self, request: OmniDiffusionRequest) -> DiffusionOutput | None:
         if self.worker is None:
             raise RuntimeError("Worker is not initialized")
-        return self.worker.execute_model(request, self.od_config).to_cpu()
+        output = self.worker.execute_model(request, self.od_config)
+        # Only rank 0 returns outputs to avoid redundant device-to-host copies and Ray transfers
+        if self.rpc_rank == 0:
+            return output.to_cpu()
+        return None
 
     def execute_method(self, method: str, *args, **kwargs) -> Any:
         if self.worker is None:
@@ -170,10 +174,6 @@ class RayDiffusionExecutor(DiffusionExecutor):
             return current_pg
 
         bundles = [{"GPU": 1} for _ in range(num_gpus)]
-        # Pin first bundle to the driver node if it has GPUs
-        if ray.cluster_resources().get("GPU", 0) > 0:
-            bundles[0][f"node:{get_ip()}"] = 0.001
-
         placement_group = ray.util.placement_group(bundles, strategy="PACK")
         logger.info(f"Waiting for placement group with {num_gpus} GPU bundles...")
         try:
@@ -222,7 +222,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         self._resources.workers = self.workers
 
         unique_ips = set(meta.ip for meta in self.workers)
-        master_addr = "127.0.0.1" if len(unique_ips) == 1 else driver_ip
+        master_addr = "127.0.0.1" if len(unique_ips) == 1 else self.workers[0].ip
         master_port = str(get_open_port())
 
         env_futures = []
@@ -255,10 +255,16 @@ class RayDiffusionExecutor(DiffusionExecutor):
         if self._closed:
             raise RuntimeError("RayDiffusionExecutor is closed.")
 
+        # All workers must execute (distributed computation), but only rank 0
+        # returns the full output — others return None to avoid redundant
+        # device-to-host copies and object transfers.
         futures = [meta.worker.execute_model.remote(request) for meta in self.workers]
         try:
-            results = ray.get(futures, timeout=EXECUTE_MODEL_TIMEOUT)
-            return results[0]
+            rank0_result = ray.get(futures[0], timeout=EXECUTE_MODEL_TIMEOUT)
+            # Wait for remaining workers to finish their side of the
+            # distributed computation, but discard their None results.
+            ray.get(futures[1:], timeout=EXECUTE_MODEL_TIMEOUT)
+            return rank0_result
         except ray.exceptions.RayTaskError as e:
             logger.error(f"Worker execution failed: {e}")
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
