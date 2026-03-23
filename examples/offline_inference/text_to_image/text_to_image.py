@@ -14,7 +14,6 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -37,7 +36,17 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default="Qwen/Qwen-Image",
         help="Diffusion model name or local path. Supported models: "
-        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, stepfun-ai/NextStep-1.1",
+        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, stepfun-ai/NextStep-1.1, "
+        "black-forest-labs/FLUX.1-dev, black-forest-labs/FLUX.2-klein-9B, "
+        "black-forest-labs/FLUX.2-dev, tencent/HunyuanImage-3.0-Instruct, "
+        "meituan-longcat/LongCat-Image, OvisAI/Ovis-Image, "
+        "stabilityai/stable-diffusion-3.5-medium, Tongyi-MAI/Z-Image-Turbo and etc.",
+    )
+    parser.add_argument(
+        "--stage-configs-path",
+        type=str,
+        default=None,
+        help="Path to a YAML file containing stage configurations for Omni.",
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
@@ -132,12 +141,10 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "gguf"],
-        help=(
-            "Quantization method for the transformer. "
-            "Options: 'fp8' (FP8 W8A8), 'gguf' (GGUF quantized weights). "
-            "Default: None (no quantization, uses BF16)."
-        ),
+        choices=["fp8", "int8", "gguf"],
+        help="Quantization method for the transformer. "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
+        "Default: None (no quantization, uses BF16).",
     )
     parser.add_argument(
         "--gguf-model",
@@ -217,6 +224,11 @@ def parse_args() -> argparse.Namespace:
         "--use-norm",
         action="store_true",
         help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
     return parser.parse_args()
 
@@ -305,9 +317,12 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
+        "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         **lora_args,
         **quant_kwargs,
     }
+    if args.stage_configs_path:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
@@ -335,6 +350,8 @@ def main():
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
+    if args.stage_configs_path:
+        print(f"  stage-configs-path: {args.stage_configs_path}")
     print(f"{'=' * 60}\n")
 
     # Build LoRA request when --lora-path is set
@@ -400,20 +417,18 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from the first output
+    # omni.generate() returns list[OmniRequestOutput]
     if not outputs or len(outputs) == 0:
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
-    # Extract images from request_output[0]['images']
     first_output = outputs[0]
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images' key")
+    req_out = first_output.request_output
+    if not hasattr(req_out, "images"):
+        raise ValueError("Invalid request_output structure or missing 'images'.")
 
     images = req_out.images
     if not images:

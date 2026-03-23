@@ -70,6 +70,7 @@ def mock_dist():
         patch.object(dist, "get_world_size", return_value=2),
         patch.object(dist, "get_rank", return_value=0),
         patch.object(dist, "is_initialized", return_value=True),
+        patch.object(dist, "all_reduce", return_value=None),
         patch.object(dist, "gather", return_value=None),
         patch.object(dist, "broadcast", return_value=None),
     ):

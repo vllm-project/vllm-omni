@@ -308,6 +308,8 @@ class FishSpeechFastAR(nn.Module):
         self._embed_buf: torch.Tensor | None = None
         self._pos_ids: torch.Tensor | None = None
         self._compiled_model_fwd: object | None = None
+        self._compile_attempted = False
+        self._compile_failed = False
 
     def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
         max_seq = self._num_codebooks + 1  # hidden_state + num_codebooks codes
@@ -322,11 +324,61 @@ class FishSpeechFastAR(nn.Module):
         self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device)
 
     def _setup_compile(self) -> None:
-        if self._compiled_model_fwd is not None:
+        if self._compile_attempted:
             return
-        # TODO: Enable torch.compile for performance.  Eager for now to avoid
-        # potential graph-break issues during initial bring-up.
-        self._compiled_model_fwd = self.model.forward
+        self._compile_attempted = True
+        try:
+            self._compiled_model_fwd = torch.compile(
+                self.model.forward,
+                # Keep the helper compiler separate from vLLM's outer
+                # cudagraph-managed Stage-0 execution.
+                mode="default",
+                dynamic=True,
+                fullgraph=False,
+            )
+        except Exception as exc:
+            self._compile_failed = True
+            logger.warning("Failed to enable torch.compile for Fish Speech Fast AR: %s", exc)
+            self._compiled_model_fwd = self.model.forward
+        else:
+            logger.info("Enabled torch.compile for Fish Speech Fast AR forward (mode=default)")
+
+    @torch.inference_mode()
+    def warmup_compile(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        batch_sizes: tuple[int, ...] = (1,),
+    ) -> None:
+        self._setup_compile()
+        if self._compiled_model_fwd is self.model.forward or self._compile_failed:
+            return
+        for batch_size in batch_sizes:
+            hidden = torch.zeros((batch_size, self.slow_ar_config.hidden_size), device=device, dtype=dtype)
+            semantic = torch.full(
+                (batch_size,),
+                self.slow_ar_config.semantic_begin_id,
+                device=device,
+                dtype=torch.long,
+            )
+            self(hidden, semantic, do_sample=False)
+        torch.cuda.synchronize(device)
+
+    @torch.inference_mode()
+    def _run_model(self, step_input: torch.Tensor, step_pos_ids: torch.Tensor, bsz: int) -> torch.Tensor:
+        # Default-on compile only pays off for single-request decode. For
+        # batched decode, eager preserves loaded throughput and avoids the
+        # regression seen with batch>1 compiled execution.
+        model_fwd = self._compiled_model_fwd if bsz == 1 else self.model.forward
+        try:
+            return model_fwd(step_input, step_pos_ids)
+        except Exception as exc:
+            if model_fwd is self.model.forward or self._compile_failed:
+                raise
+            self._compile_failed = True
+            self._compiled_model_fwd = self.model.forward
+            logger.warning("Fish Speech Fast AR torch.compile fallback to eager after runtime failure: %s", exc)
+            return self.model.forward(step_input, step_pos_ids)
 
     @torch.inference_mode()
     def forward(
@@ -369,7 +421,6 @@ class FishSpeechFastAR(nn.Module):
 
         embed_buf = self._embed_buf
         pos_ids = self._pos_ids
-        model_fwd = self._compiled_model_fwd
 
         # Position 0: projected Slow AR hidden state.
         projected = self.fast_project_in(slow_ar_hidden.reshape(bsz, -1))
@@ -390,9 +441,11 @@ class FishSpeechFastAR(nn.Module):
         for step in range(1, num_cb):
             seq_len = step + 1
             step_input = embed_buf[:bsz, :seq_len, :]
-            step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+            # Use a dense 2D position tensor for every batch size; stride-0
+            # views from expand() were fragile under compiled execution.
+            step_pos_ids = pos_ids[:seq_len].unsqueeze(0).repeat(bsz, 1)
 
-            hidden_out = model_fwd(step_input, step_pos_ids)
+            hidden_out = self._run_model(step_input, step_pos_ids, bsz)
             logits = self.fast_output(self.fast_norm(hidden_out[:, -1, :]))
 
             # Residual codebooks (step >= 1) only have 1024 entries.

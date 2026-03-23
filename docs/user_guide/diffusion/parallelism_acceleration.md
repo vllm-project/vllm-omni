@@ -40,6 +40,7 @@ The following table shows which models are currently supported by parallelism me
 | **FLUX.2-dev**           | `black-forest-labs/FLUX.2-dev`       |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      N/A        | ✅   |
 | **HunyuanImage3.0**      | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      ✅        | ❌   |
 | **DreamID-Omni**           | `XuGuo699/DreamID-Omni`       |     ❌      |    ❌    |      ✅       |        ❌        |         ❌          |      N/A        | ❌   |
+| **OmniGen2**               | `OmniGen2/OmniGen2`           |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      N/A        | ❌   |
 
 !!! note "TP Limitations for Diffusion Models"
     We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
@@ -58,6 +59,8 @@ The following table shows which models are currently supported by parallelism me
 
 | Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel | HSDP | VAE-Patch-Parallel |
 |-------|------------------|:----------:|:--------------:|:---------------:|:----:| :----:|
+| **Wan2.1** | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Wan2.1** | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **LTX-2** | `Lightricks/LTX-2` | ✅ | ✅ | ✅ | ❌ | ❌ |
 

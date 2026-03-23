@@ -29,8 +29,10 @@ def talker2code2wav(
         output = talker_output.outputs[0]
         # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
         audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
-        # Filter zero-padded frames (EOS/invalid steps), matching _extract_last_frame behavior
-        valid_mask = audio_codes.any(dim=1)
+        # Filter invalid frames: zero-padded (EOS) and frames containing
+        # out-of-range values (e.g. stop_token_id=2150 exceeds codebook_size=2048).
+        _CODEBOOK_SIZE = 2048
+        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
         audio_codes = audio_codes[valid_mask]
         ref_code = output.multimodal_output.get("ref_code")
         if isinstance(ref_code, list):
@@ -91,7 +93,6 @@ def talker2code2wav_async_chunk(
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
     elif not finished:
-        # Some steps may not produce pooling_output. Only flush on finish.
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -148,7 +149,7 @@ def talker2code2wav_async_chunk(
         if finished:
             return {
                 "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "finished": True,
             }
         return None
 
@@ -177,18 +178,24 @@ def talker2code2wav_async_chunk(
     left_context_size = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Prepend ref_code to the first decoder window only.
-    if transfer_manager.put_req_chunk[request_id] == 0:
-        ref_code = request_payload.pop(request_id, None)
-        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-            ref_frames = ref_code.tolist()
-            window_frames = ref_frames + window_frames
-            left_context_size += len(ref_frames)
+    # Prepend ref_code as decoder context for every chunk so the vocoder
+    # maintains voice-clone speaker identity throughout the stream.  The HF
+    # reference decodes ref_code + all_codes in one pass; without ref_code
+    # context on later chunks the decoder loses speaker identity and produces
+    # distorted audio.  Use `.get()` (not `.pop()`) to keep ref_code for
+    # subsequent chunks.
+    ref_code = request_payload.get(request_id)
+    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+        ref_frames = ref_code.tolist()
+        window_frames = ref_frames + window_frames
+        left_context_size += len(ref_frames)
 
-    code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    num_quantizers = len(window_frames[0])
+    num_frames = len(window_frames)
+    code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
 
     return {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,
-        "finished": torch.tensor(finished, dtype=torch.bool),
+        "finished": finished,
     }

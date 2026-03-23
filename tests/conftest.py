@@ -843,7 +843,7 @@ def modify_stage_config(
                     'async_chunk': True,
                     'stage_args': {
                         0: {'engine_args.max_model_len': 5800},
-                        1: {'runtime.max_batch_size': 2}
+                        1: {'engine_args.max_num_seqs': 2}
                     }
                 }
         deletes: Dictionary containing configurations to delete.
@@ -1236,15 +1236,12 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         port = params.port
         stage_config_path = params.stage_config_path
         if run_level == "advanced_model" and stage_config_path is not None:
+            with open(stage_config_path, encoding="utf-8") as f:
+                _cfg = yaml.safe_load(f) or {}
+            _stage_ids = [s["stage_id"] for s in _cfg.get("stage_args", []) if "stage_id" in s]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={
-                    "stage_args": {
-                        0: ["engine_args.load_format"],
-                        1: ["engine_args.load_format"],
-                        2: ["engine_args.load_format"],
-                    }
-                },
+                deletes={"stage_args": {sid: ["engine_args.load_format"] for sid in _stage_ids}},
             )
 
         server_args = params.server_args or []
@@ -1733,7 +1730,9 @@ class OmniRunner:
         Returns:
             List of SamplingParams with default decoding for each stage
         """
-        return [st.default_sampling_params for st in self.omni.stage_list]
+        if not hasattr(self.omni, "default_sampling_params_list"):
+            raise AttributeError("Omni.default_sampling_params_list is not available")
+        return list(self.omni.default_sampling_params_list)
 
     def get_omni_inputs(
         self,
@@ -1911,6 +1910,7 @@ class OmniRunner:
     def _cleanup_process(self):
         try:
             keywords = ["enginecore"]
+            matched = []
 
             for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
                 try:
@@ -1923,15 +1923,31 @@ class OmniRunner:
 
                     if is_process:
                         print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
-
-                        try:
-                            proc.terminate()
-                            time.sleep(2)
-                        except Exception:
-                            proc.kill()
-
+                        matched.append(proc)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+
+            for proc in matched:
+                try:
+                    proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            _, still_alive = psutil.wait_procs(matched, timeout=5)
+            for proc in still_alive:
+                try:
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            if still_alive:
+                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
+                if stubborn:
+                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
+                else:
+                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
+            elif matched:
+                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
 
         except Exception as e:
             print(f"Error in psutil vllm cleanup: {e}")
@@ -1974,9 +1990,9 @@ class OmniRunnerHandler:
             audio_content = None
             for stage_output in outputs:
                 if getattr(stage_output, "final_output_type", None) == "text":
-                    text_content = stage_output.request_output[0].outputs[0].text
+                    text_content = stage_output.request_output.outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output[0].outputs[0].multimodal_output["audio"]
+                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
 
             result.audio_content = audio_content
             result.text_content = text_content

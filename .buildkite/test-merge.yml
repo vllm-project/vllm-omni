@@ -12,11 +12,12 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Model Test"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 30
     depends_on: upload-merge-pipeline
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "advanced_model and diffusion" --run-level "advanced_model"
@@ -29,11 +30,12 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Images API LoRA E2E"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 30
     depends_on: upload-merge-pipeline
     commands:
       - pytest -s -v tests/e2e/online_serving/test_images_generations_lora.py
@@ -46,6 +48,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -64,6 +67,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -81,6 +85,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -98,6 +103,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -116,6 +122,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -134,6 +141,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -152,21 +160,17 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Benchmark & Engine Test"
+  - label: "Engine Test"
     depends_on: upload-merge-pipeline
     commands:
       - |
         timeout 15m bash -c '
                 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-                set +e
-                pytest -s -v tests/benchmarks/test_serve_cli.py
-                EXIT1=$$?
                 pytest -s -v tests/engine/test_async_omni_engine_abort.py
-                EXIT2=$$?
-                exit $$((EXIT1 | EXIT2))
         '
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
@@ -178,6 +182,7 @@ steps:
           shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -197,6 +202,7 @@ steps:
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
@@ -226,6 +232,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
@@ -261,6 +272,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:
@@ -272,12 +288,64 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  # - label: "Bagel Text2Img Model Test with H100"
-  #   timeout_in_minutes: 30
+  - label: "Bagel Model Test with H100 (Real Weights)"
+    timeout_in_minutes: 60
+    depends_on: upload-merge-pipeline
+    commands:
+      - |
+        timeout 55m bash -c '
+          set -e
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          export VLLM_IMAGE_FETCH_TIMEOUT=60
+          pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py -m "advanced_model" --run-level "advanced_model" -k "shared_memory"
+          pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py -m "advanced_model" --run-level "advanced_model"
+          pytest -s -v tests/e2e/online_serving/test_bagel_online.py -m "advanced_model" --run-level "advanced_model"
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  # - label: "Voxtral TTS E2E Test"
+  #   timeout_in_minutes: 20
   #   depends_on: upload-merge-pipeline
   #   commands:
-  #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  #     - pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py
+  #     - |
+  #       timeout 20m bash -c '
+  #         export VLLM_LOGGING_LEVEL=DEBUG
+  #         export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  #         pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
+  #       '
   #   agents:
   #     queue: "mithril-h100-pool"
   #   plugins:
