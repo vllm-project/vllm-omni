@@ -65,6 +65,9 @@ class OmniRequestOutput:
     # profiling data
     stage_durations: dict[str, float] = field(default_factory=dict)
 
+    # memory usage info
+    peak_memory_mb: float = 0.0
+
     @classmethod
     def from_pipeline(
         cls,
@@ -102,6 +105,7 @@ class OmniRequestOutput:
         custom_output: dict[str, Any] | None = None,
         final_output_type: str = "image",
         stage_durations: dict[str, float] | None = None,
+        peak_memory_mb: float = 0.0,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -113,6 +117,8 @@ class OmniRequestOutput:
             latents: Optional latent tensors
             multimodal_output: Optional multimodal output dict
             custom_output: Optional custom output dict (e.g. latent trajectories, prompt embeds)
+            stage_durations: Optional stage durations (execution time of each stage) dict
+            peak_memory_mb: Peak memory usage in MB
 
         Returns:
             OmniRequestOutput configured for diffusion mode
@@ -127,6 +133,7 @@ class OmniRequestOutput:
             _multimodal_output=multimodal_output or {},
             _custom_output=custom_output or {},
             stage_durations=stage_durations or {},
+            peak_memory_mb=peak_memory_mb,
             finished=True,
         )
 
@@ -277,6 +284,7 @@ class OmniRequestOutput:
             f"multimodal_output={self._multimodal_output}",
             f"custom_output={self._custom_output}",
             f"stage_durations={self.stage_durations}",
+            f"peak_memory_mb={self.peak_memory_mb}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"

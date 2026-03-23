@@ -8,83 +8,25 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServer, modify_stage_config
+from tests.conftest import OmniServer
+from tests.dfx.conftest import (
+    create_benchmark_indices,
+    create_test_parameter_mapping,
+    create_unique_server_params,
+    get_benchmark_params_for_server,
+    load_configs,
+)
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
-
-
-def load_configs(config_path: str) -> list[dict[str, Any]]:
-    try:
-        abs_path = Path(config_path).resolve()
-        with open(abs_path, encoding="utf-8") as f:
-            configs = json.load(f)
-
-        return configs
-
-    except json.JSONDecodeError as e:
-        raise ValueError(f"JSON parsing error: {str(e)}")
-    except FileNotFoundError:
-        raise ValueError(f"Configuration file not found: {config_path}")
-    except Exception as e:
-        raise RuntimeError(f"Failed to load configuration file: {str(e)}")
-
-
-def modify_stage(default_path, updates, deletes):
-    kwargs = {}
-    if updates is not None:
-        kwargs["updates"] = updates
-    if deletes is not None:
-        kwargs["deletes"] = deletes
-    if kwargs:
-        path = modify_stage_config(default_path, **kwargs)
-    else:
-        path = default_path
-
-    return path
-
-
-def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
-    unique_params = []
-    seen = set()
-    for config in configs:
-        test_name = config["test_name"]
-        model = config["server_params"]["model"]
-        stage_config_name = config["server_params"].get("stage_config_name")
-        if stage_config_name:
-            stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / stage_config_name)
-            delete = config["server_params"].get("delete", None)
-            update = config["server_params"].get("update", None)
-            stage_config_path = modify_stage(stage_config_path, update, delete)
-        else:
-            stage_config_path = None
-
-        server_param = (test_name, model, stage_config_path)
-        if server_param not in seen:
-            seen.add(server_param)
-            unique_params.append(server_param)
-
-    return unique_params
-
-
-def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[str, dict]:
-    mapping = {}
-    for config in configs:
-        test_name = config["test_name"]
-        if test_name not in mapping:
-            mapping[test_name] = {
-                "test_name": test_name,
-                "benchmark_params": [],
-            }
-        mapping[test_name]["benchmark_params"].extend(config["benchmark_params"])
-    return mapping
 
 
 CONFIG_FILE_PATH = str(Path(__file__).parent.parent / "tests" / "test.json")
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
 
 
-test_params = create_unique_server_params(BENCHMARK_CONFIGS)
+STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
+test_params = create_unique_server_params(BENCHMARK_CONFIGS, STAGE_CONFIGS_DIR)
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 
 _omni_server_lock = threading.Lock()
@@ -157,27 +99,7 @@ def run_benchmark(
     return result
 
 
-def get_benchmark_params_for_server(test_name: str) -> list:
-    if test_name not in server_to_benchmark_mapping:
-        return []
-    return server_to_benchmark_mapping[test_name]["benchmark_params"]
-
-
-def create_benchmark_indices():
-    indices = []
-    seen = set()
-    for config in BENCHMARK_CONFIGS:
-        test_name = config["test_name"]
-        if test_name not in seen:
-            seen.add(test_name)
-            params_list = get_benchmark_params_for_server(test_name)
-            for idx in range(len(params_list)):
-                indices.append((test_name, idx))
-
-    return indices
-
-
-benchmark_indices = create_benchmark_indices()
+benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
 
 
 @pytest.fixture(params=benchmark_indices)
@@ -188,7 +110,7 @@ def benchmark_params(request, omni_server):
     if test_name != omni_server.test_name:
         pytest.skip(f"Skipping parameter for {test_name} - current server is {omni_server.test_name}")
 
-    all_params = get_benchmark_params_for_server(test_name)
+    all_params = get_benchmark_params_for_server(test_name, server_to_benchmark_mapping)
 
     if not all_params:
         raise ValueError(f"No benchmark parameters found for test: {test_name}")
