@@ -534,14 +534,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["cache_salt"] = request.cache_salt
 
         speaker = getattr(request, "speaker", None)
-        logger.info(f"preprocess_chat speaker: {speaker}")
         if speaker is not None and isinstance(speaker, str) and speaker.strip():
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
                 engine_prompt["additional_information"] = {}
             engine_prompt["additional_information"]["speaker"] = [speaker.lower().strip()]
 
         language = getattr(request, "language", None)
-        logger.info(f"preprocess_chat language: {language}")
         if language is not None and isinstance(language, str) and language.strip():
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
                 engine_prompt["additional_information"] = {}

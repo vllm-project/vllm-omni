@@ -44,7 +44,7 @@ The Python client supports the following command-line arguments:
 - `--image-path` (or `-i`): Path to local image file or URL. If not provided and query-type is `use_image`, uses default image URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs and common image formats: JPEG, PNG, GIF, WebP. Example: `--image-path /path/to/image.jpg` or `--image-path https://example.com/image.png`
 - `--audio-path` (or `-a`): Path to local audio file or URL. If not provided and query-type is `use_audio`, uses default audio URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs and common audio formats: MP3, WAV, OGG, FLAC, M4A. Example: `--audio-path /path/to/audio.wav` or `--audio-path https://example.com/audio.mp3`
 - `--prompt` (or `-p`): Custom text prompt/question. If not provided, uses default prompt for the selected query type. Example: `--prompt "What are the main activities shown in this video?"`
-- `--voice`: TTS speaker/voice for audio output when requesting audio (e.g. `ethan`, `chelsie`). Omit to use the model default. Example: `--voice "chelsie"`
+- `--speaker`: TTS speaker/voice for audio output when requesting audio (e.g. `ethan`, `chelsie`, `aiden`). Omit to use the model default. Example: `--speaker "chelsie"`
 
 
 For example, to use a local video file with custom prompt:
@@ -151,13 +151,13 @@ print(response.choices[0].message.content)  # Text response
 print(response.choices[1].message.audio)    # Audio response
 ```
 
-## Voice selection
+## Speaker selection
 
-When requesting audio output, you can choose the TTS speaker (voice) used for synthesis. If not specified, the model uses its default voice.
+When requesting audio output, you can choose the TTS speaker (voice) used for synthesis. If not specified, the model uses its default speaker.
 
 ### Using curl
 
-Pass a `voice` field in the request body:
+Pass a `speaker` field in the request body:
 
 ```bash
 curl http://localhost:8091/v1/chat/completions \

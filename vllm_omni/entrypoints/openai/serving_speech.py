@@ -622,7 +622,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 else:
                     # need ref_audio for built-in speaker
                     if request.ref_audio is None:
-                        return f"Base task with built-in speaker '{request.speaker}' requires 'ref_audio' for voice cloning"
+                        return (
+                            f"Base task with built-in speaker '{request.speaker}' "
+                            "requires 'ref_audio' for voice cloning"
+                        )
                     fmt_err = self._validate_ref_audio_format(request.ref_audio)
                     if fmt_err:
                         return fmt_err
