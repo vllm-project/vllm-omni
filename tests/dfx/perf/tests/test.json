@@ -25,9 +25,9 @@
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": 100000,
-                    "mean_audio_ttfp_ms": 100000,
-                    "mean_audio_rtf": 100000
+                    "mean_ttft_ms": [1000, 3000, 5000],
+                    "mean_audio_ttfp_ms": [8000, 10000, 13000],
+                    "mean_audio_rtf": [0.2, 0.25, 0.45]
                 }
             },
             {
@@ -39,10 +39,10 @@
                     40,
                     100
                 ],
-                "max_concurrency": [
-                    1,
-                    4,
-                    10
+                "request_rate": [
+                    0.1,
+                    0.3,
+                    0.5
                 ],
                 "random_input_len": 100,
                 "random_output_len": 100,
@@ -62,9 +62,31 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": 100000,
-                    "mean_audio_ttfp_ms": 100000,
-                    "mean_audio_rtf": 100000
+                    "mean_ttft_ms": [2000, 4000, 6000],
+                    "mean_audio_ttfp_ms": [10000, 13000, 15000],
+                    "mean_audio_rtf": [0.25, 0.35, 0.45]
+                }
+            },
+            {
+                "dataset_name": "random",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    4,
+                    16
+                ],
+                "max_concurrency": [
+                    1,
+                    4
+                ],
+                "random_input_len": 2500,
+                "random_output_len": 900,
+                "ignore_eos": true,
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": [1000, 3000],
+                    "mean_audio_ttfp_ms": [30000, 60000],
+                    "mean_audio_rtf": [0.35, 0.45]
                 }
             }
         ]
@@ -113,9 +135,9 @@
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": 100000,
-                    "mean_audio_ttfp_ms": 100000,
-                    "mean_audio_rtf": 100000
+                    "mean_ttft_ms": [1000, 3000, 5000],
+                    "mean_audio_ttfp_ms": [1000, 3000, 5000],
+                    "mean_audio_rtf": [0.2, 0.35, 0.6]
                 }
             },
             {
@@ -127,10 +149,10 @@
                     40,
                     100
                 ],
-                "max_concurrency": [
-                    1,
-                    4,
-                    10
+                "request_rate": [
+                    0.1,
+                    0.3,
+                    0.5
                 ],
                 "random_input_len": 100,
                 "random_output_len": 100,
@@ -150,9 +172,31 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": 100000,
-                    "mean_audio_ttfp_ms": 100000,
-                    "mean_audio_rtf": 100000
+                    "mean_ttft_ms": [2000, 4000, 6000],
+                    "mean_audio_ttfp_ms": [2000, 4000, 6000],
+                    "mean_audio_rtf": [0.25, 0.4, 0.7]
+                }
+            },
+            {
+                "dataset_name": "random",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [
+                    4,
+                    16
+                ],
+                "max_concurrency": [
+                    1,
+                    4
+                ],
+                "random_input_len": 2500,
+                "random_output_len": 900,
+                "ignore_eos": true,
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": [1000, 3000],
+                    "mean_audio_ttfp_ms": [1000, 3000],
+                    "mean_audio_rtf": [0.35, 0.45]
                 }
             }
         ]
@@ -183,8 +227,8 @@
                 },
                 "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_audio_ttfp_ms": 100000,
-                    "mean_audio_rtf": 100000
+                    "mean_audio_ttfp_ms": [6000, 6000],
+                    "mean_audio_rtf": [0.3, 0.3]
                 }
             }
         ]
