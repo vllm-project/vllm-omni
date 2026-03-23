@@ -49,6 +49,8 @@ _TTS_LANGUAGES: set[str] = {
     "Spanish",
     "Italian",
 }
+_REF_AUDIO_MIN_DURATION = 1.0  # seconds
+_REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
@@ -448,13 +450,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         try:
             wav_np, sr = sf.read(io.BytesIO(content))
             duration = len(wav_np) / sr if sr > 0 else 0.0
-            if duration < 1.0:
+            if duration < _REF_AUDIO_MIN_DURATION:
                 raise ValueError(
-                    f"Reference audio too short ({duration:.1f}s). At least 1s of clear speech is required."
+                    f"Reference audio too short ({duration:.1f}s). "
+                    f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
                 )
-            if duration > 30.0:
+            if duration > _REF_AUDIO_MAX_DURATION:
                 raise ValueError(
-                    f"Reference audio too long ({duration:.1f}s). Maximum 30s supported — use a shorter clip."
+                    f"Reference audio too long ({duration:.1f}s). "
+                    f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
                 )
         except ValueError:
             raise
@@ -695,13 +699,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             wav_np = np.mean(wav_np, axis=-1)
         sr = int(sr)
         duration = len(wav_np) / sr if sr > 0 else 0.0
-        if duration < 1.0:
+        if duration < _REF_AUDIO_MIN_DURATION:
             raise ValueError(
                 f"Reference audio too short ({duration:.1f}s). "
-                "At least 1s of clear speech is required for speaker embedding."
+                f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
             )
-        if duration > 30.0:
-            raise ValueError(f"Reference audio too long ({duration:.1f}s). Maximum 30s supported — use a shorter clip.")
+        if duration > _REF_AUDIO_MAX_DURATION:
+            raise ValueError(
+                f"Reference audio too long ({duration:.1f}s). "
+                f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
+            )
         return wav_np.tolist(), sr
 
     async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
