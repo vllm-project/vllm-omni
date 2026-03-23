@@ -16,6 +16,8 @@ logger = init_logger(__name__)
 
 
 def _normalize_diffusion_metric_value(value: Any) -> int | float | None:
+    if normalized_value is None:
+        logger.debug("Skipping unsupported metric type: %s", type(value).__name__)
     if isinstance(value, bool):
         return int(value)
     if isinstance(value, int):
