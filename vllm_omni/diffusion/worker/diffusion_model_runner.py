@@ -262,24 +262,30 @@ class DiffusionModelRunner:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
-    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> DiffusionRequestState:
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[DiffusionRequestState, bool]:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for req_id in scheduler_output.finished_req_ids:
             self.state_cache.pop(req_id, None)
 
-        req_states = scheduler_output.req_states
-        if len(req_states) != 1:
-            raise ValueError(f"Step mode currently supports batch_size=1, but got {len(req_states)} req_states.")
+        if scheduler_output.num_scheduled_reqs != 1:
+            raise ValueError(
+                "Step mode currently supports batch_size=1, "
+                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
+            )
 
-        # TODO: remove req state from SchedulerOutput
-        # Stepwise mode currently trusts runner-owned cached state more than
-        # re-validating scheduler-provided request content on every step.
-        sched_req_state = req_states[0]
-        req_id = sched_req_state.sched_req_id
-        if req_id in self.state_cache:
-            return self.state_cache[req_id]
+        if scheduler_output.scheduled_new_reqs:
+            new_req_data = scheduler_output.scheduled_new_reqs[0]
+            req_id = new_req_data.sched_req_id
+            req = new_req_data.req
+            if req_id in self.state_cache:
+                raise ValueError(f"Received duplicate new-request payload for cached request {req_id}.")
+        else:
+            req_id = scheduler_output.scheduled_cached_reqs.sched_req_ids[0]
+            state = self.state_cache.get(req_id)
+            if state is None:
+                raise ValueError(f"Missing cached state for request {req_id}.")
+            return state, False
 
-        req = sched_req_state.req
         request_ids = req.request_ids or [req_id]
         if len(request_ids) != len(req.prompts):
             raise ValueError(
@@ -292,7 +298,7 @@ class DiffusionModelRunner:
             prompts=req.prompts,
         )
         self.state_cache[req_id] = state
-        return state
+        return state, True
 
     def _update_states_after(self, state: DiffusionRequestState, finished: bool) -> None:
         """Step-after update: clear cached state for completed request."""
@@ -313,9 +319,9 @@ class DiffusionModelRunner:
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            state = self._update_states(scheduler_output)
+            state, is_new_request = self._update_states(scheduler_output)
 
-            if state.new_request:
+            if is_new_request:
                 # TODO: support kv manager recv
                 # TODO: support cache backend
                 if state.sampling.generator is None and state.sampling.seed is not None:
@@ -329,7 +335,7 @@ class DiffusionModelRunner:
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 # step0/new request: encode
-                if state.new_request:
+                if is_new_request:
                     self.pipeline.prepare_encode(state)
 
                 noise_pred = self.pipeline.denoise_step(state)
