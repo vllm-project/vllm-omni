@@ -32,6 +32,7 @@ def _positive_divisors(n: int) -> list[int]:
         i += 1
     return sorted(divs)
 
+
 @torch.compiler.disable
 def _all_gather_int(pg: dist.ProcessGroup, value: int, *, device: torch.device) -> list[int]:
     """All-gather a scalar int across pg.
