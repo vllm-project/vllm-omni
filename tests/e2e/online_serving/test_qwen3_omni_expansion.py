@@ -405,8 +405,36 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
     """
     Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
     Output Modal: text, audio
-    Input Setting: stream=True
+    Input Setting: stream=False
     Datasets: single request
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        content_text=get_prompt("text_audio_video"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "use_audio_in_video": True,
+        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY},
+    }
+    openai_client.send_omni_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_audio_in_video_002(omni_server, openai_client) -> None:
+    """
+    Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
+    Output Modal: text, audio
+    Input Setting: stream=True
+    Datasets: few requests
     """
     video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
     messages = dummy_messages_from_mix_data(
@@ -422,7 +450,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
         "use_audio_in_video": True,
         "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY},
     }
-    openai_client.send_omni_request(request_config)
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.skip(reason="There is a known issue: https://github.com/vllm-project/vllm-omni/pull/2019")
