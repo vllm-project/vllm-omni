@@ -215,7 +215,7 @@ class DiffusionModelRunner:
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
             # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_multi_kv_cache(
+            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                 req,
                 cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
                 target_device=getattr(self.pipeline, "device", None),
