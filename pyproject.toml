@@ -51,7 +51,8 @@ dev = [
     "mooncake-transfer-engine==0.3.8.post1",
     "av", # for ComfyUI tests
     "openpyxl>=3.0.0", # for nightly CI
-    "pyttsx3>=2.99"
+    "pyttsx3>=2.99",
+    "mistune>=3.2.0", # for example tests
 ]
 
 docs = [
@@ -162,6 +163,7 @@ markers = [
     "omni: Omni model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
+    "example: Doc example code tests",
     # platform markers
     "cpu: Tests that run on CPU",
     "gpu: Tests that run on GPU (auto-added)",
