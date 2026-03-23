@@ -23,7 +23,9 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -85,7 +87,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
-        if self.vllm_config.model_config.enable_return_routed_experts:
+        if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
                 capturer.clear_buffer()  # noqa
@@ -106,7 +108,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             if not scheduler_output.total_num_scheduled_tokens:
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
-            if has_ec_transfer() and get_ec_transfer().is_producer:
+            if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
                     encoder_cache=self.encoder_cache,
@@ -263,6 +265,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        # When spec decode is enabled, defer connector finalization
+        # (wait_for_save + clear metadata) until after draft model runs.
+        defer_kv_connector_finalize = self.speculative_config is not None
         with (
             set_forward_context(
                 attn_metadata,
@@ -275,7 +280,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("Forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                defer_finalize=defer_kv_connector_finalize,
+            ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
                 input_ids=input_ids,
@@ -343,6 +351,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             slot_mappings,  # OMNI: unpack slot_mappings for upstream v1 API compatibility
         ) = self.execute_model_state
         self.execute_model_state = None
+
+        # Finalize KV connector (wait_for_save + clear metadata) after
+        # draft model runs. Deferred from target model forward.
+        if self.speculative_config is not None:
+            self.finalize_kv_connector()
 
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
@@ -465,6 +478,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        profile_seq_lens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -487,7 +501,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             create_mixed_batch: If True, create a mixed batch with both decode
                 (1 token) and prefill (multiple tokens) requests.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
-            num_active_loras: Number of active LoRAs to capture for.
+            num_active_loras: Number of distinct active LoRAs to capture for.
+                LoRA is activated when num_active_loras > 0.
+            profile_seq_lens: If provided, use this value for seq_lens instead
+                of max_query_len. Used to profile attention workspace that
+                scales with context length.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -515,7 +533,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
-        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
             assert not uniform_decode
@@ -566,7 +584,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 # activated later in the context manager, but we need to know the
                 # LoRA state when determining the batch descriptor for capture
                 force_has_lora=num_active_loras > 0,
-                # Capture shape specialization for specific active LoRA counts.
+                # `force_num_active_loras` is used for cudagraph capture; because we
+                # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
             )
         )
@@ -604,33 +623,38 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             ubatch_slices=ubatch_slices_padded,
         )
 
-        # If force_attention is True, we always capture attention. Otherwise,
-        # it only happens for cudagraph_runtime_mode=FULL.
-        if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            if create_mixed_batch:
-                # In the mixed batch mode (used for FI warmup), we use
-                # shorter sequence lengths to run faster.
-                # TODO(luka) better system for describing dummy batches
-                seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
-            else:
-                seq_lens = max_query_len  # type: ignore[assignment]
-            self.seq_lens.np[:num_reqs] = seq_lens
-            self.seq_lens.np[num_reqs:] = 0
-            self.seq_lens.copy_to_gpu()
+        with self.synchronize_input_prep():
+            # If force_attention is True, we always capture attention.
+            # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
+            if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                if profile_seq_lens is not None:
+                    seq_lens = profile_seq_lens  # type: ignore[assignment]
+                elif create_mixed_batch:
+                    # In the mixed batch mode (used for FI warmup), we use
+                    # shorter sequence lengths to run faster.
+                    # TODO(luka) better system for describing dummy batches
+                    seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]  # type: ignore[assignment]
+                else:
+                    seq_lens = max_query_len  # type: ignore[assignment]
+                self.seq_lens.np[:num_reqs] = seq_lens
+                self.seq_lens.np[num_reqs:] = 0
+                self.seq_lens.copy_to_gpu()
 
-            cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-            self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-            self.query_start_loc.copy_to_gpu()
+                cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+                self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+                self.query_start_loc.copy_to_gpu()
 
-            pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-            attn_metadata, _ = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs_padded,
-                max_query_len=max_query_len,
-                ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
-                for_cudagraph_capture=is_graph_capturing,
-                slot_mappings=slot_mappings_by_group,
-            )
+                pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
+                    for_cudagraph_capture=is_graph_capturing,
+                    slot_mappings=slot_mappings_by_group,
+                    use_spec_decode=self.speculative_config is not None,
+                )
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -720,8 +744,16 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             else:
                 hidden_states = outputs
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
-            if self.speculative_config and self.speculative_config.use_eagle():
-                assert isinstance(self.drafter, EagleProposer)
+            if self.speculative_config and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+                or self.speculative_config.uses_extract_hidden_states()
+            ):
+                assert isinstance(
+                    self.drafter,
+                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                )
+                assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
                 # Therefore only use cudagraphs if the main model uses PIECEWISE
                 # NOTE(lucas): this is a hack, need to clean up.

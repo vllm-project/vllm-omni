@@ -22,10 +22,16 @@
 CLI (examples/offline_inference/text_to_image/text_to_image.py)
   |
   v
-Omni (vllm_omni/entrypoints/omni.py)
+Omni (vllm_omni/entrypoints/__init__.py)
   |
   v
-OmniStage (diffusion)
+AsyncOmniEngine
+  |
+  v
+Orchestrator
+  |
+  v
+StageDiffusionClient
   |
   v
 DiffusionWorker
@@ -64,7 +70,13 @@ _generate_with_async_omni
 AsyncOmni
   |
   v
-DiffusionEngine
+AsyncOmniEngine
+  |
+  v
+Orchestrator
+  |
+  v
+StageDiffusionClient
   |
   v
 OmniRequestOutput
@@ -136,9 +148,9 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --height 768 \
   --width 1360 \
   --seed 42 \
-  --cfg_scale 4.0 \
-  --num_images_per_prompt 1 \
-  --num_inference_steps 4 \
+  --cfg-scale 4.0 \
+  --num-images-per-prompt 1 \
+  --num-inference-steps 4 \
   --output outputs/flux2_klein_4b.png
 ```
 
@@ -152,9 +164,9 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --height 768 \
   --width 1360 \
   --seed 42 \
-  --cfg_scale 4.0 \
-  --num_images_per_prompt 1 \
-  --num_inference_steps 4 \
+  --cfg-scale 4.0 \
+  --num-images-per-prompt 1 \
+  --num-inference-steps 4 \
   --output outputs/flux2_klein_4b_gguf.png
 ```
 

@@ -8,9 +8,9 @@ stage_args:
   - stage_id: 0
     runtime:
       devices: "0"
-      max_batch_size: 1
     engine_args:
       model_stage: thinker
+      max_num_seqs: 1
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -20,6 +20,7 @@ stage_args:
       engine_output_type: latent  # Output hidden states for talker
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
+      mm_processor_cache_gb: 0
       hf_config_name: thinker_config
       tensor_parallel_size: 1
       load_format: dummy
@@ -38,9 +39,9 @@ stage_args:
   - stage_id: 1
     runtime:
        devices: "1"
-       max_batch_size: 1
     engine_args:
        model_stage: talker
+       max_num_seqs: 1
        model_arch: Qwen3OmniMoeForConditionalGeneration
        worker_type: ar
        scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -69,9 +70,9 @@ stage_args:
   - stage_id: 2
     runtime:
       devices: "1"
-      max_batch_size: 1
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 1
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler

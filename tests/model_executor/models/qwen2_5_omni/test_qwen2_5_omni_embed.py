@@ -19,6 +19,8 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     merge_interleaved_embeddings,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # Fake token IDs
 AUDIO_TOKEN_ID = 1001
 IMAGE_TOKEN_ID = 1002
@@ -121,6 +123,7 @@ def make_mock_model(hidden: int = 8):
     cfg.video_token_index = VIDEO_TOKEN_ID
     cfg.audio_token_index = AUDIO_TOKEN_ID
     model.config = cfg
+    model._has_oov_mm_tokens = False
 
     def fake_lm_embed(ids: torch.Tensor) -> torch.Tensor:
         # Use .clone() so the tensor is contiguous (expand() creates a strided
@@ -135,13 +138,12 @@ def make_mock_model(hidden: int = 8):
 
     model._embed_text_input_ids = lambda *a, **kw: SupportsMultiModal._embed_text_input_ids(model, *a, **kw)
 
-    def fake_super_embed(ids, mm_embs=None, *, is_multimodal=None, handle_oov_mm_token=False):
+    def fake_super_embed(ids, mm_embs=None, *, is_multimodal=None):
         return SupportsMultiModal.embed_input_ids(
             model,
             ids,
             mm_embs,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
     model.embed_input_ids = lambda *a, **kw: Qwen2_5OmniThinkerForConditionalGeneration.embed_input_ids(model, *a, **kw)

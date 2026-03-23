@@ -49,7 +49,7 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -279,6 +279,7 @@ class ZImageAttention(nn.Module):
             total_num_kv_heads=num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix="to_qkv",
         )
 
         assert qk_norm is True
@@ -297,6 +298,7 @@ class ZImageAttention(nn.Module):
                     input_is_parallel=True,
                     return_bias=False,
                     quant_config=quant_config,
+                    prefix="to_out",
                 )
             ]
         )
@@ -329,10 +331,7 @@ class ZImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        cos = cos.to(query.dtype)
-        sin = sin.to(query.dtype)
-        query = self.rope(query, cos, sin)
-        key = self.rope(key, cos, sin)
+        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
@@ -364,6 +363,7 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.w13 = MergedColumnParallelLinear(
@@ -372,6 +372,7 @@ class FeedForward(nn.Module):
             bias=False,
             return_bias=False,
             quant_config=quant_config,
+            prefix=prefix,
         )
         self.act = SiluAndMul()
         self.w2 = RowParallelLinear(
@@ -381,6 +382,7 @@ class FeedForward(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
+            prefix=prefix,
         )
 
     def forward(self, x):
@@ -412,9 +414,7 @@ class ZImageTransformerBlock(nn.Module):
         )
 
         self.feed_forward = FeedForward(
-            dim=dim,
-            hidden_dim=int(dim / 3 * 8),
-            quant_config=quant_config,
+            dim=dim, hidden_dim=int(dim / 3 * 8), quant_config=quant_config, prefix="feed_forward"
         )
         self.layer_id = layer_id
 

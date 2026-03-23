@@ -556,12 +556,14 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             config.hidden_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
         self.hidden_states_downcast = ColumnParallelLinear(
             config.hidden_size,
             self.local_config.hidden_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
 
         self.lm_head = ColumnParallelLinear(
@@ -569,6 +571,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             config.vocab_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
 
         # Re-encode the sum of multi-layer RVQ embeddings to obtain true Audio Code Embeddings
@@ -770,7 +773,6 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         # This is to satisfy the type checker for each overload
         if multimodal_embeddings is None or is_multimodal is None:
@@ -780,7 +782,6 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
     def base_local_forward(

@@ -22,7 +22,9 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -96,16 +98,32 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        if not getattr(self, "_warmup_state_cleared", False):
+            self._warmup_state_cleared = True
+            if hasattr(self.model, "_clear_warmup_state"):
+                self.model._clear_warmup_state()
+
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
+        finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
+        if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
+            for req_id, data in finished_reqs.items():
+                try:
+                    model_meta = self.model.get_kv_transfer_metadata(req_id)
+                    if model_meta:
+                        existing = data.get("custom_metadata") or {}
+                        existing.update(model_meta)
+                        data["custom_metadata"] = existing
+                except Exception as e:
+                    logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
         self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=getattr(scheduler_output, "finished_requests_needing_kv_transfer", {}),
+            finished_reqs=finished_reqs,
             kv_caches=self.kv_caches,
             block_size=self.cache_config.block_size,
             cache_dtype=str(self.cache_config.cache_dtype),
             request_id_resolver=self._resolve_global_request_id,
         )
 
-        if self.vllm_config.model_config.enable_return_routed_experts:
+        if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
                 capturer.clear_buffer()  # noqa
@@ -123,7 +141,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
-            if has_ec_transfer() and get_ec_transfer().is_producer:
+            if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
                     encoder_cache=self.encoder_cache,
@@ -258,6 +276,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        # When spec decode is enabled, defer connector finalization
+        # (wait_for_save + clear metadata) until after draft model runs.
+        defer_kv_connector_finalize = self.speculative_config is not None
         with (
             set_forward_context(
                 attn_metadata,
@@ -270,7 +291,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                defer_finalize=defer_kv_connector_finalize,
+            ) as kv_connector_output,
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -282,6 +306,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+
+            # [Omni] Map pending ropes metadata to req_ids.
+            if hasattr(self.model, "flush_pending_metadata"):
+                self.model.flush_pending_metadata(list(req_ids))
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -376,13 +404,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self,
         grammar_output: GrammarOutput | None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        kv_connector_output = self.kv_connector_output
-        self.kv_connector_output = None
-
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
 
         if self.execute_model_state is None:
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
@@ -454,10 +481,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
             )
-            if spec_config.use_eagle() and not spec_config.disable_padded_drafter_batch:
-                # EAGLE speculative decoding can use the GPU sampled tokens
-                # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(self.drafter, EagleProposer)
+            use_gpu_toks = (
+                spec_config.use_eagle() or spec_config.uses_draft_model() or spec_config.uses_extract_hidden_states()
+            ) and not spec_config.disable_padded_drafter_batch
+            if use_gpu_toks:
+                assert isinstance(
+                    self.drafter,
+                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -503,8 +534,18 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        # Finalize KV connector (wait_for_save + clear metadata) after
+        # draft model runs. Deferred from target model forward to allow
+        # draft model to also save its KV cache.
+        if self.speculative_config is not None:
+            self.finalize_kv_connector()
+
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+
+        # kv_connector_output may be modified during drafting
+        kv_connector_output = self.kv_connector_output
+        self.kv_connector_output = None
 
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
@@ -519,6 +560,34 @@ class GPUARModelRunner(OmniGPUModelRunner):
             hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
         )
 
+        # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
+        # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
+        mm_cpu: dict[str, object] = {}
+        if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+            for k, v in multimodal_outputs.items():
+                try:
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                        mm_cpu[k] = v.detach().to("cpu").contiguous()
+                    elif isinstance(v, dict):
+                        sub_dict: dict[str, torch.Tensor] = {}
+                        for sk, sv in v.items():
+                            if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
+                                sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
+                        if sub_dict:
+                            mm_cpu[k] = sub_dict
+                    elif isinstance(v, list):
+                        if len(v) == 0:
+                            continue
+                        cpu_list = []
+                        for elem in v:
+                            if isinstance(elem, torch.Tensor):
+                                cpu_list.append(elem.detach().to("cpu").contiguous())
+                            else:
+                                cpu_list.append(elem)
+                        mm_cpu[k] = cpu_list
+                except Exception as e:
+                    logger.error(f"Error in merge multimodal outputs: {e}")
+
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:
             idx = req_id_to_index_output_copy[rid]
@@ -527,31 +596,29 @@ class GPUARModelRunner(OmniGPUModelRunner):
             end = start + sched
             hidden_slice = hidden_states_cpu[start:end]
             payload: dict[str, object] = {"hidden": hidden_slice}
-            if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+            if mm_cpu:
                 mm_payload: dict[str, object] = {}
-                for k, v in multimodal_outputs.items():
-                    try:
-                        if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
-                            mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
-                        elif isinstance(v, dict):
-                            sub_dict: dict[str, torch.Tensor] = {}
-                            for sk, sv in v.items():
-                                if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
-                                    sub_dict[str(sk)] = sv.detach().to("cpu")[start:end].contiguous()
-                            if sub_dict:
-                                mm_payload[k] = sub_dict
-                        elif isinstance(v, list):
-                            element = v[0]
-                            if isinstance(element, torch.Tensor):
-                                element = element.detach().to("cpu").contiguous()
-                            mm_payload[k] = element
-                    except Exception as e:
-                        logger.error(f"Error in merge multimodal outputs: {e}")
-                if mm_payload:
-                    payload.update(mm_payload)
+                for k, v in mm_cpu.items():
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                        mm_payload[k] = v[start:end].contiguous()
+                    elif isinstance(v, dict):
+                        mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
+                    elif isinstance(v, list):
+                        element = v[idx] if idx < len(v) else v[0]
+                        # Clone tensors to avoid cross-request aliasing
+                        if isinstance(element, torch.Tensor):
+                            element = element.clone()
+                        mm_payload[k] = element
+                    elif isinstance(v, torch.Tensor):
+                        # List-derived tensor payloads are request-invariant; clone to
+                        # avoid accidental cross-request aliasing on downstream mutation.
+                        mm_payload[k] = v.clone()
+                    else:
+                        mm_payload[k] = v
+                payload.update(mm_payload)
             pooler_output.append(payload)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            if self.model_config.enable_return_routed_experts:
+            if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
                 if capturer is not None:
                     capturer.save_captured_experts(indices=self.slot_mapping)  # noqa

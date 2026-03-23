@@ -26,6 +26,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -147,7 +148,7 @@ class SiglipNaViTWrapper(nn.Module):
         return outputs.last_hidden_state.squeeze(0)
 
 
-class BagelPipeline(nn.Module):
+class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     """Bagel generation pipeline (MoT) packaged for vllm-omni diffusion engine.
 
     This pipeline is self-contained and uses the ported Bagel core files.
@@ -255,6 +256,9 @@ class BagelPipeline(nn.Module):
         ]
 
         self.to(self.device)
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @staticmethod
     def _decode_image_from_latent(
@@ -331,6 +335,9 @@ class BagelPipeline(nn.Module):
                 gen_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
             else:
                 gen_context["ropes"] = [seq_len]
+
+            if req.sampling_params.kv_metadata and "image_shape" in req.sampling_params.kv_metadata:
+                image_shape = tuple(req.sampling_params.kv_metadata["image_shape"])
 
             cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None)
             if cfg_text_kv is not None:
@@ -618,7 +625,9 @@ class BagelPipeline(nn.Module):
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
-        return DiffusionOutput(output=img)
+        return DiffusionOutput(
+            output=img, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         state = self.state_dict()

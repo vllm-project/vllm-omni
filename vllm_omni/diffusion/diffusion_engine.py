@@ -6,7 +6,9 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+import numpy as np
 import PIL.Image
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -28,6 +30,13 @@ def supports_image_input(model_class_name: str) -> bool:
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "support_image_input", False))
+
+
+def supports_audio_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_audio_input", False))
 
 
 def image_color_format(model_class_name: str) -> str:
@@ -67,14 +76,20 @@ class DiffusionEngine:
             raise e
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+        diffusion_engine_start_time = time.perf_counter()
+
         # Apply pre-processing if available
+        preprocess_time = 0.0
         if self.pre_process_func is not None:
-            preprocess_start_time = time.time()
+            preprocess_start_time = time.perf_counter()
             request = self.pre_process_func(request)
-            preprocess_time = time.time() - preprocess_start_time
+            preprocess_time = time.perf_counter() - preprocess_start_time
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
+        exec_start_time = time.perf_counter()
         output = self.add_req_and_wait_for_response(request)
+        exec_total_time = time.perf_counter() - exec_start_time
+
         if output.error:
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
@@ -92,10 +107,35 @@ class DiffusionEngine:
                 for i, prompt in enumerate(request.prompts)
             ]
 
-        postprocess_start_time = time.time()
-        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
-        postprocess_time = time.time() - postprocess_start_time
+        # When CPU offload is enabled, move output to CPU before
+        # post-processing to avoid device OOM — model weights may still
+        # reside on the device and leave no headroom for intermediates.
+        output_data = output.output
+        if (
+            self.od_config.enable_cpu_offload
+            and isinstance(output_data, torch.Tensor)
+            and output_data.device.type != "cpu"
+        ):
+            output_data = output_data.cpu()
+
+        postprocess_start_time = time.perf_counter()
+        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
+        audio_payload = None
+        if isinstance(outputs, dict):
+            audio_payload = outputs.get("audio")
+            outputs = outputs.get("video", outputs)
+        postprocess_time = time.perf_counter() - postprocess_start_time
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+
+        step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
+        logger.info(
+            "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
+            "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
+            preprocess_time * 1000,
+            exec_total_time * 1000,
+            postprocess_time * 1000,
+            step_total_ms,
+        )
 
         # Convert to OmniRequestOutput format
         # Ensure outputs is a list
@@ -103,6 +143,9 @@ class DiffusionEngine:
             outputs = [outputs] if outputs is not None else []
 
         metrics = {
+            "preprocess_time_ms": preprocess_time * 1000,
+            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
+            "diffusion_engine_total_time_ms": exec_total_time * 1000,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
@@ -117,7 +160,7 @@ class DiffusionEngine:
             request_id = request.request_ids[0] if request.request_ids else ""
 
             if supports_audio_output(self.od_config.model_class_name):
-                audio_payload = outputs[0] if len(outputs) == 1 else outputs
+                request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -125,11 +168,15 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
-                        multimodal_output={"audio": audio_payload},
+                        multimodal_output={"audio": request_audio_payload},
                         final_output_type="audio",
+                        stage_durations=output.stage_durations,
                     ),
                 ]
             else:
+                mm_output = {}
+                if audio_payload is not None:
+                    mm_output["audio"] = audio_payload
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -137,6 +184,9 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        custom_output=output.custom_output or {},
+                        multimodal_output=mm_output,
+                        stage_durations=output.stage_durations,
                     ),
                 ]
         else:
@@ -150,11 +200,13 @@ class DiffusionEngine:
 
                 # Get images for this request
                 num_outputs = request.sampling_params.num_outputs_per_prompt
-                request_outputs = outputs[output_idx : output_idx + num_outputs] if output_idx < len(outputs) else []
-                output_idx += num_outputs
+                start_idx = output_idx
+                end_idx = start_idx + num_outputs
+                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
+                output_idx = end_idx
 
                 if supports_audio_output(self.od_config.model_class_name):
-                    audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
+                    request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -162,11 +214,25 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
-                            multimodal_output={"audio": audio_payload},
+                            multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
-                        )
+                            stage_durations=output.stage_durations,
+                        ),
                     )
                 else:
+                    mm_output = {}
+                    if audio_payload is not None:
+                        sliced_audio = audio_payload
+                        if isinstance(audio_payload, (list, tuple)):
+                            sliced_audio = audio_payload[start_idx:end_idx]
+                            if len(sliced_audio) == 1:
+                                sliced_audio = sliced_audio[0]
+                        elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
+                            if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
+                                sliced_audio = audio_payload[start_idx:end_idx]
+                                if num_outputs == 1:
+                                    sliced_audio = sliced_audio[0]
+                        mm_output["audio"] = sliced_audio
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -174,7 +240,10 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
-                        )
+                            custom_output=output.custom_output or {},
+                            multimodal_output=mm_output,
+                            stage_durations=output.stage_durations,
+                        ),
                     )
 
             return results
@@ -324,7 +393,19 @@ class DiffusionEngine:
             dummy_image = PIL.Image.new(color_format, (width, height))
         else:
             dummy_image = None
-        prompt: OmniTextPrompt = {"prompt": "dummy run", "multi_modal_data": {"image": dummy_image}}
+
+        if supports_audio_input(self.od_config.model_class_name):
+            audio_sr = 16000
+            audio_duration_sec = 4
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+        else:
+            dummy_audio = None
+
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
+        }
         req = OmniDiffusionRequest(
             prompts=[prompt],
             sampling_params=OmniDiffusionSamplingParams(
@@ -336,6 +417,9 @@ class DiffusionEngine:
                 # classifier-free guidance with an empty negative prompt.
                 guidance_scale=0.0,
                 num_outputs_per_prompt=1,
+                # Disable CFG for warmup to avoid triggering CFG parallel
+                # validation when cfg_parallel_size > 1.
+                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
             ),
         )
         logger.info("dummy run to warm up the model")

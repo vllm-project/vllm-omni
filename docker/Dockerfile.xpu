@@ -14,6 +14,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 RUN apt clean && apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
     curl \
+    espeak-ng \
     ffmpeg \
     git \
     libsndfile1 \
@@ -75,7 +76,7 @@ ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE="copy"
 
-ARG VLLM_VERSION=v0.16.0
+ARG VLLM_VERSION=v0.18.0
 RUN git clone -b ${VLLM_VERSION} https://github.com/vllm-project/vllm
 WORKDIR /workspace/vllm
 

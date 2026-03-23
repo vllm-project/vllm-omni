@@ -24,8 +24,6 @@ End-to-end tests verify the complete functionality of a system or component. For
 
 - **`tests/e2e/online_serving/`**: Tests for online serving scenarios (e.g., API server tests)
 
-**Example:** The test file for `vllm_omni/entrypoints/omni_llm.py` should be located at `tests/entrypoints/test_omni_llm.py`.
-
 ## Test Directory Structure
 
 The ideal directory structure mirrors the source code organization. Legend: `✅` = test exists, `⬜` = suggested to add.
@@ -75,11 +73,6 @@ vllm_omni/                                    tests/
 │   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
 │
 ├── entrypoints/                        →     ├── entrypoints/
-│   ├── omni.py                                 │   ├── test_omni.py                    ⬜  (E2E covered by e2e/offline, e2e/online)
-│   ├── omni_llm.py                             │   ├── test_omni_llm.py                ✅
-│   ├── omni_stage.py                            │   ├── test_omni_stage.py              ⬜  (partial in test_omni_stage_diffusion_config.py)
-│   ├── omni_diffusion.py                       │   ├── test_omni_diffusion.py          ✅
-│   ├── async_omni.py                            │   ├── test_async_omni.py              ✅ actually in e2e/online_serving/test_async_omni.py
 │   ├── async_omni_diffusion.py                 │   ├── test_async_omni_diffusion_config.py  ✅
 │   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
 │   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
@@ -158,6 +151,7 @@ vllm_omni/                                    tests/
                                                    ├── test_diffusion_layerwise_offload.py
                                                    ├── test_diffusion_lora.py
                                                    ├── test_sequence_parallel.py
+                                                   ├── test_qwen_image_edit_expansion.py
                                                    └── stage_configs/
                                                        ├── qwen2_5_omni_ci.yaml
                                                        ├── qwen3_omni_ci.yaml
@@ -169,7 +163,7 @@ vllm_omni/                                    tests/
 
 ### Naming Conventions
 
-- **Unit Tests**: Use `test_<module_name>.py` format. Example: `omni_llm.py` → `test_omni_llm.py`
+- **Unit Tests**: Use `test_<module_name>.py` format. Example: `stage_utils.py` → `test_stage_utils.py`
 
 - **E2E Tests**: Place in `tests/e2e/offline_inference/` or `tests/e2e/online_serving/` with descriptive names. Example: `tests/e2e/offline_inference/test_qwen3_omni.py`, `tests/e2e/offline_inference/test_diffusion_model.py`
 

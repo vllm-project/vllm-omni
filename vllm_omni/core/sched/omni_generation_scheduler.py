@@ -6,6 +6,7 @@ from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -41,7 +42,11 @@ class OmniGenerationScheduler(VLLMScheduler):
         """
 
         token_budget = self.max_num_scheduled_tokens
+        if self._pause_state == PauseState.PAUSED_ALL:
+            token_budget = 0
         scheduled_timestamp = time.monotonic()
+
+        self.kv_cache_manager.new_step_starts()
 
         scheduled_new_reqs: list[Request] = []
 
@@ -108,6 +113,8 @@ class OmniGenerationScheduler(VLLMScheduler):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
+            if request.num_cached_tokens < 0:
+                request.num_cached_tokens = num_computed_tokens
             cached_additional_information[request.request_id] = getattr(request, "additional_information", None)
             token_budget -= num_new_tokens
             scheduled_running_reqs.append(request)
@@ -119,7 +126,12 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         # Fast path selection and scheduling (treat all as diffusion requests,
         # independent of pooling_params)
-        while self.waiting and token_budget > 0 and len(self.running) < self.max_num_running_reqs:
+        while (
+            self.waiting
+            and token_budget > 0
+            and len(self.running) < self.max_num_running_reqs
+            and self._pause_state == PauseState.UNPAUSED
+        ):
             request = self.waiting.peek_request()
             # OMNI: Skip requests that are not in self.requests
             if request.request_id not in self.requests or (
@@ -172,6 +184,8 @@ class OmniGenerationScheduler(VLLMScheduler):
 
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
+            if request.num_cached_tokens < 0:
+                request.num_cached_tokens = 0
             token_budget -= num_new_tokens
             scheduled_new_reqs.append(request)
 
@@ -233,6 +247,15 @@ class OmniGenerationScheduler(VLLMScheduler):
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+
+        # Record the request ids scheduled in this step (v0.14.0 behavior).
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        new_block_ids_to_zero = (
+            (self.kv_cache_manager.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -244,11 +267,8 @@ class OmniGenerationScheduler(VLLMScheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             preempted_req_ids=set(),
+            new_block_ids_to_zero=new_block_ids_to_zero,
         )
-
-        # Record the request ids scheduled in this step (v0.14.0 behavior).
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         # KVTransfer: package metadata
         if self.connector is not None:
@@ -290,12 +310,17 @@ class OmniGenerationScheduler(VLLMScheduler):
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
 
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output)
 
         except Exception:
             # If anything goes wrong, leave the original output unchanged
             logger.exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
+        finally:
+            # Ensure chunk-waiting requests are restored even on error,
+            # otherwise they are permanently orphaned in the adapter's
+            # internal deques and never scheduled again.
+            if self.chunk_transfer_adapter:
+                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
 
         return scheduler_output
 
@@ -482,6 +507,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
         # Handle failed KV load requests
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:

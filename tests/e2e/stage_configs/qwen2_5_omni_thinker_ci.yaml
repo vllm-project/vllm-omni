@@ -3,7 +3,6 @@ stage_args:
     runtime:
       process: true            # Run this stage in a separate process
       devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
-      max_batch_size: 1
     engine_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
@@ -18,6 +17,7 @@ stage_args:
       trust_remote_code: true
       engine_output_type: latent
       enable_prefix_caching: false
+      mm_processor_cache_gb: 0
     is_comprehension: true
     final_output: true
     final_output_type: text

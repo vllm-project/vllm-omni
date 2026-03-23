@@ -119,11 +119,39 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    "OmniBagelForConditionalGeneration": (
+        "bagel",
+        "bagel",
+        "OmniBagelForConditionalGeneration",
+    ),
     "HunyuanImage3ForCausalMM": (
         "hunyuan_image3",
         "hunyuan_image3",
         "HunyuanImage3ForConditionalGeneration",
     ),
+    ## fish_speech (Fish Speech S2 Pro)
+    "FishSpeechSlowARForConditionalGeneration": (
+        "fish_speech",
+        "fish_speech_slow_ar",
+        "FishSpeechSlowARForConditionalGeneration",
+    ),
+    "FishSpeechDACDecoder": (
+        "fish_speech",
+        "fish_speech_dac_decoder",
+        "FishSpeechDACDecoder",
+    ),
+    ## Voxtral TTS
+    "VoxtralTTSForConditionalGeneration": (
+        "voxtral_tts",
+        "voxtral_tts",
+        "VoxtralTTSForConditionalGeneration",
+    ),
+    "VoxtralTTSAudioGeneration": (
+        "voxtral_tts",
+        "voxtral_tts_audio_generation",
+        "VoxtralTTSAudioGenerationForConditionalGeneration",
+    ),
+    "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
 }
 
 

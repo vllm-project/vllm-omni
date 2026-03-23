@@ -51,6 +51,7 @@ dev = [
     "mooncake-transfer-engine==0.3.8.post1",
     "av", # for ComfyUI tests
     "openpyxl>=3.0.0", # for nightly CI
+    "pyttsx3>=2.99"
 ]
 
 docs = [
@@ -166,6 +167,7 @@ markers = [
     "gpu: Tests that run on GPU (auto-added)",
     "cuda: Tests that run on CUDA (auto-added)",
     "rocm: Tests that run on AMD/ROCm (auto-added)",
+    "xpu: Tests that run on XPU (auto-added)",
     "npu: Tests that run on NPU/Ascend (auto-added)",
     # specified computation resources marks (auto-added)
     "H100: Tests that require H100 GPU",
@@ -175,9 +177,11 @@ markers = [
     "A3: Tests that require A3 NPU",
     "distributed_cuda: Tests that require multi cards on CUDA platform",
     "distributed_rocm: Tests that require multi cards on ROCm platform",
+    "distributed_xpu: Tests that require multi cards on XPU platform",
     "distributed_npu: Tests that require multi cards on NPU platform",
     "skipif_cuda: Skip if the num of CUDA cards is less than the required",
     "skipif_rocm: Skip if the num of ROCm cards is less than the required",
+    "skipif_xpu: Skip if the num of XPU cards is less than the required",
     "skipif_npu: Skip if the num of NPU cards is less than the required",
     # more detailed markers
     "slow: Slow tests (may skip in quick CI)",

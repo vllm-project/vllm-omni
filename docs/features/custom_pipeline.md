@@ -97,7 +97,7 @@ outputs = omni.generate(
 )
 
 # Access custom trajectory data
-output = outputs[0].request_output[0]
+output = outputs[0].request_output
 print(f"Trajectory timesteps shape: {output.metrics['trajectory_timesteps'].shape}")
 print(f"Trajectory latents shape: {output.latents.shape}")
 ```
@@ -115,7 +115,7 @@ python image_edit.py \
     --image cherry_blossom.jpg \
     --prompt "Let this mascot dance under the moon, surrounded by floating stars" \
     --output output_image_edit.png \
-    --num_inference_steps 10
+    --num-inference-steps 10
 ```
 
 ## Advanced Usage

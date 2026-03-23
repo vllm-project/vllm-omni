@@ -50,11 +50,14 @@ def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str
     for config in configs:
         test_name = config["test_name"]
         model = config["server_params"]["model"]
-        stage_config_name = config["server_params"]["stage_config_name"]
-        stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / stage_config_name)
-        delete = config["server_params"].get("delete", None)
-        update = config["server_params"].get("update", None)
-        stage_config_path = modify_stage(stage_config_path, update, delete)
+        stage_config_name = config["server_params"].get("stage_config_name")
+        if stage_config_name:
+            stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / stage_config_name)
+            delete = config["server_params"].get("delete", None)
+            update = config["server_params"].get("update", None)
+            stage_config_path = modify_stage(stage_config_path, update, delete)
+        else:
+            stage_config_path = None
 
         server_param = (test_name, model, stage_config_path)
         if server_param not in seen:
@@ -98,7 +101,10 @@ def omni_server(request):
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+        server_args = ["--stage-init-timeout", "120"]
+        if stage_config_path:
+            server_args = ["--stage-configs-path", stage_config_path] + server_args
+        with OmniServer(model, server_args) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
             yield server
@@ -107,8 +113,14 @@ def omni_server(request):
         print("OmniServer stopped")
 
 
-def run_benchmark(args: list, test_name: str, flow, dataset_name: str, num_prompt) -> Any:
-    """Generate synthetic image with random values."""
+def run_benchmark(
+    args: list,
+    test_name: str,
+    flow,
+    dataset_name: str,
+    num_prompt,
+) -> Any:
+    """Run a single benchmark iteration and return the parsed result JSON."""
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
     result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
     if "--result-filename" in args:
@@ -117,10 +129,6 @@ def run_benchmark(args: list, test_name: str, flow, dataset_name: str, num_promp
         ["vllm", "bench", "serve", "--omni"]
         + args
         + [
-            "--backend",
-            "openai-chat-omni",
-            "--endpoint",
-            "/v1/chat/completions",
             "--save-result",
             "--result-dir",
             os.environ.get("BENCHMARK_DIR", "tests"),
@@ -196,7 +204,10 @@ def benchmark_params(request, omni_server):
     total = len(all_params)
     print(f"\n  Running benchmark {current}/{total} for {test_name}")
 
-    return {"test_name": test_name, "params": all_params[param_index]}
+    return {
+        "test_name": test_name,
+        "params": all_params[param_index],
+    }
 
 
 def assert_result(result, params, num_prompt):
@@ -266,7 +277,11 @@ def test_performance_benchmark(omni_server, benchmark_params):
     for qps, num_prompt in zip(qps_list, num_prompt_list):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(
-            args=args, test_name=test_name, flow=qps, dataset_name=dataset_name, num_prompt=num_prompt
+            args=args,
+            test_name=test_name,
+            flow=qps,
+            dataset_name=dataset_name,
+            num_prompt=num_prompt,
         )
         assert_result(result, params, num_prompt=num_prompt)
 
@@ -274,6 +289,10 @@ def test_performance_benchmark(omni_server, benchmark_params):
     for concurrency, num_prompt in zip(max_concurrency_list, num_prompt_list):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(
-            args=args, test_name=test_name, flow=concurrency, dataset_name=dataset_name, num_prompt=num_prompt
+            args=args,
+            test_name=test_name,
+            flow=concurrency,
+            dataset_name=dataset_name,
+            num_prompt=num_prompt,
         )
         assert_result(result, params, num_prompt=num_prompt)

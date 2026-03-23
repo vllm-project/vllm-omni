@@ -246,7 +246,7 @@ class OmniARScheduler(VLLMScheduler):
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
-            if scheduled_spec_token_ids:
+            if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
@@ -364,6 +364,7 @@ class OmniARScheduler(VLLMScheduler):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
         # [Main] Handle failed KV load requests
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
@@ -481,10 +482,7 @@ class OmniARScheduler(VLLMScheduler):
         assert request.is_finished()
 
         # 1. Standard cleanup parts from base _free_request
-        connector_delay_free_blocks = False
-        kv_xfer_params = None
-        if self.connector is not None:
-            connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id

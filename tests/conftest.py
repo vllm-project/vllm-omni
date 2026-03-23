@@ -12,21 +12,27 @@ if "VLLM_TARGET_DEVICE" not in os.environ:
 
 import concurrent.futures
 import gc
+import multiprocessing
 import socket
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+import imageio.v3 as iio
 import numpy as np
 import psutil
 import pytest
+import soundfile as sf
 import torch
 import yaml
-from openai import OpenAI
+from openai import OpenAI, omit
+from PIL import Image
 from vllm import TextPrompt
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
@@ -41,6 +47,65 @@ logger = init_logger(__name__)
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
+
+
+class OmniServerParams(NamedTuple):
+    model: str
+    port: int | None = None
+    stage_config_path: str | None = None
+    server_args: list[str] | None = None
+
+
+def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
+    """Assert the file is a loadable image with optional exact dimensions."""
+    if isinstance(image, Path):
+        assert image.exists(), f"Image not found: {image}"
+        image = Image.open(image)
+        image.load()
+    assert image.width > 0 and image.height > 0
+    if width is not None:
+        assert image.width == width, f"Expected width={width}, got {image.width} in {image.name}"
+    if height is not None:
+        assert image.height == height, f"Expected height={height}, got {image.height} in {image.name}"
+    return image
+
+
+def assert_video_valid(frames: Path | np.ndarray, *, width: int, height: int, num_frames: int) -> None:
+    """Assert the MP4 has the expected resolution and exact frame count."""
+    if isinstance(frames, Path):
+        assert frames.exists(), f"Video not found: {frames}"
+        frames = iio.imread(str(frames), plugin="pyav", index=None)
+    assert frames.shape[0] == num_frames, f"Expected {num_frames} frames, got {frames.shape[0]}"
+    assert frames.shape[1] == height, f"Expected height={height}, got {frames.shape[1]}"
+    assert frames.shape[2] == width, f"Expected width={width}, got {frames.shape[2]}"
+
+
+def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
+    """Assert the WAV has the expected sample rate, channel count, and duration."""
+
+    assert path.exists(), f"Audio not found: {path}"
+    info = sf.info(str(path))
+    assert info.samplerate == sample_rate, f"Expected sample_rate={sample_rate}, got {info.samplerate}"
+    assert info.channels == channels, f"Expected {channels} channel(s), got {info.channels}"
+    expected_frames = int(duration_s * sample_rate)
+    assert info.frames == expected_frames, (
+        f"Expected {expected_frames} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
+    )
+
+
+def decode_b64_image(b64: str):
+    img = Image.open(BytesIO(base64.b64decode(b64)))
+    img.load()
+    return img
+
+
+@pytest.fixture(scope="session")
+def model_prefix() -> str:
+    """Optional model-path prefix from MODEL_PREFIX env var.
+    Useful if models are downloaded to non-default local directories.
+    """
+    prefix = os.environ.get("MODEL_PREFIX", "")
+    return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
 @pytest.fixture(autouse=True)
@@ -217,101 +282,192 @@ def generate_synthetic_audio(
     sample_rate: int = 48000,  # Default use 48000Hz.
     save_to_file: bool = False,
 ) -> dict[str, Any]:
-    """ "Generate synthetic audio with rain."""
+    """
+    Generate TTS speech with pyttsx3 and return base64 string.
+    """
+    import tempfile
+
+    import pyttsx3
     import soundfile as sf
 
-    # Initialize audio data array
-    num_samples = int(sample_rate * duration)
+    def _pick_voice(engine: pyttsx3.Engine) -> str | None:
+        voices = engine.getProperty("voices")
+        if not voices:
+            return None
+
+        preferred_tokens = (
+            "natural",
+            "jenny",
+            "sonia",
+            "susan",
+            "zira",
+            "aria",
+            "hazel",
+            "samantha",
+            "ava",
+            "allison",
+            "female",
+            "woman",
+            "english-us",
+            "en-us",
+            "english",
+        )
+        discouraged_tokens = (
+            "espeak",
+            "robot",
+            "mbrola",
+            "microsoft david",
+            "male",
+            "man",
+        )
+
+        best_voice = voices[0]
+        best_score = float("-inf")
+        for voice in voices:
+            voice_text = f"{getattr(voice, 'id', '')} {getattr(voice, 'name', '')}".lower()
+            voice_languages = " ".join(
+                lang.decode(errors="ignore") if isinstance(lang, bytes) else str(lang)
+                for lang in getattr(voice, "languages", [])
+            ).lower()
+            combined_text = f"{voice_text} {voice_languages}"
+            score = 0
+            for idx, token in enumerate(preferred_tokens):
+                if token in combined_text:
+                    score += 20 - idx
+            for token in discouraged_tokens:
+                if token in combined_text:
+                    score -= 10
+            if "english" in combined_text or "en_" in combined_text or "en-" in combined_text:
+                score += 4
+            if "en-us" in combined_text or "english-us" in combined_text:
+                score += 4
+            if score > best_score:
+                best_score = score
+                best_voice = voice
+
+        return best_voice.id
+
+    def _resample_audio(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+        if src_sr == dst_sr or len(audio) == 0:
+            return audio.astype(np.float32)
+
+        src_len = audio.shape[0]
+        dst_len = max(1, int(round(src_len * float(dst_sr) / float(src_sr))))
+        src_idx = np.arange(src_len, dtype=np.float32)
+        dst_idx = np.linspace(0, src_len - 1, dst_len, dtype=np.float32)
+
+        resampled_channels: list[np.ndarray] = []
+        for ch in range(audio.shape[1]):
+            resampled_channels.append(np.interp(dst_idx, src_idx, audio[:, ch]).astype(np.float32))
+        return np.stack(resampled_channels, axis=1)
+
+    def _match_channels(audio: np.ndarray, target_channels: int) -> np.ndarray:
+        current_channels = audio.shape[1]
+        if current_channels == target_channels:
+            return audio.astype(np.float32)
+        if target_channels == 1:
+            return np.mean(audio, axis=1, keepdims=True, dtype=np.float32)
+        if current_channels == 1:
+            return np.repeat(audio, target_channels, axis=1).astype(np.float32)
+
+        collapsed = np.mean(audio, axis=1, keepdims=True, dtype=np.float32)
+        return np.repeat(collapsed, target_channels, axis=1).astype(np.float32)
+
+    def _trim_silence(audio: np.ndarray, threshold: float = 0.01) -> np.ndarray:
+        if len(audio) == 0:
+            return audio
+        energy = np.max(np.abs(audio), axis=1)
+        voiced = np.where(energy > threshold)[0]
+        if len(voiced) == 0:
+            return audio
+        start = max(0, int(voiced[0]) - int(sample_rate * 0.02))
+        end = min(len(audio), int(voiced[-1]) + int(sample_rate * 0.04) + 1)
+        return audio[start:end]
+
+    def _enhance_speech(audio: np.ndarray) -> np.ndarray:
+        if len(audio) == 0:
+            return audio.astype(np.float32)
+        enhanced = audio.astype(np.float32).copy()
+        enhanced -= np.mean(enhanced, axis=0, keepdims=True, dtype=np.float32)
+        if len(enhanced) > 1:
+            preemphasis = enhanced.copy()
+            preemphasis[1:] = enhanced[1:] - 0.94 * enhanced[:-1]
+            enhanced = 0.7 * enhanced + 0.3 * preemphasis
+        # Mild dynamic-range compression for ASR/TTS robustness.
+        enhanced = np.sign(enhanced) * np.sqrt(np.abs(enhanced))
+        # Light fade to avoid clicks after trimming/repeating.
+        fade = min(len(enhanced) // 4, max(1, int(sample_rate * 0.01)))
+        if fade > 1:
+            ramp_in = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            ramp_out = np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            enhanced[:fade] *= ramp_in[:, None]
+            enhanced[-fade:] *= ramp_out[:, None]
+        peak = float(np.max(np.abs(enhanced)))
+        if peak > 1e-8:
+            enhanced = enhanced / peak * 0.95
+        return enhanced.astype(np.float32)
+
+    phrase_text = "test"
+    num_samples = int(sample_rate * max(1, duration))
     audio_data = np.zeros((num_samples, num_channels), dtype=np.float32)
 
-    # Configure parameters based on rain intensity
-    drop_density = 10  # Number of raindrops per second
-    drop_volume = 0.15  # Volume of individual raindrops
-    background_volume = 0.02  # Volume of background rain noise
+    engine = pyttsx3.init()
+    engine.setProperty("rate", 112)
+    engine.setProperty("volume", 1.0)
+    selected_voice = _pick_voice(engine)
+    if selected_voice is not None:
+        engine.setProperty("voice", selected_voice)
 
-    # Pink noise sounds more natural than white noise for rain
-    white_noise = np.random.randn(num_samples)
-    pink_noise = np.convolve(white_noise, np.ones(8) / 8, mode="same")
-    pink_noise = pink_noise / np.max(np.abs(pink_noise)) if np.max(np.abs(pink_noise)) > 0 else pink_noise
-    bg_noise = pink_noise * background_volume
+    temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    temp_wav.close()
 
-    # Add background noise to all channels
-    for ch in range(num_channels):
-        audio_data[:, ch] += bg_noise
+    try:
+        engine.save_to_file(phrase_text, temp_wav.name)
+        engine.runAndWait()
+        engine.stop()
 
-    # Total number of raindrops = density × duration × channels for stereo effect
-    total_drops = int(drop_density * duration * num_channels)
+        ready = False
+        for _ in range(50):
+            if os.path.exists(temp_wav.name) and os.path.getsize(temp_wav.name) > 44:
+                ready = True
+                break
+            time.sleep(0.1)
 
-    for _ in range(total_drops):
-        # Random timing for raindrop
-        drop_time = random.uniform(0, duration)
+        if not ready:
+            raise RuntimeError("pyttsx3 did not produce a WAV file in time.")
 
-        # Random duration of raindrop sound (0.01-0.05 seconds)
-        drop_duration = random.uniform(0.01, 0.05)
+        tts_audio, tts_sr = sf.read(temp_wav.name, dtype="float32", always_2d=True)
+    finally:
+        if os.path.exists(temp_wav.name):
+            os.unlink(temp_wav.name)
 
-        # Random frequency gives variation in raindrop pitch
-        drop_freq = random.uniform(500, 5000)  # Hz
+    if len(tts_audio) == 0:
+        raise RuntimeError("pyttsx3 produced an empty WAV file.")
 
-        # Random channel selection for stereo positioning
-        channel = random.randint(0, num_channels - 1)
+    tts_audio = _resample_audio(tts_audio, tts_sr, sample_rate)
+    tts_audio = _match_channels(tts_audio, num_channels)
+    tts_audio = _trim_silence(tts_audio, threshold=0.012)
+    tts_audio = _enhance_speech(tts_audio)
 
-        # Calculate sample positions for this raindrop
-        start_sample = int(drop_time * sample_rate)
-        drop_samples = int(drop_duration * sample_rate)
-        end_sample = min(start_sample + drop_samples, num_samples)
+    lead_silence = min(int(sample_rate * 0.02), num_samples // 8)
+    pause_samples = int(sample_rate * 0.18)
+    start = lead_silence
+    phrase_len = tts_audio.shape[0]
 
-        if start_sample < end_sample:
-            # Generate the raindrop sound
-            num_drop_samples = end_sample - start_sample
-            t = np.arange(num_drop_samples) / sample_rate
+    while start < num_samples:
+        take = min(phrase_len, num_samples - start)
+        audio_data[start : start + take] = tts_audio[:take]
+        start += phrase_len + pause_samples
 
-            # Basic sine wave for raindrop sound
-            drop_sound = drop_volume * np.sin(2 * math.pi * drop_freq * t)
-
-            # Apply envelope for natural attack and decay
-            envelope = np.ones(num_drop_samples)
-            attack_samples = int(num_drop_samples * 0.1)  # 10% of samples for attack
-            decay_samples = num_drop_samples - attack_samples
-
-            if attack_samples > 0:
-                # Linear attack: volume increases from 0 to 1
-                envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
-
-            if decay_samples > 0:
-                # Exponential decay for natural sound fade
-                decay = np.exp(-8 * t[attack_samples:] / drop_duration)
-                envelope[attack_samples:] = decay
-
-            # Apply envelope to raindrop sound
-            drop_sound *= envelope
-
-            # Add raindrop sound to selected channel
-            audio_data[start_sample:end_sample, channel] += drop_sound
-
-    # Step 3: Add simple reverb effect for realism
-    # Reverb simulates sound reflections in environment
-    if duration > 2:
-        # Single delay reverb (100ms delay)
-        delay_samples = int(0.1 * sample_rate)
-        if delay_samples < num_samples:
-            for ch in range(num_channels):
-                delayed = np.zeros(num_samples)
-                delayed[delay_samples:] = audio_data[:-delay_samples, ch] * 0.3
-                audio_data[:, ch] += delayed
-
-    # Step 4: Normalize audio to prevent clipping
-    # Find maximum amplitude and scale to 80% of maximum volume
-    max_amp = np.max(np.abs(audio_data))
+    max_amp = float(np.max(np.abs(audio_data)))
     if max_amp > 0:
-        audio_data = audio_data / max_amp * 0.8
+        audio_data = audio_data / max_amp * 0.95
 
-    audio_array = audio_data.copy()
-    result = {
-        "np_array": audio_array,
+    audio_bytes: bytes | None = None
+    output_path: str | None = None
+    result: dict[str, Any] = {
+        "np_array": audio_data.copy(),
     }
-
-    # Handle file saving
-    audio_bytes = None
 
     if save_to_file:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -617,24 +773,38 @@ def convert_audio_to_text(audio_data):
     return text
 
 
-def convert_audio_file_to_text(output_path):
+def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
-    model = whisper.load_model("small")
-    text = model.transcribe(
-        output_path,
-        temperature=0.0,
-        word_timestamps=True,
-        condition_on_previous_text=False,
-    )["text"]
-    del model
-    if torch.cuda.is_available():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = whisper.load_model("small", device=device)
+    try:
+        text = model.transcribe(
+            output_path,
+            temperature=0.0,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+        )["text"]
+    finally:
+        # Sync GPU so in-flight ops finish before we free the model; otherwise
+        # freed memory may not show up until those ops complete.
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        del model
         gc.collect()
-        torch.cuda.empty_cache()
-    if text:
-        return text
-    else:
-        return ""
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return text or ""
+
+
+def convert_audio_file_to_text(output_path: str) -> str:
+    """Convert an audio file to text in an isolated subprocess."""
+    # Import locally to avoid impacting test module import time.
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+        future = executor.submit(_whisper_transcribe_in_current_process, output_path)
+        return future.result()
 
 
 def merge_base64_and_convert_to_text(base64_list):
@@ -673,7 +843,7 @@ def modify_stage_config(
                     'async_chunk': True,
                     'stage_args': {
                         0: {'engine_args.max_model_len': 5800},
-                        1: {'runtime.max_batch_size': 2}
+                        1: {'engine_args.max_num_seqs': 2}
                     }
                 }
         deletes: Dictionary containing configurations to delete.
@@ -951,15 +1121,16 @@ class OmniServer:
         max_wait = 1200  # 20 minutes
         start_time = time.time()
         while time.time() - start_time < max_wait:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1)
-                    result = sock.connect_ex((self.host, self.port))
-                    if result == 0:
-                        print(f"Server ready on {self.host}:{self.port}")
-                        return
-            except Exception:
-                pass
+            # Check for process status
+            ret = self.proc.poll()
+            if ret is not None:
+                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                result = sock.connect_ex((self.host, self.port))
+                if result == 0:
+                    print(f"Server ready on {self.host}:{self.port}")
+                    return
             time.sleep(2)
 
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
@@ -1044,7 +1215,9 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(scope="session")
-def run_level(request):
+def run_level(request) -> str:
+    """A command-line argument that specifies the level of tests to run in this session.
+    See https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/CI_5levels/"""
     return request.config.getoption("--run-level")
 
 
@@ -1052,27 +1225,30 @@ _omni_server_lock = threading.Lock()
 
 
 @pytest.fixture(scope="module")
-def omni_server(request, run_level):
+def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: str) -> Generator[OmniServer, Any, None]:
     """Start vLLM-Omni server as a subprocess with actual model weights.
     Uses session scope so the server starts only once for the entire test session.
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        *port, model, stage_config_path = request.param
-        port = port[0] if port else None
-        if run_level == "advanced_model":
+        params: OmniServerParams = request.param
+        model = model_prefix + params.model
+        port = params.port
+        stage_config_path = params.stage_config_path
+        if run_level == "advanced_model" and stage_config_path is not None:
+            with open(stage_config_path, encoding="utf-8") as f:
+                _cfg = yaml.safe_load(f) or {}
+            _stage_ids = [s["stage_id"] for s in _cfg.get("stage_args", []) if "stage_id" in s]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={
-                    "stage_args": {
-                        0: ["engine_args.load_format"],
-                        1: ["engine_args.load_format"],
-                        2: ["engine_args.load_format"],
-                    }
-                },
+                deletes={"stage_args": {sid: ["engine_args.load_format"] for sid in _stage_ids}},
             )
 
-        server_args = ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]
+        server_args = params.server_args or []
+        server_args = ["--stage-init-timeout", "120", *server_args]
+        if stage_config_path is not None:
+            server_args += ["--stage-configs-path", stage_config_path]
+
         with OmniServer(model, server_args, port=port) if port else OmniServer(model, server_args) as server:
             print("OmniServer started successfully")
             yield server
@@ -1092,6 +1268,17 @@ class OmniResponse:
     error_message: str | None = None
 
 
+@dataclass
+class DiffusionResponse:
+    text_content: str | None = None
+    images: list[Image.Image] | None = None
+    audios: list[Any] | None = None
+    videos: list[Any] | None = None
+    e2e_latency: float | None = None
+    success: bool = False
+    error_message: str | None = None
+
+
 def assert_omni_response(response: OmniResponse, request_config: dict[str, Any], run_level):
     """
     Validate response results.
@@ -1105,7 +1292,7 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
     assert response.success, "The request failed."
     e2e_latency = response.e2e_latency
     if e2e_latency is not None:
-        print(f"the avg e2e is: {e2e_latency}")
+        print(f"the avg e2e latency is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
@@ -1140,6 +1327,51 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
             print(f"similarity is: {response.similarity}")
 
 
+def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
+    """
+    Validate diffusion response results.
+
+    Args:
+        response: DiffusionResponse object. Any not-None content will be validated based on the request_config.
+        request_config: Request configuration dictionary containing parameters like model, messages, extra_body.
+            When validating a certain modality, the corresponding params in request_config['extra_body'] must present.
+            It will be used to check against the multimedia file in the response.
+        run_level: Test run level (e.g., "core_model", "advanced_model")
+
+    Raises:
+        AssertionError: When the response does not meet validation criteria
+        KeyError: When the request_config does not contain necessary parameters for validation
+    """
+    assert response.success, "The request failed."
+
+    e2e_latency = response.e2e_latency
+    if e2e_latency is not None:
+        print(f"the avg e2e is: {e2e_latency}")
+
+    extra_body = request_config.get("extra_body", {})
+
+    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+
+    if response.images is not None:
+        assert len(response.images) > 0, "No images in response"
+        assert len(response.images) == num_outputs_per_prompt, (
+            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
+        )
+        if run_level == "advanced_model":
+            expected_width = extra_body["width"]  # intend to raise KeyError
+            expected_height = extra_body["height"]  # intend to raise KeyError
+            for img in response.images:
+                assert_image_valid(img, width=expected_width, height=expected_height)
+    if response.videos is not None:
+        raise NotImplementedError(
+            "Video validation is not implemented yet"
+        )  # consider using assert_video_valid defined above
+    if response.audios is not None:
+        raise NotImplementedError(
+            "Audio validation is not implemented yet"
+        )  # consider using assert_audio_valid defined above
+
+
 class OpenAIClientHandler:
     """
     OpenAI client handler class, encapsulating both streaming and non-streaming response processing logic.
@@ -1162,7 +1394,7 @@ class OpenAIClientHandler:
         self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
         self.run_level = run_level
 
-    def _process_stream_response(self, chat_completion) -> OmniResponse:
+    def _process_stream_omni_response(self, chat_completion) -> OmniResponse:
         """
         Process streaming responses.
 
@@ -1223,7 +1455,7 @@ class OpenAIClientHandler:
 
         return result
 
-    def _process_non_stream_response(self, chat_completion) -> OmniResponse:
+    def _process_non_stream_omni_response(self, chat_completion) -> OmniResponse:
         """
         Process non-streaming responses.
 
@@ -1277,7 +1509,46 @@ class OpenAIClientHandler:
 
         return result
 
-    def send_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def _process_diffusion_response(self, chat_completion) -> DiffusionResponse:
+        """
+        Process diffusion responses (image generation/editing).
+
+        Args:
+            chat_completion: OpenAI response object
+
+        Returns:
+            DiffusionResponse: Processed response object
+        """
+        result = DiffusionResponse()
+        start_time = time.perf_counter()
+
+        try:
+            images = []
+            # [TODO] reading video and audio output from API response for later validation
+
+            for choice in chat_completion.choices:
+                if hasattr(choice.message, "content") and choice.message.content is not None:
+                    content = choice.message.content
+                    if isinstance(content, list):
+                        for item in content:
+                            if hasattr(item, "image_url") and item.image_url is not None:
+                                image_url = item.image_url.url
+                                if image_url.startswith("data:image"):
+                                    b64_data = image_url.split(",", 1)[1]
+                                    img = decode_b64_image(b64_data)
+                                    images.append(img)
+
+            result.e2e_latency = time.perf_counter() - start_time
+            result.images = images if images else None
+            result.success = True
+
+        except Exception as e:
+            result.error_message = f"Diffusion response processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
         """
         Send OpenAI requests.
 
@@ -1303,9 +1574,9 @@ class OpenAIClientHandler:
             )
 
             if stream:
-                response = self._process_stream_response(chat_completion)
+                response = self._process_stream_omni_response(chat_completion)
             else:
-                response = self._process_non_stream_response(chat_completion)
+                response = self._process_non_stream_omni_response(chat_completion)
 
             assert_omni_response(response, request_config, run_level=self.run_level)
             responses.append(response)
@@ -1331,25 +1602,82 @@ class OpenAIClientHandler:
                     chat_completion = future.result()
 
                     if stream:
-                        response = self._process_stream_response(chat_completion)
+                        response = self._process_stream_omni_response(chat_completion)
                     else:
-                        response = self._process_non_stream_response(chat_completion)
+                        response = self._process_non_stream_omni_response(chat_completion)
 
                     assert_omni_response(response, request_config, run_level=self.run_level)
                     responses.append(response)
 
         return responses
 
+    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """
+        Send OpenAI requests for diffusion models.
+
+        Args:
+            request_config: Request configuration dictionary containing parameters like model, messages
+            request_num: Number of requests to send concurrently, defaults to 1 (single request)
+        Returns:
+            List[OmniResponse]: List of response objects
+        """
+        responses = []
+        stream = request_config.get("stream", False)
+        modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
+        extra_body = request_config.get("extra_body", None)
+
+        if stream:
+            raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
+
+        if request_num == 1:
+            # Send single request
+            chat_completion = self.client.chat.completions.create(
+                model=request_config.get("model"),
+                messages=request_config.get("messages"),
+                extra_body=extra_body,
+                modalities=modalities,
+            )
+
+            response = self._process_diffusion_response(chat_completion)
+            assert_diffusion_response(response, request_config, run_level=self.run_level)
+            responses.append(response)
+
+        else:
+            # Send concurrent requests
+            with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                futures = []
+
+                # Submit all request tasks
+                for _ in range(request_num):
+                    future = executor.submit(
+                        self.client.chat.completions.create,
+                        model=request_config.get("model"),
+                        messages=request_config.get("messages"),
+                        modalities=modalities,
+                        extra_body=extra_body,
+                    )
+                    futures.append(future)
+
+                # Process completed tasks
+                for future in concurrent.futures.as_completed(futures):
+                    chat_completion = future.result()
+                    response = self._process_diffusion_response(chat_completion)
+                    assert_diffusion_response(response, request_config, run_level=self.run_level)
+                    responses.append(response)
+
+        return responses
+
 
 @pytest.fixture
-def openai_client(omni_server, run_level):
-    """Create OpenAIClientHandler fixture"""
+def openai_client(omni_server: OmniServer, run_level: str):
+    """Create OpenAIClientHandler fixture to facilitate communication with OmniServer
+    with encapsulated request sending, concurrent requests, response handling, and validation."""
     return OpenAIClientHandler(host=omni_server.host, port=omni_server.port, api_key="EMPTY", run_level=run_level)
 
 
 class OmniRunner:
     """
-    Test runner for Omni models.
+    Offline test runner for Omni models.
     """
 
     def __init__(
@@ -1402,7 +1730,9 @@ class OmniRunner:
         Returns:
             List of SamplingParams with default decoding for each stage
         """
-        return [st.default_sampling_params for st in self.omni.stage_list]
+        if not hasattr(self.omni, "default_sampling_params_list"):
+            raise AttributeError("Omni.default_sampling_params_list is not available")
+        return list(self.omni.default_sampling_params_list)
 
     def get_omni_inputs(
         self,
@@ -1580,6 +1910,7 @@ class OmniRunner:
     def _cleanup_process(self):
         try:
             keywords = ["enginecore"]
+            matched = []
 
             for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
                 try:
@@ -1592,15 +1923,31 @@ class OmniRunner:
 
                     if is_process:
                         print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
-
-                        try:
-                            proc.terminate()
-                            time.sleep(2)
-                        except Exception:
-                            proc.kill()
-
+                        matched.append(proc)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+
+            for proc in matched:
+                try:
+                    proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            _, still_alive = psutil.wait_procs(matched, timeout=5)
+            for proc in still_alive:
+                try:
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            if still_alive:
+                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
+                if stubborn:
+                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
+                else:
+                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
+            elif matched:
+                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
 
         except Exception as e:
             print(f"Error in psutil vllm cleanup: {e}")
@@ -1620,9 +1967,10 @@ class OmniRunner:
 
 
 @pytest.fixture(scope="module")
-def omni_runner(request):
+def omni_runner(request, model_prefix):
     with _omni_server_lock:
         model, stage_config_path = request.param
+        model = model_prefix + model
         with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
             print("OmniRunner started successfully")
             yield runner
@@ -1642,9 +1990,9 @@ class OmniRunnerHandler:
             audio_content = None
             for stage_output in outputs:
                 if getattr(stage_output, "final_output_type", None) == "text":
-                    text_content = stage_output.request_output[0].outputs[0].text
+                    text_content = stage_output.request_output.outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output[0].outputs[0].multimodal_output["audio"]
+                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
 
             result.audio_content = audio_content
             result.text_content = text_content

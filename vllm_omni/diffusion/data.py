@@ -43,6 +43,9 @@ class DiffusionParallelConfig:
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
 
+    enable_expert_parallel: bool = False
+    """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
+
     sequence_parallel_size: int | None = None
     """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
 
@@ -91,7 +94,9 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
-        assert self.cfg_parallel_size in [1, 2], f"CFG parallel size must be 1 or 2, but got {self.cfg_parallel_size}"
+        assert self.cfg_parallel_size in [1, 2, 3], (
+            f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
+        )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
@@ -126,11 +131,12 @@ class DiffusionParallelConfig:
         # 1. Standalone: when other parallelism is all 1, HSDP determines world_size
         # 2. Combined: HSDP overlays on top of other parallelism
         if self.use_hsdp:
-            if self.tensor_parallel_size > 1:
+            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
                 raise ValueError(
-                    "HSDP (use_hsdp=True) cannot be used with Tensor Parallelism "
-                    f"(tensor_parallel_size={self.tensor_parallel_size}). "
-                    "Set tensor_parallel_size=1 when using HSDP."
+                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
+                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
+                    f"data_parallel_size={self.data_parallel_size}). "
+                    "Set tensor_parallel_size=1 and data_parallel_size=1 when using HSDP."
                 )
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
@@ -333,6 +339,7 @@ class OmniDiffusionConfig:
 
     dtype: torch.dtype = torch.bfloat16
 
+    model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
@@ -471,6 +478,25 @@ class OmniDiffusionConfig:
     quantization: str | None = None
     quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
 
+    # Diffusion pipeline Profiling config
+    enable_diffusion_pipeline_profiler: bool = False
+
+    # Step mode settings
+    step_execution: bool = False
+
+    @property
+    def is_moe(self) -> bool:
+        num_experts = self.tf_model_config.get("num_experts", None)
+        if not isinstance(num_experts, (list, tuple, int)):
+            return False
+        if isinstance(num_experts, int):
+            return num_experts > 0
+
+        if isinstance(num_experts, (list, tuple)):
+            return any(isinstance(n, int) and n > 0 for n in num_experts)
+
+        return False
+
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
         Find an available port with retry logic.
@@ -511,12 +537,11 @@ class OmniDiffusionConfig:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
-        # Convert parallel_config dict to DiffusionParallelConfig if needed
-        # This must be done before accessing parallel_config.world_size
-        if isinstance(self.parallel_config, dict):
-            self.parallel_config = DiffusionParallelConfig.from_dict(self.parallel_config)
+        # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
+        # Use Mapping to handle both plain dicts and OmegaConf DictConfig
+        if isinstance(self.parallel_config, Mapping):
+            self.parallel_config = DiffusionParallelConfig.from_dict(dict(self.parallel_config))
         elif not isinstance(self.parallel_config, DiffusionParallelConfig):
-            # If it's neither dict nor DiffusionParallelConfig, use default config
             self.parallel_config = DiffusionParallelConfig()
 
         if self.num_gpus is None:
@@ -633,8 +658,15 @@ class DiffusionOutput:
 
     post_process_func: Callable[..., Any] | None = None
 
+    # Extra custom output data (e.g. latent trajectories, prompt embeds)
+    # passed through to OmniRequestOutput.custom_output
+    custom_output: dict[str, Any] = field(default_factory=dict)
+
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+    # logged duration of stages
+    stage_durations: dict[str, float] = field(default_factory=dict)
 
 
 class AttentionBackendEnum(enum.Enum):

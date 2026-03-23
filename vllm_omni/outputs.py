@@ -60,6 +60,10 @@ class OmniRequestOutput:
     latents: torch.Tensor | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
+    _custom_output: dict[str, Any] = field(default_factory=dict)
+
+    # profiling data
+    stage_durations: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_pipeline(
@@ -95,7 +99,9 @@ class OmniRequestOutput:
         metrics: dict[str, Any] | None = None,
         latents: torch.Tensor | None = None,
         multimodal_output: dict[str, Any] | None = None,
+        custom_output: dict[str, Any] | None = None,
         final_output_type: str = "image",
+        stage_durations: dict[str, float] | None = None,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -105,6 +111,8 @@ class OmniRequestOutput:
             prompt: The prompt used
             metrics: Generation metrics
             latents: Optional latent tensors
+            multimodal_output: Optional multimodal output dict
+            custom_output: Optional custom output dict (e.g. latent trajectories, prompt embeds)
 
         Returns:
             OmniRequestOutput configured for diffusion mode
@@ -117,6 +125,8 @@ class OmniRequestOutput:
             latents=latents,
             metrics=metrics or {},
             _multimodal_output=multimodal_output or {},
+            _custom_output=custom_output or {},
+            stage_durations=stage_durations or {},
             finished=True,
         )
 
@@ -130,15 +140,30 @@ class OmniRequestOutput:
         if self.request_output is None:
             return self._multimodal_output
 
-        request_outputs = self.request_output if isinstance(self.request_output, list) else [self.request_output]
-        for req_out in request_outputs:
-            # Check completion outputs first (where multimodal_output is attached)
-            for output in getattr(req_out, "outputs", []):
-                if mm := getattr(output, "multimodal_output", None):
-                    return mm
-            if mm := getattr(req_out, "multimodal_output", None):
+        # Check completion outputs first (where multimodal_output is attached)
+        for output in getattr(self.request_output, "outputs", []):
+            if mm := getattr(output, "multimodal_output", None):
                 return mm
+        if mm := getattr(self.request_output, "multimodal_output", None):
+            return mm
         return self._multimodal_output
+
+    @property
+    def custom_output(self) -> dict[str, Any]:
+        """Return custom output data from diffusion pipelines.
+
+        For diffusion outputs, returns the local _custom_output field.
+        For pipeline outputs with an inner OmniRequestOutput, forwards
+        the custom_output from the inner request output.
+        """
+        if self.request_output is not None:
+            if isinstance(self.request_output, OmniRequestOutput):
+                return self.request_output._custom_output
+        return self._custom_output
+
+    @custom_output.setter
+    def custom_output(self, value: dict[str, Any]) -> None:
+        self._custom_output = value
 
     @property
     def num_images(self) -> int:
@@ -250,6 +275,8 @@ class OmniRequestOutput:
             f"latents={self.latents}",
             f"metrics={self.metrics}",
             f"multimodal_output={self._multimodal_output}",
+            f"custom_output={self._custom_output}",
+            f"stage_durations={self.stage_durations}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
