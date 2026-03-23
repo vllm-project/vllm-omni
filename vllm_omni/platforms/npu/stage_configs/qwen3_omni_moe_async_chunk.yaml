@@ -7,11 +7,11 @@
 async_chunk: true
 stage_args:
   - stage_id: 0
-    stage_type: llm  # Use llm stage type to launch OmniLLM
+    stage_type: llm  # Use llm stage type for AR stages
     runtime:
       devices: "0,1"
-      max_batch_size: 10
     engine_args:
+      max_num_seqs: 10
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
@@ -39,11 +39,11 @@ stage_args:
       repetition_penalty: 1.05
 
   - stage_id: 1
-    stage_type: llm  # Use llm stage type to launch OmniLLM
+    stage_type: llm  # Use llm stage type for AR stages
     runtime:
       devices: "2"
-      max_batch_size: 10
     engine_args:
+      max_num_seqs: 10
       model_stage: talker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
@@ -70,11 +70,11 @@ stage_args:
       stop_token_ids: [2150]
 
   - stage_id: 2
-    stage_type: llm  # Use llm stage type to launch OmniLLM
+    stage_type: llm  # Use llm stage type for AR stages
     runtime:
       devices: "2"
-      max_batch_size: 10
     engine_args:
+      max_num_seqs: 10
       model_stage: code2wav
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: generation
@@ -86,7 +86,7 @@ stage_args:
       engine_output_type: audio  # Final output: audio waveform
       gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 51200 # [TODO] if max_num_batch_tokens < max_batch_size * 800, there will be precision problem.
+      max_num_batched_tokens: 51200 # [TODO] if max_num_batched_tokens < max_num_seqs * 800, there will be precision problem.
       hf_config_name: thinker_config
     engine_input_source: [1]
     final_output: true

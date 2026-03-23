@@ -2,14 +2,14 @@ async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm
+    is_comprehension: true
     runtime:
       devices: "0"
-      max_batch_size: 4
+      max_batch_size: 16
     engine_args:
+      max_num_seqs: 4
       model_stage: fish_speech_slow_ar
       model_arch: FishSpeechSlowARForConditionalGeneration
-      hf_overrides:
-        architectures: [FishSpeechSlowARForConditionalGeneration]
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
@@ -17,10 +17,10 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.4
+      gpu_memory_utilization: 0.6
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 2048
-      max_model_len: 32768
+      max_num_batched_tokens: 3072
+      max_model_len: 16384
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.fish_speech.slow_ar_to_dac_decoder_async_chunk
     output_connectors:
       to_stage_1: connector_of_shared_memory
@@ -39,12 +39,11 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 1
+      max_batch_size: 16
     engine_args:
+      max_num_seqs: 1
       model_stage: dac_decoder
       model_arch: FishSpeechDACDecoder
-      hf_overrides:
-        architectures: [FishSpeechDACDecoder]
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
@@ -52,10 +51,10 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.1
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 8192
-      max_model_len: 32768
+      max_model_len: 16384
     engine_input_source: [0]
     final_output: true
     final_output_type: audio
@@ -74,7 +73,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 1
+    max_inflight: 16
 
   connectors:
     connector_of_shared_memory:
@@ -89,7 +88,7 @@ runtime:
         # 25 frames ≈ 1.16s of audio at 21.5 Hz.
         codec_chunk_frames: 25
         codec_left_context_frames: 25
-        initial_codec_chunk_frames: 0
+        initial_codec_chunk_frames: 4
 
   edges:
     - from: 0

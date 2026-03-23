@@ -1,20 +1,18 @@
 # Same as qwen3_tts.yaml with batched talker and code2wav.
-# Stage 0: max_batch_size 4, stage 1: max_batch_size 4.
-# max_batch_size must be a power of two to align with CUDA graph capture sizes
+# Stage 0: max_num_seqs 4, stage 1: max_num_seqs 4.
+# max_num_seqs must be a power of two to align with CUDA graph capture sizes
 # (stage 0) and must match --batch-size in end2end.py / benchmark scripts.
 async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm
+    is_comprehension: true
     runtime:
       devices: "0"
-      max_batch_size: 4
     engine_args:
       model_stage: qwen3_tts
+      max_num_seqs: 4
       model_arch: Qwen3TTSTalkerForConditionalGeneration
-      # Force stage-specific registered architecture.
-      hf_overrides:
-        architectures: [Qwen3TTSTalkerForConditionalGeneration]
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
@@ -43,13 +41,10 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 4
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 4
       model_arch: Qwen3TTSCode2Wav
-      # Force stage-specific registered architecture.
-      hf_overrides:
-        architectures: [Qwen3TTSCode2Wav]
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true

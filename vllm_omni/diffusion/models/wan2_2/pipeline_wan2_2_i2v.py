@@ -30,6 +30,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     retrieve_latents,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -141,7 +142,9 @@ def get_wan22_i2v_pre_process_func(
     return pre_process_func
 
 
-class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin):
+class Wan22I2VPipeline(
+    nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+):
     """
     Wan2.2 Image-to-Video Pipeline.
 
@@ -249,6 +252,9 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, ProgressB
         self._guidance_scale_2 = None
         self._num_timesteps = None
         self._current_timestep = None
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):
@@ -610,7 +616,9 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, ProgressB
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
-        return DiffusionOutput(output=output)
+        return DiffusionOutput(
+            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """

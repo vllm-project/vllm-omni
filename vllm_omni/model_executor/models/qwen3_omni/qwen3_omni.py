@@ -642,7 +642,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
             input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden
         )
-        inputs_embeds = summed_embeddings
+        # summed_embeddings is [B, seq_len, H] (3D) while text_step is [B, H] (2D).
+        # Flatten to 2D first to avoid wrong broadcasting: [B,1,H]+[B,H] → [B,B,H]
+        inputs_embeds = summed_embeddings.reshape(-1, self.talker_config.text_config.hidden_size)
         inputs_embeds = (inputs_embeds + text_step).reshape(-1, self.talker_config.text_config.hidden_size)
         return inputs_embeds, code_predictor_codes.squeeze(-1)
 

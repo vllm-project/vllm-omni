@@ -19,7 +19,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output[0].images
+    images = outputs[0].request_output.images
     images[0].save("coffee.png")
 ```
 
@@ -37,7 +37,7 @@ if __name__ == "__main__":
     ]
     outputs = omni.generate(prompts)
     for i, output in enumerate(outputs):
-      image = output.request_output[0].images[0].save(f"{i}.jpg")
+      image = output.request_output.images[0].save(f"{i}.jpg")
 ```
 
 !!! info
@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by default, and the input
+    For diffusion pipelines, the stage config field `stage_args.[].engine_args.max_num_seqs` is 1 by default, and the input
     list is sliced into single-item requests before feeding into the diffusion pipeline. For models that do internally support
     batched inputs, you can [modify this configuration](https://github.com/vllm-project/vllm-omni/tree/main/configuration/stage_configs.md) to let the model accept a longer batch of prompts.
 
@@ -72,7 +72,7 @@ if __name__ == "__main__":
       }
     ])
     for i, output in enumerate(outputs):
-      image = output.request_output[0].images[0].save(f"{i}.jpg")
+      image = output.request_output.images[0].save(f"{i}.jpg")
 ```
 
 ## Local CLI Usage
