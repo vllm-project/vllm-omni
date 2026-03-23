@@ -85,6 +85,7 @@ def get_prompt(prompt_type="text_only"):
         "text_video": "What is in this video? ",
         "text_image": "What is in this image? ",
         "text_audio": "What is in this audio? ",
+        "text_audio_video": "What is in this audio? What is in this video? ",
         "one_word": "What is the capital of France? Answer in one words.",
     }
     return prompts.get(prompt_type, prompts["text_only"])
@@ -411,7 +412,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
-        content_text=get_prompt("text_video"),
+        content_text=get_prompt("text_audio_video"),
     )
 
     request_config = {
@@ -419,7 +420,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "use_audio_in_video": True,
-        "key_words": {"video": VIDEO_KEY},
+        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY},
     }
     openai_client.send_omni_request(request_config)
 
