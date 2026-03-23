@@ -289,7 +289,7 @@ class OrchestratorAggregator:
         try:
             _m: StageRequestStats | None = result.get("metrics")
 
-             # 1. Accumulate metrics from stage stats
+            # 1. Accumulate metrics from stage stats
             if _m is not None:
                 self.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
                 if finished:
