@@ -74,6 +74,14 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     return model
 
 
+def terminate_alive_proc(proc, timeout=5):
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=timeout)
+        if proc.is_alive():
+            proc.kill()
+
+
 def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     """Resolve worker_cls from worker_type for non-diffusion stages."""
     worker_type = engine_args.get("worker_type", None)
@@ -459,11 +467,7 @@ def close_started_llm_stage(started: StartedLlmStage) -> None:
     if started.proc is None:
         return
     try:
-        if started.proc.is_alive():
-            started.proc.terminate()
-            started.proc.join(timeout=5)
-            if started.proc.is_alive():
-                started.proc.kill()
+        terminate_alive_proc(started.proc)
     except Exception as cleanup_error:
         logger.warning(
             "[stage_init] Failed to terminate process for stage %s: %s",

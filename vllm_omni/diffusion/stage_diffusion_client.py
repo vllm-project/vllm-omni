@@ -23,7 +23,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
 )
-from vllm_omni.engine.stage_init_utils import StageMetadata
+from vllm_omni.engine.stage_init_utils import StageMetadata, terminate_alive_proc
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -139,9 +139,9 @@ class StageDiffusionClient:
                 for f in fields(sampling_params)
                 if f.name not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS
             }
-        if isinstance(sampling_params, dict):
-            return {k: v for k, v in sampling_params.items() if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS}
-        return dict(sampling_params)
+        if not isinstance(sampling_params, dict):
+            raise TypeError(f"sampling_params is not a dict but {sampling_params.__class__.__name__}")
+        return {k: v for k, v in sampling_params.items() if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS}
 
     # ------------------------------------------------------------------
     # Public API (matches the interface the Orchestrator expects)
@@ -206,6 +206,7 @@ class StageDiffusionClient:
             )
         )
 
+        deadline = time.monotonic() + timeout if timeout else None
         # Wait for the matching RPC response, buffering result messages.
         try:
             while True:
@@ -217,6 +218,8 @@ class StageDiffusionClient:
                         f"StageDiffusionProc died while waiting for "
                         f"collective_rpc '{method}' (exit code {self._proc.exitcode})"
                     )
+                if deadline and time.monotonic() > deadline:
+                    raise TimeoutError(f"collective_rpc_async '{method}' timed out after {timeout}s")
                 await asyncio.sleep(0.01)
         finally:
             self._pending_rpcs.discard(rpc_id)
@@ -229,11 +232,7 @@ class StageDiffusionClient:
 
         if self._proc is not None and self._proc.is_alive():
             self._proc.join(timeout=10)
-            if self._proc.is_alive():
-                self._proc.terminate()
-                self._proc.join(timeout=5)
-                if self._proc.is_alive():
-                    self._proc.kill()
+            terminate_alive_proc(self._proc)
 
         self._request_socket.close(linger=0)
         self._response_socket.close(linger=0)
