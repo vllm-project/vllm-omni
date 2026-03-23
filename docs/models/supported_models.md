@@ -40,6 +40,7 @@ th {
 |`CosyVoice3Model` | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` |
 |`MammothModa2ForConditionalGeneration` | MammothModa2-Preview | `bytedance-research/MammothModa2-Preview` |
 |`Flux2KleinPipeline` | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B`, `black-forest-labs/FLUX.2-klein-9B` |
+|`FluxKontextPipeline` | FLUX.1-Kontext-dev | `black-forest-labs/FLUX.1-Kontext-dev` |
 |`FluxPipeline` | FLUX.1-dev | `black-forest-labs/FLUX.1-dev` |
 |`OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` |
 |`StableAudioPipeline` | Stable-Audio-Open | `stabilityai/stable-audio-open-1.0` |

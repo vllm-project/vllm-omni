@@ -41,6 +41,7 @@ The following table shows which models are currently supported by parallelism me
 | **HunyuanImage3.0**      | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      ✅        | ❌   |
 | **Bagel**                  | `ByteDance-Seed/BAGEL-7B-MoT` |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |      N/A        | ❌   |
 | **DreamID-Omni**           | `XuGuo699/DreamID-Omni`       |     ❌      |    ❌    |      ✅       |        ❌        |         ❌          |      N/A        | ❌   |
+| **FLUX.1-Kontext-dev**   | `black-forest-labs/FLUX.1-Kontext-dev`       |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      N/A        | ✅   |
 | **OmniGen2**               | `OmniGen2/OmniGen2`           |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      N/A        | ❌   |
 
 !!! note "TP Limitations for Diffusion Models"
