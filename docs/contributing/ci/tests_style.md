@@ -157,6 +157,12 @@ vllm_omni/                                    tests/
                                                        ├── qwen3_omni_ci.yaml
                                                        ├── bagel_*.yaml
                                                        └── npu/, rocm/, etc.
+examples/                                     tests
+│                                             └── examples
+├── online_serving/                     →         ├── online_serving/
+│   └── {doc_page_title}/README.md                │   └── test_{doc_page_title}.py  ⬜
+└── offline_inference/                  →         └── offline_inference/
+    └── {doc_page_title}/README.md                    └── test_{doc_page_title}.py  ⬜
 ```
 
 
