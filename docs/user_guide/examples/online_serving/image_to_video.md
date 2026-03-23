@@ -102,6 +102,11 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o wan22_i2v_outpu
 
 ## Request Format
 
+!!! note
+    The `POST /v1/videos` endpoint accepts **multipart/form-data** (`-F` flags
+    in curl), not a JSON request body. See the [Response Format](#response-format)
+    section below for the JSON returned after a job is created.
+
 ### Required Fields
 
 ```bash
@@ -142,9 +147,9 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "seed=42"
 ```
 
-## Create Response Format
+## Response Format
 
-`POST /v1/videos` returns a job record.
+`POST /v1/videos` returns a JSON job record (not a video file).
 
 ```json
 {
