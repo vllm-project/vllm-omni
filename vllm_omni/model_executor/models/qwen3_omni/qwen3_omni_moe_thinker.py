@@ -89,7 +89,10 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+from vllm.multimodal.processing.context import TimingContext
+from vllm.multimodal.processing.inputs import ProcessorInputs
 from vllm.multimodal.processing.processor import (
+    MultiModalProcessingInfo,
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
     PromptReplacement,
@@ -379,6 +382,26 @@ Qwen3OmniMoeThinkerDummyInputsBuilder = Qwen2_5OmniThinkerDummyInputsBuilder
 class Qwen3OmniMoeThinkerMultiModalProcessor(
     Qwen2_5OmniThinkerMultiModalProcessor,
 ):
+    @staticmethod
+    def _use_audio_in_video_enabled(value: object) -> bool:
+        if isinstance(value, torch.Tensor):
+            return bool(value.any().item())
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return any(Qwen3OmniMoeThinkerMultiModalProcessor._use_audio_in_video_enabled(v) for v in value)
+        return bool(value)
+
+    @staticmethod
+    def _normalize_mm_item_counts(
+        mm_item_counts: Mapping[str, int],
+        *,
+        use_audio_in_video: bool,
+    ) -> dict[str, int]:
+        normalized_item_counts = dict(mm_item_counts)
+        if use_audio_in_video and "video" in normalized_item_counts:
+            # In this mode audio is extracted from every video stream.
+            normalized_item_counts.setdefault("audio", normalized_item_counts["video"])
+        return normalized_item_counts
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -478,19 +501,22 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         mm_kwargs: MultiModalKwargsItems,
         mm_prompt_updates: MultiModalPromptUpdates,
         is_update_applied: bool,
-    ) -> tuple[list[int], str, Mapping[str, list[PlaceholderFeaturesInfo]]]:
+    ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
         """
         Qwen3-Omni reimplements this function to handle `use_audio_in_video`.
         """
         mm_item_counts = mm_items.get_all_counts()
-        self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
 
         use_audio_in_video = False
         if "video" in mm_kwargs:
             non_none_items = [item for item in mm_kwargs["video"] if item is not None]
             if non_none_items:
                 # Normal case: at least one non-cached item, read flag directly
-                use_audio_in_video = any(item["use_audio_in_video"].data for item in non_none_items)
+                use_audio_in_video = any(
+                    item.get("use_audio_in_video") is not None
+                    and self._use_audio_in_video_enabled(item["use_audio_in_video"].data)
+                    for item in non_none_items
+                )
             elif "audio" in mm_prompt_updates:
                 # All video items are from cache (None); infer from prompt:
                 # use_audio_in_video=True means the prompt has no <|audio_pad|>
@@ -507,6 +533,12 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 video_updates_num = len(mm_prompt_updates.get("video", []))
                 if video_audio_item_num != video_updates_num + audio_updates_num:
                     use_audio_in_video = True
+
+        mm_item_counts = self._normalize_mm_item_counts(
+            mm_item_counts,
+            use_audio_in_video=use_audio_in_video,
+        )
+        self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
 
         # normal case with `use_audio_in_video=False`
         if is_update_applied:
@@ -525,7 +557,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                     prompt_ids,
                     filtered_updates,
                 )
-                mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_prompt_updates)
+                mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_item_counts)
             else:
                 prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
@@ -538,6 +570,17 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             )
 
         return prompt_ids, mm_placeholders
+
+    def _cached_apply_hf_processor(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
+        # Keep audio+video pairing stable by bypassing partial MM cache for this mode.
+        if self._use_audio_in_video_enabled(inputs.hf_processor_mm_kwargs.get("use_audio_in_video", False)):
+            return self._apply_hf_processor(inputs=inputs, timing_ctx=timing_ctx)
+
+        return super()._cached_apply_hf_processor(inputs=inputs, timing_ctx=timing_ctx)
 
     def get_updates_use_audio_in_video(
         self,
@@ -690,7 +733,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
     def _derive_audio_from_video_placeholders(
         self,
         placeholders: Mapping[str, list[PlaceholderFeaturesInfo]],
-        mm_prompt_updates: MultiModalPromptUpdates,
+        mm_item_counts: Mapping[str, int],
     ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
         """
         Helper to derive audio placeholders from video placeholders when
@@ -700,7 +743,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             return placeholders
 
         num_videos = len(placeholders["video"])
-        num_audios = len(mm_prompt_updates.get("audio", []))
+        num_audios = mm_item_counts.get("audio", num_videos)
         if num_audios != num_videos:
             raise ValueError(
                 f"use_audio_in_video requires equal number of audio and video items, got {num_audios=}, {num_videos=}"
