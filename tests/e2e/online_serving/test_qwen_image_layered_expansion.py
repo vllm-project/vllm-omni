@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Reduced test suite for Qwen-Image-Layered online serving.
+Comprehensive tests of diffusion features that are available in online serving mode
+and are supported by Qwen-Image-Layered model.
 
-Kept 2 feature cases (max coverage) + 1 guard case = 3 total:
-  single_card_001 : cache_dit + cpu_offload       (1×H100)
-  parallel_001    : cache_dit + cfg_parallel 2     (2×H100)
-  layers_guard_001_layers2 : layerwise offload     (1×H100, issue #1969)
+Kept cases (maximum feature coverage, no cpu-offload):
+  sp_001              : cache_dit + Ulysses-SP 2          (2×H100)
+  cfg_parallel_002    : cache_dit + CFG-Parallel 2        (2×H100)
+  layers_guard_001    : layerwise offload + layers=2      (1×H100, issue #1969 guard)
 
-Covered features: cache_dit, cpu_offload, cfg_parallel, layerwise_offload.
-Uncovered (by design): cache_dit_summary, ulysses, ring, tp.
+Total distinct features covered: cache_dit, Ulysses-SP, CFG-Parallel, layerwise-offload.
 """
 
 import pytest
@@ -27,52 +27,27 @@ from tests.utils import hardware_marks
 MODEL = "Qwen/Qwen-Image-Layered"
 EDIT_PROMPT = "Decompose this image into layers."
 NEGATIVE_PROMPT = "blurry, low quality, distorted"
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 
 
-# ── Single-card: cache_dit + cpu_offload ─────────────────────────────────────
-SINGLE_CARD_CASES = [
+# ── Feature combination cases (2 cards) ─────────────────────────────────────
+# sp_001          : cache_dit + Ulysses-SP 2
+# cfg_parallel_002: cache_dit + CFG-Parallel 2
+FEATURE_CASES = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
             server_args=[
                 "--cache-backend",
                 "cache_dit",
-                "--enable-cpu-offload",
+                "--ulysses-degree",
+                "2",
             ],
         ),
-        id="single_card_001",
-        marks=SINGLE_CARD_FEATURE_MARKS,
+        id="sp_001",
+        marks=PARALLEL_FEATURE_MARKS,
     ),
-]
-
-
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", SINGLE_CARD_CASES, indirect=True)
-def test_single_card(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Single-card feature combination: cache_dit + cpu_offload."""
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
-
-    messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=EDIT_PROMPT)
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "extra_body": {
-            "num_inference_steps": 2,
-            "negative_prompt": NEGATIVE_PROMPT,
-            "true_cfg_scale": 4.0,
-            "seed": 42,
-        },
-    }
-
-    openai_client.send_diffusion_request(request_config)
-
-
-# ── Parallel: cache_dit + cfg_parallel (2 cards) ────────────────────────────
-PARALLEL_CASES = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
@@ -83,7 +58,7 @@ PARALLEL_CASES = [
                 "2",
             ],
         ),
-        id="parallel_001",
+        id="cfg_parallel_001",
         marks=PARALLEL_FEATURE_MARKS,
     ),
 ]
@@ -91,9 +66,9 @@ PARALLEL_CASES = [
 
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", PARALLEL_CASES, indirect=True)
-def test_parallel(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Parallel feature combination: cache_dit + cfg_parallel."""
+@pytest.mark.parametrize("omni_server", FEATURE_CASES, indirect=True)
+def test_feature(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+    """Test feature combinations with Qwen-Image-Layered."""
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=EDIT_PROMPT)
