@@ -78,8 +78,7 @@ nav:
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_tts_model.md
     - contributing/model/adding_diffusion_model.md
-  - Features:
-    - Quantization: contributing/features/quantization.md
+    - contributing/model/adding_quantization_model.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md
