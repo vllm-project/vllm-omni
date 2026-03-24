@@ -38,9 +38,6 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
-from vllm_omni.model_executor.stage_input_processors.tts_utils import (
-    extract_speaker_from_runtime_info,
-)
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -281,9 +278,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             OmniOutput with text_hidden_states and optional audio
         """
-        effective_voice_type = extract_speaker_from_runtime_info(runtime_additional_information)
-        if effective_voice_type is None:
-            effective_voice_type = "ethan"
 
         # ========== Stage 1: Thinker ==========
         if self.model_stage == "thinker":
@@ -379,7 +373,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                         left_context_size.append(info["left_context_size"])
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
-            audio_tensors = self.generate_audio(codes, effective_voice_type, left_context_size, seq_token_counts)
+            audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
 
             return audio_tensors
 
@@ -459,7 +453,6 @@ class Qwen3OmniMoeForConditionalGeneration(
     def generate_audio(
         self,
         code: torch.Tensor,
-        voice_type: str,
         left_context_size: list[int] | None = None,
         seq_token_counts: list[int] | None = None,
     ) -> list[torch.Tensor]:
@@ -468,7 +461,6 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         Args:
             code: [batch, num_quantizers, T] - RVQ codec codes
-            speaker: Speaker name (not used in Qwen3, kept for compatibility)
             left_context_size: Left context size for streaming decode
             seq_token_counts: Token count for each request in batch
 

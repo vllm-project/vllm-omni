@@ -60,7 +60,7 @@ async def _run_ws_session(host: str, port: int) -> dict:
                 {
                     "type": "session.config",
                     "model": MODEL,
-                    "speaker": "vivian",
+                    "voice": "vivian",
                     "language": "English",
                     "response_format": "pcm",
                     "stream_audio": True,

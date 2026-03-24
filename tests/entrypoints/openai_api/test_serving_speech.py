@@ -275,7 +275,7 @@ class TestSpeechAPI:
         payload = {
             "input": "Hello world",
             "model": "tts-model",
-            "speaker": "alloy",
+            "voice": "alloy",
             "response_format": "wav",
         }
         response = client.post("/v1/audio/speech", json=payload)
@@ -287,7 +287,7 @@ class TestSpeechAPI:
         payload = {
             "input": "Hello world",
             "model": "tts-model",
-            "speaker": "alloy",
+            "voice": "alloy",
             "response_format": "mp3",
         }
         response = client.post("/v1/audio/speech", json=payload)
@@ -299,7 +299,7 @@ class TestSpeechAPI:
         payload = {
             "input": "Hello world",
             "model": "tts-model",
-            "speaker": "alloy",
+            "voice": "alloy",
             "response_format": "invalid_format",
         }
         response = client.post("/v1/audio/speech", json=payload)
@@ -319,7 +319,7 @@ class TestSpeechAPI:
         payload = {
             "input": "This should be fast.",
             "model": "tts-model",
-            "speaker": "alloy",
+            "voice": "alloy",
             "response_format": "wav",
             "speed": 2.5,
         }
@@ -545,7 +545,7 @@ class TestTTSMethods:
         assert "Invalid language" in speech_server._validate_tts_request(req)
 
         # CustomVoice on model with no speakers -> rejected
-        req = OpenAICreateSpeechRequest(input="Hello", speaker="Invalid")
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Invalid")
         assert "does not support CustomVoice" in speech_server._validate_tts_request(req)
 
         # CustomVoice without voice on model with no speakers -> also rejected
@@ -602,7 +602,7 @@ class TestTTSMethods:
 
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
-        req = OpenAICreateSpeechRequest(input="Hello", speaker="Ryan", language="English")
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")
         params = speech_server._build_tts_params(req)
 
         assert params["text"] == ["Hello"]
@@ -649,7 +649,7 @@ class TestTTSMethods:
         with patch.object(speech_server, "_get_uploaded_audio_data") as mock_get_audio:
             mock_get_audio.return_value = "data:audio/wav;base64,ZmFrZWF1ZGlv"
 
-            req = OpenAICreateSpeechRequest(input="Hello", speaker="custom_voice", task_type="Base")
+            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice", task_type="Base")
 
             params = speech_server._build_tts_params(req)
 
@@ -666,7 +666,7 @@ class TestTTSMethods:
         speech_server.uploaded_speakers = {}
         speech_server.supported_speakers = {"ryan", "vivian"}
 
-        req = OpenAICreateSpeechRequest(input="Hello", speaker="ryan", task_type="Base")
+        req = OpenAICreateSpeechRequest(input="Hello", voice="ryan", task_type="Base")
 
         params = speech_server._build_tts_params(req)
 
@@ -687,7 +687,7 @@ class TestTTSMethods:
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
 
         req = OpenAICreateSpeechRequest(
-            input="Hello", speaker="custom_voice", task_type="Base", ref_audio="data:audio/wav;base64,ZXhwbGljaXQ="
+            input="Hello", voice="custom_voice", task_type="Base", ref_audio="data:audio/wav;base64,ZXhwbGljaXQ="
         )
 
         params = speech_server._build_tts_params(req)
