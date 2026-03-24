@@ -115,6 +115,9 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 
 logger = init_logger(__name__)
 router = APIRouter()
+
+# Supported resolution buckets for layered models (e.g., Qwen-Image-Layered)
+SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 profiler_router = APIRouter()
 
 
@@ -1333,6 +1336,9 @@ async def edit_images(
     generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
+    # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
+    layers: int | None = Form(None),
+    resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
@@ -1392,25 +1398,60 @@ async def edit_images(
         lora_request, lora_scale = _parse_lora_request(lora_dict)
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
-        # 3.2 Parse and add size if provided
+        # 3.2 Validate resolution if provided
+        if resolution is not None and resolution not in SUPPORTED_LAYERED_RESOLUTIONS:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Invalid resolution {resolution}. Supported resolutions: {SUPPORTED_LAYERED_RESOLUTIONS}.",
+            )
+        # 3.2.1 Validate layers if provided
+        if layers is not None and layers < 1:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Invalid layers value {layers}. layers must be >= 1.",
+            )
+        # 3.2.2 Check for conflicting size and resolution parameters
+        if resolution is not None and size.lower() != "auto":
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Cannot specify both 'resolution' and 'size'. "
+                "Use 'resolution' with size='auto', or use 'size' without 'resolution'.",
+            )
+
+        # 3.3 Parse and add size if provided
         max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
         width, height = None, None
         if size.lower() == "auto":
-            width, height = pil_images[0].size  # Use first image size
+            if resolution is None:
+                # No resolution specified, use input image size
+                width, height = pil_images[0].size
+            # else: let pipeline calculate dimensions based on resolution
         else:
             width, height = parse_size(size)
-        if max_generated_image_size is not None and (width * height > max_generated_image_size):
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                f"size of {max_generated_image_size} pixels.",
-            )
 
-        size_str = f"{width}x{height}"
+        # Check max_generated_image_size
+        if max_generated_image_size is not None:
+            if width is not None and height is not None:
+                if width * height > max_generated_image_size:
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_REQUEST.value,
+                        detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
+                        f"size of {max_generated_image_size} pixels.",
+                    )
+            elif resolution is not None:
+                # When resolution is set, the output size is resolution * resolution
+                if resolution * resolution > max_generated_image_size:
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_REQUEST.value,
+                        detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
+                        f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+                    )
+
+        size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
-        # 3.3 Add optional parameters ONLY if provided
+        # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", guidance_scale)
         _update_if_not_none(gen_params, "true_cfg_scale", true_cfg_scale)
@@ -1420,6 +1461,8 @@ async def edit_images(
         # might produce blurry images in some environments.
         _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, 2**32 - 1))
         _update_if_not_none(gen_params, "generator_device", generator_device)
+        _update_if_not_none(gen_params, "layers", layers)
+        _update_if_not_none(gen_params, "resolution", resolution)
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
         request_id = f"img_edit-{random_uuid()}"
@@ -1602,7 +1645,15 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             images = request_output["images"]
         elif hasattr(request_output, "images") and request_output.images:
             images = request_output.images
-    return images
+    # Flatten nested lists (e.g., from layered models like Qwen-Image-Layered).
+    # Note: This only flattens one level deep. Deeper nesting is not supported.
+    flattened = []
+    for img in images:
+        if isinstance(img, list):
+            flattened.extend(img)
+        else:
+            flattened.append(img)
+    return flattened
 
 
 async def _load_input_images(

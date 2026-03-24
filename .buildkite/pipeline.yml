@@ -23,7 +23,7 @@ steps:
   - label: "Upload Merge Pipeline"
     depends_on: image-build
     key: upload-merge-pipeline
-    if: build.branch == "main"
+    if: build.branch == "main" && build.env("NIGHTLY") != "1"
     commands:
       - buildkite-agent pipeline upload .buildkite/test-merge.yml
     agents:
@@ -33,7 +33,7 @@ steps:
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1"
+    if: build.branch == "main" && build.env("NIGHTLY") == "1"
     commands:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:

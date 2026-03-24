@@ -4,6 +4,7 @@ import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torchaudio
@@ -20,11 +21,21 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID, MiMoAudioConfig
 from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import MiMoAudioTokenizer
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = logging.getLogger(__name__)
 
 
-DUMMY_CODE_SHAPE = 36
+def flat_codec_group_element_count(group_size: int, audio_channels: int) -> int:
+    """Flat token count for one MiMo talker codec group on the code2wav wire.
+
+    The talker flattens a ``(group_size, audio_channels + 1)`` layout in column-major
+    order: one leading text/special column per row plus ``audio_channels`` RVQ code
+    columns. Each group therefore occupies ``group_size * (audio_channels + 1)``
+    consecutive ids. This matches ``group_width`` in :func:`extract_audio_code_tensor`
+    and is used to count how many such groups are present in a flat ``codes`` tensor.
+    """
+    return group_size * (audio_channels + 1)
 
 
 class MiMoAudioTokenizerWorker:
@@ -308,7 +319,7 @@ def extract_audio_code_tensor(
     if flat_codes.numel() == 0:
         return None
 
-    group_width = group_size * (audio_channels + 1)
+    group_width = flat_codec_group_element_count(group_size, audio_channels)
     usable = (flat_codes.numel() // group_width) * group_width
     if usable == 0:
         return None
@@ -377,6 +388,9 @@ def get_tokenizer_worker(
 class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     """Decode MiMo audio codes to waveform for the code2wav stage."""
 
+    have_multimodal_outputs = True
+    enable_update_additional_information = True
+
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -429,6 +443,23 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             * getattr(audio_tokenizer_config, "hop_length", 240)
         ) * self.config.group_size
 
+        connector_cfg = getattr(vllm_config.model_config, "stage_connector_config", None)
+        extra_cfg = (
+            (
+                connector_cfg.get("extra", connector_cfg)
+                if isinstance(connector_cfg, dict)
+                else getattr(connector_cfg, "extra", None)
+            )
+            if connector_cfg
+            else None
+        )
+        self._codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames", 3)) if isinstance(extra_cfg, dict) else 3
+        if self._codec_chunk_frames <= 0:
+            raise ValueError(f"codec_chunk_frames must be positive, got {self._codec_chunk_frames}")
+        self._codec_left_context_frames = (
+            int(extra_cfg.get("codec_left_context_frames", 3)) if isinstance(extra_cfg, dict) else 3
+        )
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -437,6 +468,61 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     ) -> set[str]:
         # Decoder has no trainable weights to load in this stage.
         return set()
+
+    @staticmethod
+    def _split_flat_codes_for_requests(
+        ids: torch.Tensor,
+        seq_token_counts: list[int] | None,
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> list[torch.Tensor]:
+        """Split flat codec token ids per request.
+
+        Prefer ``code_flat_numel`` from async-chunk / connector payload (same idea as
+        qwen3 omni/tts passing decode metadata in additional_information). Fall back
+        to runner-provided ``seq_token_counts`` (no forward_context / ubatch slicing).
+        """
+        n = ids.numel()
+        if n == 0:
+            return [ids]
+
+        if runtime_additional_information and all(
+            isinstance(info.get("code_flat_numel"), int) and int(info["code_flat_numel"]) > 0
+            for info in runtime_additional_information
+        ):
+            sizes = [int(info["code_flat_numel"]) for info in runtime_additional_information]
+            if sum(sizes) == n:
+                parts: list[torch.Tensor] = []
+                offset = 0
+                for sz in sizes:
+                    parts.append(ids[offset : offset + sz])
+                    offset += sz
+                return parts
+
+        if seq_token_counts is not None and len(seq_token_counts) > 1:
+            boundaries = [0]
+            for count in seq_token_counts:
+                boundaries.append(boundaries[-1] + count)
+            return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
+
+        return [ids]
+
+    @staticmethod
+    def _mimo_codec_runtime_lists(
+        num_req: int,
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> tuple[list[int | None], list[int | None]]:
+        """Per-request ``left_context_size`` / ``codec_chunk_frames`` from runtime buffer."""
+        left_frames: list[int | None] = [None] * num_req
+        chunk_frames: list[int | None] = [None] * num_req
+        if not runtime_additional_information:
+            return left_frames, chunk_frames
+        for i in range(min(num_req, len(runtime_additional_information))):
+            info = runtime_additional_information[i]
+            if "left_context_size" in info:
+                left_frames[i] = int(info["left_context_size"])
+            if "codec_chunk_frames" in info:
+                chunk_frames[i] = int(info["codec_chunk_frames"])
+        return left_frames, chunk_frames
 
     def chunked_decode_streaming(
         self,
@@ -453,9 +539,12 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         wav_chunk = self._decode_waveform_from_codes(codes)
         if wav_chunk.numel() == 0:
             return wav_chunk
-        # Infer number of codec frames: flat format has 36 elements per frame (9*4 with prepend)
         num_flat = codes.numel() if codes.ndim == 1 else codes.shape[-1]
-        num_chunks = num_flat // 36
+        elt_per_group = flat_codec_group_element_count(
+            self.streamer_config.group_size,
+            self.streamer_config.audio_channels,
+        )
+        num_chunks = num_flat // elt_per_group
         if num_chunks <= chunk_size:
             context_size = 0
         else:
@@ -469,50 +558,65 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor | None = None,
         codes: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs,
-    ) -> torch.Tensor | IntermediateTensors:
-        # Support both input_ids (from vLLM) and codes (from mimo_audio.py)
+    ) -> OmniOutput | torch.Tensor | IntermediateTensors:
+        if runtime_additional_information is None:
+            runtime_additional_information = kwargs.get("model_intermediate_buffer") or kwargs.get(
+                "runtime_additional_information"
+            )
         code_tensor = codes if codes is not None else input_ids
+        empty = torch.zeros((0,), dtype=torch.float32, device=self.device)
 
-        if code_tensor is None:
-            raise ValueError("Either input_ids or codes must be provided")
-
-        if code_tensor.numel() == 0:
-            raise ValueError("code_tensor is empty.")
-
-        if getattr(self.vllm_config.model_config, "async_chunk", False):
-            waveform = self.chunked_decode_streaming(code_tensor, chunk_size=10, left_context_size=10)
-        else:
-            waveform = self._decode_waveform_from_codes(code_tensor)
-
-        # For warmup/dummy run: if waveform is empty, return dummy hidden_states
-        # _dummy_run expects a tensor that can be processed by extract_multimodal_outputs
-        if waveform.numel() == 0:
-            # Return dummy hidden_states with shape [seq_len, hidden_size]
-            # This is needed for warmup to avoid NoneType errors
-            hidden_size = getattr(self.config, "hidden_size", None)
-            if hidden_size is None:
-                # Fallback: try to get from vllm_config.model_config
-                hidden_size = getattr(
-                    self.vllm_config.model_config,
-                    "hidden_size",
-                    4096,  # Default fallback
-                )
-
-            # Return [seq_len=1, hidden_size] tensor for warmup
-            dummy_hidden = torch.zeros(
-                (1, hidden_size),
-                dtype=torch.bfloat16,
-                device=self.device,
+        if code_tensor is None or code_tensor.numel() == 0:
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [empty]},
             )
 
-            return dummy_hidden
+        is_async_chunk = getattr(self.vllm_config.model_config, "async_chunk", False)
+        ids = code_tensor.reshape(-1).to(dtype=torch.long)
+        request_ids_list = self._split_flat_codes_for_requests(
+            ids, kwargs.get("seq_token_counts"), runtime_additional_information
+        )
+        per_left, per_chunk = self._mimo_codec_runtime_lists(len(request_ids_list), runtime_additional_information)
 
-        if waveform.numel() == 1 and waveform.item() == 0:
-            # Designed for Text output only
-            return None
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [empty] * len(request_ids_list)},
+            )
 
-        return waveform
+        if is_async_chunk:
+            audios = self._batch_chunked_decode_streaming(
+                request_ids_list,
+                default_chunk_size=self._codec_chunk_frames,
+                default_left_context_size=self._codec_left_context_frames,
+                per_req_left_context_frames=per_left,
+                per_req_codec_chunk_frames=per_chunk,
+            )
+        else:
+            audios = self._batch_decode_waveforms(request_ids_list)
+
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={"model_outputs": audios},
+        )
+
+    def make_omni_output(self, model_output: torch.Tensor | OmniOutput, **kwargs) -> OmniOutput:
+        """Convert raw model output to OmniOutput if needed."""
+        if isinstance(model_output, OmniOutput):
+            return model_output
+        empty = torch.zeros((0,), dtype=torch.float32, device=self.device)
+        if model_output is None:
+            return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": [empty]})
+        if isinstance(model_output, torch.Tensor):
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [model_output.to(dtype=torch.float32).reshape(-1)]},
+            )
+        raise TypeError(f"Unexpected model output type: {type(model_output)}")
 
     def _get_full_code_sequence(
         self,
@@ -545,8 +649,194 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
 
         return code_tensor
 
+    @torch.inference_mode()
+    def _batch_decode_waveforms(
+        self,
+        request_codes_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Batch-decode multiple requests' codes in a single decoder forward pass.
+
+        Instead of calling _decode_waveform_from_codes per request (which incurs
+        4 GPU↔CPU round-trips each), this method:
+          1. Extracts audio_codes for all valid requests on CPU (cheap).
+          2. Runs quantizer.decode_vq (embedding lookup) for each on GPU.
+          3. Packs all hidden-states into one tensor and calls
+             decoder(packed_hs, input_lengths) once.
+          4. Splits the output waveforms back to per-request tensors.
+        """
+        empty = torch.zeros((0,), dtype=torch.float32, device=self.device)
+        num_req = len(request_codes_list)
+        if num_req == 0:
+            return [empty]
+
+        tokenizer = self._tokenizer_service.audio_tokenizer
+        group_size = self.streamer_config.group_size
+        audio_channels = self.streamer_config.audio_channels
+
+        hidden_list: list[torch.Tensor] = []
+        lengths: list[int] = []
+        valid_indices: list[int] = []
+
+        for i, req_codes in enumerate(request_codes_list):
+            if req_codes is None or req_codes.numel() == 0:
+                continue
+            if self._check_dummy_code_tensor(req_codes):
+                continue
+
+            flat_codes = req_codes.detach().to(torch.long).cpu()
+            audio_codes = extract_audio_code_tensor(
+                flat_codes,
+                group_size,
+                audio_channels,
+                self.codes,
+            )
+            if audio_codes is None or audio_codes.numel() == 0:
+                continue
+
+            hs = tokenizer.encoder.decode_vq(audio_codes.to(self.device))
+            hidden_list.append(hs)
+            lengths.append(hs.size(0))
+            valid_indices.append(i)
+
+        if not hidden_list:
+            return [empty] * num_req
+
+        if len(hidden_list) == 1:
+            packed_hs = hidden_list[0]
+        else:
+            packed_hs = torch.cat(hidden_list, dim=0)
+        input_lengths = torch.tensor(lengths, device=self.device)
+
+        recon_wav = tokenizer.decoder(packed_hs, input_lengths)
+
+        cfg = tokenizer.config
+        frames_per_token = cfg.avg_pooler * cfg.stride_size * cfg.hop_length
+
+        result: list[torch.Tensor] = [empty] * num_req
+        if len(valid_indices) == 1:
+            wav = recon_wav.squeeze(0).squeeze(0)
+            valid_len = lengths[0] * frames_per_token
+            if wav.numel() > valid_len:
+                wav = wav[:valid_len]
+            result[valid_indices[0]] = wav.to(dtype=torch.float32).reshape(-1)
+        else:
+            for j, idx in enumerate(valid_indices):
+                wav = recon_wav[j].squeeze(0)
+                valid_len = lengths[j] * frames_per_token
+                if wav.numel() > valid_len:
+                    wav = wav[:valid_len]
+                result[idx] = wav.to(dtype=torch.float32).reshape(-1)
+
+        return result
+
+    @torch.inference_mode()
+    def _batch_chunked_decode_streaming(
+        self,
+        request_codes_list: list[torch.Tensor],
+        default_chunk_size: int,
+        default_left_context_size: int,
+        *,
+        per_req_left_context_frames: list[int | None] | None = None,
+        per_req_codec_chunk_frames: list[int | None] | None = None,
+    ) -> list[torch.Tensor]:
+        """Batch version of chunked_decode_streaming for async_chunk mode."""
+        empty = torch.zeros((0,), dtype=torch.float32, device=self.device)
+        num_req = len(request_codes_list)
+        if num_req == 0:
+            return [empty]
+
+        tokenizer = self._tokenizer_service.audio_tokenizer
+        group_size = self.streamer_config.group_size
+        audio_channels = self.streamer_config.audio_channels
+
+        hidden_list: list[torch.Tensor] = []
+        lengths: list[int] = []
+        valid_indices: list[int] = []
+        context_sizes: list[int] = []
+
+        for i, req_codes in enumerate(request_codes_list):
+            if req_codes is None or req_codes.numel() == 0:
+                continue
+            if self._check_dummy_code_tensor(req_codes):
+                continue
+
+            flat_codes = req_codes.detach().to(torch.long).cpu()
+            audio_codes = extract_audio_code_tensor(
+                flat_codes,
+                group_size,
+                audio_channels,
+                self.codes,
+            )
+            if audio_codes is None or audio_codes.numel() == 0:
+                continue
+
+            hs = tokenizer.encoder.decode_vq(audio_codes.to(self.device))
+            hidden_list.append(hs)
+            lengths.append(hs.size(0))
+            valid_indices.append(i)
+
+            num_flat = req_codes.numel() if req_codes.ndim == 1 else req_codes.shape[-1]
+            elt_per_group = flat_codec_group_element_count(group_size, audio_channels)
+            num_chunks = num_flat // elt_per_group
+            chunk_sz = default_chunk_size
+            if per_req_codec_chunk_frames is not None and i < len(per_req_codec_chunk_frames):
+                c = per_req_codec_chunk_frames[i]
+                if c is not None:
+                    chunk_sz = c
+            if (
+                per_req_left_context_frames is not None
+                and i < len(per_req_left_context_frames)
+                and per_req_left_context_frames[i] is not None
+            ):
+                ctx = int(per_req_left_context_frames[i])
+            else:
+                ctx = 0 if num_chunks <= chunk_sz else default_left_context_size
+            context_sizes.append(ctx)
+
+        if not hidden_list:
+            return [empty] * num_req
+
+        if len(hidden_list) == 1:
+            packed_hs = hidden_list[0]
+        else:
+            packed_hs = torch.cat(hidden_list, dim=0)
+        input_lengths = torch.tensor(lengths, device=self.device)
+
+        recon_wav = tokenizer.decoder(packed_hs, input_lengths)
+
+        cfg = tokenizer.config
+        frames_per_token = cfg.avg_pooler * cfg.stride_size * cfg.hop_length
+
+        result: list[torch.Tensor] = [empty] * num_req
+        if len(valid_indices) == 1:
+            wav = recon_wav.squeeze(0).squeeze(0)
+            valid_len = lengths[0] * frames_per_token
+            if wav.numel() > valid_len:
+                wav = wav[:valid_len]
+            drop = context_sizes[0] * self.total_upsample
+            if drop > 0 and drop < wav.numel():
+                wav = wav[drop:]
+            elif drop >= wav.numel():
+                wav = wav[:0]
+            result[valid_indices[0]] = wav.to(dtype=torch.float32).reshape(-1)
+        else:
+            for j, idx in enumerate(valid_indices):
+                wav = recon_wav[j].squeeze(0)
+                valid_len = lengths[j] * frames_per_token
+                if wav.numel() > valid_len:
+                    wav = wav[:valid_len]
+                drop = context_sizes[j] * self.total_upsample
+                if drop > 0 and drop < wav.numel():
+                    wav = wav[drop:]
+                elif drop >= wav.numel():
+                    wav = wav[:0]
+                result[idx] = wav.to(dtype=torch.float32).reshape(-1)
+
+        return result
+
     def _check_dummy_code_tensor(self, code_tensor: torch.Tensor) -> bool:
-        if code_tensor is not None and code_tensor.numel() == DUMMY_CODE_SHAPE:
+        expected = flat_codec_group_element_count(self.config.group_size, self.config.audio_channels)
+        if code_tensor is not None and code_tensor.numel() == expected:
             code_groups = code_tensor.view(self.config.group_size, self.config.audio_channels + 1)
             return (
                 (code_groups[:, 0] == TALKER_CODEC_PAD_TOKEN_ID).all() and (code_groups[:, 1:].sum() == 0).all()
