@@ -592,7 +592,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "or use a CustomVoice model."
                 )
             if request.voice is not None and request.voice not in self.supported_speakers:
-                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
+                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate Base task requirements
         if task_type == "Base":

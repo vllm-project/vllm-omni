@@ -21,6 +21,8 @@ from vllm_omni.diffusion.quantization import (
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 
 if TYPE_CHECKING:
+    from vllm.config import ProfilerConfig
+
     from vllm_omni.diffusion.quantization import DiffusionQuantizationConfig
 
 # Import after TYPE_CHECKING to avoid circular imports at runtime
@@ -55,6 +57,20 @@ class DiffusionParallelConfig:
     ring_degree: int = 1
     """Number of GPUs used for ring sequence parallelism."""
 
+    ulysses_mode: str = "strict"
+    """Ulysses sequence-parallel mode.
+
+    - "strict": Require divisibility constraints (fastest, default).
+    - "advanced_uaa": Enable UAA ("Ulysses Anything Attention") to support
+      uneven sequence lengths and non-divisible head counts.
+
+    Note:
+    - Ring attention does not support `attention_mask`, so models that rely on
+      mask-based auto-padding are still incompatible with Ring.
+    - When used in hybrid Ulysses+Ring, Ring requires consistent per-rank
+      sequence shapes across the ring group.
+    """
+
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
 
@@ -87,6 +103,9 @@ class DiffusionParallelConfig:
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        )
+        assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
+            f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
 
         # Validate HSDP configuration
@@ -264,6 +283,12 @@ class DiffusionCacheConfig:
     # Used by cache-dit for scm mask generation. If this value changes during inference,
     # we will re-generate the scm mask and refresh the cache context.
     num_inference_steps: int | None = None
+    # Force refresh the cache at a specific step index hint, useful for models like
+    # GLM-Image (image preprocessing step in editing mode).
+    force_refresh_step_hint: int | None = None
+    # Policy for force refresh: "once" refreshes only at the hint step,
+    # "repeat" refreshes every force_refresh_step_hint steps.
+    force_refresh_step_policy: str = "once"
 
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -453,6 +478,8 @@ class OmniDiffusionConfig:
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
 
+    profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
+
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
@@ -519,6 +546,11 @@ class OmniDiffusionConfig:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
+
+        if isinstance(self.profiler_config, dict):
+            from vllm.config import ProfilerConfig
+
+            self.profiler_config = ProfilerConfig(**self.profiler_config)
 
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig
