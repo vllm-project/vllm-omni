@@ -23,7 +23,7 @@ from tests.conftest import (
 )
 from tests.utils import hardware_test
 
-models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
+model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 AUDIO_KEY = ["test"]
 IMAGE_KEY = ["square", "quadrate"]
@@ -49,16 +49,32 @@ def get_chunk_config(default_path):
     return path
 
 
+def get_batch_token_config(default_path):
+    path = modify_stage_config(
+        default_path,
+        updates={
+            "stage_args": {1: {"engine_args.max_num_batched_tokens": 64}},
+        },
+    )
+    return path
+
+
 # CI stage config for 2*H100-80G GPUs
 default_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
-stage_configs = [default_path, get_chunk_config(default_path)]
 
 if current_omni_platform.is_xpu():
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
+    default_path = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")
 
 # Create parameter combinations for model and stage config
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    pytest.param(OmniServerParams(model=model, stage_config_path=default_path), id="default"),
+    pytest.param(OmniServerParams(model=model, stage_config_path=get_chunk_config(default_path)), id="async_chunk"),
+]
+
+test_token_params = [
+    pytest.param(
+        OmniServerParams(model=model, stage_config_path=get_batch_token_config(default_path)), id="batch_token_64"
+    )
 ]
 
 
@@ -123,7 +139,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_text_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text
@@ -290,7 +306,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text, audio
@@ -315,7 +331,7 @@ def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text, image
@@ -341,7 +357,7 @@ def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text, video
@@ -369,7 +385,7 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text, audio, image, video
@@ -420,7 +436,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": False,
         "use_audio_in_video": True,
-        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY},
+        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep"]},
     }
     openai_client.send_omni_request(request_config)
 
@@ -448,7 +464,7 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "use_audio_in_video": True,
-        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY},
+        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep"]},
     }
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
