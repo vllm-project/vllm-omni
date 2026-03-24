@@ -381,7 +381,7 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             proj_buf:  [bsz, num_code_groups + 1, hidden_size]
                 pos 0   = last_talker_hidden (NOT a codec embed)
                 pos 1   = layer0_embed
-                pos 2.. = codec_embedding[i](predicted_code_i)
+                pos 2.. = `codec_embedding[i](predicted_code_i)`
         """
         bsz = int(layer0_code.shape[0])
         device = layer0_code.device
