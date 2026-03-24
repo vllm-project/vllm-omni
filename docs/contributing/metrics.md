@@ -15,6 +15,21 @@ You can use these metrics in production to monitor the health and performance of
 vllm serve /workspace/models/Qwen3-Omni-30B-A3B-Instruct --omni --port 8014 --log-stats
 ```
 
+`--log-stats` and `--enable-metrics` serve different purposes:
+
+- `--log-stats` prints the request-level summary tables shown below to the server logs.
+- `--enable-metrics` exports vLLM-Omni Prometheus metrics under the shared `/metrics` endpoint.
+
+If you want both the log tables and the Prometheus endpoint, start the server with both flags:
+
+```bash
+vllm serve /workspace/models/Qwen3-Omni-30B-A3B-Instruct \
+  --omni \
+  --port 8091 \
+  --log-stats \
+  --enable-metrics
+```
+
 ### Send a Request
 
 ```bash
@@ -81,6 +96,73 @@ These logs include:
 - **Transfer table**: data transfer and timing for each edge.
 
 You can use these logs to monitor system health, debug performance, and analyze request-level metrics as described above.
+
+
+## Prometheus Metrics
+
+When `--enable-metrics` is set, vLLM-Omni registers its metrics into the shared Prometheus endpoint exposed by the serving process. If the server is started with `--port 8091`, you can inspect it with:
+
+```bash
+curl http://0.0.0.0:8091/metrics
+```
+
+The response contains:
+
+- Default Python/runtime metrics such as `python_gc_*` and `process_*`.
+- HTTP server metrics such as `http_requests_total` and `http_request_duration_seconds`.
+- vLLM-Omni metrics prefixed with `vllm:omni_`.
+
+### Example `/metrics` Output
+
+The full endpoint can be long. A typical response looks like this:
+
+```text
+# HELP http_requests_total Total number of requests by method, status and handler.
+# TYPE http_requests_total counter
+http_requests_total{handler="/v1/chat/completions",method="POST",status="2xx"} 6.0
+http_requests_total{handler="/v1/chat/completions",method="POST",status="4xx"} 1.0
+http_requests_total{handler="/v1/images/generations",method="POST",status="5xx"} 1.0
+
+# HELP vllm:omni_stage_generation_seconds Generation time for completed vLLM-Omni stage events.
+# TYPE vllm:omni_stage_generation_seconds histogram
+vllm:omni_stage_generation_seconds_bucket{final_output_type="text",le="0.5",model_name="Qwen3-Omni-30B-A3B-Instruct",stage_id="0"} 3.0
+vllm:omni_stage_generation_seconds_bucket{final_output_type="text",le="1.0",model_name="Qwen3-Omni-30B-A3B-Instruct",stage_id="0"} 4.0
+vllm:omni_stage_generation_seconds_count{final_output_type="text",model_name="Qwen3-Omni-30B-A3B-Instruct",stage_id="0"} 6.0
+vllm:omni_stage_generation_seconds_sum{final_output_type="text",model_name="Qwen3-Omni-30B-A3B-Instruct",stage_id="0"} 11.19272518157959
+
+# HELP vllm:omni_requests_total Total number of vLLM-Omni orchestrator requests.
+# TYPE vllm:omni_requests_total counter
+vllm:omni_requests_total{final_output_type="text",model_name="Qwen3-Omni-30B-A3B-Instruct"} 1.0
+vllm:omni_requests_total{final_output_type="audio",model_name="Qwen3-Omni-30B-A3B-Instruct"} 3.0
+vllm:omni_requests_total{final_output_type="image",model_name="Qwen3-Omni-30B-A3B-Instruct"} 2.0
+
+# HELP vllm:omni_requests_aborted_total Total number of aborted vLLM-Omni orchestrator requests.
+# TYPE vllm:omni_requests_aborted_total counter
+vllm:omni_requests_aborted_total{final_output_type="text",model_name="Qwen3-Omni-30B-A3B-Instruct"} 2.0
+
+# HELP vllm:omni_e2e_request_latency_seconds End-to-end latency of successful vLLM-Omni requests.
+# TYPE vllm:omni_e2e_request_latency_seconds histogram
+vllm:omni_e2e_request_latency_seconds_bucket{final_output_type="audio",le="10.0",model_name="Qwen3-Omni-30B-A3B-Instruct"} 1.0
+vllm:omni_e2e_request_latency_seconds_bucket{final_output_type="audio",le="20.0",model_name="Qwen3-Omni-30B-A3B-Instruct"} 2.0
+vllm:omni_e2e_request_latency_seconds_count{final_output_type="audio",model_name="Qwen3-Omni-30B-A3B-Instruct"} 3.0
+vllm:omni_e2e_request_latency_seconds_sum{final_output_type="audio",model_name="Qwen3-Omni-30B-A3B-Instruct"} 72.84698152542114
+```
+
+### vLLM-Omni Metrics Exposed
+
+The current vLLM-Omni Prometheus metrics are:
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `vllm:omni_stage_generation_seconds` | Histogram | `model_name`, `stage_id`, `final_output_type` | Generation latency for completed stage events. |
+| `vllm:omni_stage_postprocess_seconds` | Histogram | `model_name`, `stage_id`, `final_output_type` | Post-processing latency for completed stage events. |
+| `vllm:omni_transfer_bytes_total` | Counter | `model_name`, `from_stage`, `to_stage`, `used_shm` | Total bytes transferred between stages. |
+| `vllm:omni_requests_total` | Counter | `model_name`, `final_output_type` | Total number of orchestrator requests started. |
+| `vllm:omni_requests_aborted_total` | Counter | `model_name`, `final_output_type` | Total number of aborted orchestrator requests. |
+| `vllm:omni_e2e_request_latency_seconds` | Histogram | `model_name`, `final_output_type` | End-to-end latency for successful requests. |
+
+!!! note
+    Some metric families may appear without samples until the corresponding event happens. For example, `vllm:omni_stage_postprocess_seconds` is only populated after a stage records post-processing time, and `vllm:omni_transfer_bytes_total` only increases after inter-stage transfer traffic is observed.
 
 
 ## Metrics Scope: Offline vs Online Inference
