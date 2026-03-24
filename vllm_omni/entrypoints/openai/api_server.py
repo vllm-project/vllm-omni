@@ -1714,16 +1714,22 @@ def _resolve_video_runtime_context(raw_request: Request) -> tuple[str | None, li
     return app_model_name, app_stage_configs
 
 
-def _parse_form_json(value: str | None) -> Any:
+def _parse_form_json(value: str | None, expected_type: type | None = None) -> Any:
     if value is None or value == "":
         return None
     try:
-        return json.loads(value)
+        parsed = json.loads(value)
     except json.JSONDecodeError as exc:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Invalid JSON in form field.",
         ) from exc
+    if expected_type is not None and not isinstance(parsed, expected_type):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid JSON in form field: expected {expected_type.__name__}, got {type(parsed).__name__}.",
+        )
+    return parsed
 
 
 def video_response_from_request(model_name: str, req: VideoGenerationRequest) -> VideoResponse:
@@ -1844,6 +1850,7 @@ async def create_video(
     seed: int | None = Form(default=None),
     negative_prompt: str | None = Form(default=None),
     lora: str | None = Form(default=None),
+    extra_params: str | None = Form(default=None),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
 
@@ -1874,6 +1881,7 @@ async def create_video(
         seed: Optional random seed override.
         negative_prompt: Optional negative prompt.
         lora: Optional JSON-encoded per-request LoRA configuration.
+        extra_params: Optional model-specific parameters passed directly to the model's extra_args.
 
     Returns:
         A queued ``VideoResponse`` that includes the generated job identifier
@@ -1910,7 +1918,8 @@ async def create_video(
         "true_cfg_scale": true_cfg_scale,
         "seed": seed,
         "negative_prompt": negative_prompt,
-        "lora": _parse_form_json(lora),
+        "lora": _parse_form_json(lora, expected_type=dict),
+        "extra_params": _parse_form_json(extra_params, expected_type=dict),
     }
 
     request_data = {k: v for k, v in request_data.items() if v is not None}
