@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -180,7 +181,7 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     return float(mu)
 
 
-class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
+class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin):
     """Flux2 klein pipeline for text-to-image generation."""
 
     support_image_input = True
@@ -218,7 +219,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             model,
             subfolder="text_encoder",
             local_files_only=local_files_only,
-        )
+        ).to(self._execution_device)
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             model,
             subfolder="tokenizer",
@@ -244,6 +245,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         self._num_timesteps = None
         self._current_timestep = None
         self._interrupt = False
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -991,7 +995,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 latents = latents.to(self.vae.dtype)
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

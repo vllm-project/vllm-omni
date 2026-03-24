@@ -10,6 +10,7 @@ enabling concurrent request handling and streaming generation.
 
 import asyncio
 import uuid
+import weakref
 from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -25,6 +26,18 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _weak_close_async_omni_diffusion(engine: DiffusionEngine, executor: ThreadPoolExecutor) -> None:
+    """Best-effort diffusion cleanup for GC finalization."""
+    try:
+        engine.close()
+    except Exception:
+        pass
+    try:
+        executor.shutdown(wait=False)
+    except Exception:
+        pass
 
 
 class AsyncOmniDiffusion:
@@ -53,9 +66,13 @@ class AsyncOmniDiffusion:
         self,
         model: str,
         od_config: OmniDiffusionConfig | None = None,
+        batch_size: int = 1,
         **kwargs: Any,
     ):
         self.model = model
+
+        # Set batch size (default 1 for backward compatibility)
+        self._batch_size = max(1, batch_size)
 
         # Capture stage info from kwargs before they might be filtered out
         stage_id = kwargs.get("stage_id")
@@ -127,8 +144,116 @@ class AsyncOmniDiffusion:
         # Thread pool for running sync engine in async context
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_async_omni_diffusion,
+            self.engine,
+            self._executor,
+        )
 
-        logger.info("AsyncOmniDiffusion initialized with model: %s", model)
+        logger.info("AsyncOmniDiffusion initialized with model: %s, batch_size: %d", model, self._batch_size)
+
+    # ------------------------------------------------------------------
+    # batch_size property
+    # ------------------------------------------------------------------
+
+    @property
+    def batch_size(self) -> int:
+        """Return the configured batch size for request batching."""
+        return self._batch_size
+
+    @batch_size.setter
+    def batch_size(self, value: int) -> None:
+        if not isinstance(value, int) or value < 1:
+            raise ValueError("batch_size must be a positive integer")
+        self._batch_size = value
+
+    # ------------------------------------------------------------------
+    # Public batch generation API
+    # ------------------------------------------------------------------
+
+    async def generate_batch(
+        self,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        request_id: str | None = None,
+        lora_request: LoRARequest | None = None,
+    ) -> OmniRequestOutput:
+        """Generate images from multiple prompts in a single engine call.
+
+        Batches the given prompts into **one** ``DiffusionEngine.step()``
+        call and returns a single ``OmniRequestOutput`` containing all
+        generated images.  Called by ``StageDiffusionClient._run_batch``
+        when the orchestrator receives a list-prompt request.
+
+        Args:
+            prompts: List of text prompts describing the desired images.
+            sampling_params: Shared sampling parameters for all prompts.
+            request_id: Optional unique identifier. Auto-generated when *None*.
+            lora_request: Optional LoRA adapter to apply.
+
+        Returns:
+            A single ``OmniRequestOutput`` with all images combined.
+        """
+        if request_id is None:
+            request_id = f"diff-batch-{uuid.uuid4().hex[:8]}"
+        return await self._generate_batch(prompts, sampling_params, request_id, lora_request)
+
+    # ------------------------------------------------------------------
+    # Internal batch generation
+    # ------------------------------------------------------------------
+
+    async def _generate_batch(
+        self,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        request_id: str,
+        lora_request: LoRARequest | None = None,
+    ) -> OmniRequestOutput:
+        """Generate images from multiple prompts in a single engine call."""
+        if not prompts:
+            return OmniRequestOutput(request_id=request_id, images=[], final_output_type="image")
+
+        if sampling_params.guidance_scale:
+            sampling_params.guidance_scale_provided = True
+
+        if lora_request is not None:
+            sampling_params.lora_request = lora_request
+
+        request = OmniDiffusionRequest(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
+        )
+
+        logger.debug("Starting batch generation for %d prompts, request_id=%s", len(prompts), request_id)
+
+        loop = asyncio.get_event_loop()
+        try:
+            results = await loop.run_in_executor(
+                self._executor,
+                self.engine.step,
+                request,
+            )
+        except Exception as e:
+            logger.error("Batch generation failed for request %s: %s", request_id, e)
+            raise RuntimeError(f"Diffusion batch generation failed: {e}") from e
+
+        # Combine all per-prompt results into a single OmniRequestOutput
+        all_images = []
+        for result in results:
+            all_images.extend(result.images)
+
+        return OmniRequestOutput(
+            request_id=request_id,
+            images=all_images,
+            final_output_type="image",
+            finished=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Public generate API
+    # ------------------------------------------------------------------
 
     async def generate(
         self,
@@ -137,12 +262,17 @@ class AsyncOmniDiffusion:
         request_id: str | None = None,
         lora_request: LoRARequest | None = None,
     ) -> OmniRequestOutput:
-        """Generate images asynchronously from a text prompt.
+        """Generate images asynchronously from a single text prompt.
+
+        For batched generation (multiple prompts in one engine call), use
+        :meth:`generate_batch` instead.  This method always processes
+        exactly one prompt per call.
 
         Args:
             prompt: Text prompt describing the desired image
             sampling_params: Sampling parameters
             request_id: Optional unique identifier for tracking the request
+            lora_request: Optional LoRA adapter to apply
 
         Returns:
             OmniRequestOutput containing generated images
@@ -152,7 +282,6 @@ class AsyncOmniDiffusion:
         """
         if request_id is None:
             request_id = f"diff-{uuid.uuid4().hex[:16]}"
-
         if sampling_params.guidance_scale:
             sampling_params.guidance_scale_provided = True
 
@@ -167,10 +296,8 @@ class AsyncOmniDiffusion:
 
         logger.debug("Starting generation for request %s", request_id)
 
-        # Run engine in thread pool
         loop = asyncio.get_event_loop()
         try:
-            # In async mode, only a single request is submitted at a time
             result = await loop.run_in_executor(
                 self._executor,
                 self.engine.step,
@@ -181,7 +308,6 @@ class AsyncOmniDiffusion:
             logger.error("Generation failed for request %s: %s", request_id, e)
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
 
-        # Update request_id if needed
         if not result.request_id:
             result.request_id = request_id
         return result
@@ -218,6 +344,10 @@ class AsyncOmniDiffusion:
             return
         self._closed = True
 
+        finalizer = getattr(self, "_weak_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
+
         try:
             self.engine.close()
         except Exception as e:
@@ -233,13 +363,6 @@ class AsyncOmniDiffusion:
     def shutdown(self) -> None:
         """Alias for close() method."""
         self.close()
-
-    def __del__(self) -> None:
-        """Best-effort cleanup on deletion."""
-        try:
-            self.close()
-        except Exception:
-            pass
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort a request."""

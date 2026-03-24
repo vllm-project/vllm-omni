@@ -24,8 +24,6 @@ End-to-end tests verify the complete functionality of a system or component. For
 
 - **`tests/e2e/online_serving/`**: Tests for online serving scenarios (e.g., API server tests)
 
-**Example:** The test file for `vllm_omni/entrypoints/omni_llm.py` should be located at `tests/entrypoints/test_omni_llm.py`.
-
 ## Test Directory Structure
 
 The ideal directory structure mirrors the source code organization. Legend: `✅` = test exists, `⬜` = suggested to add.
@@ -75,11 +73,6 @@ vllm_omni/                                    tests/
 │   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
 │
 ├── entrypoints/                        →     ├── entrypoints/
-│   ├── omni.py                                 │   ├── test_omni.py                    ⬜  (E2E covered by e2e/offline, e2e/online)
-│   ├── omni_llm.py                             │   ├── test_omni_llm.py                ✅
-│   ├── omni_stage.py                            │   ├── test_omni_stage.py              ⬜  (partial in test_omni_stage_diffusion_config.py)
-│   ├── omni_diffusion.py                       │   ├── test_omni_diffusion.py          ✅
-│   ├── async_omni.py                            │   ├── test_async_omni.py              ✅ actually in e2e/online_serving/test_async_omni.py
 │   ├── async_omni_diffusion.py                 │   ├── test_async_omni_diffusion_config.py  ✅
 │   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
 │   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
@@ -164,13 +157,19 @@ vllm_omni/                                    tests/
                                                        ├── qwen3_omni_ci.yaml
                                                        ├── bagel_*.yaml
                                                        └── npu/, rocm/, etc.
+examples/                                     tests
+│                                             └── examples
+├── online_serving/                     →         ├── online_serving/
+│   └── {doc_page_title}/README.md                │   └── test_{doc_page_title}.py  ⬜
+└── offline_inference/                  →         └── offline_inference/
+    └── {doc_page_title}/README.md                    └── test_{doc_page_title}.py  ⬜
 ```
 
 
 
 ### Naming Conventions
 
-- **Unit Tests**: Use `test_<module_name>.py` format. Example: `omni_llm.py` → `test_omni_llm.py`
+- **Unit Tests**: Use `test_<module_name>.py` format. Example: `stage_utils.py` → `test_stage_utils.py`
 
 - **E2E Tests**: Place in `tests/e2e/offline_inference/` or `tests/e2e/online_serving/` with descriptive names. Example: `tests/e2e/offline_inference/test_qwen3_omni.py`, `tests/e2e/offline_inference/test_diffusion_model.py`
 

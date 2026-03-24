@@ -15,6 +15,15 @@ _MODEL_COEFFICIENTS = {
         -3.82021401e00,
         2.64230861e-01,
     ],
+    # Flux2 Klein transformer coefficients
+    # Same as FLUX.1 (similar dual-stream architecture)
+    "Flux2Klein": [
+        4.98651651e02,
+        -2.83781631e02,
+        5.58554382e01,
+        -3.82021401e00,
+        2.64230861e-01,
+    ],
     # Qwen-Image transformer coefficients from ComfyUI-TeaCache
     # Tuned specifically for Qwen's dual-stream transformer architecture
     # Used for all Qwen-Image Family pipelines, in general

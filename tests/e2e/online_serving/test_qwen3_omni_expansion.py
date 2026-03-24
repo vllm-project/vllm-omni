@@ -6,6 +6,8 @@ E2E Online tests for Qwen3-Omni model.
 
 import os
 
+from vllm_omni.platforms import current_omni_platform
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 from pathlib import Path
 
@@ -50,6 +52,10 @@ def get_chunk_config(default_path):
 # CI stage config for 2*H100-80G GPUs
 default_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
 stage_configs = [default_path, get_chunk_config(default_path)]
+
+if current_omni_platform.is_xpu():
+    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
+
 # Create parameter combinations for model and stage config
 test_params = [
     OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs

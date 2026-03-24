@@ -2,15 +2,13 @@ async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm
+    is_comprehension: true
     runtime:
       devices: "0"
-      max_batch_size: 10
     engine_args:
       model_stage: qwen3_tts
+      max_num_seqs: 10
       model_arch: Qwen3TTSTalkerForConditionalGeneration
-      # Force stage-specific registered architecture.
-      hf_overrides:
-        architectures: [Qwen3TTSTalkerForConditionalGeneration]
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
@@ -39,13 +37,10 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 1
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 1
       model_arch: Qwen3TTSCode2Wav
-      # Force stage-specific registered architecture.
-      hf_overrides:
-        architectures: [Qwen3TTSCode2Wav]
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
@@ -53,7 +48,7 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
       # Must be divisible by num_code_groups and cover (left_context + chunk).
       max_num_batched_tokens: 8192

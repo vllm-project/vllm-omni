@@ -148,19 +148,16 @@ def _collect_images(outputs: list) -> list[torch.Tensor]:
     """Extract all image tensors produced by the final (DiT) stage."""
     images: list[torch.Tensor] = []
     for out in outputs:
-        ro_list = getattr(out, "request_output", out)
-        if not isinstance(ro_list, list):
-            ro_list = [ro_list]
-        for ro_item in ro_list:
-            for completion in getattr(ro_item, "outputs", None) or []:
-                mm = getattr(completion, "multimodal_output", None)
-                if not isinstance(mm, dict) or "image" not in mm:
-                    raise RuntimeError(f"Missing image in multimodal output: {mm}")
-                payload = mm["image"]
-                for tensor in payload if isinstance(payload, list) else [payload]:
-                    if not isinstance(tensor, torch.Tensor):
-                        raise TypeError(f"Expected image tensor, got {type(tensor)}")
-                    images.append(tensor)
+        ro_item = getattr(out, "request_output", out)
+        for completion in getattr(ro_item, "outputs", None) or []:
+            mm = getattr(completion, "multimodal_output", None)
+            if not isinstance(mm, dict) or "image" not in mm:
+                raise RuntimeError(f"Missing image in multimodal output: {mm}")
+            payload = mm["image"]
+            for tensor in payload if isinstance(payload, list) else [payload]:
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError(f"Expected image tensor, got {type(tensor)}")
+                images.append(tensor)
     return images
 
 

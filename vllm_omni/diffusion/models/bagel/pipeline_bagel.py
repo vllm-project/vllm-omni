@@ -26,6 +26,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -147,7 +148,7 @@ class SiglipNaViTWrapper(nn.Module):
         return outputs.last_hidden_state.squeeze(0)
 
 
-class BagelPipeline(nn.Module):
+class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     """Bagel generation pipeline (MoT) packaged for vllm-omni diffusion engine.
 
     This pipeline is self-contained and uses the ported Bagel core files.
@@ -223,13 +224,15 @@ class BagelPipeline(nn.Module):
             int(required_max_id + 1),
         )
 
-        self.language_model = Qwen2MoTForCausalLM(llm_config)
+        parallel_config = od_config.parallel_config if od_config else None
+        self.language_model = Qwen2MoTForCausalLM(llm_config, parallel_config=parallel_config)
         ae_params: AutoEncoderParams = default_ae_params()
         self.vae = AutoEncoder(ae_params)
 
         self.bagel = Bagel(
             language_model=self.language_model,
             vit_model=self.vit_model,
+            parallel_config=parallel_config,
             config=BagelConfig(
                 llm_config=llm_config,
                 vae_config=vae_cfg,
@@ -255,6 +258,9 @@ class BagelPipeline(nn.Module):
         ]
 
         self.to(self.device)
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @staticmethod
     def _decode_image_from_latent(
@@ -621,7 +627,9 @@ class BagelPipeline(nn.Module):
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
-        return DiffusionOutput(output=img)
+        return DiffusionOutput(
+            output=img, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         state = self.state_dict()

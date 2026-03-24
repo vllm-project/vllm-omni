@@ -188,8 +188,21 @@ def extract_qwen_context(
     # ============================================================================
     # PREPROCESSING (Qwen-specific)
     # ============================================================================
-    hidden_states = module.img_in(hidden_states)
+    # Call image_rope_prepare instead of img_in + pos_embed directly.
+    # This ensures the SequenceParallelSplitHook registered on image_rope_prepare
+    # fires when SP is enabled, correctly sharding hidden_states and vid_freqs.
+    hidden_states, vid_freqs, txt_freqs = module.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
+    image_rotary_emb = (vid_freqs, txt_freqs)
+
     timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+    # Call modulate_index_prepare instead of handling timestep directly.
+    # For zero_cond_t=False: timestep unchanged, modulate_index=None.
+    # For zero_cond_t=True: timestep is doubled, modulate_index is created and
+    # sharded by the SequenceParallelSplitHook on modulate_index_prepare so that
+    # its sequence dimension matches the already-sharded hidden_states.
+    timestep, modulate_index = module.modulate_index_prepare(timestep, img_shapes)
+
     encoder_hidden_states = module.txt_norm(encoder_hidden_states)
     encoder_hidden_states = module.txt_in(encoder_hidden_states)
 
@@ -201,8 +214,6 @@ def extract_qwen_context(
         if guidance is None
         else module.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
     )
-
-    image_rotary_emb = module.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
     # ============================================================================
     # EXTRACT MODULATED INPUT (for cache decision)
@@ -249,6 +260,7 @@ def extract_qwen_context(
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
+                modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
             )
         return (h, e)
@@ -566,6 +578,149 @@ def extract_zimage_context(
     )
 
 
+def extract_flux2_klein_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor | None = None,
+    timestep: torch.LongTensor = None,
+    img_ids: torch.Tensor = None,
+    txt_ids: torch.Tensor = None,
+    guidance: torch.Tensor | None = None,
+    joint_attention_kwargs: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for Flux2Klein model.
+
+    Caches the full transformer output (including single_transformer_blocks).
+    When cache is reused, single_transformer_blocks is skipped to achieve maximum speedup.
+
+    Args:
+        module: Flux2Transformer2DModel instance
+        hidden_states: Input image hidden states tensor
+        encoder_hidden_states: Input text hidden states tensor
+        timestep: Current diffusion timestep
+        img_ids: Image position IDs for RoPE
+        txt_ids: Text position IDs for RoPE
+        guidance: Optional guidance scale for CFG
+        joint_attention_kwargs: Additional attention kwargs
+
+    Returns:
+        CacheContext with all information needed for generic caching
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must have transformer_blocks")
+
+    # ============================================================================
+    # PREPROCESSING (Flux2-specific)
+    # ============================================================================
+    dtype = hidden_states.dtype
+
+    num_txt_tokens = encoder_hidden_states.shape[1]
+
+    timestep = timestep.to(dtype=dtype) * 1000
+    if guidance is not None:
+        guidance = guidance.to(dtype=dtype) * 1000
+
+    temb = module.time_guidance_embed(timestep, guidance)
+
+    double_stream_mod_img = module.double_stream_modulation_img(temb)
+    double_stream_mod_txt = module.double_stream_modulation_txt(temb)
+    single_stream_mod = module.single_stream_modulation(temb)[0]
+
+    hidden_states = module.x_embedder(hidden_states)
+    encoder_hidden_states = module.context_embedder(encoder_hidden_states)
+
+    if img_ids.ndim == 3:
+        img_ids = img_ids[0]
+    if txt_ids.ndim == 3:
+        txt_ids = txt_ids[0]
+
+    image_rotary_emb = module.pos_embed(img_ids)
+    text_rotary_emb = module.pos_embed(txt_ids)
+    concat_rotary_emb = (
+        torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
+        torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+    )
+
+    # ============================================================================
+    # EXTRACT MODULATED INPUT (for cache decision)
+    # ============================================================================
+    block = module.transformer_blocks[0]
+
+    norm_hidden_states = block.norm1(hidden_states)
+    norm_hidden_states = (1 + double_stream_mod_img[0][1]) * norm_hidden_states + double_stream_mod_img[0][0]
+
+    modulated_input = norm_hidden_states
+
+    # ============================================================================
+    # DEFINE TRANSFORMER EXECUTION (Flux2-specific)
+    # ============================================================================
+    def run_flux2_transformer_blocks():
+        h = hidden_states
+        c = encoder_hidden_states
+        for block in module.transformer_blocks:
+            c, h = block(
+                hidden_states=h,
+                encoder_hidden_states=c,
+                temb_mod_params_img=double_stream_mod_img,
+                temb_mod_params_txt=double_stream_mod_txt,
+                image_rotary_emb=concat_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        return (h, c)
+
+    def run_flux2_full_transformer_with_single(ori_h, ori_c):
+        h = ori_h
+        c = ori_c
+        for block in module.transformer_blocks:
+            c, h = block(
+                hidden_states=h,
+                encoder_hidden_states=c,
+                temb_mod_params_img=double_stream_mod_img,
+                temb_mod_params_txt=double_stream_mod_txt,
+                image_rotary_emb=concat_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        h_concat = torch.cat([c, h], dim=1)
+        for block in module.single_transformer_blocks:
+            h_concat = block(
+                hidden_states=h_concat,
+                encoder_hidden_states=None,
+                temb_mod_params=single_stream_mod,
+                image_rotary_emb=concat_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        final_hidden_states = h_concat[:, num_txt_tokens:, ...]
+        return final_hidden_states, c
+
+    # ============================================================================
+    # DEFINE POSTPROCESSING (Flux2-specific)
+    # ============================================================================
+    return_dict = kwargs.get("return_dict", True)
+
+    def postprocess(h):
+        h = module.norm_out(h, temb)
+        h = module.proj_out(h)
+        if not return_dict:
+            return (h,)
+        return Transformer2DModelOutput(sample=h)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+        run_transformer_blocks=run_flux2_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "run_flux2_full_transformer_with_single": run_flux2_full_transformer_with_single,
+        },
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -576,6 +731,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
     "ZImageTransformer2DModel": extract_zimage_context,
+    "Flux2Klein": extract_flux2_klein_context,
     # Future models:
     # "FluxTransformer2DModel": extract_flux_context,
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,

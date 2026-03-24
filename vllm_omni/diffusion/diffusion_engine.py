@@ -2,15 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import threading
 import time
 from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
 import PIL.Image
+import torch
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
@@ -18,6 +20,7 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -53,7 +56,11 @@ def supports_audio_output(model_class_name: str) -> bool:
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(
+        self,
+        od_config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ):
         """Initialize the diffusion engine.
 
         Args:
@@ -66,6 +73,9 @@ class DiffusionEngine:
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
+        self.scheduler: SchedulerInterface = scheduler or RequestScheduler()
+        self.scheduler.initialize(od_config)
+        self._rpc_lock = threading.Lock()
 
         try:
             self._dummy_run()
@@ -106,8 +116,19 @@ class DiffusionEngine:
                 for i, prompt in enumerate(request.prompts)
             ]
 
+        # When CPU offload is enabled, move output to CPU before
+        # post-processing to avoid device OOM — model weights may still
+        # reside on the device and leave no headroom for intermediates.
+        output_data = output.output
+        if (
+            self.od_config.enable_cpu_offload
+            and isinstance(output_data, torch.Tensor)
+            and output_data.device.type != "cpu"
+        ):
+            output_data = output_data.cpu()
+
         postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
         audio_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
@@ -158,6 +179,8 @@ class DiffusionEngine:
                         latents=output.trajectory_latents,
                         multimodal_output={"audio": request_audio_payload},
                         final_output_type="audio",
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
                     ),
                 ]
             else:
@@ -173,6 +196,8 @@ class DiffusionEngine:
                         latents=output.trajectory_latents,
                         custom_output=output.custom_output or {},
                         multimodal_output=mm_output,
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
                     ),
                 ]
         else:
@@ -202,6 +227,8 @@ class DiffusionEngine:
                             latents=output.trajectory_latents,
                             multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
+                            stage_durations=output.stage_durations,
+                            peak_memory_mb=output.peak_memory_mb,
                         ),
                     )
                 else:
@@ -227,13 +254,18 @@ class DiffusionEngine:
                             latents=output.trajectory_latents,
                             custom_output=output.custom_output or {},
                             multimodal_output=mm_output,
+                            stage_durations=output.stage_durations,
+                            peak_memory_mb=output.peak_memory_mb,
                         ),
                     )
 
             return results
 
     @staticmethod
-    def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
+    def make_engine(
+        config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ) -> "DiffusionEngine":
         """Factory method to create a DiffusionEngine instance.
 
         Args:
@@ -242,10 +274,40 @@ class DiffusionEngine:
         Returns:
             An instance of DiffusionEngine.
         """
-        return DiffusionEngine(config)
+        return DiffusionEngine(config, scheduler=scheduler)
 
-    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
-        return self.executor.add_req(request)
+    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        with self._rpc_lock:
+            target_sched_req_id = self.scheduler.add_request(request)
+
+            # keep scheduling and executing until the target request is finished
+            while True:
+                sched_output = self.scheduler.schedule()
+                if sched_output.is_empty:
+                    if not self.scheduler.has_requests():
+                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
+                    continue
+
+                # NOTE: add_req_and_wait_for_response() is synchronous, and
+                # the scheduler currently enforces _max_batch_size = 1 (see
+                # vllm_omni/diffusion/sched/base_scheduler.py), so we directly
+                # take the single scheduled request here.
+                sched_req_id = sched_output.scheduled_req_ids[0]
+                req = sched_output.scheduled_new_reqs[0].req
+                try:
+                    output = self.executor.add_req(req)
+                except Exception as exc:
+                    logger.error(
+                        "Execution failed for diffusion request %s",
+                        sched_req_id,
+                        exc_info=True,
+                    )
+                    output = DiffusionOutput(error=str(exc))
+
+                finished_req_ids = self.scheduler.update_from_output(sched_output, output)
+                if target_sched_req_id in finished_req_ids:
+                    self.scheduler.pop_request_state(target_sched_req_id)
+                    return output
 
     def start_profile(self, trace_filename: str | None = None) -> None:
         """
@@ -392,6 +454,7 @@ class DiffusionEngine:
         }
         req = OmniDiffusionRequest(
             prompts=[prompt],
+            request_ids=["dummy_req_id"],
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
@@ -408,7 +471,9 @@ class DiffusionEngine:
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        self.add_req_and_wait_for_response(request)
+        output = self.add_req_and_wait_for_response(request)
+        if output.error:
+            raise RuntimeError(f"Dummy run failed: {output.error}")
 
     def collective_rpc(
         self,
@@ -431,15 +496,37 @@ class DiffusionEngine:
             Single result if unique_reply_rank is provided, otherwise list of results
         """
         assert isinstance(method, str), "Only string method names are supported for now"
-        return self.executor.collective_rpc(
-            method=method,
-            timeout=timeout,
-            args=args,
-            kwargs=kwargs,
-            unique_reply_rank=unique_reply_rank,
-        )
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        acquired = False
+        try:
+            if deadline is None:
+                self._rpc_lock.acquire()
+                acquired = True
+            else:
+                lock_timeout = max(0, deadline - time.monotonic())
+                acquired = self._rpc_lock.acquire(timeout=lock_timeout)
+            if not acquired:
+                raise TimeoutError(f"RPC call to {method} timed out waiting for engine lock.")
+
+            rpc_timeout = None if deadline is None else max(0, deadline - time.monotonic())
+            if deadline is not None and rpc_timeout <= 0:
+                raise TimeoutError(f"RPC call to {method} timed out.")
+
+            return self.executor.collective_rpc(
+                method=method,
+                timeout=rpc_timeout,
+                args=args,
+                kwargs=kwargs,
+                unique_reply_rank=unique_reply_rank,
+            )
+        finally:
+            if acquired:
+                self._rpc_lock.release()
 
     def close(self) -> None:
+        if hasattr(self, "scheduler"):
+            self.scheduler.close()
         if hasattr(self, "executor"):
             self.executor.shutdown()
 

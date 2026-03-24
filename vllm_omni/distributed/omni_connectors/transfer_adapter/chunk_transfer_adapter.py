@@ -52,7 +52,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
@@ -94,7 +94,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
+        self._cancelled_load_reqs.discard(request.request_id)
         self._pending_load_reqs.append(request)
+        with self._recv_cond:
+            self._recv_cond.notify()
 
     def save_async(
         self,
@@ -116,6 +119,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_finished": request.is_finished(),
         }
         self._pending_save_reqs.append(task)
+        with self._save_cond:
+            self._save_cond.notify()
 
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
@@ -238,6 +243,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_finished:
             self.code_prompt_token_ids.pop(request_id, None)
+            cached_ic = getattr(self, "_cached_ic", None)
+            if cached_ic is not None:
+                cached_ic.pop(request_id, None)
 
     ########################################################################
     # Cleanup
@@ -265,13 +273,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
 
-        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
-        self._pending_load_reqs = remaining
+        self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
 
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Schedule Helper
@@ -295,6 +306,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
+            request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
 
     def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:
