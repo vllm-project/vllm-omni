@@ -144,7 +144,7 @@ curl -X POST http://localhost:8091/v1/videos \
 
 ## Create Response Format
 
-`POST /v1/videos` returns a job record.
+`POST /v1/videos` returns a job record, not inline base64 video data.
 
 ```json
 {
@@ -201,6 +201,10 @@ done
 
 ## Example materials
 
+??? abstract "run_curl_hunyuan_video_15.sh"
+    ``````sh
+    --8<-- "examples/online_serving/image_to_video/run_curl_hunyuan_video_15.sh"
+    ``````
 ??? abstract "run_curl_image_to_video.sh"
     ``````sh
     --8<-- "examples/online_serving/image_to_video/run_curl_image_to_video.sh"
@@ -208,4 +212,8 @@ done
 ??? abstract "run_server.sh"
     ``````sh
     --8<-- "examples/online_serving/image_to_video/run_server.sh"
+    ``````
+??? abstract "run_server_hunyuan_video_15.sh"
+    ``````sh
+    --8<-- "examples/online_serving/image_to_video/run_server_hunyuan_video_15.sh"
     ``````
