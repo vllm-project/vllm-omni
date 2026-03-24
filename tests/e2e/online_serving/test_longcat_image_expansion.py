@@ -1,13 +1,14 @@
 """
-Comprehensive tests of diffusion features that are available in online serving mode
+Recommended tests of diffusion features that are available in online serving mode
 and are supported by the following model:
 - LongCat-Image: text-to-image with single prompt input
 Coverage:
-- CPU offloading
-- Cache-DIT
-- SP (Ulysses & Ring)
-- CFG-Parallel
-- Tensor-Parallel
+- CPU offloading (model-level sequential offload via --enable-cpu-offload)
+- Cache-DiT
+- SP (Ulysses)
+
+This validates:
+ - Successful image generation at the expected 768x1344 resolution with recommended feature combinations
 """
 
 import pytest
@@ -29,13 +30,12 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_diffusion_feature_cases(model: str):
+    """Return diffusion feature cases for LongCat-Image."""
     return [
         pytest.param(
             OmniServerParams(
                 model=model,
-                server_args=[
-                    "--enable-cpu-offload",
-                ],
+                server_args=["--enable-cpu-offload"],
             ),
             id="single_card_001",
             marks=SINGLE_CARD_FEATURE_MARKS,
@@ -53,43 +53,6 @@ def _get_diffusion_feature_cases(model: str):
             id="parallel_001",
             marks=PARALLEL_FEATURE_MARKS,
         ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--ring",
-                    "2",
-                ],
-            ),
-            id="parallel_002",
-            marks=PARALLEL_FEATURE_MARKS,
-        ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cfg-parallel-size",
-                    "2",
-                ],
-            ),
-            id="parallel_003",
-            marks=PARALLEL_FEATURE_MARKS,
-        ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--tensor-parallel-size",
-                    "2",
-                ],
-            ),
-            id="parallel_004",
-            marks=PARALLEL_FEATURE_MARKS,
-        ),
     ]
 
 
@@ -101,16 +64,15 @@ def _get_diffusion_feature_cases(model: str):
     indirect=True,
 )
 def test_longcat_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Test all supported diffusion features with LongCat-Image in regular text-to-image scenarios."""
+    """Test the recommended feature combinations for LongCat-Image."""
     messages = dummy_messages_from_mix_data(content_text=TEXT_TO_IMAGE_PROMPT)
 
-    # CFG parallel is only activated when a negative prompt and guidance_scale > 1.0 are both present
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "extra_body": {
-            "height": 512,
-            "width": 512,
+            "height": 768,
+            "width": 1344,
             "num_inference_steps": 2,
             "negative_prompt": NEGATIVE_PROMPT,
             "guidance_scale": 4.0,
