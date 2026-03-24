@@ -97,6 +97,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "FluxKontextPipeline": (
+        "flux",
+        "pipeline_flux_kontext",
+        "FluxKontextPipeline",
+    ),
     "HunyuanImage3ForCausalMM": (
         "hunyuan_image_3",
         "pipeline_hunyuan_image_3",
@@ -319,6 +324,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "BagelPipeline": "get_bagel_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
+    "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
