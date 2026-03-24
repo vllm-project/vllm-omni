@@ -93,6 +93,12 @@ The following table shows which models are currently supported by each accelerat
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ |
 
 
+### AudioGen
+
+| Model                  | Model Identifier                         | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
+|------------------------|------------------------------------------|:--------:|:---------:|:----------:|:--------------:|:------------:|
+| **Stable-Audio-Open**  | `stabilityai/stable-audio-open-1.0`      |    ✅    |           |            |                |              |
+
 ## Performance Benchmarks
 
 The following benchmarks were measured on **Qwen/Qwen-Image** and **Qwen/Qwen-Image-Edit** models generating 1024x1024 images with 50 inference steps:
