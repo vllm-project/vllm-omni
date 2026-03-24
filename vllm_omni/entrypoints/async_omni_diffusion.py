@@ -440,28 +440,21 @@ class AsyncOmniDiffusion:
         )
         return all(results) if isinstance(results, list) else results
 
-    async def start_profile(self, trace_filename: str | None = None) -> None:
-        """Start profiling for the diffusion model.
+    async def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        """Start or stop profiling for the diffusion model.
 
         Args:
-            trace_filename: Optional base filename for trace files.
-                           If None, a timestamp-based name will be generated.
+            is_start: True to start profiling, False to stop.
+            profile_prefix: Optional prefix for trace filename (vLLM compat).
+
+        Note:
+            Matches vLLM's worker.profile() signature for consistency.
+            Traces are saved automatically via on_trace_ready callback.
         """
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             self._executor,
-            self.engine.start_profile,
-            trace_filename,
-        )
-
-    async def stop_profile(self) -> dict:
-        """Stop profiling and return profiling results.
-
-        Returns:
-            Dictionary containing paths to trace and table files.
-        """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self._executor,
-            self.engine.stop_profile,
+            self.engine.profile,
+            is_start,
+            profile_prefix,
         )
