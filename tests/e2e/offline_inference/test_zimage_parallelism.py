@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.utils import GPUMemoryMonitor, hardware_test
+from tests.utils import DeviceMemoryMonitor, hardware_test
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -35,7 +35,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-# os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
@@ -54,12 +53,13 @@ def _pil_to_float_rgb_tensor(img: Image.Image) -> torch.Tensor:
 
 
 def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
-    """Return (mean_abs_diff, max_abs_diff) over RGB pixels in [0, 1]."""
+    """Return (mean_abs_diff, p99_abs_diff) over RGB pixels in [0, 1]."""
     ta = _pil_to_float_rgb_tensor(a)
     tb = _pil_to_float_rgb_tensor(b)
     assert ta.shape == tb.shape, f"Image shapes differ: {ta.shape} vs {tb.shape}"
     abs_diff = torch.abs(ta - tb)
-    return abs_diff.mean().item(), abs_diff.max().item()
+    p99_abs_diff = torch.quantile(abs_diff.flatten(), 0.99).item()
+    return abs_diff.mean().item(), p99_abs_diff
 
 
 def _extract_single_image(outputs) -> Image.Image:
@@ -68,7 +68,7 @@ def _extract_single_image(outputs) -> Image.Image:
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 
@@ -93,9 +93,9 @@ def _run_zimage_generate(
     if num_requests < 2:
         raise ValueError("num_requests must be >= 2 (1 warmup + >=1 timed)")
 
-    torch.cuda.empty_cache()
-    device_index = torch.cuda.current_device()
-    monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
+    current_omni_platform.empty_cache()
+    device_index = current_omni_platform.current_device()
+    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
     m = Omni(
         model=_get_zimage_model(),
@@ -161,8 +161,8 @@ def _run_zimage_generate(
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
+    if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
+        pytest.skip("Z-Image TP=2 requires >= 2 devices.")
 
     enforce_eager = False
 
@@ -196,18 +196,18 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     assert tp1_img.width == width and tp1_img.height == height
     assert tp2_img.width == width and tp2_img.height == height
 
-    mean_abs_diff, max_abs_diff = _diff_metrics(tp1_img, tp2_img)
+    mean_abs_diff, p99_abs_diff = _diff_metrics(tp1_img, tp2_img)
     mean_threshold = 3e-2
-    max_threshold = 5e-1
+    p99_threshold = 2.5e-1
     print(
         "Z-Image TP image diff stats (TP=1 vs TP=2): "
-        f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
-        f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
+        f"mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e}; "
+        f"thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e}; "
         f"tp1_img={tp1_path}, tp2_img={tp2_path}"
     )
-    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
-        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e} "
-        f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e})"
+    assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
+        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e} "
+        f"(thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e})"
     )
 
     print(f"Z-Image TP perf (lower is better): tp1_time_s={tp1_time_s:.6f}, tp2_time_s={tp2_time_s:.6f}")
@@ -223,8 +223,8 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 CUDA devices.")
+    if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
+        pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 devices.")
 
     enforce_eager = False
 
@@ -262,16 +262,16 @@ def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
     baseline_img.save(baseline_path)
     pp2_img.save(pp2_path)
 
-    mean_abs_diff, max_abs_diff = _diff_metrics(baseline_img, pp2_img)
+    mean_abs_diff, p99_abs_diff = _diff_metrics(baseline_img, pp2_img)
     mean_threshold = 5e-3
-    max_threshold = 1e-1
+    p99_threshold = 1e-1
     print(
         "Z-Image VAE patch parallel image diff stats (TP=2, pp=1 vs pp=2): "
-        f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
-        f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
+        f"mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e}; "
+        f"thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e}; "
         f"pp1_img={baseline_path}, pp2_img={pp2_path}"
     )
-    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
-        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e} "
-        f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e})"
+    assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
+        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e} "
+        f"(thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e})"
     )

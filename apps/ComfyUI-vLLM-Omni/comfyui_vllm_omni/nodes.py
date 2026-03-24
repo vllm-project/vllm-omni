@@ -1,4 +1,4 @@
-from typing import Literal, cast
+from typing import Literal
 
 import torch
 from comfy_api.input import AudioInput, VideoInput
@@ -6,7 +6,13 @@ from comfy_api.input import AudioInput, VideoInput
 from .utils.api_client import VLLMOmniClient
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
-from .utils.types import AudioFormat
+from .utils.types import (
+    AudioFormat,
+    AutoregressionSamplingParams,
+    DiffusionSamplingParams,
+    QwenTTSModelSpecificParams,
+    WanModelSpecificParams,
+)
 from .utils.validators import (
     add_sampling_parameters_to_stage,
     validate_model_and_sampling_params_types,
@@ -51,6 +57,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                 # "video": ("VIDEO",),
                 # "audio": ("AUDIO",),
                 "sampling_params": ("SAMPLING_PARAMS",),
+                "lora": ("REMOTE_LORA",),
             },
         }
 
@@ -71,9 +78,11 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         audio: AudioInput | None = None,  # Hidden & unused
         video: VideoInput | None = None,  # Hidden & unused
         sampling_params: dict | list[dict] | None = None,
+        lora: dict | None = None,
         **kwargs,
     ):
-        logger.info("Uncaught kwargs: %s", kwargs)
+        if kwargs:
+            logger.info("Uncaught kwargs: %s", kwargs)
         logger.debug("Got sampling params: %s", sampling_params)
         validate_model_and_sampling_params_types(model, sampling_params)
         if image is None and mask is not None:
@@ -86,7 +95,10 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
 
         # Prefer DALL-E compatible API for simple (one-stage) diffusion models
         if (spec is None or spec["stages"] == ["diffusion"]) and not is_bagel:
-            sampling_params = cast(dict | None, sampling_params)
+            # The number of sampling parameter groups should have been validated.
+            # Now, simply convert single-item list to dict.
+            if isinstance(sampling_params, list):
+                sampling_params = sampling_params[0]
             if audio is None and image is None and video is None:
                 # No multimodal input --- use DALL-E image generation
                 logger.info("Using DALL-E image generation endpoint")
@@ -97,6 +109,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     height=height,
                     negative_prompt=negative_prompt,
                     sampling_params=sampling_params,
+                    lora=lora,
                 )
                 return (output,)
             elif image is not None and audio is None and video is None:
@@ -111,6 +124,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     negative_prompt=negative_prompt,
                     mask=mask,
                     sampling_params=sampling_params,
+                    lora=lora,
                 )
                 return (output,)
 
@@ -128,12 +142,92 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             audio=audio,
             video=video,
             sampling_params=sampling_params,
+            lora=lora,
         )
 
         return (output,)
 
 
-class VLLMOmniComprehension(_VLLMOmniGenerateBase):
+class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "http://localhost:8000/v1"}),
+                "model": ("STRING", {"default": "Wan-AI/Wan2.2-T2V-A14B-Diffusers"}),
+                "prompt": ("STRING", {"multiline": True}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "width": ("INT", {"default": 832, "min": 1}),
+                "height": ("INT", {"default": 480, "min": 1}),
+                "fps": ("INT", {"default": 16, "min": 1}),
+                "num_frames": ("INT", {"default": 41, "min": 1}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "sampling_params": ("SAMPLING_PARAMS",),
+                "lora": ("REMOTE_LORA",),
+                "model_params": ("VIDEO_PARAMS",),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "generate"
+
+    async def generate(
+        self,
+        url: str,
+        model: str,
+        prompt: str,
+        width: int,
+        height: int,
+        fps: int,
+        num_frames: int,
+        negative_prompt: str | None = None,
+        image: torch.Tensor | None = None,
+        sampling_params: dict | list[dict] | None = None,
+        model_params: dict | None = None,
+        lora: dict | None = None,
+        **kwargs,
+    ):
+        if kwargs:
+            logger.info("Uncaught kwargs: %s", kwargs)
+        logger.debug("Got sampling params: %s", sampling_params)
+        logger.debug("Got model params: %s", model_params)
+        validate_model_and_sampling_params_types(model, sampling_params)
+
+        # Currently, all video generation models are single-stage diffusion models
+        if isinstance(sampling_params, list):
+            if len(sampling_params) != 1:
+                raise ValueError(
+                    "Video generation expects a single sampling params group. "
+                    "Please provide one Diffusion sampling node."
+                )
+            sampling_params = sampling_params[0]
+
+        if sampling_params is not None:
+            sampling_params.pop("type", None)  # internal fields
+        if model_params is not None:
+            model_params.pop("type", None)  # internal fields
+
+        client = VLLMOmniClient(url)
+        output = await client.generate_video(
+            model=model,
+            prompt=prompt,
+            image=image,  # image present => i2v, absent => t2v
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            fps=fps,
+            negative_prompt=negative_prompt,
+            sampling_params=sampling_params,
+            lora=lora,
+            model_params=model_params,
+        )
+        return (output,)
+
+
+class VLLMOmniUnderstanding(_VLLMOmniGenerateBase):
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -180,7 +274,8 @@ class VLLMOmniComprehension(_VLLMOmniGenerateBase):
         use_audio_in_video: bool = True,
         **kwargs,
     ) -> tuple[str, AudioInput]:
-        logger.info("Uncaught kwargs: %s", kwargs)
+        if kwargs:
+            logger.info("Uncaught kwargs: %s", kwargs)
         logger.debug("Got sampling params: %s", sampling_params)
         validate_model_and_sampling_params_types(model, sampling_params)
 
@@ -197,7 +292,7 @@ class VLLMOmniComprehension(_VLLMOmniGenerateBase):
             (
                 text_response,
                 _,
-            ) = await client.generate_comprehension_chat_completion(
+            ) = await client.generate_understanding_chat_completion(
                 model=model,
                 prompt=prompt,
                 image=image,
@@ -221,7 +316,7 @@ class VLLMOmniComprehension(_VLLMOmniGenerateBase):
             (
                 text_response,
                 audio,
-            ) = await client.generate_comprehension_chat_completion(
+            ) = await client.generate_understanding_chat_completion(
                 model=model,
                 prompt=prompt,
                 image=image,
@@ -287,15 +382,13 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
         logger.info("Got extra kwargs in TTS: %s", kwargs)
 
         is_qwen_tts = "qwen3-tts" in model.lower()
-        extra_params_type = None if model_specific_params is None else model_specific_params["type"]
-        if not is_qwen_tts and extra_params_type == "qwen-tts":
+        if not is_qwen_tts and isinstance(model_specific_params, QwenTTSModelSpecificParams):
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
                 "However, the model appears to not be a Qwen TTS model (no 'Qwen3-TTS' in model name)."
             )
 
         combined_params = {**kwargs, **(model_specific_params or {})}
-        combined_params.pop("type", None)  # Internal fields in model_specific_params
 
         client = VLLMOmniClient(url)
 
@@ -352,8 +445,7 @@ class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
         **kwargs,
     ):
         is_qwen_tts = "qwen3-tts" in model.lower()
-        extra_params_type = None if model_specific_params is None else model_specific_params["type"]
-        if not is_qwen_tts and extra_params_type == "qwen-tts":
+        if not is_qwen_tts and isinstance(model_specific_params, QwenTTSModelSpecificParams):
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
                 "However, the model appears to not be a Qwen TTS model (no 'Qwen3-TTS' in model name)."
@@ -366,7 +458,6 @@ class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
             **kwargs,
             **(model_specific_params or {}),
         }
-        combined_params.pop("type", None)  # Internal fields in model_specific_params
 
         client = VLLMOmniClient(url)
 
@@ -419,10 +510,7 @@ class VLLMOmniARSampling:
     CATEGORY = "vLLM-Omni/Sampling Params"
 
     def get_params(self, seed, **kwargs):
-        params = {
-            "type": "autoregression",  # for internal use, removed before sending the request
-            **kwargs,
-        }
+        params = AutoregressionSamplingParams(kwargs)
         if seed >= 0:
             params["seed"] = seed
         return (params,)
@@ -479,6 +567,13 @@ class VLLMOmniDiffusionSampling:
                         "tooltip": "Enable VAE slicing for reduced memory usage (slight quality trade-off)",
                     },
                 ),
+                "vae_use_tiling": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable VAE tiling for reduced memory usage (slight quality trade-off)",
+                    },
+                ),
                 # === Put seed at last. ===
                 # Whenever a field named "seed" is present, ComfyUI adds another field called "control after generate"
                 "seed": (
@@ -499,10 +594,7 @@ class VLLMOmniDiffusionSampling:
     CATEGORY = "vLLM-Omni/Sampling Params"
 
     def get_params(self, seed, **kwargs):
-        params = {
-            "type": "diffusion",  # for internal use, removed before sending the request
-            **kwargs,
-        }
+        params = DiffusionSamplingParams(kwargs)
         if seed >= 0:
             params["seed"] = seed
         return (params,)
@@ -542,6 +634,52 @@ class VLLMOmniSamplingParamsList:
         return (params,)
 
 
+class VLLMOmniRemoteLoRA:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "local_path": ("STRING", {"default": ""}),
+                "name": ("STRING", {"default": ""}),
+                "scale": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1},
+                ),
+                "int_id": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "step": 1,
+                        "tooltip": "0 means it is not set and the server can derive it.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("REMOTE_LORA",)
+    RETURN_NAMES = ("lora",)
+    FUNCTION = "get_lora"
+    CATEGORY = "vLLM-Omni"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, local_path, name) -> str | Literal[True]:
+        if not local_path.strip() or not name.strip():
+            return "Both local_path and name must be provided."
+        return True
+
+    def get_lora(self, local_path: str, name: str, scale: float, int_id: int):
+        local_path = local_path.strip()
+        name = name.strip()
+        lora = {
+            "local_path": local_path or None,
+            "name": name or None,
+            "scale": float(scale),
+            "int_id": int(int_id) if int_id > 0 else None,
+        }
+        return (lora,)
+
+
 class VLLMOmniQwenTTSParams:
     @classmethod
     def INPUT_TYPES(cls):
@@ -566,4 +704,33 @@ class VLLMOmniQwenTTSParams:
     CATEGORY = "vLLM-Omni/TTS Params"
 
     def get_params(self, **kwargs):
-        return ({"type": "qwen-tts", **kwargs},)
+        return (QwenTTSModelSpecificParams(kwargs),)
+
+
+class VLLMOmniWanParams:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "guidance_scale_2": (
+                    "FLOAT",
+                    {"default": 4.0, "min": 0.0, "max": 20.0, "step": 0.1},
+                ),
+                "boundary_ratio": (
+                    "FLOAT",
+                    {"default": 0.875, "min": 0.0, "max": 1.0, "step": 0.001},
+                ),
+                "flow_shift": (
+                    "FLOAT",
+                    {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO_PARAMS",)
+    RETURN_NAMES = ("Wan video params",)
+    FUNCTION = "get_params"
+    CATEGORY = "vLLM-Omni/Video Params"
+
+    def get_params(self, **kwargs):
+        return (WanModelSpecificParams(kwargs),)

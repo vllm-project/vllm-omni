@@ -26,6 +26,35 @@ The script allows overriding:
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
 
+## Async Job Behavior
+
+`POST /v1/videos` is asynchronous. It creates a video job and immediately
+returns metadata like the job ID and initial `queued` status. To get the final
+artifact, poll the job status and then download the completed file from the
+content endpoint.
+
+The main endpoints are:
+- `POST /v1/videos`: create a video generation job
+- `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
+- `GET /v1/videos`: list stored video jobs
+- `GET /v1/videos/{video_id}/content`: download the generated video file
+- `DELETE /v1/videos/{video_id}`: delete the job and any stored output
+
+## Storage
+
+Generated video files are stored on local disk by the async video API.
+Local file storage behavior can be controlled via the following environment variables:
+
+- `VLLM_OMNI_STORAGE_PATH`: directory used for generated files (default: `/tmp/storage`)
+- `VLLM_OMNI_STORAGE_MAX_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+
+Example:
+
+```bash
+export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_STORAGE_MAX_CONCURRENCY=8
+```
+
 ## API Calls
 
 ### Method 1: Using curl
@@ -35,7 +64,7 @@ The script allows overriding:
 bash run_curl_image_to_video.sh
 
 # Or execute directly (OpenAI-style multipart)
-curl -X POST http://localhost:8091/v1/videos \
+create_response=$(curl -s http://localhost:8091/v1/videos \
   -H "Accept: application/json" \
   -F "prompt=A bear playing with yarn, smooth motion" \
   -F "negative_prompt=low quality, blurry, static" \
@@ -49,7 +78,23 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
-  -F "seed=42" | jq -r '.data[0].b64_json' | base64 -d > wan22_i2v_output.mp4
+  -F "seed=42")
+
+video_id=$(echo "$create_response" | jq -r '.id')
+while true; do
+  status=$(curl -s "http://localhost:8091/v1/videos/${video_id}" | jq -r '.status')
+  if [ "$status" = "completed" ]; then
+    break
+  fi
+  if [ "$status" = "failed" ]; then
+    echo "Video generation failed"
+    exit 1
+  fi
+  sleep 2
+done
+
+curl -s "http://localhost:8091/v1/videos/${video_id}" | jq .
+curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o wan22_i2v_output.mp4
 ```
 
 ## Request Format
@@ -61,6 +106,18 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "prompt=A bear playing with yarn, smooth motion" \
   -F "negative_prompt=low quality, blurry, static" \
   -F "input_reference=@/path/to/qwen-bear.png"
+```
+
+### Alternative JSON-Safe Reference Input
+
+Use `image_reference` when you want to pass a URL or JSON-safe image reference
+instead of uploading a file. Do not send `input_reference` and
+`image_reference` together.
+
+```bash
+curl -X POST http://localhost:8091/v1/videos \
+  -F "prompt=A bear playing with yarn, smooth motion" \
+  -F 'image_reference={"image_url":"https://example.com/qwen-bear.png"}'
 ```
 
 ### Generation with Parameters
@@ -80,4 +137,61 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
   -F "seed=42"
+```
+
+## Create Response Format
+
+`POST /v1/videos` returns a job record, not inline base64 video data.
+
+```json
+{
+  "id": "video_gen_123",
+  "object": "video",
+  "status": "queued",
+  "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+  "prompt": "A bear playing with yarn, smooth motion",
+  "created_at": 1234567890
+}
+```
+
+## Retrieve, List, Download, and Delete
+
+### Retrieve a job
+
+```bash
+curl -s http://localhost:8091/v1/videos/${video_id} | jq .
+```
+
+### List jobs
+
+```bash
+curl -s http://localhost:8091/v1/videos | jq .
+```
+
+### Download the completed video
+
+```bash
+curl -L http://localhost:8091/v1/videos/${video_id}/content -o wan22_i2v_output.mp4
+```
+
+### Delete a job and its stored file
+
+```bash
+curl -X DELETE http://localhost:8091/v1/videos/${video_id} | jq .
+```
+
+## Poll Until Complete
+
+```bash
+while true; do
+  status=$(curl -s http://localhost:8091/v1/videos/${video_id} | jq -r '.status')
+  if [ "$status" = "completed" ]; then
+    break
+  fi
+  if [ "$status" = "failed" ]; then
+    echo "Video generation failed"
+    exit 1
+  fi
+  sleep 2
+done
 ```

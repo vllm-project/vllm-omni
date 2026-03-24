@@ -6,6 +6,9 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 """
 
 import argparse
+import json
+import os
+from typing import Any
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
@@ -14,6 +17,7 @@ from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
 
 logger = init_logger(__name__)
@@ -45,13 +49,23 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
+        if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
+            os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
+            log_logo()
+
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        uvloop.run(omni_run_server(args))
+        if args.headless:
+            run_headless(args)
+        else:
+            uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
+            raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
+
         # Skip validation for diffusion models as they have different requirements
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
@@ -83,10 +97,24 @@ class OmniServeCommand(CLISubcommand):
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
         omni_config_group.add_argument(
+            "--task-type",
+            type=str,
+            default=None,
+            choices=["CustomVoice", "VoiceDesign", "Base"],
+            help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
+            "If not specified, will be inferred from model path.",
+        )
+        omni_config_group.add_argument(
             "--stage-configs-path",
             type=str,
             default=None,
             help="Path to the stage configs file. If not specified, the stage configs will be loaded from the model.",
+        )
+        omni_config_group.add_argument(
+            "--stage-id",
+            type=int,
+            default=None,
+            help="Select and launch a single stage by stage_id.",
         )
         omni_config_group.add_argument(
             "--stage-init-timeout",
@@ -136,6 +164,18 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="The address of the Ray cluster to connect to.",
         )
+        omni_config_group.add_argument(
+            "--omni-master-address",
+            "-oma",
+            type=str,
+            help="Hostname or IP address of the Omni orchestrator (master).",
+        )
+        omni_config_group.add_argument(
+            "--omni-master-port",
+            "-omp",
+            type=int,
+            help="Port of the Omni orchestrator (master).",
+        )
 
         # Diffusion model specific arguments
         omni_config_group.add_argument(
@@ -143,6 +183,13 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help="Number of GPUs to use for diffusion model inference.",
+        )
+        omni_config_group.add_argument(
+            "--model-class-name",
+            dest="model_class_name",
+            type=str,
+            default=None,
+            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
         )
         omni_config_group.add_argument(
             "--usp",
@@ -155,11 +202,42 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--ring",
+            "--ring-degree",
             dest="ring_degree",
             type=int,
             default=None,
             help="Ring Sequence Parallelism degree for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
+        )
+        omni_config_group.add_argument(
+            "--quantization-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON string for diffusion quantization_config. "
+                'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
+            ),
+        )
+
+        # HSDP (Hybrid Sharded Data Parallel) parameters
+        omni_config_group.add_argument(
+            "--use-hsdp",
+            dest="use_hsdp",
+            action="store_true",
+            help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models. "
+            "Shards model weights across GPUs to reduce per-GPU memory usage.",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-shard-size",
+            type=int,
+            default=-1,
+            help="Number of GPUs to shard weights across. -1 = auto (world_size / replicate_size).",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-replicate-size",
+            type=int,
+            default=1,
+            help="Number of replica groups for HSDP. Each group holds a full sharded copy.",
         )
 
         # Cache optimization parameters
@@ -191,6 +269,21 @@ class OmniServeCommand(CLISubcommand):
             "--vae-use-tiling",
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
+        )
+
+        # Parallel weight loading (faster diffusion startup)
+        omni_config_group.add_argument(
+            "--disable-multithread-weight-load",
+            action="store_false",
+            dest="enable_multithread_weight_load",
+            default=True,
+            help="Disable multi-threaded safetensors loading (default: enabled with 4 threads).",
+        )
+        omni_config_group.add_argument(
+            "--num-weight-load-threads",
+            type=int,
+            default=4,
+            help="Number of threads for parallel weight loading (default: 4).",
         )
 
         # diffusion model offload parameters
@@ -226,6 +319,14 @@ class OmniServeCommand(CLISubcommand):
             help="Number of devices for CFG parallel computation for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
         )
+        omni_config_group.add_argument(
+            "--vae-patch-parallel-size",
+            type=int,
+            default=1,
+            help="VAE Patch Parallelism degree for diffusion models. "
+            "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
+            "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
+        )
 
         # Default sampling parameters
         omni_config_group.add_argument(
@@ -242,7 +343,52 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             help="The max size of generate image (height * width).",
         )
+
+        # TTS-specific parameters
+        omni_config_group.add_argument(
+            "--tts-max-instructions-length",
+            type=int,
+            default=None,
+            help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+        )
+
+        # Enable diffusion pipeline profiling
+        omni_config_group.add_argument(
+            "--enable-diffusion-pipeline-profiler",
+            action="store_true",
+            help="Enable diffusion pipeline profiler to display stage durations.",
+        )
         return serve_parser
+
+
+def _create_default_diffusion_stage_cfg(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Create default diffusion stage configuration.
+
+    Uses AsyncOmniEngine's implementation which doesn't have OmegaConf
+    compatibility issues.
+    """
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    return AsyncOmniEngine._create_default_diffusion_stage_cfg(vars(args))
+
+
+def run_headless(args: argparse.Namespace) -> None:
+    """Run a single stage in headless mode.
+
+    .. deprecated:: 0.x.x
+        Headless mode is deprecated and will be removed in a future version.
+        It is only compatible with the old OmniStage-based runtime.
+        The current AsyncOmniEngine-based runtime does not support headless mode.
+
+    Raises:
+        RuntimeError: Always raises an error indicating headless mode is deprecated.
+    """
+    raise RuntimeError(
+        "Headless mode is deprecated and not supported in the current runtime. "
+        "Please use the standard orchestrator mode (without --headless flag). "
+        "If you need distributed deployment, consider using Ray backend or "
+        "other distributed serving solutions."
+    )
 
 
 def cmd_init() -> list[CLISubcommand]:

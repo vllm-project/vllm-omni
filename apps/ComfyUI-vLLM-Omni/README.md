@@ -47,46 +47,35 @@ If no, check your shell running the ComfyUI process. There may be some error mes
 This extension offers the following nodes based on the output modalities (at **ComfyUI sidebar -> Node Library**):
 
 - **Generate Image** for text-to-image and image-to-image tasks
-- **Multimodality Comprehension** for multimodality-to-text and multimodality-to-audio tasks
+- **Generate Video** for text-to-video and image-to-video tasks
+- **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
 
-> [!INFO]
+> [!NOTE]
 > The node UI and feature designs are intended to match vLLM-Omni online serving interfaces. It cannot offer more than what the interfaces support.
 
 To build a simple workflow yourself,
 
 - Drag a generation node onto the canvas.
 - Depending on your need, grab built-in multimedia file loader nodes, such as **image->Load Image**, **image->video->Load Video**, **audio->Load Audio**
-- Depending on your need, grab built-in multimedia file preview nodes, such as **image->Preview Image**, **image->video->Save Video**, **audio->Preview Audio**. For text output, you can install [ComfyUI-Custom-Scripts plugin](https://github.com/pythongosssss/ComfyUI-Custom-Scripts/) and grab its **utils->Show Text 🐍** node.
+- Depending on your need, grab built-in multimedia file preview nodes, such as **image->Preview Image**, **image->video->Save Video**, **audio->Preview Audio**, **utils->Preview as Text**.
 - If you want to tune sampling parameters, grab corresponding nodes from **vLLM-Omni-> Sampling Params**.
     - For multi-stage models, you can connect multiple **AR Sampling Params** and **Diffusion Sampling Params** nodes to a **Multi-Stage Sampling Params List** node, and connect this node to the generation node.
     - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
     - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
 
-**The following features are tested**:
-
-- Single-node workflows for
-    - Multimodal Comprehension (e.g., Qwen Omni, BAGEL)
-    - Text-to-Image Generation (e.g., Qwen-Image)
-    - Image-to-Image Generation (e.g., Qwen-Image-Edit)
-    - TTS (e.g., Qwen TTS, including VoiceDesign, VoiceClone, CustomVoice)
-
-**The following features are not currently tested**. They may work or break. You are welcomed to test it out and offer comments.
-
-- Multi-node workflow that connects multiple model services together.
-
 ## Screenshots and Examples
 
-### Multimodal comprehension (e.g., Qwen Omni series, BAGEL)
+### Multimodal understanding (e.g., Qwen Omni series, BAGEL)
 
-(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Annotated Example**)
+(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Multimodal Understanding**)
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-comprehension.jpg">
-    <img alt="vLLM-Omni Main Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-comprehension.jpg" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-understanding.jpg">
+    <img alt="vLLM-Omni multimodal understanding" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-understanding.jpg" width=55%>
   </picture>
 </p>
 
@@ -98,7 +87,7 @@ You can configure per-stage sampling parameters for multi-stage models.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-multi-stage.jpg">
-    <img alt="vLLM-Omni Main Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-multi-stage.jpg" width=55%>
+    <img alt="vLLM-Omni multiple stages" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-multi-stage.jpg" width=55%>
   </picture>
 </p>
 
@@ -109,12 +98,26 @@ You can configure per-stage sampling parameters for multi-stage models.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-image-generation.jpg">
-    <img alt="vLLM-Omni Main Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-image-generation.jpg" width=55%>
+    <img alt="vLLM-Omni image generation" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-image-generation.jpg" width=55%>
   </picture>
 </p>
 
 > [!TIP]
 > The node automatically choose text-to-image or image-to-image API endpoints depending on whether you connect an image input or not.
+
+### Text-to-video and image-to-video generation (e.g., Wan)
+
+(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Video Generation**)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-video-generation.jpg">
+    <img alt="vLLM-Omni video generation" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-video-generation.jpg" width=55%>
+  </picture>
+</p>
+
+> [!TIP]
+> The node automatically choose text-to-video or image-to-video API endpoints depending on whether you connect an image input or not.
 
 ### TTS (e.g., Qwen TTS series)
 
@@ -123,12 +126,23 @@ You can configure per-stage sampling parameters for multi-stage models.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-tts.jpg">
-    <img alt="vLLM-Omni Main Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-tts.jpg" width=55%>
+    <img alt="vLLM-Omni TTS" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-tts.jpg" width=55%>
   </picture>
 </p>
 
 > [!TIP]
 > There is a dedicated node for VoiceClone tasks with reference audio input. Other simple text-to-speech tasks should use the regular TTS node.
+
+### Chaining multiple model services
+
+(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Chaining Services**)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-chaining-services.jpg">
+    <img alt="vLLM-Omni TTS" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-chaining-services.jpg" width=55%>
+  </picture>
+</p>
 
 ## Develop
 

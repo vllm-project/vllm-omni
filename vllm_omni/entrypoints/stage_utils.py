@@ -1,30 +1,13 @@
 from __future__ import annotations
 
-import enum
-import json
 import logging
 import os
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
-from omegaconf import OmegaConf
+from vllm_omni.config.yaml_util import to_dict as _omega_to_dict
 
 logger = logging.getLogger(__name__)
-
-
-class OmniStageTaskType(enum.Enum):
-    GENERATE = "generate"
-    ABORT = "abort"
-    SHUTDOWN = "shutdown"
-    PROFILER_START = "profiler_start"
-    PROFILER_STOP = "profiler_stop"
-
-
-SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
-
-
-def is_profiler_task(task_type: OmniStageTaskType) -> bool:
-    return task_type in (OmniStageTaskType.PROFILER_START, OmniStageTaskType.PROFILER_STOP)
 
 
 def set_stage_devices(
@@ -89,7 +72,7 @@ def set_stage_devices(
                 else:
                     mapped_devices.append(str(idx))
             mapped_devices_str = ",".join(mapped_devices)
-            os.environ[env_var] = mapped_devices_str
+            current_omni_platform.set_device_control_env_var(mapped_devices_str)
             if toks:
                 try:
                     selected_physical = int(mapped_devices[0])
@@ -116,7 +99,7 @@ def set_stage_devices(
                     selected_physical = None
             if selected_physical is None:
                 selected_physical = int(logical_idx)
-            os.environ[env_var] = str(selected_physical)
+            current_omni_platform.set_device_control_env_var(str(selected_physical))
             logger.debug(
                 "[Stage-%s] Logical index %d -> physical %s; set %s to single device",
                 stage_id,
@@ -128,7 +111,7 @@ def set_stage_devices(
             logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
         else:
             selected_physical = int(str(devices))
-            os.environ[env_var] = str(selected_physical)
+            current_omni_platform.set_device_control_env_var(str(selected_physical))
             logger.debug("[Stage-%s] Set %s to single device %s (fallback)", stage_id, env_var, selected_physical)
     except Exception as e:
         logger.warning("Failed to interpret devices for stage %s: %s", stage_id, e)
@@ -188,58 +171,6 @@ def shm_read_bytes(meta: dict[str, Any]) -> bytes:
     return data
 
 
-def _ensure_parent_dir(path: str) -> None:
-    """Ensure the parent directory for a file path exists (best-effort)."""
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-    except Exception:
-        pass
-
-
-def append_jsonl(path: str, record: dict[str, Any]) -> None:
-    """Append a JSON record as one line to a JSONL file (best-effort).
-
-    This is safe to call from multiple processes when each process writes
-    to a distinct file. For concurrent writes to the same file, OS append
-    semantics typically suffice, but no additional locking is provided.
-    """
-    try:
-        _ensure_parent_dir(path)
-        line = json.dumps(record, ensure_ascii=False)
-        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-        with os.fdopen(fd, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        logger.exception("Failed to append JSONL to %s", path)
-
-
-def maybe_dump_to_shm(obj: Any, threshold: int) -> tuple[bool, Any]:
-    """Dump object to SHM if serialized size exceeds threshold.
-
-    Returns (True, meta) when dumped; otherwise (False, original_obj).
-    """
-    payload = serialize_obj(obj)
-    if len(payload) > threshold:
-        logger.debug(f"Dumping object to SHM with size: {len(payload)}")
-        return True, shm_write_bytes(payload, name=None)
-    return False, obj
-
-
-def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -> Any:
-    """Load object from container that may carry SHM or inline object.
-
-    Deprecated: prefer `maybe_load_from_ipc_with_metrics` to also obtain
-    decode-time and size metrics.
-    """
-    if shm_key in container:
-        from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
-
-        return OmniSerializer.deserialize(shm_read_bytes(container[shm_key]))
-    return container[obj_key]
-
-
 def maybe_load_from_ipc_with_metrics(
     container: dict[str, Any], obj_key: str, shm_key: str
 ) -> tuple[Any, dict[str, float]]:
@@ -276,27 +207,12 @@ def maybe_load_from_ipc_with_metrics(
     }
 
 
-def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> dict[str, Any]:
-    """Return a dict payload for IPC: inline (obj_key) or SHM (shm_key).
-
-    When serialized size exceeds threshold, returns {shm_key: {name,size}};
-    otherwise returns {obj_key: obj}.
-    """
-    payload: dict[str, Any] = {}
-    use_shm, data = maybe_dump_to_shm(obj, threshold)
-    if use_shm:
-        payload[shm_key] = data
-    else:
-        payload[obj_key] = data
-    return payload
-
-
 # Convert OmegaConf/objects to plain dicts
 def _to_dict(x: Any) -> dict[str, Any]:
     try:
         if isinstance(x, dict):
             return dict(x)
-        return OmegaConf.to_container(x, resolve=True)  # type: ignore[arg-type]
+        return _omega_to_dict(x)
     except Exception:
         try:
             return dict(x)

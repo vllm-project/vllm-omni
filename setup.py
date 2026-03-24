@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from setuptools import setup
+from setuptools_scm import get_version
 
 
 def uninstall_onnxruntime() -> None:
@@ -104,6 +105,66 @@ def detect_target_device() -> str:
         return "cuda"
 
 
+def get_vllm_omni_version() -> str:
+    """
+    Get the vLLM-Omni version with device-specific suffix.
+
+    Version format: {base_version}+{device}
+    Examples:
+        - 0.14.0+cuda (release version with CUDA)
+        - 0.14.1.dev23+g1a2b3c4.rocm (dev version with ROCm)
+        - 0.15.0+npu (release version with NPU)
+
+    Environment variables:
+        VLLM_OMNI_VERSION_OVERRIDE: Override version completely
+        VLLM_OMNI_TARGET_DEVICE: Override device detection
+
+    Returns:
+        Version string with device suffix
+    """
+    # Allow complete version override via environment variable
+    if env_version := os.getenv("VLLM_OMNI_VERSION_OVERRIDE"):
+        print(f"Overriding vLLM-Omni version with {env_version} from VLLM_OMNI_VERSION_OVERRIDE")
+        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
+        # Get version without device suffix for override case
+        version = get_version(write_to="vllm_omni/_version.py")
+    else:
+        # Generate version from git tags via setuptools_scm (without writing yet)
+        try:
+            version = get_version()
+        except Exception as e:
+            print(f"Warning: Failed to get version from git, using fallback: {e}")
+            version = "dev"
+
+        # Determine separator: '+' for normal versions, '.' for dev versions with '+'
+        sep = "+" if "+" not in version else "."
+
+        # Append device-specific suffix
+        device = detect_target_device()
+
+        if device == "cuda":
+            # if it is cuda, following vLLM
+            # we don't need to add any suffix
+            pass
+        elif device == "rocm":
+            version += f"{sep}rocm"
+        elif device == "npu":
+            version += f"{sep}npu"
+        elif device == "xpu":
+            version += f"{sep}xpu"
+        elif device == "cpu":
+            version += f"{sep}cpu"
+        else:
+            raise RuntimeError(f"Unknown target device: {device}")
+
+    # Tell setuptools_scm to use this version
+    # This will be picked up by write_to and written to _version.py
+    os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = version
+    get_version(write_to="vllm_omni/_version.py")  # Write the correct version
+    print(f"Generated version: {version}")
+    return version
+
+
 def load_requirements(file_path: Path) -> list[str]:
     """
     Load requirements from a file, supporting -r directive for recursive loading.
@@ -167,5 +228,6 @@ if __name__ == "__main__":
 
     # Setup configuration
     setup(
+        version=get_vllm_omni_version(),
         install_requires=install_requires,
     )

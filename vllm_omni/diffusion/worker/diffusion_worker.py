@@ -34,10 +34,13 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
@@ -63,6 +66,7 @@ class DiffusionWorker:
         local_rank: int,
         rank: int,
         od_config: OmniDiffusionConfig,
+        skip_load_model: bool = False,
     ):
         self.local_rank = local_rank
         self.rank = rank
@@ -79,8 +83,9 @@ class DiffusionWorker:
             od_config=self.od_config,
             device=self.device,
         )
-        self.load_model(load_format=self.od_config.diffusion_load_format)
-        self.init_lora_manager()
+        if not skip_load_model:
+            self.load_model(load_format=self.od_config.diffusion_load_format)
+            self.init_lora_manager()
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
@@ -103,6 +108,7 @@ class DiffusionWorker:
         vllm_config = VllmConfig(compilation_config=CompilationConfig())
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
+        vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
@@ -122,6 +128,9 @@ class DiffusionWorker:
                 ring_degree=parallel_config.ring_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
+                hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
+                enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
             init_workspace_manager(self.device)
 
@@ -143,7 +152,10 @@ class DiffusionWorker:
                 self.rank,
                 process_memory / GiB_bytes,
             )
-        assert self.model_runner.pipeline is not None
+
+        # When load_format is "dummy", pipeline will init with custom pipeline later
+        if load_format != "dummy":
+            assert self.model_runner.pipeline is not None
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -184,6 +196,19 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         return self.model_runner.execute_model(req)
 
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one diffusion step by delegating to the model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        if self.lora_manager is not None:
+            # Step mode does not support LoRA yet. Clear any previously active
+            # adapter first so worker-local LoRA state cannot leak in.
+            self.lora_manager.set_active_adapter(None)
+
+        if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
+            raise ValueError("Step mode does not support LoRA yet.")
+
+        return self.model_runner.execute_stepwise(scheduler_output)
+
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -192,8 +217,10 @@ class DiffusionWorker:
     def remove_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.remove_adapter(adapter_id)
 
-    def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
-        return self.lora_manager.add_adapter(lora_request, lora_scale)
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        # NOTE (Alex): We have not implemented the API routing
+        # for the frontend server yet.
+        return self.lora_manager.add_adapter(lora_request)
 
     def list_loras(self) -> list[int]:
         return self.lora_manager.list_adapters()
@@ -364,9 +391,13 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: DiffusionOutput):
+    def return_result(self, output: object):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
+            try:
+                pack_diffusion_output_shm(output)
+            except Exception as e:
+                logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
             self.result_mq.enqueue(output)
 
     def recv_message(self):
@@ -518,10 +549,15 @@ class WorkerWrapperBase:
         worker_class = self._prepare_worker_class()
 
         # Create the actual worker instance
+        # When custom_pipeline_args is provided, skip initial model loading
+        # since re_init_pipeline will handle it. This avoids allocating memory
+        # through CuMemAllocator twice, which causes assertion failures in
+        # sleep mode.
         self.worker = worker_class(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
+            skip_load_model=(self.custom_pipeline_args is not None),
         )
 
         # Re-initialize pipeline with custom pipeline if provided
@@ -601,6 +637,10 @@ class WorkerWrapperBase:
             DiffusionOutput with generated results
         """
         return self.worker.execute_model(reqs, od_config)
+
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one diffusion step."""
+        return self.worker.execute_stepwise(scheduler_output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """

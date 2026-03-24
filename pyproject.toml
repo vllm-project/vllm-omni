@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-omni"
-version = "0.14.0"
+dynamic = ["version", "dependencies"]
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -17,7 +17,6 @@ authors = [
     {name = "vLLM-Omni Team"}
 ]
 keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
-dynamic = ["dependencies"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -41,6 +40,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
     "openai-whisper>=20250625",
@@ -48,7 +48,11 @@ dev = [
     "soundfile>=0.13.1",
     "imageio[ffmpeg]>=0.6.0",
     "opencv-python>=4.12.0.88",
-    "mooncake-transfer-engine==0.3.8.post1"
+    "mooncake-transfer-engine==0.3.8.post1",
+    "av", # for ComfyUI tests
+    "openpyxl>=3.0.0", # for nightly CI
+    "pyttsx3>=2.99",
+    "mistune>=3.2.0", # for example tests
 ]
 
 docs = [
@@ -83,7 +87,11 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
+"vllm_omni" = ["_version.py", "py.typed"]
 "vllm_omni.model_executor.stage_configs" = ["*.yaml"]
+
+[tool.setuptools_scm]
+# no extra settings needed, presence enables setuptools-scm
 
 [tool.ruff]
 line-length = 120
@@ -155,11 +163,13 @@ markers = [
     "omni: Omni model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
+    "example: Doc example code tests",
     # platform markers
     "cpu: Tests that run on CPU",
     "gpu: Tests that run on GPU (auto-added)",
     "cuda: Tests that run on CUDA (auto-added)",
     "rocm: Tests that run on AMD/ROCm (auto-added)",
+    "xpu: Tests that run on XPU (auto-added)",
     "npu: Tests that run on NPU/Ascend (auto-added)",
     # specified computation resources marks (auto-added)
     "H100: Tests that require H100 GPU",
@@ -169,9 +179,11 @@ markers = [
     "A3: Tests that require A3 NPU",
     "distributed_cuda: Tests that require multi cards on CUDA platform",
     "distributed_rocm: Tests that require multi cards on ROCm platform",
+    "distributed_xpu: Tests that require multi cards on XPU platform",
     "distributed_npu: Tests that require multi cards on NPU platform",
     "skipif_cuda: Skip if the num of CUDA cards is less than the required",
     "skipif_rocm: Skip if the num of ROCm cards is less than the required",
+    "skipif_xpu: Skip if the num of XPU cards is less than the required",
     "skipif_npu: Skip if the num of NPU cards is less than the required",
     # more detailed markers
     "slow: Slow tests (may skip in quick CI)",
@@ -197,3 +209,5 @@ extend-ignore-identifiers-re = [
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
 ]
+[tool.typos.default.extend-words]
+ue = "ue"

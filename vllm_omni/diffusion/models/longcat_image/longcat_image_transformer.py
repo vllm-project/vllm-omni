@@ -18,11 +18,10 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
-    get_sp_group,
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.platforms import current_omni_platform
@@ -50,6 +49,7 @@ class FeedForward(nn.Module):
 class LongCatImageAttention(nn.Module):
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         query_dim: int,
         heads: int = 8,
         dim_head: int = 64,
@@ -64,7 +64,7 @@ class LongCatImageAttention(nn.Module):
         pre_only: bool = False,
     ):
         super().__init__()
-
+        self.parallel_config = parallel_config
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
@@ -209,12 +209,8 @@ class LongCatImageAttention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            # Check if SP is enabled from forward context (set by LongCatImageTransformer2DModel)
-            forward_ctx = get_forward_context()
-            sp_size = forward_ctx.sequence_parallel_size
-            use_sp_joint_attention = sp_size > 1 and not forward_ctx.split_text_embed_in_sp
-
-            if use_sp_joint_attention:
+            sp_size = self.parallel_config.sequence_parallel_size
+            if sp_size is not None and sp_size > 1:
                 # SP Mode: Use common helper for RoPE + joint attention
                 hidden_states = self._sp_attention_with_rope(
                     img_query=query,
@@ -248,12 +244,22 @@ class LongCatImageAttention(nn.Module):
             # In SP mode, image part is chunked: (B, txt_len + img_len/SP, D)
 
             # Check if SP is enabled and we have text_seq_len info
-            forward_ctx = get_forward_context()
-            sp_size = forward_ctx.sequence_parallel_size
+            sp_size = self.parallel_config.sequence_parallel_size
             text_seq_len = kwargs.get("text_seq_len", None)
-            use_sp_single_stream = sp_size > 1 and not forward_ctx.split_text_embed_in_sp and text_seq_len is not None
+            forward_ctx = get_forward_context()
 
-            if use_sp_single_stream:
+            if (
+                sp_size is not None
+                and sp_size > 1
+                and not forward_ctx.split_text_embed_in_sp
+                and text_seq_len is not None
+            ):
+                # Ensure that the SP split won't cause out of bounds issues.
+                if text_seq_len < 0 or text_seq_len > query.shape[1]:
+                    raise ValueError(
+                        f"text_seq_len={text_seq_len} is out of bounds for sequence length {query.shape[1]}"
+                    )
+
                 # SP Mode for single-stream block:
                 # Split QKV into text and image parts, then use common helper
                 hidden_states = self._sp_attention_with_rope(
@@ -301,6 +307,7 @@ class LongCatImageAttention(nn.Module):
 class LongCatImageTransformerBlock(nn.Module):
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
@@ -309,10 +316,12 @@ class LongCatImageTransformerBlock(nn.Module):
     ):
         super().__init__()
 
+        self.parallel_config = parallel_config
         self.norm1 = AdaLayerNormZero(dim)
         self.norm1_context = AdaLayerNormZero(dim)
 
         self.attn = LongCatImageAttention(
+            parallel_config=parallel_config,
             query_dim=dim,
             added_kv_proj_dim=dim,
             dim_head=attention_head_dim,
@@ -429,6 +438,61 @@ class LongCatImageTimestepEmbeddings(nn.Module):
         return timesteps_emb
 
 
+class RoPEPreparer(nn.Module):
+    """
+    This module encapsulates RoPE computation to enable _sp_plan sharding
+    for text / image components.
+
+    For LongCat, which uses dual-stream attention, this means that text
+    components are replicated across SP ranks, while image components are
+    sharded.
+    """
+
+    def __init__(self, pos_embed: LongCatImagePosEmbed):
+        super().__init__()
+        self.pos_embed = pos_embed
+
+    def forward(
+        self,
+        txt_ids: torch.Tensor,
+        img_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute RoPE embeddings for text and image sequences.
+
+        Args:
+            txt_ids: Text position IDs (txt_seq_len, n_axes)
+            img_ids: Image position IDs (img_seq_len, n_axes)
+
+        Returns:
+            Tuple of cosine / sine components for text & image
+            in the order: (txt_cos, txt_sin, img_cos, img_sin)
+
+        NOTE: careful about output orders if this is refactored in the
+        future; we need to match the _sp_plan indices, since text
+        components (0 & 1) need to be replicated across SP ranks,
+        while image components (2 & 3) must be sharded.
+        """
+        # Concatenate and compute RoPE for full sequence
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+
+        if current_omni_platform.is_npu():
+            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
+            freqs_cos = freqs_cos.npu()
+            freqs_sin = freqs_sin.npu()
+        else:
+            freqs_cos, freqs_sin = self.pos_embed(ids)
+
+        # Split into text and image portions
+        txt_len = txt_ids.shape[0]
+        txt_cos = freqs_cos[:txt_len]
+        txt_sin = freqs_sin[:txt_len]
+        img_cos = freqs_cos[txt_len:]
+        img_sin = freqs_sin[txt_len:]
+
+        return txt_cos, txt_sin, img_cos, img_sin
+
+
 class LongCatImageSingleTransformerBlock(nn.Module):
     """
     Single-stream Transformer block for LongCat with SP (Sequence Parallelism) support.
@@ -437,7 +501,14 @@ class LongCatImageSingleTransformerBlock(nn.Module):
     This keeps the block logic clean and centralizes SP logic in the attention layer.
     """
 
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
+    def __init__(
+        self,
+        parallel_config: DiffusionParallelConfig,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        mlp_ratio: float = 4.0,
+    ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
@@ -448,6 +519,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
 
         # SP handling is delegated to LongCatImageAttention via text_seq_len kwarg
         self.attn = LongCatImageAttention(
+            parallel_config=parallel_config,
             query_dim=dim,
             dim_head=attention_head_dim,
             heads=num_attention_heads,
@@ -509,25 +581,40 @@ class LongCatImageTransformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
+
+    # Sequence Parallelism for LongCat (following diffusers' _cp_plan pattern)
+    _sp_plan = {
+        "": {
+            # Chunk the hidden states prior to the forward()
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
+        },
+        # Shard RoPE image embeddings after rope_preparer computes them
+        # Outputs 0, 1 are text components, so they aren't sharded
+        # Outputs 2, 3 are image components and are sharded
+        "rope_preparer": {
+            2: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),
+            3: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),
+        },
+        # Gather at the last linear projection
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
-        patch_size: int = 1,
-        in_channels: int = 64,
-        num_layers: int = 19,
-        num_single_layers: int = 38,
-        attention_head_dim: int = 128,
-        num_attention_heads: int = 24,
-        joint_attention_dim: int = 3584,
-        pooled_projection_dim: int = 3584,
-        axes_dims_rope: list[int] = [16, 56, 56],
     ):
         super().__init__()
+        model_config = od_config.tf_model_config
+        patch_size = model_config.patch_size
+        in_channels = model_config.in_channels
+        num_layers = model_config.num_layers
+        num_single_layers = model_config.num_single_layers
+        attention_head_dim = model_config.attention_head_dim
+        num_attention_heads = model_config.num_attention_heads
+        joint_attention_dim = model_config.joint_attention_dim
+        pooled_projection_dim = model_config.pooled_projection_dim
+        axes_dims_rope = getattr(model_config, "axes_dims_rope", [16, 56, 56])
         self.out_channels = in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.pooled_projection_dim = pooled_projection_dim
@@ -536,6 +623,7 @@ class LongCatImageTransformer2DModel(nn.Module):
         self.parallel_config = od_config.parallel_config
 
         self.pos_embed = LongCatImagePosEmbed(theta=10000, axes_dim=axes_dims_rope)
+        self.rope_preparer = RoPEPreparer(self.pos_embed)
 
         self.time_embed = LongCatImageTimestepEmbeddings(embedding_dim=self.inner_dim)
 
@@ -545,6 +633,7 @@ class LongCatImageTransformer2DModel(nn.Module):
         self.transformer_blocks = nn.ModuleList(
             [
                 LongCatImageTransformerBlock(
+                    parallel_config=self.parallel_config,
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -556,6 +645,7 @@ class LongCatImageTransformer2DModel(nn.Module):
         self.single_transformer_blocks = nn.ModuleList(
             [
                 LongCatImageSingleTransformerBlock(
+                    parallel_config=self.parallel_config,
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -582,31 +672,12 @@ class LongCatImageTransformer2DModel(nn.Module):
         guidance: torch.Tensor = None,
         return_dict: bool = True,
     ) -> torch.FloatTensor | Transformer2DModelOutput:
-        # Before: hidden_states shape = (B, img_seq_len, in_channels)
-        # After:  hidden_states shape = (B, img_seq_len // SP, in_channels)
+        fwd_context = get_forward_context()
         sp_size = self.parallel_config.sequence_parallel_size
-        # Store SP size in forward context for sub-modules to access
-        get_forward_context().sequence_parallel_size = sp_size
-        if sp_size > 1:
-            sp_world_size = get_sequence_parallel_world_size()
-            sp_rank = get_sequence_parallel_rank()
-            original_shape = hidden_states.shape
-            hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
-            # LongCat uses dual-stream (text + image) with joint attention
-            # Text embeddings should be replicated across SP ranks for correctness
-            get_forward_context().split_text_embed_in_sp = False
-            # Debug log (only first forward)
-            if not hasattr(self, "_sp_forward_logged"):
-                self._sp_forward_logged = True
-                logger.info(
-                    f"[LongCat Transformer] SP enabled: sp_size={sp_size}, world_size={sp_world_size}, "
-                    f"rank={sp_rank}, original_shape={original_shape}, chunked_shape={hidden_states.shape}"
-                )
-        else:
-            if not hasattr(self, "_sp_forward_logged"):
-                self._sp_forward_logged = True
-                logger.info(f"[LongCat Transformer] SP disabled: sp_size={sp_size}")
+        if sp_size is not None and sp_size > 1:
+            fwd_context.split_text_embed_in_sp = False
 
+        # Hidden states are sharded prior to forward() when sp is active
         hidden_states = self.x_embedder(hidden_states)
 
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -614,87 +685,38 @@ class LongCatImageTransformer2DModel(nn.Module):
         temb = self.time_embed(timestep, hidden_states.dtype)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        ids = torch.cat((txt_ids, img_ids), dim=0)
+        # Compute RoPE embeddings via rope_preparer module
+        # _sp_plan will automatically shard img_cos/img_sin (outputs 2, 3)
+        # txt_cos/txt_sin (outputs 0, 1) remain replicated for dual-stream attention
+        txt_cos, txt_sin, img_cos, img_sin = self.rope_preparer(txt_ids, img_ids)
 
-        if current_omni_platform.is_npu():
-            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-            image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
-        else:
-            image_rotary_emb = self.pos_embed(ids)
+        # Reconstruct image_rotary_emb with chunked values
+        # Final shape: (txt_seq_len + img_seq_len // SP, head_dim)
+        image_rotary_emb = (
+            torch.cat([txt_cos, img_cos], dim=0),
+            torch.cat([txt_sin, img_sin], dim=0),
+        )
 
-        # SP: Chunk RoPE embeddings along sequence dimension
-        if self.parallel_config.sequence_parallel_size > 1:
-            sp_world_size = get_sequence_parallel_world_size()
-            sp_rank = get_sequence_parallel_rank()
-            freqs_cos, freqs_sin = image_rotary_emb
-            txt_len = txt_ids.shape[0]
-
-            # Split RoPE into text and image portions
-            # txt_freqs: (txt_seq_len, head_dim) - keep full for all ranks
-            # img_freqs: (img_seq_len, head_dim) -> (img_seq_len // SP, head_dim)
-            txt_freqs_cos = freqs_cos[:txt_len]
-            txt_freqs_sin = freqs_sin[:txt_len]
-            img_freqs_cos = freqs_cos[txt_len:]
-            img_freqs_sin = freqs_sin[txt_len:]
-
-            # Chunk image RoPE for each SP rank
-            # img_freqs_cos: (img_seq_len // SP, head_dim)
-            # img_freqs_sin: (img_seq_len // SP, head_dim)
-            img_freqs_cos = torch.chunk(img_freqs_cos, sp_world_size, dim=0)[sp_rank]
-            img_freqs_sin = torch.chunk(img_freqs_sin, sp_world_size, dim=0)[sp_rank]
-
-            # Optionally chunk text RoPE if split_text_embed_in_sp is True
-            if get_forward_context().split_text_embed_in_sp:
-                txt_freqs_cos = torch.chunk(txt_freqs_cos, sp_world_size, dim=0)[sp_rank]
-                txt_freqs_sin = torch.chunk(txt_freqs_sin, sp_world_size, dim=0)[sp_rank]
-
-            # Reconstruct image_rotary_emb with chunked values
-            # Final shape: (txt_seq_len + img_seq_len // SP, head_dim)
-            image_rotary_emb = (
-                torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
-                torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
             )
 
-        for index_block, block in enumerate(self.transformer_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_checkpoint[index_block]:
-                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    image_rotary_emb,
-                )
-            else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                )
-
-        for index_block, block in enumerate(self.single_transformer_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_single_checkpoint[index_block]:
-                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    image_rotary_emb,
-                )
-            else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                )
+        for block in self.single_transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+            )
 
         hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
 
-        # SP: All-gather output to reconstruct full sequence
-        if self.parallel_config.sequence_parallel_size > 1:
-            output = get_sp_group().all_gather(output, dim=1)
+        # proj_out gathers for sequence parallel
+        output = self.proj_out(hidden_states)
 
         if not return_dict:
             return (output,)
@@ -713,6 +735,8 @@ class LongCatImageTransformer2DModel(nn.Module):
             (".add_kv_proj", ".add_k_proj", "k"),
             (".add_kv_proj", ".add_v_proj", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 
