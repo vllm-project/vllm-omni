@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from transformers.utils.hub import cached_file
@@ -1052,9 +1053,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
         if isinstance(audio_tensor, list):
-            import torch
-
-            audio_tensor = torch.cat(audio_tensor, dim=-1)
+            async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
+            if async_chunk:
+                non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
+                audio_tensor = (
+                    torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
+                )
+            else:
+                audio_history = audio_tensor
+                audio_tensor = np.zeros((0,), dtype=np.float32)
+                # Non-async Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.
+                for candidate in reversed(audio_history):
+                    if candidate.numel() > 0:
+                        audio_tensor = candidate
+                        break
         if hasattr(audio_tensor, "float"):
             audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
