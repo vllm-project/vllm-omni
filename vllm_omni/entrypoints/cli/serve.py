@@ -201,6 +201,15 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ulysses_degree.",
         )
         omni_config_group.add_argument(
+            "--ulysses-mode",
+            type=str,
+            default="strict",
+            choices=["strict", "advanced_uaa"],
+            help="Ulysses sequence-parallel mode for diffusion models. "
+            "'strict' keeps the original divisibility requirements; "
+            "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",

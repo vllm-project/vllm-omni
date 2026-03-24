@@ -697,7 +697,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
         # TODO(Peiqi): add voice_type support
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
-            voice_type=self.voice_type,
+            speaker=self.voice_type,
             output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
             output_token_ids=thinker_output_token_ids,
             thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
@@ -711,7 +711,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
     def _thinker_to_talker_prefill(
         self,
-        voice_type: str,
+        speaker: str,
         output_prompt_embeds,
         output_token_ids,
         thinker_prompt_embeds,
@@ -726,7 +726,7 @@ class Qwen2_5OmniForConditionalGeneration(
         prompt_embeds = torch.cat(
             [
                 thinker_prompt_embeds,
-                self._get_embed_text_spk_token(voice_type) + self.embed_codec_pad_token,
+                self._get_embed_text_spk_token(speaker) + self.embed_codec_pad_token,
                 output_prompt_embeds[:1] + self.embed_codec_bos_token,
             ],
             dim=0,

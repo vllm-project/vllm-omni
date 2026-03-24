@@ -7,6 +7,7 @@ expects from any stage client.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -152,7 +153,27 @@ class StageDiffusionClient:
         """
         kwargs = kwargs or {}
 
-        if method in {"add_lora", "remove_lora", "list_loras", "pin_lora", "start_profile", "stop_profile"}:
+        # Handle profile method: inject stage_id into profile_prefix for diffusion stages
+        if method == "profile":
+            target = getattr(self._engine, method, None)
+            if target is None:
+                return {
+                    "supported": False,
+                    "todo": True,
+                    "reason": f"AsyncOmniDiffusion.{method} is not implemented",
+                }
+            # Extract is_start and profile_prefix from args
+            is_start = args[0] if args else True
+            profile_prefix = args[1] if len(args) > 1 else None
+            # Generate profile_prefix with stage_id if starting and no prefix provided
+            if is_start and profile_prefix is None:
+                profile_prefix = f"stage_{self.stage_id}_diffusion_{int(time.time())}"
+            result = target(is_start, profile_prefix)
+            if timeout is not None:
+                return await asyncio.wait_for(result, timeout=timeout)
+            return await result
+
+        if method in {"add_lora", "remove_lora", "list_loras", "pin_lora"}:
             target = getattr(self._engine, method, None)
             if target is None:
                 return {

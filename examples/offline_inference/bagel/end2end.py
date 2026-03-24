@@ -70,6 +70,12 @@ def parse_args():
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="Quantization method (e.g. 'fp8').",
+    )
 
     args = parser.parse_args()
     return args
@@ -119,6 +125,8 @@ def main():
             "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         }
     )
+    if args.quantization:
+        omni_kwargs["quantization_config"] = args.quantization
 
     omni = Omni(model=model_name, **omni_kwargs)
 
