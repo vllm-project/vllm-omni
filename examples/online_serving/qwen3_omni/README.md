@@ -15,7 +15,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 If you want to open async chunking for qwen3-omni, launch the server with command below
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
 ```
 
 If you have custom stage configs file, launch the server with command below
@@ -79,7 +79,7 @@ You can control output modalities to specify which types of output the model sho
 | Modalities | Output |
 |------------|--------|
 | `["text"]` | Text only |
-| `["audio"]` | Text + Audio |
+| `["audio"]` | Audio only |
 | `["text", "audio"]` | Text + Audio |
 | Not specified | Text + Audio (default) |
 
@@ -100,13 +100,13 @@ curl http://localhost:8091/v1/chat/completions \
 #### Text + Audio
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     "messages": [{"role": "user", "content": "Describe vLLM in brief."}],
     "modalities": ["audio"]
-  }'
+  }' | jq -r '.choices[0].message.audio.data' | base64 -d > output.wav
 ```
 
 ### Using Python client
@@ -137,6 +137,7 @@ print(response.choices[0].message.content)
 #### Text + Audio
 
 ```python
+import base64
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
@@ -144,11 +145,15 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["audio"]
+    modalities=["text", "audio"]
 )
 # Response contains two choices: one with text, one with audio
 print(response.choices[0].message.content)  # Text response
-print(response.choices[1].message.audio)    # Audio response
+
+# Save audio to file
+audio_data = base64.b64decode(response.choices[1].message.audio.data)
+with open("output.wav", "wb") as f:
+    f.write(audio_data)
 ```
 
 ## Speaker selection
