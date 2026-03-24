@@ -67,6 +67,22 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - label: "Custom Pipeline Test"
+    depends_on: upload-ready-pipeline
+    commands:
+      - timeout 20m pytest -s -v tests/e2e/offline_inference/custom_pipeline/ -m "core_model"
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Diffusion Model CPU offloading Test"
     depends_on: upload-ready-pipeline
     commands:
