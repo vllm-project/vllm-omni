@@ -76,6 +76,8 @@ plugins:
       # exclude files
       exclude:
         - api/*
+        # Hook-generated content under docs/generated/ is gitignored; no git history for per-file dates.
+        - generated/**
         - user_guide/examples/**
         - contributing/design_documents/api_design_template.md
         - DOCS_GUIDE.md
@@ -122,7 +124,10 @@ plugins:
           - https://numpy.org/doc/stable/objects.inv
           # Temporarily disabled due to decompression errors
           # - https://pytorch.org/docs/stable/objects.inv
-          - https://psutil.readthedocs.io/en/stable/objects.inv
+          # Temporary disabled due to HTTP 404 error
+          # - https://psutil.readthedocs.io/en/stable/objects.inv
+          - https://psutil.readthedocs.io/objects.inv
+
 
 markdown_extensions:
   - attr_list
