@@ -199,17 +199,17 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: ":full_moon: Omni Model Perf Test & Test Case Statistics"
-    key: nightly-performance
+    key: nightly-omni-performance
     timeout_in_minutes: 180
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - export BENCHMARK_DIR=tests
+      - export BENCHMARK_DIR=tests/perf/results
       - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
-      - buildkite-agent artifact upload "tests/*.json"
-      - python tools/nightly/buildkite_testcase_statistics.py -o tests/buildkite_testcase_statistics.html
-      - buildkite-agent artifact upload "tests/*.html"
+      - buildkite-agent artifact upload "tests/perf/results/*.json"
+      - python tools/nightly/buildkite_testcase_statistics.py -o tests/perf/results/buildkite_testcase_statistics.html
+      - buildkite-agent artifact upload "tests/perf/results/*.html"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -295,16 +295,20 @@ steps:
   - label: ":email: Nightly Collection & Email"
     key: nightly-perf-distribution
     depends_on:
-      - nightly-performance
+      - nightly-omni-performance
+      - nightly-qwen-image-performance
     if: build.env("NIGHTLY") == "1"
     commands:
       - pip install openpyxl
-      - export DEFAULT_INPUT_DIR=tests
-      - export DEFAULT_OUTPUT_DIR=tests
-      - buildkite-agent artifact download "tests/*.json" . --step nightly-performance
-      - buildkite-agent artifact download "tests/*.html" . --step nightly-performance
+      - export DEFAULT_INPUT_DIR=tests/perf/results
+      - export DEFAULT_OUTPUT_DIR=tests/perf/results
+      - buildkite-agent artifact download "tests/perf/results/*.json" . --step nightly-omni-performance
+      - buildkite-agent artifact download "tests/perf/results/*.json" . --step nightly-qwen-image-performance
+      - buildkite-agent artifact download "tests/perf/results/*.html" . --step nightly-omni-performance
       - python tools/nightly/generate_nightly_perf_excel.py
-      - python tools/nightly/send_nightly_email.py --report-file "tests/*.xlsx, tests/*.html"
-      - buildkite-agent artifact upload "tests/*.xlsx"
+      - python tools/nightly/generate_nightly_perf_html.py
+      - python tools/nightly/send_nightly_email.py --report-file "tests/perf/results/*.xlsx, tests/perf/results/*.html"
+      - buildkite-agent artifact upload "tests/perf/results/*.xlsx"
+      - buildkite-agent artifact upload "tests/perf/results/*.html"
     agents:
       queue: "cpu_queue_premerge"
