@@ -8,8 +8,8 @@ Supports two server backends:
     benchmarks with diffusion_benchmark_serving.py --backend sglang
 
 A config JSON file is REQUIRED via --config-file:
-  pytest run_diffusion_benchmark.py --config-file tests/perf/tests/test_qwen_image_vllm_omni.json
-  pytest run_diffusion_benchmark.py --config-file tests/perf/tests/test_qwen_image_sglang_diffusion.json
+  pytest run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+  pytest run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_sglang_diffusion.json
 
 JSON config entries are distinguished by a "server_type" field ("vllm-omni" or "sglang").
 sglang entries support two additional fields under server_params:
@@ -50,7 +50,7 @@ _DEFAULT_RESULT_DIR = Path(__file__).parent.parent / "results"
 BENCHMARK_RESULT_DIR = Path(os.environ.get("DIFFUSION_BENCHMARK_DIR", str(_DEFAULT_RESULT_DIR)))
 
 BENCHMARK_SCRIPT = str(
-    Path(__file__).parent.parent.parent.parent / "benchmarks" / "diffusion" / "diffusion_benchmark_serving.py"
+    Path(__file__).parent.parent.parent.parent.parent / "benchmarks" / "diffusion" / "diffusion_benchmark_serving.py"
 )
 
 # Single aggregated result file for the entire benchmark session.
@@ -76,11 +76,8 @@ def _get_config_file_from_argv() -> str | None:
 
 CONFIG_FILE_PATH = _get_config_file_from_argv()
 if CONFIG_FILE_PATH is None:
-    raise ValueError(
-        "--config-file is required. Pass the path to a benchmark config JSON, e.g.:\n"
-        "  pytest run_diffusion_benchmark.py "
-        "--config-file tests/perf/tests/test_qwen_image_vllm_omni.json"
-    )
+    print("No config file provided, using default config file: tests/dfx/perf/tests/test_qwen_image_vllm_omni.json")
+    CONFIG_FILE_PATH = "tests/dfx/perf/tests/test_qwen_image_vllm_omni.json"
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -149,7 +146,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help=(
             "Path to the benchmark config JSON file (required). "
-            "Example: --config-file tests/perf/tests/test_qwen_image_vllm_omni.json"
+            "Example: --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json"
         ),
     )
 

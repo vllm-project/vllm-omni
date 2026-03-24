@@ -253,11 +253,11 @@ steps:
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - export DIFFUSION_BENCHMARK_DIR=tests/perf/results
+      - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
       - export CACHE_DIT_VERSION=1.3.0
-      - pytest -s -v tests/perf/scripts/run_diffusion_benchmark.py --config-file tests/perf/tests/test_qwen_image_vllm_omni.json
-      - buildkite-agent artifact upload "tests/perf/results/benchmark_results_*.json"
-      - buildkite-agent artifact upload "tests/perf/results/logs/*.log"
+      - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+      - buildkite-agent artifact upload "tests/dfx/perf/results/benchmark_results_*.json"
+      - buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
     agents:
       queue: "mithril-h100-pool"
     plugins:

@@ -1,0 +1,241 @@
+[
+    {
+        "test_name": "test_sglang_qwen_image_single_device",
+        "description": "sglang: single-device baseline (no parallelism)",
+        "server_type": "sglang",
+        "server_params": {
+            "model": "Qwen/Qwen-Image",
+            "serve_args": {
+                "num-gpus": 1,
+                "dit-cpu-offload": false,
+                "text-encoder-cpu-offload": false,
+                "vae-cpu-offload": false
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps20",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 20,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            },
+            {
+                "name": "1536x1536_steps35",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 1536,
+                "height": 1536,
+                "num-inference-steps": 35,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            },
+            {
+                "name": "mixed_resolution",
+                "dataset": "random",
+                "task": "t2i",
+                "num-inference-steps": 20,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "random-request-config": [
+                    {"width": 512,  "height": 512,  "num_inference_steps": 20, "weight": 0.15},
+                    {"width": 768,  "height": 768,  "num_inference_steps": 20, "weight": 0.25},
+                    {"width": 1024, "height": 1024, "num_inference_steps": 25, "weight": 0.45},
+                    {"width": 1536, "height": 1536, "num_inference_steps": 35, "weight": 0.15}
+                ],
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            }
+        ]
+    },
+
+    {
+        "test_name": "test_sglang_qwen_image_ulysses2_cfg2_vae_patch4",
+        "description": "sglang: USP=2 + CFG-parallel=2 + VAE patch parallel via --use-parallel-tiling",
+        "server_type": "sglang",
+        "server_params": {
+            "model": "Qwen/Qwen-Image",
+            "serve_args": {
+                "num-gpus": 4,
+                "sp-degree": 2,
+                "ulysses-degree": 2,
+                "enable-cfg-parallel": true,
+                "use-parallel-tiling": true,
+                "dit-cpu-offload": false,
+                "text-encoder-cpu-offload": false,
+                "vae-cpu-offload": false
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps20",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 20,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            },
+            {
+                "name": "1536x1536_steps35",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 1536,
+                "height": 1536,
+                "num-inference-steps": 35,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            },
+            {
+                "name": "mixed_resolution",
+                "dataset": "random",
+                "task": "t2i",
+                "num-inference-steps": 20,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "random-request-config": [
+                    {"width": 512,  "height": 512,  "num_inference_steps": 20, "weight": 0.15},
+                    {"width": 768,  "height": 768,  "num_inference_steps": 20, "weight": 0.25},
+                    {"width": 1024, "height": 1024, "num_inference_steps": 25, "weight": 0.45},
+                    {"width": 1536, "height": 1536, "num_inference_steps": 35, "weight": 0.15}
+                ],
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            }
+        ]
+    },
+
+    {
+        "test_name": "test_sglang_qwen_image_ulysses2_cfg2_cache_dit",
+        "description": "sglang: USP=2 + CFG-parallel=2 + Cache-DiT via YAML config (--cache-dit-config)",
+        "server_type": "sglang",
+        "server_params": {
+            "model": "Qwen/Qwen-Image",
+            "cache_dit_config": {
+                "cache_config": {
+                    "Fn_compute_blocks": 1,
+                    "Bn_compute_blocks": 0,
+                    "max_warmup_steps": 4,
+                    "residual_diff_threshold": 0.24,
+                    "max_continuous_cached_steps": 3,
+                    "enable_taylorseer": false,
+                    "taylorseer_order": 1,
+                    "scm_steps_mask_policy": "none",
+                    "scm_steps_policy": "dynamic"
+                },
+                "parallelism_config": {
+                    "ulysses_size": 2,
+                    "attention_backend": "native"
+                }
+            },
+            "serve_args": {
+                "num-gpus": 4,
+                "sp-degree": 2,
+                "ulysses-degree": 2,
+                "enable-cfg-parallel": true,
+                "dit-cpu-offload": false,
+                "text-encoder-cpu-offload": false,
+                "vae-cpu-offload": false
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps20",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 20,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            },
+            {
+                "name": "1536x1536_steps35",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 1536,
+                "height": 1536,
+                "num-inference-steps": 35,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            },
+            {
+                "name": "mixed_resolution",
+                "dataset": "random",
+                "task": "t2i",
+                "num-inference-steps": 20,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "random-request-config": [
+                    {"width": 512,  "height": 512,  "num_inference_steps": 20, "weight": 0.15},
+                    {"width": 768,  "height": 768,  "num_inference_steps": 20, "weight": 0.25},
+                    {"width": 1024, "height": 1024, "num_inference_steps": 25, "weight": 0.45},
+                    {"width": 1536, "height": 1536, "num_inference_steps": 35, "weight": 0.15}
+                ],
+                "baseline": {
+                    "throughput_qps": 0.001,
+                    "latency_p99": 1000.0,
+                    "peak_memory_mb_max": 400000,
+                    "peak_memory_mb_mean": 400000
+                }
+            }
+        ]
+    }
+]
