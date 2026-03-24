@@ -1,13 +1,18 @@
 """In-memory LRU cache for voice extraction artifacts.
 
-Model-agnostic: stores ``dict[str, Any]`` keyed by audio content hash.
-Any TTS model can use this with the 3-line pattern::
+Model-agnostic: stores ``dict[str, Any]`` keyed by a cache key that
+combines a voice identifier with the extraction mode.
 
-    audio_hash = VoiceEmbeddingCache.compute_audio_hash(wav, sr)
-    cached = cache.get(audio_hash)
+For uploaded voices the identifier is the voice name (cheap, no hashing).
+For inline ref_audio the identifier is a content hash (SHA-256 prefix).
+
+Usage::
+
+    key = VoiceEmbeddingCache.make_cache_key("alice", xvec_only=False)
+    cached = cache.get(key)
     if cached is None:
         # ... extract ...
-        cache.put(audio_hash, {"artifact": result})
+        cache.put(key, {"artifact": result})
 """
 
 import hashlib
@@ -22,7 +27,7 @@ logger = init_logger(__name__)
 
 
 class VoiceEmbeddingCache:
-    """LRU cache for voice extraction outputs, keyed by audio content hash.
+    """LRU cache for voice extraction outputs.
 
     Each entry stores a ``dict[str, Any]`` whose contents are model-specific.
     Thread-safe via a lightweight ``threading.Lock``.
@@ -37,34 +42,46 @@ class VoiceEmbeddingCache:
 
     @staticmethod
     def compute_audio_hash(wav: np.ndarray, sr: int) -> str:
-        """Compute a 16-char hex hash from normalised audio + sample rate."""
+        """Compute a 16-char hex hash from normalised audio + sample rate.
+
+        Only needed for inline ref_audio (no voice name).
+        """
         h = hashlib.sha256(wav.astype(np.float32).tobytes())
         h.update(str(sr).encode())
         return h.hexdigest()[:16]
 
-    def get(self, audio_hash: str) -> dict[str, Any] | None:
+    @staticmethod
+    def make_cache_key(identifier: str, xvec_only: bool) -> str:
+        """Build a cache key from a voice identifier and extraction mode.
+
+        Args:
+            identifier: Voice name (for uploaded voices) or audio content
+                hash (for inline ref_audio).
+            xvec_only: True for speaker-embedding-only mode, False for
+                ICL mode (speaker embedding + ref_code).
+        """
+        mode = "xvec" if xvec_only else "icl"
+        return f"{identifier}:{mode}"
+
+    def get(self, key: str) -> dict[str, Any] | None:
         """Return cached artifacts or ``None`` on miss.  Promotes to MRU on hit."""
         with self._lock:
-            if audio_hash in self._cache:
-                self._cache.move_to_end(audio_hash)
+            if key in self._cache:
+                self._cache.move_to_end(key)
                 self._hits += 1
-                logger.debug(
-                    "Voice cache HIT (hash=%s, hits=%d)",
-                    audio_hash[:8],
-                    self._hits,
-                )
-                return self._cache[audio_hash]
+                logger.debug("Voice cache HIT (key=%s, hits=%d)", key, self._hits)
+                return self._cache[key]
             self._misses += 1
             return None
 
-    def put(self, audio_hash: str, artifacts: dict[str, Any]) -> None:
-        """Store *artifacts* under *audio_hash*, evicting the LRU entry if full."""
+    def put(self, key: str, artifacts: dict[str, Any]) -> None:
+        """Store *artifacts* under *key*, evicting the LRU entry if full."""
         with self._lock:
-            self._cache[audio_hash] = artifacts
-            self._cache.move_to_end(audio_hash)
+            self._cache[key] = artifacts
+            self._cache.move_to_end(key)
             while len(self._cache) > self._max_entries:
-                evicted_hash, _ = self._cache.popitem(last=False)
-                logger.debug("Voice cache EVICT (hash=%s)", evicted_hash[:8])
+                evicted_key, _ = self._cache.popitem(last=False)
+                logger.debug("Voice cache EVICT (key=%s)", evicted_key)
 
     def stats(self) -> dict[str, int]:
         """Return cache statistics."""
