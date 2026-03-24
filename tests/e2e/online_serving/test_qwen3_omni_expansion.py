@@ -424,7 +424,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: single request
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300, embed_audio=True)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
@@ -452,7 +452,7 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
     Input Setting: stream=True
     Datasets: few requests
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300, embed_audio=True)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,

@@ -33,7 +33,7 @@ stage_args:
     temperature: 0.4
     top_p: 0.9
     top_k: 1
-    max_tokens: 200
+    max_tokens: 130
     seed: 42
     ignore_eos: False
     detokenize: True

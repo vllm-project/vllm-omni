@@ -577,8 +577,20 @@ def _mux_mp4_bytes_with_synthetic_audio(
         return video_mp4_bytes
 
 
-def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> dict[str, Any]:
-    """Generate synthetic video with bouncing balls, AAC audio from :func:`generate_synthetic_audio`, and base64."""
+def generate_synthetic_video(
+    width: int,
+    height: int,
+    num_frames: int,
+    save_to_file: bool = False,
+    *,
+    embed_audio: bool = False,
+) -> dict[str, Any]:
+    """Generate synthetic video with bouncing balls and base64 MP4.
+
+    When ``embed_audio`` is True, muxes mono AAC from :func:`generate_synthetic_audio`
+    (TTS + ffmpeg) into the MP4; otherwise returns video-only MP4 (faster when tests do
+    not need an audio track).
+    """
 
     import cv2
     import imageio
@@ -686,7 +698,10 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
         print(f"Warning: Failed to encode synthetic video: {e}")
         raise
 
-    video_bytes = _mux_mp4_bytes_with_synthetic_audio(video_only_bytes, num_frames=num_frames, fps=float(fps))
+    if embed_audio:
+        video_bytes = _mux_mp4_bytes_with_synthetic_audio(video_only_bytes, num_frames=num_frames, fps=float(fps))
+    else:
+        video_bytes = video_only_bytes
 
     if save_to_file:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
