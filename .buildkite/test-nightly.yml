@@ -246,6 +246,52 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
+  - label: ":full_moon: Qwen-Image Diffusion Perf Test with H100"
+    key: nightly-qwen-image-performance
+    timeout_in_minutes: 300
+    depends_on: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1"
+    commands:
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - export DIFFUSION_BENCHMARK_DIR=tests/perf/results
+      - export CACHE_DIT_VERSION=1.3.0
+      - pytest -s -v tests/perf/scripts/run_diffusion_benchmark.py --config-file tests/perf/tests/test_qwen_image_vllm_omni.json
+      - buildkite-agent artifact upload "tests/perf/results/benchmark_results_*.json"
+      - buildkite-agent artifact upload "tests/perf/results/logs/*.log"
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 4
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
   - label: ":email: Nightly Collection & Email"
     key: nightly-perf-distribution
     depends_on:

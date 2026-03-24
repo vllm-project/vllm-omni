@@ -204,7 +204,7 @@ class DiffusionWorker:
             # adapter first so worker-local LoRA state cannot leak in.
             self.lora_manager.set_active_adapter(None)
 
-        if any(req_state.req.sampling_params.lora_request is not None for req_state in scheduler_output.req_states):
+        if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
             raise ValueError("Step mode does not support LoRA yet.")
 
         return self.model_runner.execute_stepwise(scheduler_output)

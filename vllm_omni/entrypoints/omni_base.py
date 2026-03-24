@@ -246,6 +246,7 @@ class OmniBase:
         req_id = result.get("request_id")
         engine_outputs = result.get("engine_outputs")
         stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
+        peak_memory_mb = getattr(result["engine_outputs"], "peak_memory_mb", 0.0)
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")
@@ -281,6 +282,7 @@ class OmniBase:
             request_output=engine_outputs,
             images=images,
             stage_durations=stage_durations,
+            peak_memory_mb=peak_memory_mb,
         )
 
     def shutdown(self) -> None:
