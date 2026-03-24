@@ -49,7 +49,7 @@ def test_send_multimodal_request_001(omni_server) -> None:
         "--model",
         omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
     ]
 
     result = run_cmd(command)
@@ -85,7 +85,7 @@ def test_send_multimodal_request_002(omni_server) -> None:
         "--model",
         omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--prompt",
         "Analyze all the media content and provide a comprehensive summary.",
     ]
@@ -117,7 +117,7 @@ def test_send_multimodal_request_002(omni_server) -> None:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_003(omni_server) -> None:
-    command = ["bash", os.path.join(example_dir, "qwen2_5_omni/run_curl_multimodal_generation.sh"), "mixed_modalities"]
+    command = ["bash", os.path.join(example_dir, "qwen2_5_omni/run_curl_multimodal_generation.sh"), "use_mixed_modalities"]
 
     result = run_cmd(command)
 
@@ -144,7 +144,7 @@ def test_modality_control_001(omni_server) -> None:
         "--model",
         omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--modalities",
         "text",
     ]
@@ -174,7 +174,7 @@ def test_modality_control_002(omni_server) -> None:
         "--model",
         omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--modalities",
         "audio",
     ]
@@ -203,7 +203,7 @@ def test_modality_control_003(omni_server) -> None:
         "--model",
         omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--modalities",
         "audio,text",
     ]
@@ -240,7 +240,7 @@ def test_stream_001(omni_server) -> None:
         "--model",
         omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--stream",
     ]
 
