@@ -123,14 +123,13 @@ python text_to_image.py \
 
 `Tongyi-MAI/Z-Image-Turbo` is a distilled version of Z-Image. Distilled diffusion models usually require less number of inference steps (4~9), and Classifier-Free Guidance (CFG) is usually NOT applied. Similar distilled models are `black-forest-labs/FLUX.2-klein-4B` and `black-forest-labs/FLUX.2-klein-9B`.
 
-Hybrid Ulysses + Ring example (requires 4 GPUs):
+Advanced UAA example (requires 2 GPUs):
 
 ```bash
 python text_to_image.py \
   --model Tongyi-MAI/Z-Image-Turbo \
   --prompt "a cup of coffee on the table" \
   --ulysses-degree 2 \
-  --ring-degree 2 \
   --ulysses-mode advanced_uaa \
   --height 1024 \
   --width 1024 \
