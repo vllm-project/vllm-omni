@@ -100,7 +100,7 @@ def build_payload(
 
     if task_type == "CustomVoice":
         if voice:
-            payload["voice"] = voice
+            payload["speaker"] = voice
         if instructions and instructions.strip():
             payload["instructions"] = instructions.strip()
 

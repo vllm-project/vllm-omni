@@ -65,7 +65,7 @@ def run_tts_generation(args) -> None:
     payload = {
         "model": args.model,
         "input": args.text,
-        "voice": args.voice,
+        "speaker": args.speaker,
         "response_format": args.response_format,
     }
 
@@ -95,7 +95,7 @@ def run_tts_generation(args) -> None:
     print(f"Model: {args.model}")
     print(f"Task type: {args.task_type or 'CustomVoice'}")
     print(f"Text: {args.text}")
-    print(f"Voice: {args.voice}")
+    print(f"Speaker: {args.speaker}")
     print("Generating audio...")
 
     # Make the API call
@@ -178,10 +178,10 @@ def parse_args():
 
     # Voice/speaker
     parser.add_argument(
-        "--voice",
+        "--speaker",
         type=str,
         default="vivian",
-        help="Speaker/voice name (default: vivian). Options: vivian, ryan, aiden, etc.",
+        help="Speaker name (default: vivian). Options: vivian, ryan, aiden, etc.",
     )
     parser.add_argument(
         "--language",

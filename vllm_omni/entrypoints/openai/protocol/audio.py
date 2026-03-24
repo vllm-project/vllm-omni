@@ -9,7 +9,7 @@ class OpenAICreateSpeechRequest(BaseModel):
     model: str | None = None
     voice: str | None = Field(
         default=None,
-        description="Voice to use. For OpenAI: alloy, echo, etc. For Qwen3-TTS: Vivian, Ryan, etc.",
+        description="Speaker/voice to use. For Qwen3-TTS: vivian, ryan, aiden, etc.",
     )
     instructions: str | None = Field(
         default=None,
