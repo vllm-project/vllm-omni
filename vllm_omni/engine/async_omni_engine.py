@@ -63,6 +63,7 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
 )
+from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 
 logger = init_logger(__name__)
 
@@ -412,6 +413,13 @@ class AsyncOmniEngine:
             input_processor = None
             if started.stage_id == 0:
                 input_processor = InputProcessor(vllm_config=started.vllm_config)
+                # Use omni preprocessor so text-only prompts with
+                # mm_processor_kwargs (e.g. GLM-Image t2i target_h/target_w)
+                # still go through multimodal processor path.
+                input_processor.input_preprocessor = OmniInputPreprocessor(
+                    vllm_config=started.vllm_config,
+                    renderer=input_processor.renderer,
+                )
         except Exception:
             try:
                 stage_client.shutdown()
