@@ -444,6 +444,9 @@ class AsyncOmniEngine:
         llm_stage_count = sum(
             1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
         )
+        from vllm_omni.platforms import current_omni_platform
+
+        device_control_env = current_omni_platform.device_control_env_var
 
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)
@@ -468,19 +471,31 @@ class AsyncOmniEngine:
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
 
                     if metadata.stage_type == "diffusion":
-                        setup_stage_devices(stage_id, metadata.runtime_cfg)
-                        omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-                        if omni_conn_cfg:
-                            from vllm_omni.entrypoints.utils import inject_omni_kv_config
+                        # IMPORTANT: device visibility env vars are process-global.
+                        # Guard diffusion stage init with the same lock as LLM stage
+                        # launch and restore previous visibility after init to avoid
+                        # leaking per-stage device bindings across stages.
+                        with llm_stage_launch_lock:
+                            previous_visible_devices = os.environ.get(device_control_env)
+                            try:
+                                setup_stage_devices(stage_id, metadata.runtime_cfg)
+                                omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+                                if omni_conn_cfg:
+                                    from vllm_omni.entrypoints.utils import inject_omni_kv_config
 
-                            inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                        _inject_kv_stage_info(stage_cfg, stage_id)
-                        stage_clients[stage_id] = initialize_diffusion_stage(
-                            self.model,
-                            stage_cfg,
-                            metadata,
-                            batch_size=self.diffusion_batch_size,
-                        )
+                                    inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                                _inject_kv_stage_info(stage_cfg, stage_id)
+                                stage_clients[stage_id] = initialize_diffusion_stage(
+                                    self.model,
+                                    stage_cfg,
+                                    metadata,
+                                    batch_size=self.diffusion_batch_size,
+                                )
+                            finally:
+                                if previous_visible_devices is None:
+                                    current_omni_platform.unset_device_control_env_var()
+                                else:
+                                    current_omni_platform.set_device_control_env_var(previous_visible_devices)
                         logger.info(
                             "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
                             stage_id,
