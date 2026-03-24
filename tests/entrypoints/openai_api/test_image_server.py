@@ -194,7 +194,7 @@ def async_omni_test_client():
     ]
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
-        max_generated_image_size=4096,  # 64*64
+        max_generated_image_size=1048576,  # 1024*1024 to support resolution tests
     )
     return TestClient(app)
 
@@ -754,6 +754,119 @@ def test_image_edit_parameter_pass(async_omni_test_client):
         assert data["size"] == "16x24"
 
 
+def test_image_edit_layers_and_resolution(async_omni_test_client):
+    """Test layers and resolution parameters for layered models."""
+    img_bytes = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "decompose into layers",
+            "layers": 4,
+            "resolution": 1024,
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+    assert captured_sampling_params.layers == 4
+    assert captured_sampling_params.resolution == 1024
+
+
+def test_image_edit_resolution_auto_size(async_omni_test_client):
+    """Test that size='auto' with resolution lets pipeline calculate dimensions."""
+    img_bytes = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "test",
+            "size": "auto",
+            "resolution": 640,
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+    # When resolution is set with size=auto, width/height should be None
+    # to let pipeline calculate based on resolution
+    assert captured_sampling_params.width is None
+    assert captured_sampling_params.height is None
+    assert captured_sampling_params.resolution == 640
+
+
+def test_image_edit_invalid_resolution(async_omni_test_client):
+    """Test that invalid resolution values are rejected with 400."""
+    img_bytes = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "test",
+            "resolution": 512,  # Invalid, only 640 or 1024 are supported
+        },
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "Invalid resolution" in detail
+    assert "512" in detail
+
+
+def test_image_edit_invalid_layers(async_omni_test_client):
+    """Test that invalid layers values (< 1) are rejected with 400."""
+    img_bytes = make_test_image_bytes((16, 16))
+
+    # Test layers = 0
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "test",
+            "layers": 0,
+        },
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "Invalid layers" in detail
+    assert "layers must be >= 1" in detail
+
+    # Test layers = -1
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "test",
+            "layers": -1,
+        },
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "Invalid layers" in detail
+
+
+def test_image_edit_resolution_and_size_conflict(async_omni_test_client):
+    """Test that providing both resolution and explicit size raises 400."""
+    img_bytes = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "test",
+            "resolution": 1024,
+            "size": "512x512",  # Conflict: both resolution and explicit size
+        },
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "Cannot specify both" in detail
+    assert "resolution" in detail
+    assert "size" in detail
+
+
 def test_image_edit_parameter_default(async_omni_test_client):
     img_bytes_1 = make_test_image_bytes((24, 16))
 
@@ -776,12 +889,13 @@ def test_image_edit_parameter_default(async_omni_test_client):
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
 
+    # Test that a size exceeding max_generated_image_size returns 400
     response = async_omni_test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes_1)],
         data={
             "prompt": "hello world.",
-            "size": "96x96",
+            "size": "2048x2048",  # 4,194,304 pixels > max_generated_image_size (1,048,576)
         },
     )
     assert response.status_code == 400

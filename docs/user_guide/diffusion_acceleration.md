@@ -72,6 +72,7 @@ The following table shows which models are currently supported by each accelerat
 | **FLUX.2-klein** | `black-forest-labs/FLUX.2-klein-4B` | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | **FLUX.2-dev** | `black-forest-labs/FLUX.2-dev` | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | **FLUX.1-Kontext-dev** | `black-forest-labs/FLUX.1-Kontext-dev` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **GLM-Image** | `zai-org/GLM-Image` | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ |
 
 ### VideoGen
 
@@ -91,6 +92,12 @@ The following table shows which models are currently supported by each accelerat
 | **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ | ✅ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ |
 
+
+### AudioGen
+
+| Model                  | Model Identifier                         | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
+|------------------------|------------------------------------------|:--------:|:---------:|:----------:|:--------------:|:------------:|
+| **Stable-Audio-Open**  | `stabilityai/stable-audio-open-1.0`      |    ✅    |           |            |                |              |
 
 ## Performance Benchmarks
 

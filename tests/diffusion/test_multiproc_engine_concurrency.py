@@ -274,20 +274,19 @@ class TestSerialOperations:
         assert result.error == "result_for_Y"
 
     def test_serial_collective_rpc_all_ranks(self):
-        """``collective_rpc`` without *unique_reply_rank* collects
-        ``num_gpus`` responses.
+        """``collective_rpc`` without *unique_reply_rank* returns a single
+        response from rank 0 (only rank 0 has a result_mq).
         """
         engine, _, _, res_q = _make_engine(num_gpus=2)
 
-        # Pre-populate two results (simulating two workers replying)
+        # Pre-populate one result (only rank 0 replies via result_mq)
         res_q.put(_tagged_output("rank0"))
-        res_q.put(_tagged_output("rank1"))
 
         results = engine.collective_rpc("ping", args=("multi",))
 
-        assert len(results) == 2
+        # Only 1 response expected since only rank 0 has result_mq
+        assert len(results) == 1
         assert results[0].error == "rank0"
-        assert results[1].error == "rank1"
 
     def test_serial_add_req_then_collective_rpc(self):
         engine, _, req_q, res_q = _make_engine()

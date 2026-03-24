@@ -18,6 +18,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Sequence
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -802,6 +803,7 @@ class AsyncOmniEngine:
         if parallel_config is None:
             ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
             ring_degree = normalized_kwargs.get("ring_degree") or 1
+            ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
@@ -819,6 +821,7 @@ class AsyncOmniEngine:
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
+                ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 use_hsdp=use_hsdp,
@@ -857,6 +860,15 @@ class AsyncOmniEngine:
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
                     "quantization": kwargs.get("quantization", None),
                     "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+                    **(
+                        {
+                            "profiler_config": asdict(kwargs["profiler_config"])
+                            if hasattr(kwargs["profiler_config"], "__dataclass_fields__")
+                            else kwargs["profiler_config"]
+                        }
+                        if kwargs.get("profiler_config") is not None
+                        else {}
+                    ),
                 },
                 "final_output": True,
                 "final_output_type": "image",
