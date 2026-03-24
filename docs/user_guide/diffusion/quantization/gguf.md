@@ -12,7 +12,7 @@
 
 ## Architecture Overview
 1. `OmniDiffusionConfig` accepts `quantization` or `quantization_config`.
-2. Diffusion quantization wrapper (`DiffusionGgufConfig`) produces vLLM `QuantizationConfig` objects for linear layers.
+2. Diffusion quantization wrapper (`DiffusionGGUFConfig`) produces vLLM `QuantizationConfig` objects for linear layers.
 3. `DiffusersPipelineLoader` branches on quantization method and loads either HF weights or GGUF weights for the transformer.
 4. GGUF transformer loading is routed through model-specific adapters (e.g., Flux2Klein).
 5. vLLM GGUF path uses `GGUFConfig` and `GGUFLinearMethod` for matmul.
