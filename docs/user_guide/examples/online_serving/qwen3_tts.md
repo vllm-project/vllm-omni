@@ -21,10 +21,10 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 
 Two interactive Gradio demos are available, both supporting all 3 task types:
 
-| Demo | File | Transport | Streaming Quality |
-| ---- | ---- | --------- | ----------------- |
-| Standard | `gradio_demo.py` | HTTP chunked | May have small gaps between chunks |
-| FastRTC | `gradio_fastrtc_demo.py` | WebRTC | Gapless streaming (requires `pip install fastrtc`) |
+| Demo     | File                     | Transport    | Streaming Quality                                  |
+| -------- | ------------------------ | ------------ | -------------------------------------------------- |
+| Standard | `gradio_demo.py`         | HTTP chunked | May have small gaps between chunks                 |
+| FastRTC  | `gradio_fastrtc_demo.py` | WebRTC       | Gapless streaming (requires `pip install fastrtc`) |
 
 ```bash
 # Option 1: Launch server + Standard Gradio together
@@ -138,7 +138,7 @@ The Python client supports the following command-line arguments:
 - `--language`: Language. Options: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, `Italian`
 - `--instructions`: Voice style/emotion instructions
 - `--ref-audio`: Reference audio file path or URL for voice cloning (Base task)
-- `--ref-text`: Reference audio transcript for voice cloning (Base task)
+- `--ref-text`: Reference audio transcript for voice cloning (Base task). Local paths are automatically base64-encoded by the client before sending to the server.
 - `--response-format`: Audio output format (default: `wav`). Options: `wav`, `mp3`, `flac`, `pcm`, `aac`, `opus`
 - `--output` (or `-o`): Output audio file path (default: `tts_output.wav`)
 
@@ -311,14 +311,14 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 
 ### vLLM-Omni Extension Parameters
 
-| Parameter        | Type   | Default       | Description                                                                  |
-| ---------------- | ------ | ------------- | ---------------------------------------------------------------------------- |
-| `task_type`      | string | "CustomVoice" | Task: CustomVoice, VoiceDesign, or Base                                      |
-| `language`       | string | "Auto"        | Language (see supported languages below)                                     |
-| `instructions`   | string | ""            | Voice style/emotion instructions                                             |
-| `max_new_tokens` | int    | 2048          | Maximum tokens to generate                                                   |
-| `initial_codec_chunk_frames` | int | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
-| `stream`         | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
+| Parameter                    | Type   | Default       | Description                                                                                                          |
+| ---------------------------- | ------ | ------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `task_type`                  | string | "CustomVoice" | Task: CustomVoice, VoiceDesign, or Base                                                                              |
+| `language`                   | string | "Auto"        | Language (see supported languages below)                                                                             |
+| `instructions`               | string | ""            | Voice style/emotion instructions                                                                                     |
+| `max_new_tokens`             | int    | 2048          | Maximum tokens to generate                                                                                           |
+| `initial_codec_chunk_frames` | int    | null          | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
+| `stream`                     | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`)                                         |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
