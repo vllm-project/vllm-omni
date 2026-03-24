@@ -362,7 +362,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error(f"Could not read audio file for voice {voice_name}: {e}")
             return None
 
-    async def upload_voice(self, audio_file: UploadFile, consent: str, name: str) -> dict:
+    async def upload_voice(
+        self,
+        audio_file: UploadFile,
+        consent: str,
+        name: str,
+        ref_text: str | None = None,
+        voice_description: str | None = None,
+    ) -> dict:
         """Upload a new voice sample."""
         # Validate file size (max 10MB)
         MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
@@ -415,7 +422,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Check if voice already exists
         if voice_name_lower in self.uploaded_speakers:
-            raise ValueError(f"Voice '{name}' already exists")
+            raise ValueError(
+                f"Voice '{name}' already exists. To re-register this voice, delete it first and then upload it again."
+            )
 
         # Sanitize name and consent to prevent path traversal
         sanitized_name = _sanitize_filename(name)
@@ -459,6 +468,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "cache_generated_at": None,  # The initial cache generation time is empty.
         }
 
+        # Store ref_text for ICL (in-context learning) mode if provided.
+        if ref_text and ref_text.strip():
+            speaker_data["ref_text"] = ref_text.strip()
+
+        # Store voice description if provided.
+        if voice_description and voice_description.strip():
+            speaker_data["voice_description"] = voice_description.strip()
+
         # Save metadata using metadata manager (concurrency safe)
         success = self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
         if not success:
@@ -476,13 +493,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         logger.info(f"Uploaded new voice '{name}' with consent ID '{consent}'")
 
         # Return voice information without exposing the server file path
-        return {
+        result = {
             "name": name,
             "consent": consent,
             "created_at": timestamp,
             "mime_type": mime_type,
             "file_size": file_size,
         }
+        if speaker_data.get("ref_text"):
+            result["ref_text"] = speaker_data["ref_text"]
+        if speaker_data.get("voice_description"):
+            result["voice_description"] = speaker_data["voice_description"]
+        return result
 
     async def delete_voice(self, name: str) -> bool:
         """
@@ -798,7 +820,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_data = self._get_uploaded_audio_data(request.voice)
                 if audio_data:
                     params["ref_audio"] = [audio_data]
-                    params["x_vector_only_mode"] = [True]
+                    # Use ICL mode if ref_text available otherwise x_vector_only
+                    speaker_info = self.uploaded_speakers[request.voice.lower()]
+                    stored_ref_text = speaker_info.get("ref_text")
+                    if stored_ref_text:
+                        params["ref_text"] = [stored_ref_text]
+                        params["x_vector_only_mode"] = [False]
+                    else:
+                        params["x_vector_only_mode"] = [True]
                     logger.info(f"Auto-set ref_audio for uploaded voice: {request.voice}")
                 else:
                     raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
