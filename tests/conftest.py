@@ -514,6 +514,9 @@ def _mux_mp4_bytes_with_synthetic_audio(
 
     Uses ffmpeg from ``imageio_ffmpeg`` when available, else ``ffmpeg`` on PATH.
     If TTS or mux fails, returns ``video_mp4_bytes`` unchanged.
+
+    Mux subprocess does **not** use ``capture_output=True``: ffmpeg can block writing
+    to a full stderr pipe while :func:`subprocess.run` waits for exit (classic deadlock).
     """
     duration_sec = num_frames / fps if fps > 0 else 0.0
     # generate_synthetic_audio(duration=int) uses at least 1s of buffer internally
@@ -551,6 +554,7 @@ def _mux_mp4_bytes_with_synthetic_audio(
             cmd = [
                 ffmpeg_exe,
                 "-y",
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -569,10 +573,20 @@ def _mux_mp4_bytes_with_synthetic_audio(
                 "+faststart",
                 out_path,
             ]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                cmd,
+                check=True,
+                stdin=subprocess.DEVNULL,
+                timeout=300,
+            )
             with open(out_path, "rb") as f:
                 return f.read()
-    except (FileNotFoundError, subprocess.CalledProcessError, OSError) as e:
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ) as e:
         logger.warning("Synthetic video: audio mux failed (%s); using video-only MP4.", e)
         return video_mp4_bytes
 

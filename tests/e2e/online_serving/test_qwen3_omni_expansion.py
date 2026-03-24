@@ -101,7 +101,7 @@ def get_prompt(prompt_type="text_only"):
         "text_video": "What is in this video? ",
         "text_image": "What is in this image? ",
         "text_audio": "What is in this audio? ",
-        "text_audio_video": "What is in this audio? What is in this video? ",
+        "text_audio_video": "First, what is in this audio? Then, what is in this video? ",
         "one_word": "What is the capital of France? Answer in one words.",
     }
     return prompts.get(prompt_type, prompts["text_only"])
@@ -436,7 +436,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": False,
         "use_audio_in_video": True,
-        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep"]},
+        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep", "electronic"]},
     }
     openai_client.send_omni_request(request_config)
 
@@ -464,7 +464,7 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "use_audio_in_video": True,
-        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep"]},
+        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep", "electronic"]},
     }
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
