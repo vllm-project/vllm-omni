@@ -39,7 +39,9 @@ def fetch_voices(api_base: str) -> list[str]:
             )
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("voices", ["Vivian", "Ryan"])
+            voices = data.get("voices") or []
+            if voices:
+                return voices
     except Exception:
         pass
     return ["Vivian", "Ryan"]
