@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
+from diffusers import AutoencoderKLLTX2Audio, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg, retrieve_timesteps
@@ -24,6 +24,9 @@ from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+    DistributedAutoencoderKLLTX2Video,
+)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -158,7 +161,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin):
             local_files_only=local_files_only,
         ).to(self.device)
 
-        self.vae = AutoencoderKLLTX2Video.from_pretrained(
+        self.vae = DistributedAutoencoderKLLTX2Video.from_pretrained(
             model,
             subfolder="vae",
             torch_dtype=dtype,
