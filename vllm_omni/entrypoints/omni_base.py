@@ -292,6 +292,37 @@ class OmniBase:
     def close(self) -> None:
         self.shutdown()
 
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
+        """Start profiling specified stages.
+
+        Uses vLLM-compatible profile(is_start=True, profile_prefix) interface.
+
+        Args:
+            profile_prefix: Optional prefix for the trace file names.
+            stages: List of stage IDs to profile. If None, profiles all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.engine.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages.
+
+        Uses vLLM-compatible profile(is_start=False) interface.
+
+        Args:
+            stages: List of stage IDs to profile. If None, stops all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.engine.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
+
     def _shutdown_base(self) -> None:
         if getattr(self, "_shutdown_called", False):
             return

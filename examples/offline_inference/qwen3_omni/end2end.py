@@ -353,9 +353,9 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_enabled = args.enable_profiler
     if profiler_enabled:
-        omni.start_profile(stages=[0])
+        omni.start_profile(stages=args.profiler_stages)
     omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
@@ -405,7 +405,7 @@ def main(args):
         if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
-            omni.stop_profile()
+            omni.stop_profile(stages=args.profiler_stages)
 
             print("[Info] Waiting 30s for workers to write trace files to disk...")
             time.sleep(30)
@@ -531,6 +531,19 @@ def parse_args():
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--enable-profiler",
+        action="store_true",
+        default=False,
+        help="Enables profiling when set.",
+    )
+    parser.add_argument(
+        "--profiler-stages",
+        type=int,
+        nargs="*",
+        default=None,
+        help="List of stage IDs to profile. If not set, profiles all stages.",
     )
 
     return parser.parse_args()

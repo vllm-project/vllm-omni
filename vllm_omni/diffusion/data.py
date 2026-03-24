@@ -21,6 +21,8 @@ from vllm_omni.diffusion.quantization import (
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 
 if TYPE_CHECKING:
+    from vllm.config import ProfilerConfig
+
     from vllm_omni.diffusion.quantization import DiffusionQuantizationConfig
 
 # Import after TYPE_CHECKING to avoid circular imports at runtime
@@ -476,6 +478,8 @@ class OmniDiffusionConfig:
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
 
+    profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
+
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
@@ -542,6 +546,11 @@ class OmniDiffusionConfig:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
+
+        if isinstance(self.profiler_config, dict):
+            from vllm.config import ProfilerConfig
+
+            self.profiler_config = ProfilerConfig(**self.profiler_config)
 
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig

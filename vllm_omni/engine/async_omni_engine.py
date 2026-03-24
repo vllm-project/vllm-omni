@@ -18,6 +18,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Sequence
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -859,6 +860,15 @@ class AsyncOmniEngine:
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
                     "quantization": kwargs.get("quantization", None),
                     "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+                    **(
+                        {
+                            "profiler_config": asdict(kwargs["profiler_config"])
+                            if hasattr(kwargs["profiler_config"], "__dataclass_fields__")
+                            else kwargs["profiler_config"]
+                        }
+                        if kwargs.get("profiler_config") is not None
+                        else {}
+                    ),
                 },
                 "final_output": True,
                 "final_output_type": "image",

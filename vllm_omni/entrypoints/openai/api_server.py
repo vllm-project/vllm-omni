@@ -118,18 +118,28 @@ router = APIRouter()
 profiler_router = APIRouter()
 
 
-def _should_enable_profiler_endpoints(args: Namespace) -> bool:
-    # Check upstream vLLM's profiler_config
-    profiler_config = getattr(args, "profiler_config", None)
-    if profiler_config is not None:
-        # profiler_config exists, check if profiler is set
-        profiler = getattr(profiler_config, "profiler", None)
-        if profiler is not None:
-            return True
-
-    # TODO: remove this env after refactoring torch profiler to CLI args
-    env_value = os.environ.get("VLLM_TORCH_PROFILER_DIR")
-    return env_value is not None
+def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
+    """Check if any stage has profiler_config set in its engine_args."""
+    if not stage_configs:
+        return False
+    for stage in stage_configs:
+        engine_args = stage.get("engine_args") if isinstance(stage, dict) else getattr(stage, "engine_args", None)
+        if engine_args is None:
+            continue
+        profiler_config = (
+            engine_args.get("profiler_config")
+            if isinstance(engine_args, dict)
+            else getattr(engine_args, "profiler_config", None)
+        )
+        if profiler_config is not None:
+            profiler = (
+                profiler_config.get("profiler")
+                if isinstance(profiler_config, dict)
+                else getattr(profiler_config, "profiler", None)
+            )
+            if profiler is not None:
+                return True
+    return False
 
 
 class ProfileRequest(BaseModel):
@@ -292,8 +302,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         await omni_init_app_state(engine_client, app.state, args)
 
-        # Conditionally register profiler endpoints based on config or env var
-        if _should_enable_profiler_endpoints(args):
+        # Conditionally register profiler endpoints based on stage YAML configs
+        stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+        if _should_enable_profiler_endpoints(stage_configs):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
             app.include_router(profiler_router)
 
