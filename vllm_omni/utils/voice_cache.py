@@ -1,10 +1,8 @@
 """In-memory LRU cache for voice extraction artifacts.
 
-Model-agnostic: stores ``dict[str, Any]`` keyed by a cache key that
-combines a voice identifier with the extraction mode.
-
-For uploaded voices the identifier is the voice name (cheap, no hashing).
-For inline ref_audio the identifier is a content hash (SHA-256 prefix).
+Keyed by voice name + extraction mode (e.g. ``"alice:icl"``).
+Only named voices are cached; inline ``ref_audio`` without a voice
+name is not cached.
 
 Usage::
 
@@ -15,12 +13,10 @@ Usage::
         cache.put(key, {"artifact": result})
 """
 
-import hashlib
 import threading
 from collections import OrderedDict
 from typing import Any
 
-import numpy as np
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -41,27 +37,17 @@ class VoiceEmbeddingCache:
         self._misses = 0
 
     @staticmethod
-    def compute_audio_hash(wav: np.ndarray, sr: int) -> str:
-        """Compute a 16-char hex hash from normalised audio + sample rate.
-
-        Only needed for inline ref_audio (no voice name).
-        """
-        h = hashlib.sha256(wav.astype(np.float32).tobytes())
-        h.update(str(sr).encode())
-        return h.hexdigest()[:16]
-
-    @staticmethod
-    def make_cache_key(identifier: str, xvec_only: bool) -> str:
-        """Build a cache key from a voice identifier and extraction mode.
+    def make_cache_key(voice_name: str, xvec_only: bool) -> str:
+        """Build a cache key from a voice name and extraction mode.
 
         Args:
-            identifier: Voice name (for uploaded voices) or audio content
-                hash (for inline ref_audio).
+            voice_name: The speaker/voice name (case-insensitive, lowered
+                by the caller).
             xvec_only: True for speaker-embedding-only mode, False for
                 ICL mode (speaker embedding + ref_code).
         """
         mode = "xvec" if xvec_only else "icl"
-        return f"{identifier}:{mode}"
+        return f"{voice_name}:{mode}"
 
     def get(self, key: str) -> dict[str, Any] | None:
         """Return cached artifacts or ``None`` on miss.  Promotes to MRU on hit."""

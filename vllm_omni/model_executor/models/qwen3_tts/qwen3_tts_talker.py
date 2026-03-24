@@ -1332,23 +1332,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
 
-            # --- Voice cache: check in-memory LRU ---
-            _voice_cache_hash = None
+            # --- Voice cache: check in-memory LRU (keyed by voice name only) ---
+            _voice_cache_key = None
             if voice_clone_prompt is None:
-                _ref_audio_list = info_dict.get("ref_audio")
-                if isinstance(_ref_audio_list, list) and _ref_audio_list:
-                    from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
-
-                    _wav, _sr = self._normalize_ref_audio(_ref_audio_list[0])
-                    _voice_cache_hash = VoiceEmbeddingCache.compute_audio_hash(_wav, _sr)
-                    _cached = self._voice_cache.get(_voice_cache_hash)
+                _speaker_list = info_dict.get("speaker")
+                if isinstance(_speaker_list, list) and _speaker_list:
+                    _voice_name = str(_speaker_list[0]).lower()
+                    _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only)
+                    _cached = self._voice_cache.get(_voice_cache_key)
                     if _cached is not None:
                         voice_clone_prompt = {
                             "ref_code": _cached.get("ref_code"),
                             "ref_spk_embedding": _cached.get("ref_spk_embedding"),
                             "icl_mode": _cached.get("icl_mode"),
                         }
-                        _voice_cache_hash = None  # hit -> don't store again
+                        _voice_cache_key = None  # hit -> don't store again
 
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
@@ -1394,9 +1392,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
 
             # --- Voice cache: store on miss ---
-            if _voice_cache_hash is not None and speaker_embed is not None:
+            if _voice_cache_key is not None and speaker_embed is not None:
                 self._voice_cache.put(
-                    _voice_cache_hash,
+                    _voice_cache_key,
                     {
                         "ref_code": ref_code_prompt.detach().cpu()
                         if isinstance(ref_code_prompt, torch.Tensor)
