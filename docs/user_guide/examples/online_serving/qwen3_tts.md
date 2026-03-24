@@ -352,6 +352,42 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - `speed` adjustment is not supported when streaming.
 - Requires the server stage config to have `async_chunk: true` (default in `qwen3_tts.yaml`).
 
+## Streaming Text Input (WebSocket)
+
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally, buffers and splits it at sentence boundaries, and generates audio per sentence.
+
+When `stream_audio=true`, each sentence is emitted as `audio.start`, one or more binary PCM frames, and `audio.done`.
+
+### Quick Start
+
+```bash
+python streaming_speech_client.py \
+    --text "Hello world. How are you? I am fine."
+
+python streaming_speech_client.py \
+    --text "Hello world. How are you? I am fine." \
+    --simulate-stt --stt-delay 0.1
+```
+
+### WebSocket Protocol
+
+Client -> Server:
+
+```jsonc
+{"type": "session.config", "voice": "Vivian", "task_type": "CustomVoice", "language": "Auto", "split_granularity": "sentence", "stream_audio": true, "response_format": "pcm"}
+{"type": "input.text", "text": "Hello, how are you? "}
+{"type": "input.done"}
+```
+
+Server -> Client:
+
+```jsonc
+{"type": "audio.start", "sentence_index": 0, "sentence_text": "Hello, how are you?", "format": "pcm", "sample_rate": 24000}
+// binary PCM frame(s)
+{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}
+{"type": "session.done", "total_sentences": 1}
+```
+
 ## Limitations
 
 - **Single request**: Batch processing is not yet optimized for online serving.
@@ -385,6 +421,10 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ??? abstract "run_server.sh"
     ``````sh
     --8<-- "examples/online_serving/qwen3_tts/run_server.sh"
+    ``````
+??? abstract "streaming_speech_client.py"
+    ``````py
+    --8<-- "examples/online_serving/qwen3_tts/streaming_speech_client.py"
     ``````
 ??? abstract "tts_common.py"
     ``````py
