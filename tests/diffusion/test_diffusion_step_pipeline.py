@@ -25,10 +25,9 @@ from vllm_omni.diffusion.ipc import (
     unpack_diffusion_output_shm,
 )
 from vllm_omni.diffusion.sched.interface import (
-    DiffusionRequestState as SchedulerRequestState,
-)
-from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
     DiffusionSchedulerOutput,
+    NewRequestData,
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
@@ -224,7 +223,19 @@ def _make_distributed_runner(mode: str, device: torch.device):
 def _make_scheduler_output(req, sched_req_id="req-1", step_id=0, finished_req_ids=None):
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        req_states=[SchedulerRequestState(sched_req_id=sched_req_id, req=req)],
+        scheduled_new_reqs=[NewRequestData(sched_req_id=sched_req_id, req=req)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+
+def _make_cached_scheduler_output(sched_req_id="req-1", step_id=1, finished_req_ids=None):
+    return DiffusionSchedulerOutput(
+        step_id=step_id,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(sched_req_ids=[sched_req_id]),
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
         num_running_reqs=1,
         num_waiting_reqs=0,
@@ -297,7 +308,7 @@ class TestRunner:
         assert first.result is None
         assert "req-1" in runner.state_cache
 
-        second = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=1))
+        second = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
         assert second.req_id == "req-1"
         assert second.step_index == 2
         assert second.finished is True
@@ -369,7 +380,7 @@ class TestWorker:
         worker = object.__new__(DiffusionWorker)
         expected = RunnerOutput(req_id="req-1", step_index=1, finished=False, result=None)
         scheduler_output = SimpleNamespace(
-            req_states=[
+            scheduled_new_reqs=[
                 SimpleNamespace(
                     req=SimpleNamespace(
                         sampling_params=SimpleNamespace(lora_request=None),
@@ -389,7 +400,7 @@ class TestWorker:
     def test_clears_active_lora_before_stepwise_execution(self):
         worker = object.__new__(DiffusionWorker)
         scheduler_output = SimpleNamespace(
-            req_states=[
+            scheduled_new_reqs=[
                 SimpleNamespace(
                     req=SimpleNamespace(
                         sampling_params=SimpleNamespace(lora_request=None),
@@ -413,7 +424,7 @@ class TestWorker:
     def test_rejects_lora_requests_in_step_mode(self):
         worker = object.__new__(DiffusionWorker)
         scheduler_output = SimpleNamespace(
-            req_states=[
+            scheduled_new_reqs=[
                 SimpleNamespace(
                     req=SimpleNamespace(
                         sampling_params=SimpleNamespace(lora_request=object()),
