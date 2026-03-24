@@ -278,13 +278,13 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
             transformer_config = load_transformer_config(model, "transformer", local_files_only)
-            self.transformer = create_transformer_from_config(transformer_config)
+            self.transformer = self._create_transformer(transformer_config)
         else:
             self.transformer = None
 
         if load_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = create_transformer_from_config(transformer_2_config)
+            self.transformer_2 = self._create_transformer(transformer_2_config)
         else:
             self.transformer_2 = None
 
@@ -315,6 +315,10 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
+        """Create a transformer from a config dict. Subclasses may override."""
+        return create_transformer_from_config(config)
 
     @property
     def guidance_scale(self):

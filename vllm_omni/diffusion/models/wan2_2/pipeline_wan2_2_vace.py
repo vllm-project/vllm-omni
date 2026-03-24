@@ -15,7 +15,6 @@ determined by which inputs are provided (no explicit mode flag):
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from dataclasses import replace
 
@@ -28,7 +27,6 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
-    load_transformer_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -40,6 +38,47 @@ from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def create_vace_transformer_from_config(config: dict) -> WanVACETransformer3DModel:
+    """Create WanVACETransformer3DModel from config dict."""
+    kwargs = {}
+    if "patch_size" in config:
+        kwargs["patch_size"] = tuple(config["patch_size"])
+    if "num_attention_heads" in config:
+        kwargs["num_attention_heads"] = config["num_attention_heads"]
+    if "attention_head_dim" in config:
+        kwargs["attention_head_dim"] = config["attention_head_dim"]
+    if "in_channels" in config:
+        kwargs["in_channels"] = config["in_channels"]
+    if "out_channels" in config:
+        kwargs["out_channels"] = config["out_channels"]
+    if "text_dim" in config:
+        kwargs["text_dim"] = config["text_dim"]
+    if "freq_dim" in config:
+        kwargs["freq_dim"] = config["freq_dim"]
+    if "ffn_dim" in config:
+        kwargs["ffn_dim"] = config["ffn_dim"]
+    if "num_layers" in config:
+        kwargs["num_layers"] = config["num_layers"]
+    if "cross_attn_norm" in config:
+        kwargs["cross_attn_norm"] = config["cross_attn_norm"]
+    if "eps" in config:
+        kwargs["eps"] = config["eps"]
+    if "image_dim" in config:
+        kwargs["image_dim"] = config["image_dim"]
+    if "added_kv_proj_dim" in config:
+        kwargs["added_kv_proj_dim"] = config["added_kv_proj_dim"]
+    if "rope_max_seq_len" in config:
+        kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
+    if "pos_embed_seq_len" in config:
+        kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
+    if "vace_layers" in config:
+        kwargs["vace_layers"] = config["vace_layers"]
+    if "vace_in_channels" in config:
+        kwargs["vace_in_channels"] = config["vace_in_channels"]
+
+    return WanVACETransformer3DModel(**kwargs)
 
 
 def get_wan22_vace_pre_process_func(od_config: OmniDiffusionConfig):
@@ -131,35 +170,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
 
         super().__init__(od_config=od_config, prefix=prefix)
 
-        # Replace base transformer with VACE variant that supports conditioning.
-        # self.transformer_config is a Config object from the base transformer,
-        # which doesn't include VACE-specific keys. Re-load the raw JSON dict
-        # to get vace_layers and vace_in_channels.
-        if self.transformer is not None:
-            config = self.transformer.config
-            raw_config = load_transformer_config(od_config.model, "transformer", os.path.exists(od_config.model))
-            vace_layers = raw_config.get("vace_layers")
-            vace_in_channels = raw_config.get("vace_in_channels")
-
-            self.transformer = WanVACETransformer3DModel(
-                patch_size=config.patch_size,
-                num_attention_heads=config.num_attention_heads,
-                attention_head_dim=config.attention_head_dim,
-                in_channels=config.in_channels,
-                out_channels=config.out_channels,
-                text_dim=config.text_dim,
-                freq_dim=config.freq_dim,
-                ffn_dim=config.ffn_dim,
-                num_layers=config.num_layers,
-                cross_attn_norm=config.cross_attn_norm,
-                eps=config.eps,
-                image_dim=getattr(config, "image_dim", None),
-                added_kv_proj_dim=getattr(config, "added_kv_proj_dim", None),
-                rope_max_seq_len=getattr(config, "rope_max_seq_len", 1024),
-                vace_layers=list(vace_layers) if vace_layers is not None else None,
-                vace_in_channels=vace_in_channels,
-            )
-            self.transformer_config = self.transformer.config
+    def _create_transformer(self, config: dict) -> WanVACETransformer3DModel:
+        """Build VACE transformer directly from config dict."""
+        return create_vace_transformer_from_config(config)
 
     def check_inputs(
         self,
