@@ -51,6 +51,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             self.config = config
             self._pending_load_reqs = deque()
             self._finished_load_reqs = set()
+            self._cancelled_load_reqs = set()
             self._pending_save_reqs = deque()
             self._finished_save_reqs = set()
             self.stop_event = threading.Event()
@@ -212,7 +213,7 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping
-    assert all(getattr(r, "request_id", None) != req_id for r in adapter._pending_load_reqs)
+    assert req_id in adapter._cancelled_load_reqs
     assert req_id not in adapter._finished_load_reqs
 
     assert ext_id not in adapter.put_req_chunk

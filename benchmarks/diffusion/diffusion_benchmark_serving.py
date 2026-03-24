@@ -745,6 +745,15 @@ def calculate_metrics(
     latencies = [o.latency for o in success_outputs]
     peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
 
+    # Aggregate per-stage durations across all successful requests that reported them.
+    stage_duration_lists: dict[str, list[float]] = {}
+    for o in success_outputs:
+        for stage, duration in (o.stage_durations or {}).items():
+            stage_duration_lists.setdefault(stage, []).append(duration)
+    stage_durations_mean = {s: float(np.mean(v)) for s, v in stage_duration_lists.items()}
+    stage_durations_p50 = {s: float(np.percentile(v, 50)) for s, v in stage_duration_lists.items()}
+    stage_durations_p99 = {s: float(np.percentile(v, 99)) for s, v in stage_duration_lists.items()}
+
     metrics = {
         "duration": total_duration,
         "completed_requests": num_success,
@@ -758,6 +767,9 @@ def calculate_metrics(
         "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
         "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
+        "stage_durations_mean": stage_durations_mean,
+        "stage_durations_p50": stage_durations_p50,
+        "stage_durations_p99": stage_durations_p99,
     }
 
     if slo_enabled:
@@ -953,6 +965,12 @@ async def benchmark(args):
         print("{:<40} {:<15.2f}".format("Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]))
         print("{:<40} {:<15.2f}".format("Peak Memory Median (MB):", metrics["peak_memory_mb_median"]))
 
+    if metrics["stage_durations_mean"]:
+        print(f"{'-' * 50}")
+        print("Stage Durations Mean (s):")
+        for stage, val in metrics["stage_durations_mean"].items():
+            print("{:<40} {:<15.4f}".format(f"  {stage}:", val))
+
     print("\n" + "=" * 60)
 
     if args.output_file:
@@ -976,7 +994,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="vllm-omni",
-        choices=["vllm-omni", "openai", "v1/videos"],
+        choices=["vllm-omni", "openai", "sglang", "v1/videos"],
         help="Backend to target the benchmark to.",
     )
     parser.add_argument(

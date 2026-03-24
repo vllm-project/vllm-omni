@@ -125,6 +125,16 @@ class OmniPlatform(Platform):
 
         os.environ.pop(cls.device_control_env_var, None)
 
+    @classmethod
+    def get_profiler_cls(cls) -> str:
+        """Get the profiler class for this platform.
+
+        Returns:
+            Fully qualified class path of the profiler.
+            Default returns the base OmniTorchProfilerWrapper.
+        """
+        return "vllm_omni.profiler.omni_torch_profiler.OmniTorchProfilerWrapper"
+
 
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED

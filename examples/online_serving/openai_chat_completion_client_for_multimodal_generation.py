@@ -16,6 +16,14 @@ class QueryResult(NamedTuple):
     limit_mm_per_prompt: dict[str, int]
 
 
+def make_audio_output_filename(request_id: str | None, index: int) -> str:
+    """Build a stable output filename using request ID when available."""
+    if not request_id:
+        request_id = f"unknown_{index}"
+    safe_request_id = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in request_id)
+    return f"audio_{safe_request_id}_{index}.wav"
+
+
 def encode_base64_content_from_url(content_url: str) -> str:
     """Encode a content retrieved from a remote url to base64 format."""
 
@@ -163,6 +171,34 @@ def get_system_prompt():
             }
         ],
     }
+
+
+def _parse_csv_arg(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _build_prompt_for_query_type(
+    query_type: str,
+    custom_prompt: str | None,
+    video_path: str | None,
+    image_path: str | None,
+    audio_path: str | None,
+):
+    query_func = query_map[query_type]
+    if query_type == "use_video":
+        return query_func(video_path=video_path, custom_prompt=custom_prompt)
+    if query_type == "use_image":
+        return query_func(image_path=image_path, custom_prompt=custom_prompt)
+    if query_type == "use_audio":
+        return query_func(audio_path=audio_path, custom_prompt=custom_prompt)
+    if query_type == "text":
+        return query_func(custom_prompt=custom_prompt)
+    if query_type == "use_audio_in_video":
+        return query_func(video_path=video_path, custom_prompt=custom_prompt)
+    # use_mixed_modalities / use_multi_audios
+    return query_func(custom_prompt=custom_prompt)
 
 
 def get_text_query(custom_prompt: str | None = None):
@@ -379,31 +415,6 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
     audio_path = getattr(args, "audio_path", None)
     custom_prompt = getattr(args, "prompt", None)
 
-    # Get the query function and call it with appropriate parameters
-    query_func = query_map[args.query_type]
-    if args.query_type == "use_video":
-        prompt = query_func(video_path=video_path, custom_prompt=custom_prompt)
-    elif args.query_type == "use_image":
-        prompt = query_func(image_path=image_path, custom_prompt=custom_prompt)
-    elif args.query_type == "use_audio":
-        prompt = query_func(audio_path=audio_path, custom_prompt=custom_prompt)
-    elif args.query_type == "text":
-        prompt = query_func(custom_prompt=custom_prompt)
-    elif args.query_type == "use_audio_in_video":
-        prompt = query_func(
-            video_path=video_path,
-            custom_prompt=custom_prompt,
-        )
-    else:
-        prompt = query_func()
-
-    extra_body = {
-        "sampling_params_list": sampling_params_list  # Optional, it has a default setting in stage_configs of the corresponding model.
-    }
-
-    if args.query_type == "use_audio_in_video":
-        extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
-
     if args.modalities is not None:
         output_modalities = args.modalities.split(",")
     else:
@@ -411,6 +422,37 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
 
     # Test multiple concurrent completions
     num_concurrent_requests = args.num_concurrent_requests
+    prompt_list = _parse_csv_arg(getattr(args, "prompts", None))
+    speaker_list = _parse_csv_arg(getattr(args, "speakers", None))
+
+    request_payloads = []
+    for idx in range(num_concurrent_requests):
+        per_req_prompt = (
+            prompt_list[idx]
+            if idx < len(prompt_list)
+            else (custom_prompt if idx == 0 or not prompt_list else prompt_list[-1])
+        )
+        per_req_speaker = (
+            speaker_list[idx]
+            if idx < len(speaker_list)
+            else (args.speaker if idx == 0 or not speaker_list else speaker_list[-1])
+        )
+        prompt = _build_prompt_for_query_type(
+            query_type=args.query_type,
+            custom_prompt=per_req_prompt,
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+        )
+        extra_body = {
+            # Optional, it has default settings in stage configs.
+            "sampling_params_list": sampling_params_list
+        }
+        if args.query_type == "use_audio_in_video":
+            extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
+        if per_req_speaker and per_req_speaker.strip():
+            extra_body["speaker"] = per_req_speaker.strip()
+        request_payloads.append({"prompt": prompt, "extra_body": extra_body})
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
         # Submit multiple completion requests concurrently
@@ -419,14 +461,14 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
                 client.chat.completions.create,
                 messages=[
                     get_system_prompt(),
-                    prompt,
+                    payload["prompt"],
                 ],
                 model=model_name,
                 modalities=output_modalities,
-                extra_body=extra_body,
+                extra_body=payload["extra_body"],
                 stream=args.stream,
             )
-            for _ in range(num_concurrent_requests)
+            for payload in request_payloads
         ]
 
         # Wait for all requests to complete and collect results
@@ -437,10 +479,11 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
     if not args.stream:
         # Verify all completions succeeded
         for chat_completion in chat_completions:
+            request_id = getattr(chat_completion, "id", None)
             for choice in chat_completion.choices:
                 if choice.message.audio:
                     audio_data = base64.b64decode(choice.message.audio.data)
-                    audio_file_path = f"audio_{count}.wav"
+                    audio_file_path = make_audio_output_filename(request_id=request_id, index=count)
                     with open(audio_file_path, "wb") as f:
                         f.write(audio_data)
                     print(f"Audio saved to {audio_file_path}")
@@ -459,7 +502,8 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
 
                     if getattr(chunk, "modality", None) == "audio" and content:
                         audio_data = base64.b64decode(content)
-                        audio_file_path = f"audio_{count}.wav"
+                        request_id = getattr(chunk, "id", None)
+                        audio_file_path = make_audio_output_filename(request_id=request_id, index=count)
                         with open(audio_file_path, "wb") as f:
                             f.write(audio_data)
                         print(f"\nAudio saved to {audio_file_path}")
@@ -545,6 +589,30 @@ def parse_args():
         type=str,
         default="localhost",
         help="Host/IP of the vLLM Omni API server.",
+    )
+    parser.add_argument(
+        "--speaker",
+        type=str,
+        default=None,
+        help="TTS speaker/voice for audio output (e.g. Ethan, Vivian). Passed via extra_body to the talker stage.",
+    )
+    parser.add_argument(
+        "--speakers",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated speakers for concurrent requests, e.g. "
+            "'Ethan,Vivian,Ryan'. Overrides --speaker per request."
+        ),
+    )
+    parser.add_argument(
+        "--prompts",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated prompts for concurrent requests. "
+            "If fewer than --num-concurrent-requests, the last prompt is reused."
+        ),
     )
     return parser.parse_args()
 

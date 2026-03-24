@@ -9,6 +9,12 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
     max_ic_for_chunk_size,
 )
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_language_from_prompt,
+    extract_language_from_request,
+    extract_speaker_from_prompt,
+    extract_speaker_from_request,
+)
 
 logger = init_logger(__name__)
 
@@ -25,7 +31,7 @@ def talker2code2wav(
 
     talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     code2wav_inputs: list[OmniTokensPrompt] = []
-    for talker_output in talker_outputs:
+    for i, talker_output in enumerate(talker_outputs):
         output = talker_output.outputs[0]
         # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
         audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
@@ -45,13 +51,24 @@ def talker2code2wav(
             ref_code_len = 0
         # Code2Wav expects codebook-major flat: [Q*num_frames]
         codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
-        additional_information = {"left_context_size": [ref_code_len]} if ref_code_len > 0 else None
+        additional_information: dict[str, Any] = {}
+        if ref_code_len > 0:
+            additional_information["left_context_size"] = [ref_code_len]
+        # Propagate speaker and language from the original prompt so they are
+        # available as runtime_additional_information in later pipeline stages,
+        # consistent with qwen3-omni and qwen2.5-omni stage input processors.
+        speaker = extract_speaker_from_prompt(prompt, index=i)
+        if speaker is not None:
+            additional_information["speaker"] = speaker
+        language = extract_language_from_prompt(prompt, index=i)
+        if language is not None:
+            additional_information["language"] = language
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
-                additional_information=additional_information,
+                additional_information=additional_information if additional_information else None,
             )
         )
     return code2wav_inputs
@@ -194,8 +211,18 @@ def talker2code2wav_async_chunk(
     num_frames = len(window_frames)
     code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
 
-    return {
+    info: dict[str, Any] = {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,
         "finished": finished,
     }
+    # Propagate speaker and language from the request so they are available
+    # as runtime_additional_information in subsequent pipeline stages, consistent
+    # with qwen3-omni and qwen2.5-omni stage input processors.
+    speaker = extract_speaker_from_request(request)
+    if speaker is not None:
+        info["speaker"] = speaker
+    language = extract_language_from_request(request)
+    if language is not None:
+        info["language"] = language
+    return info

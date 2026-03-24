@@ -442,19 +442,30 @@ class AsyncOmni(EngineClient, OmniBase):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(self, stages: list[int] | None = None) -> list[Any]:
+    async def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
         """Start profiling specified stages.
 
-        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
+        Uses vLLM-compatible profile(is_start=True, profile_prefix) interface.
+
+        Args:
+            profile_prefix: Optional prefix for the trace file names.
+            stages: List of stage IDs to profile. If None, profiles all stages.
         """
-        return await self.collective_rpc(method="start_profile", stage_ids=stages)
+        return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
 
     async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Stop profiling specified stages.
 
-        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
+        Uses vLLM-compatible profile(is_start=False) interface.
+
+        Args:
+            stages: List of stage IDs to profile. If None, stops all stages.
         """
-        return await self.collective_rpc(method="stop_profile", stage_ids=stages)
+        return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache for all stages.
