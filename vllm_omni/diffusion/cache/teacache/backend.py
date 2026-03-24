@@ -48,7 +48,29 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     )
 
 
-CUSTOM_TEACACHE_ENABLERS = {"BagelPipeline": enable_bagel_teacache}
+def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """
+    Enable TeaCache for Flux2 Klein model.
+    """
+    teacache_config = TeaCacheConfig(
+        transformer_type="Flux2Klein",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    transformer = pipeline.transformer
+
+    apply_teacache_hook(transformer, teacache_config)
+
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
+CUSTOM_TEACACHE_ENABLERS = {
+    "BagelPipeline": enable_bagel_teacache,
+    "Flux2KleinPipeline": enable_flux2_klein_teacache,
+}
 
 
 class TeaCacheBackend(CacheBackend):

@@ -12,28 +12,28 @@ When `mistral_common` has `SpeechRequest` support, prompt token IDs are built vi
 python3 examples/offline_inference/voxtral_tts/end2end.py \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
     --write-audio --voice cheerful_female \
-    --model mistralai/tts-model \
+    --model mistralai/Voxtral-4B-TTS-2603 \
     --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?"
 
 # 32 replicate prompts with cheerful_female voice preset
 python3 examples/offline_inference/voxtral_tts/end2end.py \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
     --num-prompts 32 --write-audio --voice cheerful_female \
-    --model mistralai/tts-model \
+    --model mistralai/Voxtral-4B-TTS-2603 \
     --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?"
 
 # Streaming with neutral_female voice preset
 python3 examples/offline_inference/voxtral_tts/end2end.py \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
     --streaming --write-audio --voice neutral_female \
-    --model mistralai/tts-model \
+    --model mistralai/Voxtral-4B-TTS-2603 \
     --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?"
 
 # 32 prompts, 8 concurrent requests per wave, streaming with neutral_female voice
 python3 examples/offline_inference/voxtral_tts/end2end.py \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
     --num-prompts 32 --concurrency 8 --streaming --write-audio --voice neutral_female \
-    --model mistralai/tts-model \
+    --model mistralai/Voxtral-4B-TTS-2603 \
     --text "That eerie silence after the first storm was just the calm before another round of chaos, wasn't it?"
 
 # Short debug prompt with reference audio
@@ -41,7 +41,7 @@ python3 examples/offline_inference/voxtral_tts/end2end.py \
 python3 examples/offline_inference/voxtral_tts/end2end.py \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
     --write-audio \
-    --model mistralai/tts-model \
+    --model mistralai/Voxtral-4B-TTS-2603 \
     --text "This is a test message." \
     --audio-path path/to/reference_audio.wav
 ```
@@ -50,7 +50,7 @@ python3 examples/offline_inference/voxtral_tts/end2end.py \
 
 | Argument | Description |
 |---|---|
-| `--model PATH` | HuggingFace repo ID or local directory path (default: `mistralai/tts-model`) |
+| `--model PATH` | HuggingFace repo ID or local directory path (default: `mistralai/Voxtral-4B-TTS-2603`) |
 | `--text TEXT` | Text to synthesize (default: `"This is a test message."`) |
 | `--audio-path PATH` | Path to reference audio file for voice cloning |
 | `--output-dir DIR` | Directory to write output WAV files (default: `output_audio`) |

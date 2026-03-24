@@ -38,8 +38,12 @@ class StageEngineCoreClient(AsyncMPClient):
         self,
         vllm_config: Any,
         executor_class: type,
-        metadata: StageMetadata,
+        log_stats: bool = False,
         client_addresses: dict[str, str] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
+        *,
+        metadata: StageMetadata | None = None,
         engine_manager: Any = None,
         coordinator: Any = None,
     ):
@@ -51,17 +55,18 @@ class StageEngineCoreClient(AsyncMPClient):
         and calls super().__init__().
         """
         # -------- Stage metadata (public fields used at runtime) --------
-        self.stage_id = metadata.stage_id
-        self.stage_type = metadata.stage_type
-        self.engine_output_type = metadata.engine_output_type
-        self.is_comprehension = metadata.is_comprehension
-        self.requires_multimodal_data = metadata.requires_multimodal_data
-        self.engine_input_source = metadata.engine_input_source
-        self.final_output = metadata.final_output
-        self.final_output_type = metadata.final_output_type
-        self.default_sampling_params = metadata.default_sampling_params
-        self.custom_process_input_func = metadata.custom_process_input_func
-        self.model_stage = metadata.model_stage
+        if metadata is not None:
+            self.stage_id = metadata.stage_id
+            self.stage_type = metadata.stage_type
+            self.engine_output_type = metadata.engine_output_type
+            self.is_comprehension = metadata.is_comprehension
+            self.requires_multimodal_data = metadata.requires_multimodal_data
+            self.engine_input_source = metadata.engine_input_source
+            self.final_output = metadata.final_output
+            self.final_output_type = metadata.final_output_type
+            self.default_sampling_params = metadata.default_sampling_params
+            self.custom_process_input_func = metadata.custom_process_input_func
+            self.model_stage = metadata.model_stage
 
         self.engine_outputs: Any = None
 
@@ -73,8 +78,10 @@ class StageEngineCoreClient(AsyncMPClient):
             super().__init__(
                 vllm_config,
                 executor_class,
-                log_stats=False,
+                log_stats=log_stats,
                 client_addresses=client_addresses,
+                client_count=client_count,
+                client_index=client_index,
             )
             if engine_manager is not None:
                 self.resources.engine_manager = engine_manager

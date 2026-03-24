@@ -12,11 +12,13 @@
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [
                     10,
-                    40
+                    40,
+                    100
                 ],
                 "max_concurrency": [
                     1,
-                    4
+                    4,
+                    10
                 ],
                 "random_input_len": 100,
                 "random_output_len": 100,
@@ -34,11 +36,13 @@
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [
                     10,
-                    40
+                    40,
+                    100
                 ],
                 "max_concurrency": [
                     1,
-                    4
+                    4,
+                    10
                 ],
                 "random_input_len": 100,
                 "random_output_len": 100,
@@ -96,11 +100,13 @@
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [
                     10,
-                    40
+                    40,
+                    100
                 ],
                 "max_concurrency": [
                     1,
-                    4
+                    4,
+                    10
                 ],
                 "random_input_len": 100,
                 "random_output_len": 100,
@@ -118,11 +124,13 @@
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [
                     10,
-                    40
+                    40,
+                    100
                 ],
                 "max_concurrency": [
                     1,
-                    4
+                    4,
+                    10
                 ],
                 "random_input_len": 100,
                 "random_output_len": 100,

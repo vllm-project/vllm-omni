@@ -52,7 +52,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
@@ -94,6 +94,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
+        self._cancelled_load_reqs.discard(request.request_id)
         self._pending_load_reqs.append(request)
         with self._recv_cond:
             self._recv_cond.notify()
@@ -272,8 +273,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
 
-        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
-        self._pending_load_reqs = remaining
+        self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
 
         self.put_req_chunk.pop(external_req_id, None)
