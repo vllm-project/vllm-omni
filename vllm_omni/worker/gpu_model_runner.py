@@ -1323,9 +1323,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             use_cascade_attn=False,
         )
         # Force eager for unwrapped code predictors (AR loops / multinomial).
+        # When talker_mtp is not a CUDAGraphWrapper, it manages its own CUDA
+        # graphs internally (code_predictor has its own bucket sizes).
         if not isinstance(self.talker_mtp, CUDAGraphWrapper):
             _cudagraph_mode = CUDAGraphMode.NONE
-        num_tokens_padded = batch_desc.num_tokens
+            num_tokens_padded = decode_batch_size
+        else:
+            num_tokens_padded = batch_desc.num_tokens
         req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]

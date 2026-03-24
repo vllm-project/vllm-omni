@@ -21,6 +21,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -60,7 +61,7 @@ class ImageRopePrepare(nn.Module):
     Note: Our _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism).
     """
 
-    def __init__(self, img_in: nn.Linear, pos_embed: nn.Module):
+    def __init__(self, img_in: nn.Module, pos_embed: nn.Module):
         super().__init__()
         self.img_in = img_in
         self.pos_embed = pos_embed
@@ -157,11 +158,32 @@ class ModulateIndexPrepare(nn.Module):
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
-    def __init__(self, embedding_dim, use_additional_t_cond=False):
+    def __init__(
+        self,
+        embedding_dim,
+        use_additional_t_cond: bool = False,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
 
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.timestep_embedder.linear_1 = ReplicatedLinear(
+            256,
+            embedding_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="timestep_embedder.linear_1",
+        )
+        self.timestep_embedder.linear_2 = ReplicatedLinear(
+            embedding_dim,
+            embedding_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="timestep_embedder.linear_2",
+        )
         self.use_additional_t_cond = use_additional_t_cond
         if use_additional_t_cond:
             self.addition_t_embedding = nn.Embedding(2, embedding_dim)
@@ -681,7 +703,14 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True),  # For scale, shift, gate for norm1 and norm2
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix="img_mod.1",
+            ),
         )
         self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = QwenImageCrossAttention(
@@ -698,7 +727,14 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True),  # For scale, shift, gate for norm1 and norm2
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix="txt_mod.1",
+            ),
         )
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
@@ -912,13 +948,29 @@ class QwenImageTransformer2DModel(CachedTransformer):
             self.pos_embed = QwenEmbedLayer3DRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
 
         self.time_text_embed = QwenTimestepProjEmbeddings(
-            embedding_dim=self.inner_dim, use_additional_t_cond=use_additional_t_cond
+            embedding_dim=self.inner_dim,
+            use_additional_t_cond=use_additional_t_cond,
+            quant_config=quant_config,
         )
 
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
 
-        self.img_in = nn.Linear(in_channels, self.inner_dim)
-        self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
+        self.img_in = ReplicatedLinear(
+            in_channels,
+            self.inner_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="img_in",
+        )
+        self.txt_in = ReplicatedLinear(
+            joint_attention_dim,
+            self.inner_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="txt_in",
+        )
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -934,7 +986,22 @@ class QwenImageTransformer2DModel(CachedTransformer):
         )
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+        self.norm_out.linear = ReplicatedLinear(
+            self.inner_dim,
+            2 * self.inner_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="norm_out.linear",
+        )
+        self.proj_out = ReplicatedLinear(
+            self.inner_dim,
+            patch_size * patch_size * self.out_channels,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="proj_out",
+        )
 
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
@@ -1097,7 +1164,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             original_name = name
             lookup_name = name
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if weight_name not in original_name or param_name in original_name:
                     continue
                 lookup_name = original_name.replace(weight_name, param_name)
                 param = params_dict[lookup_name]
