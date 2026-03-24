@@ -39,7 +39,10 @@ The following table shows which models are currently supported by parallelism me
 | **FLUX.1-dev**           | `black-forest-labs/FLUX.1-dev`       |     ❌      |    ❌    |      ✅       |        ✅        |         ❌          |      N/A        | ✅   |
 | **FLUX.2-dev**           | `black-forest-labs/FLUX.2-dev`       |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      N/A        | ✅   |
 | **HunyuanImage3.0**      | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      ✅        | ❌   |
+| **Bagel**                  | `ByteDance-Seed/BAGEL-7B-MoT` |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |      N/A        | ❌   |
 | **DreamID-Omni**           | `XuGuo699/DreamID-Omni`       |     ❌      |    ❌    |      ✅       |        ❌        |         ❌          |      N/A        | ❌   |
+| **FLUX.1-Kontext-dev**   | `black-forest-labs/FLUX.1-Kontext-dev`       |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      N/A        | ✅   |
+| **OmniGen2**               | `OmniGen2/OmniGen2`           |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |      N/A        | ❌   |
 
 !!! note "TP Limitations for Diffusion Models"
     We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
@@ -58,6 +61,8 @@ The following table shows which models are currently supported by parallelism me
 
 | Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel | HSDP | VAE-Patch-Parallel |
 |-------|------------------|:----------:|:--------------:|:---------------:|:----:| :----:|
+| **Wan2.1** | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Wan2.1** | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **LTX-2** | `Lightricks/LTX-2` | ✅ | ✅ | ✅ | ❌ | ❌ |
 
@@ -129,6 +134,11 @@ VAE patch parallelism automatically selects between two internal decode methods 
 
 #### Ulysses-SP
 
+!!! note "Experimental UAA mode"
+    `ulysses_mode="advanced_uaa"` is an experimental extension to Ulysses-SP. It allows Ulysses attention to handle non-divisible attention head counts and uneven per-rank sequence shards without relying on `attention_mask`-based token padding.
+
+    In hybrid Ulysses + Ring mode, Ring still requires every rank in the same ring group to observe the same post-Ulysses sequence length. If that condition is not met, vLLM-Omni raises a validation error instead of entering the ring kernel with inconsistent shapes.
+
 ##### Offline Inference
 
 An example of offline inference script using [Ulysses-SP](https://arxiv.org/pdf/2309.14509) is shown below:
@@ -151,6 +161,18 @@ outputs = omni.generate(
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
 
+To enable the experimental UAA mode explicitly:
+
+```python
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    parallel_config=DiffusionParallelConfig(
+        ulysses_degree=4,
+        ulysses_mode="advanced_uaa",
+    ),
+)
+```
+
 ##### Online Serving
 
 You can enable Ulysses-SP in online serving for diffusion models via `--usp`:
@@ -158,6 +180,9 @@ You can enable Ulysses-SP in online serving for diffusion models via `--usp`:
 ```bash
 # Text-to-image (requires >= 2 GPUs)
 vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
+
+# Experimental UAA mode
+vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 --usp 4 --ulysses-mode advanced_uaa
 ```
 
 ##### Benchmarks
@@ -238,6 +263,9 @@ To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** m
 
 You can combine both Ulysses-SP and Ring-Attention for larger scale parallelism. The total sequence parallel size equals `ulysses_degree × ring_degree`.
 
+!!! note "Experimental UAA in hybrid mode"
+    `ulysses_mode="advanced_uaa"` can also be used with hybrid Ulysses + Ring, but this does not remove Ring's shape requirement. Every rank in the same ring group must still have the same post-Ulysses sequence length.
+
 ##### Offline Inference
 
 ```python
@@ -248,7 +276,11 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 # Hybrid: 2 Ulysses × 2 Ring = 4 GPUs total
 omni = Omni(
     model="Qwen/Qwen-Image",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)
+    parallel_config=DiffusionParallelConfig(
+        ulysses_degree=2,
+        ring_degree=2,
+        ulysses_mode="advanced_uaa",
+    )
 )
 
 outputs = omni.generate(
@@ -261,7 +293,7 @@ outputs = omni.generate(
 
 ```bash
 # Text-to-image (requires >= 4 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2 --ulysses-mode advanced_uaa
 ```
 
 ##### Benchmarks

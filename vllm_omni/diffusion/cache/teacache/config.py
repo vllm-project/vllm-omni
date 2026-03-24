@@ -15,6 +15,15 @@ _MODEL_COEFFICIENTS = {
         -3.82021401e00,
         2.64230861e-01,
     ],
+    # Flux2 Klein transformer coefficients
+    # Same as FLUX.1 (similar dual-stream architecture)
+    "Flux2Klein": [
+        4.98651651e02,
+        -2.83781631e02,
+        5.58554382e01,
+        -3.82021401e00,
+        2.64230861e-01,
+    ],
     # Qwen-Image transformer coefficients from ComfyUI-TeaCache
     # Tuned specifically for Qwen's dual-stream transformer architecture
     # Used for all Qwen-Image Family pipelines, in general
@@ -36,6 +45,14 @@ _MODEL_COEFFICIENTS = {
         -4.50000000e01,
         3.20000000e00,
         -2.00000000e-02,
+    ],
+    # Estimated TeaCache polynomial coefficients for StableAudioDiTModel.
+    "StableAudioDiTModel": [
+        121.77490545701518,
+        -153.7449426160371,
+        68.05368574596551,
+        -12.281286412689623,
+        1.0733905006198015,
     ],
 }
 

@@ -843,7 +843,7 @@ def modify_stage_config(
                     'async_chunk': True,
                     'stage_args': {
                         0: {'engine_args.max_model_len': 5800},
-                        1: {'runtime.max_batch_size': 2}
+                        1: {'engine_args.max_num_seqs': 2}
                     }
                 }
         deletes: Dictionary containing configurations to delete.
@@ -1907,9 +1907,37 @@ class OmniRunner:
         )
         return self.generate(omni_inputs, sampling_params_list)
 
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
+        """Start profiling specified stages.
+
+        Args:
+            profile_prefix: Optional prefix for the trace file names.
+            stages: List of stage IDs to profile. If None, profiles all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.omni.start_profile(profile_prefix=profile_prefix, stages=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages.
+
+        Args:
+            stages: List of stage IDs to profile. If None, stops all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.omni.stop_profile(stages=stages)
+
     def _cleanup_process(self):
         try:
             keywords = ["enginecore"]
+            matched = []
 
             for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
                 try:
@@ -1922,15 +1950,31 @@ class OmniRunner:
 
                     if is_process:
                         print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
-
-                        try:
-                            proc.terminate()
-                            time.sleep(2)
-                        except Exception:
-                            proc.kill()
-
+                        matched.append(proc)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+
+            for proc in matched:
+                try:
+                    proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            _, still_alive = psutil.wait_procs(matched, timeout=5)
+            for proc in still_alive:
+                try:
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            if still_alive:
+                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
+                if stubborn:
+                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
+                else:
+                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
+            elif matched:
+                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
 
         except Exception as e:
             print(f"Error in psutil vllm cleanup: {e}")
@@ -2002,6 +2046,18 @@ class OmniRunnerHandler:
         response = self._process_output(outputs)
         assert_omni_response(response, request_config, run_level="L2")
         return response
+
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
+        """Start profiling specified stages."""
+        return self.runner.start_profile(profile_prefix=profile_prefix, stages=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages."""
+        return self.runner.stop_profile(stages=stages)
 
 
 @pytest.fixture

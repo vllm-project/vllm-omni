@@ -66,16 +66,20 @@ The following table shows which models are currently supported by each accelerat
 | **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ (TP=2 only) | ✅ |
 | **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ |
-| **Bagel** | `ByteDance-Seed/BAGEL-7B-MoT` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Bagel** | `ByteDance-Seed/BAGEL-7B-MoT` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | **FLUX.1-dev** | `black-forest-labs/FLUX.1-dev` | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
 | **NextStep-1.1** | `stepfun-ai/NextStep-1.1` | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ |
-| **FLUX.2-klein** | `black-forest-labs/FLUX.2-klein-4B` | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **FLUX.2-klein** | `black-forest-labs/FLUX.2-klein-4B` | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | **FLUX.2-dev** | `black-forest-labs/FLUX.2-dev` | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **FLUX.1-Kontext-dev** | `black-forest-labs/FLUX.1-Kontext-dev` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **GLM-Image** | `zai-org/GLM-Image` | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ |
 
 ### VideoGen
 
 | Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel | HSDP | VAE-Patch-Parallel |
 |-------|------------------|:--------:|:---------:|:----------:|:--------------:|:------------:|:----:|:----:|
+| **Wan2.1-T2V** | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Wan2.1-T2V** | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **LTX-2** | `Lightricks/LTX-2` | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | **DreamID-Omni** | `XuGuo699/DreamID-Omni` | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
@@ -88,6 +92,12 @@ The following table shows which models are currently supported by each accelerat
 | **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ | ✅ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ |
 
+
+### AudioGen
+
+| Model                  | Model Identifier                         | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
+|------------------------|------------------------------------------|:--------:|:---------:|:----------:|:--------------:|:------------:|
+| **Stable-Audio-Open**  | `stabilityai/stable-audio-open-1.0`      |    ✅    |           |            |                |              |
 
 ## Performance Benchmarks
 
