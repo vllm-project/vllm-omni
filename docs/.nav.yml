@@ -28,6 +28,7 @@ nav:
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
+      - Voxtral TTS Offline Inference: user_guide/examples/offline_inference/voxtral_tts.md
       - X-To-Video-Audio: user_guide/examples/offline_inference/x_to_video_audio.md
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
@@ -78,6 +79,7 @@ nav:
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_tts_model.md
     - contributing/model/adding_diffusion_model.md
+    - contributing/model/adding_quantization_model.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md

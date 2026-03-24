@@ -1907,6 +1907,33 @@ class OmniRunner:
         )
         return self.generate(omni_inputs, sampling_params_list)
 
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
+        """Start profiling specified stages.
+
+        Args:
+            profile_prefix: Optional prefix for the trace file names.
+            stages: List of stage IDs to profile. If None, profiles all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.omni.start_profile(profile_prefix=profile_prefix, stages=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages.
+
+        Args:
+            stages: List of stage IDs to profile. If None, stops all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.omni.stop_profile(stages=stages)
+
     def _cleanup_process(self):
         try:
             keywords = ["enginecore"]
@@ -2019,6 +2046,18 @@ class OmniRunnerHandler:
         response = self._process_output(outputs)
         assert_omni_response(response, request_config, run_level="L2")
         return response
+
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
+        """Start profiling specified stages."""
+        return self.runner.start_profile(profile_prefix=profile_prefix, stages=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages."""
+        return self.runner.stop_profile(stages=stages)
 
 
 @pytest.fixture

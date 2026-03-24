@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 
@@ -64,18 +65,49 @@ def serialize_additional_information(
             entries[key] = AdditionalInformationEntry(list_data=value)
             continue
 
-        if log_prefix is None:
-            logger.warning(
-                "Dropping unsupported additional_information key=%s type=%s",
-                key,
-                type(value).__name__,
-            )
-        else:
-            logger.warning(
-                "[%s] Dropping unsupported additional_information key=%s type=%s",
-                log_prefix,
-                key,
-                type(value).__name__,
-            )
+        entries[key] = AdditionalInformationEntry(scalar_data=value)
 
     return AdditionalInformationPayload(entries=entries) if entries else None
+
+
+def deserialize_additional_information(
+    payload: dict | AdditionalInformationPayload | object | None,
+) -> dict:
+    """Deserialize an *additional_information* payload into a plain dict.
+
+    Accepts:
+    - ``dict`` – returned as-is.
+    - ``AdditionalInformationPayload`` (or duck-typed with
+      ``.entries``) – decoded entry-by-entry.
+    - ``None`` – returns ``{}``.
+    """
+
+    if payload is None:
+        return {}
+
+    if isinstance(payload, dict):
+        return payload
+
+    try:
+        entries = getattr(payload, "entries", None)
+        if not isinstance(entries, dict):
+            logger.exception("Failed to decode additional_information payload, entries field not a dict")
+            return {}
+        info: dict[str, object] = {}
+        for k, entry in entries.items():
+            if getattr(entry, "tensor_data", None) is not None:
+                dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
+                arr = np.frombuffer(entry.tensor_data, dtype=dt)
+                arr = arr.reshape(getattr(entry, "tensor_shape", ()))
+                info[k] = torch.from_numpy(arr.copy())
+            elif getattr(entry, "list_data", None) is not None:
+                info[k] = entry.list_data
+            elif getattr(entry, "scalar_data", None) is not None:
+                info[k] = entry.scalar_data
+            else:
+                info[k] = None
+        return info
+    except Exception:
+        logger.exception("Failed to decode additional_information payload")
+
+    return {}
