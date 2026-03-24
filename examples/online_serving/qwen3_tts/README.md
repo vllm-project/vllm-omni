@@ -134,8 +134,8 @@ The Python client supports the following command-line arguments:
 - `--voice`: Speaker/voice name (default: `vivian`). Options: `vivian`, `ryan`, `aiden`, etc.
 - `--language`: Language. Options: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, `Italian`
 - `--instructions`: Voice style/emotion instructions
-- `--ref-audio`: Reference audio file path or URL for voice cloning (Base task)
-- `--ref-text`: Reference audio transcript for voice cloning (Base task). Local paths are automatically base64-encoded by the client before sending to the server.
+- `--ref-audio`: Reference audio file path or URL for voice cloning (Base task). Local paths are automatically base64-encoded by the client before sending to the server.
+- `--ref-text`: Reference audio transcript for voice cloning (Base task).
 - `--response-format`: Audio output format (default: `wav`). Options: `wav`, `mp3`, `flac`, `pcm`, `aac`, `opus`
 - `--output` (or `-o`): Output audio file path (default: `tts_output.wav`)
 
@@ -281,7 +281,7 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
     "task_type": "CustomVoice",
     "language": "Auto",
     "instructions": "Optional style instructions",
-    "ref_audio": "URL or base64 for voice cloning",
+    "ref_audio":  "HTTP URL, base64 data URL, or file:// URI for voice cloning",
     "ref_text": "Reference audio transcript",
     "x_vector_only_mode": false,
     "max_new_tokens": 2048
@@ -321,11 +321,11 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 
 ### Voice Clone Parameters (Base task)
 
-| Parameter            | Type   | Required | Description                                  |
-| -------------------- | ------ | -------- | -------------------------------------------- |
-| `ref_audio`          | string | **Yes**  | Reference audio (URL or base64 data URL)     |
-| `ref_text`           | string | No       | Transcript of reference audio (for ICL mode) |
-| `x_vector_only_mode` | bool   | No       | Use speaker embedding only (no ICL)          |
+| Parameter            | Type   | Required | Description                                                                                     |
+| -------------------- | ------ | -------- | ----------------------------------------------------------------------------------------------- |
+| `ref_audio`          | string | **Yes**  | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
+| `ref_text`           | string | No       | Transcript of reference audio (for ICL mode)                                                    |
+| `x_vector_only_mode` | bool   | No       | Use speaker embedding only (no ICL)                                                             |
 
 ## Streaming
 
