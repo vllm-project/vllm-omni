@@ -94,6 +94,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
+        self._cancelled_load_reqs.discard(request.request_id)
         self._pending_load_reqs.append(request)
         with self._recv_cond:
             self._recv_cond.notify()
@@ -272,8 +273,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
 
-        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
-        self._pending_load_reqs = remaining
+        self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
 
         self.put_req_chunk.pop(external_req_id, None)

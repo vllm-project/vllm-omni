@@ -441,8 +441,22 @@ def get_stage_connector_spec(
     return {}
 
 
-def initialize_diffusion_stage(model: str, stage_cfg: Any, metadata: StageMetadata) -> Any:
-    """Build a diffusion stage client."""
+def initialize_diffusion_stage(
+    model: str,
+    stage_cfg: Any,
+    metadata: StageMetadata,
+    batch_size: int = 1,
+) -> Any:
+    """Build a diffusion stage client.
+
+    Args:
+        model: Model name or path.
+        stage_cfg: Stage configuration.
+        metadata: Extracted stage metadata.
+        batch_size: Maximum number of requests to batch together in the
+            diffusion engine.  Passed through to ``StageDiffusionClient``
+            and ultimately to ``AsyncOmniDiffusion``.
+    """
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
@@ -452,7 +466,7 @@ def initialize_diffusion_stage(model: str, stage_cfg: Any, metadata: StageMetada
     )
     if metadata.cfg_kv_collect_func is not None:
         od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
-    return StageDiffusionClient(model, od_config, metadata)
+    return StageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
 
 
 def close_started_llm_stage(started: StartedLlmStage) -> None:

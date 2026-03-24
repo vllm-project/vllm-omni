@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
@@ -13,7 +14,6 @@ from diffusers.models.embeddings import (
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from diffusers.utils import is_torch_npu_available
-from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -24,6 +24,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -190,7 +192,8 @@ class FluxAttention(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor | None = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         qkv, _ = self.to_qkv(hidden_states)
@@ -226,10 +229,17 @@ class FluxAttention(torch.nn.Module):
 
         query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
 
+        attn_metadata = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
         hidden_states = self.attn(
             query,
             key,
             value,
+            attn_metadata,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -244,7 +254,6 @@ class FluxAttention(torch.nn.Module):
 
             return hidden_states, encoder_hidden_states
         else:
-            # For single-stream blocks, there's no to_out (RowParallelLinear) to handle the reduction
             if get_tensor_model_parallel_world_size() > 1:
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
@@ -483,7 +492,7 @@ class FluxTransformer2DModel(nn.Module):
 
     def __init__(
         self,
-        od_config: OmniDiffusionConfig,
+        od_config: OmniDiffusionConfig = None,
         patch_size: int = 1,
         in_channels: int = 64,
         out_channels: int = None,
@@ -495,18 +504,23 @@ class FluxTransformer2DModel(nn.Module):
         pooled_projection_dim: int = 768,
         guidance_embeds: bool = True,
         axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
+        theta: float = 10000.0,
         quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
-        model_config = od_config.tf_model_config
-        num_layers = model_config.num_layers
-        self.parallel_config = od_config.parallel_config
+        if od_config is not None:
+            model_config = od_config.tf_model_config
+            num_layers = model_config.num_layers
+            self.parallel_config = od_config.parallel_config
+        else:
+            self.parallel_config = None
+
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.guidance_embeds = guidance_embeds
 
-        self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
+        self.pos_embed = FluxPosEmbed(theta=theta, axes_dim=axes_dims_rope)
         text_time_guidance_cls = (
             CombinedTimestepGuidanceTextProjEmbeddings if guidance_embeds else CombinedTimestepTextProjEmbeddings
         )
@@ -687,3 +701,102 @@ class FluxTransformer2DModel(nn.Module):
             loaded_params.add(original_name)
             loaded_params.add(lookup_name)
         return loaded_params
+
+
+class FluxKontextTransformer2DModel(FluxTransformer2DModel):
+    def __init__(
+        self,
+        od_config: OmniDiffusionConfig = None,
+        patch_size: int = 1,
+        in_channels: int = 64,
+        out_channels: int = None,
+        num_layers: int = 19,
+        num_single_layers: int = 38,
+        attention_head_dim: int = 128,
+        num_attention_heads: int = 24,
+        joint_attention_dim: int = 4096,
+        pooled_projection_dim: int = 768,
+        guidance_embeds: bool = True,
+        axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
+        theta: float = 10000.0,
+    ):
+        super().__init__(
+            od_config=od_config,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_layers=num_layers,
+            num_single_layers=num_single_layers,
+            attention_head_dim=attention_head_dim,
+            num_attention_heads=num_attention_heads,
+            joint_attention_dim=joint_attention_dim,
+            pooled_projection_dim=pooled_projection_dim,
+            guidance_embeds=guidance_embeds,
+            axes_dims_rope=axes_dims_rope,
+            theta=theta,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        pooled_projections: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_ids: torch.Tensor = None,
+        txt_ids: torch.Tensor = None,
+        guidance: torch.Tensor | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+        return_dict: bool = True,
+    ) -> torch.Tensor | Transformer2DModelOutput:
+        hidden_states = self.x_embedder(hidden_states)
+        timestep = timestep.to(hidden_states.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+
+        if guidance is None:
+            temb = self.time_text_embed(timestep, pooled_projections)
+        else:
+            temb = self.time_text_embed(timestep, guidance, pooled_projections)
+
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+        if txt_ids is not None and txt_ids.ndim == 3:
+            logger.warning(
+                "Passing `txt_ids` 3d torch.Tensor is deprecated."
+                "Please remove the batch dimension and pass it as a 2d torch.Tensor"
+            )
+            txt_ids = txt_ids[0]
+        if img_ids is not None and img_ids.ndim == 3:
+            logger.warning(
+                "Passing `img_ids` 3d torch.Tensor is deprecated."
+                "Please remove the batch dimension and pass it as a 2d torch.Tensor"
+            )
+            img_ids = img_ids[0]
+
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        image_rotary_emb = self.pos_embed(ids)
+
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+
+        for block in self.single_transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+
+        if not return_dict:
+            return (output,)
+
+        return Transformer2DModelOutput(sample=output)
