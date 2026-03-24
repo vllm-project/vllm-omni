@@ -122,6 +122,17 @@ class OmniOpenAIServingVideo:
         if request.flow_shift is not None:
             gen_params.extra_args["flow_shift"] = request.flow_shift
 
+        # Apply model-specific extra parameters
+        if request.extra_params is not None:
+            if not isinstance(request.extra_params, dict):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="extra_params must be a JSON object/dict.",
+                )
+            # Merge extra_params into extra_args
+            gen_params.extra_args.update(request.extra_params)
+            logger.info("Applied extra_params: %s", request.extra_params)
+
         self._apply_lora(request.lora, gen_params)
 
         logger.info(

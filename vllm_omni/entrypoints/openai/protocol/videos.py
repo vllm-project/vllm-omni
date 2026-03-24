@@ -161,6 +161,12 @@ class VideoGenerationRequest(BaseModel):
         ),
     )
 
+    # Generic model-specific parameters
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description=("Optional model-specific parameters passed directly to the model's extra_args. "),
+    )
+
     def resolve_video_params(self) -> VideoParams:
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
 
