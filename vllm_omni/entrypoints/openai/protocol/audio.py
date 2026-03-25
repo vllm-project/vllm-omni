@@ -1,7 +1,10 @@
+import math
 from typing import Literal
 
 import numpy as np
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+_MAX_EMBEDDING_DIM = 8192
 
 
 class OpenAICreateSpeechRequest(BaseModel):
@@ -41,7 +44,7 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     ref_audio: str | None = Field(
         default=None,
-        description="Reference audio for voice cloning (Base task). URL, base64, or file path.",
+        description="Reference audio for voice cloning (Base task). URL, base64, or file URI.",
     )
     ref_text: str | None = Field(
         default=None,
@@ -50,6 +53,13 @@ class OpenAICreateSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
+    )
+    speaker_embedding: list[float] | None = Field(
+        default=None,
+        max_length=_MAX_EMBEDDING_DIM,
+        description="Pre-computed speaker embedding vector (1024-dim for 0.6B, "
+        "2048-dim for 1.7B). Skips speaker encoder extraction from ref_audio. "
+        "Implies x_vector_only_mode=True. Mutually exclusive with ref_audio.",
     )
     max_new_tokens: int | None = Field(
         default=None,
@@ -67,6 +77,20 @@ class OpenAICreateSpeechRequest(BaseModel):
         if v == "sse":
             raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
+
+    @field_validator("speaker_embedding")
+    @classmethod
+    def validate_speaker_embedding(cls, v: list[float] | None) -> list[float] | None:
+        if v is not None and not all(math.isfinite(x) for x in v):
+            raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
+        return v
+
+    @model_validator(mode="after")
+    def validate_embedding_constraints(self) -> "OpenAICreateSpeechRequest":
+        if self.speaker_embedding is not None:
+            if self.ref_audio is not None:
+                raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
+        return self
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
@@ -177,6 +201,11 @@ class StreamingSpeechSessionConfig(BaseModel):
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
+    speaker_embedding: list[float] | None = Field(
+        default=None,
+        max_length=_MAX_EMBEDDING_DIM,
+        description="Pre-computed speaker embedding vector. Mutually exclusive with ref_audio.",
+    )
     stream_audio: bool = Field(
         default=False,
         description=(
