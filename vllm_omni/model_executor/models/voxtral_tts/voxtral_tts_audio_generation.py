@@ -437,7 +437,7 @@ class FlowMatchingAudioTransformer(nn.Module):
 
         # Flow matching constants
         # TODO(chenyo): hardcoded, need to fix
-        self._acoustic_decode_iters = 16
+        self._acoustic_decode_iters = 8
         # TODO(chenyo): hardcoded, need to fix
         self._cfg_alpha = 1.2
         self._noise_scale = 1.0
