@@ -225,9 +225,6 @@ class _DiffusionServingModels:
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
         self._base_model_paths = base_model_paths
         self.model_config = self._NullModelConfig()
-        # self.renderer = None
-        # self.input_processor = None
-        # self.io_processor = None
 
     @property
     def base_model_paths(self) -> list[BaseModelPath]:
@@ -526,6 +523,7 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
 
+        state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
         return
