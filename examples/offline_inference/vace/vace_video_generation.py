@@ -186,15 +186,20 @@ def main():
     )
     elapsed = time.perf_counter() - start
 
-    frames = outputs[0].request_output[0].images[0]
-    print(f"Output shape: {frames.shape}, Time: {elapsed:.1f}s")
+    video = outputs[0].images
+    if isinstance(video, list):
+        video = video[0]
+    if isinstance(video, torch.Tensor):
+        video = video.cpu().numpy()
+    if video.ndim == 5:
+        video = video[0]
+    print(f"Output shape: {video.shape}, Time: {elapsed:.1f}s")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     from diffusers.utils import export_to_video
 
-    video = frames[0] if frames.ndim == 5 else frames
     if np.issubdtype(video.dtype, np.integer):
         video = video.astype(np.float32) / 255.0
     export_to_video(list(video), str(output_path), fps=args.fps)
