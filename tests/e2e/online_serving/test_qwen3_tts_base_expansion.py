@@ -60,7 +60,6 @@ tts_server_params = [
             server_args=["--trust-remote-code", "--disable-log-stats"],
         ),
         id="no_async_chunk",
-        marks=pytest.mark.skip(reason="Known issue(2030): qwen3_tts_no_async_chunk path temporarily disabled."),
     ),
 ]
 
@@ -91,3 +90,30 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
         "ref_text": REF_TEXT,
     }
     openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_response_format_001(omni_server, openai_client) -> None:
+    """
+    Test text input processing and audio output via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text
+    Output Modal: audio
+    Input Setting: non-stream PCM
+    Datasets: few requests
+    """
+
+    request_config = {
+        "model": omni_server.model,
+        "input": get_prompt(),
+        "response_format": "pcm",
+        "task_type": "Base",
+        "voice": "clone",
+        "ref_audio": REF_AUDIO_URL,
+        "ref_text": REF_TEXT,
+    }
+    openai_client.send_audio_speech_request(request_config)

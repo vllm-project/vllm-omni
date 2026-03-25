@@ -30,7 +30,7 @@ def get_stage_config(name: str = "qwen3_tts.yaml"):
 def get_prompt(prompt_type="english"):
     """Text prompt for text-to-audio tests (same as test_qwen3_omni - beijing test case)."""
     prompts = {
-        "english": "Beijing, China's capital, blends ancient wonders like the Great Wall with modern marvels. This vibrant metropolis offers rich culture, delicious Peking duck, and endless exploration opportunities.",
+        "english": "The weather is nice today, perfect for a walk in the park.",
         "chinese": "北京，中国的首都，是一座融合了紫禁城、长城等历史遗迹与现代建筑的国际化大都市，充满了独特的文化与活力",
     }
     return prompts.get(prompt_type, prompts["english"])

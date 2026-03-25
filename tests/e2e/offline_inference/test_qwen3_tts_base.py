@@ -59,7 +59,6 @@ def get_prompt():
     return "Hello, this is a test for text to audio."
 
 
-@pytest.mark.skip(reason="Known issue(2030): qwen3_tts_no_async_chunk path temporarily disabled.")
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

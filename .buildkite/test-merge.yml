@@ -215,7 +215,8 @@ steps:
         timeout 20m bash -c '
           export VLLM_LOGGING_LEVEL=DEBUG
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
-          pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m "advanced_model" --run-level "advanced_model" && pytest -s -v tests/e2e/offline/test_qwen3_tts_customvoice.py
+          export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m "advanced_model" --run-level "advanced_model" && pytest -s -v tests/e2e/offline_inference/test_qwen3_tts_customvoice.py
         '
     agents:
       queue: "gpu_1_queue"
@@ -237,7 +238,8 @@ steps:
         timeout 20m bash -c '
           export VLLM_LOGGING_LEVEL=DEBUG
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
-          pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py -m "advanced_model" --run-level "advanced_model" && pytest -s -v tests/e2e/offline/test_qwen3_tts_base.py
+          export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py -m "advanced_model" --run-level "advanced_model" && pytest -s -v tests/e2e/offline_inference/test_qwen3_tts_base.py
         '
     agents:
       queue: "gpu_1_queue"

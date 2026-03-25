@@ -54,6 +54,9 @@ PromptVideoInput = list[Any] | Any | None
 
 _GENDER_PIPELINE = None
 
+# int16 mono PCM from /v1/audio/speech when response_format=pcm (Qwen3-TTS code2wav output rate).
+_PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
+
 
 class OmniServerParams(NamedTuple):
     model: str
@@ -828,10 +831,9 @@ def convert_audio_file_to_text(output_path: str) -> str:
 
 def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
     """
-    Write raw audio bytes to a temp WAV file suitable for Whisper/ffmpeg.
+    Write container audio bytes (WAV, etc.) to a temp WAV file suitable for Whisper/ffmpeg.
     Normalizes with soundfile to PCM_16 WAV when possible to avoid codec issues.
     """
-    # Use high-entropy filename to avoid collisions under concurrency.
     output_path = f"./test_{uuid.uuid4().hex}.wav"
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
@@ -1385,6 +1387,51 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         return "unknown"
 
 
+# Threshold aligned with _compute_pcm_hnr_db docstring (clean clone vs distorted).
+_MIN_PCM_SPEECH_HNR_DB = 1.2
+
+
+def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
+    """Compute mean Harmonic-to-Noise Ratio (dB) for speech quality.
+
+    Clean cloned speech has HNR > 1.2 dB; distorted speech (e.g. lost
+    ref_code decoder context) drops below 1.0 dB.
+    """
+    frame_len = int(0.03 * sr)  # 30ms frames
+    hop = frame_len // 2
+    hnr_values: list[float] = []
+
+    for start in range(0, len(pcm_samples) - frame_len, hop):
+        frame = pcm_samples[start : start + frame_len].astype(np.float32, copy=False)
+        frame = frame - np.mean(frame)
+        if np.max(np.abs(frame)) < 0.01:
+            continue
+        ac = np.correlate(frame, frame, mode="full")[len(frame) - 1 :]
+        ac = ac / (ac[0] + 1e-10)
+        min_lag = int(sr / 400)
+        max_lag = min(int(sr / 80), len(ac))
+        if min_lag >= max_lag:
+            continue
+        peak = float(np.max(ac[min_lag:max_lag]))
+        if 0 < peak < 1:
+            hnr_values.append(10 * np.log10(peak / (1 - peak + 1e-10)))
+
+    return float(np.mean(hnr_values)) if hnr_values else 0.0
+
+
+def _assert_pcm_int16_speech_hnr(audio_bytes: bytes) -> None:
+    """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech."""
+    assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
+    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    hnr = _compute_pcm_hnr_db(pcm_samples)
+    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {_MIN_PCM_SPEECH_HNR_DB} dB)")
+    assert hnr >= _MIN_PCM_SPEECH_HNR_DB, (
+        f"Audio distortion detected: HNR={hnr:.2f} dB < {_MIN_PCM_SPEECH_HNR_DB} dB. "
+        "Voice clone decoder may be losing ref_code speaker context on later chunks."
+    )
+
+
 def assert_omni_response(response: OmniResponse, request_config: dict[str, Any], run_level):
     """
     Validate response results.
@@ -1439,13 +1486,21 @@ def assert_audio_speech_response(
     run_level: str,
 ) -> None:
     """
-    Validate /v1/audio/speech response: success, optional format check, and transcription similarity.
+    Validate /v1/audio/speech response: success, optional format check, transcription similarity
+    and gender (non-PCM only for advanced_model), and int16 PCM HNR when response_format is pcm.
     """
     assert response.success, "The request failed."
 
     req_fmt = request_config.get("response_format")
 
-    if req_fmt and response.audio_format is not None:
+    if req_fmt == "pcm" and response.audio_bytes:
+        _assert_pcm_int16_speech_hnr(response.audio_bytes)
+        if response.audio_format:
+            assert "pcm" in response.audio_format.lower(), (
+                f"Expected audio/pcm content-type, got {response.audio_format!r}"
+            )
+
+    elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format, (
             f"The response audio format {response.audio_format} don't match the request audio format {req_fmt}"
         )
@@ -1454,8 +1509,8 @@ def assert_audio_speech_response(
     if e2e_latency is not None:
         print(f"the avg e2e latency is: {e2e_latency}")
 
-    if run_level == "advanced_model":
-        # Text–audio semantic similarity check
+    if run_level == "advanced_model" and req_fmt != "pcm":
+        # Text–audio semantic similarity check (skipped for raw PCM: no Whisper transcript).
         expected_text = request_config.get("input")
         if expected_text:
             transcript = (response.audio_content or "").strip()
@@ -1708,7 +1763,7 @@ class OpenAIClientHandler:
 
         return result
 
-    def _process_stream_audio_speech_response(self, response) -> OmniResponse:
+    def _process_stream_audio_speech_response(self, response, *, response_format: str | None = None) -> OmniResponse:
         """
         Process streaming /v1/audio/speech responses into an OmniResponse.
 
@@ -1751,7 +1806,10 @@ class OpenAIClientHandler:
                     raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
 
             raw_bytes = bytes(data)
-            transcript = convert_audio_bytes_to_text(raw_bytes)
+            if response_format == "pcm":
+                transcript = None
+            else:
+                transcript = convert_audio_bytes_to_text(raw_bytes)
 
             # Populate OmniResponse.
             result.audio_bytes = raw_bytes
@@ -1768,7 +1826,9 @@ class OpenAIClientHandler:
 
         return result
 
-    def _process_non_stream_audio_speech_response(self, response) -> OmniResponse:
+    def _process_non_stream_audio_speech_response(
+        self, response, *, response_format: str | None = None
+    ) -> OmniResponse:
         """
         Process non-streaming /v1/audio/speech responses into an OmniResponse.
 
@@ -1787,7 +1847,10 @@ class OpenAIClientHandler:
             else:
                 raise TypeError(f"Unsupported audio speech response type: {type(response)}")
 
-            transcript = convert_audio_bytes_to_text(raw_bytes)
+            if response_format == "pcm":
+                transcript = None
+            else:
+                transcript = convert_audio_bytes_to_text(raw_bytes)
 
             result.audio_bytes = raw_bytes
             result.audio_content = transcript
@@ -1895,6 +1958,8 @@ class OpenAIClientHandler:
 
         responses: list[OmniResponse] = []
 
+        speech_fmt: str | None = None if response_format is omit else str(response_format).lower()
+
         if request_num == 1:
             if stream:
                 # Use streaming response helper.
@@ -1906,7 +1971,7 @@ class OpenAIClientHandler:
                     timeout=timeout,
                     voice=voice,
                 ) as resp:
-                    omni_resp = self._process_stream_audio_speech_response(resp)
+                    omni_resp = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
             else:
                 # Non-streaming response.
                 resp = self.client.audio.speech.create(
@@ -1917,7 +1982,7 @@ class OpenAIClientHandler:
                     timeout=timeout,
                     voice=voice,
                 )
-                omni_resp = self._process_non_stream_audio_speech_response(resp)
+                omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
 
             assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
             responses.append(omni_resp)
@@ -1936,7 +2001,7 @@ class OpenAIClientHandler:
                         timeout=timeout,
                         voice=voice,
                     ) as resp:
-                        return self._process_stream_audio_speech_response(resp)
+                        return self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
                     futures = [executor.submit(_stream_task) for _ in range(request_num)]
@@ -1961,7 +2026,7 @@ class OpenAIClientHandler:
 
                     for future in concurrent.futures.as_completed(futures):
                         resp = future.result()
-                        omni_resp = self._process_non_stream_audio_speech_response(resp)
+                        omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
                         assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
                         responses.append(omni_resp)
 
@@ -2520,20 +2585,38 @@ class OmniRunnerHandler:
             modalities=["audio"],
             mm_processor_kwargs=mm_processor_kwargs or None,
         )
-        audio_tensor = None
+        mm_out: dict[str, Any] | None = None
         for stage_out in outputs:
             if getattr(stage_out, "final_output_type", None) == "audio":
-                audio_tensor = stage_out.request_output[0].outputs[0].multimodal_output["audio"]
+                mm_out = stage_out.request_output.outputs[0].multimodal_output
                 break
-        if audio_tensor is None:
+        if mm_out is None:
             result = OmniResponse(success=False, error_message="No audio output from pipeline")
             assert result.success, result.error_message
             return result
 
-        # Keep the offline path lightweight: downstream validation can be done elsewhere if needed.
-        result = OmniResponse(success=True)
+        audio_data = mm_out.get("audio")
+        if audio_data is None:
+            result = OmniResponse(success=False, error_message="No audio tensor in multimodal output")
+            assert result.success, result.error_message
+            return result
+
+        sr_raw = mm_out.get("sr")
+        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+        sr = int(sr_val.item() if hasattr(sr_val, "item") else sr_val)
+        wav_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+        wav_buf = io.BytesIO()
+        sf.write(
+            wav_buf,
+            wav_tensor.float().cpu().numpy().reshape(-1),
+            samplerate=sr,
+            format="WAV",
+            subtype="PCM_16",
+        )
+        result = OmniResponse(success=True, audio_bytes=wav_buf.getvalue(), audio_format="audio/wav")
         assert_audio_speech_response(result, request_config, run_level="core_model")
         return result
+
     def start_profile(
         self,
         profile_prefix: str | None = None,
