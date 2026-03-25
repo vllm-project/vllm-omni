@@ -533,6 +533,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
+        speaker = getattr(request, "speaker", None)
+        if speaker is not None and isinstance(speaker, str) and speaker.strip():
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["speaker"] = [speaker.lower().strip()]
+
+        language = getattr(request, "language", None)
+        if language is not None and isinstance(language, str) and language.strip():
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["language"] = [language.strip()]
+
         return conversation, [engine_prompt]
 
     async def _inject_audio_from_video_urls(

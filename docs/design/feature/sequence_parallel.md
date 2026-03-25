@@ -7,6 +7,7 @@ This section describes how to add Sequence Parallel (SP) to a diffusion transfor
 ## Table of Contents
 
 - [Overview](#overview)
+- [UAA Mode (Experimental)](#uaa-mode-experimental)
 - [Approach 1: Non-Intrusive `_sp_plan` (Recommended)](#approach-1-non-intrusive-_sp_plan-recommended)
 - [Approach 2: Intrusive Modification (For Complex Cases)](#approach-2-intrusive-modification-for-complex-cases)
 - [Testing](#testing)
@@ -43,6 +44,41 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 | `SequenceParallelOutput` | Declare output gathering in `_sp_plan` | Auto-gathers tensors at module output |
 | `sp_shard()` | Manual tensor sharding | Splits tensor across SP workers |
 | `sp_gather()` | Manual tensor gathering | Gathers sharded tensors from all workers |
+
+---
+
+## UAA Mode (Experimental)
+
+`ulysses_mode="advanced_uaa"` enables the experimental UAA ("Ulysses Anything Attention") path that was introduced to address the uneven-shape cases discussed in [issue #1324](https://github.com/vllm-project/vllm-omni/issues/1324).
+
+Use it when plain Ulysses-SP would otherwise fail because:
+
+- the local sequence shards are not evenly divisible after split hooks, or
+- the attention head count is not divisible by `ulysses_degree`.
+
+### Design Summary
+
+1. **Strict mode stays unchanged.**
+   `ulysses_mode="strict"` keeps the original fast path and still requires divisible sequence/head shapes.
+
+2. **UAA uses variable all-to-all split sizes for sequence shards.**
+   Before the Ulysses Q/K/V exchange, each rank all-gathers its local sequence length and uses those lengths as `all_to_all_single(..., output_split_sizes=seq_lens)`. This lets Ulysses gather the full sequence even when each rank started with a different local shard length.
+
+3. **UAA pads heads only inside the Ulysses exchange.**
+   If `head_cnt % ulysses_degree != 0`, UAA pads the head dimension up to the next multiple of `ulysses_degree`, performs the forward/reverse all-to-all, then slices the temporary head padding away after the reverse exchange. The same rule is applied to joint attention tensors.
+
+4. **Hybrid Ulysses + Ring is still shape-constrained.**
+   Ring attention expects every rank in a ring group to exchange exactly the same post-Ulysses sequence shape. UAA therefore validates those shapes before entering the ring path and raises a clear error if ring peers disagree on `S_global`.
+
+5. **Tiny scalar gathers stay out of TorchDynamo tracing.**
+   `_all_gather_int()` is marked with `@torch.compiler.disable` so the scalar `item()` conversions used by UAA metadata collection do not get traced into `torch.compile`.
+
+### UAA vs `auto_pad`
+
+- `auto_pad=True` pads sequence tokens in `_sp_plan` and requires attention backends that support `attention_mask`.
+- `advanced_uaa` does not depend on mask-based token padding inside Ulysses attention. It is therefore a better fit for non-divisible head counts and uneven Ulysses shard sizes.
+- `auto_pad=True` remains incompatible with Ring attention because the ring backend does not consume `attention_mask`.
+- `advanced_uaa` is still experimental and hybrid mode remains limited by Ring's equal-shape requirement.
 
 ---
 
@@ -364,9 +400,14 @@ _sp_plan = {
 
 - **Sequence Length not divisible by sp_size:**
 
-**Problem:** `SequenceParallelInput(auto_pad=False)` - auto_pad should be True to enable automatic sequence padding.
+**Problem:** strict Ulysses sequence parallel requires divisible shapes. If the shard length is uneven, or if the model head count is not divisible by `ulysses_degree`, the strict path will raise an error.
 
-**Solution:** In `SequenceParallelInput`, set `auto_pad=True` and add attention mask support.
+**Solutions:**
+
+1. Use `ulysses_mode="advanced_uaa"` for Ulysses-SP when you want the experimental uneven-shape path without relying on attention-mask padding.
+2. If the model already uses `_sp_plan` token padding and the attention backend supports `attention_mask`, set `auto_pad=True` and add attention-mask plumbing.
+
+> **Experimental Feature:** `ulysses_mode="advanced_uaa"` is experimental. It is intended to relax Ulysses divisibility constraints, but hybrid Ulysses + Ring still requires equal post-Ulysses sequence lengths inside each ring group.
 
 > **Experimental Feature:** `auto_pad=True` is an experimental feature and may be changed in the future. We plan to improve this solution to involve minimal changes to model files. More details are [here](https://github.com/vllm-project/vllm-omni/issues/1324).
 

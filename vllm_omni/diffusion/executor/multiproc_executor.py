@@ -204,20 +204,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         kwargs = kwargs or {}
 
         # Prepare RPC request message
+        # When unique_reply_rank is None, all workers must execute the RPC
+        # but only rank 0 can reply (it's the only one with a result_mq).
         rpc_request = {
             "type": "rpc",
             "method": method,
             "args": args,
             "kwargs": kwargs,
-            "output_rank": unique_reply_rank,
+            "output_rank": unique_reply_rank if unique_reply_rank is not None else 0,
+            "exec_all_ranks": unique_reply_rank is None,
         }
 
         try:
             # Broadcast RPC request to all workers via unified message queue
             self._broadcast_mq.enqueue(rpc_request)
 
-            # Determine which workers we expect responses from
-            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
+            # Only rank 0 has a result_mq, so we always expect exactly 1 response
+            num_responses = 1
 
             responses = []
             for _ in range(num_responses):

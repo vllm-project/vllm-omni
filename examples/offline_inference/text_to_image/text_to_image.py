@@ -110,6 +110,13 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
+        "--ulysses-mode",
+        type=str,
+        default="strict",
+        choices=["strict", "advanced_uaa"],
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+    )
+    parser.add_argument(
         "--ring-degree",
         type=int,
         default=1,
@@ -272,6 +279,7 @@ def main():
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
+        ulysses_mode=args.ulysses_mode,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
@@ -317,6 +325,7 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
+        "mode": "text-to-image",
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         **lora_args,
         **quant_kwargs,
@@ -343,8 +352,10 @@ def main():
         print(f"  Ignored layers: {ignored_layers}")
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
-        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
-        f"vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}."
+        f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
+        f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
+        f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
+        f"enable_expert_parallel={args.enable_expert_parallel}."
     )
     print(f"  CPU offload: {args.enable_cpu_offload}")
     print(f"  Image size: {args.width}x{args.height}")
