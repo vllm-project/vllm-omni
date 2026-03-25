@@ -58,7 +58,7 @@ python3 examples/offline_inference/voxtral_tts/end2end.py \
 | `--num-prompts N` | Number of replicate prompts to run for measuring performance (default: 1) |
 | `--streaming` | Use streaming generation via `AsyncOmni` (default: blocking `Omni`) |
 | `--concurrency N` | Max concurrent requests per wave (must be used with `--streaming`, must evenly divide `--num-prompts`) |
-| `--voice NAME` | Voice preset to use instead of reference audio file (e.g., casual_female, casual_male, cheerful_female, neutral_female, neutral_male) |
+| `--voice NAME` | Voice preset to use instead of reference audio file. Check Huggingface `mistralai/Voxtral-4B-TTS-2603` to get the list of available voices |
 | `--write-audio` | Write generated audio to WAV files |
 | `--profiling-mode` | Enable profiling mode (reduces max tokens to 50) |
 | `--log-stats` | Enable detailed statistics logging |
