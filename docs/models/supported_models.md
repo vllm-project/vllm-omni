@@ -15,7 +15,7 @@ th {
 }
 </style>
 
-| Architecture | Models | Example HF Models | NVIDIA GPU | AMD GPU | NPU | Intel GPU |
+| Architecture | Models | Example HF Models | NVIDIA GPU | AMD GPU | Ascend NPU | Intel GPU |
 |--------------|--------|-------------------|------------|---------|-----|-----------|
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
