@@ -1023,6 +1023,8 @@ async def list_voices(raw_request: Request):
                 "created_at": info.get("created_at", 0),
                 "file_size": info.get("file_size", 0),
                 "mime_type": info.get("mime_type", ""),
+                "embedding_source": info.get("embedding_source", "audio"),
+                "embedding_dim": info.get("embedding_dim"),
             }
             if info.get("ref_text"):
                 voice_entry["ref_text"] = info["ref_text"]
@@ -1043,20 +1045,28 @@ async def list_voices(raw_request: Request):
 )
 async def upload_voice(
     raw_request: Request,
-    audio_sample: UploadFile = File(...),
+    audio_sample: UploadFile | None = File(None),
+    speaker_embedding: str | None = Form(None),
     consent: str = Form(...),
     name: str = Form(...),
     ref_text: str | None = Form(None),
     voice_description: str | None = Form(None),
 ):
-    """Upload a new voice sample for voice cloning.
+    """Upload a new voice for voice cloning.
 
-    Uploads an audio file that can be used as a reference for voice cloning
-    in Base task TTS requests. The voice can then be referenced by name
-    in subsequent TTS requests.
+    Accepts either an audio file or a pre-computed speaker embedding vector.
+    These are mutually exclusive: provide one or the other.
+
+    When using ``audio_sample``, the server stores the audio and extracts the
+    speaker embedding on first use (Base task models only).
+
+    When using ``speaker_embedding``, pass a JSON-encoded list of floats
+    (1024-dim for 0.6B, 2048-dim for 1.7B). The voice is stored as a
+    safetensors file and is immediately ready for use.
 
     Args:
-        audio_sample: Audio file (max 10MB)
+        audio_sample: Audio file (max 10MB). Mutually exclusive with speaker_embedding.
+        speaker_embedding: JSON-encoded float list. Mutually exclusive with audio_sample.
         consent: Consent recording ID
         name: Name for the new voice
         ref_text: Optional transcript of the audio for ICL (in-context
@@ -1074,14 +1084,24 @@ async def upload_voice(
         return base(raw_request).create_error_response(message="The model does not support Speech API")
 
     try:
-        # Upload the voice
-        result = await handler.upload_voice(
-            audio_sample,
-            consent,
-            name,
-            ref_text=ref_text,
-            voice_description=voice_description,
-        )
+        if speaker_embedding is not None and audio_sample is not None:
+            return base(raw_request).create_error_response(
+                message="'audio_sample' and 'speaker_embedding' are mutually exclusive"
+            )
+        if speaker_embedding is not None:
+            result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
+        elif audio_sample is not None:
+            result = await handler.upload_voice(
+                audio_sample,
+                consent,
+                name,
+                ref_text=ref_text,
+                voice_description=voice_description,
+            )
+        else:
+            return base(raw_request).create_error_response(
+                message="Either 'audio_sample' or 'speaker_embedding' must be provided"
+            )
 
         return JSONResponse(content={"success": True, "voice": result})
 

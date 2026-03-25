@@ -21,10 +21,16 @@ Examples:
         --task-type Base \
         --ref-audio "https://example.com/reference.wav" \
         --ref-text "This is the reference transcript"
+
+    # Base task with pre-computed speaker embedding
+    python openai_speech_client.py --text "Hello world" \
+        --task-type Base \
+        --speaker-embedding embedding.json
 """
 
 import argparse
 import base64
+import json
 import os
 
 import httpx
@@ -91,6 +97,9 @@ def run_tts_generation(args) -> None:
         payload["ref_text"] = args.ref_text
     if args.x_vector_only:
         payload["x_vector_only_mode"] = True
+    if args.speaker_embedding:
+        with open(args.speaker_embedding) as f:
+            payload["speaker_embedding"] = json.load(f)
 
     print(f"Model: {args.model}")
     print(f"Task type: {args.task_type or 'CustomVoice'}")
@@ -213,6 +222,12 @@ def parse_args():
         "--x-vector-only",
         action="store_true",
         help="Use x-vector only mode for voice cloning (no ICL)",
+    )
+    parser.add_argument(
+        "--speaker-embedding",
+        type=str,
+        default=None,
+        help="Path to JSON file containing a pre-computed speaker embedding vector (1024-dim for 0.6B, 2048-dim for 1.7B)",
     )
 
     # Generation parameters
