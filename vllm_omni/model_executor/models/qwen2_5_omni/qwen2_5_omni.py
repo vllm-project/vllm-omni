@@ -113,6 +113,15 @@ class Qwen2_5OmniForConditionalGeneration(
                 self.model.set_suppress_start_id(t2w_token_end_id + 1)
             self.requires_raw_input_tokens = True
 
+            # Initialize thinker_embedding from config (random weights).
+            # For load_format: dummy this is the final state;
+            # for normal loading, load_weights() overwrites with real weights.
+            self.thinker_embedding = nn.Embedding(
+                self.thinker_config.text_config.vocab_size,
+                self.thinker_config.text_config.hidden_size,
+            )
+            self._init_special_tokens_embeddings()
+
         elif self.model_stage == "code2wav":
             self.thinker = None
             self.talker = None
