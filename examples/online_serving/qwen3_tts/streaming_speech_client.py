@@ -163,7 +163,7 @@ def main():
 
     # Session config options
     parser.add_argument("--model", default=None, help="Model name")
-    parser.add_argument("--voice", default="Vivian", help="Speaker voice")
+    parser.add_argument("--speaker", default="Vivian", help="Speaker name")
     parser.add_argument(
         "--task-type",
         default="CustomVoice",
@@ -215,7 +215,7 @@ def main():
     config = {}
     for key in [
         "model",
-        "voice",
+        "speaker",
         "task_type",
         "language",
         "instructions",

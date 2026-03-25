@@ -23,6 +23,29 @@ Or use the startup script:
 bash run_server.sh
 ```
 
+### Start with Parallelism Acceleration
+
+Enable Tensor Parallelism and VAE Patch Parallelism for faster inference:
+
+```bash
+# With Tensor Parallelism (requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --tensor-parallel-size 2
+
+# With Tensor Parallelism and VAE Patch Parallelism (requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --tensor-parallel-size 2 --vae-patch-parallel-size 2 --vae-use-tiling
+
+# With Sequence Parallelism (Ulysses-SP, requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
+
+# With Ring-Attention (requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
+
+# Combined: Ulysses + Ring (requires >= 4 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
+```
+
+For more details on parallelism acceleration, see the [Parallelism Acceleration Guide](https://github.com/vllm-project/vllm-omni/tree/main/examples/diffusion/parallelism_acceleration.md).
+
 ## API Calls
 
 ### Method 1: Using curl
@@ -97,12 +120,12 @@ curl -X POST http://localhost:8091/v1/images/generations \
 
 ### LoRA Parameters
 
-| Parameter     | Type   | Description                                                      |
-| ------------- | ------ | ---------------------------------------------------------------- |
-| `name`        | str    | LoRA adapter name (optional, defaults to path stem)              |
-| `local_path`  | str    | Server-local path to LoRA adapter folder (PEFT format, required) |
-| `scale`       | float  | LoRA scale factor (default: 1.0)                                 |
-| `int_id`     | int    | LoRA integer ID for caching (optional, derived from path if not provided) |
+| Parameter    | Type  | Description                                                               |
+| ------------ | ----- | ------------------------------------------------------------------------- |
+| `name`       | str   | LoRA adapter name (optional, defaults to path stem)                       |
+| `local_path` | str   | Server-local path to LoRA adapter folder (PEFT format, required)          |
+| `scale`      | float | LoRA scale factor (default: 1.0)                                          |
+| `int_id`     | int   | LoRA integer ID for caching (optional, derived from path if not provided) |
 
 ### LoRA Adapter Format
 
@@ -162,16 +185,16 @@ Use `extra_body` to pass generation parameters:
 
 ## Generation Parameters (extra_body)
 
-| Parameter                | Type  | Default | Description                    |
-| ------------------------ | ----- | ------- | ------------------------------ |
-| `height`                 | int   | None    | Image height in pixels         |
-| `width`                  | int   | None    | Image width in pixels          |
-| `size`                   | str   | None    | Image size (e.g., "1024x1024") |
-| `num_inference_steps`    | int   | 50      | Number of denoising steps      |
-| `true_cfg_scale`         | float | 4.0     | Qwen-Image CFG scale           |
-| `seed`                   | int   | None    | Random seed (reproducible)     |
-| `negative_prompt`        | str   | None    | Negative prompt                |
-| `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
+| Parameter                | Type  | Default | Description                        |
+| ------------------------ | ----- | ------- | ---------------------------------- |
+| `height`                 | int   | None    | Image height in pixels             |
+| `width`                  | int   | None    | Image width in pixels              |
+| `size`                   | str   | None    | Image size (e.g., "1024x1024")     |
+| `num_inference_steps`    | int   | 50      | Number of denoising steps          |
+| `true_cfg_scale`         | float | 4.0     | Qwen-Image CFG scale               |
+| `seed`                   | int   | None    | Random seed (reproducible)         |
+| `negative_prompt`        | str   | None    | Negative prompt                    |
+| `num_outputs_per_prompt` | int   | 1       | Number of images to generate       |
 | `--cfg-parallel-size`.   | int   | 1       | Number of GPUs for CFG parallelism |
 
 ## Response Format

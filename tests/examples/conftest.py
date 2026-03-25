@@ -336,3 +336,17 @@ def extract_content_after_keyword(keywords: str, text: str) -> str:
     if not matches:
         raise AssertionError(f"Keywords {keywords} not found in provided text output")
     return matches[0]
+
+
+def strip_trailing_audio_saved_line(text: str) -> str:
+    """Drop trailing ``Audio saved to ...`` lines from captured client stdout.
+
+    ``openai_chat_completion_client_for_multimodal_generation.py`` may print
+    ``Chat completion output from text:`` for one choice and ``Audio saved to``
+    for another; :func:`extract_content_after_keyword` uses ``re.DOTALL`` and
+    would otherwise keep the audio progress line inside the *text* segment.
+    """
+    lines = text.splitlines()
+    while lines and lines[-1].strip().startswith("Audio saved to"):
+        lines.pop()
+    return "\n".join(lines).strip()

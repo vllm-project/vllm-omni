@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from transformers.utils.hub import cached_file
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
@@ -22,8 +24,12 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.metadata_manager import MetadataManager
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
+    BatchSpeechRequest,
+    BatchSpeechResponse,
     CreateAudio,
     OpenAICreateSpeechRequest,
+    SpeechBatchItem,
+    SpeechBatchItemResult,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -166,6 +172,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
         logger.info(f"Loaded {len(self.uploaded_speakers)} uploaded speakers")
+
+        # Batch configuration
+        self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
 
         # Load speech tokenizer codec parameters for prompt length estimation
         self._codec_frame_rate: float | None = self._load_codec_frame_rate()
@@ -592,7 +601,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "or use a CustomVoice model."
                 )
             if request.voice is not None and request.voice not in self.supported_speakers:
-                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
+                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate Base task requirements
         if task_type == "Base":
@@ -1023,7 +1032,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _generate_audio_bytes(
         self,
         request: OpenAICreateSpeechRequest,
-    ) -> tuple[bytes, str]:
+        base64_encode: bool = False,
+    ) -> tuple[bytes | str, str]:
         request_id, generator, _ = await self._prepare_speech_generation(request)
 
         final_output: OmniRequestOutput | None = None
@@ -1043,9 +1053,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
         if isinstance(audio_tensor, list):
-            import torch
-
-            audio_tensor = torch.cat(audio_tensor, dim=-1)
+            async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
+            if async_chunk:
+                non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
+                audio_tensor = (
+                    torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
+                )
+            else:
+                audio_history = audio_tensor
+                audio_tensor = np.zeros((0,), dtype=np.float32)
+                # Non-async Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.
+                for candidate in reversed(audio_history):
+                    if candidate.numel() > 0:
+                        audio_tensor = candidate
+                        break
         if hasattr(audio_tensor, "float"):
             audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
@@ -1058,7 +1079,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             response_format=request.response_format or "wav",
             speed=request.speed or 1.0,
             stream_format=request.stream_format,
-            base64_encode=False,
+            base64_encode=base64_encode,
         )
         audio_response: AudioResponse = self.create_audio(audio_obj)
         return audio_response.audio_data, audio_response.media_type
@@ -1129,3 +1150,92 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
+
+    @staticmethod
+    def _merge_batch_item(
+        batch: BatchSpeechRequest,
+        item: SpeechBatchItem,
+    ) -> OpenAICreateSpeechRequest:
+        """Merge batch-level defaults with per-item overrides into a full request."""
+
+        def _pick(field: str):
+            """Return item-level value if set, else batch-level value."""
+            item_val = getattr(item, field, None)
+            return item_val if item_val is not None else getattr(batch, field, None)
+
+        picked_speed = _pick("speed")
+        return OpenAICreateSpeechRequest(
+            input=item.input,
+            model=batch.model,
+            voice=_pick("voice"),
+            instructions=_pick("instructions"),
+            response_format=_pick("response_format") or "wav",
+            speed=picked_speed if picked_speed is not None else 1.0,
+            stream=False,
+            task_type=_pick("task_type"),
+            language=_pick("language"),
+            ref_audio=_pick("ref_audio"),
+            ref_text=_pick("ref_text"),
+            x_vector_only_mode=_pick("x_vector_only_mode"),
+            max_new_tokens=_pick("max_new_tokens"),
+            initial_codec_chunk_frames=_pick("initial_codec_chunk_frames"),
+        )
+
+    async def create_speech_batch(
+        self,
+        batch_request: BatchSpeechRequest,
+    ) -> BatchSpeechResponse | ErrorResponse:
+        """Generate speech for multiple items concurrently."""
+        if len(batch_request.items) > self._batch_max_items:
+            raise ValueError(
+                f"Batch contains {len(batch_request.items)} items, exceeding the maximum of {self._batch_max_items}."
+            )
+
+        error_check_ret = await self._check_model(batch_request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        batch_id = f"speech-batch-{random_uuid()}"
+
+        merged_requests = [self._merge_batch_item(batch_request, item) for item in batch_request.items]
+
+        async def _run_item(idx: int, req: OpenAICreateSpeechRequest) -> SpeechBatchItemResult:
+            validation_error = self._validate_tts_request(req)
+            if validation_error is not None:
+                return SpeechBatchItemResult(index=idx, status="error", error=validation_error)
+            try:
+                audio_data, media_type = await self._generate_audio_bytes(req, base64_encode=True)
+            except Exception as e:
+                logger.exception("Batch item %d failed: %s", idx, e)
+                return SpeechBatchItemResult(index=idx, status="error", error=str(e))
+            return SpeechBatchItemResult(
+                index=idx,
+                status="success",
+                audio_data=audio_data,
+                media_type=media_type,
+            )
+
+        results = await asyncio.gather(
+            *[_run_item(i, req) for i, req in enumerate(merged_requests)],
+            return_exceptions=True,
+        )
+
+        final_results: list[SpeechBatchItemResult] = []
+        for i, r in enumerate(results):
+            if isinstance(r, BaseException):
+                logger.exception("Batch item %d raised unexpected exception: %s", i, r)
+                final_results.append(SpeechBatchItemResult(index=i, status="error", error=str(r)))
+            else:
+                final_results.append(r)
+
+        succeeded = sum(1 for r in final_results if r.status == "success")
+        return BatchSpeechResponse(
+            id=batch_id,
+            results=final_results,
+            total=len(final_results),
+            succeeded=succeeded,
+            failed=len(final_results) - succeeded,
+        )

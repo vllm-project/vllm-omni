@@ -11,7 +11,7 @@ Qwen3 TTS provides multiple task variants for speech generation:
 
 - **CustomVoice**: Generate speech with a known speaker identity (speaker ID) and optional instruction.
 - **VoiceDesign**: Generate speech from text plus a descriptive instruction that designs a new voice.
-- **Base**: Voice cloning using a reference audio + reference transcript, with optional mode selection.
+- **Base**: Voice cloning using a reference audio + reference transcript, with optional mode selection. The `ref_audio` field accepts a local file path, HTTP URL, or base64 data URL.
 
 ## Setup
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
@@ -89,6 +89,43 @@ Examples:
 ```
 python end2end.py --query-type Base --mode-tag icl
 ```
+
+## Voice and Language Control
+
+### Supported Voices (CustomVoice)
+
+Predefined speaker voices are set via the `speaker` (or `voice_type`) field in `additional_information`. Available speakers depend on the loaded checkpoint; check `talker_config.spk_id` in the model config for the full list. Common voices include `vivian`, `ryan`, `aiden`, `ethan`, `serena` (case-insensitive).
+
+Pass the speaker name in your request:
+
+```python
+additional_information = {
+    "text": ["你好，我是通义千问"],
+    "task_type": ["CustomVoice"],
+    "speaker": ["Vivian"],  
+    "language": ["Chinese"],
+}
+```
+
+### Supported Languages
+
+The `language` field controls the codec-level language tag. Use `"Auto"` (default) for automatic detection.
+
+Supported values: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, `Italian`.
+
+```python
+additional_information = {
+    "text": ["Hello, nice to meet you."],
+    "task_type": ["CustomVoice"],
+    "speaker": ["Aiden"],
+    "language": ["English"],
+}
+```
+
+### VoiceDesign and Base
+
+- **VoiceDesign**: Use `instruct` for natural-language voice description; no `speaker` needed.
+- **Base**: Use `ref_audio` and `ref_text` for voice cloning; `language` is optional.
 
 ## Streaming Mode
 
