@@ -18,6 +18,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Sequence
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -63,6 +64,7 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -296,8 +298,6 @@ class AsyncOmniEngine:
         omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
     ) -> StartedLlmStage:
         """Launch one LLM stage to READY state in a helper thread."""
-        from vllm_omni.platforms import current_omni_platform
-
         started_stage: StartedLlmStage | None = None
         lock_fds: list[int] = []
         device_control_env = current_omni_platform.device_control_env_var
@@ -428,6 +428,7 @@ class AsyncOmniEngine:
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors in orchestrator thread and assign to self."""
+        device_control_env = current_omni_platform.device_control_env_var
 
         num_stages = self.num_stages
         stage_clients: list[Any | None] = [None] * num_stages
@@ -468,25 +469,32 @@ class AsyncOmniEngine:
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
 
                     if metadata.stage_type == "diffusion":
-                        setup_stage_devices(stage_id, metadata.runtime_cfg)
-                        omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-                        if omni_conn_cfg:
-                            from vllm_omni.entrypoints.utils import inject_omni_kv_config
+                        previous_visible_devices = os.environ.get(device_control_env)
+                        try:
+                            setup_stage_devices(stage_id, metadata.runtime_cfg)
+                            omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+                            if omni_conn_cfg:
+                                from vllm_omni.entrypoints.utils import inject_omni_kv_config
 
-                            inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                        _inject_kv_stage_info(stage_cfg, stage_id)
-                        stage_clients[stage_id] = initialize_diffusion_stage(
-                            self.model,
-                            stage_cfg,
-                            metadata,
-                            batch_size=self.diffusion_batch_size,
-                        )
-                        logger.info(
-                            "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
-                            stage_id,
-                            self.diffusion_batch_size,
-                        )
-                        continue
+                                inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                            _inject_kv_stage_info(stage_cfg, stage_id)
+                            stage_clients[stage_id] = initialize_diffusion_stage(
+                                self.model,
+                                stage_cfg,
+                                metadata,
+                                batch_size=self.diffusion_batch_size,
+                            )
+                            logger.info(
+                                "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
+                                stage_id,
+                                self.diffusion_batch_size,
+                            )
+                            continue
+                        finally:
+                            if previous_visible_devices is None:
+                                current_omni_platform.unset_device_control_env_var()
+                            else:
+                                current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
                     llm_stage_ids.append(stage_id)
                     llm_launch_futures[stage_id] = launch_executor.submit(
@@ -802,6 +810,7 @@ class AsyncOmniEngine:
         if parallel_config is None:
             ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
             ring_degree = normalized_kwargs.get("ring_degree") or 1
+            ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
@@ -819,6 +828,7 @@ class AsyncOmniEngine:
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
+                ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 use_hsdp=use_hsdp,
@@ -857,6 +867,15 @@ class AsyncOmniEngine:
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
                     "quantization": kwargs.get("quantization", None),
                     "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+                    **(
+                        {
+                            "profiler_config": asdict(kwargs["profiler_config"])
+                            if hasattr(kwargs["profiler_config"], "__dataclass_fields__")
+                            else kwargs["profiler_config"]
+                        }
+                        if kwargs.get("profiler_config") is not None
+                        else {}
+                    ),
                 },
                 "final_output": True,
                 "final_output_type": "image",

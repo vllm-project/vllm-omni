@@ -10,7 +10,7 @@ MiMo-Audio provides multiple task variants for audio understanding and generatio
 - **tts_sft_with_instruct**: TTS generation with explicit voice style instructions.
 - **tts_sft_with_audio**: TTS generation with audio reference for voice cloning.
 - **tts_sft_with_natural_instruction**: TTS generation from natural language descriptions embedded in text.
-- **audio_trancribing_sft**: Transcribe audio to text (speech-to-text).
+- **audio_trancribing_sft**: Transcribe audio to text (speech-to-text). (note: the upstream task name uses the spelling 'trancribing', don't fix it)
 - **audio_understanding_sft**: Understand and analyze audio content with text queries.
 - **audio_understanding_sft_with_thinking**: Audio understanding with reasoning chain.
 - **spoken_dialogue_sft_multiturn**: Multi-turn spoken dialogue with audio input/output.

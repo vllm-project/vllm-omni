@@ -638,3 +638,100 @@ def test_video_response_file_extension_is_robust():
             media_type="application/x-custom-video",
         )
         _ = unknown.file_extension
+
+
+def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture):
+    """extra_params JSON object is merged into sampling_params.extra_args."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
+    )
+    extra_params = {
+        "is_enable_stage2": True,
+        "pyramid_num_stages": 3,
+        "pyramid_num_inference_steps_list": [20, 20, 20],
+        "use_cfg_zero_star": True,
+    }
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A rocket launching.",
+            "extra_params": json.dumps(extra_params),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.extra_args["is_enable_stage2"] is True
+    assert captured.extra_args["pyramid_num_stages"] == 3
+    assert captured.extra_args["pyramid_num_inference_steps_list"] == [20, 20, 20]
+    assert captured.extra_args["use_cfg_zero_star"] is True
+
+
+def test_extra_params_none_by_default(test_client, mocker: MockerFixture):
+    """When extra_params is omitted, extra_args stays empty."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "A calm river."},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert "is_enable_stage2" not in captured.extra_args
+
+
+def test_extra_params_invalid_json(test_client):
+    """Malformed JSON for extra_params returns 400."""
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A forest.",
+            "extra_params": "{not valid json}",
+        },
+    )
+    assert response.status_code == 400
+
+    """extra_params must be a JSON object, not an array."""
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A desert.",
+            "extra_params": json.dumps([1, 2, 3]),
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_extra_params_merged_with_existing_extra_args(test_client, mocker: MockerFixture):
+    """extra_params is merged on top of existing extra_args (e.g. flow_shift)."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A mountain peak.",
+            "flow_shift": "0.5",
+            "extra_params": json.dumps({"use_zero_init": True, "zero_steps": 2}),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.extra_args["flow_shift"] == 0.5
+    assert captured.extra_args["use_zero_init"] is True
+    assert captured.extra_args["zero_steps"] == 2

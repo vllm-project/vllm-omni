@@ -27,6 +27,7 @@ from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -82,8 +83,6 @@ def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     worker_cls = engine_args.get("worker_cls")
     if worker_cls is not None and worker_cls != "auto":
         return
-
-    from vllm_omni.platforms import current_omni_platform
 
     worker_type = str(worker_type).lower()
     if worker_type == "ar":
@@ -214,23 +213,17 @@ def prepare_engine_environment() -> None:
 
 def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
     """Device mapping via set_stage_devices for a single stage."""
-    try:
-        from vllm_omni.platforms import current_omni_platform
-
-        device_type = current_omni_platform.device_type
-        set_stage_devices(
-            stage_id,
-            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else None,
-            device_type=device_type,
-        )
+    physical_devices = set_stage_devices(
+        stage_id,
+        runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else None,
+    )
+    # Only log if we actually set the env vars in the stage
+    if physical_devices:
         logger.info(
-            "[stage_init] Stage-%s set devices for %s, runtime devices: %s",
+            "[stage_init] Stage-%s set runtime devices: %s",
             stage_id,
-            device_type,
-            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else None,
+            physical_devices,
         )
-    except Exception as e:
-        logger.warning("Device setup failed for stage %s: %s", stage_id, e)
 
 
 def build_engine_args_dict(
@@ -295,8 +288,6 @@ def acquire_device_locks(
     """
     lock_fds: list[int] = []
     try:
-        from vllm_omni.platforms import current_omni_platform
-
         # Get parallel sizes
         if "parallel_config" in engine_args_dict:
             pc = engine_args_dict["parallel_config"]

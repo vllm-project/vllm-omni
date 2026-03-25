@@ -7,12 +7,16 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.config import LoadConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+from vllm_omni.diffusion.models.stable_audio.pipeline_stable_audio import StableAudioPipeline
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 class DataCollectionHook(ModelHook):
@@ -32,16 +36,15 @@ class DataCollectionHook(ModelHook):
 
     def new_forward(self, module: torch.nn.Module, *args: Any, **kwargs: Any) -> Any:
         ctx = self.extractor_fn(module, *args, **kwargs)
-        modulated_input_cpu = ctx.modulated_input.detach().cpu().numpy()
+        modulated_input_cpu = ctx.modulated_input.detach().float().cpu().numpy()
 
         outputs = ctx.run_transformer_blocks()
         ctx.hidden_states = outputs[0]
         if len(outputs) > 1 and ctx.encoder_hidden_states is not None:
             ctx.encoder_hidden_states = outputs[1]
 
-        model_output_cpu = ctx.hidden_states.detach().cpu().numpy()
+        model_output_cpu = ctx.hidden_states.detach().float().cpu().numpy()
         self.current_trajectory.append((modulated_input_cpu, model_output_cpu))
-
         return ctx.postprocess(ctx.hidden_states)
 
     def start_collection(self):
@@ -82,6 +85,32 @@ class BagelAdapter:
         transformer._forward_flow = transformer.forward
 
 
+class StableAudioAdapter:
+    """Adapter for Stable Audio Open 1.0 coefficient estimation."""
+
+    @staticmethod
+    def load_pipeline(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.float16) -> Any:
+        od_config = OmniDiffusionConfig.from_kwargs(model=model_path, dtype=dtype)
+
+        # Strictly necessary because we bypass loader.load_model()
+        with set_default_torch_dtype(dtype):
+            pipeline = StableAudioPipeline(od_config=od_config)
+
+        loader = DiffusersPipelineLoader(LoadConfig())
+        loader.load_weights(pipeline)
+        pipeline.to(device)
+        return pipeline
+
+    @staticmethod
+    def get_transformer(pipeline: Any) -> tuple[Any, str]:
+        return pipeline.transformer, "StableAudioDiTModel"
+
+    @staticmethod
+    def install_hook(transformer: Any, hook: DataCollectionHook) -> None:
+        registry = HookRegistry.get_or_create(transformer)
+        registry.register_hook(hook._HOOK_NAME, hook)
+
+
 class DefaultAdapter:
     """Default adapter for standard diffusers pipelines."""
 
@@ -101,6 +130,7 @@ class DefaultAdapter:
 
 _MODEL_ADAPTERS: dict[str, type] = {
     "Bagel": BagelAdapter,
+    "StableAudio": StableAudioAdapter,
 }
 
 _EPSILON = 1e-6
@@ -165,17 +195,19 @@ class TeaCacheCoefficientEstimator:
 
     def collect_from_prompt(self, prompt: str, **generate_kwargs):
         self.hook.start_collection()
-        from vllm_omni.diffusion.request import OmniDiffusionRequest
-
         req = OmniDiffusionRequest(
-            prompt=prompt,
-            num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
-            seed=generate_kwargs.get("seed", 42),
+            prompts=[prompt],
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
+                seed=generate_kwargs.get("seed", 42),
+            ),
         )
-        self.pipeline.forward(req)
+        with torch.no_grad():
+            self.pipeline.forward(req)
         trajectory = self.hook.stop_collection()
         if trajectory:
             self.collected_data.append(trajectory)
+        torch.cuda.empty_cache()
 
     def estimate(self, poly_order: int = 4) -> list[float]:
         """Estimate polynomial coefficients from collected data.
