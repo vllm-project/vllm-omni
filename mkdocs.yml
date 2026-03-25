@@ -125,10 +125,7 @@ plugins:
           - https://numpy.org/doc/stable/objects.inv
           # Temporarily disabled due to decompression errors
           # - https://pytorch.org/docs/stable/objects.inv
-          # Temporary disabled due to HTTP 404 error
-          # - https://psutil.readthedocs.io/en/stable/objects.inv
-          - https://psutil.readthedocs.io/objects.inv
-
+          - https://psutil.readthedocs.io/stable/objects.inv
 
 markdown_extensions:
   - attr_list
