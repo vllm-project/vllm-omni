@@ -1,0 +1,18 @@
+# .buildkite/pipeline-npu-ready.yaml
+# L2: NPU tests triggered on PR (ready label)
+# Tests run natively in K8s pods via buildkite-agent-stack-k8s
+# NPU resources, driver mounts, and caches are auto-configured by pod-spec-patch
+steps:
+  - group: "NPU Tests (L2 - PR)"
+    steps:
+      - label: "NPU A2B3: Qwen2.5-Omni Offline Inference (2 cards)"
+        agents:
+          queue: "linux-aarch64-a2b3-2"
+        commands:
+          - |
+            source /usr/local/Ascend/ascend-toolkit/set_env.sh
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+            pip install -e .
+            VLLM_USE_MODELSCOPE=True pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
+        timeout_in_minutes: 60
+        soft_fail: true

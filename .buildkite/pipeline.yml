@@ -38,3 +38,11 @@ steps:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:
       queue: "cpu_queue_premerge"
+
+  # NPU Tests (independent bootstrap, NPU builds its own Docker image)
+  - label: "Upload NPU Pipeline"
+    key: upload-npu-pipeline
+    commands:
+      - bash .buildkite/bootstrap-npu-omni.sh
+    agents:
+      queue: "cpu_queue_premerge"
