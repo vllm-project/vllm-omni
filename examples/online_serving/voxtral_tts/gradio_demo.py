@@ -24,6 +24,7 @@ import gradio as gr
 import httpx
 import numpy as np
 import soundfile as sf
+from text_preprocess import sanitize_tts_input_text_for_demo
 
 logger = logging.getLogger()
 
@@ -216,9 +217,13 @@ def run_inference(
     model: str,
 ) -> tuple[int, np.ndarray]:
     """Call /v1/audio/speech and return (sample_rate, audio_array)."""
-    text_prompt = text_prompt.strip()
-    if not text_prompt:
+    user_text_prompt = text_prompt.strip()
+    if not user_text_prompt:
         raise gr.Error("Please enter a text prompt.")
+    try:
+        text_prompt = sanitize_tts_input_text_for_demo(user_text_prompt)
+    except Exception as exc:
+        raise gr.Error(f"Text preprocessing failed: {exc}") from exc
 
     payload: dict[str, Any] = {
         "input": text_prompt,
