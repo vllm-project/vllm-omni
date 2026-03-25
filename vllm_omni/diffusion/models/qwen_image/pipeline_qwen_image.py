@@ -38,6 +38,7 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.inputs.data import DiffusionParamOverrides
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
@@ -246,6 +247,13 @@ def apply_rotary_emb_qwen(
 
 class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
     supports_step_execution: ClassVar[bool] = True
+
+    # Overrides for default diffusion sampling params when using this pipeline
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=50,
+        )
 
     def __init__(
         self,
@@ -697,7 +705,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             negative_prompt=negative_prompt,
             height=sampling.height or self.default_sample_size * self.vae_scale_factor,
             width=sampling.width or self.default_sample_size * self.vae_scale_factor,
-            num_inference_steps=sampling.num_inference_steps or 50,
+            num_inference_steps=sampling.num_inference_steps,
             sigmas=sampling.sigmas,
             guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
             num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
@@ -921,7 +929,6 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         true_cfg_scale: float = 4.0,
         height: int | None = None,
         width: int | None = None,
-        num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
         guidance_scale: float = 1.0,
         num_images_per_prompt: int = 1,
@@ -942,7 +949,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
         height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
         generator = req.sampling_params.generator or generator
