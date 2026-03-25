@@ -398,6 +398,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
         num_inference_steps = req.sampling_params.num_inference_steps
+        if num_inference_steps is None:
+            num_inference_steps = 50  # Default steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
 
