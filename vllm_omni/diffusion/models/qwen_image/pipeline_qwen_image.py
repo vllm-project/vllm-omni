@@ -253,6 +253,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
     def sampling_param_defaults(self):
         return DiffusionParamOverrides(
             num_inference_steps=50,
+            true_cfg_scale=4.0,
+            max_sequence_length=512,
         )
 
     def __init__(
@@ -710,8 +712,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
             num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
             generator=sampling.generator,
-            true_cfg_scale=sampling.true_cfg_scale or 4.0,
-            max_sequence_length=sampling.max_sequence_length or 512,
+            true_cfg_scale=sampling.true_cfg_scale,
+            max_sequence_length=sampling.max_sequence_length,
             attention_kwargs=kwargs.get("attention_kwargs"),
         )
 
@@ -874,15 +876,12 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             },
         )
 
-        true_cfg_scale = state.sampling.true_cfg_scale or 4.0
-        cfg_normalize = state.sampling.cfg_normalize
-
         return self.predict_noise_maybe_with_cfg(
             state.do_true_cfg,
-            true_cfg_scale,
+            state.sampling.true_cfg_scale,
             positive_kwargs,
             negative_kwargs,
-            cfg_normalize,
+            state.sampling.cfg_normalize,
             output_slice,
         )
 
@@ -926,13 +925,11 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         req: OmniDiffusionRequest,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
-        true_cfg_scale: float = 4.0,
         height: int | None = None,
         width: int | None = None,
         sigmas: list[float] | None = None,
         guidance_scale: float = 1.0,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
@@ -941,7 +938,6 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         output_type: str | None = "pil",
         attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
     ) -> DiffusionOutput:
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
         prompt = extracted_prompt or prompt
@@ -951,9 +947,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
         num_inference_steps = req.sampling_params.num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        max_sequence_length = req.sampling_params.max_sequence_length
+        generator = req.sampling_params.generator
+        true_cfg_scale = req.sampling_params.true_cfg_scale
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (

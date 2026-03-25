@@ -223,6 +223,8 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
     def sampling_param_defaults(self):
         return DiffusionParamOverrides(
             num_inference_steps=50,
+            true_cfg_scale=4.0,
+            max_sequence_length=512,
         )
 
     def __init__(
@@ -615,13 +617,11 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         image: PIL.Image.Image | torch.Tensor | None = None,
-        true_cfg_scale: float = 4.0,
         height: int | None = None,
         width: int | None = None,
         sigmas: list[float] | None = None,
         guidance_scale: float = 1.0,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
@@ -630,7 +630,6 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
         output_type: str | None = "pil",
         attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
     ) -> DiffusionOutput:
         """Forward pass for image editing."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
@@ -678,9 +677,9 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
 
         num_inference_steps = req.sampling_params.num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        max_sequence_length = req.sampling_params.max_sequence_length
+        generator = req.sampling_params.generator
+        true_cfg_scale = req.sampling_params.true_cfg_scale
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (

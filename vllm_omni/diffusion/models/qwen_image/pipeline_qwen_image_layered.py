@@ -206,6 +206,8 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
     def sampling_param_defaults(self):
         return DiffusionParamOverrides(
             num_inference_steps=50,
+            true_cfg_scale=4.0,
+            max_sequence_length=512,
         )
 
     def __init__(
@@ -596,12 +598,10 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
-        true_cfg_scale: float = 4.0,
         layers: int | None = 4,
         sigmas: list[float] | None = None,
         guidance_scale: float | None = None,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
@@ -609,7 +609,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         negative_prompt_embeds_mask: torch.Tensor | None = None,
         output_type: str | None = "pil",
         attention_kwargs: dict[str, Any] | None = None,
-        max_sequence_length: int = 512,
         resolution: int = 640,
         cfg_normalize: bool = False,
         use_en_prompt: bool = False,
@@ -631,7 +630,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         layers = req.sampling_params.layers if req.sampling_params.layers is not None else layers
         resolution = req.sampling_params.resolution if req.sampling_params.resolution is not None else resolution
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        max_sequence_length = req.sampling_params.max_sequence_length
         cfg_normalize = (
             req.sampling_params.cfg_normalize if req.sampling_params.cfg_normalize is not None else cfg_normalize
         )
@@ -640,8 +639,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         )
         num_inference_steps = req.sampling_params.num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
-        generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        generator = req.sampling_params.generator
+        true_cfg_scale = req.sampling_params.true_cfg_scale
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (
