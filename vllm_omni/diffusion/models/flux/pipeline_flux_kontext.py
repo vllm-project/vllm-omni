@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.logger import init_logger
 
 logger = init_logger(__name__)
@@ -72,6 +73,14 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
 class FluxKontextPipeline(
     nn.Module, FluxPipelineMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
 ):
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=28,
+            true_cfg_scale=1.0,
+            max_sequence_length=512,
+        )
+
     """FLUX.1-Kontext pipeline for image editing with text guidance."""
 
     support_image_input = True
@@ -467,11 +476,8 @@ class FluxKontextPipeline(
         negative_prompt_2: str | list[str] | None = None,
         height: int | None = None,
         width: int | None = None,
-        num_inference_steps: int = 28,
         guidance_scale: float = 3.5,
-        true_cfg_scale: float = 1.0,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         pooled_prompt_embeds: torch.Tensor | None = None,
@@ -482,7 +488,6 @@ class FluxKontextPipeline(
         attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end: Callable[[int, int, dict], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
         sigmas: list[float] | None = None,
     ) -> DiffusionOutput:
         # Handle multiple prompts - only take the first one, similar to Flux2KleinPipeline
@@ -514,9 +519,11 @@ class FluxKontextPipeline(
             image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         guidance_scale = req.sampling_params.guidance_scale or guidance_scale
-        generator = req.sampling_params.generator or generator
+        generator = req.sampling_params.generator
+        true_cfg_scale = req.sampling_params.true_cfg_scale
+        max_sequence_length = req.sampling_params.max_sequence_length
         latents = (
             req.sampling_params.extra_args.get("latents")
             if req.sampling_params.extra_args.get("latents") is not None

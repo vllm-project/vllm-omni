@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -139,6 +140,12 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
     model from StepFun. It uses an LLM backbone with a flow matching head
     to generate images autoregressively.
     """
+
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=28,
+        )
 
     def __init__(
         self,
@@ -558,11 +565,9 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         prompt: str | list[str] | None = None,
         height: int | None = None,
         width: int | None = None,
-        num_inference_steps: int = 28,
         guidance_scale: float = 7.5,
         negative_prompt: str | list[str] | None = None,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | None = None,
         seed: int | None = None,
         **kwargs,
     ) -> DiffusionOutput:
@@ -596,7 +601,7 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         height = req.sampling_params.height or height or 512
         width = req.sampling_params.width or width or 512
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (
@@ -618,6 +623,7 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         positive_prompt = req.sampling_params.extra_args.get("positive_prompt", None)
 
         # Set seed for reproducibility (use generator if provided, else fall back to seed)
+        generator = req.sampling_params.generator
         if generator is None and seed is not None:
             set_seed(seed)
         elif generator is not None:

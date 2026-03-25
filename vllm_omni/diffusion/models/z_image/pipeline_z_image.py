@@ -40,6 +40,7 @@ from vllm_omni.diffusion.models.z_image.z_image_transformer import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -374,6 +375,13 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     def interrupt(self):
         return self._interrupt
 
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=50,
+            max_sequence_length=512,
+        )
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -382,14 +390,12 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         strength: float = 0.6,
         height: int = 1024,
         width: int = 1024,
-        num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
         guidance_scale: float = 5.0,
         cfg_normalization: bool = False,
         cfg_truncation: float = 1.0,
         negative_prompt: str | list[str] | None = None,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.FloatTensor | None = None,
         prompt_embeds: list[torch.FloatTensor] | None = None,
         negative_prompt_embeds: list[torch.FloatTensor] | None = None,
@@ -398,7 +404,6 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         joint_attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end: Callable[[int, int, dict], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
     ) -> DiffusionOutput:
         r"""
         Function invoked when calling the pipeline for generation.
@@ -520,10 +525,10 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         generator = req.sampling_params.generator
         sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        max_sequence_length = req.sampling_params.max_sequence_length
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_rescale is not None else guidance_scale
         )

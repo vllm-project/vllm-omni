@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,12 @@ class HunyuanVideo15I2VPipeline(
 ):
     support_image_input = True
     color_format = "RGB"
+
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=50,
+        )
 
     def __init__(
         self,
@@ -431,7 +438,6 @@ class HunyuanVideo15I2VPipeline(
     def forward(
         self,
         req: OmniDiffusionRequest,
-        num_inference_steps: int = 50,
         guidance_scale: float = 6.0,
         height: int = 480,
         width: int = 832,
@@ -470,7 +476,7 @@ class HunyuanVideo15I2VPipeline(
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
         num_frames_val = req.sampling_params.num_frames if req.sampling_params.num_frames else num_frames
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_steps = req.sampling_params.num_inference_steps
 
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale

@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -201,6 +202,12 @@ def get_prompt_language(prompt):
 
 
 class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=50,
+        )
+
     def __init__(
         self,
         *,
@@ -481,11 +488,9 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
         width: int | None = None,
-        num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
         guidance_scale: float = 4.5,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.FloatTensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
@@ -506,9 +511,9 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
 
         height = req.sampling_params.height or height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
-        generator = req.sampling_params.generator or generator
+        generator = req.sampling_params.generator
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
         )

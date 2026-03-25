@@ -24,6 +24,7 @@ from vllm_omni.diffusion.models.sd3.sd3_transformer import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -499,6 +500,13 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
     def interrupt(self):
         return self._interrupt
 
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=28,
+            max_sequence_length=256,
+        )
+
     def diffuse(
         self,
         latents: torch.Tensor,
@@ -581,16 +589,13 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         negative_prompt_3: str | list[str] = "",
         height: int | None = None,
         width: int | None = None,
-        num_inference_steps: int = 28,
         sigmas: list[float] | None = None,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         pooled_prompt_embeds: torch.Tensor | None = None,
         negative_pooled_prompt_embeds: torch.Tensor | None = None,
-        max_sequence_length: int = 256,
     ) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
@@ -602,9 +607,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
         sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        generator = req.sampling_params.generator or generator
+        max_sequence_length = req.sampling_params.max_sequence_length
+        num_inference_steps = req.sampling_params.num_inference_steps
+        generator = req.sampling_params.generator
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt > 0

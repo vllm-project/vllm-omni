@@ -43,7 +43,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     retrieve_latents,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.inputs.data import DiffusionParamOverrides, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -203,6 +203,13 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         self._current_timestep = None
 
     @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=40,
+            max_sequence_length=512,
+        )
+
+    @property
     def guidance_scale(self):
         return self._guidance_scale
 
@@ -226,11 +233,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         image: PIL.Image.Image | torch.Tensor | None = None,
         height: int = 704,
         width: int = 1280,
-        num_inference_steps: int = 40,
         guidance_scale: float = 5.0,
         frame_num: int = 81,
         output_type: str | None = "np",
-        generator: torch.Generator | list[torch.Generator] | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
@@ -272,7 +277,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
         num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_steps = req.sampling_params.num_inference_steps
 
         # Respect per-request guidance_scale when explicitly provided.
         if req.sampling_params.guidance_scale_provided:
@@ -300,8 +305,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         dtype = self.transformer.dtype
 
         # Generator setup
-        if generator is None:
-            generator = req.sampling_params.generator
+        generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
@@ -312,7 +316,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_scale > 1.0,
                 num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                max_sequence_length=req.sampling_params.max_sequence_length,
                 device=device,
                 dtype=dtype,
             )

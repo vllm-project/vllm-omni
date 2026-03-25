@@ -37,7 +37,7 @@ from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
-from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.inputs.data import DiffusionParamOverrides, OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -960,6 +960,12 @@ class OmniGen2Pipeline(nn.Module):
         )
 
     @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=28,
+        )
+
+    @property
     def num_timesteps(self):
         return self._num_timesteps
 
@@ -993,13 +999,11 @@ class OmniGen2Pipeline(nn.Module):
         max_pixels: int = 1024 * 1024,
         max_input_image_side_length: int = 1024,
         align_res: bool = True,
-        num_inference_steps: int = 28,
         text_guidance_scale: float = 4.0,
         image_guidance_scale: float = 1.0,
         cfg_range: tuple[float, float] = (0.0, 1.0),
         attention_kwargs: dict[str, Any] | None = None,
         timesteps: list[int] = None,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.FloatTensor | None = None,
         verbose: bool = False,
         step_func=None,
@@ -1025,8 +1029,8 @@ class OmniGen2Pipeline(nn.Module):
 
         height = req.sampling_params.height or height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or width or self.default_sample_size * self.vae_scale_factor
-        generator = req.sampling_params.generator or generator
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        generator = req.sampling_params.generator
+        num_inference_steps = req.sampling_params.num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             text_guidance_scale = req.sampling_params.guidance_scale
         self._text_guidance_scale = text_guidance_scale

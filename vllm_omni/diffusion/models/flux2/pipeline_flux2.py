@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
@@ -339,6 +340,13 @@ class Flux2Pipeline(nn.Module, SupportImageInput, ProgressBarMixin, DiffusionPip
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
 
     support_image_input = True
+
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=50,
+            max_sequence_length=512,
+        )
 
     def __init__(
         self,
@@ -861,11 +869,9 @@ class Flux2Pipeline(nn.Module, SupportImageInput, ProgressBarMixin, DiffusionPip
         prompt: str | list[str] | None = None,
         height: int | None = None,
         width: int | None = None,
-        num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
         guidance_scale: float | None = 4.0,
         num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
@@ -874,7 +880,6 @@ class Flux2Pipeline(nn.Module, SupportImageInput, ProgressBarMixin, DiffusionPip
         attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end: Callable[[int, int, dict], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int, ...] = (10, 20, 30),
         caption_upsample_temperature: float = None,
     ) -> DiffusionOutput:
@@ -899,18 +904,18 @@ class Flux2Pipeline(nn.Module, SupportImageInput, ProgressBarMixin, DiffusionPip
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
         )
-        generator = req.sampling_params.generator or generator
+        generator = req.sampling_params.generator
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
         )
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        max_sequence_length = req.sampling_params.max_sequence_length
         text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
 
         req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]

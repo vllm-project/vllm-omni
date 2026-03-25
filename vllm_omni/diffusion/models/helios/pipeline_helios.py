@@ -29,6 +29,7 @@ from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -156,6 +157,13 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
     Implements chunked video generation with multi-term memory history context.
     """
 
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=50,
+            max_sequence_length=226,
+        )
+
     def __init__(
         self,
         *,
@@ -265,11 +273,9 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         negative_prompt: str | None = None,
         height: int = 384,
         width: int = 640,
-        num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
         frame_num: int = 132,
         output_type: str | None = "np",
-        generator: torch.Generator | list[torch.Generator] | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
@@ -342,7 +348,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
         num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_steps = req.sampling_params.num_inference_steps
 
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
@@ -356,8 +362,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         device = self.device
         dtype = self.transformer.dtype
 
-        if generator is None:
-            generator = req.sampling_params.generator
+        generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
@@ -368,7 +373,7 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
                 num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 226,
+                max_sequence_length=req.sampling_params.max_sequence_length,
                 device=device,
                 dtype=dtype,
             )

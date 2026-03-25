@@ -35,6 +35,7 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import DiffusionParamOverrides
 from vllm_omni.lora.request import LoRARequest
 
 from .ltx2_transformer import LTX2VideoTransformer3DModel
@@ -146,6 +147,13 @@ class _VideoAudioScheduler:
 
 
 class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=40,
+            max_sequence_length=self.tokenizer_max_length,
+        )
+
     def __init__(
         self,
         *,
@@ -755,8 +763,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         width: int | None = None,
         num_frames: int | None = None,
         frame_rate: float | None = None,
-        num_inference_steps: int | None = None,
-        sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
         guidance_scale: float = 4.0,
         guidance_rescale: float = 0.0,
@@ -774,7 +780,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         output_type: str = "np",
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
-        max_sequence_length: int | None = None,
     ) -> DiffusionOutput:
         # Extract prompt/negative_prompt from request.
         # Input format: req.prompts is a list of str or dict with "prompt"/"negative_prompt" keys.
@@ -788,7 +793,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         width = req.sampling_params.width or width or 768
         num_frames = req.sampling_params.num_frames or num_frames or 121
         frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or 24.0
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps or 40
+        num_inference_steps = req.sampling_params.num_inference_steps
         if timesteps is None:
             num_inference_steps = max(int(num_inference_steps), 2)
         elif len(timesteps) < 2:
@@ -798,9 +803,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_videos_per_prompt or 1
         )
-        max_sequence_length = (
-            req.sampling_params.max_sequence_length or max_sequence_length or self.tokenizer_max_length
-        )
+        max_sequence_length = req.sampling_params.max_sequence_length
 
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale

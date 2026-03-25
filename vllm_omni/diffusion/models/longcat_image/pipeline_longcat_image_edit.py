@@ -36,7 +36,7 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.inputs.data import DiffusionParamOverrides, OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -222,6 +222,12 @@ def split_quotation(prompt, quote_pairs=None):
 
 
 class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin):
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=50,
+        )
+
     def __init__(
         self,
         *,
@@ -529,11 +535,9 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
-        num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
         guidance_scale: float = 3.5,
         num_images_per_prompt: int | None = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.FloatTensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
@@ -558,13 +562,13 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
         )
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt is not None
             else num_images_per_prompt
         )
-        generator = req.sampling_params.generator or generator
+        generator = req.sampling_params.generator
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
 

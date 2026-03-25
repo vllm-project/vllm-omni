@@ -32,6 +32,7 @@ from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import Sta
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.inputs.data import DiffusionParamOverrides
 
 logger = init_logger(__name__)
 
@@ -71,6 +72,12 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         od_config: OmniDiffusion configuration object
         prefix: Weight prefix for loading (default: "")
     """
+
+    @property
+    def sampling_param_defaults(self):
+        return DiffusionParamOverrides(
+            num_inference_steps=100,
+        )
 
     def __init__(
         self,
@@ -360,10 +367,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         negative_prompt: str | list[str] | None = None,
         audio_end_in_s: float | None = None,
         audio_start_in_s: float = 0.0,
-        num_inference_steps: int = 100,
         guidance_scale: float = 7.0,
         num_waveforms_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
@@ -399,12 +404,11 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
 
-        if generator is None:
-            generator = req.sampling_params.generator
+        generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
 
