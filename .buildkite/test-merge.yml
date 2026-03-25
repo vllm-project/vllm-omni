@@ -16,45 +16,6 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Voxtral TTS Demo Preprocess Unit Test"
-    timeout_in_minutes: 10
-    depends_on: upload-merge-pipeline
-    commands:
-      - |
-        timeout 10m bash -c '
-          set -euo pipefail
-
-          if [[ "${BUILDKITE_BRANCH:-}" == "main" ]]; then
-            changed_files=$(git diff --name-only --diff-filter=ACMDR HEAD~1 || true)
-          else
-            merge_base=$(git merge-base origin/main HEAD || true)
-            if [[ -n "${merge_base}" ]]; then
-              changed_files=$(git diff --name-only --diff-filter=ACMDR "${merge_base}" HEAD || true)
-            else
-              changed_files=$(git diff --name-only --diff-filter=ACMDR HEAD~1 || true)
-            fi
-          fi
-
-          if ! printf "%s\n" "${changed_files}" | grep -Eq "^examples/online_serving/voxtral_tts/|^tests/examples/online_serving/test_voxtral_tts_text_preprocess\.py"; then
-            echo "No changes under examples/online_serving/voxtral_tts/ or tests/examples/online_serving/test_voxtral_tts_text_preprocess.py. Skipping."
-            exit 0
-          fi
-
-          pytest -s -v tests/examples/online_serving/test_voxtral_tts_text_preprocess.py
-        '
-    agents:
-      queue: "gpu_1_queue"
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-            - "HF_TOKEN"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
-
   - label: "Diffusion Model Test"
     timeout_in_minutes: 30
     depends_on: upload-merge-pipeline

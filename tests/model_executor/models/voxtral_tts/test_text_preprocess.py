@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the Voxtral TTS demo text preprocessing helper.
 
 These tests intentionally cover only behavior ported into
@@ -11,12 +13,14 @@ from pathlib import Path
 import pytest
 
 _HELPER_PATH = (
-    Path(__file__).resolve().parents[3]
+    Path(__file__).resolve().parents[4]
     / "examples"
     / "online_serving"
     / "voxtral_tts"
     / "text_preprocess.py"
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _load_helper():
@@ -72,4 +76,3 @@ def test_sanitize_tts_input_text_for_demo_preserves_zwj_and_zwnj(input_text: str
 def test_sanitize_tts_input_text_for_demo_rejects_empty_after_sanitization(input_text: str) -> None:
     with pytest.raises(ValueError, match="Speech input is empty after sanitization"):
         sanitize_tts_input_text_for_demo(input_text)
-
