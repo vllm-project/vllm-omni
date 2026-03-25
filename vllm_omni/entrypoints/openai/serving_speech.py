@@ -5,6 +5,7 @@ import math
 import os
 import re
 import struct
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -339,6 +340,71 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
+            return 2048
+
+    def _estimate_fish_ref_code_len(self, ref_audio: object) -> int | None:
+        """Estimate Fish Speech semantic token length from raw reference audio."""
+        from vllm_omni.model_executor.models.fish_speech.dac_utils import (
+            DAC_HOP_LENGTH,
+            DAC_SAMPLE_RATE,
+        )
+
+        if not isinstance(ref_audio, (list, tuple)) or len(ref_audio) != 2:
+            return None
+        wav, sr = ref_audio
+        sr = int(sr)
+        n_samples = len(wav)
+        if sr <= 0 or n_samples <= 0:
+            return None
+        resampled_len = max(1, math.ceil(n_samples * DAC_SAMPLE_RATE / sr))
+        return max(1, math.ceil(resampled_len / DAC_HOP_LENGTH))
+
+    def _estimate_fish_prompt_len(
+        self,
+        request: OpenAICreateSpeechRequest,
+        ref_audio: object,
+    ) -> int:
+        """Estimate Fish Speech clone prompt length without encoding reference audio."""
+        try:
+            from transformers import AutoTokenizer
+
+            if self._fish_speech_tokenizer is None:
+                model_name = self.engine_client.model_config.model
+                self._fish_speech_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+            tokenizer = self._fish_speech_tokenizer
+            semantic_len = self._estimate_fish_ref_code_len(ref_audio)
+            if semantic_len is None:
+                raise ValueError("Failed to estimate Fish Speech semantic token length")
+
+            user_text = f"<|speaker:0|>{request.input}"
+            user_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": user_text}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
+            audio_start_id = tokenizer.encode("<|audio_start|>", add_special_tokens=False)
+            audio_end_id = tokenizer.encode("<|audio_end|>", add_special_tokens=False)
+            prefix_ids = tokenizer.encode(f"<|speaker:0|>{request.ref_text}", add_special_tokens=False)
+            im_start = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+            im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+            system_tag = tokenizer.encode("system\n", add_special_tokens=False)
+            newline = tokenizer.encode("\n", add_special_tokens=False)
+            return (
+                len(im_start)
+                + len(system_tag)
+                + len(prefix_ids)
+                + len(audio_start_id)
+                + semantic_len
+                + len(audio_end_id)
+                + len(im_end)
+                + len(newline)
+                + len(user_ids)
+                + len(voice_token_id)
+            )
+        except Exception as e:
+            logger.warning("Failed to estimate Fish Speech prompt length, using fallback 2048: %s", e)
             return 2048
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
@@ -900,53 +966,39 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tokenizer = self._fish_speech_tokenizer
         model_name = self.engine_client.model_config.model
 
-        if ref_audio_data is not None and request.ref_text:
-            # Voice cloning: encode reference audio and build system message.
-            from vllm_omni.model_executor.models.fish_speech.dac_encoder import (
-                encode_reference_audio,
-            )
-
-            wav_samples, sr = ref_audio_data
-            semantic_token_ids = encode_reference_audio(model_name, wav_samples, sr)
-
-            # Build system message with ref text + audio tokens.
-            audio_start_id = tokenizer.encode("<|audio_start|>", add_special_tokens=False)
-            audio_end_id = tokenizer.encode("<|audio_end|>", add_special_tokens=False)
-
-            # System content: <|speaker:0|>{ref_text}<|audio_start|>{codes}<|audio_end|>
-            prefix_text = f"<|speaker:0|>{request.ref_text}"
-            prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
-            system_content_ids = prefix_ids + audio_start_id + semantic_token_ids + audio_end_id
-
-            # Manually build system turn: <|im_start|>system\n{content}<|im_end|>\n
-            im_start = tokenizer.encode("<|im_start|>", add_special_tokens=False)
-            im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
-            system_tag = tokenizer.encode("system\n", add_special_tokens=False)
-            newline = tokenizer.encode("\n", add_special_tokens=False)
-            system_ids = im_start + system_tag + system_content_ids + im_end + newline
-
-            # User turn via chat template.
-            user_text = f"<|speaker:0|>{request.input}"
-            user_messages = [{"role": "user", "content": user_text}]
-            user_ids = tokenizer.apply_chat_template(user_messages, tokenize=True, add_generation_prompt=True)
-            prompt_ids = system_ids + user_ids
-        else:
+        if ref_audio_data is None or not request.ref_text:
             # No voice cloning: simple user message.
             user_text = f"<|speaker:0|>{request.input}"
             messages = [{"role": "user", "content": user_text}]
             prompt_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+            voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
+            prompt_ids = prompt_ids + voice_token_id
 
-        # Append <|voice|> token to signal voice generation.
-        voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
-        prompt_ids = prompt_ids + voice_token_id
+            additional_information: dict[str, Any] = {
+                "text": [request.input],
+                "max_new_tokens": [request.max_new_tokens or 4096],
+            }
+            return {
+                "prompt_token_ids": prompt_ids,
+                "additional_information": additional_information,
+            }
 
-        additional_information: dict[str, Any] = {
-            "text": [request.input],
-            "max_new_tokens": [request.max_new_tokens or 4096],
+        wav_samples, sr = ref_audio_data
+        ph_len = self._estimate_fish_prompt_len(request, ref_audio_data)
+        with tempfile.NamedTemporaryFile(prefix="fish_ref_", suffix=".npy", delete=False) as f:
+            np.save(f, np.asarray(wav_samples, dtype=np.float32))
+            ref_audio_path = f.name
+
+        additional_information = {
+            "text": request.input,
+            "max_new_tokens": request.max_new_tokens or 4096,
+            "ref_text": request.ref_text,
+            "ref_audio_path": ref_audio_path,
+            "ref_audio_sr": int(sr),
+            "fish_structured_voice_clone": True,
         }
-
         return {
-            "prompt_token_ids": prompt_ids,
+            "prompt_token_ids": [1] * ph_len,
             "additional_information": additional_information,
         }
 
