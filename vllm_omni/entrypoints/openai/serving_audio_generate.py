@@ -76,8 +76,8 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
             if request.seed is not None:
                 from vllm_omni.platforms import current_omni_platform
 
-                generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request.seed)
-                sampling_params_list[0].generator = generator
+                rng = torch.Generator(device=current_omni_platform.device_type).manual_seed(request.seed)
+                sampling_params_list[0].generator = rng
 
             if request.guidance_scale is not None:
                 sampling_params_list[0].guidance_scale = request.guidance_scale

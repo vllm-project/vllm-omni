@@ -314,8 +314,8 @@ def load_and_resolve_stage_configs(
     Returns:
         Tuple of (config_path, stage_configs)
     """
-    model_type = resolve_model_type(model)
     if stage_configs_path is None:
+        model_type = resolve_model_type(model)
         config_path = resolve_model_config_path(model_type)
         stage_configs = load_stage_configs_from_model(config_path, base_engine_args=kwargs)
         if not stage_configs:
