@@ -19,7 +19,6 @@ from diffusers.models.embeddings import get_1d_rotary_pos_embed
 from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioProjectionModel
 from diffusers.schedulers import CosineDPMSolverMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import T5EncoderModel, T5TokenizerFast
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -27,7 +26,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioOutput
+from vllm_omni.diffusion.models.interface import SupportAudioOutput, VllmDiffusionPipeline
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -61,7 +60,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
+class StableAudioPipeline(VllmDiffusionPipeline, SupportAudioOutput, DiffusionPipelineProfilerMixin):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 

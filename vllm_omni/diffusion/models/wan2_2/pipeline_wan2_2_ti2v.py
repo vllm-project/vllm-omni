@@ -34,7 +34,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Omni
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, VllmDiffusionPipeline
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -129,7 +129,7 @@ def get_wan22_ti2v_pre_process_func(
     return pre_process_func
 
 
-class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin):
+class Wan22TI2VPipeline(VllmDiffusionPipeline, SupportImageInput, CFGParallelMixin, ProgressBarMixin):
     """
     Wan2.2 Text-Image-to-Video (TI2V) Pipeline.
 

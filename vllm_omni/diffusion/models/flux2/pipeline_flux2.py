@@ -20,7 +20,6 @@ from diffusers.pipelines.flux2.system_messages import (
     SYSTEM_MESSAGE_UPSAMPLING_T2I,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration, PixtralProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -28,7 +27,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, VllmDiffusionPipeline
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -334,7 +333,7 @@ def retrieve_latents(encoder_output: torch.Tensor, generator: torch.Generator = 
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class Flux2Pipeline(nn.Module, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin):
+class Flux2Pipeline(VllmDiffusionPipeline, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     """Flux2 pipeline for text-to-image generation."""
 
     _callback_tensor_inputs = ["latents", "prompt_embeds"]

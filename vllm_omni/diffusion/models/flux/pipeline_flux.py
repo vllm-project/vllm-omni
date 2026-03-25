@@ -16,7 +16,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import AutoConfig, CLIPTextModel, CLIPTokenizer, T5TokenizerFast
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -27,6 +26,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
+from vllm_omni.diffusion.models.interface import VllmDiffusionPipeline
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -65,7 +65,7 @@ def get_flux_post_process_func(
     return post_process_func
 
 
-class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin):
+class FluxPipeline(VllmDiffusionPipeline, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     @property
     def sampling_param_defaults(self):
         return DiffusionParamOverrides(

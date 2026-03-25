@@ -28,7 +28,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import (
     ByT5Tokenizer,
     T5EncoderModel,
@@ -46,6 +45,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageKVCache,
     GlmImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.interface import VllmDiffusionPipeline
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import DiffusionParamOverrides, OmniTextPrompt
@@ -238,7 +238,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class GlmImagePipeline(VllmDiffusionPipeline, DiffusionPipelineProfilerMixin):
     """
     GLM-Image Pipeline for text-to-image and image-to-image generation.
 

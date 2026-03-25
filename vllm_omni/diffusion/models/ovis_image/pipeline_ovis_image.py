@@ -29,7 +29,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import Qwen2TokenizerFast, Qwen3Model
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -38,6 +37,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import VllmDiffusionPipeline
 from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -142,7 +142,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
+class OvisImagePipeline(VllmDiffusionPipeline, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,

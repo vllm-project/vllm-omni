@@ -16,7 +16,6 @@ from diffusers.models import AutoencoderKL
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import (
     AutoTokenizer,
     Qwen2_5_VLForConditionalGeneration,
@@ -29,7 +28,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, VllmDiffusionPipeline
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
     LongCatImageTransformer2DModel,
 )
@@ -221,7 +220,9 @@ def split_quotation(prompt, quote_pairs=None):
     return result
 
 
-class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin):
+class LongCatImageEditPipeline(
+    VllmDiffusionPipeline, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin
+):
     @property
     def sampling_param_defaults(self):
         return DiffusionParamOverrides(

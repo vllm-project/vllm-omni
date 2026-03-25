@@ -27,7 +27,7 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import supports_step_execution
+from vllm_omni.diffusion.models.interface import VllmDiffusionPipeline, supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -231,10 +231,9 @@ class DiffusionModelRunner:
             sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
 
         # Apply model specific defaults to unset fields
-        def_params = getattr(self.pipeline, "sampling_param_defaults", None)
-        if def_params is not None:
+        if isinstance(self.pipeline, VllmDiffusionPipeline):
             logger.debug("Merging default sampling params into user request")
-            sampling_params.merge_with_def_params(def_params)
+            sampling_params.merge_with_def_params(self.pipeline.sampling_param_defaults)
         return sampling_params
 
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:

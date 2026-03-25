@@ -10,11 +10,34 @@ from typing import (
     runtime_checkable,
 )
 
+from torch import nn
+
+from vllm_omni.inputs.data import DiffusionParamOverrides
+
 if TYPE_CHECKING:
     import torch
 
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+
+class VllmDiffusionPipeline(nn.Module):
+    """Base class for all vLLM Omni diffusion pipelines.
+
+    All registered diffusion pipelines should inherit from this class.
+    Currently, this is only used for ensuring the correct sampling params
+    can be fetched for cache refresh, but additional common capabilities are
+    actively being added here.
+
+    See the following RFC: https://github.com/vllm-project/vllm-omni/issues/2189
+    """
+
+    @property
+    def sampling_param_defaults(self) -> DiffusionParamOverrides:
+        """Pipeline-specific default sampling parameters."""
+        return DiffusionParamOverrides(
+            num_inference_steps=50,
+        )
 
 
 @runtime_checkable

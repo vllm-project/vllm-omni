@@ -18,7 +18,6 @@ from diffusers.models import AutoencoderKL
 from diffusers.pipelines.longcat_image.system_messages import SYSTEM_PROMPT_EN, SYSTEM_PROMPT_ZH
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, SchedulerMixin
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, Qwen2VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -27,6 +26,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import VllmDiffusionPipeline
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -201,7 +201,7 @@ def get_prompt_language(prompt):
     return "en"
 
 
-class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
+class LongCatImagePipeline(VllmDiffusionPipeline, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     @property
     def sampling_param_defaults(self):
         return DiffusionParamOverrides(

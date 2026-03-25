@@ -14,7 +14,6 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
-import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import TextualInversionLoaderMixin
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -30,7 +29,7 @@ from vllm_omni.diffusion.models.flux import (
     FluxKontextTransformer2DModel,
 )
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, VllmDiffusionPipeline
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -71,7 +70,7 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
 
 
 class FluxKontextPipeline(
-    nn.Module, FluxPipelineMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    VllmDiffusionPipeline, FluxPipelineMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
 ):
     @property
     def sampling_param_defaults(self):
