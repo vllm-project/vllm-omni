@@ -10,6 +10,7 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
 logger = init_logger(__name__)
@@ -96,6 +97,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "FluxKontextPipeline": (
+        "flux",
+        "pipeline_flux_kontext",
+        "FluxKontextPipeline",
+    ),
     "HunyuanImage3ForCausalMM": (
         "hunyuan_image_3",
         "pipeline_hunyuan_image_3",
@@ -130,6 +136,26 @@ _DIFFUSION_MODELS = {
         "helios",
         "pipeline_helios",
         "HeliosPipeline",
+    ),
+    "Flux2Pipeline": (
+        "flux2",
+        "pipeline_flux2",
+        "Flux2Pipeline",
+    ),
+    "DreamIDOmniPipeline": (
+        "dreamid_omni",
+        "pipeline_dreamid_omni",
+        "DreamIDOmniPipeline",
+    ),
+    "HunyuanVideo15Pipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5",
+        "HunyuanVideo15Pipeline",
+    ),
+    "HunyuanVideo15ImageToVideoPipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5_i2v",
+        "HunyuanVideo15I2VPipeline",
     ),
 }
 
@@ -190,9 +216,9 @@ def initialize_model(
             od_config.vae_use_tiling = True
 
         # Configure VAE memory optimization settings from config
-        if hasattr(model.vae, "use_slicing"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model.vae, "use_tiling"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
@@ -264,6 +290,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1
 
+        # update forward context sp_plan_hooks_applied
+        ctx = get_forward_context()
+        ctx.sp_plan_hooks_applied = applied_count > 0
+        logger.debug(f"Setting sp_plan_hooks_applied={ctx.sp_plan_hooks_applied} in ``ForwardContext``!")
+
         if applied_count == 0:
             logger.warning(
                 f"Sequence parallelism is enabled (sp_size={sp_size}) but no transformer with _sp_plan found. "
@@ -293,12 +324,16 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "BagelPipeline": "get_bagel_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
+    "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
+    "Flux2Pipeline": "get_flux2_post_process_func",
+    "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -315,6 +350,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
 }
 
 

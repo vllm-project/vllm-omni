@@ -18,7 +18,7 @@ If users want to modify some part of it. The custom stage_configs file can be in
 For offline (Assume necessary dependencies have ben imported):
 ```python
 model_name = "Qwen/Qwen2.5-Omni-7B"
-omni_llm = OmniLLM(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
+omni = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
 ```
 
 For online serving:
@@ -30,15 +30,15 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to
 
 Below is a specific example of stage_configs.yaml in Qwen2.5-omni.
 ```python
-# stage config for running qwen2.5-omni with architecture of OmniLLM.
+# stage config for running qwen2.5-omni with AsyncOmniEngine + Orchestrator runtime.
 stage_args:
   - stage_id: 0 # mark the unique id for each stage
     runtime: # The disaggregated configuration
       process: true  # Run this stage in a separate process
       devices: "0" # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
-      max_batch_size: 1 # the batch_size for offline inference
     engine_args: # Engine arguments for a certain engine
       model_stage: thinker
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration # The model implementation registered in model_executor/models/registry.py
       worker_type: ar # The specific worker used
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler # The specific scehduler used
@@ -62,9 +62,9 @@ stage_args:
     runtime:
       process: true
       devices: "1"
-      max_batch_size: 3
     engine_args:
       model_stage: talker
+      max_num_seqs: 3
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -88,9 +88,9 @@ stage_args:
     runtime:
       process: true
       devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
-      max_batch_size: 1
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
@@ -159,9 +159,9 @@ Visible devices for this stage, specified as a string. This controls which GPU d
 
 Default: `"0"`
 
-#### `runtime.max_batch_size`
+#### `engine_args.max_num_seqs`
 
-The maximum batch size for offline inference in this stage. This limits how many sequences can be processed together in a single batch during offline inference operations.
+The maximum number of sequences for concurrent processing in this stage. For LLM stages, this controls the vLLM scheduler's maximum concurrent sequences. For all stage types, this also controls how many tasks can be batched together in the task processing loop.
 
 Default: `1`
 

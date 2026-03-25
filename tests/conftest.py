@@ -18,16 +18,21 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+import imageio.v3 as iio
 import numpy as np
 import psutil
 import pytest
+import soundfile as sf
 import torch
 import yaml
-from openai import OpenAI
+from openai import OpenAI, omit
+from PIL import Image
 from vllm import TextPrompt
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
@@ -42,6 +47,65 @@ logger = init_logger(__name__)
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
+
+
+class OmniServerParams(NamedTuple):
+    model: str
+    port: int | None = None
+    stage_config_path: str | None = None
+    server_args: list[str] | None = None
+
+
+def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
+    """Assert the file is a loadable image with optional exact dimensions."""
+    if isinstance(image, Path):
+        assert image.exists(), f"Image not found: {image}"
+        image = Image.open(image)
+        image.load()
+    assert image.width > 0 and image.height > 0
+    if width is not None:
+        assert image.width == width, f"Expected width={width}, got {image.width} in {image.name}"
+    if height is not None:
+        assert image.height == height, f"Expected height={height}, got {image.height} in {image.name}"
+    return image
+
+
+def assert_video_valid(frames: Path | np.ndarray, *, width: int, height: int, num_frames: int) -> None:
+    """Assert the MP4 has the expected resolution and exact frame count."""
+    if isinstance(frames, Path):
+        assert frames.exists(), f"Video not found: {frames}"
+        frames = iio.imread(str(frames), plugin="pyav", index=None)
+    assert frames.shape[0] == num_frames, f"Expected {num_frames} frames, got {frames.shape[0]}"
+    assert frames.shape[1] == height, f"Expected height={height}, got {frames.shape[1]}"
+    assert frames.shape[2] == width, f"Expected width={width}, got {frames.shape[2]}"
+
+
+def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
+    """Assert the WAV has the expected sample rate, channel count, and duration."""
+
+    assert path.exists(), f"Audio not found: {path}"
+    info = sf.info(str(path))
+    assert info.samplerate == sample_rate, f"Expected sample_rate={sample_rate}, got {info.samplerate}"
+    assert info.channels == channels, f"Expected {channels} channel(s), got {info.channels}"
+    expected_frames = int(duration_s * sample_rate)
+    assert info.frames == expected_frames, (
+        f"Expected {expected_frames} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
+    )
+
+
+def decode_b64_image(b64: str):
+    img = Image.open(BytesIO(base64.b64decode(b64)))
+    img.load()
+    return img
+
+
+@pytest.fixture(scope="session")
+def model_prefix() -> str:
+    """Optional model-path prefix from MODEL_PREFIX env var.
+    Useful if models are downloaded to non-default local directories.
+    """
+    prefix = os.environ.get("MODEL_PREFIX", "")
+    return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
 @pytest.fixture(autouse=True)
@@ -779,7 +843,7 @@ def modify_stage_config(
                     'async_chunk': True,
                     'stage_args': {
                         0: {'engine_args.max_model_len': 5800},
-                        1: {'runtime.max_batch_size': 2}
+                        1: {'engine_args.max_num_seqs': 2}
                     }
                 }
         deletes: Dictionary containing configurations to delete.
@@ -1151,7 +1215,9 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(scope="session")
-def run_level(request):
+def run_level(request) -> str:
+    """A command-line argument that specifies the level of tests to run in this session.
+    See https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/CI_5levels/"""
     return request.config.getoption("--run-level")
 
 
@@ -1159,27 +1225,30 @@ _omni_server_lock = threading.Lock()
 
 
 @pytest.fixture(scope="module")
-def omni_server(request, run_level):
+def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: str) -> Generator[OmniServer, Any, None]:
     """Start vLLM-Omni server as a subprocess with actual model weights.
     Uses session scope so the server starts only once for the entire test session.
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        *port, model, stage_config_path = request.param
-        port = port[0] if port else None
-        if run_level == "advanced_model":
+        params: OmniServerParams = request.param
+        model = model_prefix + params.model
+        port = params.port
+        stage_config_path = params.stage_config_path
+        if run_level == "advanced_model" and stage_config_path is not None:
+            with open(stage_config_path, encoding="utf-8") as f:
+                _cfg = yaml.safe_load(f) or {}
+            _stage_ids = [s["stage_id"] for s in _cfg.get("stage_args", []) if "stage_id" in s]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={
-                    "stage_args": {
-                        0: ["engine_args.load_format"],
-                        1: ["engine_args.load_format"],
-                        2: ["engine_args.load_format"],
-                    }
-                },
+                deletes={"stage_args": {sid: ["engine_args.load_format"] for sid in _stage_ids}},
             )
 
-        server_args = ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]
+        server_args = params.server_args or []
+        server_args = ["--stage-init-timeout", "120", *server_args]
+        if stage_config_path is not None:
+            server_args += ["--stage-configs-path", stage_config_path]
+
         with OmniServer(model, server_args, port=port) if port else OmniServer(model, server_args) as server:
             print("OmniServer started successfully")
             yield server
@@ -1194,6 +1263,17 @@ class OmniResponse:
     audio_data: list[str] | None = None
     audio_content: str | None = None
     similarity: float | None = None
+    e2e_latency: float | None = None
+    success: bool = False
+    error_message: str | None = None
+
+
+@dataclass
+class DiffusionResponse:
+    text_content: str | None = None
+    images: list[Image.Image] | None = None
+    audios: list[Any] | None = None
+    videos: list[Any] | None = None
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
@@ -1247,6 +1327,51 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
             print(f"similarity is: {response.similarity}")
 
 
+def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
+    """
+    Validate diffusion response results.
+
+    Args:
+        response: DiffusionResponse object. Any not-None content will be validated based on the request_config.
+        request_config: Request configuration dictionary containing parameters like model, messages, extra_body.
+            When validating a certain modality, the corresponding params in request_config['extra_body'] must present.
+            It will be used to check against the multimedia file in the response.
+        run_level: Test run level (e.g., "core_model", "advanced_model")
+
+    Raises:
+        AssertionError: When the response does not meet validation criteria
+        KeyError: When the request_config does not contain necessary parameters for validation
+    """
+    assert response.success, "The request failed."
+
+    e2e_latency = response.e2e_latency
+    if e2e_latency is not None:
+        print(f"the avg e2e is: {e2e_latency}")
+
+    extra_body = request_config.get("extra_body", {})
+
+    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+
+    if response.images is not None:
+        assert len(response.images) > 0, "No images in response"
+        assert len(response.images) == num_outputs_per_prompt, (
+            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
+        )
+        if run_level == "advanced_model":
+            expected_width = extra_body["width"]  # intend to raise KeyError
+            expected_height = extra_body["height"]  # intend to raise KeyError
+            for img in response.images:
+                assert_image_valid(img, width=expected_width, height=expected_height)
+    if response.videos is not None:
+        raise NotImplementedError(
+            "Video validation is not implemented yet"
+        )  # consider using assert_video_valid defined above
+    if response.audios is not None:
+        raise NotImplementedError(
+            "Audio validation is not implemented yet"
+        )  # consider using assert_audio_valid defined above
+
+
 class OpenAIClientHandler:
     """
     OpenAI client handler class, encapsulating both streaming and non-streaming response processing logic.
@@ -1269,7 +1394,7 @@ class OpenAIClientHandler:
         self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
         self.run_level = run_level
 
-    def _process_stream_response(self, chat_completion) -> OmniResponse:
+    def _process_stream_omni_response(self, chat_completion) -> OmniResponse:
         """
         Process streaming responses.
 
@@ -1330,7 +1455,7 @@ class OpenAIClientHandler:
 
         return result
 
-    def _process_non_stream_response(self, chat_completion) -> OmniResponse:
+    def _process_non_stream_omni_response(self, chat_completion) -> OmniResponse:
         """
         Process non-streaming responses.
 
@@ -1384,7 +1509,46 @@ class OpenAIClientHandler:
 
         return result
 
-    def send_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def _process_diffusion_response(self, chat_completion) -> DiffusionResponse:
+        """
+        Process diffusion responses (image generation/editing).
+
+        Args:
+            chat_completion: OpenAI response object
+
+        Returns:
+            DiffusionResponse: Processed response object
+        """
+        result = DiffusionResponse()
+        start_time = time.perf_counter()
+
+        try:
+            images = []
+            # [TODO] reading video and audio output from API response for later validation
+
+            for choice in chat_completion.choices:
+                if hasattr(choice.message, "content") and choice.message.content is not None:
+                    content = choice.message.content
+                    if isinstance(content, list):
+                        for item in content:
+                            if hasattr(item, "image_url") and item.image_url is not None:
+                                image_url = item.image_url.url
+                                if image_url.startswith("data:image"):
+                                    b64_data = image_url.split(",", 1)[1]
+                                    img = decode_b64_image(b64_data)
+                                    images.append(img)
+
+            result.e2e_latency = time.perf_counter() - start_time
+            result.images = images if images else None
+            result.success = True
+
+        except Exception as e:
+            result.error_message = f"Diffusion response processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
         """
         Send OpenAI requests.
 
@@ -1410,9 +1574,9 @@ class OpenAIClientHandler:
             )
 
             if stream:
-                response = self._process_stream_response(chat_completion)
+                response = self._process_stream_omni_response(chat_completion)
             else:
-                response = self._process_non_stream_response(chat_completion)
+                response = self._process_non_stream_omni_response(chat_completion)
 
             assert_omni_response(response, request_config, run_level=self.run_level)
             responses.append(response)
@@ -1438,25 +1602,82 @@ class OpenAIClientHandler:
                     chat_completion = future.result()
 
                     if stream:
-                        response = self._process_stream_response(chat_completion)
+                        response = self._process_stream_omni_response(chat_completion)
                     else:
-                        response = self._process_non_stream_response(chat_completion)
+                        response = self._process_non_stream_omni_response(chat_completion)
 
                     assert_omni_response(response, request_config, run_level=self.run_level)
                     responses.append(response)
 
         return responses
 
+    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """
+        Send OpenAI requests for diffusion models.
+
+        Args:
+            request_config: Request configuration dictionary containing parameters like model, messages
+            request_num: Number of requests to send concurrently, defaults to 1 (single request)
+        Returns:
+            List[OmniResponse]: List of response objects
+        """
+        responses = []
+        stream = request_config.get("stream", False)
+        modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
+        extra_body = request_config.get("extra_body", None)
+
+        if stream:
+            raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
+
+        if request_num == 1:
+            # Send single request
+            chat_completion = self.client.chat.completions.create(
+                model=request_config.get("model"),
+                messages=request_config.get("messages"),
+                extra_body=extra_body,
+                modalities=modalities,
+            )
+
+            response = self._process_diffusion_response(chat_completion)
+            assert_diffusion_response(response, request_config, run_level=self.run_level)
+            responses.append(response)
+
+        else:
+            # Send concurrent requests
+            with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                futures = []
+
+                # Submit all request tasks
+                for _ in range(request_num):
+                    future = executor.submit(
+                        self.client.chat.completions.create,
+                        model=request_config.get("model"),
+                        messages=request_config.get("messages"),
+                        modalities=modalities,
+                        extra_body=extra_body,
+                    )
+                    futures.append(future)
+
+                # Process completed tasks
+                for future in concurrent.futures.as_completed(futures):
+                    chat_completion = future.result()
+                    response = self._process_diffusion_response(chat_completion)
+                    assert_diffusion_response(response, request_config, run_level=self.run_level)
+                    responses.append(response)
+
+        return responses
+
 
 @pytest.fixture
-def openai_client(omni_server, run_level):
-    """Create OpenAIClientHandler fixture"""
+def openai_client(omni_server: OmniServer, run_level: str):
+    """Create OpenAIClientHandler fixture to facilitate communication with OmniServer
+    with encapsulated request sending, concurrent requests, response handling, and validation."""
     return OpenAIClientHandler(host=omni_server.host, port=omni_server.port, api_key="EMPTY", run_level=run_level)
 
 
 class OmniRunner:
     """
-    Test runner for Omni models.
+    Offline test runner for Omni models.
     """
 
     def __init__(
@@ -1509,7 +1730,9 @@ class OmniRunner:
         Returns:
             List of SamplingParams with default decoding for each stage
         """
-        return [st.default_sampling_params for st in self.omni.stage_list]
+        if not hasattr(self.omni, "default_sampling_params_list"):
+            raise AttributeError("Omni.default_sampling_params_list is not available")
+        return list(self.omni.default_sampling_params_list)
 
     def get_omni_inputs(
         self,
@@ -1684,9 +1907,37 @@ class OmniRunner:
         )
         return self.generate(omni_inputs, sampling_params_list)
 
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
+        """Start profiling specified stages.
+
+        Args:
+            profile_prefix: Optional prefix for the trace file names.
+            stages: List of stage IDs to profile. If None, profiles all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.omni.start_profile(profile_prefix=profile_prefix, stages=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages.
+
+        Args:
+            stages: List of stage IDs to profile. If None, stops all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.omni.stop_profile(stages=stages)
+
     def _cleanup_process(self):
         try:
             keywords = ["enginecore"]
+            matched = []
 
             for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
                 try:
@@ -1699,15 +1950,31 @@ class OmniRunner:
 
                     if is_process:
                         print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
-
-                        try:
-                            proc.terminate()
-                            time.sleep(2)
-                        except Exception:
-                            proc.kill()
-
+                        matched.append(proc)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+
+            for proc in matched:
+                try:
+                    proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            _, still_alive = psutil.wait_procs(matched, timeout=5)
+            for proc in still_alive:
+                try:
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            if still_alive:
+                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
+                if stubborn:
+                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
+                else:
+                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
+            elif matched:
+                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
 
         except Exception as e:
             print(f"Error in psutil vllm cleanup: {e}")
@@ -1727,9 +1994,10 @@ class OmniRunner:
 
 
 @pytest.fixture(scope="module")
-def omni_runner(request):
+def omni_runner(request, model_prefix):
     with _omni_server_lock:
         model, stage_config_path = request.param
+        model = model_prefix + model
         with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
             print("OmniRunner started successfully")
             yield runner
@@ -1749,9 +2017,9 @@ class OmniRunnerHandler:
             audio_content = None
             for stage_output in outputs:
                 if getattr(stage_output, "final_output_type", None) == "text":
-                    text_content = stage_output.request_output[0].outputs[0].text
+                    text_content = stage_output.request_output.outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output[0].outputs[0].multimodal_output["audio"]
+                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
 
             result.audio_content = audio_content
             result.text_content = text_content
@@ -1778,6 +2046,18 @@ class OmniRunnerHandler:
         response = self._process_output(outputs)
         assert_omni_response(response, request_config, run_level="L2")
         return response
+
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
+        """Start profiling specified stages."""
+        return self.runner.start_profile(profile_prefix=profile_prefix, stages=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages."""
+        return self.runner.stop_profile(stages=stages)
 
 
 @pytest.fixture

@@ -5,11 +5,11 @@ from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
-from omegaconf import OmegaConf
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
+from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.platforms import current_omni_platform
 
@@ -244,8 +244,17 @@ def resolve_model_type(model: str) -> str:
     return model_type
 
 
-def load_stage_configs_from_model(config_path: str | None, base_engine_args: dict | None = None) -> list:
-    """Load stage configurations from a resolved config file path.
+def load_stage_configs_from_model(config_path: str, base_engine_args: dict | None = None) -> list:
+    """Load stage configurations from model's default config file.
+
+    .. deprecated::
+        This is the legacy OmegaConf-based loading path. New code should use
+        ``StageConfigFactory.create_from_model()`` instead. This function will
+        be removed once all callers are migrated (see PR series [2/N]).
+
+    Loads stage configurations based on the model type and device type.
+    First tries to load a device-specific YAML file from stage_configs/{device_type}/
+    directory. If not found, falls back to the default config file.
 
     Args:
         config_path: Path to the YAML configuration file, or None.
@@ -267,6 +276,9 @@ def load_stage_configs_from_model(config_path: str | None, base_engine_args: dic
 def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None = None) -> list:
     """Load stage configurations from a YAML file.
 
+    .. deprecated::
+        Legacy OmegaConf-based loader. Will be removed in PR series [2/N].
+
     Args:
         config_path: Path to the YAML configuration file
 
@@ -275,25 +287,116 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     """
     if base_engine_args is None:
         base_engine_args = {}
-    config_data = OmegaConf.load(config_path)
+    config_data = load_yaml_config(config_path)
     stage_args = config_data.stage_args
     global_async_chunk = config_data.get("async_chunk", False)
-    # Convert any nested dataclass objects to dicts before creating OmegaConf
+    # Convert any nested dataclass objects to dicts before creating DictConfig
     base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
-    base_engine_args = OmegaConf.create(base_engine_args)
+    base_engine_args = create_config(base_engine_args)
     for stage_arg in stage_args:
         base_engine_args_tmp = base_engine_args.copy()
         # Update base_engine_args with stage-specific engine_args if they exist
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
-            base_engine_args_tmp = OmegaConf.merge(base_engine_args_tmp, stage_arg.engine_args)
+            base_engine_args_tmp = create_config(merge_configs(base_engine_args_tmp, stage_arg.engine_args))
         stage_type = getattr(stage_arg, "stage_type", "llm")
         if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
-            runtime_cfg = stage_arg.runtime
-            max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-            base_engine_args_tmp["max_num_seqs"] = max_batch_size
             base_engine_args_tmp.async_chunk = global_async_chunk
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
+
+
+def filter_stages(
+    config_path: str | None,
+    stage_configs: list,
+    kwargs: dict | None,
+) -> list:
+    """Filter stage configs by mode when YAML defines a `modes` section.
+
+    The YAML can define, e.g.:
+
+        modes:
+          - mode: text-to-image
+            stages: [1]
+          - mode: image-to-text
+            stages: [0]
+
+    When users pass `mode="image-to-text"` into Omni(**kwargs), only the stages
+    listed for that mode are returned. If no mode is provided, defaults to
+    "text-to-image". If no modes are defined or filtering fails, returns the
+    original stage_configs unchanged.
+
+    Args:
+        config_path: Path to the YAML config (used to read `modes`).
+        stage_configs: Loaded list of stage configs.
+        kwargs: Engine/caller kwargs; may contain "mode".
+
+    Returns:
+        Filtered list of stage configs (or original list if filtering not applied).
+    """
+    if not stage_configs or config_path is None:
+        return stage_configs
+
+    try:
+        cfg = load_yaml_config(config_path)
+        yaml_modes = getattr(cfg, "modes", None)
+        if yaml_modes is None:
+            return stage_configs
+
+        mode_to_stage_ids: dict[str, list[int]] = {}
+        if yaml_modes is not None:
+            for entry in yaml_modes:
+                mode_name = None
+                stages = None
+                if hasattr(entry, "mode") or hasattr(entry, "stages"):
+                    mode_name = getattr(entry, "mode", None)
+                    stages = getattr(entry, "stages", None)
+                elif isinstance(entry, dict):
+                    mode_name = entry.get("mode")
+                    stages = entry.get("stages")
+
+                if mode_name is None or stages is None:
+                    continue
+
+                if isinstance(stages, int):
+                    stage_list = [stages]
+                else:
+                    stage_list = list(stages)
+
+                mode_to_stage_ids[str(mode_name)] = [int(sid) for sid in stage_list]
+
+        # No modes section or empty mapping: use all stages and return early.
+        active_mode: str | None = None
+        if isinstance(kwargs, dict):
+            active_mode = kwargs.get("mode")
+
+        if active_mode is None:
+            active_mode = "text-to-image"
+
+        if active_mode not in mode_to_stage_ids:
+            logger.warning(
+                "Requested mode '%s' not found in config '%s'; available modes: %s. Using all stages.",
+                active_mode,
+                config_path,
+                sorted(mode_to_stage_ids.keys()),
+            )
+            return stage_configs
+
+        allowed_ids = set(mode_to_stage_ids[active_mode])
+        filtered_stage_configs = [sc for sc in stage_configs if getattr(sc, "stage_id", None) in allowed_ids]
+        if not filtered_stage_configs:
+            logger.warning(
+                "Mode '%s' in config '%s' resolved to stage ids %s, but none matched loaded stage_args. "
+                "Falling back to all stages.",
+                active_mode,
+                config_path,
+                sorted(allowed_ids),
+            )
+            return stage_configs
+
+        return filtered_stage_configs
+    except Exception as e:
+        logger.warning("Failed to apply mode-based stage filtering: %s", e)
+        return stage_configs
 
 
 def load_and_resolve_stage_configs(
@@ -321,12 +424,15 @@ def load_and_resolve_stage_configs(
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = OmegaConf.create(default_stage_cfg)
+                stage_configs = create_config(default_stage_cfg)
             else:
                 stage_configs = []
     else:
         config_path = stage_configs_path
         stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
+
+    stage_configs = filter_stages(config_path, stage_configs, kwargs)
+    logger.debug(f"stage_configs: {stage_configs}")
 
     return config_path, stage_configs
 
@@ -356,6 +462,7 @@ def get_final_stage_id_for_e2e(
         output_modalities = default_modalities
 
     try:
+        final_stage_id_for_e2e = last_stage_id
         for _sid in range(last_stage_id, -1, -1):
             if (
                 getattr(stage_list[_sid], "final_output", False)
@@ -363,8 +470,6 @@ def get_final_stage_id_for_e2e(
             ):
                 final_stage_id_for_e2e = _sid
                 break
-        if final_stage_id_for_e2e < 0:
-            final_stage_id_for_e2e = last_stage_id
     except Exception as e:
         logger.debug(
             "[Orchestrator] Failed to determine final stage for E2E; \

@@ -33,18 +33,25 @@ docker run --rm \
     -p 8000:8000 \
     -it $IMAGE bash
 
+cd /vllm-workspace/vllm
+git pull origin main
+git fetch origin --tags
+git checkout v0.16.0
+
 # Because vllm-ascend will release v0.16.0rc1 after vllm-omni 0.16.0,
 # we have to pin vllm-ascend at the current commit.
 cd /vllm-workspace/vllm-ascend
+git pull origin main
 git checkout e2175d9c7e62b437391dfee996b1375674ba7c18
 pip install -v -e .
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
 git clone -b v0.16.0 https://github.com/vllm-project/vllm-omni.git
-
 cd vllm-omni
-pip install -v -e .
+pip install -v -e . --no-build-isolation
+# or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
+
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
 
@@ -61,23 +68,22 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 You can also build vLLM-Omni from the latest main branch if you want to use the latest features or bug fixes. (But sometimes it will break for a while. You can check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for the status of the latest commit of vLLM-Omni main branch on NPU.)
 
 ```bash
-# Pin vLLM version to 0.16.0
+# Pin vLLM version to 0.18.0
 cd /vllm-workspace/vllm
 git pull origin main
 git fetch origin --tags
-git checkout v0.16.0
-VLLM_TARGET_DEVICE=empty pip install -v -e .
+git checkout v0.18.0
 
 # Because vllm-ascend has not yet entered continuous development and has not been officially released, we need to pin it to a specific commit. Please note that this commit may change over time.
-cd ../vllm-ascend
+cd /vllm-workspace/vllm-ascend
 git pull origin main
 git fetch origin --tags
-git checkout e2175d9c7e62b437391dfee996b1375674ba7c18
+git checkout 1e05c4908f31737bc4eef865a9f351d030a77c9d
 pip install -v -e .
 
 # Install vLLM-Omni from the latest main branch
-cd ../vllm-omni
 git clone https://github.com/vllm-project/vllm-omni.git
+cd /vllm-workspace/vllm-omni
 pip install -v -e . --no-build-isolation
 # or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
 export VLLM_WORKER_MULTIPROC_METHOD=spawn

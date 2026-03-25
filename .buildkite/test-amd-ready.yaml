@@ -1,0 +1,178 @@
+steps:
+
+- label: "Simple Unit Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export VLLM_ROCM_USE_AITER=0
+    - "timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+
+- label: "Diffusion Model Test"
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - timeout 20m pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
+
+- label: "Diffusion Model CPU offloading Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - |
+      timeout 20m bash -c '
+        set +e
+        pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
+        EXIT1=\$?
+        pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
+        EXIT2=\$?
+        exit \$((EXIT1 | EXIT2))
+      '
+
+## ISSUE depends on `diffusers` package: https://github.com/huggingface/diffusers/issues/13274
+# - label: "Audio Generation Model Test"
+#   agent_pool: mi325_1
+#   depends_on: amd-build
+#   mirror_hardwares: [amdproduction]
+#   grade: Blocking
+#   commands:
+#     - export GPU_ARCHS=gfx942
+#     - export VLLM_LOGGING_LEVEL=DEBUG
+#     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+#     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_model.py
+
+- label: "Diffusion Cache Backend Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - timeout 15m pytest -s -v -m "core_model and cache and diffusion and not distributed_cuda and L4"
+
+- label: "Diffusion Sequence Parallelism Test"
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - timeout 20m pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py -m core_model
+
+- label: "Diffusion GPU Worker Test"
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - timeout 20m pytest -s -v tests/diffusion/test_diffusion_worker.py
+
+- label: "Benchmark & Engine Test"
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - |
+      timeout 30m bash -c '
+        set +e
+        pytest -s -v tests/benchmarks/test_serve_cli.py
+        EXIT1=\$?
+        pytest -s -v tests/engine/test_async_omni_engine_abort.py
+        EXIT2=\$?
+        exit \$((EXIT1 | EXIT2))
+      '
+
+- label: "Omni Model Test Qwen2-5-Omni"
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - timeout 17m pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
+
+- label: "Omni Model Test Qwen3-Omni"
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export VLLM_TEST_CLEAN_GPU_MEMORY=1
+    - timeout 10m pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
+    - timeout 10m pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "core_model" --run-level "core_model"
+
+- label: "Qwen3-TTS E2E Test"
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - timeout 20m pytest -s -v tests/e2e/online_serving/test_qwen3_tts.py
+
+- label: "Diffusion Image Edit Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - timeout 20m pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
+
+- label: "Bagel Text2Img Model Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_TEST_CLEAN_GPU_MEMORY=1
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export VLLM_ROCM_USE_AITER_RMSNORM=0
+    - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py -m "core_model" --run-level "core_model" -k "rocm"
+
+- label: "Bagel Img2Img Model Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_TEST_CLEAN_GPU_MEMORY=1
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export VLLM_ROCM_USE_AITER_RMSNORM=0
+    - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py -m "core_model" --run-level "core_model" -k "rocm"
+
+- label: "Bagel Online Serving Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_TEST_CLEAN_GPU_MEMORY=1
+    - export VLLM_IMAGE_FETCH_TIMEOUT=60
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export VLLM_ROCM_USE_AITER_RMSNORM=0
+    - timeout 40m pytest -s -v tests/e2e/online_serving/test_bagel_online.py -m "core_model" --run-level "core_model" -k "rocm"

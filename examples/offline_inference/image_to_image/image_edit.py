@@ -208,6 +208,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
+    )
     parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
     parser.add_argument(
         "--resolution",
@@ -320,6 +325,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -348,6 +358,7 @@ def main():
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Configure cache based on backend type
@@ -383,6 +394,7 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
     print("Pipeline loaded")
 
@@ -402,7 +414,7 @@ def main():
     else:
         print(f"  Input image size: {input_image.size}")
     print(
-        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}"
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}, enable_expert_parallel: {args.enable_expert_parallel}"
     )
     print(f"{'=' * 60}\n")
 
@@ -457,12 +469,12 @@ def main():
         raise ValueError("No output generated from omni.generate()")
 
     # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0].images
+    # omni.generate() returns list[OmniRequestOutput], extract images from request_output.images
     first_output = outputs[0]
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 

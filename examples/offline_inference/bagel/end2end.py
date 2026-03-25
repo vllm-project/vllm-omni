@@ -34,6 +34,13 @@ def parse_args():
         help="Path to input image for img2img.",
     )
 
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=".",
+        help="Output directory to save images.",
+    )
+
     # OmniLLM init args
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
@@ -58,6 +65,17 @@ def parse_args():
         help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="Quantization method (e.g. 'fp8').",
+    )
 
     args = parser.parse_args()
     return args
@@ -65,6 +83,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    os.makedirs(args.output, exist_ok=True)
     model_name = args.model
     prompts: list[OmniPromptType] = []
     try:
@@ -103,8 +122,11 @@ def main():
             "shm_threshold_bytes": args.shm_threshold_bytes,
             "worker_backend": args.worker_backend,
             "ray_address": args.ray_address,
+            "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         }
     )
+    if args.quantization:
+        omni_kwargs["quantization_config"] = args.quantization
 
     omni = Omni(model=model_name, **omni_kwargs)
 
@@ -163,25 +185,17 @@ def main():
 
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 
-    for i, req_output in enumerate(omni_outputs):
+    img_idx = 0
+    for req_output in omni_outputs:
         images = getattr(req_output, "images", None)
-        if not images and hasattr(req_output, "output"):
-            if isinstance(req_output.output, list):
-                images = req_output.output
-            else:
-                images = [req_output.output]
 
-        if images:
-            for j, img in enumerate(images):
-                img.save(f"output_{i}_{j}.png")
+        if not images:
+            continue
 
-        if hasattr(req_output, "request_output") and req_output.request_output:
-            for stage_out in req_output.request_output:
-                if hasattr(stage_out, "images") and stage_out.images:
-                    for k, img in enumerate(stage_out.images):
-                        save_path = f"output_{i}_stage_{getattr(stage_out, 'stage_id', '?')}_{k}.png"
-                        img.save(save_path)
-                        print(f"[Info] Saved stage output image to {save_path}")
+        for j, img in enumerate(images):
+            save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
+            img.save(save_path)
+        img_idx += 1
 
     print(omni_outputs)
 
