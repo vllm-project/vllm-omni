@@ -13,11 +13,7 @@ from pathlib import Path
 import pytest
 
 _HELPER_PATH = (
-    Path(__file__).resolve().parents[4]
-    / "examples"
-    / "online_serving"
-    / "voxtral_tts"
-    / "text_preprocess.py"
+    Path(__file__).resolve().parents[4] / "examples" / "online_serving" / "voxtral_tts" / "text_preprocess.py"
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
