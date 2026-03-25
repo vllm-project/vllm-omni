@@ -453,8 +453,6 @@ class AsyncOmniEngine:
         llm_stage_count = sum(
             1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
         )
-        from vllm_omni.platforms import current_omni_platform
-
         device_control_env = current_omni_platform.device_control_env_var
 
         prepare_engine_environment()
