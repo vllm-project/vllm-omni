@@ -4,41 +4,14 @@
 import logging
 import sys
 from collections.abc import Generator
-from pathlib import Path
 from types import ModuleType
 
 import pytest
 
 
-# Find repo root by looking for pyproject.toml marker
-def _find_repo_root(start: Path) -> Path:
-    """Walk up from start to find repo root (contains pyproject.toml)."""
-    current = start.resolve()
-    while current != current.parent:
-        if (current / "pyproject.toml").exists():
-            return current
-        current = current.parent
-    raise FileNotFoundError(f"Could not find repo root from {start}")
-
-
-_REPO_ROOT = _find_repo_root(Path(__file__).resolve())
-_MEMORY_PROFILING_PATH = _REPO_ROOT / "vllm_omni" / "diffusion" / "memory_profiling.py"
-
-
 def _is_vllm_related(name: str) -> bool:
     return (name == "vllm" or name.startswith("vllm.") or
             name == "vllm_omni" or name.startswith("vllm_omni."))
-
-
-def _load_memory_profiling() -> ModuleType:
-    """Load memory_profiling module without polluting sys.modules for other tests."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("vllm_omni.diffusion.memory_profiling", _MEMORY_PROFILING_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.fixture
@@ -48,21 +21,40 @@ def memory_profiling_module() -> Generator[ModuleType, None, None]:
     Saves all vllm/vllm_omni modules (including bare parents) before loading,
     then restores them afterward so this test does not affect others.
     """
-    # Save any existing module state, including bare parent modules
     original_modules: dict[str, ModuleType | None] = {}
     for name in list(sys.modules.keys()):
         if _is_vllm_related(name):
             original_modules[name] = sys.modules.pop(name)
 
-    # Load and yield
-    module = _load_memory_profiling()
+    # The module now exists at vllm_omni/diffusion/memory_profiling.py.
+    import importlib.util
+    from pathlib import Path
+
+    def _find_repo_root(start: Path) -> Path:
+        current = start.resolve()
+        while current != current.parent:
+            if (current / "pyproject.toml").exists():
+                return current
+            current = current.parent
+        raise FileNotFoundError(f"Could not find repo root from {start}")
+
+    repo_root = _find_repo_root(Path(__file__).resolve())
+    mem_prof_path = repo_root / "vllm_omni" / "diffusion" / "memory_profiling.py"
+
+    spec = importlib.util.spec_from_file_location(
+        "vllm_omni.diffusion.memory_profiling", mem_prof_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
     yield module
 
-    # Cleanup: remove any vllm/vllm_omni modules created during the test
+    # Cleanup: remove any vllm/vllm_omni modules created during the test.
     for name in list(sys.modules.keys()):
         if _is_vllm_related(name):
             sys.modules.pop(name, None)
-    # Restore original state
+    # Restore original state.
     for name, mod in original_modules.items():
         if mod is None:
             sys.modules.pop(name, None)

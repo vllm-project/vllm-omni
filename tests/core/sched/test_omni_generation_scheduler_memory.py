@@ -24,32 +24,70 @@ def _find_repo_root(start: Path) -> Path:
 _REPO_ROOT = _find_repo_root(Path(__file__).resolve())
 
 
-def _ensure_module(name: str) -> ModuleType:
-    """Get or create a module stub without polluting existing modules."""
+def _is_vllm_related(name: str) -> bool:
+    return (name == "vllm" or name.startswith("vllm.") or
+            name == "vllm_omni" or name.startswith("vllm_omni."))
+
+
+def _create_stub_package(name: str) -> ModuleType:
+    """Create a package-like module stub with ``__path__`` so Python can import submodules.
+
+    If the module already exists in ``sys.modules`` it is returned unchanged.
+    Intermediate parent packages are created and the child is set as an attribute
+    on the parent so that ``from . import sub`` works inside stub packages.
+    """
     if name in sys.modules:
-        return sys.modules[name]
-    module = ModuleType(name)
-    sys.modules[name] = module
-    return module
+        mod = sys.modules[name]
+        if not hasattr(mod, "__path__"):
+            mod.__path__ = []  # type: ignore[attr-defined]
+        return mod
+    parts = name.split(".")
+    for i in range(1, len(parts) + 1):
+        subname = ".".join(parts[:i])
+        if subname not in sys.modules:
+            mod = ModuleType(subname)
+            mod.__path__ = []  # type: ignore[attr-defined]
+            sys.modules[subname] = mod
+        else:
+            mod = sys.modules[subname]
+            if not hasattr(mod, "__path__"):
+                mod.__path__ = []  # type: ignore[attr-defined]
+        # Attach child to parent so relative imports work.
+        if i > 1:
+            parent_name = ".".join(parts[:i - 1])
+            parent = sys.modules[parent_name]
+            attr = parts[i - 1]
+            if not hasattr(parent, attr):
+                setattr(parent, attr, mod)
+    return sys.modules[name]
 
 
-def _stub_scheduler_dependencies() -> dict[str, ModuleType | None]:
+def _stub_scheduler_dependencies(
+    original_modules: dict[str, ModuleType | None],
+) -> dict[str, ModuleType]:
     """Create minimal stubs for vllm/vllm_omni dependencies.
 
-    Returns a dict mapping module names to their original value in sys.modules
-    before this call (None means the module did not exist). Caller is
-    responsible for restoring the original state after loading the scheduler.
+    For each module name that already exists in ``sys.modules``, the existing
+    reference is stored in ``original_modules`` so the caller can restore it.
+    For names that do not exist, ``None`` is stored.
+
+    Returns a dict of newly-created stub modules (excluding pre-existing ones)
+    so the caller can remove them after loading the scheduler.
     """
-    original_modules: dict[str, ModuleType | None] = {}
+    created: dict[str, ModuleType] = {}
 
     def ensure(name: str) -> ModuleType:
+        """Get or create a package-like stub for *name*."""
         if name in sys.modules:
             original_modules[name] = sys.modules[name]
         else:
             original_modules[name] = None
-            sys.modules[name] = ModuleType(name)
+            stub = _create_stub_package(name)
+            sys.modules[name] = stub
+            created[name] = stub
         return sys.modules[name]
 
+    # ── vllm ──────────────────────────────────────────────────────────────────
     ensure("vllm")
     ensure("vllm.compilation")
     cuda_graph = ensure("vllm.compilation.cuda_graph")
@@ -77,48 +115,55 @@ def _stub_scheduler_dependencies() -> dict[str, ModuleType | None]:
     if not hasattr(kv_cache, "KVCacheBlocks"):
         kv_cache.KVCacheBlocks = type("KVCacheBlocks", (), {})
 
+    ensure("vllm.v1.core.sched")
     sched_interface = ensure("vllm.v1.core.sched.interface")
     if not hasattr(sched_interface, "PauseState"):
-        sched_interface.PauseState = type("PauseState", (), {"PAUSED_ALL": object(), "UNPAUSED": object()})
-
+        sched_interface.PauseState = type(
+            "PauseState", (), {"PAUSED_ALL": object(), "UNPAUSED": object()}
+        )
     sched_output = ensure("vllm.v1.core.sched.output")
     if not hasattr(sched_output, "SchedulerOutput"):
         sched_output.SchedulerOutput = type("SchedulerOutput", (), {})
-
     request_queue = ensure("vllm.v1.core.sched.request_queue")
     if not hasattr(request_queue, "create_request_queue"):
         request_queue.create_request_queue = lambda policy: []
-
     scheduler_mod = ensure("vllm.v1.core.sched.scheduler")
     if not hasattr(scheduler_mod, "Scheduler"):
         scheduler_mod.Scheduler = type("Scheduler", (), {})
-
     sched_utils = ensure("vllm.v1.core.sched.utils")
     if not hasattr(sched_utils, "remove_all"):
         sched_utils.remove_all = lambda seq, items: [x for x in seq if x not in items]
 
+    # Missing parent stubs fixed: create vllm.v1.metrics and vllm.v1.spec_decode
+    # before their sub-modules (Copilot/Codex review feedback)
+    ensure("vllm.v1.metrics")
+    perf_mod = ensure("vllm.v1.metrics.perf")
+    if not hasattr(perf_mod, "PerfStats"):
+        perf_mod.PerfStats = type("PerfStats", (), {})
+    ensure("vllm.v1.spec_decode")
+    spec_decode = ensure("vllm.v1.spec_decode.metrics")
+    if not hasattr(spec_decode, "SpecDecodingStats"):
+        spec_decode.SpecDecodingStats = type("SpecDecodingStats", (), {})
+
     engine_mod = ensure("vllm.v1.engine")
     if not hasattr(engine_mod, "EngineCoreEventType"):
-        engine_mod.EngineCoreEventType = type("EngineCoreEventType", (), {"SCHEDULED": object()})
+        engine_mod.EngineCoreEventType = type(
+            "EngineCoreEventType", (), {"SCHEDULED": object()}
+        )
     if not hasattr(engine_mod, "EngineCoreOutput"):
         engine_mod.EngineCoreOutput = type("EngineCoreOutput", (), {})
     if not hasattr(engine_mod, "EngineCoreOutputs"):
         engine_mod.EngineCoreOutputs = type("EngineCoreOutputs", (), {})
 
-    perf_mod = ensure("vllm.v1.metrics.perf")
-    if not hasattr(perf_mod, "PerfStats"):
-        perf_mod.PerfStats = type("PerfStats", (), {})
-
     request_mod = ensure("vllm.v1.request")
     if not hasattr(request_mod, "Request"):
         request_mod.Request = type("Request", (), {})
     if not hasattr(request_mod, "RequestStatus"):
-        request_mod.RequestStatus = type("RequestStatus", (), {"FINISHED_STOPPED": object()})
+        request_mod.RequestStatus = type(
+            "RequestStatus", (), {"FINISHED_STOPPED": object()}
+        )
 
-    spec_decode = ensure("vllm.v1.spec_decode.metrics")
-    if not hasattr(spec_decode, "SpecDecodingStats"):
-        spec_decode.SpecDecodingStats = type("SpecDecodingStats", (), {})
-
+    # ── vllm_omni ─────────────────────────────────────────────────────────────
     ensure("vllm_omni")
     ensure("vllm_omni.core")
     ensure("vllm_omni.core.sched")
@@ -131,7 +176,9 @@ def _stub_scheduler_dependencies() -> dict[str, ModuleType | None]:
     ensure("vllm_omni.distributed")
     ensure("vllm_omni.distributed.omni_connectors")
     ensure("vllm_omni.distributed.omni_connectors.transfer_adapter")
-    chunk_adapter = ensure("vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter")
+    chunk_adapter = ensure(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter"
+    )
     if not hasattr(chunk_adapter, "OmniChunkTransferAdapter"):
         chunk_adapter.OmniChunkTransferAdapter = type("OmniChunkTransferAdapter", (), {})
 
@@ -140,56 +187,61 @@ def _stub_scheduler_dependencies() -> dict[str, ModuleType | None]:
         outputs_mod.OmniModelRunnerOutput = type("OmniModelRunnerOutput", (), {})
 
     ensure("vllm_omni.diffusion")
-    # Load the actual memory_profiling module
-    mem_prof_path = _REPO_ROOT / "vllm_omni" / "diffusion" / "memory_profiling.py"
+    # Provide the real memory_profiling module (fixed: was loading from a
+    # non-existent path; now uses the actual module in the repo)
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("vllm_omni.diffusion.memory_profiling", mem_prof_path)
+    mem_prof_path = _REPO_ROOT / "vllm_omni" / "diffusion" / "memory_profiling.py"
+    spec = importlib.util.spec_from_file_location(
+        "vllm_omni.diffusion.memory_profiling", mem_prof_path
+    )
     mem_prof = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(mem_prof)
     sys.modules["vllm_omni.diffusion.memory_profiling"] = mem_prof
 
-    return original_modules
+    return created
 
 
-def _load_scheduler_module(original_modules: dict[str, ModuleType | None]) -> ModuleType:
+def _load_scheduler_module(
+    original_modules: dict[str, ModuleType | None],
+) -> tuple[ModuleType, dict[str, ModuleType]]:
     """Load the scheduler module with stubs, with cleanup.
 
-    Restores sys.modules to its original state after loading (discarding any
-    stub modules that were created) so that the scheduler module's imports
-    are fully self-contained and do not leak into other tests.
+    Creates stubs for any missing vllm/vllm_omni modules, loads the scheduler,
+    then removes all vllm/vllm_omni entries from sys.modules that were created
+    by this function (leaving pre-existing real modules intact).
+
+    Returns:
+        A tuple of (loaded_scheduler_module, created_stub_modules).
     """
     import importlib.util
 
-    # Save current state (should already be populated by fixture save step)
-    _stub_scheduler_dependencies()
+    created = _stub_scheduler_dependencies(original_modules)
 
     sched_path = _REPO_ROOT / "vllm_omni" / "core" / "sched" / "omni_generation_scheduler.py"
-    spec = importlib.util.spec_from_file_location("vllm_omni.core.sched.omni_generation_scheduler", sched_path)
+    spec = importlib.util.spec_from_file_location(
+        "vllm_omni.core.sched.omni_generation_scheduler", sched_path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
-    # Discard all vllm/vllm_omni stub modules created during loading.
-    # This prevents pollution of sys.modules between tests.
-    for name in list(sys.modules.keys()):
-        if name == "vllm" or name.startswith("vllm.") or name == "vllm_omni" or name.startswith("vllm_omni."):
-            sys.modules.pop(name, None)
+    # Remove only the stub modules this function created (not pre-existing
+    # real vllm/vllm_omni packages that were in sys.modules before).
+    for name in created:
+        sys.modules.pop(name, None)
+    # Also remove memory_profiling stub if it was placed by us.
+    sys.modules.pop("vllm_omni.diffusion.memory_profiling", None)
 
-    # Restore original modules (including any that were pre-existing before loading)
+    # Restore pre-existing originals that we temporarily overwrote.
     for name, mod in original_modules.items():
         if mod is None:
             sys.modules.pop(name, None)
         else:
             sys.modules[name] = mod
 
-    return module
-
-
-def _is_vllm_related(name: str) -> bool:
-    return (name == "vllm" or name.startswith("vllm.") or
-            name == "vllm_omni" or name.startswith("vllm_omni."))
+    return module, created
 
 
 @pytest.fixture
@@ -199,21 +251,20 @@ def scheduler_module() -> Generator[ModuleType, None, None]:
     Saves all vllm/vllm_omni modules (including bare 'vllm' parent) before
     loading, then restores them afterward so this test does not affect others.
     """
-    # Save ALL vllm/vllm_omni related modules including bare parents
     original_modules: dict[str, ModuleType | None] = {}
     for name in list(sys.modules.keys()):
         if _is_vllm_related(name):
             original_modules[name] = sys.modules.pop(name)
 
-    # Load and yield
-    module = _load_scheduler_module(original_modules)
+    module, _created_stubs = _load_scheduler_module(original_modules)
     yield module
 
-    # Cleanup: remove any vllm/vllm_omni modules created during the test
+    # Remove any vllm/vllm_omni modules that exist now (should only be the
+    # scheduler module we just loaded).
     for name in list(sys.modules.keys()):
         if _is_vllm_related(name):
             sys.modules.pop(name, None)
-    # Restore original state
+    # Restore original state.
     for name, mod in original_modules.items():
         if mod is None:
             sys.modules.pop(name, None)
@@ -228,7 +279,9 @@ class DummyRequest:
         self.prompt_token_ids = [1, 2, 3, 4, 5]
 
 
-def test_log_allocation_failure_includes_memory_snapshot(monkeypatch, caplog, scheduler_module):
+def test_log_allocation_failure_includes_memory_snapshot(
+    monkeypatch, caplog, scheduler_module
+):
     scheduler = object.__new__(scheduler_module.OmniGenerationScheduler)
     scheduler._memory_profiling_enabled = True
 
@@ -246,11 +299,16 @@ def test_log_allocation_failure_includes_memory_snapshot(monkeypatch, caplog, sc
     monkeypatch.setattr(
         scheduler_module,
         "format_cuda_memory_snapshot",
-        lambda snapshot: "cuda:0 allocated=0.00GiB reserved=0.00GiB max_allocated=0.00GiB max_reserved=0.00GiB",
+        lambda snapshot: (
+            "cuda:0 allocated=0.00GiB reserved=0.00GiB "
+            "max_allocated=0.00GiB max_reserved=0.00GiB"
+        ),
     )
 
     with caplog.at_level(logging.WARNING):
-        scheduler._log_allocation_failure(DummyRequest(), required_tokens=2, token_budget=1)
+        scheduler._log_allocation_failure(
+            DummyRequest(), required_tokens=2, token_budget=1
+        )
 
     assert "Diffusion scheduler allocation failed" in caplog.text
     assert "request_id=req-1" in caplog.text
@@ -262,6 +320,8 @@ def test_log_allocation_failure_noop_when_disabled(caplog, scheduler_module):
     scheduler._memory_profiling_enabled = False
 
     with caplog.at_level(logging.WARNING):
-        scheduler._log_allocation_failure(DummyRequest(), required_tokens=2, token_budget=1)
+        scheduler._log_allocation_failure(
+            DummyRequest(), required_tokens=2, token_budget=1
+        )
 
     assert caplog.text == ""
