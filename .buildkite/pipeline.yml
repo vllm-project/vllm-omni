@@ -15,7 +15,7 @@ steps:
     key: upload-ready-pipeline
     if: build.branch != "main"
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-ready.yml
+      - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:
       queue: "cpu_queue_premerge"
 
