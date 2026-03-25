@@ -188,7 +188,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Omni Model Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 30
     depends_on: upload-merge-pipeline
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG
