@@ -35,7 +35,7 @@ steps:
             fi
           fi
 
-          if ! printf "%s\n" "${changed_files}" | grep -Eq "^(examples/online_serving/voxtral_tts/|tests/examples/online_serving/test_voxtral_tts_text_preprocess\.py$)"; then
+          if ! printf "%s\n" "${changed_files}" | grep -Eq "^examples/online_serving/voxtral_tts/|^tests/examples/online_serving/test_voxtral_tts_text_preprocess\.py"; then
             echo "No changes under examples/online_serving/voxtral_tts/ or tests/examples/online_serving/test_voxtral_tts_text_preprocess.py. Skipping."
             exit 0
           fi
