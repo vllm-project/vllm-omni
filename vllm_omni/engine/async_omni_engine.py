@@ -453,7 +453,6 @@ class AsyncOmniEngine:
         llm_stage_count = sum(
             1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
         )
-        device_control_env = current_omni_platform.device_control_env_var
 
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)
