@@ -217,6 +217,26 @@ class DiffusionModelRunner:
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
 
+    def _finalize_sampling_params(self, sampling_params):
+        """Finalizes the sampling params by adding pipeline defaults;
+        NOTE: This is done in place."""
+        # Resolve the sampling params generator first
+        if sampling_params.generator is None and sampling_params.seed is not None:
+            if sampling_params.generator_device is not None:
+                gen_device = sampling_params.generator_device
+            elif self.device.type == "cpu":
+                gen_device = "cpu"
+            else:
+                gen_device = self.device
+            sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
+
+        # Apply model specific defaults to unset fields
+        def_params = getattr(self.pipeline, "sampling_param_defaults", None)
+        if def_params is not None:
+            logger.debug("Merging default sampling params into user request")
+            sampling_params.merge_with_def_params(def_params)
+        return sampling_params
+
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -237,6 +257,9 @@ class DiffusionModelRunner:
         if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
+        # set the generator and pipeline defaults for sampling params.
+        sampling_params = self._finalize_sampling_params(req.sampling_params)
+
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
@@ -248,23 +271,14 @@ class DiffusionModelRunner:
                 target_device=getattr(self.pipeline, "device", None),
             )
 
-            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-                if req.sampling_params.generator_device is not None:
-                    gen_device = req.sampling_params.generator_device
-                elif self.device.type == "cpu":
-                    gen_device = "cpu"
-                else:
-                    gen_device = self.device
-                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
-
             # Refresh cache context if needed
             if (
                 not getattr(req, "skip_cache_refresh", False)
                 and self.cache_backend is not None
                 and self.cache_backend.is_enabled()
-                and req.sampling_params.num_inference_steps is not None
+                and sampling_params.num_inference_steps is not None
             ):
-                self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
+                self.cache_backend.refresh(self.pipeline, sampling_params.num_inference_steps)
 
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary:
@@ -356,16 +370,11 @@ class DiffusionModelRunner:
             state, is_new_request = self._update_states(scheduler_output)
 
             if is_new_request:
-                # TODO: support kv manager recv
-                # TODO: support cache backend
-                if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                # set the generator and pipeline defaults for sampling params.
+                state.sampling = self._finalize_sampling_params(state.sampling)
+
+            # TODO: support kv manager recv
+            # TODO: support cache backend
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 # step0/new request: encode

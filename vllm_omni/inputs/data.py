@@ -1,6 +1,6 @@
 import copy
 import pprint
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, TypeAlias, TypedDict
 
 from vllm.inputs import PromptType
@@ -331,6 +331,30 @@ class OmniDiffusionSamplingParams:
 
     def clone(self) -> "OmniDiffusionSamplingParams":
         return copy.deepcopy(self)
+
+    def merge_with_def_params(self, def_params: "DiffusionParamOverrides"):
+        """Merges an instance of this class with a pipeline's defaults."""
+        for attr_name, attr_val in def_params.validated_overrides.items():
+            # For now, check if the field is falsy and override it.
+            # TODO: We should handle this better, because this does
+            # not distinguish between the user passing a Falsy value
+            # vs initializing with the default, but it matches the
+            # current pipeline behavior.
+            if not getattr(self, attr_name):
+                setattr(self, attr_name, attr_val)
+
+
+class DiffusionParamOverrides:
+    """A wrapper around a dict mapping attribute names to sampling params."""
+
+    def __init__(self, **kwargs) -> None:
+        valid_keys = {f.name for f in fields(OmniDiffusionSamplingParams)}
+        for attr_name, attr_val in kwargs.items():
+            if attr_name not in valid_keys:
+                raise AttributeError(f"{attr_name} is not a valid OmniDiffusionSamplingParams field")
+
+        # TODO would be nice to validate types too
+        self.validated_overrides = kwargs
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
