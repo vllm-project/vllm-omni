@@ -1,7 +1,10 @@
+import math
 from typing import Literal
 
 import numpy as np
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+_MAX_EMBEDDING_DIM = 8192
 
 
 class OpenAICreateSpeechRequest(BaseModel):
@@ -41,7 +44,7 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     ref_audio: str | None = Field(
         default=None,
-        description="Reference audio for voice cloning (Base task). URL, base64, or file path.",
+        description="Reference audio for voice cloning (Base task). URL, base64, or file URI.",
     )
     ref_text: str | None = Field(
         default=None,
@@ -50,6 +53,13 @@ class OpenAICreateSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = Field(
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
+    )
+    speaker_embedding: list[float] | None = Field(
+        default=None,
+        max_length=_MAX_EMBEDDING_DIM,
+        description="Pre-computed speaker embedding vector (1024-dim for 0.6B, "
+        "2048-dim for 1.7B). Skips speaker encoder extraction from ref_audio. "
+        "Implies x_vector_only_mode=True. Mutually exclusive with ref_audio.",
     )
     max_new_tokens: int | None = Field(
         default=None,
@@ -68,12 +78,26 @@ class OpenAICreateSpeechRequest(BaseModel):
             raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
 
+    @field_validator("speaker_embedding")
+    @classmethod
+    def validate_speaker_embedding(cls, v: list[float] | None) -> list[float] | None:
+        if v is not None and not all(math.isfinite(x) for x in v):
+            raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
+        return v
+
+    @model_validator(mode="after")
+    def validate_embedding_constraints(self) -> "OpenAICreateSpeechRequest":
+        if self.speaker_embedding is not None:
+            if self.ref_audio is not None:
+                raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
+        return self
+
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
         if self.stream:
             if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
-                    "Streaming (stream=true) requires response_format not in ('pcm', 'wav'). "
+                    "Streaming (stream=true) requires response_format='pcm' or 'wav'. "
                     f"Got response_format='{self.response_format}'."
                 )
             if self.speed is None:
@@ -102,6 +126,62 @@ class AudioResponse(BaseModel):
     media_type: str
 
 
+# --- Batch Speech Models ---
+
+
+class SpeechBatchItem(BaseModel):
+    """Per-item input for batch speech. Only `input` is required;
+    all other fields override the batch-level defaults when set."""
+
+    input: str
+    voice: str | None = None
+    instructions: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] | None = None
+    speed: float | None = Field(default=None, ge=0.25, le=4.0)
+    task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
+    language: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+
+
+class BatchSpeechRequest(BaseModel):
+    """Top-level request for batch speech generation.
+    Fields here act as shared defaults; per-item overrides win."""
+
+    model: str | None = None
+    items: list[SpeechBatchItem] = Field(..., min_length=1)
+    voice: str | None = None
+    instructions: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
+    task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
+    language: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+
+
+class SpeechBatchItemResult(BaseModel):
+    index: int
+    status: Literal["success", "error"]
+    audio_data: str | None = None
+    media_type: str | None = None
+    error: str | None = None
+
+
+class BatchSpeechResponse(BaseModel):
+    id: str
+    results: list[SpeechBatchItemResult]
+    total: int
+    succeeded: int
+    failed: int
+
+
 class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
@@ -121,6 +201,11 @@ class StreamingSpeechSessionConfig(BaseModel):
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
+    speaker_embedding: list[float] | None = Field(
+        default=None,
+        max_length=_MAX_EMBEDDING_DIM,
+        description="Pre-computed speaker embedding vector. Mutually exclusive with ref_audio.",
+    )
     stream_audio: bool = Field(
         default=False,
         description=(

@@ -88,6 +88,7 @@ class OmniBase:
         self.log_stats = log_stats
         self.async_chunk = async_chunk
         self.output_modalities = output_modalities or []
+        self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
         logger.info("[%s] Initializing with model %s", self.__class__.__name__, model)
         st = time.time()

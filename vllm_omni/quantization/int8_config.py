@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""INT8 quantization config for diffusion transformers."""
+"""INT8 quantization config for diffusion transformers.
+
+Supports both online (dynamic) and offline (checkpoint) INT8 quantization
+on CUDA and NPU platforms.
+"""
 
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional
@@ -40,8 +44,6 @@ if current_omni_platform.is_npu():
 else:
     torch_npu = None
 
-from .base import DiffusionQuantizationConfig
-
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
@@ -72,9 +74,12 @@ def create_weight_parameter(
     )
 
 
-class Int8Config(QuantizationConfig):
-    """
-    Config class for Int8.
+class DiffusionInt8Config(QuantizationConfig):
+    """INT8 quantization config for diffusion transformers.
+
+    Supports online (dynamic) quantization from BF16/FP16 checkpoints
+    and offline quantization from serialized INT8 checkpoints.
+    Works on both CUDA and NPU platforms.
     """
 
     def __init__(
@@ -114,7 +119,7 @@ class Int8Config(QuantizationConfig):
             self.ignored_layers = hf_to_vllm_mapper.apply_list(self.ignored_layers)
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "Int8Config":
+    def from_config(cls, config: dict[str, Any]) -> "DiffusionInt8Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_int8_serialized = "int8" in quant_method
         activation_scheme = cls.get_from_keys_or(config, ["activation_scheme"], "dynamic")
@@ -168,7 +173,7 @@ class BaseInt8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Int8Config):
+    def __init__(self, quant_config: DiffusionInt8Config):
         self.quant_config = quant_config
         self.out_dtype = torch.get_default_dtype()
 
@@ -315,7 +320,7 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Int8Config):
+    def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
 
         self.int8_linear = init_int8_linear_kernel(
@@ -346,7 +351,7 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Int8Config):
+    def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
 
     def process_weights_after_loading(self, layer: Module) -> None:
@@ -445,31 +450,3 @@ class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
 
         # Prevent duplicate processing (e.g., during weight reload)
         layer._already_called_process_weights_after_loading = True
-
-
-class DiffusionInt8Config(DiffusionQuantizationConfig):
-    """
-    Int8 quantization config optimized for diffusion transformers.
-
-    Args:
-        activation_scheme: Activation quantization scheme.
-            - "dynamic": Per-token dynamic scaling (default, no calibration)
-        ignored_layers: List of layer name patterns to skip quantization.
-    """
-
-    quant_config_cls = Int8Config
-
-    def __init__(
-        self,
-        activation_scheme: str = "dynamic",
-        ignored_layers: list[str] | None = None,
-    ):
-        self.activation_scheme = activation_scheme
-        self.ignored_layers = ignored_layers or []
-
-        # Create underlying vLLM Int8 config
-        self._vllm_config = Int8Config(
-            is_checkpoint_int8_serialized=False,  # Online quantization
-            activation_scheme=activation_scheme,
-            ignored_layers=ignored_layers,
-        )
