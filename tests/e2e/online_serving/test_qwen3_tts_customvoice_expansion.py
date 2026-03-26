@@ -30,16 +30,16 @@ def get_stage_config(name: str = "qwen3_tts.yaml"):
 def get_prompt(prompt_type="english"):
     """Text prompt for text-to-audio tests (same as test_qwen3_omni - beijing test case)."""
     prompts = {
-        "english": "The weather is nice today, perfect for a walk in the park.",
-        "chinese": "北京，中国的首都，是一座融合了紫禁城、长城等历史遗迹与现代建筑的国际化大都市，充满了独特的文化与活力",
+        "english": "Paris is a city in France. It has a tall tower by the river. The streets are old and small. You can walk and see art and food. The sky is light and soft. It is a calm place to rest.",
+        "chinese": "北京，中国的首都，是一座融合了长城等历史地点与现代建筑的国际化大都市，充满了独特的文化与活力",
     }
     return prompts.get(prompt_type, prompts["english"])
 
 
 def get_max_batch_size(size_type="few"):
     """Batch size for concurrent requests (same as test_qwen3_omni)."""
-    batch_sizes = {"few": 5, "medium": 100, "large": 256}
-    return batch_sizes.get(size_type, 5)
+    batch_sizes = {"few": 3, "medium": 100, "large": 256}
+    return batch_sizes.get(size_type)
 
 
 tts_server_params = [
@@ -66,31 +66,6 @@ tts_server_params = [
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_language_001(omni_server, openai_client) -> None:
-    """
-    Test text input processing and audio output via OpenAI API.
-    Deploy Setting: default yaml
-    Input Modal: text
-    Output Modal: audio
-    Input Setting: stream=False, language=chinese
-    Datasets: few requests
-    """
-    request_config = {
-        "model": omni_server.model,
-        "input": get_prompt("chinese"),
-        "stream": False,
-        "response_format": "wav",
-        "task_type": "CustomVoice",
-        "voice": "vivian",
-    }
-
-    openai_client.send_audio_speech_request(request_config)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_001(omni_server, openai_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
@@ -106,7 +81,7 @@ def test_voice_001(omni_server, openai_client) -> None:
         "stream": True,
         "response_format": "wav",
         "task_type": "CustomVoice",
-        "voice": "eric",
+        "voice": "uncle_fu",
     }
 
     openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
@@ -132,6 +107,31 @@ def test_voice_002(omni_server, openai_client) -> None:
         "response_format": "wav",
         "task_type": "CustomVoice",
         "voice": "Serena",
+    }
+
+    openai_client.send_audio_speech_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_language_001(omni_server, openai_client) -> None:
+    """
+    Test text input processing and audio output via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text
+    Output Modal: audio
+    Input Setting: stream=False, language=chinese
+    Datasets: few requests
+    """
+    request_config = {
+        "model": omni_server.model,
+        "input": get_prompt("chinese"),
+        "stream": False,
+        "response_format": "wav",
+        "task_type": "CustomVoice",
+        "voice": "vivian",
     }
 
     openai_client.send_audio_speech_request(request_config)

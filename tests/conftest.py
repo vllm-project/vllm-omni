@@ -1589,7 +1589,7 @@ def assert_audio_speech_response(
             voice_gender_map = {
                 # adjust this mapping to your actual voice names
                 "serena": "female",
-                "eric": "male",
+                "uncle_fu": "male",
                 "clone": "female",
             }
             expected_gender = voice_gender_map.get(voice)
