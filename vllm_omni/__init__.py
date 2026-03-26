@@ -36,9 +36,11 @@ def __getattr__(name: str):
     # See: https://github.com/vllm-project/vllm-omni/issues/1793
     if name == "AsyncOmni":
         from .entrypoints.async_omni import AsyncOmni
+
         return AsyncOmni
     if name == "Omni":
         from .entrypoints.omni import Omni
+
         return Omni
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
