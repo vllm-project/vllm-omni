@@ -1,5 +1,6 @@
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
+import os
 from collections import Counter
 from dataclasses import dataclass
 
@@ -12,6 +13,7 @@ from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
     filter_dataclass_kwargs,
+    resolve_model_config_path,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -269,3 +271,36 @@ class TestFilterDataclassKwargs:
         assert "unknown_top" not in result
         assert result["cache_config"]["rel_l1_thresh"] == 0.3
         assert "extra_param" not in result["cache_config"]
+
+
+class TestResolveModelConfigPath:
+    """Test suite for resolve_model_config_path function with diffusers format models."""
+
+    def test_glm_image_diffusers_format_resolution(self, mocker: MockerFixture):
+        """Test GlmImagePipeline diffusers class resolves to glm_image config."""
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.file_or_path_exists",
+            return_value=True,
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils._try_get_class_name_from_diffusers_config",
+            return_value="GlmImagePipeline",
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
+            return_value="vllm_omni/model_executor/stage_configs",
+        )
+
+        original_exists = os.path.exists
+
+        def mock_exists(path):
+            if "glm_image.yaml" in str(path):
+                return True
+            return original_exists(path)
+
+        mocker.patch("os.path.exists", side_effect=mock_exists)
+
+        result = resolve_model_config_path("zai-org/GLM-Image")
+
+        assert result is not None
+        assert "glm_image.yaml" in result
