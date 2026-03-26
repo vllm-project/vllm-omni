@@ -451,9 +451,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         voice_description: str | None = None,
     ) -> dict:
         """Upload a new voice sample."""
-        # Normalize ref_text: treat whitespace-only as absent
+        # Normalize optional strings: treat whitespace-only as absent
         if ref_text is not None:
             ref_text = ref_text.strip() or None
+        if voice_description is not None:
+            voice_description = voice_description.strip() or None
         # Validate file size (max 10MB)
         MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
         audio_file.file.seek(0, 2)  # Seek to end
@@ -573,12 +575,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
 
         # Store ref_text for ICL (in-context learning) mode if provided.
-        if ref_text and ref_text.strip():
-            speaker_data["ref_text"] = ref_text.strip()
+        if ref_text:
+            speaker_data["ref_text"] = ref_text
 
         # Store voice description if provided.
-        if voice_description and voice_description.strip():
-            speaker_data["voice_description"] = voice_description.strip()
+        if voice_description:
+            speaker_data["voice_description"] = voice_description
 
         # Save metadata using metadata manager (concurrency safe)
         success = self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
@@ -1059,6 +1061,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 stored_ref_text = speaker_info.get("ref_text")
                 params["ref_audio"] = [audio_data]
                 params["task_type"] = ["Base"]
+                params["voice_created_at"] = [speaker_info.get("created_at", 0)]
                 if stored_ref_text:
                     params["ref_text"] = [stored_ref_text]
                     params["x_vector_only_mode"] = [False]
