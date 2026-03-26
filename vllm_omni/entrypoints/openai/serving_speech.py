@@ -580,13 +580,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         logger.info(f"Uploaded new voice '{name}' with consent ID '{consent}'")
 
         # Return voice information without exposing the server file path
-        return {
+        result = {
             "name": name,
             "consent": consent,
             "created_at": timestamp,
             "mime_type": mime_type,
             "file_size": file_size,
         }
+        if ref_text is not None:
+            result["ref_text"] = ref_text
+        return result
 
     async def upload_voice_embedding(self, embedding_json: str, consent: str, name: str) -> dict:
         """Upload a voice from a pre-computed speaker embedding.
