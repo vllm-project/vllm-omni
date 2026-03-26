@@ -99,7 +99,7 @@ class DiffusionEngine:
         exec_total_time = time.perf_counter() - exec_start_time
 
         if output.error:
-            raise Exception(f"{output.error}")
+            raise RuntimeError(f"{output.error}")
         logger.info("Generation completed successfully.")
 
         if output.output is None:
