@@ -37,17 +37,20 @@ class VoiceEmbeddingCache:
         self._misses = 0
 
     @staticmethod
-    def make_cache_key(voice_name: str, xvec_only: bool) -> str:
-        """Build a cache key from a voice name and extraction mode.
+    def make_cache_key(voice_name: str, xvec_only: bool, created_at: float = 0.0) -> str:
+        """Build a cache key from a voice name, upload timestamp, and extraction mode.
 
         Args:
             voice_name: The speaker/voice name (case-insensitive, lowered
                 by the caller).
             xvec_only: True for speaker-embedding-only mode, False for
                 ICL mode (speaker embedding + ref_code).
+            created_at: Upload timestamp from metadata. Prevents stale cache
+                hits after a voice is deleted and re-uploaded with the same
+                name but different audio.
         """
         mode = "xvec" if xvec_only else "icl"
-        return f"{voice_name}:{mode}"
+        return f"{voice_name}:{created_at}:{mode}"
 
     def get(self, key: str) -> dict[str, Any] | None:
         """Return cached artifacts or ``None`` on miss.  Promotes to MRU on hit."""
