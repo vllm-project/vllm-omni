@@ -18,6 +18,10 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
 
+_DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
+    "GlmImagePipeline": "glm_image",
+}
+
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
     """Inject connector configuration into stage engine arguments."""
@@ -218,13 +222,16 @@ def resolve_model_config_path(model: str) -> str:
             )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
-    model_type_str = f"{model_type}.yaml"
+    if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
+        normalized_model_type = _DIFFUSERS_CLASS_TO_CONFIG[model_type]
+    else:
+        normalized_model_type = model_type.replace("-", "_")
+    model_type_str = f"{normalized_model_type}.yaml"
     complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
-    # Fall back to default config
-    stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
+    stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):
         return None
