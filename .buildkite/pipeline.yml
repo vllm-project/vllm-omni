@@ -13,7 +13,7 @@ steps:
   - label: "Upload Ready Pipeline"
     depends_on: image-build
     key: upload-ready-pipeline
-    if: build.branch != "main"
+    if: build.branch != "main" && build.pull_request.labels includes "ready"
     commands:
       - buildkite-agent pipeline upload .buildkite/test-ready.yml
     agents:
@@ -29,11 +29,11 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  # L4 Test
+  # L4 Test — main+NIGHTLY=1 (scheduled), or PR with label nightly-test (e.g. add label then Rebuild)
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
-    if: build.branch == "main" && build.env("NIGHTLY") == "1"
+    if: '(build.branch == "main" && build.env("NIGHTLY") == "1") || (build.branch != "main" && build.pull_request.labels includes "nightly-test")'
     commands:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:
