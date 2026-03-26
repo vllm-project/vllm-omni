@@ -31,7 +31,7 @@ def _register_omni_hf_configs() -> None:
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
-        ("mistral", VoxtralTTSConfig),
+        ("voxtral_tts", VoxtralTTSConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
