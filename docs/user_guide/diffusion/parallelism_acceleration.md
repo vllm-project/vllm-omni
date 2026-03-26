@@ -135,7 +135,7 @@ VAE patch parallelism automatically selects between two internal decode methods 
 #### Ulysses-SP
 
 !!! note "Experimental UAA mode"
-    `ulysses_mode="advanced_uaa"` is an experimental extension to Ulysses-SP. It allows Ulysses attention to handle non-divisible attention head counts and uneven per-rank sequence shards without relying on `attention_mask`-based token padding.
+    `ulysses_mode="advanced_uaa"` is an experimental extension to Ulysses-SP. It lets Ulysses attention handle arbitrary sequence lengths and arbitrary attention head counts without relying on `attention_mask`-based token padding.
 
     In hybrid Ulysses + Ring mode, Ring still requires every rank in the same ring group to observe the same post-Ulysses sequence length. If that condition is not met, vLLM-Omni raises a validation error instead of entering the ring kernel with inconsistent shapes.
 
@@ -161,7 +161,7 @@ outputs = omni.generate(
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
 
-To enable the experimental UAA mode explicitly:
+To enable the experimental UAA mode explicitly, use a model/configuration that actually requires it. For example, `Tongyi-MAI/Z-Image-Turbo` has 30 attention heads, so `ulysses_degree=4` requires UAA because 30 is not divisible by 4:
 
 ```python
 omni = Omni(
@@ -181,7 +181,7 @@ You can enable Ulysses-SP in online serving for diffusion models via `--usp`:
 # Text-to-image (requires >= 2 GPUs)
 vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
 
-# Experimental UAA mode
+# Experimental UAA mode for a model with 30 attention heads
 vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 --usp 4 --ulysses-mode advanced_uaa
 ```
 
@@ -279,7 +279,6 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(
         ulysses_degree=2,
         ring_degree=2,
-        ulysses_mode="advanced_uaa",
     )
 )
 
@@ -293,7 +292,7 @@ outputs = omni.generate(
 
 ```bash
 # Text-to-image (requires >= 4 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2 --ulysses-mode advanced_uaa
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
 ```
 
 ##### Benchmarks

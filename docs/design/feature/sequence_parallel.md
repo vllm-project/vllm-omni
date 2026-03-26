@@ -49,7 +49,7 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 
 ## UAA Mode (Experimental)
 
-`ulysses_mode="advanced_uaa"` enables the experimental UAA ("Ulysses Anything Attention") path that was introduced to address the uneven-shape cases discussed in [issue #1324](https://github.com/vllm-project/vllm-omni/issues/1324).
+`ulysses_mode="advanced_uaa"` enables the experimental UAA ("Ulysses Anything Attention") feature, which lets Ulysses attention handle arbitrary sequence lengths and arbitrary attention head counts. The same idea is also supported by [Cache-DiT](https://cache-dit.readthedocs.io/en/latest/user_guide/CONTEXT_PARALLEL/#uaa-ulysses-anything-attention).
 
 Use it when plain Ulysses-SP would otherwise fail because:
 

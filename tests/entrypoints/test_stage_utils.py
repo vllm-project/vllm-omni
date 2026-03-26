@@ -76,6 +76,26 @@ def test_set_stage_devices_respects_logical_ids(mocker: MockerFixture, monkeypat
 
 
 @pytest.mark.usefixtures("clean_gpu_memory_between_tests")
+def test_set_stage_devices_handles_not_enough_devices(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    # Preserve an existing logical mapping and ensure devices "0,1" map through it.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
+    call_log: list[int] = []
+    dummy_torch = _make_dummy_torch(call_log)
+    monkeypatch.setitem(sys.modules, "torch", dummy_torch)
+
+    # Mock the platform at the source module where it's defined
+    mock_platform = _make_mock_platform(mocker, device_type="cuda", env_var="CUDA_VISIBLE_DEVICES")
+    monkeypatch.setattr(
+        "vllm_omni.platforms.current_omni_platform",
+        mock_platform,
+    )
+
+    # Raise since we need 4 GPUs, but we only have 2 visible
+    with pytest.raises(ValueError):
+        set_stage_devices(stage_id=0, devices="0,1,2,3")
+
+
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Test that set_stage_devices works correctly for NPU platform."""
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "4,5")
