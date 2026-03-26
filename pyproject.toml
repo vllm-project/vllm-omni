@@ -41,6 +41,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
+    "datasets>=2.14.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
     "openai-whisper>=20250625",
@@ -211,3 +212,5 @@ extend-ignore-identifiers-re = [
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
+semantics = "semantics"
+fullset = "fullset"

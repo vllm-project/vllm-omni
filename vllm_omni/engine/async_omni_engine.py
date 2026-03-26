@@ -994,6 +994,8 @@ class AsyncOmniEngine:
         try:
             return self.output_queue.sync_q.get(timeout=timeout)
         except queue.Empty:
+            if not self.is_alive():
+                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
     async def try_get_output_async(self) -> dict[str, Any] | None:
@@ -1003,6 +1005,8 @@ class AsyncOmniEngine:
         try:
             return self.output_queue.sync_q.get_nowait()
         except queue.Empty:
+            if not self.is_alive():
+                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
     def get_stage_metadata(self, stage_id: int) -> dict[str, Any]:
