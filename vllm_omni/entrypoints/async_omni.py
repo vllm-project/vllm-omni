@@ -78,7 +78,6 @@ class AsyncOmni(EngineClient, OmniBase):
         self.final_output_task: asyncio.Task | None = None
 
         self.config_path = self.engine.config_path
-        self.stage_configs = self.engine.stage_configs
         self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         self.input_processor = self.engine.input_processor
 
@@ -209,6 +208,11 @@ class AsyncOmni(EngineClient, OmniBase):
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
 
+            # Expand sampling params for PD disaggregation (user may provide N-1 params)
+            if sampling_params_list is not None and isinstance(sampling_params_list, Sequence) and not isinstance(
+                sampling_params_list, (str, bytes)
+            ):
+                sampling_params_list = self._maybe_expand_sampling_params(list(sampling_params_list))
             sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
 
             # Track per-request metrics
@@ -227,6 +231,14 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
+            
+            # PD disaggregation: modify prefill-stage sampling params per request
+            req_sp_list = list(sampling_params_list)
+            if self._pd_separation_pair is not None:
+                p_id = self._pd_separation_pair[0]
+                req_sp_list[p_id] = self._prepare_prefill_sampling_params(
+                    request_id, req_sp_list[p_id]
+                )
 
             # Add request(s) to stage 0. For streaming inputs, submit
             # chunks incrementally through streaming_update.
@@ -234,14 +246,14 @@ class AsyncOmni(EngineClient, OmniBase):
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
                     input_stream=prompt,
-                    sampling_params_list=sampling_params_list,
+                    sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
                 )
             else:
                 await self.engine.add_request_async(
                     request_id=request_id,
                     prompt=prompt,
-                    sampling_params_list=sampling_params_list,
+                    sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
                 )
             submit_ts = time.time()

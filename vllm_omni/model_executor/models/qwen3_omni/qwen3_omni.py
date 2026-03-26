@@ -661,13 +661,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         else:
             # decode
             if not info_dict.get("decode_flag", False):
-                # Prefill already consumed the first text token via the
-                # assistant bootstrap path, so decode starts from the
-                # remaining-text boundary rather than cumulative index 0.
-                prefill_consumed_text_tokens = info_dict.get("prefill_consumed_text_tokens")
-                if prefill_consumed_text_tokens is None:
-                    raise RuntimeError("Missing prefill_consumed_text_tokens for talker decode handoff.")
-                info_dict["num_processed_tokens"] = prefill_consumed_text_tokens
+                info_dict["num_processed_tokens"] = 0
                 update_dict["decode_flag"] = True
 
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
@@ -843,7 +837,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 update_dict["tts_pad_embed_projected"] = pad_proj.detach()
         except Exception:
             pass
-        update_dict["prefill_consumed_text_tokens"] = 1
         self._talker_cache_thinker_decode_embeds(info_dict, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
@@ -891,10 +884,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
+        # PD safety: zero-pad embeddings if they are shorter than the full sequence
+        target_len = thinker_result_ids.shape[-1]
+        if thinker_embed.shape[0] < target_len:
+            pad_len = target_len - thinker_embed.shape[0]
+            pad = torch.zeros(pad_len, thinker_embed.shape[1],
+                              device=thinker_embed.device, dtype=thinker_embed.dtype)
+            thinker_embed = torch.cat((thinker_embed, pad), dim=0)
+        if thinker_hidden.shape[0] < target_len:
+            pad_len = target_len - thinker_hidden.shape[0]
+            pad = torch.zeros(pad_len, thinker_hidden.shape[1],
+                              device=thinker_hidden.device, dtype=thinker_hidden.dtype)
+            thinker_hidden = torch.cat((thinker_hidden, pad), dim=0)
         im_start_indexes = torch.cat(
             (
                 torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
-                torch.tensor([thinker_result_ids.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
+                torch.tensor([target_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,
         )  # Shape [n_starts + 1]; Take batch 0 since batched inference is not supported here.
@@ -975,7 +980,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 return self.tts_pad_embed.to(device)
             update_dict["finished_flag"] = True
             return self.tts_eos_embed.to(device)
-
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
             thinker_embed = cached_thinker_decode_embeds[start_index]
@@ -984,10 +988,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
                 update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
         else:
-            thinker_embed = thinker_decode_embed
-            if thinker_embed.device != device:
-                thinker_embed = thinker_embed.to(device)
-
+            thinker_embed = thinker_decode_embed.to(device)
         update_dict["thinker_decode_embeddings"] = None
         return self.talker.text_projection(thinker_embed).to(device)
 
@@ -1029,8 +1030,23 @@ class Qwen3OmniMoeForConditionalGeneration(
         return last_talker_hidden, text_step, update_dict
 
     def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
+        # PD safety: clamp segment_end_index so we never index beyond any tensor's length
+        segment_end_index = min(
+            segment_end_index,
+            multimodal_mask.shape[0],
+            thinker_hidden.shape[0],
+            thinker_embed.shape[0],
+        )
+        seg_len = segment_end_index - im_start_index
+        if seg_len <= 0:
+            return torch.empty(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=thinker_hidden.device,
+                dtype=torch.bfloat16,
+            )
+
         user_talker_part = torch.empty(
-            (segment_end_index - im_start_index, self.config.talker_config.text_config.hidden_size),
+            (seg_len, self.config.talker_config.text_config.hidden_size),
             device=thinker_hidden.device,
             dtype=torch.bfloat16,
         )

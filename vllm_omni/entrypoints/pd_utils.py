@@ -44,7 +44,7 @@ class PDDisaggregationMixin:
         """Scan stage_list for a prefill/decode pair. Returns (p_id, d_id) or None."""
         prefill_by_id: dict[int, int] = {}
         decode_indices: list[int] = []
-        for i, stage in enumerate(self.stage_list):
+        for i, stage in enumerate(self.stage_configs):
             if getattr(stage, "is_prefill_only", False):
                 prefill_by_id[i] = i
                 sid = getattr(stage, "stage_id", i)
@@ -55,7 +55,7 @@ class PDDisaggregationMixin:
 
         pd_pairs: list[tuple[int, int]] = []
         for j in decode_indices:
-            source_ids = getattr(self.stage_list[j], "engine_input_source", [])
+            source_ids = getattr(self.stage_configs[j], "engine_input_source", [])
             for src in source_ids:
                 if src in prefill_by_id:
                     pd_pairs.append((prefill_by_id[src], j))
@@ -109,8 +109,8 @@ class PDDisaggregationMixin:
         """Validate PD stage configurations are consistent."""
         assert self._pd_separation_pair is not None
         p_id, d_id = self._pd_separation_pair
-        p_stage = self.stage_list[p_id]
-        d_stage = self.stage_list[d_id]
+        p_stage = self.stage_configs[p_id]
+        d_stage = self.stage_configs[d_id]
 
         def _get_kv_cfg(stage: "OmniStage") -> dict[str, Any]:
             ea = stage.engine_args
@@ -162,7 +162,7 @@ class PDDisaggregationMixin:
             return None
 
         p_id, _ = self._pd_separation_pair
-        p_stage = self.stage_list[p_id]
+        p_stage = self.stage_configs[p_id]
 
         ea = p_stage.engine_args
         kv_cfg = getattr(ea, "kv_transfer_config", None)
@@ -250,7 +250,7 @@ class PDDisaggregationMixin:
         """Auto-duplicate thinker SP for decode stage when user provides N-1 params."""
         if self._pd_separation_pair is None:
             return sampling_params_list
-        if len(sampling_params_list) != len(self.stage_list) - 1:
+        if len(sampling_params_list) != len(self.stage_configs) - 1:
             return sampling_params_list
         p_id, d_id = self._pd_separation_pair
         sp_list = list(sampling_params_list)
