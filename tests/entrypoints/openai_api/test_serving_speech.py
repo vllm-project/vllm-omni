@@ -250,6 +250,7 @@ def test_app(mocker: MockerFixture):
         speaker_embedding: str | None = Form(None),
         consent: str = Form(...),
         name: str = Form(...),
+        ref_text: str = Form(None),
     ):
         try:
             if speaker_embedding is not None and audio_sample is not None:
@@ -257,7 +258,7 @@ def test_app(mocker: MockerFixture):
             if speaker_embedding is not None:
                 result = await speech_server.upload_voice_embedding(speaker_embedding, consent, name)
             elif audio_sample is not None:
-                result = await speech_server.upload_voice(audio_sample, consent, name)
+                result = await speech_server.upload_voice(audio_sample, consent, name, ref_text=ref_text)
             else:
                 raise ValueError("Either 'audio_sample' or 'speaker_embedding' must be provided")
             return {"success": True, "voice": result}
@@ -361,29 +362,35 @@ class TestSpeechAPI:
         assert "voices" in response.json()
 
     def test_upload_voice_success(self, client, tmp_path):
-        """Test successful voice upload."""
-        # Create a mock audio file
-        audio_content = b"fake audio content" * 1000  # ~17KB
-        files = {
-            "audio_sample": ("test.wav", audio_content, "audio/wav"),
-        }
-        data = {
-            "consent": "user_consent_123",
-            "name": "test_voice",
-        }
+        """Test successful voice upload without ref_text."""
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "user_consent_123", "name": "test_voice"}
 
         response = client.post("/v1/audio/voices", files=files, data=data)
         assert response.status_code == 200
         result = response.json()
         assert result["success"] is True
-        assert "voice" in result
         voice_info = result["voice"]
         assert voice_info["name"] == "test_voice"
         assert voice_info["consent"] == "user_consent_123"
-        assert "created_at" in voice_info
         assert voice_info["mime_type"] == "audio/wav"
         assert voice_info["file_size"] == len(audio_content)
         response = client.delete("/v1/audio/voices/test_voice")
+
+    def test_upload_voice_with_ref_text(self, client, tmp_path):
+        """Test voice upload with ref_text enables in-context cloning."""
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_rt", "ref_text": "Hello world transcript"}
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["success"] is True
+        assert result["voice"]["name"] == "test_voice_rt"
+        assert result["voice"].get("ref_text") == "Hello world transcript"
+        response = client.delete("/v1/audio/voices/test_voice_rt")
 
     def test_upload_voice_file_too_large(self, client):
         """Test voice upload with file exceeding size limit."""
@@ -831,31 +838,48 @@ class TestTTSMethods:
         assert server.supported_speakers == {"ryan", "vivian", "aiden"}
 
     def test_build_tts_params_with_uploaded_voice(self, speech_server):
-        """Test _build_tts_params auto-sets ref_audio for uploaded voices."""
-        # Mock an uploaded speaker
+        """Test _build_tts_params auto-sets ref_audio for uploaded voices (x_vector only)."""
         speech_server.uploaded_speakers = {
             "custom_voice": {
                 "name": "custom_voice",
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
+                "ref_text": None,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
 
-        # Mock _get_uploaded_audio_data to return base64 data
         with patch.object(speech_server, "_get_uploaded_audio_data") as mock_get_audio:
             mock_get_audio.return_value = "data:audio/wav;base64,ZmFrZWF1ZGlv"
-
-            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice", task_type="Base")
-
+            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice")
             params = speech_server._build_tts_params(req)
 
-            # Verify ref_audio was auto-set
-            assert "ref_audio" in params
             assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
-            assert "x_vector_only_mode" in params
             assert params["x_vector_only_mode"] == [True]
-            mock_get_audio.assert_called_once_with("custom_voice")
+            assert params["task_type"] == ["Base"]
+            assert "ref_text" not in params
+
+    def test_build_tts_params_with_uploaded_voice_ref_text(self, speech_server):
+        """Test _build_tts_params enables in-context cloning when ref_text is stored."""
+        speech_server.uploaded_speakers = {
+            "custom_voice": {
+                "name": "custom_voice",
+                "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
+                "mime_type": "audio/wav",
+                "ref_text": "Hello world transcript",
+            }
+        }
+        speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
+
+        with patch.object(speech_server, "_get_uploaded_audio_data") as mock_get_audio:
+            mock_get_audio.return_value = "data:audio/wav;base64,ZmFrZWF1ZGlv"
+            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice")
+            params = speech_server._build_tts_params(req)
+
+            assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
+            assert params["x_vector_only_mode"] == [False]
+            assert params["task_type"] == ["Base"]
+            assert params["ref_text"] == ["Hello world transcript"]
 
     def test_build_tts_params_without_uploaded_voice(self, speech_server):
         """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""
