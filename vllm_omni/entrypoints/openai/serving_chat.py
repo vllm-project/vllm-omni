@@ -256,7 +256,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
             else:
                 should_include_tools = tool_dicts is not None
-                conversation, engine_prompts = self._make_request_with_harmony(request, should_include_tools)
+                conversation, engine_prompts = self.openai_serving_render._make_request_with_harmony(
+                    request, should_include_tools
+                )
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -297,7 +299,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
-                extra_body = getattr(request, "extra_body", None) or {}
+                # [NOTE] When sending request via openai client Python library,
+                #   `extra_body` is flattented and merged into the payload's root.
+                #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
+                #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
+                extra_body = getattr(request, "extra_body", None)
+                if not extra_body:
+                    extra_body = request.model_extra or {}
                 height = extra_body.get("height")
                 width = extra_body.get("width")
                 if "size" in extra_body:
@@ -524,6 +532,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
+
+        speaker = getattr(request, "speaker", None)
+        if speaker is not None and isinstance(speaker, str) and speaker.strip():
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["speaker"] = [speaker.lower().strip()]
+
+        language = getattr(request, "language", None)
+        if language is not None and isinstance(language, str) and language.strip():
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["language"] = [language.strip()]
 
         return conversation, [engine_prompt]
 
@@ -1908,6 +1928,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Handle profiling data
         stage_durations = omni_outputs.stage_durations
+        peak_memory_mb = omni_outputs.peak_memory_mb
 
         # Handle different image output formats
         images = []
@@ -1963,6 +1984,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         "url": f"data:image/png;base64,{img_base64}",
                     },
                     "stage_durations": stage_durations,
+                    "peak_memory_mb": peak_memory_mb,
                 }
             )
 
@@ -1999,7 +2021,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return choices
 
     # ==================== Diffusion Mode Methods ====================
-
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -2031,12 +2052,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Extract prompt and images from messages
             prompt, reference_images = self._extract_diffusion_prompt_and_images(messages)
 
-            if not prompt:
-                return self._create_error_response("No text prompt found in messages")
-
             # Extract generation parameters from extra_body (preferred)
             # Reference: text_to_image.py and text_to_video.py for supported parameters
-            extra_body = getattr(request, "extra_body", None) or {}
+            # [NOTE] When sending request via openai client Python library,
+            #   `extra_body` is flattented and merged into the payload's root.
+            #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
+            #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
+            extra_body = getattr(request, "extra_body", None)
+            if not extra_body:
+                extra_body = request.model_extra or {}
 
             # Parse size if provided (supports "1024x1024" format)
             height = extra_body.get("height")
@@ -2173,6 +2197,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])
             stage_durations = result.stage_durations
+            peak_memory_mb = result.peak_memory_mb
 
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
@@ -2194,6 +2219,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             "url": f"data:image/png;base64,{img_base64}",
                         },
                         "stage_durations": stage_durations,
+                        "peak_memory_mb": peak_memory_mb,
                     }
                 )
 

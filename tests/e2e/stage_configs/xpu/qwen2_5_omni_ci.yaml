@@ -7,8 +7,8 @@ stage_args:
     runtime:
       process: true # Run this stage in a separate process
       devices: "0" # Visible devices for this stage
-      max_batch_size: 1
     engine_args:
+      max_num_seqs: 1
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
@@ -39,8 +39,8 @@ stage_args:
     runtime:
       process: true
       devices: "1"
-      max_batch_size: 1
     engine_args:
+      max_num_seqs: 1
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
@@ -71,8 +71,8 @@ stage_args:
     runtime:
       process: true
       devices: "2"
-      max_batch_size: 1
     engine_args:
+      max_num_seqs: 1
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: generation

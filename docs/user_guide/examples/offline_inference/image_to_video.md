@@ -68,6 +68,7 @@ Key arguments:
 - `--vae-use-slicing`: Enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: Enable VAE tiling for memory optimization.
 - `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--tensor-parallel-size`: tensor parallel size (effective for models that support TP, e.g. LTX2).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--use-hsdp`: Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.
 - `--hsdp-shard-size`: Number of GPUs to shard model weights across within each replica group. -1 (default) auto-calculates as world_size / replicate_size.

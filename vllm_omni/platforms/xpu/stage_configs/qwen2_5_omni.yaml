@@ -7,9 +7,9 @@ stage_args:
     runtime:
       process: true # Run this stage in a separate process
       devices: "0" # Visible devices for this stage
-      max_batch_size: 1
     engine_args:
       model_stage: thinker
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -34,9 +34,9 @@ stage_args:
     runtime:
       process: true
       devices: "1"
-      max_batch_size: 1
     engine_args:
       model_stage: talker
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -62,9 +62,9 @@ stage_args:
     runtime:
       process: true
       devices: "1"
-      max_batch_size: 1
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler

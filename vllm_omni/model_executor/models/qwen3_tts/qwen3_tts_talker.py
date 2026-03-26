@@ -700,7 +700,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         info: dict[str, Any] = additional_information or {}
         text = _first(info.get("text"), "")
         language = _first(info.get("language"), "Auto")
-        speaker = _first(info.get("speaker"), "")
+        speaker = _first(info.get("speaker"), "").lower().strip()
         instruct = _first(info.get("instruct"), "")
         non_streaming_mode_raw = _first(info.get("non_streaming_mode"), None)
 
@@ -1357,11 +1357,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_code_prompt = ref_code_t
 
             # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
+            # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
+            # float list (from API via msgspec IPC) that _as_singleton would
+            # destructively unwrap to a single scalar.
             spk = None
             if voice_clone_prompt is not None:
-                spk = _as_singleton(voice_clone_prompt.get("ref_spk_embedding"))
+                spk = voice_clone_prompt.get("ref_spk_embedding")
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+            elif isinstance(spk, (list, np.ndarray)):
+                # Plain list/array from API (survived msgspec IPC serialization).
+                speaker_embed = torch.tensor(spk, dtype=torch.bfloat16, device=input_ids.device).view(1, 1, -1)
             else:
                 ref_audio_list = info_dict.get("ref_audio")
                 if not isinstance(ref_audio_list, list) or not ref_audio_list:
@@ -1438,11 +1444,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     )
 
         elif task_type == "CustomVoice":
-            speaker = (info_dict.get("speaker") or [""])[0]
-            if not isinstance(speaker, str) or not speaker.strip():
+            _speaker_raw = info_dict.get("speaker") or [""]
+            speaker = (
+                ((_speaker_raw[0] if isinstance(_speaker_raw, (list, tuple)) else _speaker_raw) or "").lower().strip()
+            )
+            if not speaker:
                 raise ValueError("CustomVoice requires additional_information.speaker.")
             spk_id_map = getattr(self.talker_config, "spk_id", None) or {}
-            if speaker.lower() not in spk_id_map:
+            if speaker not in spk_id_map:
                 raise ValueError(f"Unsupported speaker: {speaker}")
             spk_id = spk_id_map[speaker.lower()]
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.

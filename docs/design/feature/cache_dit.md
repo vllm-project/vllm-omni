@@ -113,13 +113,13 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
 
 Some models require custom handling:
 
-- **Dual-transformer:** Models with separate high-noise and low-noise transformers (e.g., Wan2.2)
+- **Single or dual-transformer:** Models that may use one or two transformers (e.g., Wan2.2)
 - **Multi-block-list:** Models with multiple block lists in one transformer (e.g., LongCatImage with `transformer_blocks` + `single_transformer_blocks`)
 - **Special forward patterns:** Models with non-standard block execution patterns
 
-### Example 1: Dual-Transformer Model (Wan2.2)
+### Example 1: Single or Dual-Transformer Model (Wan2.2)
 
-Wan2.2 uses two transformers: one for high-noise steps and one for low-noise steps.
+Wan2.2 can use either a single transformer or two transformers (one for high-noise steps and one for low-noise steps). The implementation automatically detects the mode based on the presence of `transformer_2`.
 
 **Key difference:** Use `BlockAdapter` to wrap multiple transformers with separate configurations.
 
@@ -267,7 +267,7 @@ Complete examples in the codebase:
 | Model | Path | Pattern | Notes |
 |-------|------|---------|-------|
 | **Standard DiT** | [`cache_dit_backend.py::enable_cache_for_dit`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_dit) | Default enabler | Single transformer, automatic |
-| **Wan2.2** | [`cache_dit_backend.py::enable_cache_for_wan22`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_wan22) | Dual-transformer | Separate high/low noise transformers |
+| **Wan2.2** | [`cache_dit_backend.py::enable_cache_for_wan22`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_wan22) | Single or dual-transformer | Auto-detects mode based on transformer_2 presence |
 | **LongCat** | [`cache_dit_backend.py::enable_cache_for_longcat_image`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_longcat_image) | Multi-block-list | Two block lists in one transformer |
 | **BAGEL** | [`cache_dit_backend.py::enable_cache_for_bagel`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/cache_dit_backend/#vllm_omni.diffusion.cache.cache_dit_backend.enable_cache_for_bagel) | Omni model | Complex architecture |
 

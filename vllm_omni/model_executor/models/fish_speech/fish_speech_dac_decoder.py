@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.parametrize import remove_parametrizations
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -58,6 +59,56 @@ class FishSpeechDACDecoder(nn.Module):
         self._hop_length: int = DAC_HOP_LENGTH
         self._logged_codec_stats = False
 
+    def _bake_weight_norm(self, codec: nn.Module) -> None:
+        baked = 0
+        for module in codec.modules():
+            parametrizations = getattr(module, "parametrizations", None)
+            if not parametrizations:
+                continue
+            for name in list(parametrizations.keys()):
+                remove_parametrizations(module, name, leave_parametrized=True)
+                baked += 1
+        if baked > 0:
+            logger.info("Baked %d DAC parametrized weights for inference", baked)
+
+    def _cache_attention_masks(self, codec: nn.Module) -> None:
+        for module in codec.modules():
+            if not hasattr(module, "make_mask") or not hasattr(module, "make_window_limited_mask"):
+                continue
+
+            base_make_mask = module.make_mask
+            base_make_window_mask = module.make_window_limited_mask
+            mask_cache: dict[int, torch.Tensor] = {}
+            window_mask_cache: dict[int, torch.Tensor] = {}
+
+            def make_mask_cached(max_length: int, x_lens: torch.Tensor | None = None, *, _orig=base_make_mask):
+                if x_lens is not None:
+                    return _orig(max_length, x_lens)
+                key = int(max_length)
+                cached = mask_cache.get(key)
+                if cached is None:
+                    cached = _orig(max_length, x_lens)
+                    mask_cache[key] = cached
+                return cached
+
+            def make_window_mask_cached(
+                max_length: int,
+                x_lens: torch.Tensor | None = None,
+                *,
+                _orig=base_make_window_mask,
+            ):
+                if x_lens is not None:
+                    return _orig(max_length, x_lens)
+                key = int(max_length)
+                cached = window_mask_cache.get(key)
+                if cached is None:
+                    cached = _orig(max_length, x_lens)
+                    window_mask_cache[key] = cached
+                return cached
+
+            module.make_mask = make_mask_cached
+            module.make_window_limited_mask = make_window_mask_cached
+
     def _ensure_codec_loaded(self) -> None:
         if self._codec is not None:
             return
@@ -87,6 +138,8 @@ class FishSpeechDACDecoder(nn.Module):
         if "generator" in state_dict:
             state_dict = state_dict["generator"]
         codec.load_state_dict(state_dict, strict=False)
+        self._bake_weight_norm(codec)
+        self._cache_attention_masks(codec)
 
         device = self.vllm_config.device_config.device
         codec = codec.to(device=device, dtype=torch.float32)
@@ -160,7 +213,7 @@ class FishSpeechDACDecoder(nn.Module):
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
-        parsed: list[tuple[int, int]] = []
+        parsed_ctx_frames: list[int] = []
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
@@ -173,7 +226,7 @@ class FishSpeechDACDecoder(nn.Module):
 
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
-                parsed.append((0, 0))
+                parsed_ctx_frames.append(0)
                 continue
             ctx_frames = left_context_size[i]
             flat = req_ids
@@ -185,11 +238,11 @@ class FishSpeechDACDecoder(nn.Module):
                         n,
                         q,
                     )
-                parsed.append((0, 0))
+                parsed_ctx_frames.append(0)
                 continue
             frames = n // q
             codes_qf = flat.reshape(q, frames)
-            parsed.append((ctx_frames, frames))
+            parsed_ctx_frames.append(ctx_frames)
             valid_codes_qf.append(codes_qf)
             valid_indices.append(i)
 
@@ -219,23 +272,33 @@ class FishSpeechDACDecoder(nn.Module):
             except Exception:
                 pass
 
-        # Decode each request individually.
-        wav_tensors: list[torch.Tensor] = []
-        for codes_qf in valid_codes_qf:
-            codes_bqf = codes_qf.unsqueeze(0)  # [1, num_codebooks, num_frames]
-            num_frames = codes_qf.shape[1]
-            feature_lengths = torch.tensor([num_frames], device=codes_bqf.device)
-            with torch.cuda.amp.autocast(enabled=False):
-                wav, audio_lengths = self._codec.decode(codes_bqf, feature_lengths)
-            # wav shape: [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        feature_lengths = torch.tensor(
+            [codes_qf.shape[1] for codes_qf in valid_codes_qf],
+            device=valid_codes_qf[0].device,
+            dtype=torch.long,
+        )
+        max_frames = int(feature_lengths.max().item())
+        batch_size = len(valid_codes_qf)
+
+        codes_bqf = torch.zeros(
+            (batch_size, q, max_frames),
+            device=valid_codes_qf[0].device,
+            dtype=torch.long,
+        )
+        for i, codes_qf in enumerate(valid_codes_qf):
+            frame_count = int(feature_lengths[i].item())
+            codes_bqf[i, :, :frame_count] = codes_qf
+
+        with torch.amp.autocast("cuda", enabled=False):
+            wav_batch, audio_lengths = self._codec.decode(codes_bqf, feature_lengths)
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
         for j, idx in enumerate(valid_indices):
-            ctx_frames, actual_frames = parsed[idx]
-            wav = wav_tensors[j]
+            ctx_frames = parsed_ctx_frames[idx]
+            audio_len = int(audio_lengths[j].item()) if audio_lengths.numel() > j else int(wav_batch.shape[-1])
+            wav = wav_batch[j, 0, :audio_len]
             # Trim context frames (left overlap for streaming).
             if ctx_frames > 0:
                 cut = ctx_frames * self._hop_length
