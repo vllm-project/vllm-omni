@@ -4,7 +4,7 @@
 
 These tests require:
   - A CUDA GPU
-  - The quantized model checkpoint (Yi30/FLUX.1-dev-AutoRound-w4a16)
+  - The quantized model checkpoint (vllm-project-org/FLUX.1-dev-AutoRound-w4a16)
 """
 
 import gc
@@ -27,8 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from vllm_omni import Omni
 
-# FIXME: update the model name
-QUANTIZED_MODEL = "Yi30/FLUX.1-dev-AutoRound-w4a16"
+QUANTIZED_MODEL = "vllm-project-org/FLUX.1-dev-AutoRound-w4a16"
 BASELINE_MODEL = "black-forest-labs/FLUX.1-dev"
 
 # Allow overriding via environment for local testing

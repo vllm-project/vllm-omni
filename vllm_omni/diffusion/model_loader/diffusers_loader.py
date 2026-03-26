@@ -352,11 +352,8 @@ class DiffusersPipelineLoader:
         # Weight suffixes that quantization methods register in the model but
         # are not present in unquantized checkpoints.
         _QUANTIZED_WEIGHT_SUFFIXES = (
-            # GPTQ / AWQ / AutoRound
-            ".qweight",
+            # GPTQ / AWQ / AutoRound – g_idx is optional (not all checkpoints include it)
             ".g_idx",
-            ".scales",
-            ".qzeros",
             # FP8
             ".weight_scale",
             ".weight_scale_inv",

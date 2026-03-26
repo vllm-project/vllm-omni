@@ -19,12 +19,11 @@ W4A16 is the first supported scheme. Additional schemes will be added in future 
 
 1. **Python API**: point `model` at a pre-quantized checkpoint. The quantization is detected automatically.
 
-<!-- FIXME: update the model name -->
 ```python
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-omni = Omni(model="Yi30/FLUX.1-dev-AutoRound-w4a16")
+omni = Omni(model="vllm-project-org/FLUX.1-dev-AutoRound-w4a16")
 
 outputs = omni.generate(
     "A cat sitting on a windowsill",
@@ -37,7 +36,7 @@ outputs[0].save_images("output.png")
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
-  --model Yi30/FLUX.1-dev-AutoRound-w4a16 \
+  --model vllm-project-org/FLUX.1-dev-AutoRound-w4a16 \
   --prompt "A cat sitting on a windowsill" \
   --num-inference-steps 28 \
   --output outputs/flux_w4a16.png
@@ -72,7 +71,7 @@ At load time:
 
 | Model | HF Checkpoint | Scheme | Group Size | Backend |
 |-------|--------------|--------|------------|---------|
-| FLUX.1-dev | `Yi30/FLUX.1-dev-AutoRound-w4a16` | W4A16 | 128 | GPTQ-Marlin |
+| FLUX.1-dev | `vllm-project-org/FLUX.1-dev-AutoRound-w4a16` | W4A16 | 128 | GPTQ-Marlin |
 
 ## Creating a Quantized Checkpoint
 

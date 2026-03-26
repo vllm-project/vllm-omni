@@ -652,11 +652,11 @@ class OmniDiffusionConfig:
                 `TransformerConfig.from_dict`.
         """
         self.tf_model_config = tf_config
-        if self.quantization_config is None and getattr(tf_config, "quant_config", None) is not None:
+        if self.quantization_config is None and tf_config.quant_config is not None:
             self.quantization_config = tf_config.quant_config
             logger.info(
                 "Auto-detected quantization '%s' from model config",
-                getattr(tf_config, "quant_method", None),
+                tf_config.quant_method,
             )
 
     def update_multimodal_support(self) -> None:
