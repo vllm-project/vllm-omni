@@ -6,6 +6,7 @@ from multiprocessing import shared_memory as _shm
 from typing import Any
 
 from vllm_omni.config.yaml_util import to_dict as _omega_to_dict
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -13,108 +14,95 @@ logger = logging.getLogger(__name__)
 def set_stage_devices(
     stage_id: int,
     devices: str | int | None,
-    device_type: str | None = None,
-) -> None:
+) -> str | None:
     """Configure per-stage device visibility and current device (CUDA or NPU).
 
     This function sets environment variables that control which devices are visible
-    to the process, and sets the current device. It must be called BEFORE worker
-    initialization so that workers see the correct devices.
+    to the process. It must be called BEFORE worker initialization so that workers
+    see the correct devices.
+
+
+    NOTE: This will set the control variable for the appropriate platform.
+        - CUDA: CUDA_VISIBLE_DEVICES
+        - NPU: ASCEND_RT_VISIBLE_DEVICES
 
     Args:
         stage_id: Stage identifier for logging
-        devices: Device specification:
-            - Comma-separated string (e.g. "2,5,7"): interpreted as logical
-              indices against the current device visibility env var (e.g.
-              CUDA_VISIBLE_DEVICES/ASCEND_RT_VISIBLE_DEVICES) when present;
-              falls back to physical IDs if no mapping exists. Logical index 0
-              is used as current device.
-            - Integer or digit-string: treat as logical index (0-based) into the
-              current device visibility mapping; map to physical device, then set
-              env var to this single device.
-            - None/"cpu": keep default visibility.
-            - Otherwise: set env var to the provided single device string.
-        device_type: Device type ("cuda" or "npu"). If None, auto-detects.
+        devices: Devices specified as either:
+            - None / "cpu"; uses the default visibility.
+            - An int or a str composed of one or more ints separated by commas,
+              which correspond to logical indices. If the control env var is
+              set, e.g., CUDA_VISIBLE_DEVICES, we will map the logical indices
+              to physical, e.g.,
+                    devices: [0,1,2,3]
+                    CUDA_VISIBLE_DEVICES -> [1, 3, 4, 5, 6]
+            will leverage [1, 3, 4, 5]
 
-    Behavior:
-        - CUDA: Sets CUDA_VISIBLE_DEVICES and calls torch.cuda.set_device()
-        - NPU: Sets ASCEND_RT_VISIBLE_DEVICES and calls torch.npu.set_device()
+    Returns:
+        The list of physical devices that were set for the given stage
+        or None if we have no passed devices / are using cpu.
     """
-    from vllm_omni.platforms import current_omni_platform
-
-    if device_type is None:
-        device_type = current_omni_platform.device_type
-
     env_var = current_omni_platform.device_control_env_var
+    vis = os.environ.get(env_var)
 
-    try:
-        selected_physical: int | None = None
-        logical_idx: int | None = None
+    if devices in (None, "cpu"):
+        logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
+        return None
 
-        if isinstance(devices, str) and "," in devices:
-            toks = [t.strip() for t in devices.split(",") if t.strip() != ""]
-            vis = os.environ.get(env_var)
-            mapped_devices: list[str] = []
-            mapping: list[int] = []
-            if vis:
-                try:
-                    mapping = [int(x) for x in vis.split(",") if x.strip() != ""]
-                except Exception as e:
-                    logger.debug("[Stage-%s] Failed to parse existing %s: %s", stage_id, env_var, e)
-            for tok in toks:
-                try:
-                    idx = int(tok)
-                except Exception:
-                    mapped_devices.append(tok)
-                    continue
-                if mapping and 0 <= idx < len(mapping):
-                    mapped_devices.append(str(mapping[idx]))
-                else:
-                    mapped_devices.append(str(idx))
-            mapped_devices_str = ",".join(mapped_devices)
-            current_omni_platform.set_device_control_env_var(mapped_devices_str)
-            if toks:
-                try:
-                    selected_physical = int(mapped_devices[0])
-                    logger.debug(
-                        "[Stage-%s] Set %s to %s; logical 0 -> physical %s",
-                        stage_id,
-                        env_var,
-                        mapped_devices_str,
-                        selected_physical,
-                    )
-                except Exception as e:
-                    logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type, e)
-                    selected_physical = None
-        elif isinstance(devices, (int, str)) and (isinstance(devices, int) or str(devices).isdigit()):
-            logical_idx = max(0, int(devices))
-            vis = os.environ.get(env_var)
-            if vis:
-                try:
-                    mapping = [int(x) for x in vis.split(",") if x.strip() != ""]
-                    if 0 <= logical_idx < len(mapping):
-                        selected_physical = mapping[logical_idx]
-                except Exception as e:
-                    logger.debug("[Stage-%s] Failed to map logical index via %s: %s", stage_id, env_var, e)
-                    selected_physical = None
-            if selected_physical is None:
-                selected_physical = int(logical_idx)
-            current_omni_platform.set_device_control_env_var(str(selected_physical))
-            logger.debug(
-                "[Stage-%s] Logical index %d -> physical %s; set %s to single device",
-                stage_id,
-                logical_idx + 1,
-                selected_physical,
-                env_var,
-            )
-        elif devices in (None, "cpu"):
-            logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
-        else:
-            selected_physical = int(str(devices))
-            current_omni_platform.set_device_control_env_var(str(selected_physical))
-            logger.debug("[Stage-%s] Set %s to single device %s (fallback)", stage_id, env_var, selected_physical)
-    except Exception as e:
-        logger.warning("Failed to interpret devices for stage %s: %s", stage_id, e)
+    elif isinstance(devices, (int, str)):
+        device_list = _parse_device_list(devices)
+        if vis is not None:
+            visible_device_list = _parse_device_list(vis)
+            device_list = _map_device_list(stage_id, device_list, visible_device_list)
+        device_str = ",".join(device_list)
+        current_omni_platform.set_device_control_env_var(device_str)
+        return device_str
+
+    raise TypeError(f"Expected str or int device IDs for stage initialization, got type {type(devices)}")
+
+
+def _parse_device_list(devices: str | int) -> list[str]:
+    """Given an int or a str representing one or more comma separated
+    non-negative IDs, coerce it to a list of strs.
+
+    Args:
+        devices: devices to be converted to a list of strs.
+    """
+    if isinstance(devices, int):
+        if devices < 0:
+            raise ValueError("Device IDs must be non-negative integers!")
+        return [str(devices)]
+    # Devices will usually be ints, but not always
+    # so we don't explicitly validate that here.
+    return [t.strip() for t in devices.split(",") if t.strip() != ""]
+
+
+def _map_device_list(stage_id: int, device_list: list[str], visible_device_list: list[str]) -> list[str]:
+    """Maps logical to physical devices if we have enough visible devices available.
+
+    Args:
+        stage_id: The stage ID currently configuring devices.
+        device_list: List of (logical) devices to be used, which are strings
+            holding non-negative nums counting from 0, 1, ..., n devices needed.
+        visible_device_list: List of physical devices available.
+    """
+    num_visible = len(visible_device_list)
+    num_logical = len(device_list)
+    if num_visible < num_logical:
+        raise ValueError(f"Stage {stage_id} requires {num_logical} devices, but only {num_visible} devices are visible")
+
+    # Ensure that the logical IDs are actually in range to avoid index errors;
+    # If the check above passes and those below fail, the logical devices are wrong,
+    # i.e., not actually 0, 1, ..., n
+    if not all(device.isdigit() for device in device_list):
+        raise ValueError("Logical devices must be non-negative integers")
+
+    logical_ids = [int(device) for device in device_list]
+    if max(logical_ids) >= num_visible:
+        raise ValueError(
+            f"Stage {stage_id} has logical IDs {device_list}, one or more of which exceed the number of visible devices"
+        )
+    return [visible_device_list[idx] for idx in logical_ids]
 
 
 def serialize_obj(obj: Any) -> bytes:

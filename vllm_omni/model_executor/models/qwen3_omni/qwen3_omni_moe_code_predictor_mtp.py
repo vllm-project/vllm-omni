@@ -1,10 +1,10 @@
 """Qwen3-Omni Code Predictor -- optimized re-prefill, no KV cache.
 
-* SDPA attention (F.scaled_dot_product_attention) -- no HF backend fallback
-* Persistent pre-allocated buffers (_proj_buf, _pos_ids) -- zero per-call alloc
-* Inline top-k sampling -- no LogitsProcessorList / custom-op overhead
+* SDPA attention (F.scaled_dot_product_attention) with native GQA support
+* Per-call embedding buffer to avoid cross-request aliasing
+* Pre-allocated position_ids (read-only, safe to persist)
 * torch.compile on inner transformer by default
-* No @support_torch_compile / static_forward_context / namedtuple
+* Inline sampling (top-k + top-p) -- no custom op overhead
 """
 
 import torch
@@ -106,7 +106,7 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
         q, k = self.rotary_emb(position_ids, q, k)
 
-        # [B, heads, seq, head_dim] for SDPA
+        # [B, heads, seq, head_dim]
         q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -271,11 +271,11 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
     short sequences, and this avoids all KV-cache management overhead.
 
     Optimizations:
-      1. Pre-allocated embedding buffer -- no torch.cat per step.
+      1. Per-call embedding buffer -- avoids cross-request aliasing.
       2. Pre-allocated position_ids -- no torch.arange per step.
-      3. Inline top-k sampling -- no LogitsProcessorList / custom op.
-      4. Cached module references -- bypass ModuleList indexing.
-      5. torch.compile on inner transformer.
+      3. Cached module references -- bypass ModuleList indexing.
+      4. torch.compile on inner transformer.
+      5. Inline sampling (top-k + top-p) -- no custom op overhead.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -306,11 +306,9 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             ]
         )
 
-        # Sampling hyperparams (inlined)
-        self._top_k = 50
+        self.set_sampling_params()
 
-        # Persistent buffers (lazily initialised on first forward)
-        self._proj_buf: torch.Tensor | None = None
+        # Lazily initialised position ids (read-only, safe to persist)
         self._pos_ids: torch.Tensor | None = None
 
         # Cached plain-list refs (set once)
@@ -320,20 +318,20 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         # Model forward (optionally compiled)
         self._model_fwd: object | None = None
 
+    def set_sampling_params(self, top_k: int = 50, top_p: float = 0.8):
+        """Configure sampling parameters to maintain consistency with previous implementation."""
+        self._top_k = top_k
+        self._top_p = top_p
+        logger.debug(f"Sampling parameters updated: top_k={top_k}, top_p={top_p}s")
+
     # ------------------------------------------------------------------
     #  Lazy-init helpers
     # ------------------------------------------------------------------
 
-    def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
-        max_seq = self.num_code_groups + 1
-        if (
-            self._proj_buf is not None
-            and self._proj_buf.shape[0] >= bsz
-            and self._proj_buf.device == device
-            and self._proj_buf.dtype == dtype
-        ):
+    def _ensure_pos_ids(self, device: torch.device) -> None:
+        if self._pos_ids is not None and self._pos_ids.device == device:
             return
-        self._proj_buf = torch.zeros(bsz, max_seq, self._hidden_size, dtype=dtype, device=device)
+        max_seq = self.num_code_groups + 1
         self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device)
 
     def _ensure_cached_refs(self) -> None:
@@ -345,19 +343,23 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
     def _ensure_model_fwd(self) -> None:
         if self._model_fwd is not None:
             return
-        if not current_omni_platform.supports_torch_inductor():
-            logger.warning_once("code_predictor: torch.compile disabled")
+        if current_omni_platform.supports_torch_inductor():
+            # torch.compile fuses the 5-layer transformer's small kernels,
+            # reducing BF16 intermediate round-trips and improving precision.
+            # mode="default" avoids Inductor's own CUDA graph capture so it
+            # doesn't conflict with the outer CUDAGraphWrapper.
+            self._model_fwd = torch.compile(
+                self.model.forward,
+                mode="default",
+                dynamic=True,
+            )
+            logger.info("code_predictor: torch.compile enabled (mode=default)")
+        else:
             self._model_fwd = self.model.forward
-            return
-        self._model_fwd = torch.compile(
-            self.model.forward,
-            mode="default",
-            dynamic=True,
-        )
-        logger.info("code_predictor: torch.compile enabled")
+            logger.info("code_predictor: using eager mode (no torch.compile)")
 
     # ------------------------------------------------------------------
-    #  Forward -- re-prefill + persistent buffers + inline sampling
+    #  Forward -- re-prefill + inline sampling
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
@@ -379,20 +381,21 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             proj_buf:  [bsz, num_code_groups + 1, hidden_size]
                 pos 0   = last_talker_hidden (NOT a codec embed)
                 pos 1   = layer0_embed
-                pos 2.. = codec_embedding[i](predicted_code_i)
+                pos 2.. = `codec_embedding[i](predicted_code_i)`
         """
         bsz = int(layer0_code.shape[0])
         device = layer0_code.device
         dtype = last_talker_hidden.dtype
         num_groups = self.num_code_groups
-        top_k = self._top_k
 
-        # Lazy init
-        self._ensure_buffers(bsz, device, dtype)
+        # Lazy init (read-only caches only)
+        self._ensure_pos_ids(device)
         self._ensure_model_fwd()
         self._ensure_cached_refs()
 
-        proj_buf = self._proj_buf
+        # Allocate proj_buf locally each call to avoid cross-call aliasing
+        max_seq = num_groups + 1
+        proj_buf = torch.zeros(bsz, max_seq, self._hidden_size, dtype=dtype, device=device)
         pos_ids = self._pos_ids
         model_fwd = self._model_fwd
         lm_heads = self._lm_heads
@@ -411,21 +414,29 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             seq_len = step + 1
             projected = proj_buf[:bsz, :seq_len, :]
             step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
+            assert step_pos_ids.shape[0] == bsz * seq_len
 
             hidden_out = model_fwd(projected, step_pos_ids)
 
-            # Inline top-k sampling
-            logits = lm_heads[step - 1](hidden_out[:, -1, :])
-            if top_k > 0:
-                topk_vals, _ = logits.topk(top_k, dim=-1)
+            # Inline sampling: top-k -> top-p -> softmax -> multinomial
+            logits = lm_heads[step - 1](hidden_out[:, -1, :])  # [bsz, vocab]
+            if self._top_k > 0:
+                topk_vals, _ = logits.topk(self._top_k, dim=-1)
                 logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+            if self._top_p < 1.0:
+                sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                cumulative_probs = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                # Remove tokens with cumulative probability above top_p
+                remove_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= self._top_p
+                sorted_logits[remove_mask] = float("-inf")
+                logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
             probs = F.softmax(logits, dim=-1)
             code = torch.multinomial(probs, num_samples=1)  # [bsz, 1]
 
             all_codes[:, step] = code
 
             # Embed predicted code -> next buffer position
-            new_embed = codec_embeds[step - 1](code)
+            new_embed = codec_embeds[step - 1](code)  # [batch, 1, hidden_size]
             proj_buf[:bsz, step + 1 : step + 2, :] = new_embed
 
         return all_codes, proj_buf[:bsz]

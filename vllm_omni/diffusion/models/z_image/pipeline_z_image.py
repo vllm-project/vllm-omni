@@ -38,7 +38,6 @@ from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -175,9 +174,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.vae = DistributedAutoencoderKL.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
         ).to(self._execution_device)
-        # Get vLLM quantization config for linear layers
-        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
-        self.transformer = ZImageTransformer2DModel(quant_config=quant_config)
+        self.transformer = ZImageTransformer2DModel(quant_config=od_config.quantization_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         # Note: Context parallelism is applied centrally in registry.initialize_model()
@@ -305,7 +302,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     @property
     def do_classifier_free_guidance(self):
-        return self._guidance_scale > 1
+        return self._guidance_scale > 0
 
     @property
     def joint_attention_kwargs(self):
@@ -365,7 +362,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
                 `guidance_scale` is defined as `w` of equation 2. of [Imagen
                 Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                0`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
                 usually at the expense of lower image quality.
             cfg_normalization (`bool`, *optional*, defaults to False):
                 Whether to apply configuration normalization.
@@ -374,7 +371,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than `1`).
+                less than or equal to `0`).
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             generator (`torch.Generator` or `list[torch.Generator]`, *optional*):

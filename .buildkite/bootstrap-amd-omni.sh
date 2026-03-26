@@ -90,10 +90,18 @@ upload_pipeline() {
     FAIL_FAST=$(fail_fast)
 
     cd .buildkite
+
+    # Select test definition file: merge suite for main, ready suite for PRs
+    if [[ $BUILDKITE_BRANCH == "main" ]]; then
+        TEST_YAML="test-amd-merge.yml"
+    else
+        TEST_YAML="test-amd-ready.yaml"
+    fi
+
     (
         set -x
         # Output pipeline.yaml with all blank lines removed
-        minijinja-cli test-template.j2 test-amd.yaml \
+        minijinja-cli test-template.j2 "$TEST_YAML" \
             -D branch="$BUILDKITE_BRANCH" \
             -D list_file_diff="$LIST_FILE_DIFF" \
             -D run_all="$RUN_ALL" \

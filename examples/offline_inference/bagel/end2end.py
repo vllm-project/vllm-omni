@@ -34,7 +34,14 @@ def parse_args():
         help="Path to input image for img2img.",
     )
 
-    # Omni runtime init args
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=".",
+        help="Output directory to save images.",
+    )
+
+    # OmniLLM init args
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
     parser.add_argument("--batch-timeout", type=int, default=5)
@@ -63,6 +70,12 @@ def parse_args():
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="Quantization method (e.g. 'fp8').",
+    )
 
     args = parser.parse_args()
     return args
@@ -70,6 +83,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    os.makedirs(args.output, exist_ok=True)
     model_name = args.model
     prompts: list[OmniPromptType] = []
     try:
@@ -111,6 +125,8 @@ def main():
             "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         }
     )
+    if args.quantization:
+        omni_kwargs["quantization_config"] = args.quantization
 
     omni = Omni(model=model_name, **omni_kwargs)
 
@@ -172,13 +188,13 @@ def main():
     img_idx = 0
     for req_output in omni_outputs:
         images = getattr(req_output, "images", None)
+
         if not images:
             continue
 
         for j, img in enumerate(images):
-            save_path = f"output_{img_idx}_{j}.png"
+            save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
             img.save(save_path)
-            print(f"[Info] Saved image to {save_path}")
         img_idx += 1
 
     print(omni_outputs)

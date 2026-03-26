@@ -79,19 +79,7 @@ Each DAC decoder chunk is logged as it arrives. The final WAV file is written on
 
 ## Example materials
 
-??? abstract "diag_codebook.py"
-    ``````py
-    --8<-- "examples/offline_inference/fish_speech/diag_codebook.py"
-    ``````
-??? abstract "diag_reference_compare.py"
-    ``````py
-    --8<-- "examples/offline_inference/fish_speech/diag_reference_compare.py"
-    ``````
 ??? abstract "end2end.py"
     ``````py
     --8<-- "examples/offline_inference/fish_speech/end2end.py"
-    ``````
-??? abstract "standalone_test.py"
-    ``````py
-    --8<-- "examples/offline_inference/fish_speech/standalone_test.py"
     ``````

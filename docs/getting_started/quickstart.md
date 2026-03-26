@@ -19,10 +19,10 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 # On CUDA
-uv pip install vllm==0.17.0 --torch-backend=auto
+uv pip install vllm==0.18.0 --torch-backend=auto
 
 # On ROCm
-uv pip install vllm==0.17.0 --extra-index-url https://wheels.vllm.ai/rocm/0.17.0/rocm700
+uv pip install vllm==0.18.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.18.0/rocm700
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
@@ -82,7 +82,7 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by default, and the input
+    For diffusion pipelines, the stage config field `stage_args.[].engine_args.max_num_seqs` is 1 by default, and the input
     list is sliced into single-item requests before feeding into the diffusion pipeline. For models that do internally support
     batched inputs, you can [modify this configuration](../configuration/stage_configs.md) to let the model accept a longer batch of prompts.
 

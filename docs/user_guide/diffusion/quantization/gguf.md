@@ -6,13 +6,13 @@
 3. Keep user-facing knobs minimal and consistent across offline and online flows.
 
 ## Scope
-1. Models: Z-Image, and Flux2-klein.
+1. Models: Z-Image, Flux2-klein, and Qwen-Image family.
 2. Components: diffusion transformer weights, loader paths, and quantization configs.
 3. Modes: native GGUF (transformer-only weights).
 
 ## Architecture Overview
 1. `OmniDiffusionConfig` accepts `quantization` or `quantization_config`.
-2. Diffusion quantization wrapper (`DiffusionGgufConfig`) produces vLLM `QuantizationConfig` objects for linear layers.
+2. Diffusion quantization wrapper (`DiffusionGGUFConfig`) produces vLLM `QuantizationConfig` objects for linear layers.
 3. `DiffusersPipelineLoader` branches on quantization method and loads either HF weights or GGUF weights for the transformer.
 4. GGUF transformer loading is routed through model-specific adapters (e.g., Flux2Klein).
 5. vLLM GGUF path uses `GGUFConfig` and `GGUFLinearMethod` for matmul.
@@ -124,19 +124,21 @@ x @ weight.T
 1. `DiffusersPipelineLoader.load_model` detects `quantization_config.method == "gguf"`.
 2. `gguf_model` is resolved as one of: local file, `repo/file.gguf`, or `repo:quant_type`.
 3. GGUF weights are routed through adapters in `vllm_omni/diffusion/model_loader/gguf_adapters/`.
-4. Name mapping is applied per-architecture (Z-Image, Flux2Klein).
+4. Name mapping is applied per-architecture (Z-Image, Flux2Klein, Qwen-Image).
 5. GGUF weights are loaded into transformer modules, remaining non-transformer weights come from the HF checkpoint.
 
 ## GGUF Adapter Design
 1. `GGUFAdapter` is an abstract base class for model-specific adapters.
 2. `Flux2KleinGGUFAdapter` implements Flux2-Klein remapping + qkv split + adaLN swap.
 3. `ZImageGGUFAdapter` implements Z-Image qkv + ffn shard handling and linear qweight routing.
-4. `get_gguf_adapter(...)` strictly selects by model class/config; unsupported models raise an error (no fallback adapter).
+4. `QwenImageGGUFAdapter` implements Qwen-Image fused attention projection remapping.
+5. `get_gguf_adapter(...)` strictly selects by model class/config; unsupported models raise an error (no fallback adapter).
 
 Adapter paths:
 - Base: `vllm_omni/diffusion/model_loader/gguf_adapters/base.py`
 - Z-Image: `vllm_omni/diffusion/model_loader/gguf_adapters/z_image.py`
 - Flux2-Klein: `vllm_omni/diffusion/model_loader/gguf_adapters/flux2_klein.py`
+- Qwen-Image: `vllm_omni/diffusion/model_loader/gguf_adapters/qwen_image.py`
 
 ## User Usage (Offline)
 
@@ -195,3 +197,31 @@ curl -X POST http://localhost:8000/v1/images/generations \
     "num_inference_steps": 4
   }'
 ```
+
+## Qwen-Image Example
+
+### Offline
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Qwen/Qwen-Image \
+  --gguf-model QuantStack/Qwen-Image-GGUF/Qwen_Image-Q4_K_M.gguf \
+  --quantization gguf \
+  --prompt "a red paper kite hanging from a pine tree in a winter courtyard" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --num_inference_steps 20 \
+  --output outputs/qwen_image_q4km.png
+```
+
+### Online
+```bash
+vllm serve Qwen/Qwen-Image \
+  --omni \
+  --port 8000 \
+  --quantization-config '{"method":"gguf","gguf_model":"QuantStack/Qwen-Image-GGUF/Qwen_Image-Q4_K_M.gguf"}'
+```
+
+Notes:
+1. The GGUF repo provides transformer weights only; the base model repo still provides tokenizer, text encoder, scheduler, and VAE.
+2. The same adapter path covers `QwenImagePipeline`, `QwenImageEditPipeline`, `QwenImageEditPlusPipeline`, and `QwenImageLayeredPipeline`.
