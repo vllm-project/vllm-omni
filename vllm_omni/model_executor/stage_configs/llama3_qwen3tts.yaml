@@ -1,0 +1,90 @@
+# Stage config for composable text-LLM → TTS pipeline
+# Stage 0: Llama-3.1-8B-Instruct  (any vLLM text model)
+#   - Runs standard AR text generation
+#   - Outputs text tokens; does NOT produce final output to user
+#   - Sentence chunks are forwarded to Stage 1 via async_chunk
+# Stage 1: Qwen3-TTS-12Hz-1.7B-CustomVoice
+#   - Receives text chunks from Stage 0 bridge
+#   - Produces final audio output
+#
+# Motivation: RFC Theme 2 (TTS as a Composable Layer, P0)
+# Any vLLM text model can be paired with any TTS decoder without
+# requiring a built-in talker stage in the base model.
+#
+# Usage (offline):
+#   python examples/offline_inference/llama3_qwen3tts/end2end.py \
+#     --stage-configs-path vllm_omni/model_executor/stage_configs/llama3_qwen3tts.yaml
+#
+# Usage (online):
+#   vllm-omni serve meta-llama/Llama-3.1-8B-Instruct \
+#     --omni \
+#     --stage-configs-path vllm_omni/model_executor/stage_configs/llama3_qwen3tts.yaml \
+#     --port 8091
+
+stages:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true       # Stage 0 owns the tokenizer for the whole pipeline
+    final_output: false          # Text tokens are intermediate; not returned to user
+    runtime:
+      devices: "0"
+      max_batch_size: 16
+    engine_args:
+      model: meta-llama/Llama-3.1-8B-Instruct
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.6
+      enforce_eager: false
+      trust_remote_code: false
+      enable_prefix_caching: true
+      max_num_batched_tokens: 8192
+      tensor_parallel_size: 1
+      distributed_executor_backend: "mp"
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 512
+    # Bridge config: controls how Stage 0 text output is chunked and
+    # forwarded to Stage 1. Implemented in:
+    #   vllm_omni/model_executor/stage_input_processors/text_tts_bridge.py
+    async_chunk: true
+    bridge:
+      processor: vllm_omni.model_executor.stage_input_processors.text_tts_bridge.text2tts
+      # Minimum characters buffered before flushing a chunk to TTS.
+      # Lower = less latency but more TTS restarts; higher = smoother audio.
+      min_sentence_chars: 40
+      # Sentence boundary characters that trigger a flush.
+      sentence_delimiters: [".", "!", "?", "。", "！", "？"]
+      # TTS task type forwarded to Stage 1 (CustomVoice / VoiceDesign / Base).
+      tts_task_type: CustomVoice
+      # Default voice injected when Stage 0 has no concept of speaker.
+      # Answers RFC design question #3 with a simple default-inject strategy.
+      default_voice: vivian
+      default_language: English
+
+  - stage_id: 1
+    stage_type: llm
+    is_comprehension: false
+    final_output: true
+    final_output_type: audio
+    engine_input_source: [0]     # Receives chunks forwarded from Stage 0 bridge
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.text_tts_bridge.text2tts
+    runtime:
+      devices: "1"               # Runs on a separate GPU from Stage 0
+      max_batch_size: 8
+    engine_args:
+      model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true        # Qwen3-TTS requires eager mode
+      trust_remote_code: true
+      max_num_batched_tokens: 4096
+      tensor_parallel_size: 1
+      distributed_executor_backend: "mp"
+    tts_config:
+      max_instructions_length: 200
+    async_chunk: true
+    default_sampling_params:
+      temperature: 1.0
+      top_k: 50
