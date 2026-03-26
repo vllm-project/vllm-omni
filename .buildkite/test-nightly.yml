@@ -205,11 +205,11 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - export BENCHMARK_DIR=tests/perf/results
+      - export BENCHMARK_DIR=tests/dfx/perf/results
       - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
-      - buildkite-agent artifact upload "tests/perf/results/*.json"
-      - python tools/nightly/buildkite_testcase_statistics.py -o tests/perf/results/buildkite_testcase_statistics.html
-      - buildkite-agent artifact upload "tests/perf/results/*.html"
+      - buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+      - python tools/nightly/buildkite_testcase_statistics.py -o tests/dfx/perf/results/buildkite_testcase_statistics.html
+      - buildkite-agent artifact upload "tests/dfx/perf/results/*.html"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -301,15 +301,15 @@ steps:
     if: build.env("NIGHTLY") == "1"
     commands:
       - pip install openpyxl
-      - export DEFAULT_INPUT_DIR=tests/perf/results
-      - export DEFAULT_OUTPUT_DIR=tests/perf/results
-      - buildkite-agent artifact download "tests/perf/results/*.json" . --step nightly-omni-performance
-      - buildkite-agent artifact download "tests/perf/results/*.json" . --step nightly-qwen-image-performance
-      - buildkite-agent artifact download "tests/perf/results/*.html" . --step nightly-omni-performance
+      - export DEFAULT_INPUT_DIR=tests/dfx/perf/results
+      - export DEFAULT_OUTPUT_DIR=tests/dfx/perf/results
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-qwen-image-performance
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-omni-performance
       - python tools/nightly/generate_nightly_perf_excel.py
       - python tools/nightly/generate_nightly_perf_html.py
-      - python tools/nightly/send_nightly_email.py --report-file "tests/perf/results/*.xlsx, tests/perf/results/*.html"
-      - buildkite-agent artifact upload "tests/perf/results/*.xlsx"
-      - buildkite-agent artifact upload "tests/perf/results/*.html"
+      - python tools/nightly/send_nightly_email.py --report-file "tests/dfx/perf/results/*.xlsx, tests/dfx/perf/results/*.html"
+      - buildkite-agent artifact upload "tests/dfx/perf/results/*.xlsx"
+      - buildkite-agent artifact upload "tests/dfx/perf/results/*.html"
     agents:
       queue: "cpu_queue_premerge"
