@@ -1905,7 +1905,7 @@ class HunyuanImage3Model(nn.Module):
         "post_processor": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
-    def __init__(self, config: HunyuanImage3Config, prefix: str = ""):
+    def __init__(self, config: HunyuanImage3Config, quant_config=None, prefix: str = ""):
         super().__init__()
         lora_config = None
         self.num_redundant_experts = 0
