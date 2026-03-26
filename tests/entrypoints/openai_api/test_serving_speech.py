@@ -250,7 +250,8 @@ def test_app(mocker: MockerFixture):
         speaker_embedding: str | None = Form(None),
         consent: str = Form(...),
         name: str = Form(...),
-        ref_text: str = Form(None),
+        ref_text: str | None = Form(None),
+        speaker_description: str | None = Form(None),
     ):
         try:
             if speaker_embedding is not None and audio_sample is not None:
@@ -258,7 +259,13 @@ def test_app(mocker: MockerFixture):
             if speaker_embedding is not None:
                 result = await speech_server.upload_voice_embedding(speaker_embedding, consent, name)
             elif audio_sample is not None:
-                result = await speech_server.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+                result = await speech_server.upload_voice(
+                    audio_sample,
+                    consent,
+                    name,
+                    ref_text=ref_text,
+                    speaker_description=speaker_description,
+                )
             else:
                 raise ValueError("Either 'audio_sample' or 'speaker_embedding' must be provided")
             return {"success": True, "voice": result}
@@ -392,19 +399,24 @@ class TestSpeechAPI:
         assert result["voice"].get("ref_text") == "Hello world transcript"
         response = client.delete("/v1/audio/voices/test_voice_rt")
 
-    def test_upload_voice_with_voice_description(self, client, tmp_path):
-        """Test voice upload with voice_description stores and returns the description."""
+    def test_upload_voice_with_speaker_description(self, client, tmp_path):
+        """Test voice upload with speaker_description stores and returns the description."""
+        # Pre-cleanup in case a previous test run left this voice behind
+        client.delete("/v1/audio/voices/test_voice_vd")
+
         audio_content = b"fake audio content" * 1000
         files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
-        data = {"consent": "c1", "name": "test_voice_vd", "voice_description": "  warm, energetic narrator  "}
+        data = {"consent": "c1", "name": "test_voice_vd", "speaker_description": "  warm, energetic narrator  "}
 
         response = client.post("/v1/audio/voices", files=files, data=data)
-        assert response.status_code == 200
-        result = response.json()
-        assert result["success"] is True
-        assert result["voice"]["name"] == "test_voice_vd"
-        assert result["voice"].get("voice_description") == "warm, energetic narrator"
-        client.delete("/v1/audio/voices/test_voice_vd")
+        try:
+            assert response.status_code == 200
+            result = response.json()
+            assert result["success"] is True
+            assert result["voice"]["name"] == "test_voice_vd"
+            assert result["voice"].get("speaker_description") == "warm, energetic narrator"
+        finally:
+            client.delete("/v1/audio/voices/test_voice_vd")
 
     def test_upload_voice_file_too_large(self, client):
         """Test voice upload with file exceeding size limit."""
