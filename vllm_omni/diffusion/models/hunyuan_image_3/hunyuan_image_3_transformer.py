@@ -859,6 +859,8 @@ class ImageKVCacheManager:
         self.image_token_len: int = image_token_len
         self.image_kv_cache: tuple[torch.Tensor, torch.Tensor] = None
 
+        self.sp_size = get_sequence_parallel_world_size()
+        self.sp_rank = get_sequence_parallel_rank()
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -866,8 +868,6 @@ class ImageKVCacheManager:
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
         )
-        self.sp_size = get_sequence_parallel_world_size()
-        self.sp_rank = get_sequence_parallel_rank()
 
     def _save_image_kv_caches(
         self,
@@ -1887,13 +1887,6 @@ class HunyuanImagePostprocessor(nn.Module):
 
 
 class HunyuanImage3Model(nn.Module):
-    @staticmethod
-    def _is_transformer_block(name: str, module) -> bool:
-        """Match transformer blocks for HSDP sharding (e.g., layers.0, layers.1)."""
-        return "layers" in name and name.split(".")[-1].isdigit()
-
-    _hsdp_shard_conditions = [_is_transformer_block]
-
     _sp_plan = {
         # Split custom_pos_emb tuple elements (cos, sin) at model forward input
         "pre_processor": {

@@ -438,7 +438,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         # slicing and tiling related
         self.use_slicing = False
         self.slicing_bsz = 1
-        self.use_spatial_tiling = True
+        self.use_spatial_tiling = False
         self.use_temporal_tiling = False
         self.use_tiling_during_training = False
 
