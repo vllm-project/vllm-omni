@@ -55,14 +55,13 @@ from vllm_omni.entrypoints.omni_llm import Omni  # noqa: E402  (after sys.path f
 # ---------------------------------------------------------------------------
 DEFAULT_LLM_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-DEFAULT_STAGE_CONFIGS = str(
-    _REPO_ROOT / "vllm_omni/model_executor/stage_configs/llama3_qwen3tts.yaml"
-)
+DEFAULT_STAGE_CONFIGS = str(_REPO_ROOT / "vllm_omni/model_executor/stage_configs/llama3_qwen3tts.yaml")
 
 
 # ---------------------------------------------------------------------------
 # Input builder
 # ---------------------------------------------------------------------------
+
 
 def build_input(
     prompt: str,
@@ -94,6 +93,7 @@ def build_input(
 # Audio sink: collect and write WAV
 # ---------------------------------------------------------------------------
 
+
 def save_audio(stage_outputs, output_path: str) -> None:
     """Collect audio tensors from stage outputs and write a WAV file."""
     audio_chunks: list[torch.Tensor] = []
@@ -108,11 +108,7 @@ def save_audio(stage_outputs, output_path: str) -> None:
         sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
-        chunk = (
-            torch.cat(audio_data, dim=-1)
-            if isinstance(audio_data, list)
-            else audio_data
-        )
+        chunk = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
         audio_chunks.append(chunk)
 
     if not audio_chunks:
@@ -128,9 +124,9 @@ def save_audio(stage_outputs, output_path: str) -> None:
 # Streaming variant (uses AsyncOmni internally via --streaming flag)
 # ---------------------------------------------------------------------------
 
+
 async def run_streaming(omni_async, inputs: dict, output_path: str) -> None:
     """Stream audio chunks as they arrive from the async_chunk pipeline."""
-    from vllm_omni.entrypoints.async_omni import AsyncOmni  # local import
 
     request_id = f"req-{uuid.uuid4().hex[:8]}"
     audio_chunks: list[torch.Tensor] = []
@@ -146,14 +142,9 @@ async def run_streaming(omni_async, inputs: dict, output_path: str) -> None:
             sr_raw = mm.get("sr", sample_rate)
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-            chunk = (
-                torch.cat(audio_data, dim=-1)
-                if isinstance(audio_data, list)
-                else audio_data
-            )
+            chunk = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
             audio_chunks.append(chunk)
-            print(f"  [stream] received audio chunk #{chunk_idx}  "
-                  f"({chunk.shape[-1] / sample_rate:.2f}s)")
+            print(f"  [stream] received audio chunk #{chunk_idx}  ({chunk.shape[-1] / sample_rate:.2f}s)")
             chunk_idx += 1
 
     if audio_chunks:
@@ -166,45 +157,60 @@ async def run_streaming(omni_async, inputs: dict, output_path: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Llama-3.1 + Qwen3-TTS composable pipeline offline demo"
-    )
+    p = argparse.ArgumentParser(description="Llama-3.1 + Qwen3-TTS composable pipeline offline demo")
     p.add_argument(
-        "--prompt", type=str,
+        "--prompt",
+        type=str,
         default="Tell me a fascinating fact about the universe in two sentences.",
         help="Text prompt sent to the LLM (Stage 0).",
     )
     p.add_argument(
-        "--llm-model", type=str, default=DEFAULT_LLM_MODEL,
+        "--llm-model",
+        type=str,
+        default=DEFAULT_LLM_MODEL,
         help="HF model ID or local path for Stage 0 text LLM.",
     )
     p.add_argument(
-        "--tts-model", type=str, default=DEFAULT_TTS_MODEL,
+        "--tts-model",
+        type=str,
+        default=DEFAULT_TTS_MODEL,
         help="HF model ID or local path for Stage 1 TTS model.",
     )
     p.add_argument(
-        "--stage-configs-path", type=str, default=DEFAULT_STAGE_CONFIGS,
+        "--stage-configs-path",
+        type=str,
+        default=DEFAULT_STAGE_CONFIGS,
         help="Path to the stage config YAML file.",
     )
     p.add_argument(
-        "--voice", type=str, default="vivian",
+        "--voice",
+        type=str,
+        default="vivian",
         help="TTS voice/speaker name (injected by the bridge; Stage 0 is unaware).",
     )
     p.add_argument(
-        "--language", type=str, default="English",
+        "--language",
+        type=str,
+        default="English",
         help="TTS language tag.",
     )
     p.add_argument(
-        "--instructions", type=str, default=None,
+        "--instructions",
+        type=str,
+        default=None,
         help="Optional TTS style instruction, e.g. 'speak slowly and warmly'.",
     )
     p.add_argument(
-        "--output-dir", type=str, default="output_audio",
+        "--output-dir",
+        type=str,
+        default="output_audio",
         help="Directory to write output WAV files.",
     )
     p.add_argument(
-        "--streaming", action="store_true",
+        "--streaming",
+        action="store_true",
         help="Stream audio chunks progressively via AsyncOmni.",
     )
     return p.parse_args()
@@ -232,6 +238,7 @@ def main() -> None:
     if args.streaming:
         # ---- Async streaming path ----------------------------------------
         import asyncio
+
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         async def _run():
