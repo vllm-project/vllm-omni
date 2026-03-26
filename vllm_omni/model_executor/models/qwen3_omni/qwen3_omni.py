@@ -661,7 +661,13 @@ class Qwen3OmniMoeForConditionalGeneration(
         else:
             # decode
             if not info_dict.get("decode_flag", False):
-                info_dict["num_processed_tokens"] = 0
+                # Prefill already consumed the first text token via the
+                # assistant bootstrap path, so decode starts from the
+                # remaining-text boundary rather than cumulative index 0.
+                prefill_consumed_text_tokens = info_dict.get("prefill_consumed_text_tokens")
+                if prefill_consumed_text_tokens is None:
+                    raise RuntimeError("Missing prefill_consumed_text_tokens for talker decode handoff.")
+                info_dict["num_processed_tokens"] = prefill_consumed_text_tokens
                 update_dict["decode_flag"] = True
 
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
