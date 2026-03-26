@@ -16,6 +16,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -46,7 +47,85 @@ class OmniModelState(DefaultModelState):
         encoder_cache: EncoderCache | None,
         device: torch.device,
     ) -> None:
-        super().__init__(vllm_config, model, encoder_cache, device)
+        # DefaultModelState.__init__ calls get_rope_state() which asserts
+        # isinstance(model, SupportsMRoPE).  Two categories of Omni models:
+        #
+        # 1. Models that implement SupportsMRoPE (e.g. Qwen3-Omni Thinker):
+        #    get_rope_state() succeeds normally, _safe_get_rope is a no-op.
+        #    These models get correct 3D M-RoPE positions from the runner.
+        #
+        # 2. Models that do NOT implement SupportsMRoPE (e.g. Qwen3-TTS
+        #    Talker, Code2Wav, FishSpeech): get_rope_state() would assert.
+        #    These models compute their own position encoding internally
+        #    (via model.forward kwargs or fixed 1D positions from
+        #    InputBatch.positions), so rope_state = None is correct —
+        #    DefaultModelState.prepare_inputs returns {} when rope_state
+        #    is None, and upstream execute_model falls back to
+        #    InputBatch.positions (1D sequential).
+        # Patch get_rope_state to handle Omni models that declare
+        # M-RoPE in config (mrope_section) but do not implement the
+        # SupportsMRoPE interface.  For these models we create a
+        # RopeState with 3D sequential positions (matching V1 MR).
+        #
+        # The patch is applied via a class-level lock to prevent
+        # concurrent OmniModelState instances (e.g. different stages
+        # in a thread pool) from overwriting each other's patch.
+        import threading, types
+        from vllm.v1.worker.gpu.model_states import default as _default_mod
+        from vllm.v1.worker.gpu.mm.rope import RopeState
+
+        if not hasattr(OmniModelState, "_rope_patch_lock"):
+            OmniModelState._rope_patch_lock = threading.Lock()
+
+        def _safe_get_rope(
+            model_config: Any, mdl: Any, **kwargs: Any
+        ) -> Any:
+            try:
+                return _orig_get_rope(model_config, mdl, **kwargs)
+            except (AssertionError, TypeError):
+                if not model_config.uses_mrope:
+                    return None
+                logger.info(
+                    "Model uses M-RoPE (config) but does not implement "
+                    "SupportsMRoPE; creating RopeState(num_dims=3)."
+                )
+                # Add get_mrope_input_positions if missing.
+                # Returns 3D sequential positions with delta=0
+                # (pure text, no vision token offsets).
+                if not hasattr(mdl, "get_mrope_input_positions"):
+                    def _default_mrope_positions(
+                        self_model: Any,
+                        input_tokens: list[int],
+                        mm_features: list,
+                    ) -> tuple[torch.Tensor, int]:
+                        """Return 3D sequential positions with zero delta.
+
+                        For non-vision Omni models (e.g. TTS Talker),
+                        all 3 M-RoPE dimensions use the same sequential
+                        positions.  Delta=0 means decode-step positions
+                        are simply ``num_computed + offset``, identical
+                        to the 1D case but broadcast to 3 dims.
+                        """
+                        n = len(input_tokens)
+                        pos = torch.arange(n, dtype=torch.long)
+                        return pos.unsqueeze(0).expand(3, -1), 0
+
+                    mdl.get_mrope_input_positions = types.MethodType(
+                        _default_mrope_positions, mdl
+                    )
+                # has_delta=True is required so init_prefill_positions
+                # calls get_mrope_input_positions (not the XD-RoPE
+                # path).  delta=0 (returned above) means no offset is
+                # applied during decode — positions stay sequential.
+                return RopeState(num_dims=3, has_delta=True, **kwargs)
+
+        with OmniModelState._rope_patch_lock:
+            _orig_get_rope = _default_mod.get_rope_state
+            _default_mod.get_rope_state = _safe_get_rope
+            try:
+                super().__init__(vllm_config, model, encoder_cache, device)
+            finally:
+                _default_mod.get_rope_state = _orig_get_rope
         max_num_reqs = self.scheduler_config.max_num_seqs
         self.intermediate_buffer = OmniIntermediateBuffer(max_num_reqs)
         self.has_preprocess: bool = getattr(model, "has_preprocess", False)
@@ -54,9 +133,106 @@ class OmniModelState(DefaultModelState):
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
         self.plugins: list[OmniModelStatePlugin] = []
 
+        # Static inputs_embeds buffer for FULL CUDA graph compatibility.
+        # Models with preprocess modify inputs_embeds each step.  By
+        # allocating a static GPU buffer and returning it from both
+        # prepare_dummy_inputs (capture) and prepare_inputs (runtime),
+        # FULL graph captures the tensor address once and preprocess
+        # fills it in-place before each replay.
+        self._static_inputs_embeds: torch.Tensor | None = None
+        if self.has_preprocess and not self.supports_mm_inputs:
+            self._static_inputs_embeds = torch.zeros(
+                (self.max_num_tokens, self.inputs_embeds_size),
+                dtype=self.dtype,
+                device=device,
+            )
+
+        # Static MTP buffers — avoid per-step torch.cat allocations.
+        # Pre-allocated for max batch size so _run_batched_mtp can
+        # use .copy_() instead of torch.cat().
+        self._mtp_input_ids: torch.Tensor | None = None
+        self._mtp_input_embeds: torch.Tensor | None = None
+        self._mtp_hidden: torch.Tensor | None = None
+        self._mtp_text_step: torch.Tensor | None = None
+        if self.has_preprocess and hasattr(model, "talker_mtp"):
+            max_bs = max_num_reqs
+            hidden_size = self.inputs_embeds_size
+            self._mtp_input_ids = torch.zeros(
+                max_bs, dtype=torch.long, device=device
+            )
+            self._mtp_input_embeds = torch.zeros(
+                (max_bs, hidden_size), dtype=self.dtype, device=device
+            )
+            self._mtp_hidden = torch.zeros(
+                (max_bs, hidden_size), dtype=self.dtype, device=device
+            )
+            self._mtp_text_step = torch.zeros(
+                (max_bs, hidden_size), dtype=self.dtype, device=device
+            )
+
         if hasattr(model, "get_omni_plugins"):
             for plugin in model.get_omni_plugins():
                 self.register_plugin(plugin)
+
+    # ------------------------------------------------------------------
+    # Attention metadata: use actual max_seq_len, not max_model_len
+    # ------------------------------------------------------------------
+
+    def prepare_attn(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: Any,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        """Override to use actual max_seq_len instead of max_model_len.
+
+        Upstream DefaultModelState uses ``self.max_model_len`` as
+        ``max_seq_len`` for attention metadata.  This causes
+        FlashAttention to use a different scheduler/tiling strategy
+        than V1 MR (which uses the actual maximum sequence length).
+        The different tiling changes the float accumulation order in
+        bf16, causing numerically different attention outputs that
+        snowball through the transformer layers and produce completely
+        different logits—leading to 30x more decode steps for TTS.
+        """
+        from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+
+        if cudagraph_mode == CUDAGraphMode.FULL:
+            num_reqs = input_batch.num_reqs_after_padding
+            num_tokens = input_batch.num_tokens_after_padding
+        else:
+            num_reqs = input_batch.num_reqs
+            num_tokens = input_batch.num_tokens
+
+        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+        max_query_len = input_batch.num_scheduled_tokens.max().item()
+
+        # Use actual max seq_len (matching V1 MR behavior) instead of
+        # max_model_len.  For CUDA graph capture, use max_model_len to
+        # ensure the captured kernel covers all possible seq_lens.
+        if for_capture:
+            max_seq_len = self.max_model_len
+        else:
+            max_seq_len = int(input_batch.seq_lens[:num_reqs].max().item())
+
+        return build_attn_metadata(
+            attn_groups=attn_groups,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            query_start_loc_gpu=input_batch.query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=max_query_len,
+            seq_lens=input_batch.seq_lens,
+            max_seq_len=max_seq_len,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            kv_cache_config=kv_cache_config,
+            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+        )
 
     # ------------------------------------------------------------------
     # Plugin management
@@ -90,6 +266,12 @@ class OmniModelState(DefaultModelState):
         base["model_intermediate_buffer"] = buffer_list
         base["runtime_additional_information"] = buffer_list
         base["seq_token_counts"] = [int(input_batch.num_scheduled_tokens[i]) for i in range(input_batch.num_reqs)]
+        # Return static inputs_embeds so FULL graph replay uses the same
+        # tensor address that was captured.  Preprocess fills it in-place.
+        if self._static_inputs_embeds is not None:
+            base["inputs_embeds"] = self._static_inputs_embeds[
+                : input_batch.num_tokens_after_padding
+            ]
         for plugin in self.plugins:
             base.update(plugin.prepare_extra_inputs(input_batch, req_states))
         return base
@@ -107,7 +289,178 @@ class OmniModelState(DefaultModelState):
             base["seq_token_counts"] = counts
         else:
             base["seq_token_counts"] = []
+        # Return static inputs_embeds for FULL graph capture so the graph
+        # captures this tensor's address.
+        if self._static_inputs_embeds is not None:
+            base["inputs_embeds"] = self._static_inputs_embeds[:num_tokens]
         return base
+
+    # ------------------------------------------------------------------
+    # Pre-forward: per-request preprocess + batched MTP
+    # ------------------------------------------------------------------
+
+    def run_preprocess(self, input_batch: InputBatch, model_inputs: dict[str, Any]) -> None:
+        """Per-request preprocess + MTP before model forward.
+
+        Modifies ``model_inputs["input_ids"]`` and ``model_inputs["inputs_embeds"]``
+        in-place.  Collects decode-step MTP inputs and runs a single batched MTP
+        forward at the end.
+        """
+        if not self.has_preprocess:
+            return
+
+        embeds = model_inputs.get("inputs_embeds")
+        if embeds is None:
+            embeds = self.model.embed_input_ids(
+                input_batch.input_ids[: input_batch.num_tokens]
+            )
+            model_inputs["inputs_embeds"] = embeds
+
+        input_ids = model_inputs.get("input_ids")
+        if input_ids is None:
+            input_ids = input_batch.input_ids
+
+        gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
+        mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]] = []
+
+        for i in range(input_batch.num_reqs):
+            req_idx = int(input_batch.idx_mapping_np[i])
+            buf = self.intermediate_buffer.buffers[req_idx]
+
+            # Skip warmup/dummy requests that have no real buffer data.
+            # Warmup creates fake requests without the metadata that
+            # model.preprocess() requires (e.g. additional_information.text).
+            if not buf or "req_id" not in buf:
+                continue
+
+            start = int(input_batch.query_start_loc_np[i])
+            n_tok = int(input_batch.num_scheduled_tokens[i])
+
+            ids_slice = input_ids[start : start + n_tok]
+            emb_slice = embeds[start : start + n_tok]
+
+            try:
+                new_ids, new_emb, updates = self.model.preprocess(
+                    ids_slice, emb_slice, **buf
+                )
+            except Exception:
+                logger.warning(
+                    "preprocess failed for req_idx=%d (req_id=%s); "
+                    "skipping preprocess for this request",
+                    req_idx,
+                    buf.get("req_id", "?"),
+                    exc_info=True,
+                )
+                continue
+
+            # Write back in-place
+            seg = min(n_tok, new_ids.shape[0])
+            input_ids[start : start + seg] = new_ids[:seg]
+            embeds[start : start + seg] = new_emb[:seg]
+
+            # Collect MTP inputs for decode steps (n_tok == 1 with mtp_inputs)
+            mtp_inputs = updates.pop("mtp_inputs", None)
+            if mtp_inputs is not None and n_tok == 1:
+                mtp_batches.append((i, start, mtp_inputs))
+
+            self.intermediate_buffer.update(req_idx, updates, gpu_keys)
+
+        if mtp_batches and hasattr(self.model, "talker_mtp"):
+            self._run_batched_mtp(mtp_batches, input_ids, embeds, input_batch, gpu_keys)
+
+    def _run_batched_mtp(
+        self,
+        mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]],
+        input_ids: torch.Tensor,
+        embeds: torch.Tensor,
+        input_batch: InputBatch,
+        gpu_keys: set[str],
+    ) -> None:
+        """Batch MTP forward for all decode-step requests.
+
+        Uses pre-allocated static buffers to avoid per-step torch.cat
+        memory allocations.
+        """
+        from vllm.forward_context import set_forward_context
+
+        bsz = len(mtp_batches)
+
+        # Fill static buffers via .copy_() — no allocation.
+        if (
+            self._mtp_input_ids is not None
+            and bsz <= self._mtp_input_ids.shape[0]
+        ):
+            for j, (_i, start, (past_hidden, text_step)) in enumerate(
+                mtp_batches
+            ):
+                self._mtp_input_ids[j] = input_ids[start]
+                self._mtp_input_embeds[j].copy_(embeds[start])
+                self._mtp_hidden[j].copy_(
+                    past_hidden.reshape(-1)[: self._mtp_hidden.shape[1]]
+                )
+                self._mtp_text_step[j].copy_(
+                    text_step.reshape(-1)[: self._mtp_text_step.shape[1]]
+                )
+            batch_ids = self._mtp_input_ids[:bsz]
+            batch_emb = self._mtp_input_embeds[:bsz]
+            batch_hidden = self._mtp_hidden[:bsz]
+            batch_step = self._mtp_text_step[:bsz]
+        else:
+            # Fallback to torch.cat if static buffers not available.
+            ids_list, emb_list, hidden_list, step_list = [], [], [], []
+            for _i, start, (past_hidden, text_step) in mtp_batches:
+                ids_list.append(input_ids[start : start + 1])
+                emb_list.append(embeds[start : start + 1])
+                hidden_list.append(past_hidden)
+                step_list.append(text_step)
+            batch_ids = torch.cat(ids_list)
+            batch_emb = torch.cat(emb_list)
+            batch_hidden = torch.cat(hidden_list)
+            batch_step = torch.cat(step_list)
+
+        with set_forward_context(
+            None,
+            self.vllm_config,
+            num_tokens=bsz,
+        ):
+            new_emb, codes = self.model.talker_mtp(
+                batch_ids, batch_emb, batch_hidden, batch_step,
+            )
+
+        audio_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
+        for j, (i, start, _) in enumerate(mtp_batches):
+            embeds[start : start + 1] = new_emb[j : j + 1]
+            req_idx = int(input_batch.idx_mapping_np[i])
+            self.intermediate_buffer.update(
+                req_idx, {audio_key: codes[j : j + 1]}, gpu_keys
+            )
+
+    # ------------------------------------------------------------------
+    # Post-forward: per-request postprocess
+    # ------------------------------------------------------------------
+
+    def run_postprocess(
+        self, hidden_states: torch.Tensor, input_batch: InputBatch
+    ) -> None:
+        """Per-request postprocess after model forward.
+
+        Extracts per-request updates from hidden_states and writes them
+        back to the intermediate buffer (e.g. ``last_talker_hidden``).
+        """
+        if not self.has_postprocess:
+            return
+        gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
+        for i in range(input_batch.num_reqs):
+            req_idx = int(input_batch.idx_mapping_np[i])
+            buf = self.intermediate_buffer.buffers[req_idx]
+            if not buf or "req_id" not in buf:
+                continue
+            start = int(input_batch.query_start_loc_np[i])
+            n_tok = int(input_batch.num_scheduled_tokens[i])
+            h_slice = hidden_states[start : start + n_tok]
+            updates = self.model.postprocess(h_slice, **buf)
+            if updates:
+                self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 
     # ------------------------------------------------------------------
     # Output post-processing
@@ -134,9 +487,13 @@ class OmniModelState(DefaultModelState):
                         runtime_additional_information=buffer_list,
                     )
                 except Exception:
-                    logger.debug(
-                        "make_omni_output skipped for %s output",
-                        type(model_output).__name__,
+                    _desc = type(model_output).__name__
+                    if isinstance(model_output, (list, tuple)):
+                        _desc += f"(len={len(model_output)})"
+                    logger.warning(
+                        "make_omni_output failed for %s; "
+                        "multimodal outputs will be empty",
+                        _desc,
                         exc_info=True,
                     )
 

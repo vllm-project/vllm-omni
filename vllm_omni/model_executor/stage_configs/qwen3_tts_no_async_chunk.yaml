@@ -62,3 +62,4 @@ stage_args:
       seed: 42
       detokenize: true
       repetition_penalty: 1.0
+      stop_token_ids: [0]

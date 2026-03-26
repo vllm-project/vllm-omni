@@ -28,8 +28,6 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
 
-EMPTY_GEN_OUTPUT = OmniModelRunnerOutput(req_ids=[], req_id_to_index={})
-
 
 class OmniGenerationModelRunner(OmniGPUModelRunner):
     """Non-autoregressive generation runner (e.g. Code2Wav).
@@ -148,8 +146,9 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                     runtime_additional_information=buffer_list,
                 )
             except Exception:
-                logger.debug(
-                    "make_omni_output failed for generation output",
+                logger.error(
+                    "make_omni_output failed for generation output; "
+                    "raw output will be used as multimodal_outputs",
                     exc_info=True,
                 )
 
@@ -188,24 +187,62 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         self._gen_model_output = None
         self._gen_input_batch = None
         self._gen_kv_connector_output = None
+        self.execute_model_state = None
 
         if model_output is None or input_batch is None:
             return None
 
+        num_reqs = input_batch.num_reqs
+
+        # Resolve the EOS token once.  Used both for postprocess
+        # (advancing num_computed_tokens) and for the returned
+        # sampled_token_ids (triggering scheduler's check_stop).
+        # OmniModelConfig may not expose eos_token_id directly;
+        # fall back through hf_text_config, then default to 0.
+        eos_id = getattr(self.model_config, "eos_token_id", None)
+        if eos_id is None:
+            eos_id = getattr(
+                getattr(self.model_config, "hf_text_config", None),
+                "eos_token_id",
+                None,
+            )
+        if eos_id is None:
+            eos_id = 0
+
+        # Advance num_computed_tokens via the upstream postprocess
+        # kernel.  Without this the scheduler re-schedules the same
+        # tokens every step (infinite loop).
+        dummy_sampled = torch.full(
+            (num_reqs, 1), eos_id, dtype=torch.long, device=self.device
+        )
+        dummy_num_sampled = torch.ones(
+            num_reqs, dtype=torch.int32, device=self.device
+        )
+        dummy_num_rejected = torch.zeros(
+            num_reqs, dtype=torch.int32, device=self.device
+        )
+        self.postprocess(
+            input_batch, dummy_sampled, dummy_num_sampled, dummy_num_rejected
+        )
+
+        # Build pooler_output from multimodal model outputs.
         multimodal_outputs: dict | list | torch.Tensor | None = None
         if isinstance(model_output, OmniOutput):
             multimodal_outputs = model_output.multimodal_outputs
         else:
             multimodal_outputs = model_output
 
-        num_reqs = input_batch.num_reqs
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
             for i in range(num_reqs):
-                pooler_output.append({"model_outputs": multimodal_outputs[i].detach().cpu().contiguous()})
+                pooler_output.append(
+                    {"model_outputs": multimodal_outputs[i].detach().cpu().contiguous()}
+                )
         elif isinstance(multimodal_outputs, list):
             for out in multimodal_outputs:
-                pooler_output.append({"model_outputs": out.detach().cpu().contiguous() if out is not None else None})
+                pooler_output.append(
+                    {"model_outputs": out.detach().cpu().contiguous() if out is not None else None}
+                )
         elif isinstance(multimodal_outputs, dict):
             for i in range(num_reqs):
                 mm_payload: dict[str, Any] = {}
@@ -217,7 +254,10 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                             mm_payload[key] = val.detach().cpu().contiguous()
                     elif isinstance(val, list) and len(val) == num_reqs:
                         out = val[i]
-                        mm_payload[key] = out.detach().cpu().contiguous() if isinstance(out, torch.Tensor) else out
+                        mm_payload[key] = (
+                            out.detach().cpu().contiguous()
+                            if isinstance(out, torch.Tensor) else out
+                        )
                     else:
                         mm_payload[key] = val
                 pooler_output.append(mm_payload)
@@ -225,13 +265,21 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             pooler_output = [None] * num_reqs
 
         req_ids = input_batch.req_ids[:]
+
+        # Generation models don't do token sampling, but V2's scheduler
+        # relies on sampled_token_ids to detect request completion via
+        # check_stop().  Emit one EOS token per request so the scheduler
+        # marks them FINISHED_STOPPED and frees the request slot.
+        sampled_token_ids: list[list[int]] = [[eos_id]] * len(req_ids)
+
         return OmniModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
-            sampled_token_ids=[],
+            sampled_token_ids=sampled_token_ids,
             pooler_output=pooler_output,
             multimodal_outputs=(
-                multimodal_outputs if isinstance(multimodal_outputs, dict) else {"model_outputs": multimodal_outputs}
+                multimodal_outputs if isinstance(multimodal_outputs, dict)
+                else {"model_outputs": multimodal_outputs}
             ),
             kv_connector_output=kv_connector_output,
         )

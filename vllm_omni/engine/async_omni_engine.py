@@ -304,6 +304,11 @@ class AsyncOmniEngine:
         device_control_env = current_omni_platform.device_control_env_var
 
         try:
+            # Only hold the lock for device setup and config building.
+            # Engine creation (launch_core_engines) runs outside the lock
+            # so that multiple stages can initialize in parallel, which
+            # is critical for TTS where Stage 1 (Code2Wav) CUDA Graph
+            # warmup takes several seconds.
             with llm_stage_launch_lock:
                 previous_visible_devices = os.environ.get(device_control_env)
                 try:
@@ -335,27 +340,30 @@ class AsyncOmniEngine:
                         stage_init_timeout,
                     )
                     addresses = get_engine_zmq_addresses(vllm_config)
-                    launch_cm = launch_core_engines(
-                        vllm_config=vllm_config,
-                        executor_class=executor_class,
-                        log_stats=False,
-                        addresses=addresses,
-                    )
-                    engine_manager, coordinator, addresses = launch_cm.__enter__()
-                    started_stage = StartedLlmStage(
-                        stage_id=metadata.stage_id,
-                        metadata=metadata,
-                        vllm_config=vllm_config,
-                        executor_class=executor_class,
-                        engine_manager=engine_manager,
-                        coordinator=coordinator,
-                        addresses=addresses,
-                    )
                 finally:
                     if previous_visible_devices is None:
                         current_omni_platform.unset_device_control_env_var()
                     else:
                         current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+            # Engine creation and startup outside the lock — allows
+            # parallel initialization across stages.
+            launch_cm = launch_core_engines(
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=False,
+                addresses=addresses,
+            )
+            engine_manager, coordinator, addresses = launch_cm.__enter__()
+            started_stage = StartedLlmStage(
+                stage_id=metadata.stage_id,
+                metadata=metadata,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                engine_manager=engine_manager,
+                coordinator=coordinator,
+                addresses=addresses,
+            )
 
             logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
             launch_cm.__exit__(None, None, None)

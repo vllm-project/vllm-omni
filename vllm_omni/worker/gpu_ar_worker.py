@@ -109,3 +109,42 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    @instrument(span_name="Compile/warmup")
+    def compile_or_warm_up_model(self) -> float:
+        """Skip warmup_kernels for V2 Omni AR models.
+
+        Upstream ``compile_or_warm_up_model`` calls ``warmup_kernels()``
+        only for V2 model runners.  ``warmup_kernels`` creates fake
+        requests with hardcoded block_ids that bypass KVCacheManager
+        and runs real (non-dummy) execute_model + sample_tokens.  For
+        Omni AR models with preprocess, this pollutes model-internal
+        state and produces incorrect logits for subsequent real
+        requests (observed 30x more decode steps than V1).
+
+        This override runs the parent implementation but patches out
+        the ``warmup_kernels`` call, matching V1 behavior.
+        """
+        if not self.use_v2_model_runner:
+            return super().compile_or_warm_up_model()
+
+        # Temporarily disable warmup_kernels during parent call.
+        # Must patch both the module attribute AND the local name in
+        # gpu_worker (from-import creates a local binding).
+        import vllm.v1.worker.gpu_worker as _gw
+        _orig = _gw.warmup_kernels
+        _noop = lambda *a, **kw: None
+        _gw.warmup_kernels = _noop
+        # Also patch the module where it was originally defined
+        import vllm.v1.worker.gpu.warmup as _wm
+        _orig_wm = _wm.warmup_kernels
+        _wm.warmup_kernels = _noop
+        try:
+            result = super().compile_or_warm_up_model()
+        finally:
+            _gw.warmup_kernels = _orig
+            _wm.warmup_kernels = _orig_wm
+        logger.info(
+            "compile_or_warm_up_model: skipped warmup_kernels for Omni AR V2"
+        )
+        return result

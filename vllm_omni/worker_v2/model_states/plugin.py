@@ -28,7 +28,6 @@ class OmniModelStatePlugin(ABC):
     def prepare_extra_inputs(self, input_batch: InputBatch, req_states: RequestState) -> dict[str, Any]:
         return {}
 
-    @abstractmethod
     def postprocess(
         self,
         text_hidden: Any,
@@ -36,6 +35,7 @@ class OmniModelStatePlugin(ABC):
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> tuple[Any, dict]:
+        """Post-process model output.  Default is pass-through."""
         return text_hidden, multimodal_outputs
 
     def dummy_run(self, state: Any, num_tokens: int) -> None:
