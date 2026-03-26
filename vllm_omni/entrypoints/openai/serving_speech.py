@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import json
 import math
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import soundfile as sf
 import torch
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
@@ -54,6 +56,8 @@ _TTS_LANGUAGES: set[str] = {
     "Spanish",
     "Italian",
 }
+_REF_AUDIO_MIN_DURATION = 1.0  # seconds
+_REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
@@ -437,8 +441,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error(f"Could not read audio file for voice {voice_name}: {e}")
             return None
 
-    async def upload_voice(self, audio_file: UploadFile, consent: str, name: str) -> dict:
-        """Upload a new voice sample."""
+    async def upload_voice(
+        self, audio_file: UploadFile, consent: str, name: str, *, ref_text: str | None = None
+    ) -> dict:
+        # Normalize ref_text: treat whitespace-only as absent
+        if ref_text is not None:
+            ref_text = ref_text.strip() or None
         # Validate file size (max 10MB)
         MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
         audio_file.file.seek(0, 2)  # Seek to end
@@ -512,10 +520,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not _validate_path_within_directory(file_path, self.uploaded_speakers_dir):
             raise ValueError("Invalid file path: potential path traversal attack detected")
 
+        # Read content and validate duration before saving
+        content = await audio_file.read()
+        try:
+            wav_np, sr = sf.read(io.BytesIO(content))
+            duration = len(wav_np) / sr if sr > 0 else 0.0
+            if duration < _REF_AUDIO_MIN_DURATION:
+                raise ValueError(
+                    f"Reference audio too short ({duration:.1f}s). "
+                    f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
+                )
+            if duration > _REF_AUDIO_MAX_DURATION:
+                raise ValueError(
+                    f"Reference audio too long ({duration:.1f}s). "
+                    f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
+                )
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning("Could not validate audio duration: %s", e)
+
         # Save audio file
         try:
             with open(file_path, "wb") as f:
-                content = await audio_file.read()
                 f.write(content)
         except Exception as e:
             raise ValueError(f"Failed to save audio file: {e}")
@@ -529,6 +556,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "mime_type": mime_type,
             "original_filename": audio_file.filename,
             "file_size": file_size,
+            "ref_text": ref_text,
             "cache_status": "pending",  # The initial cache state is pending.
             "cache_file": None,  # The initial cache file is empty.
             "cache_generated_at": None,  # The initial cache generation time is empty.
@@ -552,13 +580,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         logger.info(f"Uploaded new voice '{name}' with consent ID '{consent}'")
 
         # Return voice information without exposing the server file path
-        return {
+        result = {
             "name": name,
             "consent": consent,
             "created_at": timestamp,
             "mime_type": mime_type,
             "file_size": file_size,
         }
+        if ref_text is not None:
+            result["ref_text"] = ref_text
+        return result
 
     async def upload_voice_embedding(self, embedding_json: str, consent: str, name: str) -> dict:
         """Upload a voice from a pre-computed speaker embedding.
@@ -863,7 +894,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
-        return wav_np.tolist(), int(sr)
+        sr = int(sr)
+        duration = len(wav_np) / sr if sr > 0 else 0.0
+        if duration < _REF_AUDIO_MIN_DURATION:
+            raise ValueError(
+                f"Reference audio too short ({duration:.1f}s). "
+                f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
+            )
+        if duration > _REF_AUDIO_MAX_DURATION:
+            raise ValueError(
+                f"Reference audio too long ({duration:.1f}s). "
+                f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
+            )
+        return wav_np.tolist(), sr
 
     async def _generate_audio_chunks(self, generator, request_id: str, response_format: str = "pcm"):
         """Generate audio chunks for streaming response.
@@ -987,15 +1030,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.voice is not None:
             params["speaker"] = [request.voice]
 
-            # If voice is an uploaded speaker and no ref_audio provided, auto-set it
+            # Uploaded voices use task_type="Base" (CustomVoice requires built-in spk_id).
+            # If ref_text was provided at upload time, use in-context cloning; otherwise x_vector only.
             if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
                 audio_data = self._get_uploaded_audio_data(request.voice)
-                if audio_data:
-                    params["ref_audio"] = [audio_data]
-                    params["x_vector_only_mode"] = [True]
-                    logger.info(f"Auto-set ref_audio for uploaded voice: {request.voice}")
-                else:
+                if not audio_data:
                     raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
+                speaker_info = self.uploaded_speakers[request.voice.lower()]
+                stored_ref_text = speaker_info.get("ref_text")
+                params["ref_audio"] = [audio_data]
+                params["task_type"] = ["Base"]
+                if stored_ref_text:
+                    params["ref_text"] = [stored_ref_text]
+                    params["x_vector_only_mode"] = [False]
+                else:
+                    params["x_vector_only_mode"] = [True]
+                logger.info("Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text))
 
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice
@@ -1162,8 +1212,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params = {}
             else:
                 tts_params = self._build_tts_params(request)
-                if request.ref_audio is not None:
-                    wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                # Resolve ref_audio (explicit or auto-set for uploaded voices)
+                # to [[wav_list, sr]] so the model doesn't re-decode base64.
+                ref_audio_source = request.ref_audio
+                if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
+                    # Uploaded voice: ref_audio was auto-set as [base64_data_url]
+                    ref_audio_source = tts_params["ref_audio"][0]
+                if ref_audio_source is not None and isinstance(ref_audio_source, str):
+                    wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
                     tts_params["ref_audio"] = [[wav_list, sr]]
 
                 ph_len = self._estimate_prompt_len(tts_params)
