@@ -38,10 +38,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class TextTTSBridgeConfig:
@@ -52,9 +52,7 @@ class TextTTSBridgeConfig:
     Lower → less latency / higher TTFA variance.
     Higher → smoother audio / higher TTFA."""
 
-    sentence_delimiters: list[str] = field(
-        default_factory=lambda: [".", "!", "?", "。", "！", "？"]
-    )
+    sentence_delimiters: list[str] = field(default_factory=lambda: [".", "!", "?", "。", "！", "？"])
     """Punctuation characters that trigger a sentence flush."""
 
     tts_task_type: str = "CustomVoice"
@@ -67,7 +65,7 @@ class TextTTSBridgeConfig:
     """Fallback language tag for Qwen3-TTS CustomVoice inputs."""
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "TextTTSBridgeConfig":
+    def from_dict(cls, d: dict[str, Any]) -> TextTTSBridgeConfig:
         valid = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
         return cls(**valid)
 
@@ -75,6 +73,7 @@ class TextTTSBridgeConfig:
 # ---------------------------------------------------------------------------
 # Sentence chunker
 # ---------------------------------------------------------------------------
+
 
 def _build_sentence_re(delimiters: list[str]) -> re.Pattern:
     """Compile a lookbehind regex for the given sentence-ending delimiters."""
@@ -137,6 +136,7 @@ class SentenceChunker:
 # Helpers: extract detokenized text from pooling_output
 # ---------------------------------------------------------------------------
 
+
 def _get_decoded_text(
     pooling_output: dict[str, Any],
     request: Any,
@@ -197,6 +197,7 @@ def _cleanup_chunker(transfer_manager: Any, request_id: str) -> None:
 # Input builder: text chunk → Qwen3-TTS CustomVoice input dict
 # ---------------------------------------------------------------------------
 
+
 def _build_tts_input(
     text_chunk: str,
     cfg: TextTTSBridgeConfig,
@@ -230,6 +231,7 @@ def _build_tts_input(
 # ---------------------------------------------------------------------------
 # Main hook: custom_process_next_stage_input_func entry point
 # ---------------------------------------------------------------------------
+
 
 def text2tts(
     transfer_manager: Any,
@@ -293,7 +295,4 @@ def text2tts(
         return None  # still buffering — matches framework convention
 
     # --- Build one Qwen3-TTS input dict per flushed sentence chunk ----------
-    return [
-        _build_tts_input(chunk, cfg, request)
-        for chunk in ready_chunks
-    ]
+    return [_build_tts_input(chunk, cfg, request) for chunk in ready_chunks]

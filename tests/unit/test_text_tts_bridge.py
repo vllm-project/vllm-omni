@@ -12,23 +12,21 @@ Run:
     pytest tests/unit/test_text_tts_bridge.py -v --noconftest
 """
 
-import pytest
 from unittest.mock import MagicMock
 
 from vllm_omni.model_executor.stage_input_processors.text_tts_bridge import (
     SentenceChunker,
     TextTTSBridgeConfig,
-    _build_sentence_re,
+    _cleanup_chunker,
     _get_decoded_text,
     _get_or_create_chunker,
-    _cleanup_chunker,
     text2tts,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
+
 
 def make_transfer_manager(bridge_cfg: dict | None = None):
     """
@@ -85,8 +83,8 @@ def make_pooling_output(text: str = "") -> dict:
 # TextTTSBridgeConfig
 # =============================================================================
 
-class TestTextTTSBridgeConfig:
 
+class TestTextTTSBridgeConfig:
     def test_defaults(self):
         cfg = TextTTSBridgeConfig()
         assert cfg.min_sentence_chars == 40
@@ -114,8 +112,8 @@ class TestTextTTSBridgeConfig:
 # SentenceChunker
 # =============================================================================
 
-class TestSentenceChunker:
 
+class TestSentenceChunker:
     def _chunker(self, min_chars=5):
         return SentenceChunker(TextTTSBridgeConfig(min_sentence_chars=min_chars))
 
@@ -194,8 +192,8 @@ class TestSentenceChunker:
 # _get_decoded_text
 # =============================================================================
 
-class TestGetDecodedText:
 
+class TestGetDecodedText:
     def test_reads_text_key_from_pooling_output(self):
         req = make_request()
         text = _get_decoded_text({"text": "Hello"}, req)
@@ -221,8 +219,8 @@ class TestGetDecodedText:
 # transfer_manager state helpers
 # =============================================================================
 
-class TestTransferManagerState:
 
+class TestTransferManagerState:
     def test_creates_chunker_on_first_call(self):
         tm = make_transfer_manager()
         cfg = TextTTSBridgeConfig(min_sentence_chars=5)
@@ -259,6 +257,7 @@ class TestTransferManagerState:
 # =============================================================================
 # text2tts — the full hook with real signature
 # =============================================================================
+
 
 class TestText2TtsHook:
     """
@@ -356,7 +355,7 @@ class TestText2TtsHook:
         all_results = []
 
         for i, tok in enumerate(tokens):
-            is_last = (i == len(tokens) - 1)
+            is_last = i == len(tokens) - 1
             r = text2tts(tm, make_pooling_output(tok), req, is_last)
             if r:
                 all_results.extend(r)
