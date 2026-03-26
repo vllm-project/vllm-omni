@@ -392,6 +392,20 @@ class TestSpeechAPI:
         assert result["voice"].get("ref_text") == "Hello world transcript"
         response = client.delete("/v1/audio/voices/test_voice_rt")
 
+    def test_upload_voice_with_voice_description(self, client, tmp_path):
+        """Test voice upload with voice_description stores and returns the description."""
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_vd", "voice_description": "  warm, energetic narrator  "}
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["success"] is True
+        assert result["voice"]["name"] == "test_voice_vd"
+        assert result["voice"].get("voice_description") == "warm, energetic narrator"
+        client.delete("/v1/audio/voices/test_voice_vd")
+
     def test_upload_voice_file_too_large(self, client):
         """Test voice upload with file exceeding size limit."""
         # Create a file larger than 10MB
@@ -845,6 +859,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": None,
+                "created_at": 1711234567.89,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -857,6 +872,7 @@ class TestTTSMethods:
             assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
             assert params["x_vector_only_mode"] == [True]
             assert params["task_type"] == ["Base"]
+            assert params["voice_created_at"] == [1711234567.89]
             assert "ref_text" not in params
 
     def test_build_tts_params_with_uploaded_voice_ref_text(self, speech_server):
@@ -867,6 +883,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": "Hello world transcript",
+                "created_at": 1711234567.89,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -880,6 +897,7 @@ class TestTTSMethods:
             assert params["x_vector_only_mode"] == [False]
             assert params["task_type"] == ["Base"]
             assert params["ref_text"] == ["Hello world transcript"]
+            assert params["voice_created_at"] == [1711234567.89]
 
     def test_build_tts_params_without_uploaded_voice(self, speech_server):
         """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""
