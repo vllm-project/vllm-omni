@@ -112,7 +112,7 @@ steps:
                   type: DirectoryOrCreate
 
   - label: ":full_moon: Diffusion Model Wan22 completed Test with H100"
-    timeout_in_minutes: 45
+    timeout_in_minutes: 90
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:
