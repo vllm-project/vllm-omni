@@ -53,6 +53,8 @@ PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
 
 _GENDER_PIPELINE = None
+# transformers.Pipeline is not thread-safe; concurrent e2e requests must serialize inference.
+_GENDER_PIPELINE_LOCK = threading.Lock()
 
 # int16 mono PCM from /v1/audio/speech when response_format=pcm (Qwen3-TTS code2wav output rate).
 _PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
@@ -1332,6 +1334,45 @@ def _load_gender_pipeline():
         return None
 
 
+def _median_pitch_hz_from_autocorr(mono: np.ndarray, sr: int) -> float | None:
+    """
+    Rough median F0 (Hz) over short-time frames. Used to debias wav2vec2 gender head on TTS,
+    which often labels lower-pitched synthetic speech as female under load or on clean signals.
+    Returns None if the clip is too short or mostly unvoiced.
+    """
+    x = np.asarray(mono, dtype=np.float64)
+    x = x - np.mean(x)
+    if x.size < int(0.15 * sr):
+        return None
+    frame_len = int(0.04 * sr)
+    hop = max(frame_len // 2, 1)
+    f0_min_hz, f0_max_hz = 70.0, 400.0
+    lag_min = max(1, int(sr / f0_max_hz))
+    lag_max = min(frame_len - 2, int(sr / f0_min_hz))
+    if lag_max <= lag_min:
+        return None
+    win = np.hamming(frame_len)
+    pitches: list[float] = []
+    for start in range(0, int(x.shape[0]) - frame_len, hop):
+        frame = x[start : start + frame_len] * win
+        frame = frame - np.mean(frame)
+        if float(np.sqrt(np.mean(frame**2))) < 1e-4:
+            continue
+        ac = np.correlate(frame, frame, mode="full")[frame_len - 1 :]
+        ac = ac / (float(ac[0]) + 1e-12)
+        region = ac[lag_min : lag_max + 1]
+        peak_rel = int(np.argmax(region))
+        peak_lag = peak_rel + lag_min
+        if peak_lag <= 0:
+            continue
+        f0 = float(sr) / float(peak_lag)
+        if f0_min_hz <= f0 <= f0_max_hz:
+            pitches.append(f0)
+    if len(pitches) < 4:
+        return None
+    return float(np.median(np.asarray(pitches, dtype=np.float64)))
+
+
 def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     """
     Estimate voice gender from audio using a small pre-trained classification model.
@@ -1340,6 +1381,9 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     Returns 'male' / 'female' when the model confidence is >= 0.9 and the label
     maps to one of these; otherwise returns 'unknown'. If the model is unavailable
     or inference fails, returns 'unknown' to keep tests stable.
+
+    Under concurrent tests, a global lock serializes pipeline calls (the HF pipeline is not
+    thread-safe). A coarse F0 median can correct systematic "male -> female" errors on TTS audio.
     """
     data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
     if data.size == 0:
@@ -1356,13 +1400,16 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
             mono = np.interp(dst_idx, src_idx, mono.astype(np.float32, copy=False)).astype(np.float32)
             sr = target_sr
 
+        median_f0 = _median_pitch_hz_from_autocorr(mono, sr)
+
         clf = _load_gender_pipeline()
         if clf is None:
             print("gender model not available, returning 'unknown'")
             return "unknown"
 
         # transformers pipeline returns a list of {label, score} (highest score first).
-        outputs = clf(mono, sampling_rate=sr)
+        with _GENDER_PIPELINE_LOCK:
+            outputs = clf(mono, sampling_rate=sr)
         if not outputs:
             return "unknown"
 
@@ -1380,7 +1427,19 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         else:
             gender = "unknown"
 
-        print(f"gender classifier: label={label}, conf={conf:.3f}, gender={gender}")
+        # Debias: wav2vec2 gender heads often call TTS / band-limited male speech "female".
+        # Low median F0 (~speech male range) + female label -> trust pitch when score is not overwhelming.
+        if gender == "female" and median_f0 is not None and median_f0 < 165.0 and conf < 0.88:
+            print(f"gender pitch assist: reclassifying female->male (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
+            gender = "male"
+        elif gender == "male" and median_f0 is not None and median_f0 > 230.0 and conf < 0.88:
+            print(f"gender pitch assist: reclassifying male->female (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
+            gender = "female"
+
+        print(
+            f"gender classifier: label={label}, conf={conf:.3f}, gender={gender}"
+            + (f", median_f0={median_f0:.1f}Hz" if median_f0 is not None else "")
+        )
         return gender
     except Exception as exc:  # pragma: no cover - best-effort fallback
         print(f"Warning: gender classification failed, returning 'unknown': {exc}")
