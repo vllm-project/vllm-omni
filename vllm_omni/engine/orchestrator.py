@@ -692,7 +692,8 @@ class Orchestrator:
                 model_config=self.stage_vllm_configs[next_stage_id].model_config,
                 mm_features=_mm_features,
             )
-
+            
+            # TODO: Here we directly use the req id to assign.
             request.external_req_id = request.request_id
 
             self.output_processors[next_stage_id].add_request(
