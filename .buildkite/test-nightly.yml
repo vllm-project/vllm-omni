@@ -228,6 +228,93 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  - label: ":full_moon: GEBench Accuracy Test with H100"
+    key: nightly-gebench-accuracy
+    timeout_in_minutes: 60
+    depends_on: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    commands:
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/e2e/accuracy/test_gebench_h100_smoke.py --run-level advanced_model --gebench-model Qwen/Qwen-Image-2512 --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --accuracy-gpu 0 --gebench-port 8093 --accuracy-workers 1
+      - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gebench_qwen-image-2512/summary*.json"
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  - label: ":full_moon: GEdit-Bench Accuracy Test with H100"
+    key: nightly-gedit-bench-accuracy
+    timeout_in_minutes: 60
+    depends_on: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    commands:
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/e2e/accuracy/test_gedit_bench_h100_smoke.py --run-level advanced_model --gedit-model Qwen/Qwen-Image-Edit --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --accuracy-gpu 0 --gedit-port 8093 --gedit-samples-per-group 20 --accuracy-workers 1
+      - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gedit_scores_qwen-image-edit/qwen-image-edit_all_all_vie_score_*.csv"
+      - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gedit_scores_qwen-image-edit/qwen-image-edit_all_all_summary_*.json"
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
                   - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
                     value: "120"
                   - name: HF_TOKEN

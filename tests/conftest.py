@@ -54,6 +54,8 @@ class OmniServerParams(NamedTuple):
     port: int | None = None
     stage_config_path: str | None = None
     server_args: list[str] | None = None
+    env_dict: dict[str, str] | None = None
+    use_omni: bool = True
 
 
 def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
@@ -1076,6 +1078,7 @@ class OmniServer:
         *,
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
+        use_omni: bool = True,
     ) -> None:
         _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
@@ -1083,6 +1086,7 @@ class OmniServer:
         self.model = model
         self.serve_args = serve_args
         self.env_dict = env_dict
+        self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         if port is None:
@@ -1103,12 +1107,14 @@ class OmniServer:
             "vllm_omni.entrypoints.cli.main",
             "serve",
             self.model,
-            "--omni",
             "--host",
             self.host,
             "--port",
             str(self.port),
-        ] + self.serve_args
+        ]
+        if self.use_omni:
+            cmd.append("--omni")
+        cmd += self.serve_args
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         self.proc = subprocess.Popen(
@@ -1237,19 +1243,35 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         stage_config_path = params.stage_config_path
         if run_level == "advanced_model" and stage_config_path is not None:
             with open(stage_config_path, encoding="utf-8") as f:
-                _cfg = yaml.safe_load(f) or {}
-            _stage_ids = [s["stage_id"] for s in _cfg.get("stage_args", []) if "stage_id" in s]
+                cfg = yaml.safe_load(f) or {}
+            stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={"stage_args": {sid: ["engine_args.load_format"] for sid in _stage_ids}},
+                deletes={"stage_args": {stage_id: ["engine_args.load_format"] for stage_id in stage_ids}},
             )
 
         server_args = params.server_args or []
-        server_args = ["--stage-init-timeout", "120", *server_args]
+        if params.use_omni:
+            server_args = ["--stage-init-timeout", "120", *server_args]
         if stage_config_path is not None:
             server_args += ["--stage-configs-path", stage_config_path]
 
-        with OmniServer(model, server_args, port=port) if port else OmniServer(model, server_args) as server:
+        with (
+            OmniServer(
+                model,
+                server_args,
+                port=port,
+                env_dict=params.env_dict,
+                use_omni=params.use_omni,
+            )
+            if port
+            else OmniServer(
+                model,
+                server_args,
+                env_dict=params.env_dict,
+                use_omni=params.use_omni,
+            )
+        ) as server:
             print("OmniServer started successfully")
             yield server
             print("OmniServer stopping...")
