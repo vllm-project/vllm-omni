@@ -448,14 +448,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         name: str,
         *,
         ref_text: str | None = None,
-        voice_description: str | None = None,
+        speaker_description: str | None = None,
     ) -> dict:
         """Upload a new voice sample."""
         # Normalize optional strings: treat whitespace-only as absent
         if ref_text is not None:
             ref_text = ref_text.strip() or None
-        if voice_description is not None:
-            voice_description = voice_description.strip() or None
+        if speaker_description is not None:
+            speaker_description = speaker_description.strip() or None
         # Validate file size (max 10MB)
         MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
         audio_file.file.seek(0, 2)  # Seek to end
@@ -579,8 +579,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             speaker_data["ref_text"] = ref_text
 
         # Store voice description if provided.
-        if voice_description:
-            speaker_data["voice_description"] = voice_description
+        if speaker_description:
+            speaker_data["speaker_description"] = speaker_description
 
         # Save metadata using metadata manager (concurrency safe)
         success = self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
@@ -608,8 +608,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
         if speaker_data.get("ref_text"):
             result["ref_text"] = speaker_data["ref_text"]
-        if speaker_data.get("voice_description"):
-            result["voice_description"] = speaker_data["voice_description"]
+        if speaker_data.get("speaker_description"):
+            result["speaker_description"] = speaker_data["speaker_description"]
         return result
 
     async def upload_voice_embedding(self, embedding_json: str, consent: str, name: str) -> dict:

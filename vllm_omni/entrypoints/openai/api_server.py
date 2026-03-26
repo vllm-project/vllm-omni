@@ -1028,8 +1028,8 @@ async def list_voices(raw_request: Request):
             }
             if info.get("ref_text"):
                 voice_entry["ref_text"] = info["ref_text"]
-            if info.get("voice_description"):
-                voice_entry["voice_description"] = info["voice_description"]
+            if info.get("speaker_description"):
+                voice_entry["speaker_description"] = info["speaker_description"]
             uploaded_speakers.append(voice_entry)
 
     return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
@@ -1050,7 +1050,7 @@ async def upload_voice(
     consent: str = Form(...),
     name: str = Form(...),
     ref_text: str | None = Form(None),
-    voice_description: str | None = Form(None),
+    speaker_description: str | None = Form(None),
 ):
     """Upload a new voice for voice cloning.
 
@@ -1072,7 +1072,7 @@ async def upload_voice(
         ref_text: Optional transcript of the audio for ICL (in-context
             learning) mode. When provided, voice clone requests using this
             voice will produce higher quality results.
-        voice_description: Optional free-form description of the voice
+        speaker_description: Optional free-form description of the voice
             (e.g. "warm speaker", "energetic narrator").
         raw_request: Raw FastAPI request
 
@@ -1096,7 +1096,7 @@ async def upload_voice(
                 consent,
                 name,
                 ref_text=ref_text,
-                voice_description=voice_description,
+                speaker_description=speaker_description,
             )
         else:
             return base(raw_request).create_error_response(
