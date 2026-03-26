@@ -1357,11 +1357,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_code_prompt = ref_code_t
 
             # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
+            # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
+            # float list (from API via msgspec IPC) that _as_singleton would
+            # destructively unwrap to a single scalar.
             spk = None
             if voice_clone_prompt is not None:
-                spk = _as_singleton(voice_clone_prompt.get("ref_spk_embedding"))
+                spk = voice_clone_prompt.get("ref_spk_embedding")
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+            elif isinstance(spk, (list, np.ndarray)):
+                # Plain list/array from API (survived msgspec IPC serialization).
+                speaker_embed = torch.tensor(spk, dtype=torch.bfloat16, device=input_ids.device).view(1, 1, -1)
             else:
                 ref_audio_list = info_dict.get("ref_audio")
                 if not isinstance(ref_audio_list, list) or not ref_audio_list:
