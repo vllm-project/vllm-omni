@@ -602,7 +602,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
             update_dict["code_predictor_codes"] = code_predictor_codes
-            update_dict["num_processed_tokens_delta"] = span_len
         else:
             # decode
             if not info_dict.get("decode_flag", False):
@@ -620,8 +619,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
-        processed_delta = update_dict.pop("num_processed_tokens_delta")
-        update_dict["num_processed_tokens"] = info_dict.get("num_processed_tokens", 0) + processed_delta
+        update_dict["num_processed_tokens"] = info_dict.get("num_processed_tokens", 0) + span_len
         return input_ids, input_embeds, update_dict
 
     def talker_mtp(
@@ -918,7 +916,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         start_index = info_dict.get("num_processed_tokens", 0)
         thinker_output_token_ids = info_dict.get("thinker_output_token_ids", [])
         if start_index >= len(thinker_output_token_ids) - 1:
-            update_dict["num_processed_tokens_delta"] = 0
             if info_dict.get("finished_flag"):
                 return self.tts_pad_embed.to(device)
             update_dict["finished_flag"] = True
@@ -937,7 +934,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 thinker_embed = thinker_embed.to(device)
 
         update_dict["thinker_decode_embeddings"] = None
-        update_dict["num_processed_tokens_delta"] = 1
         return self.talker.text_projection(thinker_embed).to(device)
 
     def talker_preprocess_decode(
