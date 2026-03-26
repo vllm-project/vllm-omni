@@ -34,6 +34,7 @@ import pytest
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
 
 # ---------------------------------------------------------------------------
 # Paths
