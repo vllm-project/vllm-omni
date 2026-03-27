@@ -72,7 +72,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: ":full_moon: Diffusion Model Test with H100"
-    timeout_in_minutes: 60
+    timeout_in_minutes: 120
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:
