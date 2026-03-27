@@ -201,6 +201,18 @@ gpu_memory_utilization: 0.5
 
 - The first request may be slow due to model warmup. Subsequent requests will be faster.
 
+- If you encounter `Transformers does not recognize this architecture` error, your have to upgrade `transformers` package to `5.3.0` or newer:
+
+```
+pip install --upgrade transformers
+```
+
+or 
+
+```
+pip install transformers>=5.3.0
+```
+
 ## Example materials
 
 ??? abstract "openai_chat_client.py"
