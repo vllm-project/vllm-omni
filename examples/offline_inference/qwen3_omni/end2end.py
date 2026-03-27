@@ -296,6 +296,7 @@ def main(args):
 
     omni = Omni(
         model=model_name,
+        dtype=args.dtype,
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
@@ -554,6 +555,12 @@ def parse_args():
         nargs="*",
         default=None,
         help="List of stage IDs to profile. If not set, profiles all stages.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
     return parser.parse_args()

@@ -160,6 +160,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 | `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4) |
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
+| `ref_text` | string | No | Transcript of the audio. When provided, enables in-context voice cloning (higher quality). Without it, only the speaker embedding is extracted. |
 
 **Response Example:**
 
@@ -182,7 +183,8 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
-  -F "name=custom_voice_1"
+  -F "name=custom_voice_1" \
+  -F "ref_text=The exact transcript of the audio sample."
 ```
 
 ## Streaming Text Input (WebSocket)
@@ -318,11 +320,22 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ```
 
 ### Upload Voice
+
+Upload voice (speaker embedding only):
 ```bash
 curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1"
+```
+
+Upload voice with transcript (in-context cloning, higher quality):
+```bash
+curl -X POST http://localhost:8091/v1/audio/voices \
+  -F "audio_sample=@/path/to/voice_sample.wav" \
+  -F "consent=user_consent_id" \
+  -F "name=custom_voice_2" \
+  -F "ref_text=The exact transcript of the audio sample."
 ```
 
 ### Use Uploaded Voice
@@ -331,7 +344,6 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, this is a cloned voice",
-        "task_type": "Base",
         "voice": "custom_voice_1"
     }' --output cloned.wav
 ```

@@ -29,6 +29,10 @@ The `MIMO_AUDIO_TOKENIZER_PATH` environment variable is mandatory due to the spe
 export MIMO_AUDIO_TOKENIZER_PATH="XiaomiMiMo/MiMo-Audio-Tokenizer"
 ```
 
+### Flash Attention (audio generation)
+
+For **audio generation** (e.g. TTS variants, multi-turn spoken dialogue with audio output), install the **`flash-attn`** package with a build that matches your **CUDA** and **PyTorch** versions. On GPU, omitting **`flash-attn`** can cause **generated audio to be noise-only or otherwise unusable**. See the [FlashAttention](https://github.com/Dao-AILab/flash-attention) project for installation options and prebuilt wheels.
+
 ## Quick Start
 
 Run a single sample for basic TTS:
