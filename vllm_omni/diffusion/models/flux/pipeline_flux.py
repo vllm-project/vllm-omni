@@ -109,7 +109,9 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
         self.vae = DistributedAutoencoderKL.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
         ).to(self.device)
-        self.transformer = FluxTransformer2DModel(od_config=od_config, quant_config=quant_config)
+        self.transformer = FluxTransformer2DModel(
+            od_config=od_config, quant_config=od_config.quantization_config
+        )
 
         self.tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.tokenizer_2 = T5TokenizerFast.from_pretrained(
