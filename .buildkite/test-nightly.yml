@@ -11,10 +11,11 @@ steps:
         EXIT1=$$?
         pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "advanced_model" --run-level "advanced_model"
         EXIT2=$$?
-        # TODO: uncomment when mistralai/tts-model is public
-        # pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
-        # EXIT3=$$?
-        exit $$((EXIT1 | EXIT2))
+        pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
+        EXIT3=$$?
+        pytest -s -v tests/e2e/offline_inference/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
+        EXIT4=$$?
+        exit $$((EXIT1 | EXIT2 | EXIT3 | EXIT4))
     agents:
       queue: "mithril-h100-pool"
     plugins:
