@@ -2031,10 +2031,6 @@ class HunyuanImage3Model(nn.Module):
             return False
 
         for name, loaded_weight in weights:
-            # if "layers." in name:
-            #     layers_num = int(name.split("layers.")[1].split(".")[0])
-            #     if layers_num >= 2:
-            #         continue
             # print(f"Loading weight name: {name}, tp_rank: {tp_rank}", flush=True)
             if contains_unexpected_keyword(name, unexpected_keywords):
                 print(f"Skipping unexpected weight name: {name}")
@@ -2240,6 +2236,7 @@ class HunyuanImage3Model(nn.Module):
         prompt_size = 0
         shard_image_size = 0
         shard_padding_size = 0
+        origin_query_len = query_lens[0]
         if sp_world_size > 1:
             assert query_lens[0] == hidden_states.shape[1]
             (
@@ -2338,7 +2335,10 @@ class HunyuanImage3Model(nn.Module):
         if sp_world_size > 1:
             text_output, image_output = self._split_result(hidden_states, prompt_size)
             hidden_states = self.post_processor(image_output)
-            hidden_states = self.unifiled_cat(text_output, hidden_states, dim=1).contiguous()
+            hidden_states = self.unifiled_cat(text_output, hidden_states, dim=1)
+            # Since the SP system only records the primary padding information from the first stage,
+            # but different stages may introduce different padding sizes, we truncate it to ensure correct output.
+            hidden_states = hidden_states[:, :origin_query_len, :].contiguous()
 
         next_cache = None
         if use_cache:

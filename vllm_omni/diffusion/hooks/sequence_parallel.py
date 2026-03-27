@@ -426,13 +426,13 @@ class SequenceParallelSplitHook(ModelHook):
         if is_forward_context_available():
             ctx = get_forward_context()
             # Only set if not already set (first auto_pad tensor wins)
-            # if ctx.sp_original_seq_len is None:
-            ctx.sp_padding_size = pad_size
-            ctx.sp_original_seq_len = seq_len
-            logger.debug(
-                f"Auto-padded sequence from {seq_len} to {padded_seq_len} "
-                f"(pad_size={pad_size}, world_size={world_size}, dim={dim})"
-            )
+            if ctx.sp_original_seq_len is None:
+                ctx.sp_padding_size = pad_size
+                ctx.sp_original_seq_len = seq_len
+                logger.debug(
+                    f"Auto-padded sequence from {seq_len} to {padded_seq_len} "
+                    f"(pad_size={pad_size}, world_size={world_size}, dim={dim})"
+                )
 
         # Shard the padded tensor
         rank = get_sequence_parallel_rank()
