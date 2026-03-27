@@ -269,51 +269,6 @@ class StageDiffusionClient:
         finally:
             self._pending_rpcs.discard(rpc_id)
 
-        # Handle profile method: inject stage_id into profile_prefix for diffusion stages
-        if method == "profile":
-            target = getattr(self._engine, method, None)
-            if target is None:
-                return {
-                    "supported": False,
-                    "todo": True,
-                    "reason": f"AsyncOmniDiffusion.{method} is not implemented",
-                }
-            # Extract is_start and profile_prefix from args
-            is_start = args[0] if args else True
-            profile_prefix = args[1] if len(args) > 1 else None
-            # Generate profile_prefix with stage_id if starting and no prefix provided
-            if is_start and profile_prefix is None:
-                profile_prefix = f"stage_{self.stage_id}_diffusion_{int(time.time())}"
-            result = target(is_start, profile_prefix)
-            if timeout is not None:
-                return await asyncio.wait_for(result, timeout=timeout)
-            return await result
-
-        if method in {"add_lora", "remove_lora", "list_loras", "pin_lora"}:
-            target = getattr(self._engine, method, None)
-            if target is None:
-                return {
-                    "supported": False,
-                    "todo": True,
-                    "reason": f"AsyncOmniDiffusion.{method} is not implemented",
-                }
-            result = target(*args, **kwargs)
-            if timeout is not None:
-                return await asyncio.wait_for(result, timeout=timeout)
-            return await result
-
-        # Fall back to collective RPC for other methods
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._engine._executor,
-            self._engine.engine.collective_rpc,
-            method,
-            timeout,
-            args,
-            kwargs,
-            None,
-        )
-
     def shutdown(self) -> None:
         try:
             self._request_socket.send(self._encoder.encode({"type": "shutdown"}))
