@@ -25,7 +25,7 @@ from vllm.v1.executor import Executor
 
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
-from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path, resolve_model_type
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -408,7 +408,8 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
     try:
-        resolved_config_path = config_path or resolve_model_config_path(model)
+        model_type = resolve_model_type(model)
+        resolved_config_path = config_path or resolve_model_config_path(model_type)
         return load_omni_transfer_config(resolved_config_path)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)

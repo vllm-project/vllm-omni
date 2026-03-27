@@ -230,6 +230,9 @@ class _DiffusionServingModels:
     def base_model_paths(self) -> list[BaseModelPath]:
         return self._base_model_paths
 
+    def is_base_model(self, model_name: str) -> bool:
+        return any(p.name == model_name for p in self._base_model_paths)
+
     def __getattr__(self, name):
         return self._Unsupported(name)
 
