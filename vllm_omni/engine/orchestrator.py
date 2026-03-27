@@ -636,6 +636,9 @@ class Orchestrator:
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
         if self._pd_pair is not None and (stage_id, next_stage_id) == self._pd_pair:
+            # Save prefill stage outputs so thinker2talker can merge embeddings later
+            self.stage_clients[stage_id].set_engine_outputs([output])
+
             params = self._build_pd_decode_params(req_id, params)
 
             # Use the original user prompt for the decode stage (not processed embeddings)
