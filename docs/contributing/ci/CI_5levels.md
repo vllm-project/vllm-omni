@@ -229,6 +229,7 @@ vllm_omni/                                    tests/
                                                │   ├── test_async_omni.py
                                                │   ├── test_qwen3_omni.py
                                                │   ├── test_qwen3_omni_expansion.py
+                                               │   ├── test_mimo_audio.py
                                                │   ├── test_image_gen_edit.py
                                                │   ├── test_images_generations_lora.py
                                                │   └── stage_configs/

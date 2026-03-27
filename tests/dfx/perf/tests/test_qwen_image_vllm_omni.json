@@ -21,9 +21,8 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.40,
-                    "latency_p99": 2.55,
-                    "peak_memory_mb_max": 67000,
+                    "throughput_qps": 0.30,
+                    "latency_mean": 3.50,
                     "peak_memory_mb_mean": 67000
                 }
             },
@@ -39,29 +38,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.037,
-                    "latency_p99": 27.0,
-                    "peak_memory_mb_max": 74000,
-                    "peak_memory_mb_mean": 74000
-                }
-            },
-            {
-                "name": "mixed_resolution",
-                "dataset": "random",
-                "task": "t2i",
-                "num-inference-steps": 20,
-                "num-prompts": 10,
-                "max-concurrency": 1,
-                "enable-negative-prompt": true,
-                "random-request-config": [
-                    {"width": 512,  "height": 512,  "num_inference_steps": 20, "weight": 0.15},
-                    {"width": 768,  "height": 768,  "num_inference_steps": 20, "weight": 0.25},
-                    {"width": 1024, "height": 1024, "num_inference_steps": 25, "weight": 0.45},
-                    {"width": 1536, "height": 1536, "num_inference_steps": 35, "weight": 0.15}
-                ],
-                "baseline": {
-                    "throughput_qps": 0.14,
-                    "latency_p99": 25.0,
-                    "peak_memory_mb_max": 74000,
+                    "latency_mean": 27.0,
                     "peak_memory_mb_mean": 74000
                 }
             }
@@ -94,9 +71,8 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.43,
-                    "latency_p99": 2.34,
-                    "peak_memory_mb_max": 61000,
+                    "throughput_qps": 0.1,
+                    "latency_mean": 2.34,
                     "peak_memory_mb_mean": 61000
                 }
             },
@@ -111,30 +87,8 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.11,
-                    "latency_p99": 9.1,
-                    "peak_memory_mb_max": 61000,
-                    "peak_memory_mb_mean": 61000
-                }
-            },
-            {
-                "name": "mixed_resolution",
-                "dataset": "random",
-                "task": "t2i",
-                "num-inference-steps": 20,
-                "num-prompts": 10,
-                "max-concurrency": 1,
-                "enable-negative-prompt": true,
-                "random-request-config": [
-                    {"width": 512,  "height": 512,  "num_inference_steps": 20, "weight": 0.15},
-                    {"width": 768,  "height": 768,  "num_inference_steps": 20, "weight": 0.25},
-                    {"width": 1024, "height": 1024, "num_inference_steps": 25, "weight": 0.45},
-                    {"width": 1536, "height": 1536, "num_inference_steps": 35, "weight": 0.15}
-                ],
-                "baseline": {
-                    "throughput_qps": 0.29,
-                    "latency_p99": 8.5,
-                    "peak_memory_mb_max": 61000,
+                    "throughput_qps": 0.1,
+                    "latency_mean": 9.1,
                     "peak_memory_mb_mean": 61000
                 }
             }
@@ -177,9 +131,8 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.52,
-                    "latency_p99": 2.36,
-                    "peak_memory_mb_max": 67000,
+                    "throughput_qps": 0.1,
+                    "latency_mean": 3.50,
                     "peak_memory_mb_mean": 67000
                 }
             },
@@ -194,30 +147,8 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.17,
-                    "latency_p99": 6.15,
-                    "peak_memory_mb_max": 74000,
-                    "peak_memory_mb_mean": 74000
-                }
-            },
-            {
-                "name": "mixed_resolution",
-                "dataset": "random",
-                "task": "t2i",
-                "num-inference-steps": 20,
-                "num-prompts": 10,
-                "max-concurrency": 1,
-                "enable-negative-prompt": true,
-                "random-request-config": [
-                    {"width": 512,  "height": 512,  "num_inference_steps": 20, "weight": 0.15},
-                    {"width": 768,  "height": 768,  "num_inference_steps": 20, "weight": 0.25},
-                    {"width": 1024, "height": 1024, "num_inference_steps": 25, "weight": 0.45},
-                    {"width": 1536, "height": 1536, "num_inference_steps": 35, "weight": 0.15}
-                ],
-                "baseline": {
-                    "throughput_qps": 0.41,
-                    "latency_p99": 5.33,
-                    "peak_memory_mb_max": 74000,
+                    "throughput_qps": 0.1,
+                    "latency_mean": 6.15,
                     "peak_memory_mb_mean": 74000
                 }
             }
