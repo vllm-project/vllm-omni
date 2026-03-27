@@ -289,6 +289,9 @@ class VBenchDataset(BaseDataset):
 
     def _resize_data(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Resize data to match num_prompts."""
+        if not data:
+            raise ValueError("No benchmark data available. Install Pillow or provide --dataset-path.")
+
         if not self.args.num_prompts:
             return data
 
@@ -512,6 +515,14 @@ class TraceDataset(BaseDataset):
         timestamp = self._coerce_float(row.get("timestamp"))
         slo_ms = self._coerce_float(row.get("slo_ms"))
         image_paths = row.get("image_paths")
+        if not image_paths:
+            single = row.get("image_path")
+            image_paths = [single] if single else None
+
+        if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i"]:
+            raise ValueError(
+                f"Task {self.args.task} requires image input, but no image_path or image_paths found in trace row."
+            )
 
         override_w = self.args.width
         override_h = self.args.height
@@ -714,19 +725,19 @@ async def iter_requests(
     requests_list: list[RequestFuncInput],
     request_rate: float,
 ) -> AsyncGenerator[RequestFuncInput, None]:
-    """Yield requests using a fixed interval if request_rate is set.
+    """Yield requests using a Poisson process if request_rate is set.
 
     - If request_rate is inf, all requests are yielded immediately (no sleep).
-    - Otherwise, requests are emitted at a fixed cadence of 1 / request_rate seconds.
+    - Otherwise, inter-arrival times follow an exponential distribution.
     """
 
     if request_rate != float("inf"):
         if request_rate <= 0:
             raise ValueError(f"request_rate must be positive or inf, got {request_rate}.")
-        interval_s = 1.0 / float(request_rate)
 
     for i, req in enumerate(requests_list):
         if request_rate != float("inf") and i > 0:
+            interval_s = random.expovariate(request_rate)
             await asyncio.sleep(interval_s)
         yield req
 
@@ -893,6 +904,8 @@ async def benchmark(args):
                         warm_req,
                         num_inference_steps=args.warmup_num_inference_steps,
                     )
+                if args.task == "t2v":
+                    warm_req = replace(warm_req, num_frames=1)
                 warm_out = await limited_request_func(warm_req, session, None)
                 warmup_pairs.append((warm_req, warm_out))
 
