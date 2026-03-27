@@ -248,9 +248,10 @@ class FluxAttention(torch.nn.Module):
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
-            hidden_states = self.to_out[0](hidden_states)
+            # Contiguous for FP8 quantization in RowParallelLinear
+            hidden_states = self.to_out[0](hidden_states.contiguous())
             hidden_states = self.to_out[1](hidden_states)
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
 
             return hidden_states, encoder_hidden_states
         else:
