@@ -19,6 +19,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -148,8 +149,6 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             "time_embed_2",
             "final_layer.model",
         ]
-
-        from vllm_omni.diffusion.distributed.utils import get_local_device
 
         device_str = f"{get_local_device()}"
         named_modules = dict(self.named_modules())
