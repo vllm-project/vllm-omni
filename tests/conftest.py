@@ -1158,10 +1158,12 @@ def modify_stage_config(
                 # Direct top-level key
                 config[key] = value
 
-    # Save to new file with timestamp
-    timestamp = int(time.time())
+    # Unique suffix: multiple modify_stage_config calls in one process often run
+    # within the same second (e.g. test_qwen3_omni_expansion imports both
+    # get_chunk_config and get_batch_token_config). int(time.time()) would collide
+    # and the later write would overwrite the earlier YAML on disk.
     base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
-    output_path = f"{base_name}_{timestamp}.yaml"
+    output_path = f"{base_name}_{time.time_ns()}.yaml"
 
     with open(output_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
