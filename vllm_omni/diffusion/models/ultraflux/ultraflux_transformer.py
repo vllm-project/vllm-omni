@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Iterable
 from typing import Any
-import math
 
 import numpy as np
 import torch
@@ -16,7 +16,6 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from diffusers.utils import is_torch_npu_available
 from torch import nn
-from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
@@ -25,7 +24,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
@@ -411,8 +409,6 @@ class UltraFluxAttention(torch.nn.Module):
         image_rotary_emb: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        batch_size = hidden_states.shape[0]
-
         query, key, value = self.to_qkv(hidden_states).chunk(3, dim=-1)
 
         encoder_query = encoder_key = encoder_value = None
@@ -784,4 +780,3 @@ class UltraFluxTransformer2DModel(nn.Module):
             loaded_params.add(original_name)
             loaded_params.add(lookup_name)
         return loaded_params
-
