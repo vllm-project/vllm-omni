@@ -19,6 +19,15 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 
 ## Gradio Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
 Two interactive Gradio demos are available, both supporting all 3 task types:
 
 | Demo     | File                     | Transport    | Streaming Quality                                  |
