@@ -1,7 +1,6 @@
 import argparse
 import os
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniPromptType
 
 
@@ -65,17 +64,6 @@ def parse_args():
         choices=[1, 2, 3],
         help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
     )
-    parser.add_argument(
-        "--vae-use-tiling",
-        action="store_true",
-        help="Enable VAE tiling for memory optimization.",
-    )
-    parser.add_argument(
-        "--vae-patch-parallel-size",
-        type=int,
-        default=1,
-        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
-    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
@@ -121,11 +109,6 @@ def main():
 
     from vllm_omni.entrypoints.omni import Omni
 
-    parallel_config = DiffusionParallelConfig(
-        cfg_parallel_size=args.cfg_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-    )
-
     omni_kwargs = {}
     if args.stage_configs_path:
         omni_kwargs["stage_configs_path"] = args.stage_configs_path
@@ -139,8 +122,6 @@ def main():
             "shm_threshold_bytes": args.shm_threshold_bytes,
             "worker_backend": args.worker_backend,
             "ray_address": args.ray_address,
-            "parallel_config": parallel_config,
-            "vae_use_tiling": args.vae_use_tiling,
             "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         }
     )
@@ -201,13 +182,6 @@ def main():
             if args.negative_prompt is not None:
                 extra["negative_prompt"] = args.negative_prompt
             diffusion_params.extra_args = extra  # type: ignore
-
-    print(
-        "[Info] Parallel configuration:"
-        f" cfg_parallel_size={args.cfg_parallel_size},"
-        f" vae_patch_parallel_size={args.vae_patch_parallel_size},"
-        f" vae_use_tiling={args.vae_use_tiling}"
-    )
 
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 

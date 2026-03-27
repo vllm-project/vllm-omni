@@ -23,6 +23,7 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.image_processor import VaeImageProcessor
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -34,9 +35,6 @@ from transformers import (
 )
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import (
-    DistributedAutoencoderKL,
-)
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -296,7 +294,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Load VAE
         logger.info("Loading AutoencoderKL (VAE)...")
-        self.vae = DistributedAutoencoderKL.from_pretrained(
+        self.vae = AutoencoderKL.from_pretrained(
             model_path, subfolder="vae", local_files_only=True, torch_dtype=torch.bfloat16
         ).to(self.device)
         self.vae.eval()

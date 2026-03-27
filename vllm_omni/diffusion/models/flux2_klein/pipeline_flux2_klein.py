@@ -26,6 +26,7 @@ import PIL.Image
 import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
+from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
@@ -35,9 +36,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_flux2 import (
-    DistributedAutoencoderKLFlux2,
-)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -226,7 +224,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             subfolder="tokenizer",
             local_files_only=local_files_only,
         )
-        self.vae = DistributedAutoencoderKLFlux2.from_pretrained(
+        self.vae = AutoencoderKLFlux2.from_pretrained(
             model,
             subfolder="vae",
             local_files_only=local_files_only,

@@ -21,9 +21,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_nextstep import (
-    DistributedAutoencoderKLNextStep,
-)
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -31,6 +28,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import AutoencoderKL
 from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep import (
     NextStepConfig,
     NextStepModel,
@@ -186,13 +184,13 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
             vae_path = os.path.join(model_path, vae_path)
 
         if os.path.exists(vae_path):
-            self.vae = DistributedAutoencoderKLNextStep.from_pretrained(vae_path)
+            self.vae = AutoencoderKL.from_pretrained(vae_path)
         else:
             # Try loading from model directory
             vae_checkpoint = os.path.join(model_path, "vae", "checkpoint.pt")
             vae_config = os.path.join(model_path, "vae", "config.json")
             if os.path.exists(vae_checkpoint) and os.path.exists(vae_config):
-                self.vae = DistributedAutoencoderKLNextStep.from_pretrained(os.path.join(model_path, "vae"))
+                self.vae = AutoencoderKL.from_pretrained(os.path.join(model_path, "vae"))
             else:
                 raise ValueError(f"Could not find VAE at {vae_path}")
 
