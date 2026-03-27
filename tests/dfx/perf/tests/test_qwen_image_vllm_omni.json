@@ -71,7 +71,7 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.43,
+                    "throughput_qps": 0.15,
                     "latency_mean": 2.34,
                     "peak_memory_mb_mean": 61000
                 }
@@ -87,7 +87,7 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.11,
+                    "throughput_qps": 0.15,
                     "latency_mean": 9.1,
                     "peak_memory_mb_mean": 61000
                 }
@@ -131,7 +131,7 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.52,
+                    "throughput_qps": 0.15,
                     "latency_mean": 3.50,
                     "peak_memory_mb_mean": 67000
                 }
@@ -147,7 +147,7 @@
                 "max-concurrency": 1,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.17,
+                    "throughput_qps": 0.15,
                     "latency_mean": 6.15,
                     "peak_memory_mb_mean": 74000
                 }
