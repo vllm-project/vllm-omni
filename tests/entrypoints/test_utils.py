@@ -14,6 +14,7 @@ from vllm_omni.entrypoints.utils import (
     _filter_dict_like_object,
     filter_dataclass_kwargs,
     resolve_model_config_path,
+    resolve_model_type,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -300,7 +301,8 @@ class TestResolveModelConfigPath:
 
         mocker.patch("os.path.exists", side_effect=mock_exists)
 
-        result = resolve_model_config_path("zai-org/GLM-Image")
+        model_type = resolve_model_type("zai-org/GLM-Image")
+        result = resolve_model_config_path(model_type)
 
         assert result is not None
         assert "glm_image.yaml" in result
