@@ -317,6 +317,7 @@ def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "model": cfg["server_params"]["model"],
                 "serve_args": _build_serve_args(cfg["server_params"].get("serve_args", {})),
                 "benchmark_backend": "vllm-omni",
+                "server_params": cfg["server_params"],
             }
         )
     return result
@@ -363,6 +364,7 @@ def diffusion_server(request):
         print(f"\nStarting {server_type} server for test: {test_name}")
         with _make_server(server_cfg) as server:
             server.test_name = test_name
+            server.server_params = server_cfg["server_params"]
             print(f"{server_type} server started successfully")
             yield server
             print(f"{server_type} server stopping…")
@@ -400,6 +402,7 @@ def run_benchmark(
     params: dict[str, Any],
     test_name: str,
     backend: str = "vllm-omni",
+    server_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run diffusion_benchmark_serving.py as a subprocess and return parsed metrics.
 
@@ -496,6 +499,7 @@ def run_benchmark(
         "test_name": test_name,
         "backend": backend,
         "timestamp": timestamp,
+        "server_params": server_params,
         "benchmark_params": params,
         "result": metrics,
         "log_file": str(log_file),
@@ -561,6 +565,7 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
         params=params,
         test_name=test_name,
         backend=backend,
+        server_params=diffusion_server.server_params,
     )
 
     print(f"\n{'=' * 60}")
