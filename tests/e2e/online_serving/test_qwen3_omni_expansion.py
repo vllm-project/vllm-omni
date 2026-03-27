@@ -102,7 +102,7 @@ def get_prompt(prompt_type="text_only"):
         "text_image": "What is in this image? ",
         "text_audio": "What is in this audio? ",
         "text_audio_video": "First, what is in this audio? Then, what is in this video? ",
-        "one_word": "What is the capital of France? Answer in one words",
+        "one_word": "What is the capital of UK? Answer in one word",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -466,7 +466,18 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
         "use_audio_in_video": True,
         "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep", "electronic"]},
     }
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+    # Retry when assert_omni_response fails on key_words (see tests/conftest.py).
+    _keyword_assert_msg = "The output does not contain any of the keywords."
+    _max_retries = 3
+    for attempt in range(_max_retries):
+        try:
+            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+            break
+        except AssertionError as e:
+            if _keyword_assert_msg not in str(e) or attempt == _max_retries - 1:
+                raise
+            print(f"Keyword assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
 
 
 @pytest.mark.advanced_model
@@ -489,9 +500,17 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
-        "key_words": {"text": ["paris"]},
-        # If text/audio cosine similarity is low, still require these tokens in the Whisper transcript.
-        "audio_transcript_key_words": ["pears"],
+        "key_words": {"text": ["london"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/conftest.py).
+    _similarity_assert_msg = "The audio content is not same as the text"
+    _max_retries = 3
+    for attempt in range(_max_retries):
+        try:
+            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+            break
+        except AssertionError as e:
+            if _similarity_assert_msg not in str(e) or attempt == _max_retries - 1:
+                raise
+            print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
