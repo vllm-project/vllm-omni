@@ -126,15 +126,21 @@ class VoxtralTTSForConditionalGeneration(
             tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
             self._audio_token_id = tokenizer.instruct.audio_encoder.special_ids.audio
             speaker_id = config.audio_config.get("speaker_id", None)
-            if speaker_id and self.is_hf_model:
-                self.voice_to_embedding = {
-                    sid: torch.load(hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt"))
-                    for sid in speaker_id
-                }
+            if speaker_id:
+                self.voice_to_embedding = {}
+                for sid in speaker_id:
+                    if self.is_hf_model:
+                        path = hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt")
+                    else:
+                        path = Path(self.repo_id) / "voice_embedding" / f"{sid}.pt"
+                    if Path(path).exists():
+                        self.voice_to_embedding[sid] = torch.load(path, map_location="cpu")
+                    else:
+                        logger.warning("Voice embedding not found: %s", path)
                 logger.info("Available voice embeddings: %s", list(self.voice_to_embedding.keys()))
             else:
                 self.voice_to_embedding = {}
-                logger.warning("No speaker_id configured in audio_config.No voice embeddings will be available.")
+                logger.warning("No speaker_id configured in audio_config. No voice embeddings will be available.")
         elif self.model_stage == "audio_tokenizer":
             self.requires_raw_input_tokens = True
             self.audio_generation = None
