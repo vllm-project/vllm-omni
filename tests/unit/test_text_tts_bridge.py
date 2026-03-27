@@ -88,6 +88,7 @@ def make_pooling_output(text: str = "") -> dict:
 
 
 @pytest.mark.core_model
+@pytest.mark.cpu
 class TestTextTTSBridgeConfig:
     def test_defaults(self):
         cfg = TextTTSBridgeConfig()
@@ -118,6 +119,7 @@ class TestTextTTSBridgeConfig:
 
 
 @pytest.mark.core_model
+@pytest.mark.cpu
 class TestSentenceChunker:
     def _chunker(self, min_chars=5):
         return SentenceChunker(TextTTSBridgeConfig(min_sentence_chars=min_chars))
@@ -199,6 +201,7 @@ class TestSentenceChunker:
 
 
 @pytest.mark.core_model
+@pytest.mark.cpu
 class TestGetDecodedText:
     def test_reads_text_key_from_pooling_output(self):
         req = make_request()
@@ -227,6 +230,7 @@ class TestGetDecodedText:
 
 
 @pytest.mark.core_model
+@pytest.mark.cpu
 class TestTransferManagerState:
     def test_creates_chunker_on_first_call(self):
         tm = make_transfer_manager()
@@ -267,6 +271,7 @@ class TestTransferManagerState:
 
 
 @pytest.mark.core_model
+@pytest.mark.cpu
 class TestText2TtsHook:
     """
     Tests use the real function signature matching OmniChunkTransferAdapter:
