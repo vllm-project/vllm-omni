@@ -22,8 +22,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.30,
-                    "latency_p99": 3.50,
-                    "peak_memory_mb_max": 67000,
+                    "latency_mean": 3.50,
                     "peak_memory_mb_mean": 67000
                 }
             },
@@ -39,8 +38,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.037,
-                    "latency_p99": 27.0,
-                    "peak_memory_mb_max": 74000,
+                    "latency_mean": 27.0,
                     "peak_memory_mb_mean": 74000
                 }
             }
@@ -74,8 +72,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.43,
-                    "latency_p99": 2.34,
-                    "peak_memory_mb_max": 61000,
+                    "latency_mean": 2.34,
                     "peak_memory_mb_mean": 61000
                 }
             },
@@ -91,8 +88,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.11,
-                    "latency_p99": 9.1,
-                    "peak_memory_mb_max": 61000,
+                    "latency_mean": 9.1,
                     "peak_memory_mb_mean": 61000
                 }
             }
@@ -136,8 +132,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.52,
-                    "latency_p99": 3.50,
-                    "peak_memory_mb_max": 67000,
+                    "latency_mean": 3.50,
                     "peak_memory_mb_mean": 67000
                 }
             },
@@ -153,8 +148,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.17,
-                    "latency_p99": 6.15,
-                    "peak_memory_mb_max": 74000,
+                    "latency_mean": 6.15,
                     "peak_memory_mb_mean": 74000
                 }
             }
