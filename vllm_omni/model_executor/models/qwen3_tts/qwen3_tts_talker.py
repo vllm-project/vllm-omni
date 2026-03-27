@@ -1331,14 +1331,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
 
-            # --- Voice cache: check in-memory LRU (keyed by voice name + upload timestamp) ---
+            # Voice cache: only for uploaded voices (created_at > 0)
             _voice_cache_key = None
             if voice_clone_prompt is None:
                 _speaker_list = info_dict.get("speaker")
                 if isinstance(_speaker_list, list) and _speaker_list:
                     _voice_name = str(_speaker_list[0]).lower()
                     _voice_created_at = float((info_dict.get("voice_created_at") or [0])[0])
-                    _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only, _voice_created_at)
+                    if _voice_created_at > 0:
+                        _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only, _voice_created_at)
                     _cached = self._voice_cache.get(_voice_cache_key)
                     if _cached is not None:
                         voice_clone_prompt = {
@@ -1397,7 +1398,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
 
-            # --- Voice cache: store on miss ---
+            # Cache miss: store extraction result
             if _voice_cache_key is not None and speaker_embed is not None:
                 self._voice_cache.put(
                     _voice_cache_key,
