@@ -359,15 +359,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
+            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs, (
+                f"Tensor multimodal_outputs batch dim ({multimodal_outputs.shape[0]}) "
+                f"!= num_reqs ({self.input_batch.num_reqs})"
             )
-            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
                 pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
+            assert len(multimodal_outputs) == self.input_batch.num_reqs, (
+                f"List multimodal_outputs length ({len(multimodal_outputs)}) != num_reqs ({self.input_batch.num_reqs})"
             )
             for out in multimodal_outputs:
                 pooler_output.append(
