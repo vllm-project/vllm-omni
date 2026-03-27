@@ -78,7 +78,6 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
     ]
 
 
-@pytest.mark.skip(reason="L3 CI failed")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -102,11 +101,9 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.skip(reason="L3 CI failed")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.skip(reason="Issue #2249")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bagel_img2img_online(omni_server, openai_client) -> None:
@@ -121,8 +118,6 @@ def test_bagel_img2img_online(omni_server, openai_client) -> None:
         "messages": _build_img2img_messages(IMG2IMG_PROMPT, image_b64),
         "modalities": ["image"],
         "extra_body": {
-            "height": 512,
-            "width": 512,
             "num_inference_steps": 2,
             "guidance_scale": 0.0,
             "seed": 42,
