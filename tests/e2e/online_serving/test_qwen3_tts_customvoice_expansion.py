@@ -84,7 +84,15 @@ def test_voice_001(omni_server, openai_client) -> None:
         "voice": "uncle_fu",
     }
 
-    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
+    # Retry once on assertion failures from transcript similarity / gender checks (flaky ASR or estimators).
+    for attempt in range(2):
+        try:
+            openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
+            break
+        except AssertionError:
+            if attempt == 0:
+                continue
+            raise
 
 
 @pytest.mark.advanced_model

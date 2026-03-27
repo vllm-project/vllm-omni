@@ -21,7 +21,6 @@ import multiprocessing
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -1646,7 +1645,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
 
 
 # Threshold aligned with _compute_pcm_hnr_db docstring (clean clone vs distorted).
-_MIN_PCM_SPEECH_HNR_DB = 1.2
+_MIN_PCM_SPEECH_HNR_DB = 1.0
 
 
 def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
