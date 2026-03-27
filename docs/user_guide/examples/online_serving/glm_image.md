@@ -207,12 +207,6 @@ gpu_memory_utilization: 0.5
 pip install --upgrade transformers
 ```
 
-or 
-
-```
-pip install transformers>=5.3.0
-```
-
 ## Example materials
 
 ??? abstract "openai_chat_client.py"

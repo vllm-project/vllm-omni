@@ -140,12 +140,6 @@ Your have to upgrade `transformers` package to `5.3.0` or newer:
 pip install --upgrade transformers
 ```
 
-or 
-
-```
-pip install transformers>=5.3.0
-```
-
 ## Requirements
 
 - vLLM-Omni with GLM-Image support
