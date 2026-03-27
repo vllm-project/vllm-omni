@@ -1426,10 +1426,24 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
                         "The output does not contain any of the keywords."
                     )
 
-        # Verify similarity
+        # Verify similarity (Whisper transcript vs streamed/detokenized text)
         if "text" in modalities and "audio" in modalities:
-            assert response.similarity > 0.9, "The audio content is not same as the text"
-            print(f"similarity is: {response.similarity}")
+            sim = response.similarity
+            t_kw = request_config.get("audio_transcript_key_words")
+            if t_kw and (sim is None or sim <= 0.9):
+                assert response.audio_content is not None
+                norm_audio = preprocess_text(response.audio_content)
+                norm_expected = {preprocess_text(str(kw)) for kw in t_kw}
+                norm_expected.discard("")
+                assert norm_expected, "audio_transcript_key_words must normalize to at least one non-empty string"
+                assert norm_audio in norm_expected, (
+                    f"Low similarity ({sim}); normalized Whisper transcript {norm_audio!r} must equal one of "
+                    f"{sorted(norm_expected)} (raw transcript: {response.audio_content!r})"
+                )
+                print(f"similarity {sim} below 0.9; Whisper transcript matches expected text after normalization")
+            else:
+                assert sim is not None and sim > 0.9, "The audio content is not same as the text"
+                print(f"similarity is: {sim}")
 
 
 def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
@@ -1663,6 +1677,9 @@ class OpenAIClientHandler:
                 ``extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}`` for Qwen-Omni video+audio
                 extraction (merged with any existing ``extra_body`` / ``mm_processor_kwargs``).
                 Optional ``extra_body`` (dict): passed through to ``chat.completions.create`` after merge.
+                Optional ``audio_transcript_key_words`` (list[str], advanced_model, text+audio only): when
+                non-empty and similarity is at most 0.9, require the Whisper transcript to match one entry
+                exactly after ``preprocess_text`` (strip, lower, drop punctuation/extra whitespace).
             request_num: Number of requests, defaults to 1 (single request)
 
         Returns:

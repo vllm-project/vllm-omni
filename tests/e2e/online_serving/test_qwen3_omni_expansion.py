@@ -102,7 +102,7 @@ def get_prompt(prompt_type="text_only"):
         "text_image": "What is in this image? ",
         "text_audio": "What is in this audio? ",
         "text_audio_video": "First, what is in this audio? Then, what is in this video? ",
-        "one_word": "What is the capital of France? Answer in one words.",
+        "one_word": "What is the capital of France? Answer in one words",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -469,7 +469,6 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.skip(reason="There is a known issue: https://github.com/vllm-project/vllm-omni/pull/2019")
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -491,5 +490,8 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {"text": ["paris"]},
+        # If text/audio cosine similarity is low, still require these tokens in the Whisper transcript.
+        "audio_transcript_key_words": ["pears"],
     }
+
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
