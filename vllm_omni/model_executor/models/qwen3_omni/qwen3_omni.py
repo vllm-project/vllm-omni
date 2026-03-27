@@ -1047,9 +1047,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dim=0,
             )
         else:
-            trailing_text_hidden = torch.zeros(
-                tts_eos_embed.shape, device=tts_eos_embed.device, dtype=tts_eos_embed.dtype
-            )
+            trailing_text_hidden = tts_eos_embed
 
         input_embeds = assistant_text_hidden + assistant_codec_hidden
         input_ids = torch.full(
