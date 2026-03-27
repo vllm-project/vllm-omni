@@ -39,8 +39,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
 
-    def _log_allocation_failure(self, request: Request, *, required_tokens: int,
-                                token_budget: int) -> None:
+    def _log_allocation_failure(self, request: Request, *, required_tokens: int, token_budget: int) -> None:
         """Log a memory allocation failure with a CUDA memory snapshot.
 
         Only emits a log message when :attr:`_memory_profiling_enabled` is True.
@@ -50,8 +49,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         snapshot = capture_cuda_memory_snapshot()
         snapshot_str = format_cuda_memory_snapshot(snapshot)
         logger.warning(
-            "Diffusion scheduler allocation failed: "
-            "request_id=%s required_tokens=%d token_budget=%d %s",
+            "Diffusion scheduler allocation failed: request_id=%s required_tokens=%d token_budget=%d %s",
             request.request_id,
             required_tokens,
             token_budget,

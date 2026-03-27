@@ -10,8 +10,7 @@ import pytest
 
 
 def _is_vllm_related(name: str) -> bool:
-    return (name == "vllm" or name.startswith("vllm.") or
-            name == "vllm_omni" or name.startswith("vllm_omni."))
+    return name == "vllm" or name.startswith("vllm.") or name == "vllm_omni" or name.startswith("vllm_omni.")
 
 
 @pytest.fixture
@@ -41,9 +40,7 @@ def memory_profiling_module() -> Generator[ModuleType, None, None]:
     repo_root = _find_repo_root(Path(__file__).resolve())
     mem_prof_path = repo_root / "vllm_omni" / "diffusion" / "memory_profiling.py"
 
-    spec = importlib.util.spec_from_file_location(
-        "vllm_omni.diffusion.memory_profiling", mem_prof_path
-    )
+    spec = importlib.util.spec_from_file_location("vllm_omni.diffusion.memory_profiling", mem_prof_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)

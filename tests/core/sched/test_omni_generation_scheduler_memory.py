@@ -25,8 +25,7 @@ _REPO_ROOT = _find_repo_root(Path(__file__).resolve())
 
 
 def _is_vllm_related(name: str) -> bool:
-    return (name == "vllm" or name.startswith("vllm.") or
-            name == "vllm_omni" or name.startswith("vllm_omni."))
+    return name == "vllm" or name.startswith("vllm.") or name == "vllm_omni" or name.startswith("vllm_omni.")
 
 
 def _create_stub_package(name: str) -> ModuleType:
@@ -54,7 +53,7 @@ def _create_stub_package(name: str) -> ModuleType:
                 mod.__path__ = []  # type: ignore[attr-defined]
         # Attach child to parent so relative imports work.
         if i > 1:
-            parent_name = ".".join(parts[:i - 1])
+            parent_name = ".".join(parts[: i - 1])
             parent = sys.modules[parent_name]
             attr = parts[i - 1]
             if not hasattr(parent, attr):
@@ -118,9 +117,7 @@ def _stub_scheduler_dependencies(
     ensure("vllm.v1.core.sched")
     sched_interface = ensure("vllm.v1.core.sched.interface")
     if not hasattr(sched_interface, "PauseState"):
-        sched_interface.PauseState = type(
-            "PauseState", (), {"PAUSED_ALL": object(), "UNPAUSED": object()}
-        )
+        sched_interface.PauseState = type("PauseState", (), {"PAUSED_ALL": object(), "UNPAUSED": object()})
     sched_output = ensure("vllm.v1.core.sched.output")
     if not hasattr(sched_output, "SchedulerOutput"):
         sched_output.SchedulerOutput = type("SchedulerOutput", (), {})
@@ -147,9 +144,7 @@ def _stub_scheduler_dependencies(
 
     engine_mod = ensure("vllm.v1.engine")
     if not hasattr(engine_mod, "EngineCoreEventType"):
-        engine_mod.EngineCoreEventType = type(
-            "EngineCoreEventType", (), {"SCHEDULED": object()}
-        )
+        engine_mod.EngineCoreEventType = type("EngineCoreEventType", (), {"SCHEDULED": object()})
     if not hasattr(engine_mod, "EngineCoreOutput"):
         engine_mod.EngineCoreOutput = type("EngineCoreOutput", (), {})
     if not hasattr(engine_mod, "EngineCoreOutputs"):
@@ -159,9 +154,7 @@ def _stub_scheduler_dependencies(
     if not hasattr(request_mod, "Request"):
         request_mod.Request = type("Request", (), {})
     if not hasattr(request_mod, "RequestStatus"):
-        request_mod.RequestStatus = type(
-            "RequestStatus", (), {"FINISHED_STOPPED": object()}
-        )
+        request_mod.RequestStatus = type("RequestStatus", (), {"FINISHED_STOPPED": object()})
 
     # ── vllm_omni ─────────────────────────────────────────────────────────────
     ensure("vllm_omni")
@@ -176,9 +169,7 @@ def _stub_scheduler_dependencies(
     ensure("vllm_omni.distributed")
     ensure("vllm_omni.distributed.omni_connectors")
     ensure("vllm_omni.distributed.omni_connectors.transfer_adapter")
-    chunk_adapter = ensure(
-        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter"
-    )
+    chunk_adapter = ensure("vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter")
     if not hasattr(chunk_adapter, "OmniChunkTransferAdapter"):
         chunk_adapter.OmniChunkTransferAdapter = type("OmniChunkTransferAdapter", (), {})
 
@@ -192,9 +183,7 @@ def _stub_scheduler_dependencies(
     import importlib.util
 
     mem_prof_path = _REPO_ROOT / "vllm_omni" / "diffusion" / "memory_profiling.py"
-    spec = importlib.util.spec_from_file_location(
-        "vllm_omni.diffusion.memory_profiling", mem_prof_path
-    )
+    spec = importlib.util.spec_from_file_location("vllm_omni.diffusion.memory_profiling", mem_prof_path)
     mem_prof = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(mem_prof)
@@ -220,9 +209,7 @@ def _load_scheduler_module(
     created = _stub_scheduler_dependencies(original_modules)
 
     sched_path = _REPO_ROOT / "vllm_omni" / "core" / "sched" / "omni_generation_scheduler.py"
-    spec = importlib.util.spec_from_file_location(
-        "vllm_omni.core.sched.omni_generation_scheduler", sched_path
-    )
+    spec = importlib.util.spec_from_file_location("vllm_omni.core.sched.omni_generation_scheduler", sched_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -279,9 +266,7 @@ class DummyRequest:
         self.prompt_token_ids = [1, 2, 3, 4, 5]
 
 
-def test_log_allocation_failure_includes_memory_snapshot(
-    monkeypatch, caplog, scheduler_module
-):
+def test_log_allocation_failure_includes_memory_snapshot(monkeypatch, caplog, scheduler_module):
     scheduler = object.__new__(scheduler_module.OmniGenerationScheduler)
     scheduler._memory_profiling_enabled = True
 
@@ -299,16 +284,11 @@ def test_log_allocation_failure_includes_memory_snapshot(
     monkeypatch.setattr(
         scheduler_module,
         "format_cuda_memory_snapshot",
-        lambda snapshot: (
-            "cuda:0 allocated=0.00GiB reserved=0.00GiB "
-            "max_allocated=0.00GiB max_reserved=0.00GiB"
-        ),
+        lambda snapshot: ("cuda:0 allocated=0.00GiB reserved=0.00GiB max_allocated=0.00GiB max_reserved=0.00GiB"),
     )
 
     with caplog.at_level(logging.WARNING):
-        scheduler._log_allocation_failure(
-            DummyRequest(), required_tokens=2, token_budget=1
-        )
+        scheduler._log_allocation_failure(DummyRequest(), required_tokens=2, token_budget=1)
 
     assert "Diffusion scheduler allocation failed" in caplog.text
     assert "request_id=req-1" in caplog.text
@@ -320,8 +300,6 @@ def test_log_allocation_failure_noop_when_disabled(caplog, scheduler_module):
     scheduler._memory_profiling_enabled = False
 
     with caplog.at_level(logging.WARNING):
-        scheduler._log_allocation_failure(
-            DummyRequest(), required_tokens=2, token_budget=1
-        )
+        scheduler._log_allocation_failure(DummyRequest(), required_tokens=2, token_budget=1)
 
     assert caplog.text == ""
