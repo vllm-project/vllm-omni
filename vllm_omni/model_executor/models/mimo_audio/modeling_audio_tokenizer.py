@@ -23,6 +23,98 @@ except Exception:
     logger.warning("flash_attn not installed")
 
 
+def _should_use_flash_attn(hidden_states: torch.Tensor) -> bool:
+    return hidden_states.is_cuda and is_flash_atth_available
+
+
+def _build_varlen_attn_mask(
+    seq_len: int,
+    window_size: tuple[int, int],
+    causal: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Additive mask (L, L): 0 keep, min-float for masked. Matches flash_attn varlen window (left, right):
+    keep key j for query i iff j >= i - left (when left >= 0), j <= i + right (when right >= 0), and j <= i if causal.
+    """
+    left, right = int(window_size[0]), int(window_size[1])
+    has_window = left >= 0 or right >= 0
+    if not causal and not has_window:
+        return None
+
+    i_idx = torch.arange(seq_len, device=device).view(seq_len, 1)
+    j_idx = torch.arange(seq_len, device=device).view(1, seq_len)
+    ok = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+    if left >= 0:
+        ok &= j_idx >= i_idx - left
+    if right >= 0:
+        ok &= j_idx <= i_idx + right
+    if causal:
+        ok &= j_idx <= i_idx
+
+    # Use finfo.min for half/bfloat stability in SDPA (same pattern as Transformers)
+    neg = torch.finfo(dtype).min
+    mask = torch.zeros(seq_len, seq_len, device=device, dtype=dtype)
+    mask = mask.masked_fill(~ok, neg)
+    return mask
+
+
+def _attention_forward_sdpa(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    seq_len: torch.Tensor,
+    embed_dim: int,
+    head_dim: int,
+    causal: bool,
+    window_size: tuple[int, int],
+) -> torch.Tensor:
+    total_seq_len = query_states.size(0)
+    cu_len = F.pad(torch.cumsum(seq_len, dim=0), (1, 0), "constant", 0).to(torch.long)
+    attn_output = torch.zeros(
+        total_seq_len,
+        embed_dim,
+        device=query_states.device,
+        dtype=query_states.dtype,
+    )
+    compute_dtype = query_states.dtype
+    left, right = int(window_size[0]), int(window_size[1])
+    has_window = left >= 0 or right >= 0
+    use_is_causal = causal and not has_window
+
+    for i, slen in enumerate(seq_len.tolist()):
+        if slen == 0:
+            continue
+        start = int(cu_len[i].item())
+        end = int(cu_len[i + 1].item())
+        q = query_states[start:end].transpose(0, 1).contiguous()
+        k = key_states[start:end].transpose(0, 1).contiguous()
+        v = value_states[start:end].transpose(0, 1).contiguous()
+        q_b = q.unsqueeze(0)
+        k_b = k.unsqueeze(0)
+        v_b = v.unsqueeze(0)
+
+        attn_mask = None
+        if not use_is_causal:
+            attn_mask = _build_varlen_attn_mask(slen, window_size, causal, q_b.device, compute_dtype)
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+
+        out = F.scaled_dot_product_attention(
+            q_b,
+            k_b,
+            v_b,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=use_is_causal,
+            scale=None,
+        )
+        out = out.squeeze(0).transpose(0, 1).reshape(slen, embed_dim)
+        attn_output[start:end] = out
+
+    return attn_output
+
+
 def get_sequence_mask(inputs, inputs_length):
     if inputs.dim() == 3:
         bsz, tgt_len, _ = inputs.size()
@@ -256,7 +348,8 @@ class Attention(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.window_size = window_size
+
+        self.window_size = tuple(window_size) if window_size is not None else (-1, -1)
 
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
@@ -282,8 +375,8 @@ class Attention(nn.Module):
             query_states = apply_rotary_pos_emb(query_states, cos, sin)
             key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
-        if hidden_states.is_cuda and is_flash_atth_available is True:
-            # === Use flash-attn in GPU mode ===
+        if _should_use_flash_attn(hidden_states):
+            # === Use flash-attn in GPU mode (when auto/flash and available) ===
             cu_len = F.pad(torch.cumsum(seq_len, dim=0), (1, 0), "constant", 0).to(torch.int32)
             max_seqlen = torch.max(seq_len).to(torch.int32).detach()
             attn_output = flash_attn_varlen_func(
@@ -300,31 +393,16 @@ class Attention(nn.Module):
             attn_output = attn_output.reshape(total_seq_len, self.embed_dim)
 
         else:
-            # === Fallback implementation in CPU / Eager mode ===
-            cu_len = F.pad(torch.cumsum(seq_len, dim=0), (1, 0), "constant", 0).to(torch.long)
-            attn_output = torch.zeros_like(hidden_states)
-
-            for i, slen in enumerate(seq_len.tolist()):
-                start_idx = cu_len[i].item()
-                end_idx = cu_len[i + 1].item()
-
-                q = query_states[start_idx:end_idx]  # [slen, num_heads, head_dim]
-                k = key_states[start_idx:end_idx]
-                v = value_states[start_idx:end_idx]
-
-                q = q.transpose(0, 1)  # [num_heads, slen, head_dim]
-                k = k.transpose(0, 1)
-                v = v.transpose(0, 1)
-
-                attn_scores = torch.matmul(q, k.transpose(-1, -2)) / (self.head_dim**0.5)
-                if self.causal:
-                    mask = torch.tril(torch.ones_like(attn_scores))
-                    attn_scores = attn_scores.masked_fill(mask == 0, float("-inf"))
-                attn_probs = F.softmax(attn_scores, dim=-1)
-                attn_out = torch.matmul(attn_probs, v)  # [num_heads, slen, head_dim]
-
-                attn_out = attn_out.transpose(0, 1).reshape(slen, self.embed_dim)
-                attn_output[start_idx:end_idx] = attn_out
+            attn_output = _attention_forward_sdpa(
+                query_states,
+                key_states,
+                value_states,
+                seq_len,
+                self.embed_dim,
+                self.head_dim,
+                self.causal,
+                self.window_size,
+            )
 
         attn_output = self.out_proj(attn_output)
         return attn_output

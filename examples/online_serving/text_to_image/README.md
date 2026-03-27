@@ -68,13 +68,45 @@ curl -s http://localhost:8091/v1/chat/completions \
   }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
 ```
 
-### Method 2: Using Python Client
+### Method 2: Using OpenAI Python SDK
+
+```python
+from openai import OpenAI
+import base64
+
+client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen-Image",
+    messages=[{"role": "user", "content": "A beautiful landscape painting"}],
+    extra_body={
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 50,
+        "true_cfg_scale": 4.0,
+        "seed": 42,
+    },
+)
+
+img_url = response.choices[0].message.content[0].image_url.url
+_, b64_data = img_url.split(",", 1)
+with open("output.png", "wb") as f:
+    f.write(base64.b64decode(b64_data))
+```
+
+!!! note
+    The OpenAI SDK's `extra_body` keyword argument merges parameters into the
+    top-level request body automatically. When using curl or Python `requests`,
+    wrap generation parameters inside a literal `"extra_body"` key in the JSON
+    instead (as shown in the curl example above).
+
+### Method 3: Using Python Client Script
 
 ```bash
 python openai_chat_client.py --prompt "A beautiful landscape painting" --output output.png
 ```
 
-### Method 3: Using Gradio Demo
+### Method 4: Using Gradio Demo
 
 ```bash
 python gradio_demo.py
@@ -180,19 +212,25 @@ Use `extra_body` to pass generation parameters:
 }
 ```
 
-## Generation Parameters (extra_body)
+## Generation Parameters
 
-| Parameter                | Type  | Default | Description                        |
-| ------------------------ | ----- | ------- | ---------------------------------- |
-| `height`                 | int   | None    | Image height in pixels             |
-| `width`                  | int   | None    | Image width in pixels              |
-| `size`                   | str   | None    | Image size (e.g., "1024x1024")     |
-| `num_inference_steps`    | int   | 50      | Number of denoising steps          |
-| `true_cfg_scale`         | float | 4.0     | Qwen-Image CFG scale               |
-| `seed`                   | int   | None    | Random seed (reproducible)         |
-| `negative_prompt`        | str   | None    | Negative prompt                    |
-| `num_outputs_per_prompt` | int   | 1       | Number of images to generate       |
-| `--cfg-parallel-size`.   | int   | 1       | Number of GPUs for CFG parallelism |
+When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
+JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK.
+When using the dedicated `/v1/images/generations` endpoint, pass the supported
+generation controls as top-level JSON fields directly. For image dimensions and
+count, use `size` and `n` rather than `height`, `width`, or
+`num_outputs_per_prompt`.
+
+| Parameter                | Type  | Default | Description                    |
+| ------------------------ | ----- | ------- | ------------------------------ |
+| `height`                 | int   | None    | Image height in pixels         |
+| `width`                  | int   | None    | Image width in pixels          |
+| `size`                   | str   | None    | Image size (e.g., "1024x1024") |
+| `num_inference_steps`    | int   | 50      | Number of denoising steps      |
+| `true_cfg_scale`         | float | 4.0     | Qwen-Image CFG scale           |
+| `seed`                   | int   | None    | Random seed (reproducible)     |
+| `negative_prompt`        | str   | None    | Negative prompt                |
+| `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
 
 ## Response Format
 
