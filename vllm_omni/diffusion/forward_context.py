@@ -80,6 +80,23 @@ def is_forward_context_available() -> bool:
     return _forward_context is not None
 
 
+def get_ulysses_mode(*, default: str = "strict") -> str:
+    """Resolve the Ulysses-SP mode from the current ForwardContext.
+
+    Returns `default` when ForwardContext is unavailable or the diffusion
+    config is not set.
+    """
+    if not is_forward_context_available():
+        return default
+
+    cfg = get_forward_context().omni_diffusion_config
+    if cfg is None:
+        return default
+
+    parallel_config = cfg.parallel_config
+    return str(getattr(parallel_config, "ulysses_mode", default))
+
+
 def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,

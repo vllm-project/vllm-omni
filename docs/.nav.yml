@@ -6,6 +6,7 @@ nav:
     - getting_started/installation/*
   - Serving:
     - OpenAI-Compatible API:
+      - Diffusion Chat API: serving/diffusion_chat_api.md
       - Image Generation: serving/image_generation_api.md
       - Image Edit: serving/image_edit_api.md
       - Text to Speech: serving/speech_api.md
@@ -79,6 +80,7 @@ nav:
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_tts_model.md
     - contributing/model/adding_diffusion_model.md
+    - contributing/model/adding_quantization_model.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md

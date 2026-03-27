@@ -20,7 +20,12 @@ from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio, OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    BatchSpeechRequest,
+    CreateAudio,
+    OpenAICreateSpeechRequest,
+    SpeechBatchItem,
+)
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _create_wav_header,
@@ -181,6 +186,7 @@ def test_app(mocker: MockerFixture):
 
     mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_fn)
     mock_engine_client.default_sampling_params_list = [{}]
+    mock_engine_client.tts_batch_max_items = 32
 
     # Mock models to have an is_base_model method
     mock_models = mocker.MagicMock()
@@ -193,6 +199,9 @@ def test_app(mocker: MockerFixture):
         models=mock_models,
         request_logger=mock_request_logger,
     )
+
+    # Skip TTS validation in tests (mock doesn't set up supported_speakers)
+    speech_server._validate_tts_request = mocker.MagicMock(return_value=None)
 
     # Patch the signature of create_speech to remove 'raw_request' for FastAPI route introspection
     original_create_speech = speech_server.create_speech
@@ -226,16 +235,32 @@ def test_app(mocker: MockerFixture):
                         "created_at": info.get("created_at", 0),
                         "file_size": info.get("file_size", 0),
                         "mime_type": info.get("mime_type", ""),
+                        "embedding_source": info.get("embedding_source", "audio"),
+                        "embedding_dim": info.get("embedding_dim"),
                     }
                 )
         return {"voices": speakers, "uploaded_voices": uploaded_voices}
 
     app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
+    app.add_api_route("/v1/audio/speech/batch", speech_server.create_speech_batch, methods=["POST"])
 
     # Add upload_voice endpoint
-    async def upload_voice(audio_sample: UploadFile = File(...), consent: str = Form(...), name: str = Form(...)):
+    async def upload_voice(
+        audio_sample: UploadFile | None = File(None),
+        speaker_embedding: str | None = Form(None),
+        consent: str = Form(...),
+        name: str = Form(...),
+        ref_text: str = Form(None),
+    ):
         try:
-            result = await speech_server.upload_voice(audio_sample, consent, name)
+            if speaker_embedding is not None and audio_sample is not None:
+                raise ValueError("'audio_sample' and 'speaker_embedding' are mutually exclusive")
+            if speaker_embedding is not None:
+                result = await speech_server.upload_voice_embedding(speaker_embedding, consent, name)
+            elif audio_sample is not None:
+                result = await speech_server.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+            else:
+                raise ValueError("Either 'audio_sample' or 'speaker_embedding' must be provided")
             return {"success": True, "voice": result}
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -337,29 +362,35 @@ class TestSpeechAPI:
         assert "voices" in response.json()
 
     def test_upload_voice_success(self, client, tmp_path):
-        """Test successful voice upload."""
-        # Create a mock audio file
-        audio_content = b"fake audio content" * 1000  # ~17KB
-        files = {
-            "audio_sample": ("test.wav", audio_content, "audio/wav"),
-        }
-        data = {
-            "consent": "user_consent_123",
-            "name": "test_voice",
-        }
+        """Test successful voice upload without ref_text."""
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "user_consent_123", "name": "test_voice"}
 
         response = client.post("/v1/audio/voices", files=files, data=data)
         assert response.status_code == 200
         result = response.json()
         assert result["success"] is True
-        assert "voice" in result
         voice_info = result["voice"]
         assert voice_info["name"] == "test_voice"
         assert voice_info["consent"] == "user_consent_123"
-        assert "created_at" in voice_info
         assert voice_info["mime_type"] == "audio/wav"
         assert voice_info["file_size"] == len(audio_content)
         response = client.delete("/v1/audio/voices/test_voice")
+
+    def test_upload_voice_with_ref_text(self, client, tmp_path):
+        """Test voice upload with ref_text enables in-context cloning."""
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_rt", "ref_text": "Hello world transcript"}
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+        result = response.json()
+        assert result["success"] is True
+        assert result["voice"]["name"] == "test_voice_rt"
+        assert result["voice"].get("ref_text") == "Hello world transcript"
+        response = client.delete("/v1/audio/voices/test_voice_rt")
 
     def test_upload_voice_file_too_large(self, client):
         """Test voice upload with file exceeding size limit."""
@@ -436,13 +467,13 @@ class TestSpeechAPI:
         response = client.post("/v1/audio/voices", files=files, data=data)
         assert response.status_code == 422  # Validation error
 
-        # Missing file
+        # Missing both audio_sample and speaker_embedding
         data = {
             "consent": "user_consent_123",
             "name": "test_voice6",
         }
         response = client.post("/v1/audio/voices", data=data)
-        assert response.status_code == 422  # Validation error
+        assert response.status_code == 400
 
     def test_delete_voice_success(self, client):
         """Test successful voice deletion."""
@@ -478,6 +509,89 @@ class TestSpeechAPI:
         assert response.status_code == 404
         result = response.json()
         assert "not found" in result["detail"]
+
+    # ── speaker_embedding upload via voices endpoint ──
+
+    def test_upload_voice_embedding_success(self, client):
+        """Upload a voice via speaker_embedding JSON."""
+        import json
+
+        emb = [0.1] * 1024
+        data = {
+            "speaker_embedding": json.dumps(emb),
+            "consent": "consent_emb_1",
+            "name": "emb_voice",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 200, f"Upload failed: {response.text}"
+        result = response.json()
+        assert result["success"] is True
+        voice = result["voice"]
+        assert voice["name"] == "emb_voice"
+        assert voice["embedding_source"] == "direct"
+        assert voice["embedding_dim"] == 1024
+        # Clean up
+        client.delete("/v1/audio/voices/emb_voice")
+
+    def test_upload_voice_embedding_appears_in_listing(self, client):
+        """Embedding-uploaded voice appears in list with correct source."""
+        import json
+
+        emb = [0.2] * 2048
+        data = {
+            "speaker_embedding": json.dumps(emb),
+            "consent": "consent_list",
+            "name": "listed_emb_voice",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 200
+
+        listing = client.get("/v1/audio/voices").json()
+        uploaded = {v["name"]: v for v in listing["uploaded_voices"]}
+        assert "listed_emb_voice" in uploaded
+        assert uploaded["listed_emb_voice"]["embedding_source"] == "direct"
+        assert uploaded["listed_emb_voice"]["embedding_dim"] == 2048
+        # Clean up
+        client.delete("/v1/audio/voices/listed_emb_voice")
+
+    def test_upload_voice_embedding_and_audio_mutually_exclusive(self, client):
+        """Providing both audio_sample and speaker_embedding returns 400."""
+        import json
+
+        emb = [0.1] * 1024
+        files = {"audio_sample": ("test.wav", b"fake", "audio/wav")}
+        data = {
+            "speaker_embedding": json.dumps(emb),
+            "consent": "consent_mx",
+            "name": "mx_voice",
+        }
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 400
+        assert "mutually exclusive" in response.json()["detail"]
+
+    def test_upload_voice_embedding_invalid_json(self, client):
+        """Invalid JSON in speaker_embedding returns 400."""
+        data = {
+            "speaker_embedding": "not valid json [[[",
+            "consent": "consent_bad",
+            "name": "bad_json_voice",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 400
+        assert "JSON" in response.json()["detail"]
+
+    def test_upload_voice_embedding_nan_rejected(self, client):
+        """NaN values in speaker_embedding return 400."""
+        import json
+
+        data = {
+            "speaker_embedding": json.dumps([0.1] * 1023 + [float("nan")]),
+            "consent": "consent_nan",
+            "name": "nan_voice",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 400
+        assert "finite" in response.json()["detail"]
 
 
 class TestTTSMethods:
@@ -600,6 +714,96 @@ class TestTTSMethods:
         result = speech_server._validate_tts_request(req)
         assert "does not support CustomVoice" in result
 
+    # ── speaker_embedding validation ──
+
+    def test_speaker_embedding_valid_base_task(self, speech_server):
+        """speaker_embedding with Base task, x_vector_only_mode, and no ref_audio is accepted."""
+        emb = [0.1] * 1024
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_speaker_embedding_auto_sets_x_vector_only_mode(self, speech_server):
+        """speaker_embedding auto-implies x_vector_only_mode, so validation passes."""
+        emb = [0.1] * 1024
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb)
+        result = speech_server._validate_tts_request(req)
+        assert result is None
+        assert req.x_vector_only_mode is True
+
+    def test_speaker_embedding_wrong_task_type(self, speech_server):
+        """speaker_embedding is only valid for Base task."""
+        emb = [0.1] * 1024
+        req = OpenAICreateSpeechRequest(
+            input="Hello", task_type="VoiceDesign", speaker_embedding=emb, instructions="warm"
+        )
+        result = speech_server._validate_tts_request(req)
+        assert "only valid for Base task" in result
+
+    def test_speaker_embedding_mutually_exclusive_with_ref_audio(self, speech_server):
+        """speaker_embedding and ref_audio cannot both be provided (pydantic validation)."""
+        emb = [0.1] * 1024
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            OpenAICreateSpeechRequest(
+                input="Hello", task_type="Base", speaker_embedding=emb, ref_audio="data:audio/wav;base64,abc"
+            )
+
+    def test_speaker_embedding_nan_rejected(self, speech_server):
+        """NaN values in speaker_embedding are rejected at parse level."""
+        with pytest.raises(ValidationError, match="finite"):
+            OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=[0.1] * 1023 + [float("nan")])
+
+    def test_speaker_embedding_inf_rejected(self, speech_server):
+        """Inf values in speaker_embedding are rejected at parse level."""
+        with pytest.raises(ValidationError, match="finite"):
+            OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=[float("inf")] + [0.1] * 1023)
+
+    def test_speaker_embedding_empty_list_rejected(self, speech_server):
+        """Empty speaker_embedding list is rejected."""
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=[])
+        result = speech_server._validate_tts_request(req)
+        assert "non-empty" in result
+
+    def test_speaker_embedding_wrong_dims_accepted(self, speech_server):
+        """Non-standard dimensions pass validation (warning only, not an error)."""
+        emb = [0.1] * 512  # not 1024 or 2048
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
+        result = speech_server._validate_tts_request(req)
+        assert result is None
+
+    def test_speaker_embedding_2048_dims_accepted(self, speech_server):
+        """2048-dim embedding (1.7B model) is accepted without warning."""
+        emb = [0.1] * 2048
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_base_task_requires_ref_audio_or_speaker_embedding(self, speech_server):
+        """Base task without ref_audio or speaker_embedding is rejected."""
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base")
+        result = speech_server._validate_tts_request(req)
+        assert "ref_audio" in result and "speaker_embedding" in result
+
+    # ── speaker_embedding in _build_tts_params ──
+
+    def test_build_tts_params_with_speaker_embedding(self, speech_server):
+        """speaker_embedding produces voice_clone_prompt and x_vector_only_mode."""
+        emb = [0.1] * 1024
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb)
+        params = speech_server._build_tts_params(req)
+
+        assert "voice_clone_prompt" in params
+        vcp = params["voice_clone_prompt"][0]
+        assert "ref_spk_embedding" in vcp
+        # Stored as plain list (not tensor) so it survives msgspec IPC serialization
+        assert isinstance(vcp["ref_spk_embedding"], list)
+        assert len(vcp["ref_spk_embedding"]) == 1024
+        assert params["x_vector_only_mode"] == [True]
+
+    def test_build_tts_params_without_speaker_embedding(self, speech_server):
+        """Without speaker_embedding, voice_clone_prompt is not set."""
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")
+        params = speech_server._build_tts_params(req)
+        assert "voice_clone_prompt" not in params
+
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
         req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")
@@ -634,31 +838,48 @@ class TestTTSMethods:
         assert server.supported_speakers == {"ryan", "vivian", "aiden"}
 
     def test_build_tts_params_with_uploaded_voice(self, speech_server):
-        """Test _build_tts_params auto-sets ref_audio for uploaded voices."""
-        # Mock an uploaded speaker
+        """Test _build_tts_params auto-sets ref_audio for uploaded voices (x_vector only)."""
         speech_server.uploaded_speakers = {
             "custom_voice": {
                 "name": "custom_voice",
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
+                "ref_text": None,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
 
-        # Mock _get_uploaded_audio_data to return base64 data
         with patch.object(speech_server, "_get_uploaded_audio_data") as mock_get_audio:
             mock_get_audio.return_value = "data:audio/wav;base64,ZmFrZWF1ZGlv"
-
-            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice", task_type="Base")
-
+            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice")
             params = speech_server._build_tts_params(req)
 
-            # Verify ref_audio was auto-set
-            assert "ref_audio" in params
             assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
-            assert "x_vector_only_mode" in params
             assert params["x_vector_only_mode"] == [True]
-            mock_get_audio.assert_called_once_with("custom_voice")
+            assert params["task_type"] == ["Base"]
+            assert "ref_text" not in params
+
+    def test_build_tts_params_with_uploaded_voice_ref_text(self, speech_server):
+        """Test _build_tts_params enables in-context cloning when ref_text is stored."""
+        speech_server.uploaded_speakers = {
+            "custom_voice": {
+                "name": "custom_voice",
+                "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
+                "mime_type": "audio/wav",
+                "ref_text": "Hello world transcript",
+            }
+        }
+        speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
+
+        with patch.object(speech_server, "_get_uploaded_audio_data") as mock_get_audio:
+            mock_get_audio.return_value = "data:audio/wav;base64,ZmFrZWF1ZGlv"
+            req = OpenAICreateSpeechRequest(input="Hello", voice="custom_voice")
+            params = speech_server._build_tts_params(req)
+
+            assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
+            assert params["x_vector_only_mode"] == [False]
+            assert params["task_type"] == ["Base"]
+            assert params["ref_text"] == ["Hello world transcript"]
 
     def test_build_tts_params_without_uploaded_voice(self, speech_server):
         """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""
@@ -923,7 +1144,7 @@ class TestStreamingProtocolValidation:
 
     def test_stream_validation_errors(self):
         """stream=True requires response_format not in ('pcm', 'wav') and speed=1.0."""
-        with pytest.raises(ValidationError, match="requires response_format not in \\('pcm', 'wav'\\)"):
+        with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
         with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
@@ -1026,6 +1247,139 @@ class TestStreamingResponse:
         response = client.post("/v1/audio/speech", json={"input": "Hello", "response_format": "wav"})
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
+
+
+class TestSpeechBatchAPI:
+    """Tests for the /v1/audio/speech/batch endpoint."""
+
+    def test_batch_success(self, client):
+        """Batch with two items should return two successful results with base64 audio."""
+        payload = {
+            "items": [
+                {"input": "Hello world"},
+                {"input": "Goodbye world"},
+            ],
+            "response_format": "wav",
+        }
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 2
+        assert body["succeeded"] == 2
+        assert body["failed"] == 0
+        assert all(r["status"] == "success" for r in body["results"])
+        assert all(r["audio_data"] is not None for r in body["results"])
+        # Verify audio_data is valid base64
+        import base64
+
+        for r in body["results"]:
+            decoded = base64.b64decode(r["audio_data"])
+            assert len(decoded) > 0
+
+    def test_batch_single_item(self, client):
+        """Batch with a single item should work."""
+        payload = {"items": [{"input": "Solo"}]}
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 1
+        assert body["succeeded"] == 1
+
+    def test_batch_empty_items_rejected(self, client):
+        """Empty items list should be rejected by Pydantic validation."""
+        response = client.post("/v1/audio/speech/batch", json={"items": []})
+        assert response.status_code == 422
+
+    def test_batch_too_many_items(self, client):
+        """Exceeding the batch max items limit (default 32) should be rejected."""
+        payload = {"items": [{"input": f"text {i}"} for i in range(33)]}
+        with pytest.raises(ValueError, match="exceeding the maximum"):
+            client.post("/v1/audio/speech/batch", json=payload)
+
+    def test_batch_max_items_allowed(self, client):
+        """Exactly 32 items should be accepted."""
+        payload = {"items": [{"input": f"text {i}"} for i in range(32)]}
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 32
+        assert body["succeeded"] == 32
+
+    def test_batch_results_have_correct_indices(self, client):
+        """Each result should have an index matching its position."""
+        payload = {"items": [{"input": f"text {i}"} for i in range(3)]}
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        body = response.json()
+        indices = [r["index"] for r in body["results"]]
+        assert indices == [0, 1, 2]
+
+    def test_batch_response_has_id(self, client):
+        """Batch response should have a unique id starting with 'speech-batch-'."""
+        payload = {"items": [{"input": "Hello"}]}
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        body = response.json()
+        assert body["id"].startswith("speech-batch-")
+
+
+class TestMergeBatchItem:
+    """Tests for the _merge_batch_item static method."""
+
+    def test_item_override_wins(self):
+        """Per-item voice should override batch-level voice."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", voice="Ryan")],
+            voice="Vivian",
+        )
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.voice == "Ryan"
+
+    def test_batch_default_used(self):
+        """Batch-level voice should be used when item doesn't specify one."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi")],
+            voice="Vivian",
+        )
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.voice == "Vivian"
+
+    def test_response_format_override(self):
+        """Per-item response_format should override batch default."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", response_format="mp3")],
+            response_format="wav",
+        )
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.response_format == "mp3"
+
+    def test_stream_always_false(self):
+        """Merged requests should always have stream=False."""
+        batch = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.stream is False
+
+    def test_all_fields_merge(self):
+        """All overridable fields should merge correctly."""
+        batch = BatchSpeechRequest(
+            items=[
+                SpeechBatchItem(
+                    input="hello",
+                    voice="Ryan",
+                    language="English",
+                    speed=1.5,
+                    task_type="CustomVoice",
+                    max_new_tokens=512,
+                )
+            ],
+            voice="Vivian",
+            language="Chinese",
+            speed=1.0,
+        )
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.voice == "Ryan"
+        assert merged.language == "English"
+        assert merged.speed == 1.5
+        assert merged.task_type == "CustomVoice"
+        assert merged.max_new_tokens == 512
 
 
 class TestAsyncOmniSupportedTasks:

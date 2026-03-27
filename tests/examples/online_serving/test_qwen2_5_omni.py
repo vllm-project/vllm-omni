@@ -14,7 +14,11 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import OmniServerParams, convert_audio_file_to_text, cosine_similarity_text
-from tests.examples.conftest import extract_content_after_keyword, run_cmd
+from tests.examples.conftest import (
+    extract_content_after_keyword,
+    run_cmd,
+    strip_trailing_audio_saved_line,
+)
 from tests.utils import hardware_test
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.example]
@@ -29,7 +33,7 @@ if current_omni_platform.is_xpu():
         str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")
     ]
 
-example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving" / "qwen2_5_omni")
+example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving")
 # Create parameter combinations for model and stage config
 test_params = [
     OmniServerParams(model=model, port=8091, stage_config_path=stage_config)
@@ -37,25 +41,29 @@ test_params = [
     for stage_config in stage_configs
 ]
 
+common_args = ["python", os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py")]
+
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_001(omni_server) -> None:
-    command = [
-        "python",
-        os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py"),
+    command = common_args + [
+        "--model",
+        omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
     ]
 
     result = run_cmd(command)
 
-    text_content = extract_content_after_keyword("Chat completion output from text:", result)
+    text_content_tmp = extract_content_after_keyword("Chat completion output from text:", result)
+    text_content = strip_trailing_audio_saved_line(text_content_tmp)
 
     # Verify text output same as audio output
-    audio_content = convert_audio_file_to_text(output_path="./audio_0.wav")
+    wav_path = extract_content_after_keyword("Audio saved to", result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
 
@@ -78,20 +86,22 @@ def test_send_multimodal_request_001(omni_server) -> None:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_002(omni_server) -> None:
-    command = [
-        "python",
-        os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py"),
+    command = common_args + [
+        "--model",
+        omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--prompt",
         "Analyze all the media content and provide a comprehensive summary.",
     ]
     result = run_cmd(command)
 
-    text_content = extract_content_after_keyword("Chat completion output from text:", result)
+    text_content_tmp = extract_content_after_keyword("Chat completion output from text:", result)
+    text_content = strip_trailing_audio_saved_line(text_content_tmp)
 
     # Verify text output same as audio output
-    audio_content = convert_audio_file_to_text(output_path="./audio_0.wav")
+    wav_path = extract_content_after_keyword("Audio saved to", result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
     print(f"text content is: {text_content}")
     assert all(keyword in text_content for keyword in ["baby", "book"]), (
         "The output does not contain any of the keywords in video description."
@@ -113,7 +123,11 @@ def test_send_multimodal_request_002(omni_server) -> None:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_003(omni_server) -> None:
-    command = ["bash", os.path.join(example_dir, "run_curl_multimodal_generation.sh"), "mixed_modalities"]
+    command = [
+        "bash",
+        os.path.join(example_dir, "qwen2_5_omni/run_curl_multimodal_generation.sh"),
+        "mixed_modalities",
+    ]
 
     result = run_cmd(command)
 
@@ -136,11 +150,11 @@ def test_send_multimodal_request_003(omni_server) -> None:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_001(omni_server) -> None:
-    command = [
-        "python",
-        os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py"),
+    command = common_args + [
+        "--model",
+        omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--modalities",
         "text",
     ]
@@ -166,18 +180,19 @@ def test_modality_control_001(omni_server) -> None:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_002(omni_server) -> None:
-    command = [
-        "python",
-        os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py"),
+    command = common_args + [
+        "--model",
+        omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--modalities",
         "audio",
     ]
 
-    run_cmd(command)
+    result = run_cmd(command)
     # Verify text output same as audio output
-    audio_content = convert_audio_file_to_text(output_path="./audio_0.wav")
+    wav_path = extract_content_after_keyword("Audio saved to", result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
     print(f"audio content is: {audio_content}")
     assert all(keyword in audio_content for keyword in ["baby", "book"]), (
         "The output does not contain any of the keywords in video description."
@@ -194,21 +209,23 @@ def test_modality_control_002(omni_server) -> None:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_003(omni_server) -> None:
-    command = [
-        "python",
-        os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py"),
+    command = common_args + [
+        "--model",
+        omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--modalities",
         "audio,text",
     ]
 
     result = run_cmd(command)
 
-    text_content = extract_content_after_keyword("Chat completion output from text:", result)
+    text_content_tmp = extract_content_after_keyword("Chat completion output from text:", result)
+    text_content = strip_trailing_audio_saved_line(text_content_tmp)
 
     # Verify text output same as audio output
-    audio_content = convert_audio_file_to_text(output_path="./audio_0.wav")
+    wav_path = extract_content_after_keyword("Audio saved to", result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
     print(f"text content is: {text_content}")
     assert all(keyword in text_content for keyword in ["baby", "book"]), (
         "The output does not contain any of the keywords in video description."
@@ -230,20 +247,22 @@ def test_modality_control_003(omni_server) -> None:
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_stream_001(omni_server) -> None:
-    command = [
-        "python",
-        os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py"),
+    command = common_args + [
+        "--model",
+        omni_server.model,
         "--query-type",
-        "mixed_modalities",
+        "use_mixed_modalities",
         "--stream",
     ]
 
     result = run_cmd(command)
 
-    text_content = extract_content_after_keyword("content:", result)
+    text_content_tmp = extract_content_after_keyword("content:", result)
+    text_content = strip_trailing_audio_saved_line(text_content_tmp)
 
     # Verify text output same as audio output
-    audio_content = convert_audio_file_to_text(output_path="./audio_0.wav")
+    wav_path = extract_content_after_keyword("Audio saved to", result)
+    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path.strip()}")
     print(f"text content is: {text_content}")
     assert all(keyword in text_content for keyword in ["baby", "book"]), (
         "The output does not contain any of the keywords in video description."
