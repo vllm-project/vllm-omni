@@ -1046,6 +1046,7 @@ async def upload_voice(
     speaker_embedding: str | None = Form(None),
     consent: str = Form(...),
     name: str = Form(...),
+    ref_text: str = Form(None),
 ):
     """Upload a new voice for voice cloning.
 
@@ -1081,7 +1082,7 @@ async def upload_voice(
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
-            result = await handler.upload_voice(audio_sample, consent, name)
+            result = await handler.upload_voice(audio_sample, consent, name, ref_text=ref_text)
         else:
             return base(raw_request).create_error_response(
                 message="Either 'audio_sample' or 'speaker_embedding' must be provided"

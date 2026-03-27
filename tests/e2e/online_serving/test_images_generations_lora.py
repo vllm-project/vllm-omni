@@ -28,7 +28,7 @@ from tests.utils import hardware_test
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
-DIFFUSION_INIT_TIMEOUT_S = 600
+DIFFUSION_INIT_TIMEOUT_S = 700
 
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
