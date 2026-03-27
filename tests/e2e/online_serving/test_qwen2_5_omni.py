@@ -74,6 +74,9 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+@pytest.mark.skip(
+    reason="qwen2.5-omni model cannot recognize the synthetic video and audio data, need to update the test data to enable this test case"
+)
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
