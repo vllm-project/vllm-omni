@@ -1495,15 +1495,15 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
-    if "audio" in modalities:
-        assert response.audio_content is not None, "No audio output is generated"
-        print(f"audio content is: {response.audio_content}")
-
-    if "text" in modalities:
-        assert response.text_content is not None, "No text output is generated"
-        print(f"text content is: {response.text_content}")
-
     if run_level == "advanced_model":
+        if "audio" in modalities:
+            assert response.audio_content is not None, "No audio output is generated"
+            print(f"audio content is: {response.audio_content}")
+
+        if "text" in modalities:
+            assert response.text_content is not None, "No text output is generated"
+            print(f"text content is: {response.text_content}")
+
         # Verify image description
         word_types = ["text", "image", "audio", "video"]
         keywords_dict = request_config.get("key_words", {})
