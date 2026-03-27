@@ -84,6 +84,7 @@ def _get_wan22_feature_cases():
 
 
 @pytest.mark.advanced_model
+@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_wan22_feature_cases(),
