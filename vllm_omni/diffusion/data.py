@@ -13,15 +13,15 @@ from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
-
-from vllm_omni.diffusion.quantization import (
-    DiffusionQuantizationConfig,
-    get_diffusion_quant_config,
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
 )
+
 from vllm_omni.diffusion.utils.network_utils import is_port_available
+from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.quantization import DiffusionQuantizationConfig
+    from vllm.config import ProfilerConfig
 
 # Import after TYPE_CHECKING to avoid circular imports at runtime
 # The actual import is deferred to __post_init__ to avoid import order issues
@@ -55,6 +55,20 @@ class DiffusionParallelConfig:
     ring_degree: int = 1
     """Number of GPUs used for ring sequence parallelism."""
 
+    ulysses_mode: str = "strict"
+    """Ulysses sequence-parallel mode.
+
+    - "strict": Require divisibility constraints (fastest, default).
+    - "advanced_uaa": Enable UAA ("Ulysses Anything Attention") to support
+      uneven sequence lengths and non-divisible head counts.
+
+    Note:
+    - Ring attention does not support `attention_mask`, so models that rely on
+      mask-based auto-padding are still incompatible with Ring.
+    - When used in hybrid Ulysses+Ring, Ring requires consistent per-rank
+      sequence shapes across the ring group.
+    """
+
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
 
@@ -87,6 +101,9 @@ class DiffusionParallelConfig:
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        )
+        assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
+            f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
 
         # Validate HSDP configuration
@@ -264,6 +281,12 @@ class DiffusionCacheConfig:
     # Used by cache-dit for scm mask generation. If this value changes during inference,
     # we will re-generate the scm mask and refresh the cache context.
     num_inference_steps: int | None = None
+    # Force refresh the cache at a specific step index hint, useful for models like
+    # GLM-Image (image preprocessing step in editing mode).
+    force_refresh_step_hint: int | None = None
+    # Policy for force refresh: "once" refreshes only at the hint step,
+    # "repeat" refreshes every force_refresh_step_hint steps.
+    force_refresh_step_policy: str = "once"
 
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -453,13 +476,15 @@ class OmniDiffusionConfig:
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
 
+    profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
+
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
-    # Quantization settings
-    # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)
-    quantization: str | None = None
-    quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
+    # Quantization: str method name, dict config, QuantizationConfig, or None.
+    # str is resolved to {"method": <str>} internally.
+    # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
+    quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
@@ -520,6 +545,11 @@ class OmniDiffusionConfig:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
+        if isinstance(self.profiler_config, dict):
+            from vllm.config import ProfilerConfig
+
+            self.profiler_config = ProfilerConfig(**self.profiler_config)
+
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig
         if isinstance(self.parallel_config, Mapping):
@@ -565,34 +595,17 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
-        # Convert quantization config (deferred import to avoid circular imports)
-        if self.quantization is not None or self.quantization_config is not None:
-            from vllm_omni.diffusion.quantization import (
-                DiffusionQuantizationConfig,
-            )
-
-            # Handle dict or DictConfig (from OmegaConf) - use Mapping for broader compatibility
-            if isinstance(self.quantization_config, Mapping):
-                # Convert DictConfig to dict if needed (OmegaConf compatibility)
-                config_dict = dict(self.quantization_config)
-                # Use get() instead of pop() to avoid mutating original dict
-                quant_method = config_dict.get("method", self.quantization)
-                # Filter out "method" key for kwargs
-                quant_kwargs = {k: v for k, v in config_dict.items() if k != "method"}
-
-                # Validate conflicting methods
-                if self.quantization is not None and quant_method is not None and quant_method != self.quantization:
-                    logger.warning(
-                        f"Conflicting quantization methods: quantization={self.quantization!r}, "
-                        f"quantization_config['method']={quant_method!r}. Using quantization_config['method']."
-                    )
-
-                self.quantization_config = get_diffusion_quant_config(quant_method, **quant_kwargs)
-            elif self.quantization_config is None and self.quantization is not None:
-                self.quantization_config = get_diffusion_quant_config(self.quantization)
-            elif not isinstance(self.quantization_config, DiffusionQuantizationConfig):
+        # Resolve quantization_config: str/dict -> QuantizationConfig via build_quant_config.
+        if self.quantization_config is not None:
+            if isinstance(self.quantization_config, QuantizationConfig):
+                pass  # Already built
+            elif isinstance(self.quantization_config, str):
+                self.quantization_config = build_quant_config(self.quantization_config)
+            elif isinstance(self.quantization_config, Mapping):
+                self.quantization_config = build_quant_config(dict(self.quantization_config))
+            else:
                 raise TypeError(
-                    f"quantization_config must be a DiffusionQuantizationConfig, dict, or None, "
+                    f"quantization_config must be str, dict, QuantizationConfig, or None, "
                     f"got {type(self.quantization_config)!r}"
                 )
 
@@ -613,6 +626,13 @@ class OmniDiffusionConfig:
             if "lora_scale" not in kwargs:
                 kwargs["lora_scale"] = kwargs["static_lora_scale"]
             kwargs.pop("static_lora_scale", None)
+
+        # Backwards-compatibility: map "quantization" to "quantization_config"
+        # so callers using the old field name still work.
+        if "quantization" in kwargs and "quantization_config" not in kwargs:
+            kwargs["quantization_config"] = kwargs.pop("quantization")
+        else:
+            kwargs.pop("quantization", None)
 
         # Check environment variable as fallback for cache_backend
         # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
@@ -650,6 +670,9 @@ class DiffusionOutput:
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # memory usage info
+    peak_memory_mb: float = 0.0
 
 
 class AttentionBackendEnum(enum.Enum):

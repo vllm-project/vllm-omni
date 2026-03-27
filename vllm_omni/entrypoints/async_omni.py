@@ -130,8 +130,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     async def generate(
         self,
-        prompt: OmniPromptType,
-        sampling_params: Any = None,
+        prompt: OmniPromptType | list[OmniPromptType],
         request_id: str = "",
         *,
         prompt_text: str | None = None,
@@ -140,22 +139,31 @@ class AsyncOmni(EngineClient, OmniBase):
         sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         output_modalities: list[str] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Generate outputs for the given prompt asynchronously.
+        """Generate outputs for the given prompt(s) asynchronously.
 
-        Coordinates multi-stage pipeline execution. Processes the prompt through
-        all stages in the pipeline and yields outputs as they become available.
+        Coordinates multi-stage pipeline execution. Processes the prompt
+        through all stages in the pipeline and yields outputs as they become
+        available.
+
+        **Batch mode (diffusion only):**
+        When *prompt* is a ``list``, all prompts are dispatched in a single
+        ``DiffusionEngine.step()`` call at the diffusion stage.  The combined
+        result is yielded as one ``OmniRequestOutput`` with all generated
+        images.  Only a single *request_id* is used for the whole batch.
 
         Args:
-            prompt: Prompt to process. Can be a text string, token IDs,
-                or multimodal prompt.
-            request_id: Unique identifier for this request
-            sampling_params_list: List of SamplingParams, one for each stage.
+            prompt: A single prompt **or** a list of prompts.  A list
+                triggers batch mode when the diffusion stage is reached.
+            request_id: Unique identifier for this request.
+            sampling_params_list: List of SamplingParams, one per stage.
                 Must have the same length as the number of stages.
-                If None, uses default sampling params for each stage.
+                If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
+            In batch mode the diffusion stage yields one output containing
+            all generated images.
 
         Raises:
             ValueError: If sampling_params_list has incorrect length.
@@ -434,19 +442,30 @@ class AsyncOmni(EngineClient, OmniBase):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(self, stages: list[int] | None = None) -> list[Any]:
+    async def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
         """Start profiling specified stages.
 
-        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
+        Uses vLLM-compatible profile(is_start=True, profile_prefix) interface.
+
+        Args:
+            profile_prefix: Optional prefix for the trace file names.
+            stages: List of stage IDs to profile. If None, profiles all stages.
         """
-        return await self.collective_rpc(method="start_profile", stage_ids=stages)
+        return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
 
     async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Stop profiling specified stages.
 
-        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
+        Uses vLLM-compatible profile(is_start=False) interface.
+
+        Args:
+            stages: List of stage IDs to profile. If None, stops all stages.
         """
-        return await self.collective_rpc(method="stop_profile", stage_ids=stages)
+        return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache for all stages.

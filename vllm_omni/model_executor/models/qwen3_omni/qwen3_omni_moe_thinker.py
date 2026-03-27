@@ -23,6 +23,7 @@
 """Inference-only Qwen3-Omni-Moe model (thinker part)."""
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from typing import Any, Literal, cast
 
@@ -47,10 +48,18 @@ from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -77,7 +86,15 @@ from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer as _Qwen3Omni_VisionTransformer,
 )
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
-    Qwen3OmniMoeAudioEncoder,
+    Qwen3OmniMoeAudioAttention as _Qwen3OmniMoeAudioAttention,
+)
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeAudioEncoder as _Qwen3OmniMoeAudioEncoder,
+)
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeAudioEncoderLayer as _Qwen3OmniMoeAudioEncoderLayer,
+)
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     _get_feat_extract_output_lengths,
 )
 from vllm.model_executor.models.utils import (
@@ -102,6 +119,7 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
 )
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 try:
     import flash_attn
@@ -212,6 +230,252 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
                 x_ds = self.merger_list[idx](x_ds)
                 processed_hidden_states_list.append(x_ds)
             hidden_states = torch.cat(processed_hidden_states_list, dim=1)
+
+        return hidden_states
+
+
+class Qwen3OmniMoeAudioAttention(_Qwen3OmniMoeAudioAttention):
+    """Subclass that adds quant_config support to audio attention."""
+
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        nn.Module.__init__(self)
+        self.embed_dim = config.d_model
+        self.num_heads = config.encoder_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_local_heads = self.num_heads // tp_size
+
+        if (self.head_dim * self.num_heads) != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: "
+                f"{self.embed_dim} and `num_heads`: {self.num_heads})."
+            )
+
+        self.scaling = self.head_dim**-0.5
+
+        self.qkv = QKVParallelLinear(
+            hidden_size=self.embed_dim,
+            head_size=self.head_dim,
+            total_num_heads=self.num_heads,
+            total_num_kv_heads=self.num_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv",
+        )
+
+        self.out_proj = RowParallelLinear(
+            input_size=self.embed_dim,
+            output_size=self.embed_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
+        )
+
+        self.attn = MMEncoderAttention(
+            num_heads=self.num_local_heads,
+            head_size=self.head_dim,
+            scale=self.scaling,
+            prefix=f"{prefix}.attn",
+        )
+
+
+class Qwen3OmniMoeAudioEncoderLayer(_Qwen3OmniMoeAudioEncoderLayer):
+    """Subclass that adds quant_config support to audio encoder layers."""
+
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        nn.Module.__init__(self)
+        self.embed_dim = config.d_model
+        self.self_attn = Qwen3OmniMoeAudioAttention(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
+        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.activation_fn = _ACTIVATION_REGISTRY[config.activation_function]
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim,
+            config.encoder_ffn_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc1",
+        )
+        self.fc2 = RowParallelLinear(
+            config.encoder_ffn_dim,
+            self.embed_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc2",
+        )
+        self.final_layer_norm = nn.LayerNorm(self.embed_dim)
+
+
+class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
+    """Subclass that adds quant_config support to the audio encoder."""
+
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        nn.Module.__init__(self)
+
+        embed_dim = config.d_model
+        self.num_mel_bins = config.num_mel_bins
+        self.max_source_positions = config.max_source_positions
+        self.n_window = config.n_window
+        self.n_window_infer = config.n_window_infer
+        self.conv_chunksize = config.conv_chunksize
+
+        from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+            SinusoidsPositionEmbedding,
+        )
+
+        self.positional_embedding = SinusoidsPositionEmbedding(self.max_source_positions, embed_dim)
+
+        # Convolutional layers (not quantized)
+        self.conv2d1 = nn.Conv2d(1, config.downsample_hidden_size, 3, 2, padding=1)
+        self.conv2d2 = nn.Conv2d(
+            config.downsample_hidden_size,
+            config.downsample_hidden_size,
+            3,
+            2,
+            padding=1,
+        )
+        self.conv2d3 = nn.Conv2d(
+            config.downsample_hidden_size,
+            config.downsample_hidden_size,
+            3,
+            2,
+            padding=1,
+        )
+
+        conv_out_dim = config.downsample_hidden_size * ((((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2)
+        self.conv_out = ReplicatedLinear(
+            conv_out_dim,
+            config.d_model,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.conv_out",
+        )
+
+        self.layers = nn.ModuleList(
+            [
+                Qwen3OmniMoeAudioEncoderLayer(
+                    config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{i}",
+                )
+                for i in range(config.encoder_layers)
+            ]
+        )
+
+        self.ln_post = nn.LayerNorm(config.d_model)
+        self.proj1 = ReplicatedLinear(
+            config.d_model,
+            config.d_model,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj1",
+        )
+        self.act = _ACTIVATION_REGISTRY[config.activation_function]
+        self.proj2 = ReplicatedLinear(
+            config.d_model,
+            config.output_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj2",
+        )
+
+        from vllm.model_executor.models.vision import get_vit_attn_backend
+
+        self.attn_backend = get_vit_attn_backend(
+            head_size=config.d_model // config.encoder_attention_heads,
+            dtype=torch.get_default_dtype(),
+        )
+
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        feature_lens: torch.Tensor,
+        aftercnn_lens: torch.Tensor,
+    ):
+        import torch.nn.functional as F
+
+        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+
+        chunk_lengths = torch.tensor(
+            [self.n_window * 2] * chunk_num.sum(),
+            dtype=torch.long,
+            device=feature_lens.device,
+        )
+        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
+        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+
+        chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
+        padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+
+        feature_lens_after_cnn = self._get_cnn_output_lengths(chunk_lengths)
+        max_len_after_cnn = feature_lens_after_cnn.max().item()
+        indices = torch.arange(max_len_after_cnn, device=padded_feature.device)
+        padded_mask_after_cnn = indices.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)
+
+        padded_feature = padded_feature.unsqueeze(1)
+
+        if padded_feature.size(0) <= self.conv_chunksize:
+            padded_embed = F.gelu(self.conv2d1(padded_feature))
+            padded_embed = F.gelu(self.conv2d2(padded_embed))
+            padded_embed = F.gelu(self.conv2d3(padded_embed))
+        else:
+            padded_embeds = []
+            for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+                padded_embed = F.gelu(self.conv2d1(chunk))
+                padded_embed = F.gelu(self.conv2d2(padded_embed))
+                padded_embed = F.gelu(self.conv2d3(padded_embed))
+                padded_embeds.append(padded_embed)
+            padded_embed = torch.cat(padded_embeds, dim=0)
+
+        b, c, f, t = padded_embed.size()
+        padded_embed, _ = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
+
+        positional_embedding = (
+            self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
+            .unsqueeze(0)
+            .to(padded_embed.dtype)
+        )
+        padded_embed = padded_embed + positional_embedding
+
+        hidden_states = padded_embed[padded_mask_after_cnn]
+
+        cu_chunk_lens = [0]
+        window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
+        for cnn_len in aftercnn_lens.tolist():
+            num_full_chunks = cnn_len // window_aftercnn
+            remainder = cnn_len % window_aftercnn
+            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
+            if remainder:
+                cu_chunk_lens.append(remainder)
+        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
+
+        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+
+        for encoder_layer in self.layers:
+            hidden_states = encoder_layer(
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+            )
+
+        # ReplicatedLinear returns (output, bias) — unpack
+        hidden_states = self.ln_post(hidden_states)
+        hidden_states, _ = self.proj1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states, _ = self.proj2(hidden_states)
 
         return hidden_states
 
@@ -850,9 +1114,41 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.multimodal_config = multimodal_config
         self.quant_config = quant_config
 
+        # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) quantize the
+        # entire thinker — audio tower, visual encoder, and language model
+        # all share the same quant method.  Dynamic quantization methods
+        # (e.g. --quantization fp8) should only target the language model.
+        _PRE_QUANTIZED_METHODS = {"modelopt", "modelopt_fp4", "modelopt_mxfp8"}
+
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            audio_quant_config = quant_config.resolve("audio_tower")
+            visual_quant_config = quant_config.resolve("visual")
+            language_quant_config = quant_config.resolve("language_model")
+        elif quant_config is not None:
+            if quant_config.get_name() in _PRE_QUANTIZED_METHODS:
+                # Pre-quantized: pass quant_config to all subcomponents.
+                audio_quant_config = quant_config
+                visual_quant_config = quant_config
+                language_quant_config = quant_config
+            else:
+                # Dynamic quantization: scope to language_model only.
+                quant_config = ComponentQuantizationConfig(
+                    component_configs={"language_model": quant_config},
+                    default_config=None,
+                )
+                vllm_config = replace(vllm_config, quant_config=quant_config)
+                audio_quant_config = None
+                visual_quant_config = None
+                language_quant_config = quant_config.resolve("language_model")
+        else:
+            audio_quant_config = None
+            visual_quant_config = None
+            language_quant_config = None
+
         with self._mark_tower_model(vllm_config, "audio"):
             self.audio_tower = Qwen3OmniMoeAudioEncoder(
                 thinker_config.audio_config,
+                quant_config=audio_quant_config,
                 prefix=maybe_prefix(prefix, "audio_tower"),
             )
 
@@ -867,7 +1163,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             self.visual = Qwen3Omni_VisionTransformer(
                 vision_config=thinker_config.vision_config,
                 norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
+                quant_config=visual_quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
@@ -882,11 +1178,14 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 ]
 
         with self._mark_language_model(vllm_config):
+            lm_vllm_config = vllm_config.with_hf_config(
+                thinker_config.text_config,
+                architectures=["Qwen3MoeForCausalLM"],
+            )
+            if language_quant_config is not quant_config:
+                lm_vllm_config = replace(lm_vllm_config, quant_config=language_quant_config)
             self.language_model = Qwen3MoeLLMForCausalLM(
-                vllm_config=vllm_config.with_hf_config(
-                    thinker_config.text_config,
-                    architectures=["Qwen3MoeForCausalLM"],
-                ),
+                vllm_config=lm_vllm_config,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
 

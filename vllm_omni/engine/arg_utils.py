@@ -7,6 +7,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.engine.output_modality import OutputModality
 from vllm_omni.plugins import load_omni_general_plugins
 
 logger = init_logger(__name__)
@@ -30,7 +31,7 @@ def _register_omni_hf_configs() -> None:
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
-        ("mistral", VoxtralTTSConfig),
+        ("voxtral_tts", VoxtralTTSConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -124,6 +125,14 @@ class OmniEngineArgs(EngineArgs):
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
+        # If model_arch is specified, inject it into hf_overrides so vLLM can
+        # resolve the architecture even when config.json lacks 'architectures'.
+        if self.model_arch:
+            if self.hf_overrides is None:
+                self.hf_overrides = {}
+            if isinstance(self.hf_overrides, dict):
+                self.hf_overrides.setdefault("architectures", [self.model_arch])
+
         # Build the vLLM config first, then use it to create the Omni config.
         model_config = super().create_model_config()
 
@@ -143,3 +152,8 @@ class OmniEngineArgs(EngineArgs):
             task_type=self.task_type,
         )
         return omni_config
+
+    @property
+    def output_modality(self) -> OutputModality:
+        """Parse engine_output_type into a type-safe OutputModality flag."""
+        return OutputModality.from_string(self.engine_output_type)

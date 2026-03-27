@@ -22,6 +22,7 @@ from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
@@ -301,6 +302,10 @@ class OmniARScheduler(VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                    if self.chunk_transfer_adapter is not None:
+                        self.chunk_transfer_adapter.cleanup_receiver(
+                            request.request_id,
+                        )
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
@@ -382,9 +387,8 @@ class OmniARScheduler(VLLMScheduler):
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.cleanup(
+                    self.chunk_transfer_adapter.cleanup_receiver(
                         request.request_id,
-                        getattr(request, "external_req_id", None),
                     )
 
         # [Omni] Cleanup state for finished requests
@@ -521,17 +525,13 @@ class OmniARScheduler(VLLMScheduler):
                     # Also update request.additional_information for good measure
                     add_info = getattr(request, "additional_information", None)
                     # If additional_information is an AdditionalInformationPayload-like object,
-                    # unpack list_data into a plain dict.
+                    # unpack it into a plain dict.
                     if (
                         add_info is not None
                         and hasattr(add_info, "entries")
                         and isinstance(getattr(add_info, "entries"), dict)
                     ):
-                        request.additional_information = {
-                            k: getattr(v, "list_data")
-                            for k, v in getattr(add_info, "entries").items()
-                            if getattr(v, "list_data", None) is not None
-                        }
+                        request.additional_information = deserialize_additional_information(add_info)
                         add_info = request.additional_information
                     if add_info is None:
                         request.additional_information = {}

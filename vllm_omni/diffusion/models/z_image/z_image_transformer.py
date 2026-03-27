@@ -623,6 +623,11 @@ class ZImageTransformer2DModel(CachedTransformer):
         quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
+        # NOTE: `DiffusersPipelineLoader.load_model()` initializes this module
+        # under `set_default_torch_dtype(od_config.dtype)`, so using the current
+        # default dtype keeps `self.dtype` consistent with the actually loaded
+        # weights. This dtype is used by the pipeline to cast inputs.
+        self.dtype = torch.get_default_dtype()
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.all_patch_size = all_patch_size

@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -365,21 +366,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         "additional_information on request data is deprecated, use model_intermediate_buffer"
                     )
                     payload_info = new_req_data.additional_information
-                    info_dict = {}
-                    if isinstance(payload_info, dict):
-                        info_dict = payload_info
-                    else:
-                        from vllm_omni.engine import AdditionalInformationPayload
-
-                        if isinstance(payload_info, AdditionalInformationPayload):
-                            for k, entry in payload_info.entries.items():
-                                if entry.tensor_data is not None:
-                                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
-                                    arr = np.frombuffer(entry.tensor_data, dtype=dt)
-                                    arr = arr.reshape(entry.tensor_shape)
-                                    info_dict[k] = torch.from_numpy(arr.copy())
-                                else:
-                                    info_dict[k] = entry.list_data
+                    info_dict = deserialize_additional_information(payload_info)
                     if info_dict:
                         self.model_intermediate_buffer[req_id] = info_dict
                         setattr(
@@ -921,41 +908,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             logger.exception("Failed to decode prompt_embeds payload")
         return None
 
-    @staticmethod
-    def _resolve_additional_information(
-        payload: "dict | object | None",
-    ) -> dict[str, object]:
-        """Convert an *additional_information* payload to a plain dict.
-
-        Accepts:
-        - ``dict`` – returned as-is.
-        - ``AdditionalInformationPayload`` (or duck-typed with
-          ``.entries``) – decoded entry-by-entry.
-        - ``None`` – returns ``{}``.
-        """
-        if payload is None:
-            return {}
-        if isinstance(payload, dict):
-            return payload
-        try:
-            entries = getattr(payload, "entries", None)
-            if not isinstance(entries, dict):
-                return {}
-            info: dict[str, object] = {}
-            for k, entry in entries.items():
-                tensor_data = getattr(entry, "tensor_data", None)
-                if tensor_data is not None:
-                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
-                    arr = np.frombuffer(tensor_data, dtype=dt)
-                    arr = arr.reshape(getattr(entry, "tensor_shape", ()))
-                    info[k] = torch.from_numpy(arr.copy())
-                else:
-                    info[k] = getattr(entry, "list_data", None)
-            return info
-        except Exception:
-            logger.exception("Failed to decode additional_information payload")
-        return {}
-
     def _decode_and_store_request_payloads(
         self,
         scheduler_output: "SchedulerOutput",
@@ -978,7 +930,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 logger.warning_once(
                     "additional_information on request data is deprecated, use model_intermediate_buffer"
                 )
-            info_dict = self._resolve_additional_information(info_payload)
+            info_dict = deserialize_additional_information(info_payload)
             if info_dict:
                 self.model_intermediate_buffer[req_id] = info_dict
                 setattr(self.requests[req_id], "additional_information_cpu", info_dict)
@@ -1323,9 +1275,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             use_cascade_attn=False,
         )
         # Force eager for unwrapped code predictors (AR loops / multinomial).
+        # When talker_mtp is not a CUDAGraphWrapper, it manages its own CUDA
+        # graphs internally (code_predictor has its own bucket sizes).
         if not isinstance(self.talker_mtp, CUDAGraphWrapper):
             _cudagraph_mode = CUDAGraphMode.NONE
-        num_tokens_padded = batch_desc.num_tokens
+            num_tokens_padded = decode_batch_size
+        else:
+            num_tokens_padded = batch_desc.num_tokens
         req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]

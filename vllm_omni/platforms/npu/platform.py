@@ -105,3 +105,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory
+
+    @classmethod
+    def get_profiler_cls(cls) -> str:
+        return "vllm_omni.platforms.npu.profiler.NPUTorchProfilerWrapper"

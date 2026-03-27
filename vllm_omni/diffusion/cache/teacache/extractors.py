@@ -188,8 +188,21 @@ def extract_qwen_context(
     # ============================================================================
     # PREPROCESSING (Qwen-specific)
     # ============================================================================
-    hidden_states = module.img_in(hidden_states)
+    # Call image_rope_prepare instead of img_in + pos_embed directly.
+    # This ensures the SequenceParallelSplitHook registered on image_rope_prepare
+    # fires when SP is enabled, correctly sharding hidden_states and vid_freqs.
+    hidden_states, vid_freqs, txt_freqs = module.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
+    image_rotary_emb = (vid_freqs, txt_freqs)
+
     timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+    # Call modulate_index_prepare instead of handling timestep directly.
+    # For zero_cond_t=False: timestep unchanged, modulate_index=None.
+    # For zero_cond_t=True: timestep is doubled, modulate_index is created and
+    # sharded by the SequenceParallelSplitHook on modulate_index_prepare so that
+    # its sequence dimension matches the already-sharded hidden_states.
+    timestep, modulate_index = module.modulate_index_prepare(timestep, img_shapes)
+
     encoder_hidden_states = module.txt_norm(encoder_hidden_states)
     encoder_hidden_states = module.txt_in(encoder_hidden_states)
 
@@ -201,8 +214,6 @@ def extract_qwen_context(
         if guidance is None
         else module.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
     )
-
-    image_rotary_emb = module.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
     # ============================================================================
     # EXTRACT MODULATED INPUT (for cache decision)
@@ -249,6 +260,7 @@ def extract_qwen_context(
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
+                modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
             )
         return (h, e)
@@ -709,6 +721,112 @@ def extract_flux2_klein_context(
     )
 
 
+def extract_stable_audio_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    global_hidden_states: torch.Tensor | None = None,
+    rotary_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
+    return_dict: bool = True,
+    attention_mask: torch.Tensor | None = None,
+    encoder_attention_mask: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for Stable Audio DiT model.
+
+    Architecture Notes:
+        - Stable Audio uses standard LayerNorm
+        - Timestep conditioning via global_hidden_states prepended to sequence
+        - Single-stream model (cross-attention handled separately)
+        - Input: [B, C, L] (C=in_channels) -> transpose -> [B, L, C] -> project -> [B, L, inner_dim]
+        - Global states prepended: [B, 1+L, inner_dim]
+    """
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must have transformer_blocks attribute with at least one block")
+
+    # Cast inputs to match model weights dtype
+    hidden_states = hidden_states.to(module.dtype)
+    encoder_hidden_states = encoder_hidden_states.to(module.dtype)
+    if global_hidden_states is not None:
+        global_hidden_states = global_hidden_states.to(module.dtype)
+
+    cross_attention_hidden_states = module.cross_attention_proj(encoder_hidden_states)
+    global_hidden_states = module.global_proj(global_hidden_states)
+    time_hidden_states = module.timestep_proj(module.time_proj(timestep.to(module.dtype)))
+
+    # Combine global and time embeddings → [B, 1, inner_dim]
+    temb = global_hidden_states + time_hidden_states.unsqueeze(1)
+
+    hidden_states = module.preprocess_conv(hidden_states) + hidden_states
+    hidden_states = hidden_states.transpose(1, 2)
+
+    # Capture the original sequence length for safe post-processing slicing
+    original_seq_len = hidden_states.shape[1]
+
+    hidden_states = module.proj_in(hidden_states)
+    hidden_states = torch.cat([temb, hidden_states], dim=1)
+
+    # attention_mask is not used in the standard Stable Audio Open inference path.
+    assert attention_mask is None, (
+        "attention_mask is not supported in extract_stable_audio_context; expected None for Stable Audio Open."
+    )
+
+    # Stable Audio prepends the combined global+time embedding (`temb`) to the sequence.
+    # Therefore, the standard LayerNorm applied here still captures the timestep signal
+    # within the first token of the output, giving the cache discriminator the info it needs.
+    first_block = module.transformer_blocks[0]
+    modulated_input = first_block.norm1(hidden_states)
+
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        """
+        Execute all Stable Audio transformer blocks.
+
+        Returns:
+            Tuple containing only hidden_states (single-stream model).
+            Format: (hidden_states,)
+        """
+        h = hidden_states
+        for block in module.transformer_blocks:
+            h = block(
+                hidden_states=h,
+                encoder_hidden_states=cross_attention_hidden_states,
+                rotary_embedding=rotary_embedding,
+                attention_mask=attention_mask,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+        return (h,)
+
+    def postprocess(h: torch.Tensor) -> Any:
+        """
+        Apply Stable Audio-specific output postprocessing.
+
+        Args:
+            h: Hidden states from transformer blocks [B, 1+L, inner_dim]
+
+        Returns:
+            Transformer2DModelOutput or tuple based on return_dict
+        """
+        from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+        h = module.proj_out(h)
+        h = h.transpose(1, 2)[:, :, -original_seq_len:]
+        output = module.postprocess_conv(h) + h
+        if return_dict:
+            return Transformer2DModelOutput(sample=output)
+        return (output,)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -720,6 +838,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "Bagel": extract_bagel_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
+    "StableAudioDiTModel": extract_stable_audio_context,
     # Future models:
     # "FluxTransformer2DModel": extract_flux_context,
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,
