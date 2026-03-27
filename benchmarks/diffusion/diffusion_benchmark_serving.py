@@ -1,4 +1,4 @@
-# adapted from sglang and fastvideo
+# adapted from fastvideo
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -1007,7 +1007,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="vllm-omni",
-        choices=["vllm-omni", "openai", "sglang", "v1/videos"],
+        choices=["vllm-omni", "openai", "v1/videos"],
         help="Backend to target the benchmark to.",
     )
     parser.add_argument(
