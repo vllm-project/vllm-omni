@@ -242,6 +242,7 @@ class SequenceParallelSplitHook(ModelHook):
 
         if not is_tensor and not is_tensor_list:
             # No tensor outputs to shard
+            logger.warning_once("No tensor outputs to shard.")
             return output
 
         output_list = [output] if is_tensor else list(output)
