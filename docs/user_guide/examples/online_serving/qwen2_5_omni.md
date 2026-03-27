@@ -223,10 +223,6 @@ sudo apt install ffmpeg
     ``````py
     --8<-- "examples/online_serving/qwen2_5_omni/gradio_demo.py"
     ``````
-??? abstract "openai_chat_completion_client_for_multimodal_generation.py"
-    ``````py
-    --8<-- "examples/online_serving/qwen2_5_omni/openai_chat_completion_client_for_multimodal_generation.py"
-    ``````
 ??? abstract "run_curl_multimodal_generation.sh"
     ``````sh
     --8<-- "examples/online_serving/qwen2_5_omni/run_curl_multimodal_generation.sh"
