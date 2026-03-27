@@ -238,7 +238,7 @@ def text2tts(
     pooling_output: dict[str, Any],
     request: Any,
     is_finished: bool = False,
-) -> list[dict[str, Any]] | None:
+) -> dict[str, Any] | None:
     """
     OmniChunkTransferAdapter custom_process_next_stage_input_func hook.
 
@@ -294,5 +294,9 @@ def text2tts(
     if not ready_chunks:
         return None  # still buffering — matches framework convention
 
-    # --- Build one Qwen3-TTS input dict per flushed sentence chunk ----------
-    return [_build_tts_input(chunk, cfg, request) for chunk in ready_chunks]
+    # Framework expects dict | None (not list[dict]).
+    # Return first ready chunk; re-queue remaining into chunker buffer.
+    if len(ready_chunks) > 1:
+        chunker._buf = " ".join(ready_chunks[1:]) + " " + chunker._buf
+
+    return _build_tts_input(ready_chunks[0], cfg, request)

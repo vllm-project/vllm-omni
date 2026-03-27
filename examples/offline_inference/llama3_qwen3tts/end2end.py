@@ -48,7 +48,7 @@ _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parents[2]  # examples/offline_inference/llama3_qwen3tts → root
 sys.path.insert(0, str(_REPO_ROOT))
 
-from vllm_omni.entrypoints.omni_llm import Omni  # noqa: E402  (after sys.path fix)
+from vllm_omni.entrypoints.omni import Omni  # noqa: E402  (after sys.path fix)
 
 # ---------------------------------------------------------------------------
 # Default model IDs  (override with CLI args)

@@ -12,7 +12,10 @@ Run:
     pytest tests/unit/test_text_tts_bridge.py -v --noconftest
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock  # noqa: F401
+
+import pytest
+from pytest_mock import MockerFixture  # noqa: F401
 
 from vllm_omni.model_executor.stage_input_processors.text_tts_bridge import (
     SentenceChunker,
@@ -84,6 +87,7 @@ def make_pooling_output(text: str = "") -> dict:
 # =============================================================================
 
 
+@pytest.mark.core_model
 class TestTextTTSBridgeConfig:
     def test_defaults(self):
         cfg = TextTTSBridgeConfig()
@@ -113,6 +117,7 @@ class TestTextTTSBridgeConfig:
 # =============================================================================
 
 
+@pytest.mark.core_model
 class TestSentenceChunker:
     def _chunker(self, min_chars=5):
         return SentenceChunker(TextTTSBridgeConfig(min_sentence_chars=min_chars))
@@ -193,6 +198,7 @@ class TestSentenceChunker:
 # =============================================================================
 
 
+@pytest.mark.core_model
 class TestGetDecodedText:
     def test_reads_text_key_from_pooling_output(self):
         req = make_request()
@@ -220,6 +226,7 @@ class TestGetDecodedText:
 # =============================================================================
 
 
+@pytest.mark.core_model
 class TestTransferManagerState:
     def test_creates_chunker_on_first_call(self):
         tm = make_transfer_manager()
@@ -259,6 +266,7 @@ class TestTransferManagerState:
 # =============================================================================
 
 
+@pytest.mark.core_model
 class TestText2TtsHook:
     """
     Tests use the real function signature matching OmniChunkTransferAdapter:
@@ -280,8 +288,8 @@ class TestText2TtsHook:
         req = make_request()
         result = text2tts(tm, make_pooling_output("Hi."), req, False)
         assert result is not None
-        assert len(result) == 1
-        assert result[0]["text"] == "Hi."
+        assert isinstance(result, dict)
+        assert result["text"] == "Hi."
 
     def test_flushes_on_eos(self):
         tm = make_transfer_manager({"min_sentence_chars": 100})
@@ -291,8 +299,8 @@ class TestText2TtsHook:
         # Send EOS
         result = text2tts(tm, make_pooling_output(""), req, True)
         assert result is not None
-        assert len(result) == 1
-        assert "No delimiter here" in result[0]["text"]
+        assert isinstance(result, dict)
+        assert "No delimiter here" in result["text"]
 
     def test_cleanup_after_eos(self):
         tm = make_transfer_manager({"min_sentence_chars": 3})
@@ -310,11 +318,10 @@ class TestText2TtsHook:
         req = make_request()
         result = text2tts(tm, make_pooling_output("Hi."), req, False)
         assert result is not None
-        tts_input = result[0]
-        assert "text" in tts_input
-        assert "task_type" in tts_input
-        assert "voice" in tts_input
-        assert "language" in tts_input
+        assert "text" in result
+        assert "task_type" in result
+        assert "voice" in result
+        assert "language" in result
 
     # ------------------------------------------------------------------
     # Voice/language injection — RFC Q3
@@ -324,20 +331,20 @@ class TestText2TtsHook:
         tm = make_transfer_manager({"min_sentence_chars": 3, "default_voice": "ryan"})
         req = make_request()  # no speaker in request
         result = text2tts(tm, make_pooling_output("Hi."), req, False)
-        assert result[0]["voice"] == "ryan"
+        assert result["voice"] == "ryan"
 
     def test_per_request_voice_overrides_default(self):
         """Speaker from request.additional_information overrides YAML default."""
         tm = make_transfer_manager({"min_sentence_chars": 3, "default_voice": "vivian"})
         req = make_request(speaker="serena")
         result = text2tts(tm, make_pooling_output("Hi."), req, False)
-        assert result[0]["voice"] == "serena"
+        assert result["voice"] == "serena"
 
     def test_per_request_language_overrides_default(self):
         tm = make_transfer_manager({"min_sentence_chars": 3, "default_language": "English"})
         req = make_request(language="French")
         result = text2tts(tm, make_pooling_output("Hi."), req, False)
-        assert result[0]["language"] == "French"
+        assert result["language"] == "French"
 
     # ------------------------------------------------------------------
     # Stateful chunker persists across multiple calls (real streaming)
@@ -358,7 +365,7 @@ class TestText2TtsHook:
             is_last = i == len(tokens) - 1
             r = text2tts(tm, make_pooling_output(tok), req, is_last)
             if r:
-                all_results.extend(r)
+                all_results.append(r)
 
         texts = " ".join(r["text"] for r in all_results)
         assert "blue" in texts
