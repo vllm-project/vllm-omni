@@ -349,15 +349,6 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         return scheduler_output
 
-    """
-    Scheduler for the diffusion model.
-    This scheduler is modified to stop the request immediately for the diffusion model.
-    This is because the diffusion model can generate the final image/audio in one step.
-    Note: This is just a minimal modification to the original scheduler,
-    and there should be some further efforts to optimize the scheduler.
-    The original scheduler is still used for the AR model.
-    """
-
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
