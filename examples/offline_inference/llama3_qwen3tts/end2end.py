@@ -55,7 +55,7 @@ from vllm_omni.entrypoints.omni import Omni  # noqa: E402  (after sys.path fix)
 # ---------------------------------------------------------------------------
 DEFAULT_LLM_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-DEFAULT_STAGE_CONFIGS = str(_REPO_ROOT / "vllm_omni/model_executor/stage_configs/llama3_qwen3tts.yaml")
+DEFAULT_STAGE_CONFIGS = str(_REPO_ROOT / "vllm_omni/model_executor/stage_configs/text_tts.yaml")
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,46 @@
+# Deploy config for composable text-LLM -> TTS pipeline
+# -------------------------------------------------------
+# Users only need to set:
+#   - stage 0: which text LLM to use
+#   - stage 1: which TTS model to use
+#   - runtime: devices, gpu_memory_utilization
+#
+# The static pipeline topology (bridge hook, connectors, edges)
+# is defined in:
+#   vllm_omni/model_executor/models/text_tts/pipeline.yaml
+#
+# Example combinations:
+#   Stage 0              Stage 1
+#   Llama-3.1-8B      +  Qwen3-TTS-1.7B   (this file)
+#   Mistral-7B         +  CosyVoice3
+#   Domain LLM         +  FishSpeech
+#
+# Usage:
+#   vllm-omni serve <llm_model> \
+#     --omni \
+#     --stage-configs-path vllm_omni/model_executor/stage_configs/text_tts.yaml \
+#     --port 8091
+
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: "0"
+      max_batch_size: 16
+    engine_args:
+      model: meta-llama/Llama-3.1-8B-Instruct
+      max_num_batched_tokens: 8192
+      gpu_memory_utilization: 0.6
+      tensor_parallel_size: 1
+
+  - stage_id: 1
+    runtime:
+      devices: "1"
+      max_batch_size: 8
+    engine_args:
+      model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+      max_num_batched_tokens: 4096
+      max_model_len: 32768
+      gpu_memory_utilization: 0.8
+      tensor_parallel_size: 1
+    tts_args:
+      max_instructions_length: 200
