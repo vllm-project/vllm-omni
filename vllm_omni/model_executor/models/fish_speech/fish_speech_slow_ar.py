@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .configuration_fish_speech import FishSpeechConfig, FishSpeechFastARConfig, FishSpeechSlowARConfig
 from .dac_encoder import _load_dac_codec, encode_reference_audio
 from .fish_speech_fast_ar import FishSpeechFastAR
+from .prompt_utils import build_fish_voice_clone_prompt_ids
 
 logger = init_logger(__name__)
 
@@ -535,25 +536,14 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             ref_audio_sr,
             device=self.codebook_embeddings.weight.device,
         )
-        audio_start_id = tokenizer.encode("<|audio_start|>", add_special_tokens=False)
-        audio_end_id = tokenizer.encode("<|audio_end|>", add_special_tokens=False)
-        prefix_ids = tokenizer.encode(f"<|speaker:0|>{ref_text}", add_special_tokens=False)
-        im_start = tokenizer.encode("<|im_start|>", add_special_tokens=False)
-        im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
-        system_tag = tokenizer.encode("system\n", add_special_tokens=False)
-        newline = tokenizer.encode("\n", add_special_tokens=False)
-        system_ids = (
-            im_start + system_tag + prefix_ids + audio_start_id + semantic_token_ids + audio_end_id + im_end + newline
+        prompt_ids, _, _ = build_fish_voice_clone_prompt_ids(
+            tokenizer,
+            text,
+            ref_text,
+            semantic_token_ids,
         )
-        user_text = f"<|speaker:0|>{text}"
-        user_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": user_text}],
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-        voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
         prompt_ids = torch.tensor(
-            system_ids + user_ids + voice_token_id,
+            prompt_ids,
             dtype=torch.long,
             device=self.codebook_embeddings.weight.device,
         )
