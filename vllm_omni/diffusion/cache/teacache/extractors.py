@@ -578,6 +578,88 @@ def extract_zimage_context(
     )
 
 
+def extract_sd3_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    pooled_projections: torch.Tensor,
+    timestep: torch.Tensor | float | int,
+    return_dict: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for SD3Transformer2DModel (Stable Diffusion 3 / 3.5).
+
+    SD3 is a joint-attention DiT where the transformer output is used to predict
+    latent noise (image stream only). We only cache/replay residuals for the
+    image stream (`hidden_states`) since the encoder stream is not part of the
+    external output.
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must have transformer_blocks")
+
+    # Preserve original latent spatial size for unpatchify in postprocess.
+    height, width = hidden_states.shape[-2:]
+
+    # Preprocessing (mirrors SD3Transformer2DModel.forward)
+    hidden_states = module.pos_embed(hidden_states)
+    temb = module.time_text_embed(timestep, pooled_projections)
+
+    # ============================================================================
+    # EXTRACT MODULATED INPUT (for cache decision)
+    # ============================================================================
+    block0 = module.transformer_blocks[0]
+    norm_outputs = block0.norm1(hidden_states, emb=temb)
+    modulated_input = norm_outputs[0] if isinstance(norm_outputs, (tuple, list)) else norm_outputs
+
+    # Define transformer execution (SD3-specific)
+    def run_transformer_blocks():
+        h = hidden_states
+        # context_embedder can be expensive. Delay it until we actually need to
+        # run transformer blocks (slow-path).
+        e = module.context_embedder(encoder_hidden_states)
+        for block in module.transformer_blocks:
+            e, h = block(hidden_states=h, encoder_hidden_states=e, temb=temb)
+        return (h,)
+
+    # Postprocessing (mirrors SD3Transformer2DModel.forward)
+    def postprocess(h):
+        h = module.norm_out(h, temb)
+        h = module.proj_out(h)
+        # proj_out may return a tuple; keep the tensor sample for unpatchify.
+        if isinstance(h, (tuple, list)):
+            h = h[0]
+
+        patch_size = module.patch_size
+        out_channels = module.out_channels
+
+        # unpatchify
+        h_height = height // patch_size
+        h_width = width // patch_size
+        h = h.reshape(shape=(h.shape[0], h_height, h_width, patch_size, patch_size, out_channels))
+        h = torch.einsum("nhwpqc->nchpwq", h)
+        output = h.reshape(shape=(h.shape[0], out_channels, h_height * patch_size, h_width * patch_size))
+
+        _ = kwargs  # reserved for future compatibility
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    # ============================================================================
+    # RETURN CONTEXT
+    # ============================================================================
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 def extract_flux2_klein_context(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -837,6 +919,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
     "ZImageTransformer2DModel": extract_zimage_context,
+    "SD3Transformer2DModel": extract_sd3_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
     # Future models:
