@@ -7,6 +7,49 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class TestSetForwardContextNumTokens:
+    """Test _set_forward_context_num_tokens defensive fix for vLLM 0.18.0."""
+
+    def test_sets_num_tokens_when_context_available(self, mocker):
+        """num_tokens should be set on ForwardContext when available."""
+        import vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe as hunyuan_moe
+
+        mock_ctx = mocker.MagicMock()
+        del mock_ctx.in_profile_run  # simulate missing attr
+        mocker.patch.object(hunyuan_moe._vllm_fc, "is_forward_context_available", return_value=True)
+        mocker.patch.object(hunyuan_moe._vllm_fc, "get_forward_context", return_value=mock_ctx)
+
+        hunyuan_moe._set_forward_context_num_tokens(1024)
+
+        assert mock_ctx.num_tokens == 1024
+        assert mock_ctx.in_profile_run is False
+
+    def test_sets_in_profile_run_only_if_missing(self, mocker):
+        """in_profile_run should not be overwritten if already set."""
+        import vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe as hunyuan_moe
+
+        mock_ctx = mocker.MagicMock()
+        mock_ctx.in_profile_run = True  # already set
+        mocker.patch.object(hunyuan_moe._vllm_fc, "is_forward_context_available", return_value=True)
+        mocker.patch.object(hunyuan_moe._vllm_fc, "get_forward_context", return_value=mock_ctx)
+
+        hunyuan_moe._set_forward_context_num_tokens(512)
+
+        assert mock_ctx.num_tokens == 512
+        assert mock_ctx.in_profile_run is True  # not overwritten
+
+    def test_noop_when_context_unavailable(self, mocker):
+        """Should do nothing when ForwardContext is not available."""
+        import vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe as hunyuan_moe
+
+        mocker.patch.object(hunyuan_moe._vllm_fc, "is_forward_context_available", return_value=False)
+        mock_get = mocker.patch.object(hunyuan_moe._vllm_fc, "get_forward_context")
+
+        hunyuan_moe._set_forward_context_num_tokens(256)
+
+        mock_get.assert_not_called()
+
+
 class TestHunyuanFusedMoEPlatformDispatch:
     """Test platform dispatch via platform qualname hooks."""
 
