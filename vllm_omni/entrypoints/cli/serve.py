@@ -248,6 +248,12 @@ class OmniServeCommand(CLISubcommand):
             default=1,
             help="Number of replica groups for HSDP. Each group holds a full sharded copy.",
         )
+        omni_config_group.add_argument(
+            "--diffusion-only",
+            action="store_true",
+            help="Start only the diffusion (DIT) stage for model support multiple startup modes,"
+            "e.g., HunyuanImage-3.0 support both DIT and AR+DIT.",
+        )
 
         # Cache optimization parameters
         omni_config_group.add_argument(

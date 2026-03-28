@@ -60,7 +60,6 @@ def main(args: argparse.Namespace) -> None:
     omni = Omni(
         model=args.model,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
-        mode="image-to-text",
     )
 
     prompt = "<|startoftext|>You are an assistant that understands images and outputs text.<img>" + args.prompt

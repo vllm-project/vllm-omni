@@ -242,6 +242,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable logging of diffusion pipeline stats.",
     )
+    parser.add_argument(
+        "--diffusion-only",
+        action="store_true",
+        help="Start only the diffusion (DIT) stage for model support multiple startup modes,"
+        "e.g., HunyuanImage-3.0 support both DIT and AR+DIT.",
+    )
     return parser.parse_args()
 
 
@@ -330,7 +336,7 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
-        "mode": "text-to-image",
+        "diffusion_only": args.diffusion_only,
         "log_stats": args.log_stats,
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         **lora_args,
