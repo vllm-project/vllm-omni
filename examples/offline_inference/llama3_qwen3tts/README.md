@@ -2,7 +2,7 @@
 
 This directory demonstrates **RFC Theme 2: TTS as a Composable Layer**,
 enabling any vLLM text model to be paired with any TTS decoder without
-requiring a built-in talker stage.
+requiring a built-in talker stage in the base model.
 
 ## General Pattern
 ```
@@ -16,20 +16,34 @@ hook that:
 2. Forwards complete sentence chunks to Stage 1 as TTS inputs
 3. Injects voice/language defaults when Stage 0 has no speaker concept
 
-Any combination is supported by providing the appropriate stage config YAML:
+Any LLM + TTS combination is supported. The pipeline topology is defined
+once in `models/text_tts/pipeline.yaml` and is model-agnostic. Users only
+need to specify which models to use in the deploy config:
 
-| Stage 0 (text LLM) | Stage 1 (TTS decoder) | Config |
+| Stage 0 (text LLM) | Stage 1 (TTS decoder) | Deploy config |
 |---|---|---|
-| Llama-3.1-8B | Qwen3-TTS-1.7B | `llama3_qwen3tts.yaml` |
-| Mistral-7B | CosyVoice3 | (add your own YAML) |
-| Domain-finetuned LLM | FishSpeech | (add your own YAML) |
+| Llama-3.1-8B | Qwen3-TTS-1.7B | `text_tts.yaml` (reference) |
+| Mistral-7B | CosyVoice3 | edit `text_tts.yaml` |
+| Domain-finetuned LLM | FishSpeech | edit `text_tts.yaml` |
+
+## Config Structure
+
+The configuration follows the two-tier pattern used across vLLM-Omni:
+
+- **`vllm_omni/model_executor/models/text_tts/pipeline.yaml`**
+  Static DAG topology: bridge hook, SharedMemoryConnector, edges.
+  Defined once by the framework — users never need to touch this.
+
+- **`vllm_omni/model_executor/stage_configs/text_tts.yaml`**
+  User-facing deploy config: specifies which LLM and TTS model to use,
+  plus runtime parameters (devices, GPU memory utilization).
 
 ## Reference Example: Llama-3.1-8B + Qwen3-TTS
 
-This example uses:
 - **Stage 0**: `meta-llama/Llama-3.1-8B-Instruct`
 - **Stage 1**: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
-- **Config**: `vllm_omni/model_executor/stage_configs/llama3_qwen3tts.yaml`
+- **Pipeline**: `vllm_omni/model_executor/models/text_tts/pipeline.yaml`
+- **Deploy config**: `vllm_omni/model_executor/stage_configs/text_tts.yaml`
 
 ### Setup
 ```bash
@@ -47,7 +61,7 @@ python end2end.py --prompt "Explain how transformers work."
 # Custom voice and language
 python end2end.py --prompt "Bonjour." --voice serena --language French
 
-# Streaming
+# Streaming (low latency, audio chunks arrive progressively)
 python end2end.py --prompt "Tell me a story." --streaming
 ```
 
@@ -56,28 +70,33 @@ Available voices: `aiden`, `dylan`, `eric`, `ono_anna`, `ryan`,
 
 ## Adding a New LLM + TTS Combination
 
-To wire a different pair, create a new YAML based on `llama3_qwen3tts.yaml`:
+Only two fields in the deploy config need to change:
 
-1. Set `engine_args.model` in Stage 0 to your text LLM
-2. Set `engine_args.model` in Stage 1 to your TTS model
-3. Keep `custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.text_tts_bridge.text2tts`
-4. Tune `min_sentence_chars` in `connectors.connector_of_shared_memory.extra`
+1. Set `stage_args[0].engine_args.model` to your text LLM
+2. Set `stage_args[1].engine_args.model` to your TTS model
+3. Adjust `runtime.devices` and `gpu_memory_utilization` as needed
 
-## Design (RFC answers)
+The pipeline topology, bridge hook, and connector config are inherited
+from `pipeline.yaml` with no changes required.
 
-**Q1 — Bridge as stage-level processor, not a new stage type.**
-The bridge is a `custom_process_next_stage_input_func` hook on Stage 0,
-reusing the existing `async_chunk` / `OmniChunkTransferAdapter` framework.
+## Design Considerations
 
-**Q2 — Latency / buffering.**
-`SentenceChunker` buffers tokens until a sentence boundary and
-`min_sentence_chars` characters. Tunable in the YAML connector config.
+** Bridge as stage-level processor, not a new stage type.**
+The bridge is a `custom_process_next_stage_input_func` hook in Stage 0
+`engine_args`, reusing the existing `OmniChunkTransferAdapter` async_chunk
+framework with zero changes to `OmniStage`.
 
-**Q3 — Voice/speaker parameter routing.**
-`default_voice` / `default_language` injected from YAML connector config.
-Per-request override via `request.additional_information`.
+** Latency / buffering.**
+`SentenceChunker` buffers tokens until a sentence boundary and at least
+`min_sentence_chars` characters. Tunable in `pipeline.yaml` connector config:
+lower value = less Time-To-First-Audio, higher value = smoother audio.
+
+**Voice/speaker parameter routing.**
+`default_voice` and `default_language` are injected from the connector
+config when Stage 0 has no concept of speaker. Per-request override is
+passed via `request.additional_information`.
 
 ## Known Limitations / Follow-up
 
 - Online serving (`/v1/audio/speech`) integration is a follow-up
-- Richer per-turn voice routing (LLM-emitted tags) is out of scope
+- Richer per-turn voice routing (e.g. LLM-emitted speaker tags) is out of scope
