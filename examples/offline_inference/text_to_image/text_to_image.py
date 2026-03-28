@@ -64,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=1.0,
-        help="Classifier-free guidance scale.",
+        default=4.0,
+        help="Classifier-free guidance scale. HunyuanImage3 recommends 4.0-5.0.",
     )
     parser.add_argument("--height", type=int, default=1024, help="Height of generated image.")
     parser.add_argument("--width", type=int, default=1024, help="Width of generated image.")
