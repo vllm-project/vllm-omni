@@ -1207,38 +1207,16 @@ _remove_route_from_router(router, "/v1/models")
 
 @router.get("/v1/models")
 async def show_available_models(raw_request: Request) -> JSONResponse:
-    """Show available models endpoint that works for both LLM and diffusion modes.
+    """Show available models for both LLM and diffusion modes.
 
-    Returns model information in OpenAI-compatible format.
+    Delegates to state.openai_serving_models which is set to either
+    OpenAIServingModels (LLM) or _DiffusionServingModels (pure diffusion).
     """
-    # Check if we're in diffusion mode
-    diffusion_model_name = getattr(raw_request.app.state, "diffusion_model_name", None)
-    if diffusion_model_name is not None:
-        # Diffusion mode - return the loaded model
-        return JSONResponse(
-            content={
-                "object": "list",
-                "data": [
-                    {
-                        "id": diffusion_model_name,
-                        "object": "model",
-                        "created": 0,
-                        "owned_by": "vllm-omni",
-                        "permission": [],
-                    }
-                ],
-            }
-        )
-
-    # LLM mode - delegate to openai_serving_models
-    openai_serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
-    if openai_serving_models is not None:
-        models = await openai_serving_models.show_available_models()
+    handler = getattr(raw_request.app.state, "openai_serving_models", None)
+    if handler is not None:
+        models = await handler.show_available_models()
         return JSONResponse(content=models.model_dump())
-
-    return JSONResponse(
-        content={"object": "list", "data": []},
-    )
+    return JSONResponse(content={"object": "list", "data": []})
 
 
 # Image generation API endpoints
