@@ -5,9 +5,9 @@
 steps:
   - group: "NPU Tests (L2 - PR)"
     steps:
-      - label: "NPU A2B3: Qwen2.5-Omni Offline Inference (2 cards)"
+      - label: "NPU A2B3: Basic Test (1 card)"
         agents:
-          queue: "linux-aarch64-a2b3-2"
+          queue: "linux-aarch64-a2b3-gy006-test"
         commands:
           - |
             source /usr/local/Ascend/ascend-toolkit/set_env.sh

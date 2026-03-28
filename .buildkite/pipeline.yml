@@ -1,48 +1,9 @@
 steps:
-  - label: ":docker: Build image"
-    key: image-build
+  # NPU Simple Test - Quick validation that NPU test environment works
+  # Once this passes, replace with bootstrap-npu-omni.sh for full CI
+  - label: "Upload NPU Simple Test"
+    key: upload-npu-simple-test
     commands:
-      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
-      - "docker build --progress=plain --file docker/Dockerfile.ci -t vllm-omni-ci ."
-      - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
-      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
-    agents:
-      queue: "cpu_queue_premerge"
-
-  # L2 Test
-  - label: "Upload Ready Pipeline"
-    depends_on: image-build
-    key: upload-ready-pipeline
-    if: build.branch != "main"
-    commands:
-      - buildkite-agent pipeline upload .buildkite/test-ready.yml
-    agents:
-      queue: "cpu_queue_premerge"
-
-  # L3 Test
-  - label: "Upload Merge Pipeline"
-    depends_on: image-build
-    key: upload-merge-pipeline
-    if: build.branch == "main"
-    commands:
-      - buildkite-agent pipeline upload .buildkite/test-merge.yml
-    agents:
-      queue: "cpu_queue_premerge"
-
-  # L4 Test
-  - label: "Upload Nightly Pipeline"
-    depends_on: image-build
-    key: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1"
-    commands:
-      - buildkite-agent pipeline upload .buildkite/test-nightly.yml
-    agents:
-      queue: "cpu_queue_premerge"
-
-  # NPU Tests (independent bootstrap, NPU builds its own Docker image)
-  - label: "Upload NPU Pipeline"
-    key: upload-npu-pipeline
-    commands:
-      - bash .buildkite/bootstrap-npu-omni.sh
+      - buildkite-agent pipeline upload .buildkite/pipeline-npu-simple-test.yaml
     agents:
       queue: "cpu_queue_premerge"

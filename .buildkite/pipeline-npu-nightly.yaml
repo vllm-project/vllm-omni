@@ -4,9 +4,21 @@
 steps:
   - group: "NPU Tests (L4 - Nightly)"
     steps:
+      - label: ":full_moon: NPU A2B3: Smoke Test (1 card)"
+        agents:
+          queue: "linux-aarch64-a2b3-gy006-test"
+        commands:
+          - |
+            source /usr/local/Ascend/ascend-toolkit/set_env.sh
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+            pip install -e .
+            VLLM_USE_MODELSCOPE=True pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
+        timeout_in_minutes: 60
+        soft_fail: true
+
       - label: ":full_moon: NPU A2B3: Full Model Regression (2 cards)"
         agents:
-          queue: "linux-aarch64-a2b3-2"
+          queue: "linux-aarch64-a2b3-gy006-test"
         commands:
           - |
             source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -18,7 +30,7 @@ steps:
 
       - label: ":full_moon: NPU A2B3: Qwen3-TTS Non-Async-Chunk (2 cards)"
         agents:
-          queue: "linux-aarch64-a2b3-2"
+          queue: "linux-aarch64-a2b3-gy006-test"
         commands:
           - |
             source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -30,7 +42,7 @@ steps:
 
       - label: ":full_moon: NPU A2B3: Distributed Full Regression (8 cards)"
         agents:
-          queue: "linux-aarch64-a2b3-8"
+          queue: "linux-aarch64-a2b3-gy006-test"
         commands:
           - |
             source /usr/local/Ascend/ascend-toolkit/set_env.sh
