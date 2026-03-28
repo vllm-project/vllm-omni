@@ -1340,7 +1340,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     _voice_created_at = float((info_dict.get("voice_created_at") or [0])[0])
                     if _voice_created_at > 0:
                         _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only, _voice_created_at)
-                    _cached = self._voice_cache.get(_voice_cache_key)
+                    _cached = self._voice_cache.get(_voice_cache_key) if _voice_cache_key is not None else None
                     if _cached is not None:
                         voice_clone_prompt = {
                             "ref_code": _cached.get("ref_code"),
