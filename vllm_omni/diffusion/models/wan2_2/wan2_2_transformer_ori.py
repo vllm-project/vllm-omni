@@ -11,11 +11,7 @@ import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-
-# liqian
-# from diffusers.models.normalization import FP32LayerNorm
-from vllm_omni.diffusion.layers.layernorm32 import FastLayerNorm32 as FP32LayerNorm
-
+from diffusers.models.normalization import FP32LayerNorm
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -33,14 +29,6 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
-# liqian
-from importlib.util import find_spec
-from vllm_omni.diffusion.layers.rope import apply_rotary_emb_mindiesd
-
-import torch_npu
-# from vllm_omni.diffusion.layers.fast_feedforward import FastFeedForward
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -61,18 +49,6 @@ def apply_rotary_emb_wan(
     Returns:
         Tensor with rotary embeddings applied
     """
-    # liqian
-    # if hidden_states.device.type == "npu" and find_spec("mindiesd") is not None:
-    #     from mindiesd import rotary_position_embedding
-
-    #     return rotary_position_embedding(
-    #         hidden_states,
-    #         freqs_cos.to(hidden_states.dtype),
-    #         freqs_sin.to(hidden_states.dtype),
-    #         rotated_mode="rotated_interleaved",
-    #         fused=True,
-    # ).type_as(hidden_states)
-
     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos = freqs_cos[..., 0::2]
     sin = freqs_sin[..., 1::2]
@@ -132,11 +108,6 @@ class ColumnParallelGELU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
         return F.gelu(x, approximate=self.approximate)
-        # liqian
-        # if current_omni_platform.is_npu():
-        #     return torch_npu.fast_gelu(x)
-        # else:
-        #     return F.gelu(x, approximate=self.approximate)
 
 
 class WanFeedForward(nn.Module):
@@ -250,7 +221,7 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
         freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
 
-        return freqs_cos, freqs_sin
+        return freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
 
 
 class WanImageEmbedding(nn.Module):
@@ -261,11 +232,6 @@ class WanImageEmbedding(nn.Module):
 
         self.norm1 = FP32LayerNorm(in_features)
         self.ff = FeedForward(in_features, out_features, mult=1, activation_fn="gelu")
-        # liqian
-        # if current_omni_platform.is_npu():
-        #     self.ff = FastFeedForward(in_features, out_features, mult=1, activation_fn="gelu")
-        # else:
-        #     self.ff = FeedForward(in_features, out_features, mult=1, activation_fn="gelu")
         self.norm2 = FP32LayerNorm(out_features)
         if pos_embed_seq_len is not None:
             self.pos_embed = nn.Parameter(torch.zeros(1, pos_embed_seq_len, in_features))
@@ -405,8 +371,6 @@ class WanSelfAttention(nn.Module):
         self.num_kv_heads = self.to_qkv.num_kv_heads
         self.tp_inner_dim = self.num_heads * head_dim
 
-        self.rope = RotaryEmbedding(is_neox_style=False)
-
         # QK normalization using vLLM's RMSNorm
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
@@ -452,21 +416,10 @@ class WanSelfAttention(nn.Module):
         value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
 
         # Apply rotary embeddings
-        # if rotary_emb is not None:
-        #     freqs_cos, freqs_sin = rotary_emb
-        #     query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
-        #     key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
-            
-        # liqian
         if rotary_emb is not None:
             freqs_cos, freqs_sin = rotary_emb
-            if find_spec("mindiesd") is not None and current_omni_platform.is_npu():
-                #print(f"==========mindiesd================")
-                query = self.rope(query,freqs_cos, freqs_sin)
-                key = self.rope(key,freqs_cos, freqs_sin)
-            else:
-                query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
-                key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
+            query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
+            key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
         # Create attention metadata if mask is provided
         attn_metadata = None
@@ -712,26 +665,17 @@ class WanTransformerBlock(nn.Module):
             ).chunk(6, dim=1)
 
         # 1. Self-attention
-        # liqian
-        # norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        norm_hidden_states = (self.norm1(hidden_states) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-
+        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
         attn_output = self.attn1(norm_hidden_states, rotary_emb, hidden_states_mask)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
-        # liqian
-        # norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-        norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
+        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        # liqian
-        # norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
-        #     hidden_states
-        # )
-        norm_hidden_states = (self.norm3(hidden_states) * (1 + c_scale_msa) + c_shift_msa).type_as(
+        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
             hidden_states
         )
         ff_output = self.ffn(norm_hidden_states)
@@ -992,10 +936,7 @@ class WanTransformer3DModel(nn.Module):
             shift = shift.unsqueeze(1)
             scale = scale.unsqueeze(1)
 
-        
-        # liqian
-        # hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
-        hidden_states = (self.norm_out(hidden_states) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
