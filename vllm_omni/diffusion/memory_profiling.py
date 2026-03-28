@@ -33,25 +33,22 @@ def _bytes_to_gib(value: int) -> float:
     return value / float(1024**3)
 
 
+def _device_index(device: int | str | torch.device | None) -> int:
+    """Normalize *device* to a torch.device and return its integer index."""
+    if device is None:
+        device = torch.cuda.current_device()
+    # Build a torch.device and extract its index (avoids pyright narrowing issues
+    # with torch.device("cuda", int) → int | torch.device)
+    d = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+    idx = d.index
+    return idx if idx is not None else torch.cuda.current_device()
+
+
 def capture_cuda_memory_snapshot(device: int | str | torch.device | None = None) -> dict[str, Any] | None:
     if not torch.cuda.is_available():
         return None
 
-    if device is None:
-        device = torch.cuda.current_device()
-
-    # Normalize device to torch.device, then extract index
-    if isinstance(device, str):
-        torch_device = torch.device(device)
-    elif isinstance(device, torch.device):
-        torch_device = device
-    else:
-        # Integer index
-        torch_device = torch.device("cuda", device)
-
-    device_index = torch_device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
+    device_index = _device_index(device)
 
     return {
         "device": device_index,
@@ -78,20 +75,4 @@ def format_cuda_memory_snapshot(snapshot: dict[str, Any] | None) -> str:
 def reset_cuda_peak_memory_stats(device: int | str | torch.device | None = None) -> None:
     if not torch.cuda.is_available():
         return
-
-    if device is None:
-        device = torch.cuda.current_device()
-
-    # Normalize device to torch.device, then extract index
-    if isinstance(device, str):
-        torch_device = torch.device(device)
-    elif isinstance(device, torch.device):
-        torch_device = device
-    else:
-        # Integer index
-        torch_device = torch.device("cuda", device)
-
-    device_index = torch_device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    torch.cuda.reset_peak_memory_stats(device_index)
+    torch.cuda.reset_peak_memory_stats(_device_index(device))
