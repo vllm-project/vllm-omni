@@ -265,7 +265,7 @@ class TestText2TtsHook:
         result = text2tts(tm, make_pooling_output(""), req, True)
         assert result is not None
         assert isinstance(result, dict)
-        assert "No delimiter here" in result["text"]
+        assert "No delimiter here" in result["text"]  # all chunks combined
 
     def test_cleanup_after_eos(self, mocker: MockerFixture):
         tm = make_transfer_manager(mocker, {"min_sentence_chars": 3})

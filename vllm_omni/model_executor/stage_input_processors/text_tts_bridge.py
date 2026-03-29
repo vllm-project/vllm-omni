@@ -289,14 +289,15 @@ def text2tts(
 
     if is_finished:
         ready_chunks.extend(chunker.flush())
+        # Cleanup AFTER collecting all chunks to avoid writing to dead object.
+        # All chunks are joined into one payload so none are silently dropped.
         _cleanup_chunker(transfer_manager, request_id)
 
     if not ready_chunks:
         return None  # still buffering — matches framework convention
 
     # Framework expects dict | None (not list[dict]).
-    # Return first ready chunk; re-queue remaining into chunker buffer.
-    if len(ready_chunks) > 1:
-        chunker._buf = " ".join(ready_chunks[1:]) + " " + chunker._buf
-
-    return _build_tts_input(ready_chunks[0], cfg, request)
+    # Join all ready chunks into a single TTS input to avoid data loss
+    # when multiple sentences are flushed at once (e.g. at EOS).
+    combined_text = " ".join(ready_chunks)
+    return _build_tts_input(combined_text, cfg, request)

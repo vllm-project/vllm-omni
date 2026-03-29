@@ -238,6 +238,10 @@ class StageConfigFactory:
         "glm-image": "glm_image",
         "cosyvoice3": "cosyvoice3",
         "mammothmoda2": "mammoth_moda2",
+        # Composable text-LLM -> TTS bridge (RFC Theme 2).
+        # Any standard HF text LLM paired with any TTS decoder.
+        # Pipeline topology defined in models/text_tts/pipeline.yaml.
+        "text_tts": "text_tts",
     }
 
     # Fallback: map HF architecture class names to pipeline dirs.
