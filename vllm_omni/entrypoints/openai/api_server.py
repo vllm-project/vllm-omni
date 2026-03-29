@@ -1753,10 +1753,27 @@ def _choose_output_format(output_format: str | None, background: str | None) -> 
     return "jpeg"
 
 
+def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.Image:
+    fmt = format.lower()
+    if fmt not in {"jpg", "jpeg"}:
+        return image
+
+    if image.mode == "RGB":
+        return image
+
+    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+        alpha_image = image.convert("RGBA")
+        flattened = Image.new("RGB", alpha_image.size, (255, 255, 255))
+        flattened.paste(alpha_image, mask=alpha_image.getchannel("A"))
+        return flattened
+
+    return image.convert("RGB")
+
+
 def _encode_image_base64_with_compression(
     image: Image.Image, format: str = "png", output_compression: int = 100
 ) -> str:
-    """Encode PIL Image to base64 PNG string.
+    """Encode PIL Image to a base64 image string.
 
     Args:
         image: PIL Image object
@@ -1766,6 +1783,7 @@ def _encode_image_base64_with_compression(
         Base64-encoded image as string
     """
     buffer = io.BytesIO()
+    image = _prepare_image_for_output_format(image, format)
     save_kwargs = {}
     if format in ("jpg", "jpeg", "webp"):
         save_kwargs["quality"] = output_compression
