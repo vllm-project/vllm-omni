@@ -233,7 +233,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 - `consent` (required): Consent recording ID
 - `name` (required): Name for the new voice
 - `ref_text` (optional): Transcript of the audio. Enables in-context voice cloning (higher quality).
-- `speaker_description` (optional): Free-form description of the voice (e.g. "warm narrator", "energetic presenter"). Stored as metadata.
+- `speaker_description` (optional): Free-form description of the voice (e.g. "warm narrator", "energetic presenter").
 
 **Response Example:**
 ```json
