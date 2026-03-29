@@ -119,3 +119,54 @@ python end2end.py --query-type CustomVoice \
 
 - The script uses the model paths embedded in `end2end.py`. Update them if your local cache path differs.
 - Use `--output-dir` to change the output folder.
+
+## End-to-End Benchmark Script
+
+`end2end_benchmark_script.py` is an offline benchmark tool that runs warmup + test rounds with a single Omni instance to avoid repeated model loading. It prints per-round wall time and optional detailed pipeline summary at the end.
+
+### Quick Example
+
+```bash
+VLLM_OMNI_USE_V2_RUNNER=1 python examples/offline_inference/qwen3_tts/end2end_benchmark_script.py \
+    --query-type Base \
+    --streaming \
+    --log-stats \
+    --enable-diffusion-pipeline-profiler \
+    --test-rounds 7 \
+    --warmup-rounds 3
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--query-type`, `-q` | str | `CustomVoice` | Query type. Choices: `CustomVoice`, `VoiceDesign`, `Base` |
+| `--warmup-rounds` | int | `3` | Number of warmup rounds (results discarded) |
+| `--test-rounds` | int | `7` | Number of test rounds (results saved and timed) |
+| `--log-stats` | flag | disabled | Enable writing detailed statistics |
+| `--streaming` | flag | disabled | Stream audio chunks via AsyncOmni |
+| `--batch-size` | int | `1` | Number of prompts per batch (must be a power of two) |
+| `--output-dir` | str | `output_audio` | Output directory for generated wav files |
+| `--txt-prompts` | str | None | Path to a `.txt` file with one prompt per line |
+| `--stage-configs-path` | str | None | Path to a stage configs file |
+| `--stage-init-timeout` | int | `300` | Timeout for initializing a single stage in seconds |
+| `--use-batch-sample` | flag | disabled | Use batch input sample for the selected query type |
+| `--mode-tag` | str | `icl` | Mode tag for Base query. Choices: `icl`, `xvec_only` |
+| `--enable-diffusion-pipeline-profiler` | flag | disabled | Enable diffusion pipeline profiler to display stage durations |
+
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `VLLM_OMNI_USE_V2_RUNNER` | Set to `1` to use the V2 runner |
+
+### Execution Modes
+
+- **Sync mode** (default): Uses `Omni` for synchronous generation.
+- **Streaming mode** (`--streaming`): Uses `AsyncOmni` to stream audio chunks progressively, logging TTFA and inter-chunk timing.
+
+### Output
+
+- Generated wav files are saved to the `--output-dir` directory, named `output_<round>_<request_id>.wav`.
+- A benchmark summary is printed at the end, including per-round wall time, average, min, and max.
+- When `--log-stats` is enabled, a detailed pipeline summary is also printed with per-stage timing and throughput metrics.
