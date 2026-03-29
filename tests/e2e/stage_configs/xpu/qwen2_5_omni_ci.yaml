@@ -8,7 +8,6 @@ stage_args:
       process: true # Run this stage in a separate process
       devices: "0" # Visible devices for this stage
     engine_args:
-      max_num_seqs: 1
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
@@ -40,7 +39,6 @@ stage_args:
       process: true
       devices: "1"
     engine_args:
-      max_num_seqs: 1
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar

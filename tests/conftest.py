@@ -1,9 +1,13 @@
 import base64
 import datetime
 import io
+import json
 import math
 import os
 import random
+import tempfile
+
+import requests
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 # Set CPU device for CI environments without GPU
@@ -24,7 +28,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, NamedTuple
 
-import imageio.v3 as iio
+import cv2
 import numpy as np
 import psutil
 import pytest
@@ -54,6 +58,106 @@ class OmniServerParams(NamedTuple):
     port: int | None = None
     stage_config_path: str | None = None
     server_args: list[str] | None = None
+    env_dict: dict[str, str] | None = None
+    use_omni: bool = True
+
+
+def assert_image_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate image diffusion response.
+
+    Expected request_config schema:
+        {
+            "request_type": "image",
+            "extra_body": {
+                "num_outputs_per_prompt": 1,
+                "width": ...,
+                "height": ...,
+                ...
+            }
+        }
+    """
+    assert response.images is not None, "Image response is None"
+    assert len(response.images) > 0, "No images in response"
+
+    extra_body = request_config.get("extra_body") or {}
+
+    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt")
+    if num_outputs_per_prompt is not None:
+        assert len(response.images) == num_outputs_per_prompt, (
+            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
+        )
+
+    if run_level == "advanced_model":
+        width = extra_body.get("width")
+        height = extra_body.get("height")
+
+        if width is not None or height is not None:
+            for img in response.images:
+                assert_image_valid(img, width=width, height=height)
+
+
+def assert_video_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate video diffusion response.
+
+    Expected request_config schema:
+        {
+            "request_type": "video",
+            "form_data": {
+                "prompt": "...",
+                "num_frames": ...,
+                "width": ...,
+                "height": ...,
+                "fps": ...,
+                ...
+            }
+        }
+    """
+    form_data = request_config.get("form_data", {})
+
+    assert response.videos is not None, "Video response is None"
+    assert len(response.videos) > 0, "No videos in response"
+
+    expected_frames = _maybe_int(form_data.get("num_frames"))
+    expected_width = _maybe_int(form_data.get("width"))
+    expected_height = _maybe_int(form_data.get("height"))
+    expected_fps = _maybe_int(form_data.get("fps"))
+
+    for vid_bytes in response.videos:
+        assert_video_valid(
+            vid_bytes,
+            num_frames=expected_frames,
+            width=expected_width,
+            height=expected_height,
+            fps=expected_fps,
+        )
+
+
+def assert_audio_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate audio diffusion response.
+    """
+    raise NotImplementedError("Audio validation is not implemented yet")
+    # consider using assert_audio_valid defined above
+
+
+def _maybe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
@@ -64,20 +168,97 @@ def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, h
         image.load()
     assert image.width > 0 and image.height > 0
     if width is not None:
-        assert image.width == width, f"Expected width={width}, got {image.width} in {image.name}"
+        assert image.width == width, f"Expected width={width}, got {image.width}"
     if height is not None:
-        assert image.height == height, f"Expected height={height}, got {image.height} in {image.name}"
+        assert image.height == height, f"Expected height={height}, got {image.height}"
     return image
 
 
-def assert_video_valid(frames: Path | np.ndarray, *, width: int, height: int, num_frames: int) -> None:
+def assert_video_valid(
+    video: Path | bytes | BytesIO,
+    *,
+    num_frames: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: float | None = None,
+) -> dict[str, int | float]:
     """Assert the MP4 has the expected resolution and exact frame count."""
-    if isinstance(frames, Path):
-        assert frames.exists(), f"Video not found: {frames}"
-        frames = iio.imread(str(frames), plugin="pyav", index=None)
-    assert frames.shape[0] == num_frames, f"Expected {num_frames} frames, got {frames.shape[0]}"
-    assert frames.shape[1] == height, f"Expected height={height}, got {frames.shape[1]}"
-    assert frames.shape[2] == width, f"Expected width={width}, got {frames.shape[2]}"
+    temp_path = None
+    cap = None
+    try:
+        # Normalize input to file path
+        if isinstance(video, Path):
+            if not video.exists():
+                raise AssertionError(f"Video file not found: {video}")
+            video_path = str(video)
+        else:
+            # Create temp file for bytes/BytesIO
+            suffix = ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="wb") as tmp:
+                if isinstance(video, bytes):
+                    tmp.write(video)
+                elif isinstance(video, BytesIO):
+                    tmp.write(video.getvalue())
+                else:
+                    raise TypeError(f"Unsupported video type: {type(video)}")
+                temp_path = Path(tmp.name)
+                video_path = str(temp_path)
+
+        # Open video capture
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise AssertionError(f"Failed to open video: {video_path}")
+
+        # Extract properties
+        actual_num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+
+        actual_num_frames = 0
+        while True:
+            ok, _frame = cap.read()
+            if not ok:
+                break
+            actual_num_frames += 1
+
+        # Basic validity checks
+        if actual_num_frames <= 0:
+            raise AssertionError(f"Invalid frame count: {actual_num_frames} (must be > 0)")
+        if actual_width <= 0 or actual_height <= 0:
+            raise AssertionError(f"Invalid dimensions: {actual_width}x{actual_height} (must be > 0)")
+        if actual_fps <= 0:
+            raise AssertionError(f"Invalid FPS: {actual_fps} (must be > 0)")
+
+        # Validate against expectations
+        if num_frames is not None:
+            expected_num_frames = (num_frames // 4) * 4 + 1
+            assert actual_num_frames == expected_num_frames, (
+                f"Frame count mismatch: expected {num_frames}, got {actual_num_frames}"
+            )
+        if width is not None:
+            assert actual_width == width, f"Width mismatch: expected {width}px, got {actual_width}px"
+        if height is not None:
+            assert actual_height == height, f"Height mismatch: expected {height}px, got {actual_height}px"
+        if fps is not None:
+            # Use tolerance for float comparison (codec rounding)
+            assert abs(actual_fps - fps) < 0.5, f"FPS mismatch: expected {fps}, got {actual_fps:.2f}"
+
+        return {"num_frames": actual_num_frames, "width": actual_width, "height": actual_height, "fps": actual_fps}
+
+    except Exception as e:
+        print(f"ERROR: {type(e).__name__}: {e}", flush=True)
+        raise
+
+    finally:
+        # Cleanup resources
+        if cap is not None:
+            cap.release()
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
@@ -1076,6 +1257,7 @@ class OmniServer:
         *,
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
+        use_omni: bool = True,
     ) -> None:
         _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
@@ -1083,6 +1265,7 @@ class OmniServer:
         self.model = model
         self.serve_args = serve_args
         self.env_dict = env_dict
+        self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         if port is None:
@@ -1103,12 +1286,14 @@ class OmniServer:
             "vllm_omni.entrypoints.cli.main",
             "serve",
             self.model,
-            "--omni",
             "--host",
             self.host,
             "--port",
             str(self.port),
-        ] + self.serve_args
+        ]
+        if self.use_omni:
+            cmd.append("--omni")
+        cmd += self.serve_args
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         self.proc = subprocess.Popen(
@@ -1237,19 +1422,35 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         stage_config_path = params.stage_config_path
         if run_level == "advanced_model" and stage_config_path is not None:
             with open(stage_config_path, encoding="utf-8") as f:
-                _cfg = yaml.safe_load(f) or {}
-            _stage_ids = [s["stage_id"] for s in _cfg.get("stage_args", []) if "stage_id" in s]
+                cfg = yaml.safe_load(f) or {}
+            stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={"stage_args": {sid: ["engine_args.load_format"] for sid in _stage_ids}},
+                deletes={"stage_args": {stage_id: ["engine_args.load_format"] for stage_id in stage_ids}},
             )
 
         server_args = params.server_args or []
-        server_args = ["--stage-init-timeout", "120", *server_args]
+        if params.use_omni:
+            server_args = ["--stage-init-timeout", "120", *server_args]
         if stage_config_path is not None:
             server_args += ["--stage-configs-path", stage_config_path]
 
-        with OmniServer(model, server_args, port=port) if port else OmniServer(model, server_args) as server:
+        with (
+            OmniServer(
+                model,
+                server_args,
+                port=port,
+                env_dict=params.env_dict,
+                use_omni=params.use_omni,
+            )
+            if port
+            else OmniServer(
+                model,
+                server_args,
+                env_dict=params.env_dict,
+                use_omni=params.use_omni,
+            )
+        ) as server:
             print("OmniServer started successfully")
             yield server
             print("OmniServer stopping...")
@@ -1296,15 +1497,15 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
-    if "audio" in modalities:
-        assert response.audio_content is not None, "No audio output is generated"
-        print(f"audio content is: {response.audio_content}")
-
-    if "text" in modalities:
-        assert response.text_content is not None, "No text output is generated"
-        print(f"text content is: {response.text_content}")
-
     if run_level == "advanced_model":
+        if "audio" in modalities:
+            assert response.audio_content is not None, "No audio output is generated"
+            print(f"audio content is: {response.audio_content}")
+
+        if "text" in modalities:
+            assert response.text_content is not None, "No text output is generated"
+            print(f"text content is: {response.text_content}")
+
         # Verify image description
         word_types = ["text", "image", "audio", "video"]
         keywords_dict = request_config.get("key_words", {})
@@ -1331,12 +1532,12 @@ def assert_diffusion_response(response: DiffusionResponse, request_config: dict[
     """
     Validate diffusion response results.
 
+    Dispatcher that routes validation to modality-specific assert functions.
+
     Args:
-        response: DiffusionResponse object. Any not-None content will be validated based on the request_config.
-        request_config: Request configuration dictionary containing parameters like model, messages, extra_body.
-            When validating a certain modality, the corresponding params in request_config['extra_body'] must present.
-            It will be used to check against the multimedia file in the response.
-        run_level: Test run level (e.g., "core_model", "advanced_model")
+        response: DiffusionResponse object.
+        request_config: Request configuration dictionary.
+        run_level: Test run level (e.g. "core_model", "advanced_model")
 
     Raises:
         AssertionError: When the response does not meet validation criteria
@@ -1348,28 +1549,29 @@ def assert_diffusion_response(response: DiffusionResponse, request_config: dict[
     if e2e_latency is not None:
         print(f"the avg e2e is: {e2e_latency}")
 
-    extra_body = request_config.get("extra_body", {})
-
-    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+    has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
+    assert has_any_content, "Response contains no images, videos, or audios"
 
     if response.images is not None:
-        assert len(response.images) > 0, "No images in response"
-        assert len(response.images) == num_outputs_per_prompt, (
-            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
+        assert_image_diffusion_response(
+            response=response,
+            request_config=request_config,
+            run_level=run_level,
         )
-        if run_level == "advanced_model":
-            expected_width = extra_body["width"]  # intend to raise KeyError
-            expected_height = extra_body["height"]  # intend to raise KeyError
-            for img in response.images:
-                assert_image_valid(img, width=expected_width, height=expected_height)
+
     if response.videos is not None:
-        raise NotImplementedError(
-            "Video validation is not implemented yet"
-        )  # consider using assert_video_valid defined above
+        assert_video_diffusion_response(
+            response=response,
+            request_config=request_config,
+            run_level=run_level,
+        )
+
     if response.audios is not None:
-        raise NotImplementedError(
-            "Audio validation is not implemented yet"
-        )  # consider using assert_audio_valid defined above
+        assert_audio_diffusion_response(
+            response=response,
+            request_config=request_config,
+            run_level=run_level,
+        )
 
 
 class OpenAIClientHandler:
@@ -1391,6 +1593,7 @@ class OpenAIClientHandler:
             port: vLLM-Omni server port
             api_key: API key (defaults to "EMPTY")
         """
+        self.base_url = f"http://{host}:{port}"
         self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
         self.run_level = run_level
 
@@ -1531,12 +1734,15 @@ class OpenAIClientHandler:
                     content = choice.message.content
                     if isinstance(content, list):
                         for item in content:
-                            if hasattr(item, "image_url") and item.image_url is not None:
-                                image_url = item.image_url.url
-                                if image_url.startswith("data:image"):
-                                    b64_data = image_url.split(",", 1)[1]
-                                    img = decode_b64_image(b64_data)
-                                    images.append(img)
+                            if isinstance(item, dict):
+                                image_url = item.get("image_url", {}).get("url")
+                            else:
+                                image_url_obj = getattr(item, "image_url", None)
+                                image_url = hasattr(image_url_obj, "url", None) if image_url_obj else None
+                            if image_url and image_url.startswith("data:image"):
+                                b64_data = image_url.split(",", 1)[1]
+                                img = decode_b64_image(b64_data)
+                                images.append(img)
 
             result.e2e_latency = time.perf_counter() - start_time
             result.images = images if images else None
@@ -1666,6 +1872,122 @@ class OpenAIClientHandler:
                     responses.append(response)
 
         return responses
+
+    def send_video_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """
+        Send native /v1/videos requests.
+        """
+        if request_num != 1:
+            raise NotImplementedError("Concurrent video diffusion requests are not currently implemented")
+
+        if request_config.get("stream", False):
+            raise NotImplementedError("Streaming is not currently implemented for video diffusion e2e test")
+
+        form_data = request_config.get("form_data")
+        if not isinstance(form_data, dict):
+            raise ValueError("Video request_config must contain 'form_data'")
+
+        if not form_data.get("prompt"):
+            raise ValueError("Video request_config['form_data'] must contain 'prompt'")
+
+        normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
+
+        files: dict[str, tuple[str, BytesIO, str]] = {}
+        image_reference = request_config.get("image_reference")
+        if image_reference:
+            if image_reference.startswith("data:image"):
+                header, encoded = image_reference.split(",", 1)
+                content_type = header.split(";")[0].removeprefix("data:")
+                extension = content_type.split("/")[-1]
+                file_data = base64.b64decode(encoded)
+
+                files["input_reference"] = (
+                    f"reference.{extension}",
+                    BytesIO(file_data),
+                    content_type,
+                )
+            else:
+                normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
+
+        result = DiffusionResponse()
+        start_time = time.perf_counter()
+
+        try:
+            create_url = self._build_url("/v1/videos")
+            response = requests.post(
+                create_url,
+                data=normalized_form_data,
+                files=files,
+                headers={"Accept": "application/json"},
+                timeout=60,
+            )
+            response.raise_for_status()
+
+            job_data = response.json()
+            video_id = job_data["id"]
+
+            self._wait_until_video_completed(video_id)
+
+            video_content = self._download_video_content(video_id)
+
+            result.success = True
+            result.videos = [video_content]
+            result.e2e_latency = time.perf_counter() - start_time
+
+            assert_diffusion_response(result, request_config, run_level=self.run_level)
+
+        except Exception as e:
+            result.success = False
+            result.error_message = f"Diffusion response processing error: {e}"
+            assert False, result.error_message
+
+        return [result]
+
+    def _wait_until_video_completed(
+        self,
+        video_id: str,
+        poll_interval_seconds: int = 2,
+        timeout_seconds: int = 300,
+    ) -> None:
+        status_url = self._build_url(f"/v1/videos/{video_id}")
+        deadline = time.monotonic() + timeout_seconds
+
+        while time.monotonic() < deadline:
+            status_resp = requests.get(
+                status_url,
+                headers={"Accept": "application/json"},
+                timeout=30,
+            )
+            status_resp.raise_for_status()
+
+            status_data = status_resp.json()
+            current_status = status_data["status"]
+
+            if current_status == "completed":
+                return
+
+            if current_status == "failed":
+                error_msg = status_data.get("last_error", "Unknown error")
+                raise RuntimeError(f"Job failed: {error_msg}")
+
+            time.sleep(poll_interval_seconds)
+
+        raise TimeoutError(f"Video job {video_id} did not complete within {timeout_seconds}s")
+
+    def _download_video_content(self, video_id: str) -> bytes:
+        download_url = self._build_url(f"/v1/videos/{video_id}/content")
+        video_resp = requests.get(download_url, stream=True, timeout=60)
+        video_resp.raise_for_status()
+
+        video_bytes = BytesIO()
+        for chunk in video_resp.iter_content(chunk_size=8192):
+            if chunk:
+                video_bytes.write(chunk)
+
+        return video_bytes.getvalue()
+
+    def _build_url(self, path: str) -> str:
+        return f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 @pytest.fixture

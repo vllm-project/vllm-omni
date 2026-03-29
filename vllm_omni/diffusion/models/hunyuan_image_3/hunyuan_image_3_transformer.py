@@ -11,7 +11,6 @@ from typing import Any, cast
 import numpy as np
 import regex as re
 import torch
-import torch.nn.functional as F
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -57,8 +56,19 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.v1.attention.backend import AttentionType
 
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+)
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pp_group,
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+)
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe import HunyuanFusedMoE
@@ -411,14 +421,18 @@ def apply_rotary_pos_emb(
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    Equivalent to torch.repeat_interleave(x, dim=2, repeats=n_rep).
+    Input:  (batch, seqlen, num_key_value_heads, head_dim)
+    Output: (batch, seqlen, num_attention_heads, head_dim)
     """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
+
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
+
+    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
 
 
 def default(value, default_value):
@@ -830,14 +844,30 @@ class ImageKVCacheManager:
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
 
-    def __init__(self, image_token_len: int = 4097):
+    def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int, scaling: float, image_token_len: int = 4097):
         """
         Args:
             image_token_len: Number of tokens per image (including special placeholders),
             default 4097 (timestamp + 4096 image tokens).
         """
+        # attention related
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.scaling = scaling
+        # cache related
         self.image_token_len: int = image_token_len
         self.image_kv_cache: tuple[torch.Tensor, torch.Tensor] = None
+
+        self.sp_size = get_sequence_parallel_world_size()
+        self.sp_rank = get_sequence_parallel_rank()
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=self.scaling,
+            num_kv_heads=self.num_kv_heads,
+        )
 
     def _save_image_kv_caches(
         self,
@@ -910,6 +940,63 @@ class ImageKVCacheManager:
 
         return new_key.contiguous(), new_value.contiguous()
 
+    def _sp_save_prompt_kv_caches(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        seq_len: int,
+        shard_image_size: int,
+    ) -> None:
+        """
+        We don't need to cached last token, since it all false and nevel attn to in non-first step.
+        With sp the key len is [text, image_shard], image_shard in rank include [image token, padding token]
+        The cache is [prompt0, prompt1], see _prepare_attention_mask_for_generation and
+        _update_model_kwargs_for_generation
+        """
+        bs, q_len, num_kv_heads, head_dim = key.shape
+        assert q_len == seq_len, f"for first-step, {q_len} != {seq_len}"
+        key = key.reshape(-1, num_kv_heads, head_dim)
+        value = value.reshape(-1, num_kv_heads, head_dim)
+        cached_prompt_len = seq_len - shard_image_size
+        if bs > 1:
+            assert bs == 2, "for cfg case, bs must be 2"
+
+        cached_key = []
+        cached_value = []
+        for b in range(bs):
+            base = b * seq_len
+            # cache text prompt
+            cached_key.append(key[base : base + cached_prompt_len])
+            cached_value.append(value[base : base + cached_prompt_len])
+
+        cached_key = torch.cat(cached_key, dim=0)
+        cached_value = torch.cat(cached_value, dim=0)
+        self.image_kv_cache_map = (cached_key, cached_value)
+
+    def _sp_get_prompt_kv_caches(
+        self,
+        key: torch.Tensor,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cached_key, cached_value = self.image_kv_cache_map
+        bs, q_len, kv_head_num, head_dim = key.shape
+
+        cached_prompt_len = cached_key.shape[0] // bs
+
+        assert cached_prompt_len == seq_len - q_len
+
+        joint_text_key = []
+        joint_text_value = []
+        for b in range(bs):
+            cache_base = b * cached_prompt_len
+            joint_text_key.append(cached_key[cache_base : cache_base + cached_prompt_len])
+            joint_text_value.append(cached_value[cache_base : cache_base + cached_prompt_len])
+
+        joint_text_key = torch.cat(joint_text_key, dim=0).reshape(bs, cached_prompt_len, kv_head_num, head_dim)
+        joint_text_value = torch.cat(joint_text_value, dim=0).reshape(bs, cached_prompt_len, kv_head_num, head_dim)
+
+        return joint_text_key.contiguous(), joint_text_value.contiguous()
+
     def __call__(
         self,
         query: torch.Tensor,
@@ -923,6 +1010,7 @@ class ImageKVCacheManager:
 
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
+        shard_image_size = kwargs.get("shard_image_size")
         bs = len(query_lens)
         q_len = query_lens[0]
         seq_len = seq_lens[0]
@@ -936,25 +1024,54 @@ class ImageKVCacheManager:
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
         key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
-
         if first_step:
             self.image_kv_cache_map = None
-            self._save_image_kv_caches(key, value, seq_len)
+            if self.sp_size <= 1:
+                self._save_image_kv_caches(key, value, seq_len)
+            else:
+                self._sp_save_prompt_kv_caches(key, value, seq_len, shard_image_size)
+                cached_prompt_len = self.image_kv_cache_map[0].shape[0] // bs
+                # joint text part
+                joint_text_query = query[:, :cached_prompt_len, :, :]
+                joint_text_key = key[:, :cached_prompt_len, :, :]
+                joint_text_value = value[:, :cached_prompt_len, :, :]
+                # image part
+                query = query[:, cached_prompt_len:, :, :]
+                key = key[:, cached_prompt_len:, :, :]
+                value = value[:, cached_prompt_len:, :, :]
         else:
-            key, value = self._update_image_kv_caches(key, value, seq_len)
-
-        query = query.transpose(1, 2).contiguous()
-        key = key.transpose(1, 2).contiguous()
-        value = value.transpose(1, 2).contiguous()
+            if self.sp_size <= 1:
+                key, value = self._update_image_kv_caches(key, value, seq_len)
+            else:
+                joint_text_query = query[:, :0, :, :]
+                joint_text_key, joint_text_value = self._sp_get_prompt_kv_caches(key, seq_len)
 
         key = repeat_kv(key, repeat_num)
         value = repeat_kv(value, repeat_num)
+        if self.sp_size > 1:
+            joint_text_key = repeat_kv(joint_text_key, repeat_num)
+            joint_text_value = repeat_kv(joint_text_value, repeat_num)
 
         attention_mask = attention_mask.contiguous()
 
-        attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0)
+        if self.sp_size <= 1:
+            attn_metadata = AttentionMetadata(
+                attn_mask=attention_mask,
+            )
+        else:
+            attn_metadata = AttentionMetadata(
+                joint_query=joint_text_query,
+                joint_key=joint_text_key,
+                joint_value=joint_text_value,
+                joint_strategy="front",
+                attn_mask=attention_mask,
+            )
+        # Compute attention using unified attention layer
+        attn_output = self.attn(query, key, value, attn_metadata)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [bs, q_len, heads, head_dim]
+        # attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0)
+
+        # attn_output = attn_output.transpose(1, 2).contiguous()  # [bs, q_len, heads, head_dim]
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
 
@@ -1512,7 +1629,13 @@ class HunYuanAttention(nn.Module):
         )
 
         # default image_token_len = timestamp + 4096*image_tokes
-        self.image_attn = ImageKVCacheManager(image_token_len=4097)
+        self.image_attn = ImageKVCacheManager(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            num_kv_heads=self.num_kv_heads,
+            scaling=self.scaling,
+            image_token_len=4097,
+        )
         self.image_rope2d_emb = HunYuanRotary2DEmbedder(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -1709,8 +1832,73 @@ class HunyuanImage3PreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
+class HunyuanImagePreprocessor(nn.Module):
+    """
+    Prepares hidden_states for SP by separating to  text, image parts
+
+    Split hidden_states [B, seq_len, D] to
+        - text part: [B, text_seq_len, D]
+        - image part: [B, image_seq_len + last_token, D]
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        custom_pos_emb: tuple[torch.FloatTensor],
+        position_ids: torch.LongTensor,
+        image_token_len: int,
+        is_first_step: bool = False,
+    ):
+        # ---------- compute prompt length ----------
+        prompt_len = hidden_states.shape[1] - image_token_len - 1 if is_first_step else 0
+
+        # ---------- hidden_states ----------
+        text_hidden_states = hidden_states[:, :prompt_len, :]
+        image_hidden_states = hidden_states[:, prompt_len:, :]
+
+        # ---------- position_ids ----------
+        text_position_ids = position_ids[:, :prompt_len]
+        image_position_ids = position_ids[:, prompt_len:]
+
+        # ---------- custom_pos_emb ----------
+        text_custom_pos_emb = (custom_pos_emb[0][:, :prompt_len, :], custom_pos_emb[1][:, :prompt_len, :])
+        image_custom_pos_emb = (custom_pos_emb[0][:, prompt_len:, :], custom_pos_emb[1][:, prompt_len:, :])
+
+        return (
+            text_hidden_states,
+            image_hidden_states,
+            text_position_ids,
+            image_position_ids,
+            text_custom_pos_emb[0],
+            image_custom_pos_emb[0],
+            text_custom_pos_emb[1],
+            image_custom_pos_emb[1],
+        )
+
+
+class UnifiledCat(nn.Module):
+    def forward(self, x, y, dim: int = 1):
+        return torch.cat([x, y], dim=dim)
+
+
+class HunyuanImagePostprocessor(nn.Module):
+    def forward(self, x):
+        return x
+
+
 class HunyuanImage3Model(nn.Module):
-    def __init__(self, config: HunyuanImage3Config, quant_config: QuantizationConfig | None, prefix: str = ""):
+    _sp_plan = {
+        # Split custom_pos_emb tuple elements (cos, sin) at model forward input
+        "pre_processor": {
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),
+            5: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # sin
+            7: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # cos
+        },
+        "post_processor": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
+
+    def __init__(self, config: HunyuanImage3Config, quant_config=None, prefix: str = ""):
         super().__init__()
         lora_config = None
         self.num_redundant_experts = 0
@@ -1747,6 +1935,10 @@ class HunyuanImage3Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+
+        self.pre_processor = HunyuanImagePreprocessor()
+        self.unifiled_cat = UnifiledCat()
+        self.post_processor = HunyuanImagePostprocessor()
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
@@ -1998,6 +2190,11 @@ class HunyuanImage3Model(nn.Module):
             loaded_params.add(name)
         return loaded_params
 
+    def _split_result(self, x, text_prompt_len):
+        text_output = x[:, 0:text_prompt_len, :].contiguous()
+        image_output = x[:, text_prompt_len:, :].contiguous()
+        return text_output, image_output
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -2035,6 +2232,71 @@ class HunyuanImage3Model(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        sp_world_size = get_sequence_parallel_world_size()
+        prompt_size = 0
+        shard_image_size = 0
+        shard_padding_size = 0
+        origin_query_len = query_lens[0]
+        if sp_world_size > 1:
+            assert query_lens[0] == hidden_states.shape[1]
+            (
+                text_hidden_states,
+                image_hidden_states,
+                text_position_ids,
+                image_position_ids,
+                text_custom_pos_emb_sin,
+                image_custom_pos_emb_sin,
+                text_custom_pos_emb_cos,
+                image_custom_pos_emb_cos,
+            ) = self.pre_processor(
+                hidden_states,
+                custom_pos_emb,
+                position_ids,
+                num_image_tokens,
+                first_step,
+            )
+            assert len(set(query_lens)) == 1 and len(set(seq_lens)) == 1, (
+                "query_lens and seq_lens must be the same for sequence parallel"
+            )
+            prompt_size = text_hidden_states.shape[1]
+            shard_image_size = image_hidden_states.shape[1]
+
+            if first_step:  # [image tokens, last token]
+                shard_padding_size = shard_image_size * sp_world_size - (num_image_tokens + 1)
+            else:  # [image tokens, last token]
+                shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
+            if first_step:
+                seq_lens = [prompt_size + shard_image_size for _ in seq_lens]
+            else:
+                seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
+                seq_lens = [seq_len + shard_image_size - 1 for seq_len in seq_lens]
+            query_lens = [prompt_size + shard_image_size for _ in query_lens]
+
+            if prompt_size > 0:
+                hidden_states = self.unifiled_cat(text_hidden_states, image_hidden_states, dim=1)
+                position_ids = self.unifiled_cat(text_position_ids, image_position_ids, dim=1)
+                custom_pos_emb = (
+                    self.unifiled_cat(text_custom_pos_emb_sin, image_custom_pos_emb_sin, dim=1),
+                    self.unifiled_cat(text_custom_pos_emb_cos, image_custom_pos_emb_cos, dim=1),
+                )
+            else:
+                hidden_states = image_hidden_states
+                position_ids = image_position_ids
+                custom_pos_emb = (image_custom_pos_emb_sin, image_custom_pos_emb_cos)
+
+            if not first_step:
+                assert torch.all(~attention_mask[..., -1]), "The last token should not be attended to"
+                attention_mask = attention_mask[..., :-1]  # we attention without last token
+
+            if shard_padding_size > 0:
+                B, H, Q, K = attention_mask.shape
+                pad = shard_padding_size
+
+                q_pad = attention_mask.new_zeros(B, H, pad, K)
+                attention_mask = torch.cat((attention_mask, q_pad), dim=2)
+
+                k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
+                attention_mask = torch.cat((attention_mask, k_pad), dim=3)
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -2055,6 +2317,8 @@ class HunyuanImage3Model(nn.Module):
                 seq_lens=seq_lens,
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
+                shard_image_size=shard_image_size,
+                shard_padding_size=shard_padding_size,
             )
 
             hidden_states = layer_outputs[0]
@@ -2068,6 +2332,13 @@ class HunyuanImage3Model(nn.Module):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if sp_world_size > 1:
+            text_output, image_output = self._split_result(hidden_states, prompt_size)
+            hidden_states = self.post_processor(image_output)
+            hidden_states = self.unifiled_cat(text_output, hidden_states, dim=1)
+            # Since the SP system only records the primary padding information from the first stage,
+            # but different stages may introduce different padding sizes, we truncate it to ensure correct output.
+            hidden_states = hidden_states[:, :origin_query_len, :].contiguous()
 
         next_cache = None
         if use_cache:
@@ -2396,6 +2667,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # ---- TeaCache initialization ----
+        tea_cache_config = getattr(self.model, "_tea_cache_config", None)
+        if tea_cache_config is not None:
+            tc_rescale = np.poly1d(tea_cache_config.coefficients)
+            tc_acc_dist = 0.0
+            tc_prev_mod = None
+            tc_prev_pred = None
+            tc_cnt = 0
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -2404,17 +2684,42 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
                 t_expand = t.repeat(latent_model_input.shape[0])
 
-                model_inputs = self.model.prepare_inputs_for_generation(
-                    input_ids,
-                    images=latent_model_input,
-                    timestep=t_expand,
-                    **model_kwargs,
-                )
+                # ---- TeaCache: decide whether to compute or reuse ----
+                should_compute = True
+                if tea_cache_config is not None:
+                    with torch.no_grad():
+                        # Use timestep embedding as the modulated input for cache decision
+                        cur_mod = self.model.time_embed(t.unsqueeze(0))
+                    if tc_cnt > 0 and tc_prev_mod is not None:
+                        rel_dist = (
+                            ((cur_mod - tc_prev_mod).abs().mean() / (tc_prev_mod.abs().mean() + 1e-8)).cpu().item()
+                        )
+                        rescaled = float(tc_rescale(rel_dist))
+                        tc_acc_dist += abs(rescaled)
+                        if tc_acc_dist < tea_cache_config.rel_l1_thresh:
+                            should_compute = False
+                        else:
+                            tc_acc_dist = 0.0
+                    tc_prev_mod = cur_mod.detach()
 
-                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                    model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
-                    pred = model_output["diffusion_prediction"]
-                pred = pred.to(dtype=torch.float32)
+                if should_compute:
+                    model_inputs = self.model.prepare_inputs_for_generation(
+                        input_ids,
+                        images=latent_model_input,
+                        timestep=t_expand,
+                        **model_kwargs,
+                    )
+
+                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+                        model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
+                        pred = model_output["diffusion_prediction"]
+                    pred = pred.to(dtype=torch.float32)
+
+                    if tea_cache_config is not None:
+                        tc_prev_pred = pred.clone()
+                else:
+                    # TeaCache fast path: reuse previous prediction
+                    pred = tc_prev_pred
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -2424,7 +2729,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
 
-                if i != len(timesteps) - 1:
+                if i != len(timesteps) - 1 and should_compute:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
                         model_kwargs,
@@ -2437,6 +2742,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     seq_lens = [seq_len] * b
                     model_kwargs["query_lens"] = query_lens
                     model_kwargs["seq_lens"] = seq_lens
+
+                if tea_cache_config is not None:
+                    tc_cnt += 1
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

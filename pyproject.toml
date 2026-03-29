@@ -41,6 +41,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
+    "datasets>=2.14.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
     "openai-whisper>=20250625",
@@ -53,6 +54,10 @@ dev = [
     "openpyxl>=3.0.0", # for nightly CI
     "pyttsx3>=2.99",
     "mistune>=3.2.0", # for example tests
+]
+
+demo = [
+    "gradio>=6.7.0",
 ]
 
 docs = [
@@ -211,3 +216,5 @@ extend-ignore-identifiers-re = [
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
+semantics = "semantics"
+fullset = "fullset"
