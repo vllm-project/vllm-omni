@@ -109,7 +109,17 @@ class AsyncOmniDiffusion:
                 od_config.update_multimodal_support()
 
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
-                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+                if tf_config_dict is not None:
+                    od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+                elif od_config.model_class_name in ("MOVA", "DreamIDOmniPipeline"):
+                    # Multi-component models have no single transformer/ subfolder
+                    # (e.g. MOVA: video_dit/, audio_dit/, dual_tower_bridge/)
+                    od_config.tf_model_config = TransformerConfig()
+                else:
+                    raise FileNotFoundError(
+                        f"transformer/config.json not found for model {od_config.model}. "
+                        "If this is a multi-component model, add its class name to the allowlist above."
+                    )
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
