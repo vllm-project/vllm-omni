@@ -168,7 +168,13 @@ def test_client(mock_async_diffusion):
     app.state.engine_client = mock_async_diffusion
     app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
     app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
-    app.state.diffusion_model_name = "Qwen/Qwen-Image"  # For models endpoint
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+
+    from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels
+
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
+    )
     app.state.args = Namespace(
         default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5}}',
         max_generated_image_size=4096,  # 64*64

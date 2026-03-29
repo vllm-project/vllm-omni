@@ -24,7 +24,10 @@ import io
 import json
 import logging
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    raise ImportError("gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'") from None
 import httpx
 import numpy as np
 import soundfile as sf
