@@ -24,7 +24,6 @@ from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.metadata_manager import MetadataManager
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
     BatchSpeechRequest,
@@ -147,14 +146,10 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Initialize uploaded speakers storage
+        # Initialize uploaded speakers storage (ephemeral — cleared on restart)
         speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
         self.uploaded_speakers_dir = Path(speech_voice_samples_dir)
         self.uploaded_speakers_dir.mkdir(parents=True, exist_ok=True)
-        self.metadata_file = self.uploaded_speakers_dir / "metadata.json"
-
-        # Initialize metadata manager
-        self.metadata_manager = MetadataManager(self.metadata_file)
 
         # Find and cache the TTS stage (if any) during initialization
         self._tts_stage = self._find_tts_stage()
@@ -171,17 +166,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Cache TTS configuration values (computed once, reused per request)
         self._max_instructions_length = self._compute_max_instructions_length()
 
-        # Load supported speakers
+        # Load supported speakers (built-in only; uploaded voices start empty)
         self.supported_speakers = self._load_supported_speakers()
-        # Load uploaded speakers
-        self.uploaded_speakers = self.metadata_manager.get_uploaded_speakers()
-
-        # Merge supported speakers with uploaded speakers
-        self.supported_speakers.update(self.uploaded_speakers.keys())
+        self.uploaded_speakers: dict[str, dict] = {}
         self._tts_tokenizer = None
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
-        logger.info(f"Loaded {len(self.uploaded_speakers)} uploaded speakers")
 
         # Batch configuration
         self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
@@ -534,7 +524,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise ValueError(f"Failed to save audio file: {e}")
 
         # Create speaker data
-        speaker_data = {
+        speaker_data: dict[str, Any] = {
             "name": name,
             "consent": consent,
             "file_path": str(file_path),
@@ -543,31 +533,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "original_filename": audio_file.filename,
             "file_size": file_size,
             "ref_text": ref_text,
-            "cache_status": "pending",  # The initial cache state is pending.
-            "cache_file": None,  # The initial cache file is empty.
-            "cache_generated_at": None,  # The initial cache generation time is empty.
             "embedding_source": "audio",
         }
-
-        # Store ref_text for ICL (in-context learning) mode if provided.
-        if ref_text:
-            speaker_data["ref_text"] = ref_text
 
         # Store voice description if provided.
         if speaker_description:
             speaker_data["speaker_description"] = speaker_description
 
-        # Save metadata using metadata manager (concurrency safe)
-        success = self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
-        if not success:
-            # Clean up the saved file if metadata creation failed
-            try:
-                file_path.unlink()
-            except Exception:
-                pass
-            raise ValueError(f"Failed to create metadata for voice '{name}' (possibly already exists)")
-
-        # Update in-memory cache
         self.uploaded_speakers[voice_name_lower] = speaker_data
         self.supported_speakers.add(voice_name_lower)
 
@@ -654,20 +626,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "mime_type": "application/x-safetensors",
             "original_filename": filename,
             "file_size": file_path.stat().st_size,
-            "cache_status": "ready",
-            "cache_file": str(file_path),
-            "cache_generated_at": timestamp,
             "embedding_source": "direct",
             "embedding_dim": emb_dim,
         }
-
-        success = self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
-        if not success:
-            try:
-                file_path.unlink()
-            except Exception:
-                pass
-            raise ValueError(f"Failed to create metadata for voice '{name}' (possibly already exists)")
 
         self.uploaded_speakers[voice_name_lower] = speaker_data
         self.supported_speakers.add(voice_name_lower)
@@ -694,25 +655,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         voice_name_lower = name.lower()
 
-        # Check if voice exists in memory cache
         if voice_name_lower not in self.uploaded_speakers:
-            logger.warning(f"Voice '{name}' not found in memory cache")
+            logger.warning(f"Voice '{name}' not found")
             return False
 
-        # Delete from metadata manager with file cleanup
-        # Pass base_dir for path validation
-        deleted_info = self.metadata_manager.delete_speaker(voice_name_lower)
-        if not deleted_info:
-            logger.error(f"Failed to delete voice '{name}' from metadata")
-            return False
+        speaker_info = self.uploaded_speakers.pop(voice_name_lower)
+        self.supported_speakers.discard(voice_name_lower)
 
-        # Update in-memory cache
-        if voice_name_lower in self.uploaded_speakers:
-            del self.uploaded_speakers[voice_name_lower]
-        if voice_name_lower in self.supported_speakers:
-            self.supported_speakers.remove(voice_name_lower)
+        # Clean up audio file on disk
+        file_path = speaker_info.get("file_path")
+        if file_path:
+            try:
+                Path(file_path).unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"Failed to delete audio file for '{name}': {e}")
 
-        logger.info(f"Deleted voice '{name}' and associated files")
+        logger.info(f"Deleted voice '{name}'")
         return True
 
     def _is_tts_model(self) -> bool:
