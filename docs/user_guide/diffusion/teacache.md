@@ -125,6 +125,7 @@ th {
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
 | `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` |
+| `HunyuanImage3Pipeline` | HunyuanImage3 | `tencent/HunyuanImage-3.0-Instruct` |
 
 ### VideoGen
 

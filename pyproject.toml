@@ -56,6 +56,10 @@ dev = [
     "mistune>=3.2.0", # for example tests
 ]
 
+demo = [
+    "gradio>=6.7.0",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",

@@ -2667,6 +2667,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # ---- TeaCache initialization ----
+        tea_cache_config = getattr(self.model, "_tea_cache_config", None)
+        if tea_cache_config is not None:
+            tc_rescale = np.poly1d(tea_cache_config.coefficients)
+            tc_acc_dist = 0.0
+            tc_prev_mod = None
+            tc_prev_pred = None
+            tc_cnt = 0
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -2675,17 +2684,42 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
                 t_expand = t.repeat(latent_model_input.shape[0])
 
-                model_inputs = self.model.prepare_inputs_for_generation(
-                    input_ids,
-                    images=latent_model_input,
-                    timestep=t_expand,
-                    **model_kwargs,
-                )
+                # ---- TeaCache: decide whether to compute or reuse ----
+                should_compute = True
+                if tea_cache_config is not None:
+                    with torch.no_grad():
+                        # Use timestep embedding as the modulated input for cache decision
+                        cur_mod = self.model.time_embed(t.unsqueeze(0))
+                    if tc_cnt > 0 and tc_prev_mod is not None:
+                        rel_dist = (
+                            ((cur_mod - tc_prev_mod).abs().mean() / (tc_prev_mod.abs().mean() + 1e-8)).cpu().item()
+                        )
+                        rescaled = float(tc_rescale(rel_dist))
+                        tc_acc_dist += abs(rescaled)
+                        if tc_acc_dist < tea_cache_config.rel_l1_thresh:
+                            should_compute = False
+                        else:
+                            tc_acc_dist = 0.0
+                    tc_prev_mod = cur_mod.detach()
 
-                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                    model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
-                    pred = model_output["diffusion_prediction"]
-                pred = pred.to(dtype=torch.float32)
+                if should_compute:
+                    model_inputs = self.model.prepare_inputs_for_generation(
+                        input_ids,
+                        images=latent_model_input,
+                        timestep=t_expand,
+                        **model_kwargs,
+                    )
+
+                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+                        model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
+                        pred = model_output["diffusion_prediction"]
+                    pred = pred.to(dtype=torch.float32)
+
+                    if tea_cache_config is not None:
+                        tc_prev_pred = pred.clone()
+                else:
+                    # TeaCache fast path: reuse previous prediction
+                    pred = tc_prev_pred
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -2695,7 +2729,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
 
-                if i != len(timesteps) - 1:
+                if i != len(timesteps) - 1 and should_compute:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
                         model_kwargs,
@@ -2708,6 +2742,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     seq_lens = [seq_len] * b
                     model_kwargs["query_lens"] = query_lens
                     model_kwargs["seq_lens"] = seq_lens
+
+                if tea_cache_config is not None:
+                    tc_cnt += 1
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
