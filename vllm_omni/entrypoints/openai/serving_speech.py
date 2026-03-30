@@ -710,34 +710,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return any(stage.engine_args.model_stage in _TTS_MODEL_STAGES for stage in self.engine_client.stage_configs)
 
     def _is_f5_tts_model(self) -> bool:
-        if not self.diffusion_mode:
-            return False
-
-        if getattr(self.engine_client, "model_type", None) == "F5TTSPipeline":
-            return True
-
-        model_config = getattr(self.engine_client, "model_config", None)
-        if getattr(model_config, "model_type", None) == "F5TTSPipeline":
-            return True
-        if getattr(model_config, "model_class_name", None) == "F5TTSPipeline":
-            return True
-
-        hf_config = getattr(model_config, "hf_config", None)
-        if getattr(hf_config, "model_type", None) == "F5TTSPipeline":
-            return True
-
-        model_refs = (
-            self.model_name,
-            getattr(self.engine_client, "model", None),
-            getattr(model_config, "model", None),
-            getattr(hf_config, "_name_or_path", None),
-        )
-        for model_ref in model_refs:
-            if not isinstance(model_ref, str) or not model_ref:
-                continue
-            if is_f5_model(model_ref):
-                return True
-        return False
+        return self.diffusion_mode and is_f5_model(self.model_name)
 
     @staticmethod
     def _audio_value_numel(audio_value: Any) -> int:
