@@ -1406,6 +1406,11 @@ async def edit_images(
         if not input_images_list:
             raise HTTPException(status_code=422, detail="Field 'image' or 'url' is required")
         pil_images = await _load_input_images(input_images_list)
+        if len(pil_images) > 1 and not _supports_multimodal_image_inputs(raw_request, engine_client):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Received multiple input images. Only a single image is supported by this model.",
+            )
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
@@ -1582,6 +1587,20 @@ def _get_engine_and_model(raw_request: Request):
         model_name = "unknown"
 
     return engine_client, model_name, normalized_stage_configs
+
+
+def _supports_multimodal_image_inputs(raw_request: Request, engine_client: Any) -> bool:
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None) or engine_client
+    get_diffusion_od_config = getattr(diffusion_engine, "get_diffusion_od_config", None)
+    od_config = (
+        get_diffusion_od_config() if callable(get_diffusion_od_config) else getattr(diffusion_engine, "od_config", None)
+    )
+
+    if od_config is None:
+        # Preserve the existing compatibility behavior when the diffusion
+        # config is not exposed on the serving surface.
+        return True
+    return bool(getattr(od_config, "supports_multimodal_inputs", False))
 
 
 def _get_lora_from_json_str(lora_body):
