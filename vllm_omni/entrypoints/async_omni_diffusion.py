@@ -251,6 +251,10 @@ class AsyncOmniDiffusion:
             finished=True,
         )
 
+    def get_diffusion_od_config(self) -> OmniDiffusionConfig:
+        """Return the diffusion config used by this engine."""
+        return self.od_config
+
     # ------------------------------------------------------------------
     # Public generate API
     # ------------------------------------------------------------------

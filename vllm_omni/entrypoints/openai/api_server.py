@@ -84,8 +84,10 @@ from vllm.utils.system_utils import decorate_logs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
+    SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64,
     parse_size,
+    validate_layered_layers,
 )
 from vllm_omni.entrypoints.openai.protocol.audio import BatchSpeechRequest, OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
@@ -116,8 +118,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 logger = init_logger(__name__)
 router = APIRouter()
 
-# Supported resolution buckets for layered models (e.g., Qwen-Image-Layered)
-SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 profiler_router = APIRouter()
 
 
@@ -1292,6 +1292,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
+        _update_if_not_none(gen_params, "layers", request.layers)
 
         request_id = f"img_gen-{random_uuid()}"
 
@@ -1406,6 +1407,11 @@ async def edit_images(
         if not input_images_list:
             raise HTTPException(status_code=422, detail="Field 'image' or 'url' is required")
         pil_images = await _load_input_images(input_images_list)
+        if len(pil_images) > 1 and not _supports_multimodal_image_inputs(raw_request, engine_client):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Received multiple input images. Only a single image is supported by this model.",
+            )
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
@@ -1440,11 +1446,13 @@ async def edit_images(
                 detail=f"Invalid resolution {resolution}. Supported resolutions: {SUPPORTED_LAYERED_RESOLUTIONS}.",
             )
         # 3.2.1 Validate layers if provided
-        if layers is not None and layers < 1:
+        try:
+            layers = validate_layered_layers(layers)
+        except ValueError as e:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
-                detail=f"Invalid layers value {layers}. layers must be >= 1.",
-            )
+                detail=str(e),
+            ) from e
         # 3.2.2 Check for conflicting size and resolution parameters
         if resolution is not None and size.lower() != "auto":
             raise HTTPException(
@@ -1582,6 +1590,20 @@ def _get_engine_and_model(raw_request: Request):
         model_name = "unknown"
 
     return engine_client, model_name, normalized_stage_configs
+
+
+def _supports_multimodal_image_inputs(raw_request: Request, engine_client: Any) -> bool:
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None) or engine_client
+    get_diffusion_od_config = getattr(diffusion_engine, "get_diffusion_od_config", None)
+    od_config = (
+        get_diffusion_od_config() if callable(get_diffusion_od_config) else getattr(diffusion_engine, "od_config", None)
+    )
+
+    if od_config is None:
+        # Preserve the existing compatibility behavior when the diffusion
+        # config is not exposed on the serving surface.
+        return True
+    return bool(getattr(od_config, "supports_multimodal_inputs", False))
 
 
 def _get_lora_from_json_str(lora_body):
