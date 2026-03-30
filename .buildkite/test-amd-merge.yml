@@ -134,15 +134,33 @@ steps:
     - timeout 10m pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
     - timeout 20m pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "advanced_model" --run-level "advanced_model"
 
-- label: "Qwen3-TTS E2E Test"
+- label: "Qwen3-TTS CustomVoice E2E Test"
   agent_pool: mi325_2
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - export VLLM_LOGGING_LEVEL=DEBUG
-    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - timeout 20m pytest -s -v tests/e2e/online_serving/test_qwen3_tts.py
+    - |
+      timeout 20m bash -c '
+        export VLLM_LOGGING_LEVEL=DEBUG
+        export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+        pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m "advanced_model" --run-level "advanced_model" && pytest -s -v tests/e2e/offline_inference/test_qwen3_tts_customvoice.py
+      '
+
+- label: "Qwen3-TTS Base E2E Test"
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - |
+      timeout 20m bash -c '
+        export VLLM_LOGGING_LEVEL=DEBUG
+        export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+        pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py -m "advanced_model" --run-level "advanced_model" && pytest -s -v tests/e2e/offline_inference/test_qwen3_tts_base.py
+      '
 
 - label: "Diffusion Image Edit Test"
   agent_pool: mi325_1
