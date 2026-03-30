@@ -159,7 +159,7 @@ Lists available voices for the loaded model.
 }
 ```
 
-`uploaded_voices` is only present when custom voices have been uploaded. Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
+`uploaded_voices` is always present (empty list when no custom voices have been uploaded). Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
 
 ```
 POST /v1/audio/voices

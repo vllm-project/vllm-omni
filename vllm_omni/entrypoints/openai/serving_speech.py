@@ -169,6 +169,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Load supported speakers (built-in only; uploaded voices start empty)
         self.supported_speakers = self._load_supported_speakers()
         self.uploaded_speakers: dict[str, dict] = {}
+        logger.warning(
+            "Uploaded voices are ephemeral and will be lost on server restart. "
+            "Re-upload voices after each restart if needed."
+        )
         self._tts_tokenizer = None
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
