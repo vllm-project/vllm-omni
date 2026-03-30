@@ -106,7 +106,7 @@ def test_encode_image_base64():
 
 
 class MockGenerationResult:
-    """Mock result object from AsyncOmniDiffusion.generate()"""
+    """Mock result object from AsyncOmni.generate()"""
 
     def __init__(self, images):
         self.images = images

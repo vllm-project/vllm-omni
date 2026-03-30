@@ -158,7 +158,7 @@ class StageDiffusionProc:
         """Dispatch collective RPC calls to DiffusionEngine.
 
         LoRA methods remap arguments and post-process results to match
-        the contract that ``AsyncOmniDiffusion`` previously provided.
+        the contract that ``AsyncOmni`` provides.
         """
         loop = asyncio.get_running_loop()
 

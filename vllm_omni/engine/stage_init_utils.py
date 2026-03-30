@@ -453,7 +453,7 @@ def initialize_diffusion_stage(
         metadata: Extracted stage metadata.
         batch_size: Maximum number of requests to batch together in the
             diffusion engine.  Passed through to ``StageDiffusionClient``
-            and ultimately to ``AsyncOmniDiffusion``.
+            and ultimately to ``AsyncOmni``.
     """
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
