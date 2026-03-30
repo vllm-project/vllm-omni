@@ -65,6 +65,7 @@ def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
         force_refresh_step_policy=cache_config.force_refresh_step_policy,
     )
 
+
 def enable_cache_for_ultraflux(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     db_cache_config = _build_db_cache_config(cache_config)
 
@@ -86,6 +87,7 @@ def enable_cache_for_ultraflux(pipeline: Any, cache_config: Any) -> Callable[[in
         ),
         cache_config=db_cache_config,
     )
+
 
 def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for Wan2.2 single or dual-transformer architecture.
