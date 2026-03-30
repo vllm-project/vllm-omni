@@ -1,9 +1,10 @@
 """Qwen3-Omni Code Predictor -- optimized re-prefill, no KV cache.
 
 * SDPA attention (F.scaled_dot_product_attention) with native GQA support
+* HF-compatible numerics (float32 RMSNorm, float32 RoPE, separate linear layers)
 * Per-call embedding buffer to avoid cross-request aliasing
 * Pre-allocated position_ids (read-only, safe to persist)
-* torch.compile on inner transformer by default
+* torch.compile (epilogue_fusion=False) on inner transformer by default
 * Inline sampling (top-k + top-p) -- no custom op overhead
 """
 
@@ -12,15 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -28,15 +22,84 @@ logger = init_logger(__name__)
 
 
 # ===================================================================
-#  Standalone Attention (SDPA, no KV cache, no HF backend fallback)
+# HF-numerics-compatible layers for code predictor
 # ===================================================================
+#
+# These use plain PyTorch ops (nn.Linear, manual RMSNorm in float32,
+# rotate_half RoPE) to produce outputs numerically identical to the
+# HuggingFace reference. vLLM's fused kernels (RMSNorm, QKVParallel,
+# get_rope) introduce small precision differences that compound across
+# the autoregressive steps of the code predictor, causing severe
+# audio quality degradation.
+#
+# See: https://github.com/vllm-project/vllm-omni/issues/2274
+
+
+class _RMSNorm(nn.Module):
+    """RMSNorm matching HuggingFace's implementation exactly.
+
+    Computes variance in float32 to avoid bfloat16 precision loss.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class _RotaryEmbedding(nn.Module):
+    """RoPE matching HuggingFace's implementation exactly.
+
+    Forces float32 computation for cos/sin, matching HF's torch.autocast(enabled=False).
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        rope_theta = getattr(config, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # position_ids: [batch, seq_len]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        # Force float32 (matching HF)
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class Qwen3OmniCodePredictorAttention(nn.Module):
     """Multi-head self-attention for code predictor.
 
-    Uses ``F.scaled_dot_product_attention`` directly.  No KV cache -- the code
-    predictor always re-prefills the full (short) sequence each AR step.
+    Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
+    No KV cache -- the code predictor always re-prefills the full (short)
+    sequence each AR step.
 
     Input : [B, seq_len, hidden_size]
     Output: [B, seq_len, hidden_size]
@@ -45,7 +108,6 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
     def __init__(
         self,
         config,
-        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -58,58 +120,52 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
             cp_cfg.hidden_size // cp_cfg.num_attention_heads,
         )
         self.hidden_size = cp_cfg.hidden_size
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self._use_gqa = self.num_kv_heads != self.num_heads
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=self.hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=self.num_heads,
-            total_num_kv_heads=self.num_kv_heads,
+        # Separate q/k/v projections matching HF (no fused packing)
+        self.q_proj = nn.Linear(
+            self.hidden_size,
+            self.num_heads * self.head_dim,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-            disable_tp=True,
         )
-        self.o_proj = RowParallelLinear(
-            input_size=self.num_heads * self.head_dim,
-            output_size=self.hidden_size,
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-            disable_tp=True,
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=cp_cfg.max_position_embeddings,
-            rope_parameters=None,
-            dual_chunk_attention_config=None,
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=False,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=cp_cfg.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=cp_cfg.rms_norm_eps)
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+        )
+        self.q_norm = _RMSNorm(self.head_dim, eps=cp_cfg.rms_norm_eps)
+        self.k_norm = _RMSNorm(self.head_dim, eps=cp_cfg.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
+        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
+        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
 
-        # Flatten to 2-D so vLLM rotary_emb gets [num_tokens, size]
-        qkv, _ = self.qkv_proj(hidden_states.reshape(bsz * seq_len, -1))
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
 
-        # QK-norm -> RoPE (both 2-D)
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(q.shape)
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
-        q, k = self.rotary_emb(position_ids, q, k)
-
-        # [B, heads, seq, head_dim]
-        q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        cos, sin = position_embeddings
+        # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
+        cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
+        sin = sin.unsqueeze(1)
+        q = (q * cos) + (_rotate_half(q) * sin)
+        k = (k * cos) + (_rotate_half(k) * sin)
 
         attn_out = F.scaled_dot_product_attention(
             q,
@@ -120,9 +176,9 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
             enable_gqa=self._use_gqa,
         )
 
-        attn_out = attn_out.transpose(1, 2).reshape(bsz * seq_len, -1)
-        output, _ = self.o_proj(attn_out)
-        return output.view(bsz, seq_len, -1)
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.o_proj(attn_out)
+        return output
 
 
 # ===================================================================
@@ -131,40 +187,23 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
 
 
 class Qwen3OmniCodePredictorMLP(nn.Module):
-    """SiLU-gated MLP for code predictor."""
+    """SiLU-gated MLP for code predictor, matching HF's implementation."""
 
     def __init__(
         self,
         config,
-        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
         hidden_size = config.code_predictor_config.hidden_size
         intermediate_size = config.code_predictor_config.intermediate_size
 
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[intermediate_size, intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-            disable_tp=True,
-        )
-        self.down_proj = RowParallelLinear(
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-            disable_tp=True,
-        )
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(hidden_states)
-        gate, up = gate_up.chunk(2, dim=-1)
-        down, _ = self.down_proj(F.silu(gate) * up)
-        return down
+        return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
 # ===================================================================
@@ -178,32 +217,29 @@ class Qwen3OmniCodePredictorDecoderLayer(nn.Module):
     def __init__(
         self,
         config,
-        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3OmniCodePredictorAttention(
             config,
-            quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
         self.mlp = Qwen3OmniCodePredictorMLP(
             config,
-            quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
         cp_cfg = config.code_predictor_config
-        self.input_layernorm = RMSNorm(cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps)
+        self.input_layernorm = _RMSNorm(cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps)
+        self.post_attention_layernorm = _RMSNorm(cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_ids)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -238,13 +274,13 @@ class Qwen3OmniCodePredictorBaseModel(nn.Module):
             [
                 Qwen3OmniCodePredictorDecoderLayer(
                     vllm_config.model_config.hf_config,
-                    quant_config=vllm_config.quant_config,
                     prefix=f"{prefix}.layers.{idx}",
                 )
                 for idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = _RotaryEmbedding(config)
 
     def forward(
         self,
@@ -252,8 +288,9 @@ class Qwen3OmniCodePredictorBaseModel(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, position_ids)
+            hidden_states = layer(hidden_states, position_embeddings)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -332,7 +369,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         if self._pos_ids is not None and self._pos_ids.device == device:
             return
         max_seq = self.num_code_groups + 1
-        self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device)
+        # [1, max_seq] for HF-style RoPE (will be expanded to [bsz, seq_len] at use)
+        self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device).unsqueeze(0)
 
     def _ensure_cached_refs(self) -> None:
         if self._lm_heads is not None:
@@ -344,16 +382,18 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         if self._model_fwd is not None:
             return
         if current_omni_platform.supports_torch_inductor():
-            # torch.compile fuses the 5-layer transformer's small kernels,
-            # reducing BF16 intermediate round-trips and improving precision.
-            # mode="default" avoids Inductor's own CUDA graph capture so it
-            # doesn't conflict with the outer CUDAGraphWrapper.
+            # torch.compile fuses RMSNorm/RoPE in ways that lose float32
+            # precision, compounding across AR steps. Use epilogue_fusion=False
+            # to disable the problematic fusions while still getting kernel
+            # fusion benefits for the linear layers and SDPA.
             self._model_fwd = torch.compile(
                 self.model.forward,
-                mode="default",
                 dynamic=True,
+                options={
+                    "epilogue_fusion": False,
+                },
             )
-            logger.info("code_predictor: torch.compile enabled (mode=default)")
+            logger.info("code_predictor: torch.compile enabled (no epilogue fusion)")
         else:
             self._model_fwd = self.model.forward
             logger.info("code_predictor: using eager mode (no torch.compile)")
@@ -413,8 +453,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         for step in range(1, num_groups):
             seq_len = step + 1
             projected = proj_buf[:bsz, :seq_len, :]
-            step_pos_ids = pos_ids[:seq_len] if bsz == 1 else pos_ids[:seq_len].repeat(bsz)
-            assert step_pos_ids.shape[0] == bsz * seq_len
+            # position_ids: [batch, seq_len] for HF-style RoPE
+            step_pos_ids = pos_ids[:, :seq_len].expand(bsz, -1)
 
             hidden_out = model_fwd(projected, step_pos_ids)
 
@@ -446,21 +486,11 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights with mapping for fused QKV and gate_up projections.
+        """Load weights directly (no fused projection remapping needed).
 
-        Maps original HF weights (q_proj, k_proj, v_proj, gate_proj, up_proj)
-        to fused vLLM weights (qkv_proj, gate_up_proj).
+        Since we use separate nn.Linear for q/k/v/o and gate/up/down,
+        weight names match the HF checkpoint directly.
         """
-        # Mapping for fused projections
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
@@ -469,36 +499,12 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Handle stacked/fused parameters
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
+            param = params_dict.get(name)
+            if param is None:
+                continue
 
-                name = name.replace(weight_name, param_name)
-                # Skip if parameter doesn't exist (e.g., bias)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Non-stacked parameters - use default loading
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is not None:
-                    weight_loader(param, loaded_weight)
-                else:
-                    param.data.copy_(loaded_weight)
-
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
         return loaded_params

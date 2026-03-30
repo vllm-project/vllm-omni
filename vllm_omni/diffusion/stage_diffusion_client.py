@@ -186,23 +186,17 @@ class StageDiffusionClient:
                 return await asyncio.wait_for(result, timeout=timeout)
             return await result
 
-        if method in {"sleep", "wake_up"}:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                self._engine._executor,
-                self._engine.engine.collective_rpc,
-                method,
-                timeout,
-                args,
-                kwargs,
-                None,
-            )
-
-        return {
-            "supported": False,
-            "todo": True,
-            "reason": f"Diffusion stage collective_rpc method {method} is not implemented yet",
-        }
+        # Fall back to collective RPC for other methods
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._engine._executor,
+            self._engine.engine.collective_rpc,
+            method,
+            timeout,
+            args,
+            kwargs,
+            None,
+        )
 
     def shutdown(self) -> None:
         for task in self._tasks.values():
