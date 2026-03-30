@@ -46,7 +46,7 @@ its stepwise request state machine. For normal diffusion inference, leave it
 disabled unless your workflow depends on this mode.
 
 If you are looking for general diffusion speedups, see
-[Diffusion Acceleration Overview](../diffusion_acceleration.md).
+[Diffusion Features Overview](../diffusion_features.md).
 
 ## Troubleshooting
 
