@@ -13,6 +13,7 @@ Usage::
         cache.put(key, {"artifact": result})
 """
 
+import os
 import threading
 from collections import OrderedDict
 from typing import Any
@@ -20,6 +21,8 @@ from typing import Any
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+_DEFAULT_MAX_ENTRIES = 128
 
 
 class VoiceEmbeddingCache:
@@ -29,12 +32,15 @@ class VoiceEmbeddingCache:
     Thread-safe via a lightweight ``threading.Lock``.
     """
 
-    def __init__(self, max_entries: int = 128):
+    def __init__(self, max_entries: int | None = None):
+        if max_entries is None:
+            max_entries = int(os.environ.get("VOICE_CACHE_MAX_ENTRIES", _DEFAULT_MAX_ENTRIES))
         self._cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._max_entries = max_entries
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
+        logger.info("Voice embedding cache initialized (max_entries=%d)", max_entries)
 
     @staticmethod
     def make_cache_key(voice_name: str, xvec_only: bool, created_at: float = 0.0) -> str:
