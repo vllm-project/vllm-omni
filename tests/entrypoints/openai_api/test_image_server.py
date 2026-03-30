@@ -740,6 +740,29 @@ def test_image_edit_images_processing(async_omni_test_client):
     assert processed_images[1].size == (24, 24)
 
 
+def test_image_edit_rejects_multiple_images_when_model_does_not_support_them(async_omni_test_client):
+    img_bytes_1 = make_test_image_bytes((16, 16))
+    img_bytes_2 = make_test_image_bytes((32, 32))
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(supports_multimodal_inputs=False)
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", img_bytes_1),
+            ("image", img_bytes_2),
+        ],
+        data={"prompt": "hello world."},
+    )
+
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"] == "Received multiple input images. Only a single image is supported by this model."
+    )
+    assert engine.captured_prompt is None
+
+
 def test_image_edit_parameter_pass(async_omni_test_client):
     img_bytes_1 = make_test_image_bytes((16, 16))
 

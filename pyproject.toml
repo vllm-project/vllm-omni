@@ -53,6 +53,7 @@ dev = [
     "av", # for ComfyUI tests
     "openpyxl>=3.0.0", # for nightly CI
     "pyttsx3>=2.99",
+    "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
 ]
 
