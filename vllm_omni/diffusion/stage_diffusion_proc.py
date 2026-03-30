@@ -175,7 +175,11 @@ class StageDiffusionProc:
         args: tuple,
         kwargs: dict,
     ) -> Any:
-        """Dispatch collective RPC calls to DiffusionEngine."""
+        """Dispatch collective RPC calls to DiffusionEngine.
+
+        LoRA methods remap arguments and post-process results to match
+        the contract that ``AsyncOmniDiffusion`` previously provided.
+        """
         loop = asyncio.get_running_loop()
 
         if method == "profile":
@@ -188,26 +192,70 @@ class StageDiffusionProc:
                 profile_prefix,
             )
 
-        if method in {
-            "add_lora",
-            "remove_lora",
-            "list_loras",
-            "pin_lora",
-            "start_profile",
-            "stop_profile",
-            "sleep",
-            "wake_up",
-        }:
+        if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
-            if method == "add_lora" and args:
+            lora_request = args[0] if args else kwargs.get("lora_request")
+            if lora_request is not None:
                 from vllm.lora.request import LoRARequest
 
-                if not isinstance(args[0], LoRARequest):
-                    args = (
-                        msgspec.convert(args[0], LoRARequest),
-                        *args[1:],
+                if not isinstance(lora_request, LoRARequest):
+                    lora_request = msgspec.convert(
+                        lora_request, LoRARequest
                     )
+            results = await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                "add_lora",
+                timeout,
+                (),
+                {"lora_request": lora_request},
+                None,
+            )
+            return all(results) if isinstance(results, list) else results
 
+        if method == "remove_lora":
+            results = await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                "remove_lora",
+                timeout,
+                args,
+                kwargs or {},
+                None,
+            )
+            return all(results) if isinstance(results, list) else results
+
+        if method == "list_loras":
+            results = await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                "list_loras",
+                timeout,
+                (),
+                {},
+                None,
+            )
+            if not isinstance(results, list):
+                return results or []
+            merged: set[int] = set()
+            for part in results:
+                merged.update(part or [])
+            return sorted(merged)
+
+        if method == "pin_lora":
+            lora_id = args[0] if args else kwargs.get("adapter_id")
+            results = await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                "pin_lora",
+                timeout,
+                (),
+                {"adapter_id": lora_id},
+                None,
+            )
+            return all(results) if isinstance(results, list) else results
+
+        if method in {"start_profile", "stop_profile", "sleep", "wake_up"}:
             return await loop.run_in_executor(
                 self._executor,
                 self._engine.collective_rpc,
