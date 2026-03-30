@@ -724,6 +724,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["GlmImageTransformerBlock"]
+    _layerwise_offload_blocks_attr = "transformer_blocks"
 
     _hsdp_shard_conditions = [is_transformer_block_module]
 
