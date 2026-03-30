@@ -1,0 +1,58 @@
+# XPU stage config for running CosyVoice3 with 2-stage architecture
+# Stage 0: Talker (text prompt → speech tokens)
+# Stage 1: Code2Wav (flow matching → acoustic features → waveform)
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      process: true
+      devices: "0"
+    engine_args:
+      model_stage: talker
+      model_arch: CosyVoice3Model
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      trust_remote_code: true
+      gpu_memory_utilization: 0.4
+      engine_output_type: latent
+      disable_hybrid_kv_cache_manager: true
+      enable_prefix_caching: false
+      enforce_eager: false
+      mm_processor_cache_gb: 0
+      skip_mm_profiling: true
+      dtype: "float32"
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+    engine_args:
+      model_stage: code2wav
+      model_arch: CosyVoice3Model
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      trust_remote_code: true
+      engine_output_type: latent
+      gpu_memory_utilization: 0.2
+      enforce_eager: true
+      disable_hybrid_kv_cache_manager: true
+      enable_prefix_caching: false
+      skip_mm_profiling: true
+      dtype: "float32"
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.cosyvoice3.text2flow
+    final_output: true
+    final_output_type: audio
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
