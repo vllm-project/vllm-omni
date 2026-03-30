@@ -144,6 +144,7 @@ def process_text(
 
 
 def _is_cjk_char(ch: str) -> bool:
+    # chinese, japanese, korean
     return "\u3100" <= ch <= "\u9fff"
 
 
