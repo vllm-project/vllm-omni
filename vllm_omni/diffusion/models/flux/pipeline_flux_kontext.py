@@ -130,6 +130,8 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, FluxKontextTransformer2DModel)
+        transformer_kwargs["od_config"] = od_config
+        transformer_kwargs["quant_config"] = od_config.quantization_config
         self.transformer = FluxKontextTransformer2DModel(**transformer_kwargs)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8

@@ -28,7 +28,7 @@ stage_args:
       temperature: 0.8
       top_k: 30
       top_p: 0.9
-      max_tokens: 200
+      max_tokens: 2048
       seed: 42
       detokenize: false
       repetition_penalty: 1.0

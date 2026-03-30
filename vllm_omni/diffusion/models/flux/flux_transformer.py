@@ -196,6 +196,8 @@ class FluxAttention(torch.nn.Module):
         attention_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Ensure contiguous for FP8 quantized linear layers
+        hidden_states = hidden_states.contiguous()
         qkv, _ = self.to_qkv(hidden_states)
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
@@ -209,6 +211,7 @@ class FluxAttention(torch.nn.Module):
         key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
+            encoder_hidden_states = encoder_hidden_states.contiguous()
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             add_q_size = self.add_kv_proj.num_heads * self.head_dim
             add_kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
@@ -720,6 +723,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
         guidance_embeds: bool = True,
         axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
         theta: float = 10000.0,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__(
             od_config=od_config,
@@ -735,6 +739,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
             guidance_embeds=guidance_embeds,
             axes_dims_rope=axes_dims_rope,
             theta=theta,
+            quant_config=quant_config,
         )
 
     def forward(
