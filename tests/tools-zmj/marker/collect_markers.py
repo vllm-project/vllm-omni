@@ -229,6 +229,45 @@ def extract_pytestmark_rhs_from_stmts(body: list[ast.stmt]) -> str | None:
     return None
 
 
+def extract_pytestmark_expr_from_stmts(body: list[ast.stmt]) -> ast.AST | None:
+    """从语句块顶层取第一个 ``pytestmark = ...`` / 注解赋值的右侧表达式 AST。"""
+    for node in body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "pytestmark":
+                    return node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "pytestmark" and node.value:
+                return node.value
+    return None
+
+
+def marker_names_from_pytestmark_expr(expr: ast.AST | None) -> set[str]:
+    """从 ``pytestmark = ...`` 右侧表达式里抽取 marker 名称集合（尽量静态推断）。"""
+    if expr is None:
+        return set()
+    out: set[str] = set()
+    _collect_marks_from_expr(expr, out)
+    return out
+
+
+def marker_names_from_function_decorators(
+    decorators: list[ast.expr],
+    *,
+    exclude_parametrize: bool,
+) -> set[str]:
+    """从函数 decorator_list 里抽取显式 pytest.mark.xxx 的名称集合。"""
+    out: set[str] = set()
+    for d in decorators:
+        name = _is_pytest_mark_attr(d)
+        if not name:
+            continue
+        if exclude_parametrize and name == "parametrize":
+            continue
+        out.add(name)
+    return out
+
+
 def collect_test_function_rows(
     body: list[ast.stmt],
     filepath: str,
@@ -236,6 +275,9 @@ def collect_test_function_rows(
     out: list[tuple[str, str, str]],
     module_pytestmark_line: str,
     enclosing_pytestmark_lines: list[str],
+    module_marker_names: set[str],
+    enclosing_marker_names: set[str],
+    overlap_out: list[tuple[str, str, str, str]] | None,
     *,
     csv_exclude_parametrize: bool,
 ) -> None:
@@ -245,6 +287,10 @@ def collect_test_function_rows(
             if not node.name.startswith("test_"):
                 continue
             qual = f"{class_prefix}.{node.name}" if class_prefix else node.name
+            func_marker_names = marker_names_from_function_decorators(
+                node.decorator_list,
+                exclude_parametrize=csv_exclude_parametrize,
+            )
             func_dec = format_decorator_list(
                 node.decorator_list,
                 exclude_parametrize=csv_exclude_parametrize,
@@ -257,15 +303,31 @@ def collect_test_function_rows(
                 parts.append(func_dec)
             dec_str = "\n".join(parts)
             out.append((filepath, qual, dec_str))
+
+            if overlap_out is not None:
+                inherited = set(module_marker_names) | set(enclosing_marker_names)
+                overlap = sorted(inherited & func_marker_names)
+                if overlap:
+                    overlap_out.append(
+                        (
+                            filepath,
+                            qual,
+                            ",".join(overlap),
+                            dec_str,
+                        )
+                    )
         elif isinstance(node, ast.ClassDef):
             prefix = f"{class_prefix}.{node.name}" if class_prefix else node.name
             cls_rhs = extract_pytestmark_rhs_from_stmts(node.body)
+            cls_expr = extract_pytestmark_expr_from_stmts(node.body)
+            cls_marker_names = marker_names_from_pytestmark_expr(cls_expr)
             cls_line = (
                 f"[类 pytestmark] {prefix}: pytestmark = {cls_rhs}"
                 if cls_rhs
                 else ""
             )
             new_enclosing = enclosing_pytestmark_lines + ([cls_line] if cls_line else [])
+            new_enclosing_names = set(enclosing_marker_names) | set(cls_marker_names)
             collect_test_function_rows(
                 node.body,
                 filepath,
@@ -273,6 +335,9 @@ def collect_test_function_rows(
                 out,
                 module_pytestmark_line,
                 new_enclosing,
+                module_marker_names,
+                new_enclosing_names,
+                overlap_out,
                 csv_exclude_parametrize=csv_exclude_parametrize,
             )
 
@@ -384,6 +449,13 @@ def main() -> int:
         action="store_true",
         help="CSV 第三列保留 @pytest.mark.parametrize（默认剔除）",
     )
+    parser.add_argument(
+        "--csv-overlap",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="将「模块/类 pytestmark 与函数装饰器重复 marker」的用例写入 CSV 便于筛选",
+    )
     args = parser.parse_args()
     tests_root = resolve_tests_root(args.tests_root)
     if not tests_root.is_dir():
@@ -395,6 +467,7 @@ def main() -> int:
     all_marks: set[str] = set()
     all_hw: set[str] = set()
     csv_rows: list[tuple[str, str, str]] = []
+    overlap_rows: list[tuple[str, str, str, str]] = []
 
     for py in sorted(iter_test_py_files(tests_root)):
         try:
@@ -419,15 +492,13 @@ def main() -> int:
             by_file_hw[key].update(local_hw)
         all_marks.update(local)
         all_hw.update(local_hw)
-        if args.csv is not None:
-            mod_rhs = (
-                extract_pytestmark_rhs_from_stmts(tree.body)
-                if isinstance(tree, ast.Module)
-                else None
-            )
-            module_line = (
-                f"[模块 pytestmark] pytestmark = {mod_rhs}" if mod_rhs else ""
-            )
+        if args.csv is not None or args.csv_overlap is not None:
+            mod_rhs = extract_pytestmark_rhs_from_stmts(tree.body)
+            mod_expr = extract_pytestmark_expr_from_stmts(tree.body)
+            module_line = f"[模块 pytestmark] pytestmark = {mod_rhs}" if mod_rhs else ""
+            module_marker_names = marker_names_from_pytestmark_expr(mod_expr)
+
+            overlap_sink = overlap_rows if args.csv_overlap is not None else None
             collect_test_function_rows(
                 tree.body,
                 key,
@@ -435,6 +506,9 @@ def main() -> int:
                 csv_rows,
                 module_line,
                 [],
+                module_marker_names,
+                set(),
+                overlap_sink,
                 csv_exclude_parametrize=not args.csv_include_parametrize,
             )
 
@@ -450,6 +524,15 @@ def main() -> int:
             for row in sorted(csv_rows, key=lambda r: (r[0], r[1])):
                 w.writerow(row)
         print(f"已写入 CSV：{args.csv}（test_* 函数行数 {len(csv_rows)}）")
+
+    if args.csv_overlap is not None:
+        args.csv_overlap.parent.mkdir(parents=True, exist_ok=True)
+        with args.csv_overlap.open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["文件名", "函数名", "重复marker", "修饰器（含模块/类 pytestmark）"])
+            for row in sorted(overlap_rows, key=lambda r: (r[0], r[1], r[2])):
+                w.writerow(row)
+        print(f"已写入 overlap CSV：{args.csv_overlap}（行数 {len(overlap_rows)}）")
 
     if args.json:
         payload = {
