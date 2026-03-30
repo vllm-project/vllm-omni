@@ -369,7 +369,7 @@ class T5EncoderModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
-                lookup_name = name.replace(weight_name, param_name)
+                lookup_name = name.replace(f".{weight_name}.", f".{param_name}.")
                 if lookup_name not in params_dict:
                     continue
                 param = params_dict[lookup_name]
