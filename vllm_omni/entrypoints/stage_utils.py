@@ -99,6 +99,9 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
 
     logical_ids = [int(device) for device in device_list]
     mapped_devices = [visible_device_list[idx] for idx in logical_ids if idx < num_visible]
+    mapping_pairs = [
+        f"{logical_id}->{visible_device_list[logical_id]}" for logical_id in logical_ids if logical_id < num_visible
+    ]
     if not mapped_devices:
         raise ValueError(
             f"Stage {stage_id} has logical IDs {device_list}, none of which map to the visible devices "
@@ -107,12 +110,19 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
     if len(mapped_devices) < len(logical_ids):
         logger.warning(
             "Stage %s requested logical devices %s, but only %d device(s) are currently available: %s. "
-            "Falling back to mapped subset %s",
+            "Resolved logical-to-physical mapping: %s. Falling back to mapped subset %s",
             stage_id,
             device_list,
             num_visible,
             visible_device_list,
+            ", ".join(mapping_pairs) if mapping_pairs else "(none)",
             mapped_devices,
+        )
+    else:
+        logger.info(
+            "Stage %s logical-to-physical device mapping: %s",
+            stage_id,
+            ", ".join(mapping_pairs),
         )
     return mapped_devices
 
