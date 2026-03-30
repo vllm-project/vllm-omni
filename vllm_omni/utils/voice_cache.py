@@ -50,7 +50,7 @@ class VoiceEmbeddingCache:
                 name but different audio.
         """
         mode = "xvec" if xvec_only else "icl"
-        return f"{voice_name}:{created_at}:{mode}"
+        return f"{voice_name}:{created_at:.6f}:{mode}"
 
     def get(self, key: str) -> dict[str, Any] | None:
         """Return cached artifacts or ``None`` on miss.  Promotes to MRU on hit."""
