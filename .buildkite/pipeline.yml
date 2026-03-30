@@ -1,9 +1,28 @@
 steps:
-  # NPU Simple Test - Quick validation that NPU test environment works
-  # Once this passes, replace with bootstrap-npu-omni.sh for full CI
-  - label: "Upload NPU Simple Test"
-    key: upload-npu-simple-test
-    commands:
-      - buildkite-agent pipeline upload .buildkite/pipeline-npu-simple-test.yaml
+  - label: ":docker: Build image"
+    key: image-build
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "linux-aarch64-a2b3-gy006-test"
+    plugins:
+      - docker#v5.2.0:
+          image: "docker:24.0"
+          dockerd:
+            image: "docker:24.0-dind"
+            config: |
+              {
+                "registry-mirrors": ["https://docker.xuanyuan.me"]
+              }
+          propagate-environment: true
+    command: |
+      git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
+      docker build -t vllm-omni-ci-npu -f ./docker/Dockerfile.npu .
+
+  - label: "Upload Ready Pipeline"
+    depends_on: image-build
+    key: upload-ready-pipeline
+    if: build.branch != "main" && build.pull_request.labels includes "ready"
+    agents:
+      queue: "linux-aarch64-a2b3-gy006-test"
+    command: |
+      git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
+      buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml

@@ -1,0 +1,12 @@
+steps:
+  - label: "🧪 Simple Unit Test"
+    depends_on: upload-ready-pipeline
+    agents:
+      queue: "linux-aarch64-a2b3-gy006-test"
+    plugins:
+      - docker#v5.2.0:
+          image: "vllm-omni-ci-npu"
+          always-pull: true
+    command: |
+      git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
+      timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml

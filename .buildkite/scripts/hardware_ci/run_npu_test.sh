@@ -28,7 +28,7 @@ mkdir -p ${builder_cache_dir}
 cat <<EOF | DOCKER_BUILDKIT=1 docker build \
     --add-host pypi-cache:${PYPI_CACHE_HOST} \
     --builder ${builder_name} --cache-from type=local,src=${builder_cache_dir} \
-                           --cache-to type=local,dest=${builder_cache_dir},mode=max \
+                               --cache-to type=local,dest=${builder_cache_dir},mode=max \
     --build-arg BUILDKITE_PULL_REQUEST="${BUILDKITE_PULL_REQUEST}" \
     --build-arg BUILDKITE_PULL_REQUEST_REPO="${BUILDKITE_PULL_REQUEST_REPO}" \
     --progress=plain --load -t ${image_name} -f - .
@@ -45,8 +45,9 @@ RUN pip config set global.index-url http://pypi-cache:${PYPI_CACHE_PORT}/pypi/si
     rm -rf /var/lib/apt/lists/*
 
 # Install for pytest to make the docker build cache layer always valid
+# FIX: Added --break-system-packages to bypass PEP 668 protection
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install pytest>=6.0  pytest-cov modelscope
+    pip install --break-system-packages pytest>=6.0  pytest-cov modelscope
 
 COPY . .
 
@@ -69,11 +70,12 @@ RUN git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com
     fi
 
 RUN --mount=type=cache,target=/root/.cache/pip \
+    # FIX: Added --break-system-packages here as well for the main install
     export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/\`uname -i\`-linux/devlib && \
-    python3 -m pip install -v -e /workspace/vllm-omni/
+    python3 -m pip install --break-system-packages -v -e /workspace/vllm-omni/
 
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
