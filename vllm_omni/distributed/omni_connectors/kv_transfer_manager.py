@@ -383,15 +383,6 @@ class OmniKVTransferManager:
         """Get connector (compatibility wrapper for existing code)."""
         return self.connector
 
-    def get_sender_connection_info(self) -> dict[str, Any] | None:
-        """Return sender connection info when KV transfer runs in sender mode."""
-        if not self.config.need_send_cache:
-            return None
-        conn = self.connector
-        if conn and hasattr(conn, "get_connection_info"):
-            return conn.get_connection_info()
-        return None
-
     def update_sender_info(self, sender_info: dict[str, Any]) -> None:
         """Update receiver-side sender info before loading remote KV cache."""
         if not self.config.need_recv_cache:

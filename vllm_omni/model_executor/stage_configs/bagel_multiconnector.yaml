@@ -87,9 +87,11 @@ runtime:
         localbuf: 64000000     # 64MB
         proto: "tcp"
 
-    # Transfer-engine template for RDMA-based Bagel deployment.
-    # See `bagel_rdma.yaml` for the config that switches the Bagel stage edge
-    # from the store connector to this transfer-engine connector directly.
+    # PR1 (#1019) note:
+    # - Keep this transfer-engine connector config as a ready-to-use template.
+    # - Bagel does NOT consume this connector in PR1(#1019).
+    # - output_connectors/input_connectors above still point to mooncake_connector.
+    # - We will switch Bagel to this connector in the next PR.
     rdma_connector:
       name: MooncakeTransferEngineConnector
       extra:
