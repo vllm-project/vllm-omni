@@ -38,7 +38,7 @@ def _force_default_gemm(monkeypatch):
     """Force CPU-compatible GEMM dispatch for tests using CPU tensors.
 
     vLLM's dispatch_unquantized_gemm() selects the backend by platform
-    (e.g. rocm_unquantized_gemm on AMD node), not by tensor device.
+    (e.g. rocm_unquantized_gemm on AMD machines), not by tensor device.
     CPU test tensors crash with NotImplementedError on ROCm.  Monkeypatch
     the dispatcher to always return the default (torch.nn.functional.linear)
     implementation which works on any device."""
