@@ -1,6 +1,6 @@
 """Subprocess entry point for the diffusion engine.
 
-StageDiffusionProc runs AsyncOmniDiffusion in a child process,
+StageDiffusionProc runs DiffusionEngine in a child process,
 communicating with StageDiffusionClient via ZMQ (PUSH/PULL).
 """
 
@@ -8,23 +8,31 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
+
 import msgspec
 import zmq
 import zmq.asyncio
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.utils import shutdown
 
+from vllm_omni.diffusion.data import TransformerConfig
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
@@ -32,17 +40,348 @@ _HANDSHAKE_POLL_TIMEOUT_S = 600
 
 
 class StageDiffusionProc:
-    """Subprocess entry point for diffusion inference."""
+    """Subprocess entry point for diffusion inference.
 
-    @staticmethod
+    Manages DiffusionEngine lifecycle, async request processing,
+    and ZMQ-based communication with StageDiffusionClient.
+    """
+
+    def __init__(self, model: str, od_config: OmniDiffusionConfig) -> None:
+        self._model = model
+        self._od_config = od_config
+        self._engine: DiffusionEngine | None = None
+        self._executor: ThreadPoolExecutor | None = None
+        self._closed = False
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+
+    def initialize(self) -> None:
+        """Enrich config, create DiffusionEngine and thread pool."""
+        self._enrich_config()
+        self._engine = DiffusionEngine.make_engine(self._od_config)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        logger.info(
+            "StageDiffusionProc initialized with model: %s", self._model
+        )
+
+    def _enrich_config(self) -> None:
+        """Load model metadata from HuggingFace and populate od_config fields.
+
+        Diffusers-style models expose ``model_index.json`` with ``_class_name``.
+        Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
+        so we fall back to reading that and mapping model_type manually.
+        """
+        od_config = self._od_config
+
+        try:
+            config_dict = get_hf_file_to_dict(
+                "model_index.json", od_config.model
+            )
+            if config_dict is not None:
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = config_dict.get(
+                        "_class_name", None
+                    )
+                od_config.update_multimodal_support()
+
+                tf_config_dict = get_hf_file_to_dict(
+                    "transformer/config.json", od_config.model
+                )
+                od_config.tf_model_config = TransformerConfig.from_dict(
+                    tf_config_dict
+                )
+            else:
+                raise FileNotFoundError("model_index.json not found")
+        except (AttributeError, OSError, ValueError, FileNotFoundError):
+            cfg = get_hf_file_to_dict("config.json", od_config.model)
+            if cfg is None:
+                raise ValueError(
+                    f"Could not find config.json or model_index.json "
+                    f"for model {od_config.model}"
+                )
+
+            od_config.tf_model_config = TransformerConfig.from_dict(cfg)
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+
+            if (
+                model_type == "bagel"
+                or "BagelForConditionalGeneration" in architectures
+            ):
+                od_config.model_class_name = "BagelPipeline"
+                od_config.tf_model_config = TransformerConfig()
+                od_config.update_multimodal_support()
+            elif model_type == "nextstep":
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = "NextStep11Pipeline"
+                od_config.tf_model_config = TransformerConfig()
+                od_config.update_multimodal_support()
+            elif architectures and len(architectures) == 1:
+                od_config.model_class_name = architectures[0]
+            else:
+                raise
+
+    # ------------------------------------------------------------------
+    # Request processing
+    # ------------------------------------------------------------------
+
+    async def _process_request(
+        self,
+        request_id: str,
+        prompt: Any,
+        sampling_params_dict: dict,
+    ) -> OmniRequestOutput:
+        """Build a diffusion request and run DiffusionEngine.step()."""
+        # Reconstruct LoRARequest if needed.
+        # LoRARequest is a msgspec.Struct with array_like=True,
+        # so it deserializes as a list (not dict). Use msgspec.convert
+        # to handle both list and dict representations.
+        lora_req = sampling_params_dict.get("lora_request")
+        if lora_req is not None:
+            from vllm.lora.request import LoRARequest
+
+            if not isinstance(lora_req, LoRARequest):
+                sampling_params_dict["lora_request"] = msgspec.convert(
+                    lora_req, LoRARequest
+                )
+
+        sampling_params = OmniDiffusionSamplingParams(**sampling_params_dict)
+
+        request = OmniDiffusionRequest(
+            prompts=[prompt],
+            sampling_params=sampling_params,
+            request_ids=[request_id],
+        )
+
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            self._executor, self._engine.step, request
+        )
+        result = results[0]
+        if not result.request_id:
+            result.request_id = request_id
+        return result
+
+    # ------------------------------------------------------------------
+    # Collective RPC dispatch
+    # ------------------------------------------------------------------
+
+    async def _handle_collective_rpc(
+        self,
+        method: str,
+        timeout: float | None,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        """Dispatch collective RPC calls to DiffusionEngine."""
+        loop = asyncio.get_running_loop()
+
+        if method == "profile":
+            is_start = args[0] if args else True
+            profile_prefix = args[1] if len(args) > 1 else None
+            return await loop.run_in_executor(
+                self._executor,
+                self._engine.profile,
+                is_start,
+                profile_prefix,
+            )
+
+        if method in {
+            "add_lora",
+            "remove_lora",
+            "list_loras",
+            "pin_lora",
+            "start_profile",
+            "stop_profile",
+            "sleep",
+            "wake_up",
+        }:
+            # Reconstruct LoRARequest after IPC if needed.
+            if method == "add_lora" and args:
+                from vllm.lora.request import LoRARequest
+
+                if not isinstance(args[0], LoRARequest):
+                    args = (
+                        msgspec.convert(args[0], LoRARequest),
+                        *args[1:],
+                    )
+
+            return await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                method,
+                timeout,
+                args,
+                kwargs or {},
+                None,
+            )
+
+        return {
+            "supported": False,
+            "todo": True,
+            "reason": (
+                f"Diffusion stage collective_rpc method "
+                f"{method} is not implemented yet"
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # ZMQ event loop
+    # ------------------------------------------------------------------
+
+    async def run_loop(
+        self,
+        request_address: str,
+        response_address: str,
+    ) -> None:
+        """Async event loop handling ZMQ messages from StageDiffusionClient."""
+        ctx = zmq.asyncio.Context()
+
+        request_socket = ctx.socket(zmq.PULL)
+        request_socket.bind(request_address)
+
+        response_socket = ctx.socket(zmq.PUSH)
+        response_socket.bind(response_address)
+
+        encoder = OmniMsgpackEncoder()
+        decoder = OmniMsgpackDecoder()
+
+        tasks: dict[str, asyncio.Task] = {}
+
+        async def _dispatch_request(
+            request_id: str, prompt: Any, sampling_params_dict: dict
+        ) -> None:
+            """Process a single diffusion request and send the response."""
+            try:
+                result = await self._process_request(
+                    request_id, prompt, sampling_params_dict
+                )
+                await response_socket.send(
+                    encoder.encode({"type": "result", "output": result})
+                )
+            except Exception as e:
+                logger.exception(
+                    "Diffusion request %s failed: %s", request_id, e
+                )
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "error",
+                            "request_id": request_id,
+                            "error": str(e),
+                        }
+                    )
+                )
+            finally:
+                tasks.pop(request_id, None)
+
+        try:
+            while True:
+                raw = await request_socket.recv()
+                msg = decoder.decode(raw)
+                msg_type = msg.get("type")
+
+                if msg_type == "add_request":
+                    request_id = msg["request_id"]
+                    task = asyncio.create_task(
+                        _dispatch_request(
+                            request_id,
+                            msg["prompt"],
+                            msg["sampling_params"],
+                        )
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "abort":
+                    for rid in msg.get("request_ids", []):
+                        task = tasks.pop(rid, None)
+                        if task:
+                            task.cancel()
+                        self._engine.abort(rid)
+
+                elif msg_type == "collective_rpc":
+                    rpc_id = msg["rpc_id"]
+                    try:
+                        result = await self._handle_collective_rpc(
+                            msg["method"],
+                            msg.get("timeout"),
+                            tuple(msg.get("args", ())),
+                            msg.get("kwargs", {}),
+                        )
+                        await response_socket.send(
+                            encoder.encode(
+                                {
+                                    "type": "rpc_result",
+                                    "rpc_id": rpc_id,
+                                    "result": result,
+                                }
+                            )
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            "Collective RPC %s failed: %s", msg["method"], e
+                        )
+                        await response_socket.send(
+                            encoder.encode(
+                                {
+                                    "type": "error",
+                                    "rpc_id": rpc_id,
+                                    "error": str(e),
+                                }
+                            )
+                        )
+
+                elif msg_type == "shutdown":
+                    break
+
+        finally:
+            for task in tasks.values():
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+            request_socket.close()
+            response_socket.close()
+            ctx.term()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """Release engine and thread pool resources."""
+        if self._closed:
+            return
+        self._closed = True
+
+        if self._engine is not None:
+            try:
+                self._engine.close()
+            except Exception as e:
+                logger.warning("Error closing diffusion engine: %s", e)
+
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception as e:
+                logger.warning("Error shutting down executor: %s", e)
+
+    # ------------------------------------------------------------------
+    # Subprocess entry point
+    # ------------------------------------------------------------------
+
+    @classmethod
     def run_diffusion_proc(
+        cls,
         model: str,
         od_config: OmniDiffusionConfig,
         handshake_address: str,
         request_address: str,
         response_address: str,
     ) -> None:
-        """Run the diffusion engine in a subprocess."""
+        """Entry point for the diffusion subprocess."""
         shutdown_requested = False
 
         def signal_handler(signum: int, frame: Any) -> None:
@@ -54,13 +393,9 @@ class StageDiffusionProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        engine = None
+        proc = cls(model, od_config)
         try:
-            from vllm_omni.entrypoints.async_omni_diffusion import (
-                AsyncOmniDiffusion,
-            )
-
-            engine = AsyncOmniDiffusion(model=model, od_config=od_config)
+            proc.initialize()
 
             # Send READY via handshake socket
             handshake_ctx = zmq.Context()
@@ -71,7 +406,7 @@ class StageDiffusionProc:
             handshake_ctx.term()
 
             # Run async event loop
-            asyncio.run(_run_loop(engine, request_address, response_address))
+            asyncio.run(proc.run_loop(request_address, response_address))
 
         except SystemExit:
             logger.debug("StageDiffusionProc exiting.")
@@ -80,197 +415,10 @@ class StageDiffusionProc:
             logger.exception("StageDiffusionProc encountered a fatal error.")
             raise
         finally:
-            if engine is not None:
-                engine.close()
+            proc.close()
 
 
-async def _run_loop(
-    engine: Any,
-    request_address: str,
-    response_address: str,
-) -> None:
-    """Async event loop for the diffusion subprocess."""
-    ctx = zmq.asyncio.Context()
-
-    request_socket = ctx.socket(zmq.PULL)
-    request_socket.bind(request_address)
-
-    response_socket = ctx.socket(zmq.PUSH)
-    response_socket.bind(response_address)
-
-    encoder = OmniMsgpackEncoder()
-    decoder = OmniMsgpackDecoder()
-
-    tasks: dict[str, asyncio.Task] = {}
-
-    async def process_request(request_id: str, prompt: Any, sampling_params_dict: dict) -> None:
-        """Process a single diffusion request."""
-        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-        try:
-            # Reconstruct LoRARequest if needed.
-            # LoRARequest is a msgspec.Struct with array_like=True,
-            # so it deserializes as a list (not dict). Use msgspec.convert
-            # to handle both list and dict representations.
-            lora_req = sampling_params_dict.get("lora_request")
-            if lora_req is not None:
-                from vllm.lora.request import LoRARequest
-
-                if not isinstance(lora_req, LoRARequest):
-                    sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
-
-            sampling_params = OmniDiffusionSamplingParams(**sampling_params_dict)
-            result = await engine.generate(prompt, sampling_params, request_id)
-            await response_socket.send(encoder.encode({"type": "result", "output": result}))
-        except Exception as e:
-            logger.exception("Diffusion request %s failed: %s", request_id, e)
-            await response_socket.send(
-                encoder.encode(
-                    {
-                        "type": "error",
-                        "request_id": request_id,
-                        "error": str(e),
-                    }
-                )
-            )
-        finally:
-            tasks.pop(request_id, None)
-
-    try:
-        while True:
-            raw = await request_socket.recv()
-            msg = decoder.decode(raw)
-            msg_type = msg.get("type")
-
-            if msg_type == "add_request":
-                request_id = msg["request_id"]
-                prompt = msg["prompt"]
-                sampling_params_dict = msg["sampling_params"]
-                task = asyncio.create_task(process_request(request_id, prompt, sampling_params_dict))
-                tasks[request_id] = task
-
-            elif msg_type == "abort":
-                for rid in msg.get("request_ids", []):
-                    task = tasks.pop(rid, None)
-                    if task:
-                        task.cancel()
-                    await engine.abort(rid)
-
-            elif msg_type == "collective_rpc":
-                rpc_id = msg["rpc_id"]
-                method = msg["method"]
-                timeout = msg.get("timeout")
-                args = tuple(msg.get("args", ()))
-                kwargs = msg.get("kwargs", {})
-                try:
-                    result = await _handle_collective_rpc(engine, method, timeout, args, kwargs)
-                    await response_socket.send(
-                        encoder.encode(
-                            {
-                                "type": "rpc_result",
-                                "rpc_id": rpc_id,
-                                "result": result,
-                            }
-                        )
-                    )
-                except Exception as e:
-                    logger.exception("Collective RPC %s failed: %s", method, e)
-                    await response_socket.send(
-                        encoder.encode(
-                            {
-                                "type": "error",
-                                "rpc_id": rpc_id,
-                                "error": str(e),
-                            }
-                        )
-                    )
-
-            elif msg_type == "shutdown":
-                break
-
-    finally:
-        for task in tasks.values():
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-        request_socket.close()
-        response_socket.close()
-        ctx.term()
-
-
-async def _handle_collective_rpc(
-    engine: Any,
-    method: str,
-    timeout: float | None,
-    args: tuple,
-    kwargs: dict,
-) -> Any:
-    """Handle collective RPC calls in the subprocess."""
-    if method == "profile":
-        target = getattr(engine, method, None)
-        if target is None:
-            return {
-                "supported": False,
-                "todo": True,
-                "reason": f"AsyncOmniDiffusion.{method} is not implemented",
-            }
-        # Extract is_start and profile_prefix from args
-        is_start = args[0] if args else True
-        profile_prefix = args[1] if len(args) > 1 else None
-        result = target(is_start, profile_prefix)
-        if timeout is not None:
-            return await asyncio.wait_for(result, timeout=timeout)
-        return await result
-
-    if method in {
-        "add_lora",
-        "remove_lora",
-        "list_loras",
-        "pin_lora",
-        "start_profile",
-        "stop_profile",
-    }:
-        # Reconstruct LoRARequest after IPC if needed.
-        # LoRARequest is a msgspec.Struct with array_like=True,
-        # so msgpack deserializes it as a plain list.
-        if method == "add_lora" and args:
-            from vllm.lora.request import LoRARequest
-
-            if not isinstance(args[0], LoRARequest):
-                args = (msgspec.convert(args[0], LoRARequest), *args[1:])
-
-        target = getattr(engine, method, None)
-        if target is None:
-            return {
-                "supported": False,
-                "todo": True,
-                "reason": (f"AsyncOmniDiffusion.{method} is not implemented"),
-            }
-        result = target(*args, **kwargs)
-        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-            if timeout is not None:
-                return await asyncio.wait_for(result, timeout=timeout)
-            return await result
-        return result
-
-    if method in {"sleep", "wake_up"}:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            engine._executor,
-            engine.engine.collective_rpc,
-            method,
-            timeout,
-            args,
-            kwargs,
-            None,
-        )
-
-    return {
-        "supported": False,
-        "todo": True,
-        "reason": (f"Diffusion stage collective_rpc method {method} is not implemented yet"),
-    }
+# -- Free functions for backward compatibility with StageDiffusionClient ------
 
 
 def spawn_diffusion_proc(
@@ -321,7 +469,9 @@ def _perform_diffusion_handshake(
     handshake_address: str,
 ) -> None:
     """Run the handshake with the diffusion subprocess."""
-    with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
+    with zmq_socket_ctx(
+        handshake_address, zmq.ROUTER, bind=True
+    ) as handshake_socket:
         poller = zmq.Poller()
         poller.register(handshake_socket, zmq.POLLIN)
         poller.register(proc.sentinel, zmq.POLLIN)
@@ -330,7 +480,9 @@ def _perform_diffusion_handshake(
         while True:
             events = dict(poller.poll(timeout=timeout_ms))
             if not events:
-                raise TimeoutError("Timed out waiting for READY from StageDiffusionProc")
+                raise TimeoutError(
+                    "Timed out waiting for READY from StageDiffusionProc"
+                )
             if handshake_socket in events:
                 identity, raw = handshake_socket.recv_multipart()
                 msg = msgspec.msgpack.decode(raw)
@@ -338,4 +490,7 @@ def _perform_diffusion_handshake(
                     return
                 raise RuntimeError(f"Expected READY, got: {msg}")
             if proc.exitcode is not None:
-                raise RuntimeError(f"StageDiffusionProc died during handshake (exit code {proc.exitcode})")
+                raise RuntimeError(
+                    f"StageDiffusionProc died during handshake "
+                    f"(exit code {proc.exitcode})"
+                )
