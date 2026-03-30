@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 from collections.abc import Iterable
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
@@ -33,7 +35,9 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .configuration_fish_speech import FishSpeechConfig, FishSpeechFastARConfig, FishSpeechSlowARConfig
+from .dac_encoder import _load_dac_codec, encode_reference_audio
 from .fish_speech_fast_ar import FishSpeechFastAR
+from .prompt_utils import build_fish_voice_clone_prompt_ids
 
 logger = init_logger(__name__)
 
@@ -360,7 +364,10 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             dev = input_ids.device
 
             if is_first_prefill:
-                prompt_embeds = self._build_prefill_embeds(input_ids, info_dict)
+                if bool(info_dict.get("fish_structured_voice_clone", False)):
+                    prompt_embeds = self._build_structured_voice_clone_prefill_embeds(info_dict)
+                else:
+                    prompt_embeds = self._build_prefill_embeds(input_ids, info_dict)
                 prompt_embeds_buf = prompt_embeds.detach().to("cpu").contiguous()
                 if not prompt_embeds_buf.is_pinned():
                     prompt_embeds_buf = prompt_embeds_buf.pin_memory()
@@ -506,6 +513,41 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
         result = base_embeds + codebook_sum
         return result.squeeze(0).to(dtype=torch.bfloat16)
+
+    def _build_structured_voice_clone_prefill_embeds(self, info_dict: dict[str, Any]) -> torch.Tensor:
+        tokenizer = self._get_tokenizer()
+        ref_text = info_dict.get("ref_text")
+        text = info_dict.get("text")
+        ref_audio_path = info_dict.get("ref_audio_path")
+        ref_audio_sr = info_dict.get("ref_audio_sr")
+        if not isinstance(ref_text, str) or not isinstance(text, str):
+            raise ValueError("Fish Speech structured voice clone requires string text and ref_text")
+        if not isinstance(ref_audio_path, str) or not ref_audio_path:
+            raise ValueError("Fish Speech structured voice clone requires ref_audio_path")
+        if not isinstance(ref_audio_sr, int):
+            raise ValueError("Fish Speech structured voice clone requires integer ref_audio_sr")
+
+        ref_audio_wav = np.load(ref_audio_path)
+        os.remove(ref_audio_path)
+
+        semantic_token_ids = encode_reference_audio(
+            self.model_path,
+            ref_audio_wav,
+            ref_audio_sr,
+            device=self.codebook_embeddings.weight.device,
+        )
+        prompt_ids, _, _ = build_fish_voice_clone_prompt_ids(
+            tokenizer,
+            text,
+            ref_text,
+            semantic_token_ids,
+        )
+        prompt_ids = torch.tensor(
+            prompt_ids,
+            dtype=torch.long,
+            device=self.codebook_embeddings.weight.device,
+        )
+        return self.embed_input_ids(prompt_ids.unsqueeze(0)).squeeze(0).to(dtype=torch.bfloat16)
 
     # -------------------- GPU-side MTP fast-path --------------------
 
@@ -680,5 +722,12 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             )
         except Exception as exc:
             logger.warning("Fish Speech Fast AR compile warmup failed: %s", exc)
+
+        codec_device = self.codebook_embeddings.weight.device
+        _load_dac_codec(
+            self.model_path,
+            device=codec_device,
+            dtype=torch.float32,
+        )
 
         return loaded_params

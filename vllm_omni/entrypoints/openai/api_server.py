@@ -87,7 +87,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
-from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import BatchSpeechRequest, OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -115,21 +115,34 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 
 logger = init_logger(__name__)
 router = APIRouter()
+
+# Supported resolution buckets for layered models (e.g., Qwen-Image-Layered)
+SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 profiler_router = APIRouter()
 
 
-def _should_enable_profiler_endpoints(args: Namespace) -> bool:
-    # Check upstream vLLM's profiler_config
-    profiler_config = getattr(args, "profiler_config", None)
-    if profiler_config is not None:
-        # profiler_config exists, check if profiler is set
-        profiler = getattr(profiler_config, "profiler", None)
-        if profiler is not None:
-            return True
-
-    # TODO: remove this env after refactoring torch profiler to CLI args
-    env_value = os.environ.get("VLLM_TORCH_PROFILER_DIR")
-    return env_value is not None
+def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
+    """Check if any stage has profiler_config set in its engine_args."""
+    if not stage_configs:
+        return False
+    for stage in stage_configs:
+        engine_args = stage.get("engine_args") if isinstance(stage, dict) else getattr(stage, "engine_args", None)
+        if engine_args is None:
+            continue
+        profiler_config = (
+            engine_args.get("profiler_config")
+            if isinstance(engine_args, dict)
+            else getattr(engine_args, "profiler_config", None)
+        )
+        if profiler_config is not None:
+            profiler = (
+                profiler_config.get("profiler")
+                if isinstance(profiler_config, dict)
+                else getattr(profiler_config, "profiler", None)
+            )
+            if profiler is not None:
+                return True
+    return False
 
 
 class ProfileRequest(BaseModel):
@@ -292,8 +305,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         await omni_init_app_state(engine_client, app.state, args)
 
-        # Conditionally register profiler endpoints based on config or env var
-        if _should_enable_profiler_endpoints(args):
+        # Conditionally register profiler endpoints based on stage YAML configs
+        stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+        if _should_enable_profiler_endpoints(stage_configs):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
             app.include_router(profiler_router)
 
@@ -936,6 +950,42 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
 
+@router.post(
+    "/v1/audio/speech/batch",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request):
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        if base_server is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND.value,
+                detail="The model does not support Speech API",
+            )
+        return base_server.create_error_response(message="The model does not support Speech API")
+    try:
+        result = await handler.create_speech_batch(request)
+        if isinstance(result, ErrorResponse):
+            return JSONResponse(
+                content=result.model_dump(),
+                status_code=result.error.code if result.error else 400,
+            )
+        return JSONResponse(content=result.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
 @router.get(
     "/v1/audio/voices",
     responses={
@@ -974,6 +1024,8 @@ async def list_voices(raw_request: Request):
                     "created_at": info.get("created_at", 0),
                     "file_size": info.get("file_size", 0),
                     "mime_type": info.get("mime_type", ""),
+                    "embedding_source": info.get("embedding_source", "audio"),
+                    "embedding_dim": info.get("embedding_dim"),
                 }
             )
 
@@ -990,18 +1042,27 @@ async def list_voices(raw_request: Request):
 )
 async def upload_voice(
     raw_request: Request,
-    audio_sample: UploadFile = File(...),
+    audio_sample: UploadFile | None = File(None),
+    speaker_embedding: str | None = Form(None),
     consent: str = Form(...),
     name: str = Form(...),
+    ref_text: str = Form(None),
 ):
-    """Upload a new voice sample for voice cloning.
+    """Upload a new voice for voice cloning.
 
-    Uploads an audio file that can be used as a reference for voice cloning
-    in Base task TTS requests. The voice can then be referenced by name
-    in subsequent TTS requests.
+    Accepts either an audio file or a pre-computed speaker embedding vector.
+    These are mutually exclusive: provide one or the other.
+
+    When using ``audio_sample``, the server stores the audio and extracts the
+    speaker embedding on first use (Base task models only).
+
+    When using ``speaker_embedding``, pass a JSON-encoded list of floats
+    (1024-dim for 0.6B, 2048-dim for 1.7B). The voice is stored as a
+    safetensors file and is immediately ready for use.
 
     Args:
-        audio_sample: Audio file (max 10MB)
+        audio_sample: Audio file (max 10MB). Mutually exclusive with speaker_embedding.
+        speaker_embedding: JSON-encoded float list. Mutually exclusive with audio_sample.
         consent: Consent recording ID
         name: Name for the new voice
         raw_request: Raw FastAPI request
@@ -1014,8 +1075,18 @@ async def upload_voice(
         return base(raw_request).create_error_response(message="The model does not support Speech API")
 
     try:
-        # Upload the voice
-        result = await handler.upload_voice(audio_sample, consent, name)
+        if speaker_embedding is not None and audio_sample is not None:
+            return base(raw_request).create_error_response(
+                message="'audio_sample' and 'speaker_embedding' are mutually exclusive"
+            )
+        if speaker_embedding is not None:
+            result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
+        elif audio_sample is not None:
+            result = await handler.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+        else:
+            return base(raw_request).create_error_response(
+                message="Either 'audio_sample' or 'speaker_embedding' must be provided"
+            )
 
         return JSONResponse(content={"success": True, "voice": result})
 
@@ -1136,38 +1207,16 @@ _remove_route_from_router(router, "/v1/models")
 
 @router.get("/v1/models")
 async def show_available_models(raw_request: Request) -> JSONResponse:
-    """Show available models endpoint that works for both LLM and diffusion modes.
+    """Show available models for both LLM and diffusion modes.
 
-    Returns model information in OpenAI-compatible format.
+    Delegates to state.openai_serving_models which is set to either
+    OpenAIServingModels (LLM) or _DiffusionServingModels (pure diffusion).
     """
-    # Check if we're in diffusion mode
-    diffusion_model_name = getattr(raw_request.app.state, "diffusion_model_name", None)
-    if diffusion_model_name is not None:
-        # Diffusion mode - return the loaded model
-        return JSONResponse(
-            content={
-                "object": "list",
-                "data": [
-                    {
-                        "id": diffusion_model_name,
-                        "object": "model",
-                        "created": 0,
-                        "owned_by": "vllm-omni",
-                        "permission": [],
-                    }
-                ],
-            }
-        )
-
-    # LLM mode - delegate to openai_serving_models
-    openai_serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
-    if openai_serving_models is not None:
-        models = await openai_serving_models.show_available_models()
+    handler = getattr(raw_request.app.state, "openai_serving_models", None)
+    if handler is not None:
+        models = await handler.show_available_models()
         return JSONResponse(content=models.model_dump())
-
-    return JSONResponse(
-        content={"object": "list", "data": []},
-    )
+    return JSONResponse(content={"object": "list", "data": []})
 
 
 # Image generation API endpoints
@@ -1322,6 +1371,9 @@ async def edit_images(
     generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
+    # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
+    layers: int | None = Form(None),
+    resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
@@ -1381,25 +1433,60 @@ async def edit_images(
         lora_request, lora_scale = _parse_lora_request(lora_dict)
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
-        # 3.2 Parse and add size if provided
+        # 3.2 Validate resolution if provided
+        if resolution is not None and resolution not in SUPPORTED_LAYERED_RESOLUTIONS:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Invalid resolution {resolution}. Supported resolutions: {SUPPORTED_LAYERED_RESOLUTIONS}.",
+            )
+        # 3.2.1 Validate layers if provided
+        if layers is not None and layers < 1:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Invalid layers value {layers}. layers must be >= 1.",
+            )
+        # 3.2.2 Check for conflicting size and resolution parameters
+        if resolution is not None and size.lower() != "auto":
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Cannot specify both 'resolution' and 'size'. "
+                "Use 'resolution' with size='auto', or use 'size' without 'resolution'.",
+            )
+
+        # 3.3 Parse and add size if provided
         max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
         width, height = None, None
         if size.lower() == "auto":
-            width, height = pil_images[0].size  # Use first image size
+            if resolution is None:
+                # No resolution specified, use input image size
+                width, height = pil_images[0].size
+            # else: let pipeline calculate dimensions based on resolution
         else:
             width, height = parse_size(size)
-        if max_generated_image_size is not None and (width * height > max_generated_image_size):
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST.value,
-                detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                f"size of {max_generated_image_size} pixels.",
-            )
 
-        size_str = f"{width}x{height}"
+        # Check max_generated_image_size
+        if max_generated_image_size is not None:
+            if width is not None and height is not None:
+                if width * height > max_generated_image_size:
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_REQUEST.value,
+                        detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
+                        f"size of {max_generated_image_size} pixels.",
+                    )
+            elif resolution is not None:
+                # When resolution is set, the output size is resolution * resolution
+                if resolution * resolution > max_generated_image_size:
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_REQUEST.value,
+                        detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
+                        f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+                    )
+
+        size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
-        # 3.3 Add optional parameters ONLY if provided
+        # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", guidance_scale)
         _update_if_not_none(gen_params, "true_cfg_scale", true_cfg_scale)
@@ -1409,6 +1496,8 @@ async def edit_images(
         # might produce blurry images in some environments.
         _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, 2**32 - 1))
         _update_if_not_none(gen_params, "generator_device", generator_device)
+        _update_if_not_none(gen_params, "layers", layers)
+        _update_if_not_none(gen_params, "resolution", resolution)
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
         request_id = f"img_edit-{random_uuid()}"
@@ -1591,7 +1680,15 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             images = request_output["images"]
         elif hasattr(request_output, "images") and request_output.images:
             images = request_output.images
-    return images
+    # Flatten nested lists (e.g., from layered models like Qwen-Image-Layered).
+    # Note: This only flattens one level deep. Deeper nesting is not supported.
+    flattened = []
+    for img in images:
+        if isinstance(img, list):
+            flattened.extend(img)
+        else:
+            flattened.append(img)
+    return flattened
 
 
 async def _load_input_images(
@@ -1656,10 +1753,27 @@ def _choose_output_format(output_format: str | None, background: str | None) -> 
     return "jpeg"
 
 
+def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.Image:
+    fmt = format.lower()
+    if fmt not in {"jpg", "jpeg"}:
+        return image
+
+    if image.mode == "RGB":
+        return image
+
+    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+        alpha_image = image.convert("RGBA")
+        flattened = Image.new("RGB", alpha_image.size, (255, 255, 255))
+        flattened.paste(alpha_image, mask=alpha_image.getchannel("A"))
+        return flattened
+
+    return image.convert("RGB")
+
+
 def _encode_image_base64_with_compression(
     image: Image.Image, format: str = "png", output_compression: int = 100
 ) -> str:
-    """Encode PIL Image to base64 PNG string.
+    """Encode PIL Image to a base64 image string.
 
     Args:
         image: PIL Image object
@@ -1669,6 +1783,7 @@ def _encode_image_base64_with_compression(
         Base64-encoded image as string
     """
     buffer = io.BytesIO()
+    image = _prepare_image_for_output_format(image, format)
     save_kwargs = {}
     if format in ("jpg", "jpeg", "webp"):
         save_kwargs["quality"] = output_compression

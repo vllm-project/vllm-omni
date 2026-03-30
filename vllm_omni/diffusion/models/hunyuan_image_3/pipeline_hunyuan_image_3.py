@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -14,13 +15,13 @@ from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
 from transformers.models.siglip2 import Siglip2VisionConfig, Siglip2VisionModel
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .autoencoder import AutoencoderKLConv3D
@@ -62,7 +63,16 @@ def to_device(data, device):
         return data
 
 
-class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
+class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, DiffusionPipelineProfilerMixin):
+    _PROFILER_TARGETS = [
+        "model.forward",
+        "model.layers[0].forward",
+        "model.layers[0].self_attn.forward",
+        "model.layers[0].mlp.forward",
+        "vae.encode",
+        "vae.decode",
+    ]
+
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
         self.hf_config = get_config(od_config.model, trust_remote_code=True)
         super().__init__(self.hf_config)
@@ -78,8 +88,14 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
                 fall_back_to_pt=True,
             )
         ]
-        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        quant_config = od_config.quantization_config
+        os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
+        logger.info(
+            "Setting attention backend to TORCH_SDPA. "
+            "HunyuanImage3Pipeline only supports TORCH_SDPA to handle mixed causal and full attention."
+        )
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
+        self.transformer = self.model
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
         self._pipeline = None
         self._tkwrapper = TokenizerWrapper(od_config.model)
@@ -113,6 +129,9 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(self.hf_config.hidden_size, self.hf_config.vocab_size, bias=False)
         self.vllm_config = get_current_vllm_config()
         self.post_init()
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
@@ -130,8 +149,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             "time_embed_2",
             "final_layer.model",
         ]
-        tp_rank = get_tensor_model_parallel_rank()
-        device_str = f"{self.model.device.type}:{tp_rank}"
+
+        device_str = f"{get_local_device()}"
         named_modules = dict(self.named_modules())
         for prefix in non_model_layer_prefixes:
             mod = named_modules.get(prefix)
@@ -713,6 +732,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         updated_model_kwargs = {
             "mode": mode,
             "custom_pos_emb": model_kwargs["custom_pos_emb"],
+            "num_image_tokens": model_kwargs["num_image_tokens"],
         }
 
         # update past_key_values keeping its naming used in model code
@@ -998,4 +1018,6 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             guidance_scale=guidance_scale,
         )
         outputs = self._generate(**model_inputs, **kwargs)
-        return DiffusionOutput(output=outputs[0])
+        return DiffusionOutput(
+            output=outputs[0], stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )

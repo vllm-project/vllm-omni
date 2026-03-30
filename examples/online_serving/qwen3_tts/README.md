@@ -43,30 +43,23 @@ Then open http://localhost:7860 in your browser.
 
 ### Launch the Server
 
+The default stage config is located at `vllm_omni/model_executor/stage_configs/qwen3_tts.yaml`. For other platforms (e.g., NPU), refer to `vllm_omni/platforms/npu/stage_configs/qwen3_tts.yaml`.
+
 ```bash
 # CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
     --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+    --port 8091
 
 # VoiceDesign model
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
     --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+    --port 8091
 
 # Base model (voice cloning)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
     --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+    --port 8091
 ```
 
 If you have custom stage configs file, launch the server with command below
@@ -74,9 +67,7 @@ If you have custom stage configs file, launch the server with command below
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path /path/to/stage_configs_file \
     --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+    --port 8091
 ```
 
 Alternatively, use the convenience script:
@@ -99,12 +90,14 @@ cd examples/online_serving/qwen3_tts
 ```bash
 # CustomVoice: Use predefined speaker
 python openai_speech_client.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --text "你好，我是通义千问" \
     --voice vivian \
     --language Chinese
 
 # CustomVoice with style instruction
 python openai_speech_client.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --text "今天天气真好" \
     --voice ryan \
     --instructions "用开心的语气说"
@@ -239,6 +232,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 - `audio_sample` (required): Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4)
 - `consent` (required): Consent recording ID
 - `name` (required): Name for the new voice
+- `ref_text` (optional): Transcript of the audio. Enables in-context voice cloning (higher quality).
 
 **Response Example:**
 ```json
@@ -259,7 +253,8 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 curl -X POST http://localhost:8000/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
-  -F "name=custom_voice_1"
+  -F "name=custom_voice_1" \
+  -F "ref_text=The exact transcript of the audio sample."
 ```
 
 ### Endpoint

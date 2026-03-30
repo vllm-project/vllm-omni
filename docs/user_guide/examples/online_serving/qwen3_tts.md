@@ -19,6 +19,15 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 
 ## Gradio Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
 Two interactive Gradio demos are available, both supporting all 3 task types:
 
 | Demo     | File                     | Transport    | Streaming Quality                                  |
@@ -242,6 +251,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 - `audio_sample` (required): Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4)
 - `consent` (required): Consent recording ID
 - `name` (required): Name for the new voice
+- `ref_text` (optional): Transcript of the audio. Enables in-context voice cloning (higher quality).
 
 **Response Example:**
 ```json
@@ -262,7 +272,8 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 curl -X POST http://localhost:8000/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
-  -F "name=custom_voice_1"
+  -F "name=custom_voice_1" \
+  -F "ref_text=The exact transcript of the audio sample."
 ```
 
 ### Endpoint

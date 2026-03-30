@@ -219,7 +219,13 @@ class Qwen3TTSCode2Wav(nn.Module):
                 if i >= len(left_context_size):
                     break
                 if "left_context_size" in info:
-                    left_context_size[i] = info["left_context_size"]
+                    # left_context_size may come through serialization as an int, [int], or tensor([int]).
+                    value = info["left_context_size"]
+                    if isinstance(value, list):
+                        value = value[0] if value else 0
+                    if isinstance(value, torch.Tensor):
+                        value = value.reshape(-1)[0].item() if value.numel() > 0 else 0
+                    left_context_size[i] = int(value)
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
                 parsed.append((0, 0))
@@ -230,8 +236,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             if n == 0 or n % q != 0:
                 if n > 0:
                     logger.warning(
-                        "Code2Wav input_ids length %d not divisible by num_quantizers %d, "
-                        "likely a warmup run; returning empty audio.",
+                        "Code2Wav input_ids length %d not divisible by num_quantizers %d; skipping malformed request.",
                         n,
                         q,
                     )
@@ -284,24 +289,21 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
-            if ctx_frames > 0:
-                # Proportional trim matching the official HF implementation:
-                # the decoder output length may not be exactly frames * upsample
-                # so compute cut as a proportion of total decoded length.
+            # Drop the ref_code prefix from the decoded waveform, keeping only newly generated audio.
+            if ctx_frames <= 0:
+                expected_len = actual_frames * upsample
+                if wav.shape[0] > expected_len:
+                    wav = wav[:expected_len]
+            else:
                 cut = int(ctx_frames / max(actual_frames, 1) * wav.shape[0])
-                if cut < wav.shape[0]:
-                    wav = wav[cut:]
-                else:
+                if cut >= wav.shape[0]:
                     logger.warning(
                         "Context trim %d >= decoded length %d; returning empty audio.",
                         cut,
                         wav.shape[0],
                     )
                     continue
-            else:
-                expected_len = actual_frames * upsample
-                if wav.shape[0] > expected_len:
-                    wav = wav[:expected_len]
+                wav = wav[cut:]
             if wav.shape[0] > 0:
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 

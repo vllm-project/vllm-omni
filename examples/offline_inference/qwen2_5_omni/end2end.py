@@ -327,7 +327,6 @@ def main(args):
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
@@ -540,11 +539,6 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
-    )
-    parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
     )
     return parser.parse_args()
 
