@@ -8,8 +8,7 @@ steps:
           queue: "linux-aarch64-a2b3-gy006-test"
         plugins:
           - docker#v5.2.0:
-              image: "vllm-omni-ci-npu"
-              always-pull: true
+              image: "vllm-omni-ci-npu:latest"
         command: |
           git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -24,8 +23,7 @@ steps:
           queue: "linux-aarch64-a2b3-gy006-test"
         plugins:
           - docker#v5.2.0:
-              image: "vllm-omni-ci-npu"
-              always-pull: true
+              image: "vllm-omni-ci-npu:latest"
         command: |
           git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -40,8 +38,7 @@ steps:
           queue: "linux-aarch64-a2b3-gy006-test"
         plugins:
           - docker#v5.2.0:
-              image: "vllm-omni-ci-npu"
-              always-pull: true
+              image: "vllm-omni-ci-npu:latest"
         command: |
           git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -56,8 +53,7 @@ steps:
           queue: "linux-aarch64-a2b3-gy006-test"
         plugins:
           - docker#v5.2.0:
-              image: "vllm-omni-ci-npu"
-              always-pull: true
+              image: "vllm-omni-ci-npu:latest"
         command: |
           git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
