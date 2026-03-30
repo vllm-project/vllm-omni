@@ -64,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=1.0,
-        help="Classifier-free guidance scale.",
+        default=4.0,
+        help="Classifier-free guidance scale. HunyuanImage3 recommends 4.0-5.0.",
     )
     parser.add_argument("--height", type=int, default=1024, help="Height of generated image.")
     parser.add_argument("--width", type=int, default=1024, help="Width of generated image.")
@@ -237,6 +237,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        help="Enable logging of diffusion pipeline stats.",
+    )
     return parser.parse_args()
 
 
@@ -326,6 +331,7 @@ def main():
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
+        "log_stats": args.log_stats,
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         **lora_args,
         **quant_kwargs,

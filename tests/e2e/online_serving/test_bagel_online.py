@@ -78,7 +78,6 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
     ]
 
 
-@pytest.mark.skip(reason="L3 CI failed")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -90,12 +89,18 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": _build_text2img_messages(TEXT2IMG_PROMPT),
         "modalities": ["image"],
+        "extra_body": {
+            "height": 512,
+            "width": 512,
+            "num_inference_steps": 2,
+            "guidance_scale": 0.0,
+            "seed": 42,
+        },
     }
 
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.skip(reason="L3 CI failed")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -112,6 +117,11 @@ def test_bagel_img2img_online(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": _build_img2img_messages(IMG2IMG_PROMPT, image_b64),
         "modalities": ["image"],
+        "extra_body": {
+            "num_inference_steps": 2,
+            "guidance_scale": 0.0,
+            "seed": 42,
+        },
     }
 
     openai_client.send_diffusion_request(request_config)
