@@ -329,7 +329,13 @@ def acquire_device_locks(
             num_devices = current_omni_platform.get_device_count()
             physical_devices = list(range(num_devices))
 
-        num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
+        if len(physical_devices) < num_devices_per_stage:
+            raise RuntimeError(
+                f"Stage {stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+                f"but only {len(physical_devices)} device(s) are available: {physical_devices}"
+            )
+
+        num_devices_to_lock = num_devices_per_stage
         devices_to_lock = sorted(physical_devices[:num_devices_to_lock])
 
         logger.debug(
