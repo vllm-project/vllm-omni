@@ -3,11 +3,15 @@
 
 from time import time
 
+import pytest
+
 from vllm_omni.distributed.omni_coordinator import (
     InstanceInfo,
     RandomBalancer,
     StageStatus,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_load_balancer_select_returns_valid_index():

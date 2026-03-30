@@ -9,6 +9,10 @@ those requests are permanently orphaned.
 import unittest
 from collections import deque
 
+import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class FakeAdapter:
     """Minimal mock of OmniChunkTransferAdapter tracking restore calls."""

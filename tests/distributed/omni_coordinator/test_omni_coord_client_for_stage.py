@@ -3,12 +3,15 @@
 
 import json
 
+import pytest
 import zmq
 
 from vllm_omni.distributed.omni_coordinator import (
     OmniCoordClientForStage,
     StageStatus,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _bind_router() -> tuple[zmq.Context, zmq.Socket, str]:

@@ -6,6 +6,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestPreLookaheadLayer:
     """Tests for PreLookaheadLayer."""

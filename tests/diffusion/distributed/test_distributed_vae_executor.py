@@ -11,6 +11,8 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class E2EOperator:
     """tiles with (2, 3) -- (H,W)"""
