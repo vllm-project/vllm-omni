@@ -1292,7 +1292,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Build TTS parameters and prompt
             tts_params = self._build_tts_params(request)
 
-            # Pass ref_audio as the raw base64/URL string — the Cohere
+            # Pass ref_audio as the raw base64/URL string — the
             # pipeline decodes it internally (unlike Qwen3-TTS which
             # resolves to wav samples here).
             if request.ref_audio is not None:
