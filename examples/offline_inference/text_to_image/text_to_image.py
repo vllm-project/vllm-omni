@@ -333,7 +333,6 @@ def main():
         "mode": "text-to-image",
         "log_stats": args.log_stats,
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
-        "log_stats": args.log_stats,
         **lora_args,
         **quant_kwargs,
     }
