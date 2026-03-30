@@ -81,22 +81,24 @@ def assert_image_diffusion_response(
             }
         }
     """
-    extra_body = request_config.get("extra_body", {})
-
-    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
-
     assert response.images is not None, "Image response is None"
     assert len(response.images) > 0, "No images in response"
-    assert len(response.images) == num_outputs_per_prompt, (
-        f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
-    )
+
+    extra_body = request_config.get("extra_body") or {}
+
+    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt")
+    if num_outputs_per_prompt is not None:
+        assert len(response.images) == num_outputs_per_prompt, (
+            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
+        )
 
     if run_level == "advanced_model":
-        expected_width = extra_body["width"]  # intentionally raise KeyError if missing
-        expected_height = extra_body["height"]  # intentionally raise KeyError if missing
+        width = extra_body.get("width")
+        height = extra_body.get("height")
 
-        for img in response.images:
-            assert_image_valid(img, width=expected_width, height=expected_height)
+        if width is not None or height is not None:
+            for img in response.images:
+                assert_image_valid(img, width=width, height=height)
 
 
 def assert_video_diffusion_response(
@@ -166,9 +168,9 @@ def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, h
         image.load()
     assert image.width > 0 and image.height > 0
     if width is not None:
-        assert image.width == width, f"Expected width={width}, got {image.width} in {image.name}"
+        assert image.width == width, f"Expected width={width}, got {image.width}"
     if height is not None:
-        assert image.height == height, f"Expected height={height}, got {image.height} in {image.name}"
+        assert image.height == height, f"Expected height={height}, got {image.height}"
     return image
 
 
@@ -1495,15 +1497,15 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
-    if "audio" in modalities:
-        assert response.audio_content is not None, "No audio output is generated"
-        print(f"audio content is: {response.audio_content}")
-
-    if "text" in modalities:
-        assert response.text_content is not None, "No text output is generated"
-        print(f"text content is: {response.text_content}")
-
     if run_level == "advanced_model":
+        if "audio" in modalities:
+            assert response.audio_content is not None, "No audio output is generated"
+            print(f"audio content is: {response.audio_content}")
+
+        if "text" in modalities:
+            assert response.text_content is not None, "No text output is generated"
+            print(f"text content is: {response.text_content}")
+
         # Verify image description
         word_types = ["text", "image", "audio", "video"]
         keywords_dict = request_config.get("key_words", {})

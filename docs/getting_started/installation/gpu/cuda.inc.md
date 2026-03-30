@@ -29,6 +29,11 @@ uv pip install vllm --torch-backend=auto
 uv pip install vllm-omni
 ```
 
+To run Gradio demos, also install the optional extras:
+```bash
+uv pip install 'vllm-omni[demo]'
+```
+
 # --8<-- [end:pre-built-wheels]
 
 # --8<-- [start:build-wheel-from-source]
@@ -48,6 +53,11 @@ Since vllm-omni is rapidly evolving, it's recommended to install it from source
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 uv pip install -e .
+```
+
+To run Gradio demos, install with optional extras:
+```bash
+uv pip install -e '.[demo]'
 ```
 
 <details><summary>(Optional) Installation of vLLM from source</summary>
