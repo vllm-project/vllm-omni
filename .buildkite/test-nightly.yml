@@ -50,13 +50,15 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Omni Model Test"
-    timeout_in_minutes: 60
+  - label: ":full_moon: Omni Model Test with L4"
+    timeout_in_minutes: 90
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
+      - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+      - pytest -s -v tests/examples/ -m "advanced_model and L4 and omni" --run-level "advanced_model"
+      - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and L4 and omni" --run-level "advanced_model"
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
@@ -217,29 +219,6 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Qwen3-TTS Non-Async-Chunk E2E Test"
-    timeout_in_minutes: 30
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - |
-        huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
-        export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        pytest -s -v tests/e2e/online_serving/test_qwen3_tts.py::TestQwen3TTSNoAsyncChunk
-    agents:
-      queue: "gpu_4_queue"
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          shm-size: "8gb"
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-            - "HF_TOKEN"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
-
   - label: ":full_moon: Omni Model Perf Test & Test Case Statistics"
     key: nightly-omni-performance
     timeout_in_minutes: 180
@@ -248,6 +227,7 @@ steps:
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - export BENCHMARK_DIR=tests/dfx/perf/results
+      - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
       - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
       - buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
       - python tools/nightly/buildkite_testcase_statistics.py -o tests/dfx/perf/results/buildkite_testcase_statistics.html

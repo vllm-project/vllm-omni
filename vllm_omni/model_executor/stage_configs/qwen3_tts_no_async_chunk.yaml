@@ -46,8 +46,8 @@ stage_args:
       engine_output_type: audio
       gpu_memory_utilization: 0.2
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 8192
-      max_model_len: 32768
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav
     final_output: true
