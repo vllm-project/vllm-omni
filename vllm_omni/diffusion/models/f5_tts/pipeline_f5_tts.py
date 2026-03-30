@@ -11,7 +11,7 @@ integrated with the vLLM-Omni diffusion framework.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import torch
@@ -202,6 +202,7 @@ class F5TTSPipeline(nn.Module, SupportAudioOutput):
         attn_mask_enabled = tf_cfg.get("attn_mask_enabled", True)
         long_skip_connection = tf_cfg.get("long_skip_connection", False)
         text_mask_padding = tf_cfg.get("text_mask_padding", True)
+        pe_attn_head = tf_cfg.get("pe_attn_head")
         conv_pos_embed_groups = tf_cfg.get("conv_pos_embed_groups", 1)
 
         hf_repo_id = tf_cfg.get("hf_repo_id")
@@ -234,6 +235,7 @@ class F5TTSPipeline(nn.Module, SupportAudioOutput):
             text_num_embeds=text_num_embeds,
             text_dim=text_dim,
             text_mask_padding=text_mask_padding,
+            pe_attn_head=pe_attn_head,
             conv_layers=conv_layers,
             attn_mask_enabled=attn_mask_enabled,
             long_skip_connection=long_skip_connection,
@@ -618,6 +620,14 @@ class F5TTSPipeline(nn.Module, SupportAudioOutput):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        def iter_checkpoint_tensors(name: str, value: Any) -> Iterable[tuple[str, torch.Tensor]]:
+            if isinstance(value, torch.Tensor):
+                yield name, value
+                return
+            if isinstance(value, Mapping):
+                for nested_name, nested_value in value.items():
+                    yield from iter_checkpoint_tensors(f"{name}.{nested_name}", nested_value)
+
         # Mark vocoder params as loaded - they are initialized separately
         # via load_vocoder(), not from the main checkpoint.
         if self._vocoder is not None and isinstance(self._vocoder, nn.Module):
@@ -626,18 +636,28 @@ class F5TTSPipeline(nn.Module, SupportAudioOutput):
                     loaded_params.add(name)
 
         for jax_name, loaded_weight in weights:
-            direct_name = jax_name
-            for prefix in ("ema_model.", "model_state_dict.", "ema_model_state_dict."):
-                if direct_name.startswith(prefix):
-                    direct_name = direct_name[len(prefix) :]
+            matched = False
+            for flat_name, tensor_value in iter_checkpoint_tensors(jax_name, loaded_weight):
+                direct_name = flat_name
+                prefixes = ("ema_model_state_dict.", "model_state_dict.", "ema_model.")
+                stripped = True
+                while stripped:
+                    stripped = False
+                    for prefix in prefixes:
+                        if direct_name.startswith(prefix):
+                            direct_name = direct_name[len(prefix) :]
+                            stripped = True
 
-            if direct_name in params_dict:
-                param = params_dict[direct_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(direct_name)
-                continue
-            logger.debug("Skipping unmatched F5 weight: %s", jax_name)
+                if direct_name in params_dict:
+                    param = params_dict[direct_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, tensor_value)
+                    loaded_params.add(direct_name)
+                    matched = True
+                else:
+                    logger.debug("Skipping unmatched F5 weight: %s", flat_name)
+            if not matched and not isinstance(loaded_weight, Mapping):
+                logger.debug("Skipping unmatched F5 weight: %s", jax_name)
 
         # Log loading summary
         all_params = set(params_dict.keys())

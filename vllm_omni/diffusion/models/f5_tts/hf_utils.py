@@ -27,10 +27,12 @@ class F5ModelSpec:
     win_length: int
     n_fft: int
     mel_spec_type: str
+    tokenizer_subfolder: str | None = None
     wav_norm: bool = False
     dim_head: int = 64
     dropout: float = 0.0
     text_mask_padding: bool = True
+    pe_attn_head: int | None = None
     attn_mask_enabled: bool = False
     long_skip_connection: bool = False
     conv_pos_embed_groups: int = 16
@@ -64,6 +66,7 @@ _F5_MODEL_SPECS: dict[str, F5ModelSpec] = {
         subfolder="F5TTS_v1_Base_no_zero_init",
         ckpt_filename="model_1250000.safetensors",
         tokenizer_filename="vocab.txt",
+        tokenizer_subfolder="F5TTS_v1_Base",
         tokenizer_type="pinyin",
         dim=1024,
         depth=22,
@@ -77,6 +80,49 @@ _F5_MODEL_SPECS: dict[str, F5ModelSpec] = {
         win_length=1024,
         n_fft=1024,
         mel_spec_type="vocos",
+    ),
+    "F5TTS_Base": F5ModelSpec(
+        repo_id=F5_REPO_ID,
+        subfolder="F5TTS_Base",
+        ckpt_filename="model_1200000.safetensors",
+        tokenizer_filename="vocab.txt",
+        tokenizer_type="pinyin",
+        dim=1024,
+        depth=22,
+        heads=16,
+        ff_mult=2,
+        text_dim=512,
+        text_conv_layers=4,
+        mel_dim=100,
+        sample_rate=24000,
+        hop_length=256,
+        win_length=1024,
+        n_fft=1024,
+        mel_spec_type="vocos",
+        text_mask_padding=False,
+        pe_attn_head=1,
+    ),
+    "F5TTS_Base_bigvgan": F5ModelSpec(
+        repo_id=F5_REPO_ID,
+        subfolder="F5TTS_Base_bigvgan",
+        ckpt_filename="model_1250000.pt",
+        tokenizer_filename="vocab.txt",
+        tokenizer_subfolder="F5TTS_Base",
+        tokenizer_type="pinyin",
+        dim=1024,
+        depth=22,
+        heads=16,
+        ff_mult=2,
+        text_dim=512,
+        text_conv_layers=4,
+        mel_dim=100,
+        sample_rate=24000,
+        hop_length=256,
+        win_length=1024,
+        n_fft=1024,
+        mel_spec_type="bigvgan",
+        text_mask_padding=False,
+        pe_attn_head=1,
     ),
 }
 
@@ -138,8 +184,12 @@ def build_f5_transformer_config(
     if spec is None:
         raise ValueError(f"Unsupported F5 model reference: {model}")
 
+    tokenizer_model = model
+    if spec.tokenizer_subfolder is not None:
+        tokenizer_model = f"{spec.repo_id}/{spec.tokenizer_subfolder}"
+
     vocab_path = download_f5_file(
-        model,
+        tokenizer_model,
         spec.tokenizer_filename,
         revision=revision,
         cache_dir=cache_dir,
@@ -157,6 +207,7 @@ def build_f5_transformer_config(
         "text_num_embeds": vocab_size,
         "text_dim": spec.text_dim,
         "text_mask_padding": spec.text_mask_padding,
+        "pe_attn_head": spec.pe_attn_head,
         "text_conv_layers": spec.text_conv_layers,
         "attn_mask_enabled": spec.attn_mask_enabled,
         "long_skip_connection": spec.long_skip_connection,

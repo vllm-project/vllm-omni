@@ -20,4 +20,5 @@ janus>=1.0.0
 pydub
 pypinyin
 rjieba
+bigvgan
 vocos

@@ -42,6 +42,7 @@ class F5TTSSelfAttention(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         dropout: float = 0.0,
+        pe_attn_head: int | None = None,
         attn_mask_enabled: bool = True,
     ):
         super().__init__()
@@ -50,6 +51,7 @@ class F5TTSSelfAttention(nn.Module):
         self.num_heads = num_attention_heads
         self.head_dim = attention_head_dim
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.pe_attn_head = pe_attn_head
         self.attn_mask_enabled = attn_mask_enabled
 
         # All projections use the full inner_dim with checkpoint-compatible bias terms.
@@ -86,8 +88,21 @@ class F5TTSSelfAttention(nn.Module):
         # Apply rotary embeddings
         freqs, xpos_scale = rotary_embedding
         q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
-        query = xt_apply_rotary_pos_emb(query, freqs, q_xpos_scale)
-        key = xt_apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+        if self.pe_attn_head is None:
+            query = xt_apply_rotary_pos_emb(query, freqs, q_xpos_scale)
+            key = xt_apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+        else:
+            rotary_head_count = min(self.pe_attn_head, self.num_heads)
+            query[:, :rotary_head_count] = xt_apply_rotary_pos_emb(
+                query[:, :rotary_head_count],
+                freqs,
+                q_xpos_scale,
+            )
+            key[:, :rotary_head_count] = xt_apply_rotary_pos_emb(
+                key[:, :rotary_head_count],
+                freqs,
+                k_xpos_scale,
+            )
 
         if self.attn_mask_enabled and attention_mask is not None:
             attn_mask = attention_mask.unsqueeze(1).unsqueeze(1)
@@ -421,6 +436,7 @@ class DiTBlock(nn.Module):
         dim_head: int,
         ff_mult: int = 4,
         dropout: float = 0.1,
+        pe_attn_head: int | None = None,
         attn_mask_enabled: bool = True,
     ):
         super().__init__()
@@ -431,6 +447,7 @@ class DiTBlock(nn.Module):
             num_attention_heads=heads,
             attention_head_dim=dim_head,
             dropout=0.0,
+            pe_attn_head=pe_attn_head,
             attn_mask_enabled=attn_mask_enabled,
         )
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -490,6 +507,7 @@ class F5TTSDiTModel(nn.Module):
         text_num_embeds=256,
         text_dim=None,
         text_mask_padding=True,
+        pe_attn_head=None,
         conv_layers=0,
         attn_mask_enabled=True,
         long_skip_connection=False,
@@ -511,6 +529,7 @@ class F5TTSDiTModel(nn.Module):
                 "dim_head": dim_head,
                 "mel_dim": mel_dim,
                 "text_num_embeds": text_num_embeds,
+                "pe_attn_head": pe_attn_head,
             },
         )()
 
@@ -543,6 +562,7 @@ class F5TTSDiTModel(nn.Module):
                     dim_head=dim_head,
                     ff_mult=ff_mult,
                     dropout=dropout,
+                    pe_attn_head=pe_attn_head,
                     attn_mask_enabled=attn_mask_enabled,
                 )
                 for _ in range(depth)
