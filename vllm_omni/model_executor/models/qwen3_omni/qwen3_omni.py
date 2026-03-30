@@ -891,18 +891,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
-        # PD safety: zero-pad embeddings if they are shorter than the full sequence
         target_len = thinker_result_ids.shape[-1]
-        if thinker_embed.shape[0] < target_len:
-            pad_len = target_len - thinker_embed.shape[0]
-            pad = torch.zeros(pad_len, thinker_embed.shape[1],
-                              device=thinker_embed.device, dtype=thinker_embed.dtype)
-            thinker_embed = torch.cat((thinker_embed, pad), dim=0)
-        if thinker_hidden.shape[0] < target_len:
-            pad_len = target_len - thinker_hidden.shape[0]
-            pad = torch.zeros(pad_len, thinker_hidden.shape[1],
-                              device=thinker_hidden.device, dtype=thinker_hidden.dtype)
-            thinker_hidden = torch.cat((thinker_hidden, pad), dim=0)
         im_start_indexes = torch.cat(
             (
                 torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
@@ -1041,13 +1030,23 @@ class Qwen3OmniMoeForConditionalGeneration(
         return last_talker_hidden, text_step, update_dict
 
     def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
-        # PD safety: clamp segment_end_index so we never index beyond any tensor's length
-        segment_end_index = min(
+        clamped = min(
             segment_end_index,
             multimodal_mask.shape[0],
             thinker_hidden.shape[0],
             thinker_embed.shape[0],
         )
+        if clamped < segment_end_index:
+            logger.warning(
+                "_get_talker_user_parts: segment_end_index %d clamped to %d "
+                "(embed=%d, hidden=%d, mask=%d). "
+                "This usually means _merge_pd_embeddings failed to merge "
+                "prefill embeddings – check PD prefill_mm keys.",
+                segment_end_index, clamped,
+                thinker_embed.shape[0], thinker_hidden.shape[0],
+                multimodal_mask.shape[0],
+            )
+        segment_end_index = clamped
         seg_len = segment_end_index - im_start_index
         if seg_len <= 0:
             return torch.empty(

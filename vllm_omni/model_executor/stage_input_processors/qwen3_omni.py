@@ -132,7 +132,14 @@ def _merge_pd_embeddings(
     try:
         p_emb = prefill_mm[_EMBED_LAYER_KEY].detach().to(device=device, dtype=torch.float)
         p_hid = prefill_mm[_HIDDEN_LAYER_KEY].detach().to(device=device, dtype=torch.float)
-    except (KeyError, AttributeError, TypeError):
+    except (KeyError, AttributeError, TypeError) as exc:
+        available_keys = list(prefill_mm.keys()) if isinstance(prefill_mm, dict) else type(prefill_mm).__name__
+        logger.warning(
+            "_merge_pd_embeddings: failed to extract prefill embeddings (%s). "
+            "Expected keys %r and %r, got: %s. "
+            "Falling back to decode-only embeddings – talker user-segment will be degraded.",
+            exc, _EMBED_LAYER_KEY, _HIDDEN_LAYER_KEY, available_keys,
+        )
         return decode_emb, decode_hid
 
     if p_emb.shape[0] == 0 or decode_emb.shape[0] == 0:
@@ -432,38 +439,15 @@ def talker2code2wav(
     for talker_output in talker_outputs:
         output = talker_output.outputs[0]
         
-        # Use multimodal_output (contains all generated codes)
-        codes_tensor = output.multimodal_output["code_predictor_codes"]
-        codes_tensor = codes_tensor.to(torch.long)  # [T, 16]
-        seq_len = codes_tensor.shape[0]
-        num_quantizers = codes_tensor.shape[1]
-        
-        # Skip prefill padding: find first frame with non-zero values
-        first_nonzero_frame = 0
-        for i in range(codes_tensor.shape[0]):
-            if codes_tensor[i].count_nonzero().item() > 0:
-                first_nonzero_frame = i
-                break
-        
-        # Skip the padding frames
-        if first_nonzero_frame > 0:
-            codes_tensor = codes_tensor[first_nonzero_frame:]
-            logger.warning("[PD][skip_padding] skipped %s zero frames, remaining shape=%s",
-                first_nonzero_frame, codes_tensor.shape)
-        
-        seq_len = codes_tensor.shape[0]
-        
-        # Transpose to [16, T] for code2wav
-        codes_tensor = codes_tensor.transpose(0, 1)
-        
-        # Guard against exceeding code2wav's maximum prompt length
-        max_seq_len = _CODE2WAV_MAX_PROMPT_LEN // max(num_quantizers, 1)
-        if codes_tensor.shape[1] > max_seq_len:
-            codes_tensor = codes_tensor[:, -max_seq_len:]
-            seq_len = max_seq_len
-        
-        # Flatten to quantizer-first order: [q0_f0, q0_f1, ..., q0_fN, q1_f0, ...]
-        codec_codes = codes_tensor.cpu().reshape(-1).tolist()
+        seq_len = len(output.token_ids) - 1
+        codec_codes = (
+            output.multimodal_output["code_predictor_codes"][-seq_len:]
+            .to(torch.long)
+            .transpose(0, 1)
+            .cpu()
+            .reshape(-1)
+            .tolist()
+        )
         
         code2wav_inputs.append(
             OmniTokensPrompt(
