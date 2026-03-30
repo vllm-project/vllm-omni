@@ -12,6 +12,7 @@ import pytest
 import torch
 
 # ── Load modules without triggering vllm_omni.__init__ ─────────────
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _ENGINE_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "engine"
 

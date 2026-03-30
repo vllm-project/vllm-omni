@@ -4,6 +4,7 @@
 import json
 import time
 
+import pytest
 import zmq
 from vllm.v1.utils import get_engine_client_zmq_addr
 
@@ -12,6 +13,8 @@ from vllm_omni.distributed.omni_coordinator import (
     OmniCoordinator,
     StageStatus,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _recv_instance_list(sub: zmq.Socket, timeout_ms: int = 2000) -> dict | None:
