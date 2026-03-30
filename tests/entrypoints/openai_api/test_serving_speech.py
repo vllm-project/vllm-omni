@@ -233,17 +233,20 @@ def test_app(mocker: MockerFixture):
         uploaded_voices = []
         if hasattr(speech_server, "uploaded_speakers"):
             for voice_name, info in speech_server.uploaded_speakers.items():
-                uploaded_voices.append(
-                    {
-                        "name": info.get("name", voice_name),
-                        "consent": info.get("consent", ""),
-                        "created_at": info.get("created_at", 0),
-                        "file_size": info.get("file_size", 0),
-                        "mime_type": info.get("mime_type", ""),
-                        "embedding_source": info.get("embedding_source", "audio"),
-                        "embedding_dim": info.get("embedding_dim"),
-                    }
-                )
+                voice_entry = {
+                    "name": info.get("name", voice_name),
+                    "consent": info.get("consent", ""),
+                    "created_at": info.get("created_at", 0),
+                    "file_size": info.get("file_size", 0),
+                    "mime_type": info.get("mime_type", ""),
+                    "embedding_source": info.get("embedding_source", "audio"),
+                    "embedding_dim": info.get("embedding_dim"),
+                }
+                if info.get("ref_text"):
+                    voice_entry["ref_text"] = info["ref_text"]
+                if info.get("speaker_description"):
+                    voice_entry["speaker_description"] = info["speaker_description"]
+                uploaded_voices.append(voice_entry)
         return {"voices": speakers, "uploaded_voices": uploaded_voices}
 
     app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
@@ -422,6 +425,25 @@ class TestSpeechAPI:
             assert result["voice"].get("speaker_description") == "warm, energetic narrator"
         finally:
             client.delete("/v1/audio/voices/test_voice_vd")
+
+    def test_upload_voice_speaker_description_in_listing(self, client):
+        """Test that speaker_description survives the upload → list round-trip."""
+        client.delete("/v1/audio/voices/test_voice_sd_list")
+
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_sd_list", "speaker_description": "calm female narrator"}
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        try:
+            assert response.status_code == 200
+
+            listing = client.get("/v1/audio/voices").json()
+            uploaded = {v["name"]: v for v in listing["uploaded_voices"]}
+            assert "test_voice_sd_list" in uploaded
+            assert uploaded["test_voice_sd_list"]["speaker_description"] == "calm female narrator"
+        finally:
+            client.delete("/v1/audio/voices/test_voice_sd_list")
 
     def test_upload_voice_file_too_large(self, client):
         """Test voice upload with file exceeding size limit."""
