@@ -19,10 +19,7 @@ import pytest
 from tests.conftest import OmniServerParams
 from tests.utils import hardware_test
 
-MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-
-REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
-REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
 
 def get_stage_config(name: str = "qwen3_tts.yaml"):
@@ -33,7 +30,7 @@ def get_stage_config(name: str = "qwen3_tts.yaml"):
 def get_prompt(prompt_type="text"):
     """Text prompt for text-to-audio tests (same as test_qwen3_omni - beijing test case)."""
     prompts = {
-        "text": "The weather is nice today, perfect for a walk in the park.",
+        "text": "Beijing, China's capital, blends ancient wonders like the Great Wall with modern marvels. This vibrant metropolis offers rich culture, delicious Peking duck, and endless exploration opportunities.",
     }
     return prompts.get(prompt_type, prompts["text"])
 
@@ -56,8 +53,8 @@ tts_server_params = [
 ]
 
 
-@pytest.mark.advanced_model
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
@@ -70,20 +67,19 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=False
     Datasets: few requests
     """
-
     request_config = {
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": False,
         "response_format": "wav",
-        "task_type": "Base",
-        "voice": "clone",
-        "ref_audio": REF_AUDIO_URL,
-        "ref_text": REF_TEXT,
+        "task_type": "CustomVoice",
+        "voice": "vivian",
     }
-    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
+
+    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
 
 
+@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -102,9 +98,8 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "input": get_prompt(),
         "stream": True,
         "response_format": "wav",
-        "task_type": "Base",
-        "voice": "clone",
-        "ref_audio": REF_AUDIO_URL,
-        "ref_text": REF_TEXT,
+        "task_type": "CustomVoice",
+        "voice": "vivian",
     }
+
     openai_client.send_audio_speech_request(request_config)
