@@ -34,6 +34,11 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItem,
     SpeechBatchItemResult,
 )
+from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
+    build_fish_text_only_prompt_ids,
+    estimate_fish_voice_clone_prompt_len_from_normalized,
+    normalize_fish_voice_clone_texts,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -363,11 +368,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         resampled_len = max(1, math.ceil(n_samples * DAC_SAMPLE_RATE / sr))
         return max(1, math.ceil(resampled_len / DAC_HOP_LENGTH))
 
-    def _estimate_fish_prompt_len(
-        self,
-        request: OpenAICreateSpeechRequest,
-        ref_audio: object,
-    ) -> int:
+    def _estimate_fish_prompt_len(self, text: str, ref_text: str, ref_audio: object) -> int:
         """Estimate Fish Speech clone prompt length without encoding reference audio."""
         try:
             from transformers import AutoTokenizer
@@ -380,33 +381,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             semantic_len = self._estimate_fish_ref_code_len(ref_audio)
             if semantic_len is None:
                 raise ValueError("Failed to estimate Fish Speech semantic token length")
-
-            user_text = f"<|speaker:0|>{request.input}"
-            user_ids = tokenizer.apply_chat_template(
-                [{"role": "user", "content": user_text}],
-                tokenize=True,
-                add_generation_prompt=True,
-            )
-            voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
-            audio_start_id = tokenizer.encode("<|audio_start|>", add_special_tokens=False)
-            audio_end_id = tokenizer.encode("<|audio_end|>", add_special_tokens=False)
-            prefix_ids = tokenizer.encode(f"<|speaker:0|>{request.ref_text}", add_special_tokens=False)
-            im_start = tokenizer.encode("<|im_start|>", add_special_tokens=False)
-            im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
-            system_tag = tokenizer.encode("system\n", add_special_tokens=False)
-            newline = tokenizer.encode("\n", add_special_tokens=False)
-            return (
-                len(im_start)
-                + len(system_tag)
-                + len(prefix_ids)
-                + len(audio_start_id)
-                + semantic_len
-                + len(audio_end_id)
-                + len(im_end)
-                + len(newline)
-                + len(user_ids)
-                + len(voice_token_id)
-            )
+            return estimate_fish_voice_clone_prompt_len_from_normalized(tokenizer, text, ref_text, semantic_len)
         except Exception as e:
             logger.warning("Failed to estimate Fish Speech prompt length, using fallback 2048: %s", e)
             return 2048
@@ -727,6 +702,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Validate TTS request parameters. Returns error message or None."""
         if self._tts_model_type == "voxtral_tts":
             return self._validate_voxtral_tts_request(request)
+        if self._tts_model_type == "fish_tts":
+            return self._validate_fish_tts_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
@@ -870,6 +847,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return f"Instructions too long (max {self._max_instructions_length} characters)"
 
         # Validate max_new_tokens range
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+
+        return None
+
+    def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Fish Speech request parameters. Returns error message or None."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+            if not request.ref_text or not request.ref_text.strip():
+                return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
+
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
                 return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
@@ -1131,11 +1128,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Build prompt for Fish Speech S2 Pro.
 
         Without voice cloning:
-          <|im_start|>user\\n<|speaker:0|>{text}<|im_end|>\\n<|im_start|>assistant\\n<|voice|>
+          <|im_start|>system\\nconvert the provided text to speech<|im_end|>
+          <|im_start|>user\\n{text}<|im_end|>\\n<|im_start|>assistant\\n<|voice|>
 
         With voice cloning (ref_audio + ref_text):
-          <|im_start|>system\\n<|speaker:0|>{ref_text}<|audio_start|>{semantic_tokens}<|audio_end|><|im_end|>
-          <|im_start|>user\\n<|speaker:0|>{text}<|im_end|>\\n<|im_start|>assistant\\n<|voice|>
+          <|im_start|>system\\nconvert the provided text to speech reference to the following...
+          <|im_end|>\\n<|im_start|>user\\n{text}<|im_end|>\\n<|im_start|>assistant\\n<|voice|>
         """
         from transformers import AutoTokenizer
 
@@ -1144,39 +1142,43 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._fish_speech_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
         tokenizer = self._fish_speech_tokenizer
-        model_name = self.engine_client.model_config.model
 
         if ref_audio_data is None or not request.ref_text:
-            # No voice cloning: simple user message.
-            user_text = f"<|speaker:0|>{request.input}"
-            messages = [{"role": "user", "content": user_text}]
-            prompt_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-            voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
-            prompt_ids = prompt_ids + voice_token_id
+            prompt_ids, normalized_text = build_fish_text_only_prompt_ids(tokenizer, request.input)
 
+            # Keep the prompt-dict metadata shape aligned with the existing text-only
+            # TTS entrypoints: scalar values are wrapped in single-item lists before
+            # EngineCore serialization. Structured clone below is different because
+            # model-side preprocess consumes concrete per-request scalar fields.
             additional_information: dict[str, Any] = {
-                "text": [request.input],
-                "max_new_tokens": [request.max_new_tokens or 4096],
+                "text": [normalized_text],
             }
+            if request.max_new_tokens is not None:
+                additional_information["max_new_tokens"] = [request.max_new_tokens]
             return {
                 "prompt_token_ids": prompt_ids,
                 "additional_information": additional_information,
             }
 
         wav_samples, sr = ref_audio_data
-        ph_len = self._estimate_fish_prompt_len(request, ref_audio_data)
+        normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(request.input, request.ref_text)
+        ph_len = self._estimate_fish_prompt_len(normalized_text, normalized_ref_text, ref_audio_data)
         with tempfile.NamedTemporaryFile(prefix="fish_ref_", suffix=".npy", delete=False) as f:
             np.save(f, np.asarray(wav_samples, dtype=np.float32))
             ref_audio_path = f.name
 
+        # Structured clone metadata is consumed directly by
+        # FishSpeechSlowARForConditionalGeneration.preprocess(), so keep these
+        # values as scalars instead of the list-wrapped prompt-dict convention.
         additional_information = {
-            "text": request.input,
-            "max_new_tokens": request.max_new_tokens or 4096,
-            "ref_text": request.ref_text,
+            "text": normalized_text,
+            "ref_text": normalized_ref_text,
             "ref_audio_path": ref_audio_path,
             "ref_audio_sr": int(sr),
             "fish_structured_voice_clone": True,
         }
+        if request.max_new_tokens is not None:
+            additional_information["max_new_tokens"] = request.max_new_tokens
         return {
             "prompt_token_ids": [1] * ph_len,
             "additional_information": additional_information,
@@ -1192,12 +1194,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise self.engine_client.dead_error
 
         if self._is_fish_speech:
-            if not request.input or not request.input.strip():
-                raise ValueError("Input text cannot be empty")
+            validation_error = self._validate_fish_tts_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
             ref_audio_data = None
             if request.ref_audio is not None:
-                if not request.ref_text or not request.ref_text.strip():
-                    raise ValueError("Voice cloning requires 'ref_text' (transcript of the reference audio)")
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 ref_audio_data = (wav_list, sr)
             prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
@@ -1246,7 +1247,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         sampling_params_list = self.engine_client.default_sampling_params_list
 
-        # Override Stage-0 max_tokens if caller specified max_new_tokens (Fish Speech).
+        # Fish defaults come from stage_configs YAML. Only override when the caller
+        # explicitly requests a different generation length.
         if self._is_fish_speech and request.max_new_tokens is not None and sampling_params_list:
             import copy
 

@@ -39,7 +39,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.skip(reason="CI failed 5148")
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
