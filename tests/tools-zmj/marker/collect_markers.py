@@ -12,6 +12,10 @@
   python tests/tools-zmj/marker/collect_markers.py --by-file --infer-hardware
   python tests/tools-zmj/marker/collect_markers.py --json markers.json
   python tests/tools-zmj/marker/collect_markers.py --csv markers.csv
+
+CSV 第三列「修饰器」：
+  - 包含文件头/类上的 ``pytestmark = ...``（标注为 [模块 pytestmark] / [类 pytestmark]）；
+  - 默认不包含 ``@pytest.mark.parametrize``（可用 ``--csv-include-parametrize`` 保留）。
 """
 
 from __future__ import annotations
@@ -187,12 +191,18 @@ def iter_test_py_files(tests_root: Path) -> Iterator[Path]:
             yield p
 
 
-def format_decorator_list(decorators: list[ast.expr]) -> str:
+def format_decorator_list(
+    decorators: list[ast.expr],
+    *,
+    exclude_parametrize: bool = True,
+) -> str:
     """将函数上的装饰器列表转为可读字符串（多行，每行一个 @...）。"""
     if not decorators:
         return ""
     parts: list[str] = []
     for d in decorators:
+        if exclude_parametrize and _is_pytest_mark_attr(d) == "parametrize":
+            continue
         try:
             parts.append("@" + ast.unparse(d))
         except (AttributeError, TypeError, ValueError):
@@ -200,23 +210,71 @@ def format_decorator_list(decorators: list[ast.expr]) -> str:
     return "\n".join(parts)
 
 
+def extract_pytestmark_rhs_from_stmts(body: list[ast.stmt]) -> str | None:
+    """从语句块顶层取第一个 ``pytestmark = ...`` / 注解赋值的右侧表达式源码。"""
+    for node in body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "pytestmark":
+                    try:
+                        return ast.unparse(node.value)
+                    except (AttributeError, TypeError, ValueError):
+                        return None
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "pytestmark" and node.value:
+                try:
+                    return ast.unparse(node.value)
+                except (AttributeError, TypeError, ValueError):
+                    return None
+    return None
+
+
 def collect_test_function_rows(
     body: list[ast.stmt],
     filepath: str,
     class_prefix: str | None,
     out: list[tuple[str, str, str]],
+    module_pytestmark_line: str,
+    enclosing_pytestmark_lines: list[str],
+    *,
+    csv_exclude_parametrize: bool,
 ) -> None:
-    """递归扫描类嵌套，收集名称以 test_ 开头的函数及其装饰器。"""
+    """递归扫描类嵌套，收集 test_* 函数；合并模块/类 pytestmark 与函数装饰器。"""
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if not node.name.startswith("test_"):
                 continue
             qual = f"{class_prefix}.{node.name}" if class_prefix else node.name
-            dec_str = format_decorator_list(node.decorator_list)
+            func_dec = format_decorator_list(
+                node.decorator_list,
+                exclude_parametrize=csv_exclude_parametrize,
+            )
+            parts: list[str] = []
+            if module_pytestmark_line:
+                parts.append(module_pytestmark_line)
+            parts.extend(enclosing_pytestmark_lines)
+            if func_dec:
+                parts.append(func_dec)
+            dec_str = "\n".join(parts)
             out.append((filepath, qual, dec_str))
         elif isinstance(node, ast.ClassDef):
             prefix = f"{class_prefix}.{node.name}" if class_prefix else node.name
-            collect_test_function_rows(node.body, filepath, prefix, out)
+            cls_rhs = extract_pytestmark_rhs_from_stmts(node.body)
+            cls_line = (
+                f"[类 pytestmark] {prefix}: pytestmark = {cls_rhs}"
+                if cls_rhs
+                else ""
+            )
+            new_enclosing = enclosing_pytestmark_lines + ([cls_line] if cls_line else [])
+            collect_test_function_rows(
+                node.body,
+                filepath,
+                prefix,
+                out,
+                module_pytestmark_line,
+                new_enclosing,
+                csv_exclude_parametrize=csv_exclude_parametrize,
+            )
 
 
 def _collect_marks_from_expr(expr: ast.AST, out: set[str]) -> None:
@@ -321,6 +379,11 @@ def main() -> int:
         metavar="PATH",
         help="将每个 test_* 函数一行写入 CSV：文件名、函数名、修饰器",
     )
+    parser.add_argument(
+        "--csv-include-parametrize",
+        action="store_true",
+        help="CSV 第三列保留 @pytest.mark.parametrize（默认剔除）",
+    )
     args = parser.parse_args()
     tests_root = resolve_tests_root(args.tests_root)
     if not tests_root.is_dir():
@@ -357,7 +420,23 @@ def main() -> int:
         all_marks.update(local)
         all_hw.update(local_hw)
         if args.csv is not None:
-            collect_test_function_rows(tree.body, key, None, csv_rows)
+            mod_rhs = (
+                extract_pytestmark_rhs_from_stmts(tree.body)
+                if isinstance(tree, ast.Module)
+                else None
+            )
+            module_line = (
+                f"[模块 pytestmark] pytestmark = {mod_rhs}" if mod_rhs else ""
+            )
+            collect_test_function_rows(
+                tree.body,
+                key,
+                None,
+                csv_rows,
+                module_line,
+                [],
+                csv_exclude_parametrize=not args.csv_include_parametrize,
+            )
 
     builtin_hits = sorted(n for n in all_marks if n in PYTEST_BUILTIN_MARK_NAMES)
     project_hits = sorted(n for n in all_marks if n not in PYTEST_BUILTIN_MARK_NAMES)
