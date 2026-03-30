@@ -20,6 +20,11 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.models.f5_tts.hf_utils import (
+    F5_PIPELINE_CLASS,
+    build_f5_transformer_config,
+    is_f5_model,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.lora.request import LoRARequest
@@ -99,41 +104,50 @@ class AsyncOmniDiffusion:
             self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
         # Diffusers-style models expose `model_index.json` with `_class_name`.
-        # Non-diffusers models (e.g. Bagel, NextStep) only have `config.json`,
-        # so we fall back to reading that and mapping model_type manually.
-        try:
-            config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
-            if config_dict is not None:
-                if od_config.model_class_name is None:
-                    od_config.model_class_name = config_dict.get("_class_name", None)
-                od_config.update_multimodal_support()
+        # Some checkpoints (e.g. F5-TTS) need bespoke config discovery.
+        if is_f5_model(od_config.model):
+            if od_config.model_class_name is None:
+                od_config.model_class_name = F5_PIPELINE_CLASS
+            tf_config_dict = build_f5_transformer_config(
+                od_config.model,
+                revision=od_config.revision,
+            )
+            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            od_config.update_multimodal_support()
+        else:
+            try:
+                config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
+                if config_dict is not None:
+                    if od_config.model_class_name is None:
+                        od_config.model_class_name = config_dict.get("_class_name", None)
+                    od_config.update_multimodal_support()
 
-                tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
-                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
-            else:
-                raise FileNotFoundError("model_index.json not found")
-        except (AttributeError, OSError, ValueError, FileNotFoundError):
-            cfg = get_hf_file_to_dict("config.json", od_config.model)
-            if cfg is None:
-                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+                    tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
+                    od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+                else:
+                    raise FileNotFoundError("model_index.json not found")
+            except (AttributeError, OSError, ValueError, FileNotFoundError):
+                cfg = get_hf_file_to_dict("config.json", od_config.model)
+                if cfg is None:
+                    raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
 
-            od_config.tf_model_config = TransformerConfig.from_dict(cfg)
-            model_type = cfg.get("model_type")
-            architectures = cfg.get("architectures") or []
-            # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
-            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                od_config.model_class_name = "BagelPipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
-            elif model_type == "nextstep":
-                if od_config.model_class_name is None:
-                    od_config.model_class_name = "NextStep11Pipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
-            elif architectures and len(architectures) == 1:
-                od_config.model_class_name = architectures[0]
-            else:
-                raise
+                od_config.tf_model_config = TransformerConfig.from_dict(cfg)
+                model_type = cfg.get("model_type")
+                architectures = cfg.get("architectures") or []
+                # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
+                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                    od_config.model_class_name = "BagelPipeline"
+                    od_config.tf_model_config = TransformerConfig()
+                    od_config.update_multimodal_support()
+                elif model_type == "nextstep":
+                    if od_config.model_class_name is None:
+                        od_config.model_class_name = "NextStep11Pipeline"
+                    od_config.tf_model_config = TransformerConfig()
+                    od_config.update_multimodal_support()
+                elif architectures and len(architectures) == 1:
+                    od_config.model_class_name = architectures[0]
+                else:
+                    raise
 
         if cfg_kv_collect_func is not None:
             od_config.cfg_kv_collect_func = cfg_kv_collect_func

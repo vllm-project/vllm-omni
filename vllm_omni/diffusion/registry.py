@@ -87,6 +87,11 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "F5TTSPipeline": (
+        "f5_tts",
+        "pipeline_f5_tts",
+        "F5TTSPipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -216,10 +221,11 @@ def initialize_model(
             od_config.vae_use_tiling = True
 
         # Configure VAE memory optimization settings from config
-        if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
-            model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
-            model.vae.use_tiling = od_config.vae_use_tiling
+        if hasattr(model, "vae"):
+            if hasattr(model.vae, "use_slicing"):
+                model.vae.use_slicing = od_config.vae_use_slicing
+            if hasattr(model.vae, "use_tiling"):
+                model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
             model.vae.set_parallel_size(vae_pp_size)
@@ -319,6 +325,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "F5TTSPipeline": "get_f5_tts_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
