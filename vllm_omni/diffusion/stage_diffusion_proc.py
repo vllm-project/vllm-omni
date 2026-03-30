@@ -10,7 +10,6 @@ import asyncio
 import signal
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
-
 import msgspec
 import zmq
 import zmq.asyncio
@@ -219,9 +218,6 @@ async def _handle_collective_rpc(
         # Extract is_start and profile_prefix from args
         is_start = args[0] if args else True
         profile_prefix = args[1] if len(args) > 1 else None
-        # Generate profile_prefix with stage_id if starting and no prefix provided
-        if is_start and profile_prefix is None:
-            profile_prefix = f"stage_{self.stage_id}_diffusion_{int(time.time())}"
         result = target(is_start, profile_prefix)
         if timeout is not None:
             return await asyncio.wait_for(result, timeout=timeout)

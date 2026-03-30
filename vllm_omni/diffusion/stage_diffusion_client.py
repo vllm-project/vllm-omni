@@ -234,6 +234,19 @@ class StageDiffusionClient:
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
         """Forward control RPCs to the diffusion subprocess."""
+        # Inject a default profile_prefix that includes stage_id when profiling.
+        if method == "profile":
+            args_list = list(args)
+            is_start = args_list[0] if args_list else True
+            profile_prefix = args_list[1] if len(args_list) > 1 else None
+            if is_start and profile_prefix is None:
+                profile_prefix = f"stage_{self.stage_id}_diffusion_{int(time.time())}"
+                if len(args_list) > 1:
+                    args_list[1] = profile_prefix
+                else:
+                    args_list.append(profile_prefix)
+                args = tuple(args_list)
+
         kwargs = kwargs or {}
         rpc_id = uuid.uuid4().hex
         self._pending_rpcs.add(rpc_id)
