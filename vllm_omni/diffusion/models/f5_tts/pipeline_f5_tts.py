@@ -49,8 +49,6 @@ def get_epss_timesteps(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
-    Empirically Pruned Step Sampling (EPSS) timesteps for low-NFE regimes.
-
     Returns a 1-D tensor of ``n + 1`` timestep values in [0, 1].
     For supported values of *n* the schedule is taken from a table of
     hand-tuned timesteps; otherwise falls back to uniform spacing.
@@ -479,9 +477,9 @@ class F5TTSPipeline(nn.Module, SupportAudioOutput):
 
             prompts = [{
                 "prompt": "<target text to synthesize>",
-                "multi_modal_data": {"audio": <conditioning audio bytes>},
                 "additional_information": {
                     "cond_text": "<transcript of conditioning audio>",
+                    "ref_audio": <conditioning audio bytes>,
                     "lang": "<ISO language code>",
                 },
             }]
