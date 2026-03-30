@@ -62,9 +62,7 @@ class StageDiffusionProc:
         self._enrich_config()
         self._engine = DiffusionEngine.make_engine(self._od_config)
         self._executor = ThreadPoolExecutor(max_workers=1)
-        logger.info(
-            "StageDiffusionProc initialized with model: %s", self._model
-        )
+        logger.info("StageDiffusionProc initialized with model: %s", self._model)
 
     def _enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate od_config fields.
@@ -76,40 +74,26 @@ class StageDiffusionProc:
         od_config = self._od_config
 
         try:
-            config_dict = get_hf_file_to_dict(
-                "model_index.json", od_config.model
-            )
+            config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
             if config_dict is not None:
                 if od_config.model_class_name is None:
-                    od_config.model_class_name = config_dict.get(
-                        "_class_name", None
-                    )
+                    od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
 
-                tf_config_dict = get_hf_file_to_dict(
-                    "transformer/config.json", od_config.model
-                )
-                od_config.tf_model_config = TransformerConfig.from_dict(
-                    tf_config_dict
-                )
+                tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
+                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             cfg = get_hf_file_to_dict("config.json", od_config.model)
             if cfg is None:
-                raise ValueError(
-                    f"Could not find config.json or model_index.json "
-                    f"for model {od_config.model}"
-                )
+                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
 
             od_config.tf_model_config = TransformerConfig.from_dict(cfg)
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
 
-            if (
-                model_type == "bagel"
-                or "BagelForConditionalGeneration" in architectures
-            ):
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                 od_config.model_class_name = "BagelPipeline"
                 od_config.tf_model_config = TransformerConfig()
                 od_config.update_multimodal_support()
@@ -156,9 +140,7 @@ class StageDiffusionProc:
         )
 
         loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            self._executor, self._engine.step, request
-        )
+        results = await loop.run_in_executor(self._executor, self._engine.step, request)
         result = results[0]
         if not result.request_id:
             result.request_id = request_id
@@ -199,9 +181,7 @@ class StageDiffusionProc:
                 from vllm.lora.request import LoRARequest
 
                 if not isinstance(lora_request, LoRARequest):
-                    lora_request = msgspec.convert(
-                        lora_request, LoRARequest
-                    )
+                    lora_request = msgspec.convert(lora_request, LoRARequest)
             results = await loop.run_in_executor(
                 self._executor,
                 self._engine.collective_rpc,
@@ -269,10 +249,7 @@ class StageDiffusionProc:
         return {
             "supported": False,
             "todo": True,
-            "reason": (
-                f"Diffusion stage collective_rpc method "
-                f"{method} is not implemented yet"
-            ),
+            "reason": (f"Diffusion stage collective_rpc method {method} is not implemented yet"),
         }
 
     # ------------------------------------------------------------------
@@ -298,21 +275,13 @@ class StageDiffusionProc:
 
         tasks: dict[str, asyncio.Task] = {}
 
-        async def _dispatch_request(
-            request_id: str, prompt: Any, sampling_params_dict: dict
-        ) -> None:
+        async def _dispatch_request(request_id: str, prompt: Any, sampling_params_dict: dict) -> None:
             """Process a single diffusion request and send the response."""
             try:
-                result = await self._process_request(
-                    request_id, prompt, sampling_params_dict
-                )
-                await response_socket.send(
-                    encoder.encode({"type": "result", "output": result})
-                )
+                result = await self._process_request(request_id, prompt, sampling_params_dict)
+                await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except Exception as e:
-                logger.exception(
-                    "Diffusion request %s failed: %s", request_id, e
-                )
+                logger.exception("Diffusion request %s failed: %s", request_id, e)
                 await response_socket.send(
                     encoder.encode(
                         {
@@ -368,9 +337,7 @@ class StageDiffusionProc:
                             )
                         )
                     except Exception as e:
-                        logger.exception(
-                            "Collective RPC %s failed: %s", msg["method"], e
-                        )
+                        logger.exception("Collective RPC %s failed: %s", msg["method"], e)
                         await response_socket.send(
                             encoder.encode(
                                 {
@@ -517,9 +484,7 @@ def _perform_diffusion_handshake(
     handshake_address: str,
 ) -> None:
     """Run the handshake with the diffusion subprocess."""
-    with zmq_socket_ctx(
-        handshake_address, zmq.ROUTER, bind=True
-    ) as handshake_socket:
+    with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
         poller = zmq.Poller()
         poller.register(handshake_socket, zmq.POLLIN)
         poller.register(proc.sentinel, zmq.POLLIN)
@@ -528,9 +493,7 @@ def _perform_diffusion_handshake(
         while True:
             events = dict(poller.poll(timeout=timeout_ms))
             if not events:
-                raise TimeoutError(
-                    "Timed out waiting for READY from StageDiffusionProc"
-                )
+                raise TimeoutError("Timed out waiting for READY from StageDiffusionProc")
             if handshake_socket in events:
                 identity, raw = handshake_socket.recv_multipart()
                 msg = msgspec.msgpack.decode(raw)
@@ -538,7 +501,4 @@ def _perform_diffusion_handshake(
                     return
                 raise RuntimeError(f"Expected READY, got: {msg}")
             if proc.exitcode is not None:
-                raise RuntimeError(
-                    f"StageDiffusionProc died during handshake "
-                    f"(exit code {proc.exitcode})"
-                )
+                raise RuntimeError(f"StageDiffusionProc died during handshake (exit code {proc.exitcode})")
