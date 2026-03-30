@@ -33,6 +33,23 @@ def _init_distributed():
     cleanup_dist_env_and_memory()
 
 
+@pytest.fixture(autouse=True)
+def _force_default_gemm(monkeypatch):
+    """Force CPU-compatible GEMM dispatch for tests using CPU tensors.
+
+    vLLM's dispatch_unquantized_gemm() selects the backend by platform
+    (e.g. rocm_unquantized_gemm on AMD machines), not by tensor device.
+    CPU test tensors crash with NotImplementedError on ROCm.  Monkeypatch
+    the dispatcher to always return the default (torch.nn.functional.linear)
+    implementation which works on any device."""
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        lambda: default_unquantized_gemm,
+    )
+
+
 def test_adalayernorm_import_from_shared_module():
     """Verify imports work from the shared adalayernorm module."""
     from vllm_omni.diffusion.layers.adalayernorm import (  # noqa: F401
