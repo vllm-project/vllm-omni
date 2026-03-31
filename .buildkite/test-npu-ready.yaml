@@ -6,5 +6,4 @@ steps:
       - docker#v5.2.0:
           image: "vllm-omni-ci-npu:latest"
     command: |
-      git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
       timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml

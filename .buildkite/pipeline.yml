@@ -9,15 +9,13 @@ steps:
           volumes:
             - /var/run/docker.sock:/var/run/docker.sock
     command: |
-      git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
-      docker build -t vllm-omni-ci-npu -f ./docker/Dockerfile.npu .
+      docker build -t vllm-omni-ci-npu -f ./docker/Dockerfile_test.npu .
 
   - label: "Upload Test Pipeline"
     depends_on: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
     command: |
-      git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
       if [[ "${BUILDKITE_BRANCH}" == "main" ]]; then
         echo "--- 上传 merge 测试 pipeline"
         buildkite-agent pipeline upload .buildkite/test-npu-merge.yaml

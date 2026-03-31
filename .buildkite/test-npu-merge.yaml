@@ -10,7 +10,6 @@ steps:
           - docker#v5.2.0:
               image: "vllm-omni-ci-npu:latest"
         command: |
-          git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
           pip install -e .
@@ -25,7 +24,6 @@ steps:
           - docker#v5.2.0:
               image: "vllm-omni-ci-npu:latest"
         command: |
-          git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
           pip install -e .
@@ -40,7 +38,6 @@ steps:
           - docker#v5.2.0:
               image: "vllm-omni-ci-npu:latest"
         command: |
-          git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
           pip install -e .
@@ -55,7 +52,6 @@ steps:
           - docker#v5.2.0:
               image: "vllm-omni-ci-npu:latest"
         command: |
-          git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
           pip install -e .
@@ -70,7 +66,6 @@ steps:
           - docker#v5.2.0:
               image: "vllm-omni-ci-npu:latest"
         command: |
-          git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
           pip install -e .
