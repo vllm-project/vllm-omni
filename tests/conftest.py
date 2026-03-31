@@ -1843,12 +1843,14 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
             keywords = keywords_dict.get(word_type)
             if "text" in modalities:
                 if keywords:
-                    assert any(keyword in response.text_content.lower() for keyword in keywords), (
+                    text_lower = response.text_content.lower()
+                    assert any(str(kw).lower() in text_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
             else:
                 if keywords:
-                    assert any(keyword in response.audio_content.lower() for keyword in keywords), (
+                    audio_lower = response.audio_content.lower()
+                    assert any(str(kw).lower() in audio_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
 
