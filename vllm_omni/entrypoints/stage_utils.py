@@ -53,9 +53,7 @@ def set_stage_devices(
         device_list = _parse_device_list(devices)
         if vis is not None:
             visible_device_list = _parse_device_list(vis)
-        else:
-            visible_device_list = [str(i) for i in range(current_omni_platform.get_device_count())]
-        device_list = _map_device_list(stage_id, device_list, visible_device_list)
+            device_list = _map_device_list(stage_id, device_list, visible_device_list)
         device_str = ",".join(device_list)
         current_omni_platform.set_device_control_env_var(device_str)
         return device_str
