@@ -621,6 +621,13 @@ def test_parameter_validation():
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", guidance_scale=21.0)
 
+    # Invalid layers for layered models (must stay within the backend-supported range)
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", layers=2)
+
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", layers=11)
+
 
 # Pass-Through Tests
 
@@ -868,35 +875,36 @@ def test_image_edit_invalid_resolution(async_omni_test_client):
 
 
 def test_image_edit_invalid_layers(async_omni_test_client):
-    """Test that invalid layers values (< 1) are rejected with 400."""
+    """Test that layered image edits reject out-of-range layers with 400."""
     img_bytes = make_test_image_bytes((16, 16))
 
-    # Test layers = 0
+    # Test layers below the supported range
     response = async_omni_test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": 0,
+            "layers": 2,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be >= 1" in detail
+    assert "layers must be between 3 and 10 inclusive" in detail
 
-    # Test layers = -1
+    # Test layers above the supported range
     response = async_omni_test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": -1,
+            "layers": 11,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
+    assert "layers must be between 3 and 10 inclusive" in detail
 
 
 def test_image_edit_resolution_and_size_conflict(async_omni_test_client):
