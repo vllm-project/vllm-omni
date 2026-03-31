@@ -6,8 +6,6 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.stage_utils import set_stage_devices
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
 
 def _make_dummy_torch(call_log):
     class _Props:
@@ -55,6 +53,8 @@ def _make_mock_platform(mocker, device_type: str = "cuda", env_var: str = "CUDA_
     return mock_platform
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 def test_set_stage_devices_respects_logical_ids(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     # Preserve an existing logical mapping and ensure devices "0,1" map through it.
@@ -75,6 +75,8 @@ def test_set_stage_devices_respects_logical_ids(mocker: MockerFixture, monkeypat
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "6,7"
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 def test_set_stage_devices_handles_not_enough_devices(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     # Preserve an existing logical mapping and ensure devices "0,1" map through it.
