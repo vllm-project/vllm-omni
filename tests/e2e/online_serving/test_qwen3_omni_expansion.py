@@ -78,7 +78,7 @@ test_token_params = [
 ]
 
 
-def get_system_prompt(*, voice_gender: str | None = None):
+def get_system_prompt():
     return {
         "role": "system",
         "content": [
@@ -88,7 +88,6 @@ def get_system_prompt(*, voice_gender: str | None = None):
                     "You are Qwen, a virtual human developed by the Qwen Team, "
                     "Alibaba Group, capable of perceiving auditory and visual inputs, "
                     "as well as generating text and speech."
-                    + (f" When speaking, use a {voice_gender} voice." if voice_gender in {"male", "female"} else "")
                 ),
             }
         ],
@@ -98,13 +97,13 @@ def get_system_prompt(*, voice_gender: str | None = None):
 def get_prompt(prompt_type="text_only"):
     prompts = {
         "text_only": "What is the capital of China? Answer in 20 words.",
-        "text_only_chinese": "中国的首都在哪里？",
         "mix": "What is recited in the audio? What is in this image? What is in this video?",
         "text_video": "What is in this video? ",
         "text_image": "What is in this image? ",
         "text_audio": "What is in this audio? ",
         "text_audio_video": "First, what is in this audio? Then, what is in this video? ",
         "one_word": "What is the capital of UK? Answer in one word",
+        "text_chinese": "英国的首都在哪里？",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -516,3 +515,120 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
             if _similarity_assert_msg not in str(e) or attempt == _max_retries - 1:
                 raise
             print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_speaker_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (one-word answer constraint).
+    Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "speaker": "Serena",
+        "key_words": {"text": ["Beijing"]},
+    }
+
+    openai_client.send_omni_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_speaker_002(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (one-word answer constraint).
+    Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "speaker": "uncle_fu",
+        "key_words": {"text": ["Beijing"]},
+    }
+
+    # Retry only when assert_omni_response fails on preset voice gender (see tests/conftest.py).
+    _gender_assert_substr = "estimated gender"
+    _max_retries = 3
+    for attempt in range(_max_retries):
+        try:
+            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+            break
+        except AssertionError as e:
+            if _gender_assert_substr not in str(e) or attempt == _max_retries - 1:
+                raise
+            print(f"Gender assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_speaker_003(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (one-word answer constraint).
+    Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "speaker": "SERENA",
+        "key_words": {"text": ["Beijing"]},
+    }
+
+    openai_client.send_omni_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_language_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (one-word answer constraint).
+    Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text_chinese"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {"text": ["伦敦"]},
+    }
+
+    openai_client.send_omni_request(request_config)

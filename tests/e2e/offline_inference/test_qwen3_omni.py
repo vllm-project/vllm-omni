@@ -43,10 +43,10 @@ if current_omni_platform.is_rocm():
 elif current_omni_platform.is_xpu():
     stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
 else:
-    stage_config = get_cuda_graph_config()
-    config_id = "no_cuda_graph"
+    stage_configs = [get_cuda_graph_config()]
 
-test_params = [pytest.param((model, stage_config), id=config_id) for model in models]
+# Create parameter combinations for model and stage config
+test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
 def get_question(prompt_type="video"):

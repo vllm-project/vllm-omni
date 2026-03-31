@@ -49,11 +49,9 @@ if current_omni_platform.is_xpu():
 else:  # MI325 GPU should share the same config as H100
     stage_configs = [get_chunk_config()]
 
-# Create parameter combinations for model and stage config with readable param ids
+# Create parameter combinations for model and stage config
 test_params = [
-    pytest.param(OmniServerParams(model=model, stage_config_path=path), id=config_id)
-    for model in models
-    for path, config_id in stage_configs_with_id
+    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
 ]
 
 
@@ -76,7 +74,7 @@ def get_system_prompt():
 def get_prompt(prompt_type="text_only"):
     prompts = {
         "text_only": "What is the capital of China? Answer in 20 words.",
-        "mix": "What is recited in the audio? What is in this image? What is in this video?",
+        "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 

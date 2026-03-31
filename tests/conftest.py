@@ -1126,125 +1126,6 @@ def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
     return text
 
 
-def merge_base64_and_convert_to_text(base64_list):
-    """
-    Merge a list of base64 encoded audio data and convert to text.
-    """
-    merged_audio = _merge_base64_audio_to_segment(base64_list)
-    output_path = f"./test_{uuid.uuid4().hex}.wav"
-    merged_audio.export(output_path, format="wav")
-    print(f"audio data is saved: {output_path}")
-    text = convert_audio_file_to_text(output_path)
-    return text
-
-
-def _extract_expected_voice_gender(messages: list[dict[str, Any]] | None) -> str | None:
-    """Parse expected voice gender from system prompt text ('male'/'female') if present."""
-    if not messages:
-        return None
-    for msg in messages:
-        if msg.get("role") != "system":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text = " ".join(
-                item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
-            )
-        else:
-            text = ""
-        m = re.search(r"\buse a (male|female) voice\b", text, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).lower()
-    return None
-
-
-def _get_merged_audio_bytes(audio_data: list[str] | None) -> bytes | None:
-    """Merge base64 audio chunks (stream or single) into one WAV bytes for analysis."""
-    if not audio_data:
-        return None
-    merged = _merge_base64_audio_to_segment(audio_data)
-    buf = io.BytesIO()
-    merged.export(buf, format="wav")
-    return buf.getvalue()
-
-
-def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
-    """
-    Estimate voice gender from WAV bytes by fundamental frequency (F0).
-    Male typical F0 ~85-180 Hz, female ~165-255 Hz. Returns 'male' or 'female'.
-    Uses autocorrelation-based F0 estimate with harmonic-doubling mitigation.
-    """
-    data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
-    if data.size == 0:
-        raise ValueError("Empty audio")
-    mono = np.mean(data, axis=1)
-
-    def _estimate_f0(seg: np.ndarray) -> float | None:
-        seg = seg - float(np.mean(seg))
-        if float(np.max(np.abs(seg))) < 1e-3:
-            return None
-        min_lag = max(2, int(sr / 350))
-        max_lag = min(len(seg) // 2, int(sr / 60))
-        if max_lag <= min_lag + 2:
-            return None
-        corr = np.correlate(seg, seg, mode="same")
-        mid = len(corr) // 2
-        valid = corr[mid + min_lag : mid + max_lag + 1]
-        # local maxima above threshold
-        the = float(np.max(valid)) * 0.5
-        peaks: list[tuple[int, float]] = []
-        for i in range(1, len(valid) - 1):
-            v = float(valid[i])
-            if v > the and v >= float(valid[i - 1]) and v >= float(valid[i + 1]):
-                peaks.append((min_lag + i, v))
-        if not peaks:
-            lag = min_lag + int(np.argmax(valid))
-            return float(sr) / float(lag)
-        # Prefer lower F0 (longer lag) to mitigate harmonic doubling, but also
-        # explicitly check for octave errors when two peaks are similarly strong.
-        best_v = max(v for _, v in peaks)
-        close = [(lag, v) for lag, v in peaks if v >= best_v * 0.85]
-        # Start with the longest-lag candidate.
-        lag = max(lag for lag, _ in close)
-
-        # If there is also a strong peak around 2*lag (i.e. current pick is doubled F0),
-        # switch to the longer lag.
-        cand2 = [(lag2, v) for lag2, v in peaks if abs(lag2 - 2 * lag) <= max(2, int(0.03 * (2 * lag)))]
-        if cand2:
-            best2 = max(v for _, v in cand2)
-            if best2 >= best_v * 0.75:
-                lag = max(lag_val for lag_val, _ in cand2)
-        return float(sr) / float(lag)
-
-    # Estimate from multiple windows and use median to stabilize
-    win_len = min(int(sr * 0.8), len(mono))
-    if win_len < int(sr * 0.2):
-        raise ValueError("Cannot estimate F0: audio too short")
-    starts = [
-        max(0, (len(mono) - win_len) // 4),
-        max(0, (len(mono) - win_len) // 2),
-        max(0, (len(mono) - win_len) * 3 // 4),
-    ]
-    f0s = [f for f in (_estimate_f0(mono[s : s + win_len]) for s in starts) if f is not None]
-    if not f0s:
-        raise ValueError("Cannot estimate F0: no voiced segment found")
-    f0s.sort()
-    f0 = float(f0s[len(f0s) // 2])
-
-    # Post-correction for octave (harmonic) errors:
-    # If halving produces a plausible adult male F0, prefer it.
-    if f0 > 170.0:
-        half = f0 / 2.0
-        if 75.0 <= half <= 185.0:
-            f0 = half
-
-    result = "female" if f0 > 165.0 else "male"
-    print(f"estimated f0 is: {f0:.1f} Hz; gender is: {result}")
-    return result
-
-
 def modify_stage_config(
     yaml_path: str,
     updates: dict[str, Any] = None,
@@ -1858,6 +1739,32 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         return "unknown"
 
 
+_PRESET_VOICE_GENDER_MAP: dict[str, str] = {
+    "serena": "female",
+    "uncle_fu": "male",
+    "clone": "female",
+}
+
+
+def _assert_preset_voice_gender_from_audio(
+    audio_bytes: bytes | None,
+    voice_name: str | None,
+) -> None:
+    """If ``voice_name`` matches a known preset, assert classifier gender matches (skip when unknown)."""
+    if not voice_name or not audio_bytes:
+        return
+    key = str(voice_name).lower()
+    expected_gender = _PRESET_VOICE_GENDER_MAP.get(key)
+    if expected_gender is None:
+        return
+    estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
+    print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
+    if estimated_gender != "unknown":
+        assert estimated_gender == expected_gender, (
+            f"{voice_name!r} is expected {expected_gender}, but estimated gender is {estimated_gender!r}"
+        )
+
+
 # Threshold aligned with _compute_pcm_hnr_db docstring (clean clone vs distorted).
 _MIN_PCM_SPEECH_HNR_DB = 1.0
 
@@ -1952,6 +1859,11 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
             )
             print(f"similarity is: {response.similarity}")
 
+            _assert_preset_voice_gender_from_audio(
+                response.audio_bytes,
+                request_config.get("speaker"),
+            )
+
 
 def assert_audio_speech_response(
     response: OmniResponse,
@@ -1995,24 +1907,12 @@ def assert_audio_speech_response(
                 f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
             )
 
-        # Voice gender consistency check:
+        # Voice gender consistency check (preset names in ``_PRESET_VOICE_GENDER_MAP``).
         # When the estimator returns 'unknown', we treat it as inconclusive and do NOT fail the test.
-        voice = (request_config.get("voice") or "").lower()
-        if voice and response.audio_bytes:
-            estimated_gender = _estimate_voice_gender_from_audio(response.audio_bytes)
-            voice_gender_map = {
-                # adjust this mapping to your actual voice names
-                "serena": "female",
-                "uncle_fu": "male",
-                "clone": "female",
-            }
-            expected_gender = voice_gender_map.get(voice)
-            if expected_gender is not None:
-                print(f"Estimated voice gender from audio: {estimated_gender} (voice='{voice}')")
-                if estimated_gender != "unknown":
-                    assert estimated_gender == expected_gender, (
-                        f"Voice '{voice}' is expected {expected_gender}, but estimated gender is '{estimated_gender}'"
-                    )
+        _assert_preset_voice_gender_from_audio(
+            response.audio_bytes,
+            request_config.get("voice"),
+        )
 
 
 def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
@@ -2128,7 +2028,11 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = merge_base64_and_convert_to_text(audio_data)
+                    merged_seg = _merge_base64_audio_to_segment(audio_data)
+                    wav_buf = BytesIO()
+                    merged_seg.export(wav_buf, format="wav")
+                    result.audio_bytes = wav_buf.getvalue()
+                    audio_content = convert_audio_bytes_to_text(result.audio_bytes)
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
@@ -2183,13 +2087,13 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = convert_audio_to_text(audio_data)
+                    result.audio_bytes = base64.b64decode(audio_data)
+                    audio_content = convert_audio_bytes_to_text(result.audio_bytes)
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
-            # Populate result object (audio_data for voice/gender validation)
+            # Populate result object
             result.text_content = text_content
-            result.audio_data = [audio_data] if audio_data is not None else None
             result.audio_content = audio_content
             result.similarity = similarity
             result.success = True
@@ -2353,8 +2257,9 @@ class OpenAIClientHandler:
             request_config: Request configuration dictionary containing parameters like model, messages, stream.
                 Optional ``use_audio_in_video`` (bool): when true, sets
                 ``extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}`` for Qwen-Omni video+audio
-                extraction (merged with any existing ``extra_body`` / ``mm_processor_kwargs``).
-                Optional ``extra_body`` (dict): passed through to ``chat.completions.create`` after merge.
+                extraction.
+                Optional top-level ``speaker`` (str): Qwen3-Omni preset TTS speaker name; sent as
+                ``extra_body["speaker"]`` to ``chat.completions.create``.
             request_num: Number of requests, defaults to 1 (single request)
 
         Returns:
@@ -2366,9 +2271,8 @@ class OpenAIClientHandler:
         modalities = request_config.get("modalities", ["text", "audio"])
 
         extra_body: dict[str, Any] = {}
-        raw_extra = request_config.get("extra_body")
-        if raw_extra:
-            extra_body.update(raw_extra)
+        if "speaker" in request_config:
+            extra_body["speaker"] = request_config["speaker"]
         if request_config.get("use_audio_in_video"):
             mm = dict(extra_body.get("mm_processor_kwargs") or {})
             mm["use_audio_in_video"] = True
@@ -2393,7 +2297,6 @@ class OpenAIClientHandler:
             else:
                 response = self._process_non_stream_omni_response(chat_completion)
 
-            response.e2e_latency = time.perf_counter() - start_time
             assert_omni_response(response, request_config, run_level=self.run_level)
             responses.append(response)
 
@@ -2401,12 +2304,15 @@ class OpenAIClientHandler:
             # Send concurrent requests: run create + process in worker so e2e_latency includes full round-trip.
             def _one_omni_request():
                 start = time.perf_counter()
-                chat_completion = self.client.chat.completions.create(
-                    model=request_config.get("model"),
-                    messages=request_config.get("messages"),
-                    modalities=modalities,
-                    stream=stream,
-                )
+                worker_kwargs: dict[str, Any] = {
+                    "model": request_config.get("model"),
+                    "messages": request_config.get("messages"),
+                    "modalities": modalities,
+                    "stream": stream,
+                }
+                if extra_body_arg is not None:
+                    worker_kwargs["extra_body"] = extra_body_arg
+                chat_completion = self.client.chat.completions.create(**worker_kwargs)
                 if stream:
                     response = self._process_stream_omni_response(chat_completion)
                 else:
