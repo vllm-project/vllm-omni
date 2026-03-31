@@ -77,6 +77,7 @@ class TestFlux2TransformerWeightLoading:
 
 class TestFlux2RopePositionEmbedding:
     """Test Flux2 RoPE position embedding functionality"""
+
     @pytest.mark.core_model
     @pytest.mark.cpu
     def test_rope_position_embedding(self):
