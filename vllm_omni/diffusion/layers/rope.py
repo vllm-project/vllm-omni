@@ -117,7 +117,9 @@ class RotaryEmbedding(CustomOp):
             # (B, S, D/2) -> (S, D/2)
             cos = cos[0]
             sin = sin[0]
-
+        if cos.shape[-1] == x.shape[-1]:
+            half_head_dim = False
+            
         return self.apply_rotary_emb_flash_attn(
             x,
             cos,
