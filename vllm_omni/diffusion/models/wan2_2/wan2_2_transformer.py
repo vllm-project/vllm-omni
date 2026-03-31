@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import FP32LayerNorm
+
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -29,6 +29,12 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from importlib.util import find_spec
+import torch_npu
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.diffusion.layers.layernorm32 import FastLayerNorm32 as FP32LayerNorm
+
 
 logger = init_logger(__name__)
 
@@ -371,6 +377,8 @@ class WanSelfAttention(nn.Module):
         self.num_kv_heads = self.to_qkv.num_kv_heads
         self.tp_inner_dim = self.num_heads * head_dim
 
+        self.rope = RotaryEmbedding(is_neox_style=False)
+
         # QK normalization using vLLM's RMSNorm
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
@@ -418,8 +426,12 @@ class WanSelfAttention(nn.Module):
         # Apply rotary embeddings
         if rotary_emb is not None:
             freqs_cos, freqs_sin = rotary_emb
-            query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
-            key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
+            if find_spec("mindiesd") is not None and current_omni_platform.is_npu():
+                query = self.rope(query,freqs_cos, freqs_sin)
+                key = self.rope(key,freqs_cos, freqs_sin)
+            else:
+                query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
+                key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
         # Create attention metadata if mask is provided
         attn_metadata = None
@@ -665,17 +677,18 @@ class WanTransformerBlock(nn.Module):
             ).chunk(6, dim=1)
 
         # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        norm_hidden_states = (self.norm1(hidden_states) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+
         attn_output = self.attn1(norm_hidden_states, rotary_emb, hidden_states_mask)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+        norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
+        norm_hidden_states = (self.norm3(hidden_states) * (1 + c_scale_msa) + c_shift_msa).type_as(
             hidden_states
         )
         ff_output = self.ffn(norm_hidden_states)
@@ -936,7 +949,7 @@ class WanTransformer3DModel(nn.Module):
             shift = shift.unsqueeze(1)
             scale = scale.unsqueeze(1)
 
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = (self.norm_out(hidden_states) * (1 + scale) + shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
@@ -1008,6 +1021,14 @@ class WanTransformer3DModel(nn.Module):
 
                 if ".to_out.0." in lookup_name:
                     lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+
+                # Compatibility: some Wan conversion pipelines still keep
+                # block modulation keys as `blocks.N.modulation` instead of
+                # `blocks.N.scale_shift_table`.
+                if lookup_name.endswith(".modulation"):
+                    modulation_alias = lookup_name[: -len(".modulation")] + ".scale_shift_table"
+                    if modulation_alias in params_dict:
+                        lookup_name = modulation_alias
 
                 if lookup_name not in params_dict:
                     logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
