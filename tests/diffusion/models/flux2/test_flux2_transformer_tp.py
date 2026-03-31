@@ -8,8 +8,6 @@ from vllm_omni.diffusion.models.flux2.flux2_transformer import (
     Flux2Transformer2DModel,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
 
 # Initialize TP group before tests
 @pytest.fixture(scope="function", autouse=True)
@@ -79,7 +77,8 @@ class TestFlux2TransformerWeightLoading:
 
 class TestFlux2RopePositionEmbedding:
     """Test Flux2 RoPE position embedding functionality"""
-
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_rope_position_embedding(self):
         """Verify RoPE produces correct embeddings for 4D coordinates"""
         # Prepare test data - use model default configuration

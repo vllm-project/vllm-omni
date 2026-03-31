@@ -16,10 +16,28 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Voxtral TTS CUDA Unit Test"
+  - label: "CUDA Unit Test"
     timeout_in_minutes: 10
     depends_on: upload-ready-pipeline
     commands:
+      - |
+        timeout 10m bash -c '
+                pytest -s -v tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py
+                pytest -s -v tests/diffusion/models/flux2/test_flux2_transformer_tp.py::TestFlux2TransformerWeightLoading::test_weight_loading_tp2
+                pytest -s -v tests/diffusion/models/flux2/test_flux2_transformer_tp.py::TestFlux2PackedModuleMapping::test_packed_module_mapping
+                pytest -s -v tests/diffusion/models/flux2/test_flux2_transformer_tp.py::TestFlux2PackedModuleMapping::test_packed_mapping_edge_cases
+                pytest -s -v tests/diffusion/test_diffusion_model_runner.py::test_execute_model_skips_cache_summary_without_active_cache_backend
+                pytest -s -v tests/diffusion/test_diffusion_model_runner.py::test_execute_model_emits_cache_summary_with_active_cache_dit_backend
+                pytest -s -v tests/entrypoints/test_stage_utils.py::test_set_stage_devices_npu_platform
+                pytest -s -v tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py::TestDiTAttention::test_forward_shape
+                pytest -s -v tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py::TestDiTAttention::test_forward_with_mask
+                pytest -s -v tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py::TestDiTAttention::test_qkv_projections
+                pytest -s -v tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py::TestDiTBlock::test_forward_shape
+                pytest -s -v tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py::TestDiTBlock::test_adalayernorm_modulation
+                pytest -s -v tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py::TestDiT::test_forward_shape
+                pytest -s -v tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py::TestDiT::test_timestep_embedding
+                pytest -s -v tests/model_executor/models/cosyvoice3/test_cosyvoice3_components.py::TestSDPAFallback::test_float32_uses_sdpa
+        '
       - "timeout 10m pytest -s -v tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py"
     agents:
       queue: "gpu_1_queue"

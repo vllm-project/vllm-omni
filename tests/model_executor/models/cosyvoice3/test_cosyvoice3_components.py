@@ -6,8 +6,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
 
 class TestPreLookaheadLayer:
     """Tests for PreLookaheadLayer."""
@@ -18,6 +16,8 @@ class TestPreLookaheadLayer:
 
         return PreLookaheadLayer(in_channels=512, channels=512, pre_lookahead_len=3)
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_forward_shape(self, layer):
         """Test that output shape matches input shape."""
         batch, seq_len, channels = 2, 10, 512
@@ -27,6 +27,8 @@ class TestPreLookaheadLayer:
 
         assert out.shape == x.shape
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_forward_with_context(self, layer):
         """Test forward with context for streaming."""
         batch, seq_len, channels = 1, 10, 512
@@ -38,6 +40,8 @@ class TestPreLookaheadLayer:
 
         assert out.shape == x.shape
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_residual_connection(self, layer):
         """Test that residual connection is applied."""
         batch, seq_len, channels = 1, 5, 512
@@ -190,6 +194,8 @@ class TestCFM:
 
         return DummyEstimator()
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_causal_conditional_cfm_forward(self, dummy_estimator):
         """Test CausalConditionalCFM forward pass."""
         from omegaconf import DictConfig

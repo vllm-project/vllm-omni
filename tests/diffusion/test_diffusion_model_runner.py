@@ -10,7 +10,7 @@ import torch
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.diffusion]
 
 
 @contextmanager
@@ -107,6 +107,8 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
     assert cache_summary_calls == [(runner.pipeline, True)]
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
