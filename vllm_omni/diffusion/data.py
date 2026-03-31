@@ -18,7 +18,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 
 from vllm_omni.diffusion.utils.network_utils import is_port_available
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
@@ -558,21 +557,11 @@ class OmniDiffusionConfig:
         elif not isinstance(self.parallel_config, DiffusionParallelConfig):
             self.parallel_config = DiffusionParallelConfig()
 
-        num_devices_per_stage = self.parallel_config.world_size
-        device_control_env = current_omni_platform.device_control_env_var
-        visible_devices_str = os.environ.get(device_control_env)
-        if visible_devices_str:
-            physical_devices = [device.strip() for device in visible_devices_str.split(",") if device.strip()]
-        else:
-            physical_devices = list(range(current_omni_platform.get_device_count()))
-
-        if len(physical_devices) < num_devices_per_stage:
-            raise ValueError(
-                f"Stage requires {num_devices_per_stage} device(s) based on parallel_config, "
-                f"but {len(physical_devices)} device(s) are available: {physical_devices}"
-            )
-
-        self.num_gpus = num_devices_per_stage
+        if self.num_gpus is None:
+            if self.parallel_config is not None:
+                self.num_gpus = self.parallel_config.world_size
+            else:
+                self.num_gpus = 1
 
         if self.num_gpus < self.parallel_config.world_size:
             raise ValueError(
