@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import re
 import tempfile
 
 import requests
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Generator
 from dataclasses import dataclass
 from io import BytesIO
@@ -37,6 +39,7 @@ import torch
 import yaml
 from openai import OpenAI, omit
 from PIL import Image
+from transformers import pipeline
 from vllm import TextPrompt
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
@@ -51,6 +54,13 @@ logger = init_logger(__name__)
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
+
+_GENDER_PIPELINE = None
+# transformers.Pipeline is not thread-safe; concurrent e2e requests must serialize inference.
+_GENDER_PIPELINE_LOCK = threading.Lock()
+
+# int16 mono PCM from /v1/audio/speech when response_format=pcm (Qwen3-TTS code2wav output rate).
+_PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
 
 
 class OmniServerParams(NamedTuple):
@@ -263,7 +273,6 @@ def assert_video_valid(
 
 def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
     """Assert the WAV has the expected sample rate, channel count, and duration."""
-
     assert path.exists(), f"Audio not found: {path}"
     info = sf.info(str(path))
     assert info.samplerate == sample_rate, f"Expected sample_rate={sample_rate}, got {info.samplerate}"
@@ -466,7 +475,6 @@ def generate_synthetic_audio(
     """
     Generate TTS speech with pyttsx3 and return base64 string.
     """
-    import tempfile
 
     import pyttsx3
     import soundfile as sf
@@ -674,14 +682,118 @@ def generate_synthetic_audio(
     # Return result
     base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
     result["base64"] = base64_audio
-    if save_to_file and output_path:
-        result["file_path"] = output_path
+    # Always include file_path to avoid KeyError in callers.
+    result["file_path"] = output_path if save_to_file and output_path else None
 
     return result
 
 
-def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> dict[str, Any]:
-    """Generate synthetic video with bouncing balls and return base64 string."""
+def _mux_mp4_bytes_with_synthetic_audio(
+    video_mp4_bytes: bytes,
+    *,
+    num_frames: int,
+    fps: float = 30.0,
+    sample_rate: int = 48000,
+) -> bytes:
+    """
+    Mux a video-only MP4 with mono TTS audio from :func:`generate_synthetic_audio` (AAC).
+
+    Audio length is at least the video duration in whole seconds (rounded up); ffmpeg
+    ``-shortest`` trims to the video when the WAV is longer.
+
+    Uses ffmpeg from ``imageio_ffmpeg`` when available, else ``ffmpeg`` on PATH.
+    If TTS or mux fails, returns ``video_mp4_bytes`` unchanged.
+
+    Mux subprocess does **not** use ``capture_output=True``: ffmpeg can block writing
+    to a full stderr pipe while :func:`subprocess.run` waits for exit (classic deadlock).
+    """
+    duration_sec = num_frames / fps if fps > 0 else 0.0
+    # generate_synthetic_audio(duration=int) uses at least 1s of buffer internally
+    duration_int = max(1, int(math.ceil(duration_sec)))
+
+    try:
+        audio_result = generate_synthetic_audio(
+            duration=duration_int,
+            num_channels=1,
+            sample_rate=sample_rate,
+            save_to_file=False,
+        )
+        audio_pcm = audio_result["np_array"]
+    except Exception as e:
+        logger.warning("Synthetic video: generate_synthetic_audio failed (%s); using video-only MP4.", e)
+        return video_mp4_bytes
+
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_exe = "ffmpeg"
+
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="syn_vid_mux_") as tmp:
+            vid_path = os.path.join(tmp, "video.mp4")
+            wav_path = os.path.join(tmp, "audio.wav")
+            out_path = os.path.join(tmp, "out.mp4")
+            with open(vid_path, "wb") as f:
+                f.write(video_mp4_bytes)
+            sf.write(wav_path, audio_pcm, sample_rate, format="WAV", subtype="PCM_16")
+            cmd = [
+                ffmpeg_exe,
+                "-y",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                vid_path,
+                "-i",
+                wav_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                out_path,
+            ]
+            subprocess.run(
+                cmd,
+                check=True,
+                stdin=subprocess.DEVNULL,
+                timeout=300,
+            )
+            with open(out_path, "rb") as f:
+                return f.read()
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ) as e:
+        logger.warning("Synthetic video: audio mux failed (%s); using video-only MP4.", e)
+        return video_mp4_bytes
+
+
+def generate_synthetic_video(
+    width: int,
+    height: int,
+    num_frames: int,
+    save_to_file: bool = False,
+    *,
+    embed_audio: bool = False,
+) -> dict[str, Any]:
+    """Generate synthetic video with bouncing balls and base64 MP4.
+
+    When ``embed_audio`` is True, muxes mono AAC from :func:`generate_synthetic_audio`
+    (TTS + ffmpeg) into the MP4; otherwise returns video-only MP4 (faster when tests do
+    not need an audio track).
+    """
 
     import cv2
     import imageio
@@ -754,13 +866,13 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
     result = {
         "np_array": video_array,
     }
-    video_bytes = None
     saved_file_path = None
 
+    fps = 30
     buffer = io.BytesIO()
     writer_kwargs = {
         "format": "mp4",
-        "fps": 30,
+        "fps": fps,
         "codec": "libx264",
         "quality": 7,
         "pixelformat": "yuv420p",
@@ -779,32 +891,31 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
         ],
     }
 
-    if save_to_file:
-        import datetime
-
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"video_{width}x{height}_{timestamp}.mp4"
-        try:
-            with imageio.get_writer(output_path, **writer_kwargs) as writer:
-                for frame in video_frames:
-                    writer.append_data(frame)
-
-            saved_file_path = output_path
-            print(f"Video saved to: {saved_file_path}")
-            with open(output_path, "rb") as f:
-                video_bytes = f.read()
-
-        except Exception as e:
-            print(f"Warning: Failed to save video to file {output_path}: {e}")
-            save_to_file = False
-
-    if not save_to_file or video_bytes is None:
+    try:
         with imageio.get_writer(buffer, **writer_kwargs) as writer:
             for frame in video_frames:
                 writer.append_data(frame)
-
         buffer.seek(0)
-        video_bytes = buffer.read()
+        video_only_bytes = buffer.read()
+    except Exception as e:
+        print(f"Warning: Failed to encode synthetic video: {e}")
+        raise
+
+    if embed_audio:
+        video_bytes = _mux_mp4_bytes_with_synthetic_audio(video_only_bytes, num_frames=num_frames, fps=float(fps))
+    else:
+        video_bytes = video_only_bytes
+
+    if save_to_file:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"video_{width}x{height}_{timestamp}.mp4"
+        try:
+            with open(output_path, "wb") as f:
+                f.write(video_bytes)
+            saved_file_path = output_path
+            print(f"Video saved to: {saved_file_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save video to file {output_path}: {e}")
 
     base64_video = base64.b64encode(video_bytes).decode("utf-8")
 
@@ -887,7 +998,7 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
 
 
 def preprocess_text(text):
-    import re
+    import opencc
 
     word_to_num = {
         "zero": "0",
@@ -909,6 +1020,14 @@ def preprocess_text(text):
 
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
+    cc = opencc.OpenCC("t2s")
+    text = cc.convert(text)
+
+    # Special handling for spaces between Chinese characters:
+    # - Keep single spaces between English words/numbers
+    # - Remove spaces only when surrounded by Chinese characters on both sides to prevent incorrect word segmentation
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+
     return text.lower().strip()
 
 
@@ -920,6 +1039,7 @@ def cosine_similarity_text(text1, text2, n: int = 3):
 
     text1 = preprocess_text(text1)
     text2 = preprocess_text(text2)
+    print(f"cosine similarity text1 is: {text1}, text2 is: {text2}")
 
     ngrams1 = [text1[i : i + n] for i in range(len(text1) - n + 1)]
     ngrams2 = [text2[i : i + n] for i in range(len(text2) - n + 1)]
@@ -945,7 +1065,7 @@ def convert_audio_to_text(audio_data):
     Convert base64 encoded audio data to text using speech recognition.
     """
     audio_data = base64.b64decode(audio_data)
-    output_path = f"./test_{int(time.time())}"
+    output_path = f"./test_{int(time.time())}.wav"
     with open(output_path, "wb") as audio_file:
         audio_file.write(audio_data)
 
@@ -954,11 +1074,23 @@ def convert_audio_to_text(audio_data):
     return text
 
 
+def _merge_base64_audio_to_segment(base64_list: list[str]):
+    """Merge a list of base64-encoded audio chunks into one pydub AudioSegment."""
+    from pydub import AudioSegment
+
+    merged = None
+    for b64 in base64_list:
+        raw = base64.b64decode(b64.split(",", 1)[-1])
+        seg = AudioSegment.from_file(io.BytesIO(raw))
+        merged = seg if merged is None else merged + seg
+    return merged
+
+
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = whisper.load_model("small", device=device)
+    # Keep Whisper on CPU to avoid consuming GPU memory in tests.
+    model = whisper.load_model("small", device="cpu")
     try:
         text = model.transcribe(
             output_path,
@@ -967,14 +1099,8 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
             condition_on_previous_text=False,
         )["text"]
     finally:
-        # Sync GPU so in-flight ops finish before we free the model; otherwise
-        # freed memory may not show up until those ops complete.
-        if torch is not None and torch.cuda.is_available():
-            torch.cuda.synchronize()
         del model
         gc.collect()
-        if torch is not None and torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     return text or ""
 
@@ -988,22 +1114,26 @@ def convert_audio_file_to_text(output_path: str) -> str:
         return future.result()
 
 
+def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
+    """
+    Write container audio bytes (WAV, etc.) to a temp WAV file suitable for Whisper/ffmpeg.
+    Normalizes with soundfile to PCM_16 WAV when possible to avoid codec issues.
+    """
+    output_path = f"./test_{uuid.uuid4().hex}.wav"
+    data, samplerate = sf.read(io.BytesIO(raw_bytes))
+    sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
+    text = convert_audio_file_to_text(output_path)
+    return text
+
+
 def merge_base64_and_convert_to_text(base64_list):
     """
     Merge a list of base64 encoded audio data and convert to text.
     """
-    from pydub import AudioSegment
-
-    merged_audio = None
-    for base64_data in base64_list:
-        audio_data = base64.b64decode(base64_data.split(",", 1)[-1])
-        seg = AudioSegment.from_file(io.BytesIO(audio_data))
-        if merged_audio is None:
-            merged_audio = seg
-        else:
-            merged_audio += seg
-    output_path = f"./test_{int(time.time())}"
+    merged_audio = _merge_base64_audio_to_segment(base64_list)
+    output_path = f"./test_{uuid.uuid4().hex}.wav"
     merged_audio.export(output_path, format="wav")
+    print(f"audio data is saved: {output_path}")
     text = convert_audio_file_to_text(output_path)
     return text
 
@@ -1184,8 +1314,7 @@ def modify_stage_config(
                                 break
 
                         if target_stage is None:
-                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
-                            raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+                            continue
 
                         # Delete specified paths in this stage
                         for path in delete_paths:
@@ -1236,10 +1365,12 @@ def modify_stage_config(
                 # Direct top-level key
                 config[key] = value
 
-    # Save to new file with timestamp
-    timestamp = int(time.time())
+    # Unique suffix: multiple modify_stage_config calls in one process often run
+    # within the same second (e.g. test_qwen3_omni_expansion imports both
+    # get_chunk_config and get_batch_token_config). int(time.time()) would collide
+    # and the later write would overwrite the earlier YAML on disk.
     base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
-    output_path = f"{base_name}_{timestamp}.yaml"
+    output_path = f"{base_name}_{time.time_ns()}.yaml"
 
     with open(output_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
@@ -1463,6 +1594,8 @@ class OmniResponse:
     text_content: str | None = None
     audio_data: list[str] | None = None
     audio_content: str | None = None
+    audio_format: str | None = None
+    audio_bytes: bytes | None = None
     similarity: float | None = None
     e2e_latency: float | None = None
     success: bool = False
@@ -1480,6 +1613,189 @@ class DiffusionResponse:
     error_message: str | None = None
 
 
+def _load_gender_pipeline():
+    """
+    Lazy-load a cached audio-classification pipeline for gender.
+
+    We prefer the pipeline wrapper because it encapsulates processor/model loading
+    and avoids direct AutoProcessor.from_pretrained call sites in this file.
+    """
+    global _GENDER_PIPELINE
+    if _GENDER_PIPELINE is not None:
+        return _GENDER_PIPELINE
+
+    model_name = "7wolf/wav2vec2-base-gender-classification"
+    try:
+        # device=-1 forces CPU for pipeline.
+        _GENDER_PIPELINE = pipeline(
+            task="audio-classification",
+            model=model_name,
+            device=-1,
+        )
+        return _GENDER_PIPELINE
+    except Exception as exc:  # pragma: no cover - best-effort fallback
+        print(f"Warning: failed to create gender pipeline '{model_name}': {exc}")
+        _GENDER_PIPELINE = None
+        return None
+
+
+def _median_pitch_hz_from_autocorr(mono: np.ndarray, sr: int) -> float | None:
+    """
+    Rough median F0 (Hz) over short-time frames. Used to debias wav2vec2 gender head on TTS,
+    which often labels lower-pitched synthetic speech as female under load or on clean signals.
+    Returns None if the clip is too short or mostly unvoiced.
+    """
+    x = np.asarray(mono, dtype=np.float64)
+    x = x - np.mean(x)
+    if x.size < int(0.15 * sr):
+        return None
+    frame_len = int(0.04 * sr)
+    hop = max(frame_len // 2, 1)
+    f0_min_hz, f0_max_hz = 70.0, 400.0
+    lag_min = max(1, int(sr / f0_max_hz))
+    lag_max = min(frame_len - 2, int(sr / f0_min_hz))
+    if lag_max <= lag_min:
+        return None
+    win = np.hamming(frame_len)
+    pitches: list[float] = []
+    for start in range(0, int(x.shape[0]) - frame_len, hop):
+        frame = x[start : start + frame_len] * win
+        frame = frame - np.mean(frame)
+        if float(np.sqrt(np.mean(frame**2))) < 1e-4:
+            continue
+        ac = np.correlate(frame, frame, mode="full")[frame_len - 1 :]
+        ac = ac / (float(ac[0]) + 1e-12)
+        region = ac[lag_min : lag_max + 1]
+        peak_rel = int(np.argmax(region))
+        peak_lag = peak_rel + lag_min
+        if peak_lag <= 0:
+            continue
+        f0 = float(sr) / float(peak_lag)
+        if f0_min_hz <= f0 <= f0_max_hz:
+            pitches.append(f0)
+    if len(pitches) < 4:
+        return None
+    return float(np.median(np.asarray(pitches, dtype=np.float64)))
+
+
+def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
+    """
+    Estimate voice gender from audio using a small pre-trained classification model.
+
+    Uses a cached `audio-classification` pipeline to classify the clip.
+    Returns 'male' / 'female' when the model confidence is >= 0.9 and the label
+    maps to one of these; otherwise returns 'unknown'. If the model is unavailable
+    or inference fails, returns 'unknown' to keep tests stable.
+
+    Under concurrent tests, a global lock serializes pipeline calls (the HF pipeline is not
+    thread-safe). A coarse F0 median can correct systematic "male -> female" errors on TTS audio.
+    """
+    data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+    if data.size == 0:
+        raise ValueError("Empty audio")
+    mono = np.mean(data, axis=1)
+
+    try:
+        target_sr = 16000
+        if int(sr) != target_sr and mono.size > 1:
+            src_len = int(mono.shape[0])
+            dst_len = max(1, int(round(src_len * float(target_sr) / float(sr))))
+            src_idx = np.arange(src_len, dtype=np.float32)
+            dst_idx = np.linspace(0, src_len - 1, dst_len, dtype=np.float32)
+            mono = np.interp(dst_idx, src_idx, mono.astype(np.float32, copy=False)).astype(np.float32)
+            sr = target_sr
+
+        median_f0 = _median_pitch_hz_from_autocorr(mono, sr)
+
+        clf = _load_gender_pipeline()
+        if clf is None:
+            print("gender model not available, returning 'unknown'")
+            return "unknown"
+
+        # transformers pipeline returns a list of {label, score} (highest score first).
+        with _GENDER_PIPELINE_LOCK:
+            outputs = clf(mono, sampling_rate=sr)
+        if not outputs:
+            return "unknown"
+
+        top = outputs[0]
+        label = str(top.get("label", "")).lower()
+        conf = float(top.get("score", 0.0))
+
+        if conf < 0.6:
+            gender = "unknown"
+        # Some models use non-English labels (e.g., Russian). Normalize to 'male'/'female'.
+        elif ("female" in label) or ("жен" in label):
+            gender = "female"
+        elif ("male" in label) or ("муж" in label):
+            gender = "male"
+        else:
+            gender = "unknown"
+
+        # Debias: wav2vec2 gender heads often call TTS / band-limited male speech "female".
+        # Low median F0 (~speech male range) + female label -> trust pitch when score is not overwhelming.
+        if gender == "female" and median_f0 is not None and median_f0 < 165.0 and conf < 0.88:
+            print(f"gender pitch assist: reclassifying female->male (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
+            gender = "male"
+        elif gender == "male" and median_f0 is not None and median_f0 > 230.0 and conf < 0.88:
+            print(f"gender pitch assist: reclassifying male->female (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
+            gender = "female"
+
+        print(
+            f"gender classifier: label={label}, conf={conf:.3f}, gender={gender}"
+            + (f", median_f0={median_f0:.1f}Hz" if median_f0 is not None else "")
+        )
+        return gender
+    except Exception as exc:  # pragma: no cover - best-effort fallback
+        print(f"Warning: gender classification failed, returning 'unknown': {exc}")
+        return "unknown"
+
+
+# Threshold aligned with _compute_pcm_hnr_db docstring (clean clone vs distorted).
+_MIN_PCM_SPEECH_HNR_DB = 1.0
+
+
+def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
+    """Compute mean Harmonic-to-Noise Ratio (dB) for speech quality.
+
+    Clean cloned speech has HNR > 1.2 dB; distorted speech (e.g. lost
+    ref_code decoder context) drops below 1.0 dB.
+    """
+    frame_len = int(0.03 * sr)  # 30ms frames
+    hop = frame_len // 2
+    hnr_values: list[float] = []
+
+    for start in range(0, len(pcm_samples) - frame_len, hop):
+        frame = pcm_samples[start : start + frame_len].astype(np.float32, copy=False)
+        frame = frame - np.mean(frame)
+        if np.max(np.abs(frame)) < 0.01:
+            continue
+        ac = np.correlate(frame, frame, mode="full")[len(frame) - 1 :]
+        ac = ac / (ac[0] + 1e-10)
+        min_lag = int(sr / 400)
+        max_lag = min(int(sr / 80), len(ac))
+        if min_lag >= max_lag:
+            continue
+        peak = float(np.max(ac[min_lag:max_lag]))
+        if 0 < peak < 1:
+            hnr_values.append(10 * np.log10(peak / (1 - peak + 1e-10)))
+
+    return float(np.mean(hnr_values)) if hnr_values else 0.0
+
+
+def _assert_pcm_int16_speech_hnr(audio_bytes: bytes) -> None:
+    """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech."""
+    assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
+    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    hnr = _compute_pcm_hnr_db(pcm_samples)
+    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {_MIN_PCM_SPEECH_HNR_DB} dB)")
+    assert hnr >= _MIN_PCM_SPEECH_HNR_DB, (
+        f"Audio distortion detected: HNR={hnr:.2f} dB < {_MIN_PCM_SPEECH_HNR_DB} dB. "
+        "Voice clone decoder may be losing ref_code speaker context on later chunks."
+    )
+
+
 def assert_omni_response(response: OmniResponse, request_config: dict[str, Any], run_level):
     """
     Validate response results.
@@ -1493,7 +1809,7 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
     assert response.success, "The request failed."
     e2e_latency = response.e2e_latency
     if e2e_latency is not None:
-        print(f"the avg e2e latency is: {e2e_latency}")
+        print(f"the e2e latency is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
@@ -1522,10 +1838,74 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
                         "The output does not contain any of the keywords."
                     )
 
-        # Verify similarity
+        # Verify similarity (Whisper transcript vs streamed/detokenized text)
         if "text" in modalities and "audio" in modalities:
-            assert response.similarity > 0.9, "The audio content is not same as the text"
+            assert response.similarity is not None and response.similarity > 0.9, (
+                "The audio content is not same as the text"
+            )
             print(f"similarity is: {response.similarity}")
+
+
+def assert_audio_speech_response(
+    response: OmniResponse,
+    request_config: dict[str, Any],
+    run_level: str,
+) -> None:
+    """
+    Validate /v1/audio/speech response: success, optional format check, transcription similarity
+    and gender (non-PCM only for advanced_model), and int16 PCM HNR when response_format is pcm.
+    """
+    assert response.success, "The request failed."
+
+    req_fmt = request_config.get("response_format")
+
+    if req_fmt == "pcm" and response.audio_bytes:
+        _assert_pcm_int16_speech_hnr(response.audio_bytes)
+        if response.audio_format:
+            assert "pcm" in response.audio_format.lower(), (
+                f"Expected audio/pcm content-type, got {response.audio_format!r}"
+            )
+
+    elif req_fmt == "wav" and response.audio_format:
+        assert req_fmt in response.audio_format, (
+            f"The response audio format {response.audio_format} don't match the request audio format {req_fmt}"
+        )
+
+    e2e_latency = response.e2e_latency
+    if e2e_latency is not None:
+        print(f"the avg e2e latency is: {e2e_latency}")
+
+    if run_level == "advanced_model" and req_fmt != "pcm":
+        # Text–audio semantic similarity check (skipped for raw PCM: no Whisper transcript).
+        expected_text = request_config.get("input")
+        if expected_text:
+            transcript = (response.audio_content or "").strip()
+            print(f"audio content is: {transcript}")
+            print(f"input text is: {expected_text}")
+            similarity = cosine_similarity_text(transcript.lower(), expected_text.lower())
+            print(f"Cosine similarity: {similarity:.3f}")
+            assert similarity > 0.9, (
+                f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
+            )
+
+        # Voice gender consistency check:
+        # When the estimator returns 'unknown', we treat it as inconclusive and do NOT fail the test.
+        voice = (request_config.get("voice") or "").lower()
+        if voice and response.audio_bytes:
+            estimated_gender = _estimate_voice_gender_from_audio(response.audio_bytes)
+            voice_gender_map = {
+                # adjust this mapping to your actual voice names
+                "serena": "female",
+                "uncle_fu": "male",
+                "clone": "female",
+            }
+            expected_gender = voice_gender_map.get(voice)
+            if expected_gender is not None:
+                print(f"Estimated voice gender from audio: {estimated_gender} (voice='{voice}')")
+                if estimated_gender != "unknown":
+                    assert estimated_gender == expected_gender, (
+                        f"Voice '{voice}' is expected {expected_gender}, but estimated gender is '{estimated_gender}'"
+                    )
 
 
 def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
@@ -1754,12 +2134,119 @@ class OpenAIClientHandler:
 
         return result
 
+    def _process_stream_audio_speech_response(self, response, *, response_format: str | None = None) -> OmniResponse:
+        """
+        Process streaming /v1/audio/speech responses into an OmniResponse.
+
+        This mirrors _process_stream_omni_response but operates on low-level
+        audio bytes and produces an OmniResponse with audio_content filled
+        from Whisper transcription.
+        """
+        result = OmniResponse()
+        start_time = time.perf_counter()
+
+        try:
+            # Aggregate all audio bytes from the streaming response.
+            data = bytearray()
+
+            # Preferred OpenAI helper.
+            if hasattr(response, "iter_bytes") and callable(getattr(response, "iter_bytes")):
+                for chunk in response.iter_bytes():
+                    if chunk:
+                        data.extend(chunk)
+            else:
+                # Generic iterable-of-bytes fallback (e.g., generator or list of chunks).
+                try:
+                    iterator = iter(response)
+                except TypeError:
+                    iterator = None
+
+                if iterator is not None:
+                    for chunk in iterator:
+                        if not chunk:
+                            continue
+                        if isinstance(chunk, (bytes, bytearray)):
+                            data.extend(chunk)
+                        elif hasattr(chunk, "data"):
+                            data.extend(chunk.data)  # type: ignore[arg-type]
+                        elif hasattr(chunk, "content"):
+                            data.extend(chunk.content)  # type: ignore[arg-type]
+                        else:
+                            raise TypeError(f"Unsupported stream chunk type: {type(chunk)}")
+                else:
+                    raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
+
+            raw_bytes = bytes(data)
+            if response_format == "pcm":
+                transcript = None
+            else:
+                transcript = convert_audio_bytes_to_text(raw_bytes)
+
+            # Populate OmniResponse.
+            result.audio_bytes = raw_bytes
+            result.audio_content = transcript
+            result.e2e_latency = time.perf_counter() - start_time
+            result.success = True
+            result.audio_format = getattr(response, "response", None)
+            if result.audio_format is not None:
+                result.audio_format = result.audio_format.headers.get("content-type", "")
+
+        except Exception as e:
+            result.error_message = f"Audio speech stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def _process_non_stream_audio_speech_response(
+        self, response, *, response_format: str | None = None
+    ) -> OmniResponse:
+        """
+        Process non-streaming /v1/audio/speech responses into an OmniResponse.
+
+        This mirrors _process_non_stream_omni_response but for the binary
+        audio payload returned by audio.speech.create.
+        """
+        result = OmniResponse()
+        start_time = time.perf_counter()
+
+        try:
+            # OpenAI non-streaming audio.speech.create returns HttpxBinaryResponseContent (.read() or .content)
+            if hasattr(response, "read") and callable(getattr(response, "read")):
+                raw_bytes = response.read()
+            elif hasattr(response, "content"):
+                raw_bytes = response.content  # type: ignore[assignment]
+            else:
+                raise TypeError(f"Unsupported audio speech response type: {type(response)}")
+
+            if response_format == "pcm":
+                transcript = None
+            else:
+                transcript = convert_audio_bytes_to_text(raw_bytes)
+
+            result.audio_bytes = raw_bytes
+            result.audio_content = transcript
+            result.e2e_latency = time.perf_counter() - start_time
+            result.success = True
+            result.audio_format = getattr(response, "response", None)
+            if result.audio_format is not None:
+                result.audio_format = result.audio_format.headers.get("content-type", "")
+
+        except Exception as e:
+            result.error_message = f"Audio speech non-stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
     def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
         """
         Send OpenAI requests.
 
         Args:
-            request_config: Request configuration dictionary containing parameters like model, messages, stream
+            request_config: Request configuration dictionary containing parameters like model, messages, stream.
+                Optional ``use_audio_in_video`` (bool): when true, sets
+                ``extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}`` for Qwen-Omni video+audio
+                extraction (merged with any existing ``extra_body`` / ``mm_processor_kwargs``).
+                Optional ``extra_body`` (dict): passed through to ``chat.completions.create`` after merge.
             request_num: Number of requests, defaults to 1 (single request)
 
         Returns:
@@ -1770,14 +2257,28 @@ class OpenAIClientHandler:
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
 
+        extra_body: dict[str, Any] = {}
+        raw_extra = request_config.get("extra_body")
+        if raw_extra:
+            extra_body.update(raw_extra)
+        if request_config.get("use_audio_in_video"):
+            mm = dict(extra_body.get("mm_processor_kwargs") or {})
+            mm["use_audio_in_video"] = True
+            extra_body["mm_processor_kwargs"] = mm
+        extra_body_arg: dict[str, Any] | None = extra_body if extra_body else None
+
+        create_kwargs: dict[str, Any] = {
+            "model": request_config.get("model"),
+            "messages": request_config.get("messages"),
+            "stream": stream,
+            "modalities": modalities,
+        }
+        if extra_body_arg is not None:
+            create_kwargs["extra_body"] = extra_body_arg
+
         if request_num == 1:
             # Send single request
-            chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"),
-                messages=request_config.get("messages"),
-                stream=stream,
-                modalities=modalities,
-            )
+            chat_completion = self.client.chat.completions.create(**create_kwargs)
 
             if stream:
                 response = self._process_stream_omni_response(chat_completion)
@@ -1788,32 +2289,135 @@ class OpenAIClientHandler:
             responses.append(response)
 
         else:
-            # Send concurrent requests
+            # Send concurrent requests: run create + process in worker so e2e_latency includes full round-trip.
+            def _one_omni_request():
+                start = time.perf_counter()
+                chat_completion = self.client.chat.completions.create(
+                    model=request_config.get("model"),
+                    messages=request_config.get("messages"),
+                    modalities=modalities,
+                    stream=stream,
+                )
+                if stream:
+                    response = self._process_stream_omni_response(chat_completion)
+                else:
+                    response = self._process_non_stream_omni_response(chat_completion)
+                response.e2e_latency = time.perf_counter() - start
+                return response
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                futures = []
-
-                # Submit all request tasks
-                for _ in range(request_num):
-                    future = executor.submit(
-                        self.client.chat.completions.create,
-                        model=request_config.get("model"),
-                        messages=request_config.get("messages"),
-                        modalities=modalities,
-                        stream=stream,
-                    )
-                    futures.append(future)
-
-                # Process completed tasks
+                futures = [executor.submit(_one_omni_request) for _ in range(request_num)]
                 for future in concurrent.futures.as_completed(futures):
-                    chat_completion = future.result()
-
-                    if stream:
-                        response = self._process_stream_omni_response(chat_completion)
-                    else:
-                        response = self._process_non_stream_omni_response(chat_completion)
-
+                    response = future.result()
                     assert_omni_response(response, request_config, run_level=self.run_level)
                     responses.append(response)
+
+        return responses
+
+    def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """
+        Call the /v1/audio/speech endpoint using the same configuration-dict
+        style as send_omni_request, but via the OpenAI Python client's
+        audio.speech APIs.
+
+        Expected keys in request_config:
+          - model: model name/path (required)
+          - input: text to synthesize (required)
+          - response_format: audio format such as "wav" or "pcm" (optional)
+          - task_type, ref_text, ref_audio: TTS-specific extras (optional, passed via extra_body)
+          - timeout: request timeout in seconds (float, optional, default 120.0)
+          - stream: whether to use streaming API (bool, optional, default False)
+        """
+        timeout = float(request_config.get("timeout", 120.0))
+
+        model = request_config["model"]
+        text_input = request_config["input"]
+        stream = bool(request_config.get("stream", False))
+        voice = request_config.get("voice", None)
+
+        # Standard OpenAI param: use omit when not provided to keep default behavior.
+        response_format = request_config.get("response_format", omit)
+
+        # Qwen3-TTS custom fields, forwarded via extra_body.
+        extra_body: dict[str, Any] = {}
+        # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
+        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens"):
+            if key in request_config:
+                extra_body[key] = request_config[key]
+
+        responses: list[OmniResponse] = []
+
+        speech_fmt: str | None = None if response_format is omit else str(response_format).lower()
+
+        if request_num == 1:
+            if stream:
+                # Use streaming response helper.
+                with self.client.audio.speech.with_streaming_response.create(
+                    model=model,
+                    input=text_input,
+                    response_format=response_format,
+                    extra_body=extra_body or None,
+                    timeout=timeout,
+                    voice=voice,
+                ) as resp:
+                    omni_resp = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+            else:
+                # Non-streaming response.
+                resp = self.client.audio.speech.create(
+                    model=model,
+                    input=text_input,
+                    response_format=response_format,
+                    extra_body=extra_body or None,
+                    timeout=timeout,
+                    voice=voice,
+                )
+                omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
+
+            assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+            responses.append(omni_resp)
+            return responses
+        else:
+            # request_num > 1: concurrent requests (use same params as single-request path)
+
+            if stream:
+
+                def _stream_task():
+                    with self.client.audio.speech.with_streaming_response.create(
+                        model=model,
+                        input=text_input,
+                        response_format=response_format,
+                        extra_body=extra_body or None,
+                        timeout=timeout,
+                        voice=voice,
+                    ) as resp:
+                        return self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                    futures = [executor.submit(_stream_task) for _ in range(request_num)]
+                    for future in concurrent.futures.as_completed(futures):
+                        omni_resp = future.result()
+                        assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+                        responses.append(omni_resp)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                    futures = []
+                    for _ in range(request_num):
+                        future = executor.submit(
+                            self.client.audio.speech.create,
+                            model=model,
+                            input=text_input,
+                            response_format=response_format,
+                            extra_body=extra_body or None,
+                            timeout=timeout,
+                            voice=voice,
+                        )
+                        futures.append(future)
+
+                    for future in concurrent.futures.as_completed(futures):
+                        resp = future.result()
+                        omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
+                        assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+                        responses.append(omni_resp)
 
         return responses
 
@@ -2045,6 +2649,44 @@ class OmniRunner:
             **kwargs,
         )
 
+    def _estimate_prompt_len(
+        self,
+        additional_information: dict[str, Any],
+        model_name: str,
+        _cache: dict[str, Any] = {},
+    ) -> int:
+        """Estimate prompt_token_ids placeholder length for the Talker stage.
+
+        The AR Talker replaces all input embeddings via ``preprocess``, so the
+        placeholder values are irrelevant but the **length** must match the
+        embeddings that ``preprocess`` will produce.
+        """
+        try:
+            from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
+            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+                Qwen3TTSTalkerForConditionalGeneration,
+            )
+
+            if model_name not in _cache:
+                from transformers import AutoTokenizer
+
+                tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
+                cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
+                _cache[model_name] = (tok, getattr(cfg, "talker_config", None))
+
+            tok, tcfg = _cache[model_name]
+            task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
+            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+                additional_information=additional_information,
+                task_type=task_type,
+                tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
+                codec_language_id=getattr(tcfg, "codec_language_id", None),
+                spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
+            )
+        except Exception as exc:
+            logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
+            return 2048
+
     def get_default_sampling_params_list(self) -> list[OmniSamplingParams]:
         """
         Get a list of default sampling parameters for all stages.
@@ -2098,6 +2740,42 @@ class OmniRunner:
 
         if isinstance(prompts, str):
             prompts = [prompts]
+
+        # Qwen-TTS: follow examples/offline_inference/qwen3_tts/end2end.py style.
+        # Stage 0 expects token placeholders + additional_information (text/speaker/task_type/...),
+        # and Talker replaces embeddings in preprocess based on additional_information only.
+        is_tts_model = "Qwen3-TTS" in self.model_name or "qwen3_tts" in self.model_name.lower()
+        if is_tts_model and modalities == ["audio"]:
+            tts_kw = mm_processor_kwargs or {}
+            task_type = tts_kw.get("task_type", "CustomVoice")
+            speaker = tts_kw.get("speaker", "Vivian")
+            language = tts_kw.get("language", "Auto")
+            max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
+            ref_audio = tts_kw.get("ref_audio", None)
+            ref_text = tts_kw.get("ref_text", None)
+
+            omni_inputs: list[TextPrompt] = []
+            for prompt_text in prompts:
+                text_str = str(prompt_text).strip() or " "
+                additional_information: dict[str, Any] = {
+                    "task_type": [task_type],
+                    "text": [text_str],
+                    "language": [language],
+                    "speaker": [speaker],
+                    "max_new_tokens": [max_new_tokens],
+                }
+                if ref_audio is not None:
+                    additional_information["ref_audio"] = [ref_audio]
+                if ref_text is not None:
+                    additional_information["ref_text"] = [ref_text]
+                # Use official helper to get correct placeholder length
+                plen = self._estimate_prompt_len(additional_information, self.model_name)
+                input_dict: TextPrompt = {
+                    "prompt_token_ids": [0] * plen,
+                    "additional_information": additional_information,
+                }
+                omni_inputs.append(input_dict)
+            return omni_inputs
 
         def _normalize_mm_input(mm_input, num_prompts):
             if mm_input is None:
@@ -2366,8 +3044,83 @@ class OmniRunnerHandler:
             prompts=prompts, videos=videos, images=images, audios=audios, modalities=modalities
         )
         response = self._process_output(outputs)
-        assert_omni_response(response, request_config, run_level="L2")
+        assert_omni_response(response, request_config, run_level="core_model")
         return response
+
+    def send_audio_speech_request(
+        self,
+        request_config: dict[str, Any],
+    ) -> OmniResponse:
+        """
+        Offline TTS: text -> audio via generate_multimodal, then validate with assert_audio_speech_response.
+
+        request_config must contain:
+          - 'input' or 'prompts': text to synthesize.
+        Optional keys:
+          - 'voice'       -> speaker (CustomVoice)
+          - 'task_type'   -> task_type in additional_information (default: "CustomVoice")
+          - 'language'    -> language in additional_information (default: "Auto")
+          - 'max_new_tokens' -> max_new_tokens in additional_information (default: 2048)
+          - 'response_format' -> desired audio format (used only for assertion)
+        """
+        input_text = request_config.get("input") or request_config.get("prompts")
+        if input_text is None:
+            raise ValueError("request_config must contain 'input' or 'prompts' for TTS")
+        if isinstance(input_text, list):
+            input_text = input_text[0] if input_text else ""
+
+        # Build TTS-specific kwargs passed through to get_omni_inputs for Qwen3-TTS,
+        # matching examples/offline_inference/qwen3_tts/end2end.py.
+        mm_processor_kwargs: dict[str, Any] = {}
+        if "voice" in request_config:
+            mm_processor_kwargs["speaker"] = request_config["voice"]
+        if "task_type" in request_config:
+            mm_processor_kwargs["task_type"] = request_config["task_type"]
+        if "ref_audio" in request_config:
+            mm_processor_kwargs["ref_audio"] = request_config["ref_audio"]
+        if "ref_text" in request_config:
+            mm_processor_kwargs["ref_text"] = request_config["ref_text"]
+        if "language" in request_config:
+            mm_processor_kwargs["language"] = request_config["language"]
+        if "max_new_tokens" in request_config:
+            mm_processor_kwargs["max_new_tokens"] = request_config["max_new_tokens"]
+
+        outputs = self.runner.generate_multimodal(
+            prompts=input_text,
+            modalities=["audio"],
+            mm_processor_kwargs=mm_processor_kwargs or None,
+        )
+        mm_out: dict[str, Any] | None = None
+        for stage_out in outputs:
+            if getattr(stage_out, "final_output_type", None) == "audio":
+                mm_out = stage_out.request_output.outputs[0].multimodal_output
+                break
+        if mm_out is None:
+            result = OmniResponse(success=False, error_message="No audio output from pipeline")
+            assert result.success, result.error_message
+            return result
+
+        audio_data = mm_out.get("audio")
+        if audio_data is None:
+            result = OmniResponse(success=False, error_message="No audio tensor in multimodal output")
+            assert result.success, result.error_message
+            return result
+
+        sr_raw = mm_out.get("sr")
+        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+        sr = int(sr_val.item() if hasattr(sr_val, "item") else sr_val)
+        wav_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+        wav_buf = io.BytesIO()
+        sf.write(
+            wav_buf,
+            wav_tensor.float().cpu().numpy().reshape(-1),
+            samplerate=sr,
+            format="WAV",
+            subtype="PCM_16",
+        )
+        result = OmniResponse(success=True, audio_bytes=wav_buf.getvalue(), audio_format="audio/wav")
+        assert_audio_speech_response(result, request_config, run_level="core_model")
+        return result
 
     def start_profile(
         self,

@@ -216,44 +216,42 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  # - label: "Omni Model Test with H100"
-  #   depends_on: upload-ready-pipeline
-  #   commands:
-  #     - |
-  #       timeout 20m bash -c '
-  #         export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  #         export VLLM_TEST_CLEAN_GPU_MEMORY="1"
-  #         # - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
-  #         pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "core_model" --run-level "core_model"
-  #       '
-  #   agents:
-  #     queue: "mithril-h100-pool"
-  #   plugins:
-  #     - kubernetes:
-  #         podSpec:
-  #           containers:
-  #             - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-  #               resources:
-  #                 limits:
-  #                   nvidia.com/gpu: 2
-  #               volumeMounts:
-  #                 - name: devshm
-  #                   mountPath: /dev/shm
-  #                 - name: hf-cache
-  #                   mountPath: /root/.cache/huggingface
-  #               env:
-  #                 - name: HF_HOME
-  #                   value: /root/.cache/huggingface
-  #           nodeSelector:
-  #             node.kubernetes.io/instance-type: gpu-h100-sxm
-  #           volumes:
-  #             - name: devshm
-  #               emptyDir:
-  #                 medium: Memory
-  #             - name: hf-cache
-  #               hostPath:
-  #                 path: /mnt/hf-cache
-  #                 type: DirectoryOrCreate
+  - label: "Omni Model Test with H100"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 20m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "core_model" --run-level "core_model"
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 2
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
 
   - label: "MiMo-Audio E2E Test with H100"
     depends_on: upload-ready-pipeline
@@ -303,13 +301,13 @@ steps:
     commands:
       - |
         timeout 20m bash -c '
-          huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
           export VLLM_LOGGING_LEVEL=DEBUG
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
-          pytest -s -v tests/e2e/online_serving/test_qwen3_tts.py -k "not NoAsyncChunk"
+          export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m "core_model" --run-level "core_model"
         '
     agents:
-      queue: "gpu_4_queue"
+      queue: "gpu_1_queue"
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT

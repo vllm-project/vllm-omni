@@ -118,6 +118,23 @@ class AsyncOmni(EngineClient, OmniBase):
         """Compatibility helper for call sites expecting async vllm config access."""
         return self.vllm_config
 
+    def get_diffusion_od_config(self) -> Any | None:
+        """Return the diffusion-stage config when the pipeline has one."""
+        for stage_client in self.engine.stage_clients:
+            if getattr(stage_client, "stage_type", None) != "diffusion":
+                continue
+
+            od_config = getattr(stage_client, "od_config", None)
+            if od_config is not None:
+                return od_config
+
+            inner_engine = getattr(stage_client, "_engine", None)
+            od_config = getattr(inner_engine, "od_config", None)
+            if od_config is not None:
+                return od_config
+
+        return None
+
     @property
     def model_config(self):
         """Return the model config for the comprehension stage when present."""
