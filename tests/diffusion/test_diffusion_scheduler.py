@@ -664,14 +664,15 @@ class TestStepScheduler:
         assert outputs[1].request_id == "req-b"
         assert outputs[0].final_output_type == "audio"
         assert outputs[1].final_output_type == "audio"
-        assert len(outputs[0].multimodal_output["audio"]) == 2
-        assert len(outputs[1].multimodal_output["audio"]) == 2
+        # Each payload must be a (K, ...) slice with the batch dim preserved.
+        assert outputs[0].multimodal_output["audio"].shape == (2, 3)
+        assert outputs[1].multimodal_output["audio"].shape == (2, 3)
         torch.testing.assert_close(
-            torch.stack(outputs[0].multimodal_output["audio"]),
+            outputs[0].multimodal_output["audio"],
             torch.arange(6, dtype=torch.float32).reshape(2, 3),
         )
         torch.testing.assert_close(
-            torch.stack(outputs[1].multimodal_output["audio"]),
+            outputs[1].multimodal_output["audio"],
             torch.arange(6, 12, dtype=torch.float32).reshape(2, 3),
         )
 
@@ -680,9 +681,7 @@ class TestStepScheduler:
         engine.od_config = Mock(model_class_name="mock_image_model", enable_cpu_offload=False)
         engine.pre_process_func = None
         engine.post_process_func = None
-        engine.add_req_and_wait_for_response = Mock(
-            return_value=DiffusionOutput(output="image-bytes")
-        )
+        engine.add_req_and_wait_for_response = Mock(return_value=DiffusionOutput(output="image-bytes"))
 
         request = _make_request("timing")
 

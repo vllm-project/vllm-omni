@@ -140,8 +140,7 @@ class DiffusionEngine:
                 output_data = output_data.cpu()
             elif isinstance(output_data, tuple):
                 output_data = tuple(
-                    t.cpu() if isinstance(t, torch.Tensor) and t.device.type != "cpu" else t
-                    for t in output_data
+                    t.cpu() if isinstance(t, torch.Tensor) and t.device.type != "cpu" else t for t in output_data
                 )
 
         postprocess_start_time = time.perf_counter()
@@ -166,17 +165,11 @@ class DiffusionEngine:
         # Evaluate once; used in both single- and multi-prompt branches below.
         is_audio_output = supports_audio_output(self.od_config.model_class_name)
 
-        # Normalize outputs to a flat per-sample list.
-        # Audio models return a batched tensor [N*K, ...]; split along dim-0 so
-        # per-prompt slicing works uniformly for single and multiple prompts.
-        if is_audio_output and not isinstance(outputs, list):
-            if outputs is not None and hasattr(outputs, "__len__") and hasattr(outputs, "__getitem__"):
-                outputs = list(outputs)  # splits tensor/ndarray along axis-0
-            elif outputs is not None:
-                outputs = [outputs]
-            else:
-                outputs = []
-        elif not isinstance(outputs, list):
+        # For image models, normalize to a flat list of per-output items.
+        # Audio models return a batched tensor shaped (N*K, C, T); keep it
+        # as-is and slice per-prompt below so the batch dimension is preserved
+        # in every per-request payload (e.g. (K, C, T) per prompt).
+        if not is_audio_output and not isinstance(outputs, list):
             outputs = [outputs] if outputs is not None else []
 
         metrics = {
@@ -195,7 +188,8 @@ class DiffusionEngine:
             request_id = request.request_ids[0] if request.request_ids else ""
 
             if is_audio_output:
-                request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
+                num_outputs = request.sampling_params.num_outputs_per_prompt
+                request_audio_payload = outputs[0:num_outputs] if outputs is not None else None
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -243,7 +237,7 @@ class DiffusionEngine:
                 output_idx = end_idx
 
                 if is_audio_output:
-                    request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
+                    request_audio_payload = outputs[start_idx:end_idx] if outputs is not None else None
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
