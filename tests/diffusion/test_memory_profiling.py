@@ -25,25 +25,15 @@ def memory_profiling_module() -> Generator[ModuleType, None, None]:
         if _is_vllm_related(name):
             original_modules[name] = sys.modules.pop(name)
 
-    # The module now exists at vllm_omni/diffusion/memory_profiling.py.
-    import importlib.util
-    from pathlib import Path
+    # Use importlib.import_module so Python resolves the module normally.
+    # Fall back to skip if vllm_omni is not installed (e.g., in environments
+    # where the full package is not importable).
+    import importlib
 
-    def _find_repo_root(start: Path) -> Path:
-        current = start.resolve()
-        while current != current.parent:
-            if (current / "pyproject.toml").exists():
-                return current
-            current = current.parent
-        raise FileNotFoundError(f"Could not find repo root from {start}")
-
-    repo_root = _find_repo_root(Path(__file__).resolve())
-    mem_prof_path = repo_root / "vllm_omni" / "diffusion" / "memory_profiling.py"
-
-    spec = importlib.util.spec_from_file_location("vllm_omni.diffusion.memory_profiling", mem_prof_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    try:
+        module = importlib.import_module("vllm_omni.diffusion.memory_profiling")
+    except ModuleNotFoundError:
+        pytest.skip("vllm_omni.diffusion.memory_profiling is not available")
 
     yield module
 
