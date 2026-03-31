@@ -4,7 +4,6 @@ librosa>=0.11.0
 resampy>=0.4.3
 diffusers>=0.36.0
 accelerate==1.12.0
-gradio==5.50
 soundfile>=0.13.1
 cache-dit==1.3.0
 tqdm>=4.66.0
@@ -18,3 +17,4 @@ prettytable>=3.8.0
 aenum==3.1.16
 pyzmq>=25.0.0
 janus>=1.0.0
+pydub

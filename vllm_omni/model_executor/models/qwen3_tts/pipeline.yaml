@@ -59,8 +59,8 @@ stages:
       engine_output_type: audio
       gpu_memory_utilization: 0.08
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 8192
-      max_model_len: 32768
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
     input_connectors:
       from_stage_0: connector_of_shared_memory
     tts_args:

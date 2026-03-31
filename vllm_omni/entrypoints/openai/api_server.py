@@ -84,8 +84,10 @@ from vllm.utils.system_utils import decorate_logs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
+    SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64,
     parse_size,
+    validate_layered_layers,
 )
 from vllm_omni.entrypoints.openai.protocol.audio import BatchSpeechRequest, OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
@@ -116,8 +118,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 logger = init_logger(__name__)
 router = APIRouter()
 
-# Supported resolution buckets for layered models (e.g., Qwen-Image-Layered)
-SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 profiler_router = APIRouter()
 
 
@@ -1207,38 +1207,16 @@ _remove_route_from_router(router, "/v1/models")
 
 @router.get("/v1/models")
 async def show_available_models(raw_request: Request) -> JSONResponse:
-    """Show available models endpoint that works for both LLM and diffusion modes.
+    """Show available models for both LLM and diffusion modes.
 
-    Returns model information in OpenAI-compatible format.
+    Delegates to state.openai_serving_models which is set to either
+    OpenAIServingModels (LLM) or _DiffusionServingModels (pure diffusion).
     """
-    # Check if we're in diffusion mode
-    diffusion_model_name = getattr(raw_request.app.state, "diffusion_model_name", None)
-    if diffusion_model_name is not None:
-        # Diffusion mode - return the loaded model
-        return JSONResponse(
-            content={
-                "object": "list",
-                "data": [
-                    {
-                        "id": diffusion_model_name,
-                        "object": "model",
-                        "created": 0,
-                        "owned_by": "vllm-omni",
-                        "permission": [],
-                    }
-                ],
-            }
-        )
-
-    # LLM mode - delegate to openai_serving_models
-    openai_serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
-    if openai_serving_models is not None:
-        models = await openai_serving_models.show_available_models()
+    handler = getattr(raw_request.app.state, "openai_serving_models", None)
+    if handler is not None:
+        models = await handler.show_available_models()
         return JSONResponse(content=models.model_dump())
-
-    return JSONResponse(
-        content={"object": "list", "data": []},
-    )
+    return JSONResponse(content={"object": "list", "data": []})
 
 
 # Image generation API endpoints
@@ -1314,6 +1292,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
+        _update_if_not_none(gen_params, "layers", request.layers)
 
         request_id = f"img_gen-{random_uuid()}"
 
@@ -1428,6 +1407,11 @@ async def edit_images(
         if not input_images_list:
             raise HTTPException(status_code=422, detail="Field 'image' or 'url' is required")
         pil_images = await _load_input_images(input_images_list)
+        if len(pil_images) > 1 and not _supports_multimodal_image_inputs(raw_request, engine_client):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Received multiple input images. Only a single image is supported by this model.",
+            )
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
@@ -1462,11 +1446,13 @@ async def edit_images(
                 detail=f"Invalid resolution {resolution}. Supported resolutions: {SUPPORTED_LAYERED_RESOLUTIONS}.",
             )
         # 3.2.1 Validate layers if provided
-        if layers is not None and layers < 1:
+        try:
+            layers = validate_layered_layers(layers)
+        except ValueError as e:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
-                detail=f"Invalid layers value {layers}. layers must be >= 1.",
-            )
+                detail=str(e),
+            ) from e
         # 3.2.2 Check for conflicting size and resolution parameters
         if resolution is not None and size.lower() != "auto":
             raise HTTPException(
@@ -1604,6 +1590,20 @@ def _get_engine_and_model(raw_request: Request):
         model_name = "unknown"
 
     return engine_client, model_name, normalized_stage_configs
+
+
+def _supports_multimodal_image_inputs(raw_request: Request, engine_client: Any) -> bool:
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None) or engine_client
+    get_diffusion_od_config = getattr(diffusion_engine, "get_diffusion_od_config", None)
+    od_config = (
+        get_diffusion_od_config() if callable(get_diffusion_od_config) else getattr(diffusion_engine, "od_config", None)
+    )
+
+    if od_config is None:
+        # Preserve the existing compatibility behavior when the diffusion
+        # config is not exposed on the serving surface.
+        return True
+    return bool(getattr(od_config, "supports_multimodal_inputs", False))
 
 
 def _get_lora_from_json_str(lora_body):
@@ -1775,10 +1775,27 @@ def _choose_output_format(output_format: str | None, background: str | None) -> 
     return "jpeg"
 
 
+def _prepare_image_for_output_format(image: Image.Image, format: str) -> Image.Image:
+    fmt = format.lower()
+    if fmt not in {"jpg", "jpeg"}:
+        return image
+
+    if image.mode == "RGB":
+        return image
+
+    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+        alpha_image = image.convert("RGBA")
+        flattened = Image.new("RGB", alpha_image.size, (255, 255, 255))
+        flattened.paste(alpha_image, mask=alpha_image.getchannel("A"))
+        return flattened
+
+    return image.convert("RGB")
+
+
 def _encode_image_base64_with_compression(
     image: Image.Image, format: str = "png", output_compression: int = 100
 ) -> str:
-    """Encode PIL Image to base64 PNG string.
+    """Encode PIL Image to a base64 image string.
 
     Args:
         image: PIL Image object
@@ -1788,6 +1805,7 @@ def _encode_image_base64_with_compression(
         Base64-encoded image as string
     """
     buffer = io.BytesIO()
+    image = _prepare_image_for_output_format(image, format)
     save_kwargs = {}
     if format in ("jpg", "jpeg", "webp"):
         save_kwargs["quality"] = output_compression
