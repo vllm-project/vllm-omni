@@ -36,6 +36,8 @@ except Exception:
     normalize_spk_id_map = _mod.normalize_spk_id_map
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 class TestSpeakerCaseSensitivity:
     """Test that speaker name lookup is case-insensitive."""
 
