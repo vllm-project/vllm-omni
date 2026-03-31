@@ -20,6 +20,24 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig
 logger = init_logger(__name__)
 
 
+def enable_hunyuan_image3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """
+    Enable TeaCache for HunyuanImage3 model.
+
+    HunyuanImage3 uses a GPT-based architecture with KV cache, which is incompatible
+    with the standard hook-based TeaCache approach. Instead, we store the TeaCacheConfig
+    on the pipeline so the denoising loop can implement caching directly.
+    """
+    teacache_config = TeaCacheConfig(
+        transformer_type="HunyuanImage3Pipeline",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    pipeline._tea_cache_config = teacache_config
+
+    logger.info(f"TeaCache enabled for HunyuanImage3 with rel_l1_thresh={teacache_config.rel_l1_thresh}")
+
+
 def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     """
     Enable TeaCache for Bagel model.
@@ -70,6 +88,7 @@ def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> 
 CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
+    "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
 }
 
 
@@ -157,6 +176,17 @@ class TeaCacheBackend(CacheBackend):
                                 Currently not used by TeaCache but accepted for interface consistency.
             verbose: Whether to log refresh operations (default: True)
         """
+        # HunyuanImage3: tea cache state is managed inside the denoising loop,
+        # so refresh is a no-op (state is re-initialized every __call__).
+        if (
+            hasattr(pipeline, "_tea_cache_config")
+            and isinstance(pipeline._tea_cache_config, TeaCacheConfig)
+            and pipeline.__class__.__name__ == "HunyuanImage3Pipeline"
+        ):
+            if verbose:
+                logger.debug(f"TeaCache state refreshed for HunyuanImage3 (num_inference_steps={num_inference_steps})")
+            return
+
         # Extract transformer from pipeline
         transformer = pipeline.transformer
 

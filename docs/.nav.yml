@@ -6,6 +6,7 @@ nav:
     - getting_started/installation/*
   - Serving:
     - OpenAI-Compatible API:
+      - Diffusion Chat API: serving/diffusion_chat_api.md
       - Image Generation: serving/image_generation_api.md
       - Image Edit: serving/image_edit_api.md
       - Text to Speech: serving/speech_api.md
@@ -53,20 +54,28 @@ nav:
   - Features:
     - Sleep Mode: features/sleep_mode.md
     - Diffusion Features:
-      - Acceleration Overview: user_guide/diffusion_acceleration.md
-      - TeaCache: user_guide/diffusion/teacache.md
-      - Cache-DiT: user_guide/diffusion/cache_dit_acceleration.md
+      - Overview: user_guide/diffusion_features.md
+      - Feature Compatibility: user_guide/feature_compatibility.md
+      - Cache Acceleration:
+        - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
+        - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
       - Quantization:
         - Overview: user_guide/diffusion/quantization/overview.md
         - FP8: user_guide/diffusion/quantization/fp8.md
         - Int8: user_guide/diffusion/quantization/int8.md
         - GGUF: user_guide/diffusion/quantization/gguf.md
-      - Step Execution: user_guide/diffusion/step_execution.md
-      - Parallelism Acceleration: user_guide/diffusion/parallelism_acceleration.md
+      - Parallelism:
+        - Overview: user_guide/diffusion/parallelism/overview.md
+        - CFG Parallel: user_guide/diffusion/parallelism/cfg_parallel.md
+        - Expert Parallel: user_guide/diffusion/parallelism/expert_parallel.md
+        - Hybrid Sharded Data Parallel: user_guide/diffusion/parallelism/hsdp.md
+        - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
+        - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
+        - VAE Patch Parallel: user_guide/diffusion/parallelism/vae_patch_parallel.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
       - LoRA: user_guide/diffusion/lora.md
-      - Hybrid Sharded Data Parallel: design/feature/hsdp.md
       - Custom Pipeline: features/custom_pipeline.md
+      - Step Execution: user_guide/diffusion/step_execution.md
     - ComfyUI: features/comfyui.md
 - Developer Guide:
   - General:
@@ -91,6 +100,8 @@ nav:
       - design/feature/cfg_parallel.md
       - design/feature/sequence_parallel.md
       - design/feature/tensor_parallel.md
+      - design/feature/vae_parallel.md
+      - design/feature/hsdp.md
       - design/feature/cache_dit.md
       - design/feature/teacache.md
       - design/feature/async_chunk_design.md
