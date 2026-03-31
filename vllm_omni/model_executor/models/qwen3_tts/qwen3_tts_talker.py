@@ -27,7 +27,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, 
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.models.qwen3_tts.speaker_utils import normalize_spk_id_map
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
@@ -1451,7 +1450,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
             if not speaker:
                 raise ValueError("CustomVoice requires additional_information.speaker.")
-            spk_id_map = normalize_spk_id_map(getattr(self.talker_config, "spk_id", None))
+            spk_id_map = {k.lower(): v for k, v in (getattr(self.talker_config, "spk_id", None) or {}).items()}
             if speaker not in spk_id_map:
                 raise ValueError(f"Unsupported speaker: {speaker}")
             spk_id = spk_id_map[speaker]
