@@ -29,8 +29,6 @@ class CUDAGraphDecoderWrapper:
         output = wrapper.decode(codes)  # Automatically uses CUDA graph if possible
     """
 
-    DEFAULT_CAPTURE_SIZES = [2, 4, 8, 16, 25, 32, 50, 100, 150, 200, 250, 300]
-
     def __init__(
         self,
         decoder: torch.nn.Module,
@@ -39,7 +37,8 @@ class CUDAGraphDecoderWrapper:
         enabled: bool = True,
     ):
         self.decoder = decoder
-        self.capture_sizes = capture_sizes or self.DEFAULT_CAPTURE_SIZES
+        self._explicit_sizes = capture_sizes is not None
+        self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
         self.num_quantizers = num_quantizers
         self.enabled = enabled
 
@@ -50,66 +49,82 @@ class CUDAGraphDecoderWrapper:
         self._warmed_up = False
         self._device = None
 
+    @staticmethod
+    def compute_capture_sizes(
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
+    ) -> list[int]:
+        """Compute capture sizes from chunking config for high graph hit rate."""
+        sizes: set[int] = set()
+
+        # Streaming exact hits
+        if codec_chunk_frames > 0:
+            sizes.add(codec_chunk_frames)
+            if codec_left_context_frames > 0:
+                sizes.add(codec_chunk_frames + codec_left_context_frames)
+
+        # Non-streaming chunked decode: full chunk + last-chunk buckets
+        non_stream_max = decode_chunk_size + decode_left_context
+        sizes.add(non_stream_max)
+
+        # Power-of-2 buckets covering both streaming IC sizes and non-streaming last-chunk sizes
+        for p2 in [2, 4, 8, 16, 32, 64, 128, 256]:
+            if p2 <= non_stream_max:
+                sizes.add(p2)
+
+        return sorted(sizes)
+
     def _get_padded_size(self, actual_size: int) -> int | None:
         for size in self.capture_sizes:
             if actual_size <= size:
                 return size
         return None
 
-    def warmup(self, device: torch.device, dtype: torch.dtype = torch.long):
-        if device.type != "cuda":
-            logger.info("CUDA Graph warmup skipped: device %s is not CUDA", device)
-            return
-
-        if not self.enabled:
-            logger.info("CUDA Graph is disabled, skipping warmup")
-            return
-
-        if self._warmed_up:
-            logger.warning("CUDA Graph already warmed up, skipping")
+    def warmup(
+        self,
+        device: torch.device,
+        dtype: torch.dtype = torch.long,
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+    ):
+        if device.type != "cuda" or not self.enabled or self._warmed_up:
             return
 
         self._device = device
         self.decoder.eval()
 
+        if not self._explicit_sizes:
+            self.capture_sizes = self.compute_capture_sizes(
+                codec_chunk_frames=codec_chunk_frames,
+                codec_left_context_frames=codec_left_context_frames,
+            )
+
         logger.info("Starting CUDA Graph warmup for %d sizes: %s", len(self.capture_sizes), self.capture_sizes)
 
         # Warmup runs to ensure CUDA memory is allocated
         for size in self.capture_sizes:
-            dummy_codes = torch.zeros(
-                1,
-                self.num_quantizers,
-                size,
-                dtype=dtype,
-                device=device,
-            )
+            dummy = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
             with torch.no_grad():
-                _ = self.decoder(dummy_codes)
+                _ = self.decoder(dummy)
 
         torch.cuda.synchronize(device)
 
         for size in self.capture_sizes:
             try:
-                self._capture_graph_for_size(size, device, dtype)
+                self._capture(size, device, dtype)
                 logger.info("  Captured CUDA Graph for size=%d", size)
             except Exception:
-                logger.warning("  Failed to capture CUDA Graph for size=%d", size, exc_info=True)
+                logger.warning("  Failed to capture graph for size=%d", size, exc_info=True)
 
         self._warmed_up = True
-        logger.info("CUDA Graph warmup complete. Captured %d graphs.", len(self.graphs))
+        logger.info("CUDA Graph warmup complete: %d/%d captured", len(self.graphs), len(self.capture_sizes))
 
-    def _capture_graph_for_size(self, size: int, device: torch.device, dtype: torch.dtype):
-        static_input = torch.zeros(
-            1,
-            self.num_quantizers,
-            size,
-            dtype=dtype,
-            device=device,
-        )
-
+    def _capture(self, size: int, device: torch.device, dtype: torch.dtype):
+        static_input = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
             _ = self.decoder(static_input)
-
         torch.cuda.synchronize(device)
 
         graph = CUDAGraph()
@@ -122,10 +137,7 @@ class CUDAGraphDecoderWrapper:
         self.static_outputs[size] = static_output
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        if not self.enabled or not self._warmed_up:
-            return self.decoder(codes)
-
-        if codes.shape[0] != 1:
+        if not self.enabled or not self._warmed_up or codes.shape[0] != 1:
             return self.decoder(codes)
 
         actual_size = codes.shape[-1]
@@ -136,14 +148,10 @@ class CUDAGraphDecoderWrapper:
 
         self.static_inputs[padded_size].zero_()
         self.static_inputs[padded_size][:, :, :actual_size] = codes
-
         self.graphs[padded_size].replay()
 
-        output = self.static_outputs[padded_size]
-        total_upsample = self.decoder.total_upsample
-        actual_output_len = actual_size * total_upsample
-
-        return output[..., :actual_output_len].clone()
+        actual_out_len = actual_size * self.decoder.total_upsample
+        return self.static_outputs[padded_size][..., :actual_out_len].clone()
 
     def chunked_decode_with_cudagraph(
         self,

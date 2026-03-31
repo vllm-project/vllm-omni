@@ -209,9 +209,10 @@ class Flux2Attention(nn.Module):
                 [context_len, hidden_states.shape[1] - context_len],
                 dim=1,
             )
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            # Contiguous for FP8 quantization in RowParallelLinear
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
 
-        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[0](hidden_states.contiguous())
         hidden_states = self.to_out[1](hidden_states)
 
         if encoder_hidden_states is not None:
@@ -552,6 +553,12 @@ class Flux2Transformer2DModel(nn.Module):
     """
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return ("transformer_blocks" in name or "single_transformer_blocks" in name) and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
 
     def __init__(
         self,

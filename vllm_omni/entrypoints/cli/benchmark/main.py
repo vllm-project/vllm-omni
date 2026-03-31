@@ -9,7 +9,7 @@ from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
 
 if typing.TYPE_CHECKING:
-    from vllm.utils import FlexibleArgumentParser
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 class OmniBenchmarkSubcommand(CLISubcommand):

@@ -3,7 +3,10 @@
 import base64
 import io
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    raise ImportError("gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'") from None
 import httpx
 import numpy as np
 import soundfile as sf
@@ -39,7 +42,9 @@ def fetch_voices(api_base: str) -> list[str]:
             )
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("voices", ["Vivian", "Ryan"])
+            voices = data.get("voices") or []
+            if voices:
+                return voices
     except Exception:
         pass
     return ["Vivian", "Ryan"]
@@ -98,7 +103,7 @@ def build_payload(
 
     if task_type == "CustomVoice":
         if voice:
-            payload["voice"] = voice
+            payload["speaker"] = voice
         if instructions and instructions.strip():
             payload["instructions"] = instructions.strip()
 

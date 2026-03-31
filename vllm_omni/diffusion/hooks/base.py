@@ -8,6 +8,7 @@ and modifying model forward passes without invasive changes to model code.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -166,7 +167,9 @@ class HookRegistry:
             # `_original_forward` attribute on the same module.
             if not hasattr(module, "_omni_original_forward"):
                 module._omni_original_forward = module.forward  # type: ignore[attr-defined]
-                module.forward = _WrappedForward(module)  # type: ignore[assignment]
+                wrapped = _WrappedForward(module)
+                wrapped.__signature__ = inspect.signature(module.forward)  # type: ignore[attr-defined]
+                module.forward = wrapped  # type: ignore[assignment]
 
         return registry
 

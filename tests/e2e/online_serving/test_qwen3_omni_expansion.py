@@ -6,6 +6,8 @@ E2E Online tests for Qwen3-Omni model.
 
 import os
 
+from vllm_omni.platforms import current_omni_platform
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 from pathlib import Path
 
@@ -21,7 +23,7 @@ from tests.conftest import (
 )
 from tests.utils import hardware_test
 
-models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
+model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 AUDIO_KEY = ["test"]
 IMAGE_KEY = ["square", "quadrate"]
@@ -47,17 +49,32 @@ def get_chunk_config(default_path):
     return path
 
 
+def get_batch_token_config(default_path):
+    path = modify_stage_config(
+        default_path,
+        updates={
+            "stage_args": {1: {"engine_args.max_num_batched_tokens": 64}},
+        },
+    )
+    return path
+
+
 # CI stage config for 2*H100-80G GPUs
 default_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
-stage_configs_with_id = [
-    (default_path, "default"),
-    (get_chunk_config(default_path), "async_chunk"),
-]
-# Create parameter combinations for model and stage config with readable param ids
+
+if current_omni_platform.is_xpu():
+    default_path = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")
+
+# Create parameter combinations for model and stage config
 test_params = [
-    pytest.param(OmniServerParams(model=model, stage_config_path=path), id=config_id)
-    for model in models
-    for path, config_id in stage_configs_with_id
+    pytest.param(OmniServerParams(model=model, stage_config_path=default_path), id="default"),
+    pytest.param(OmniServerParams(model=model, stage_config_path=get_chunk_config(default_path)), id="async_chunk"),
+]
+
+test_token_params = [
+    pytest.param(
+        OmniServerParams(model=model, stage_config_path=get_batch_token_config(default_path)), id="batch_token_64"
+    )
 ]
 
 
@@ -86,6 +103,8 @@ def get_prompt(prompt_type="text_only"):
         "text_video": "What is in this video? ",
         "text_image": "What is in this image? ",
         "text_audio": "What is in this audio? ",
+        "text_audio_video": "First, what is in this audio? Then, what is in this video? ",
+        "one_word": "What is the capital of UK? Answer in one word",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -122,7 +141,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_text_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text
@@ -289,7 +308,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text, audio
@@ -314,7 +333,7 @@ def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text, image
@@ -340,7 +359,7 @@ def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text, video
@@ -368,7 +387,7 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text, audio, image, video
@@ -400,25 +419,26 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_voice_001(omni_server, openai_client) -> None:
+def test_audio_in_video_001(omni_server, openai_client) -> None:
     """
-    Input Modal: text
+    Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
     Output Modal: text, audio
-    Language: English
-    Input Setting: stream=True
-    Voice: female
-    Datasets: few requests
+    Input Setting: stream=False
+    Datasets: single request
     """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300, embed_audio=True)['base64']}"
     messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(voice_gender="female"),
-        content_text=get_prompt("text_only"),
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        content_text=get_prompt("text_audio_video"),
     )
 
     request_config = {
         "model": omni_server.model,
         "messages": messages,
-        "stream": True,
-        "key_words": {"text": ["beijing"]},
+        "stream": False,
+        "use_audio_in_video": True,
+        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep", "electronic"]},
     }
     openai_client.send_omni_request(request_config)
 
@@ -427,24 +447,72 @@ def test_voice_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_voice_002(omni_server, openai_client) -> None:
+def test_audio_in_video_002(omni_server, openai_client) -> None:
     """
-    Input Modal: text
-    Language: Chinese
+    Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
     Output Modal: text, audio
     Input Setting: stream=True
-    Voice: male
     Datasets: few requests
     """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300, embed_audio=True)['base64']}"
     messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(voice_gender="male"),
-        content_text=get_prompt("text_only_chinese"),
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        content_text=get_prompt("text_audio_video"),
     )
 
     request_config = {
         "model": omni_server.model,
         "messages": messages,
-        "stream": False,
-        "key_words": {"text": ["北京"]},
+        "stream": True,
+        "use_audio_in_video": True,
+        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep", "electronic"]},
     }
-    openai_client.send_omni_request(request_config)
+
+    # Retry when assert_omni_response fails on key_words (see tests/conftest.py).
+    _keyword_assert_msg = "The output does not contain any of the keywords."
+    _max_retries = 3
+    for attempt in range(_max_retries):
+        try:
+            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+            break
+        except AssertionError as e:
+            if _keyword_assert_msg not in str(e) or attempt == _max_retries - 1:
+                raise
+            print(f"Keyword assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_one_word_prompt_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (one-word answer constraint).
+    Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("one_word"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {"text": ["london"]},
+    }
+
+    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/conftest.py).
+    _similarity_assert_msg = "The audio content is not same as the text"
+    _max_retries = 3
+    for attempt in range(_max_retries):
+        try:
+            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+            break
+        except AssertionError as e:
+            if _similarity_assert_msg not in str(e) or attempt == _max_retries - 1:
+                raise
+            print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")

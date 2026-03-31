@@ -38,8 +38,10 @@ def get_cuda_graph_config():
 
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
 if current_omni_platform.is_rocm():
-    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")
-    config_id = "default"
+    # ROCm stage config optimized for MI325 GPU
+    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
+elif current_omni_platform.is_xpu():
+    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
 else:
     stage_config = get_cuda_graph_config()
     config_id = "no_cuda_graph"

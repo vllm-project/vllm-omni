@@ -9,6 +9,12 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
     max_ic_for_chunk_size,
 )
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_language_from_prompt,
+    extract_language_from_request,
+    extract_speaker_from_prompt,
+    extract_speaker_from_request,
+)
 
 logger = init_logger(__name__)
 
@@ -25,31 +31,86 @@ def talker2code2wav(
 
     talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     code2wav_inputs: list[OmniTokensPrompt] = []
-    for talker_output in talker_outputs:
+    for i, talker_output in enumerate(talker_outputs):
+        if not talker_output.finished:
+            # Non-async decode should only run once, after talker has
+            # accumulated the final code sequence.
+            continue
         output = talker_output.outputs[0]
         # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
         audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
-        # Filter zero-padded frames (EOS/invalid steps), matching _extract_last_frame behavior
-        valid_mask = audio_codes.any(dim=1)
+        token_ids = output.token_ids
+        # token_ids provides an upper bound on the newly generated codec span.
+        # audio_codes may still contain zero-padded / invalid rows, so trim only
+        # after filtering valid frames instead of trying to align EOS indices.
+        seq_len = max(len(token_ids) - 1, 0)
+        # Filter invalid frames: zero-padded (EOS) and frames containing
+        # out-of-range values (e.g. stop_token_id=2150 exceeds codebook_size=2048).
+        _CODEBOOK_SIZE = 2048
+        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
         audio_codes = audio_codes[valid_mask]
+        if seq_len > 0 and audio_codes.ndim == 2 and int(audio_codes.shape[0]) > seq_len:
+            audio_codes = audio_codes[-seq_len:]
         ref_code = output.multimodal_output.get("ref_code")
+        ref_code_len = output.multimodal_output.get("ref_code_len")
+        if isinstance(ref_code_len, torch.Tensor):
+            ref_code_len = int(ref_code_len.reshape(-1)[-1].item()) if ref_code_len.numel() > 0 else 0
+        elif ref_code_len is None:
+            ref_code_len = 0
+        else:
+            ref_code_len = int(ref_code_len)
         if isinstance(ref_code, list):
             ref_code = ref_code[0] if ref_code else None
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
             ref_code = ref_code.to(torch.long).cpu().contiguous()
-            ref_code_len = int(ref_code.shape[0])
-            audio_codes = torch.cat([ref_code.to(audio_codes.device), audio_codes], dim=0)
+            if ref_code.ndim == 1:
+                num_quantizers = int(audio_codes.shape[1]) if audio_codes.ndim == 2 and audio_codes.shape[1] > 0 else 16
+                if ref_code.numel() % num_quantizers != 0:
+                    logger.warning(
+                        "Ignoring malformed ref_code with %d elements not divisible by num_quantizers=%d",
+                        ref_code.numel(),
+                        num_quantizers,
+                    )
+                    ref_code = None
+                else:
+                    ref_code = ref_code.reshape(-1, num_quantizers)
+            elif ref_code.ndim != 2:
+                logger.warning("Ignoring malformed ref_code shape %s", tuple(ref_code.shape))
+                ref_code = None
+            if isinstance(ref_code, torch.Tensor) and ref_code_len > 0 and int(ref_code.shape[0]) > ref_code_len:
+                logger.warning(
+                    "Trimming ref_code from %d frames to ref_code_len=%d before Code2Wav.",
+                    int(ref_code.shape[0]),
+                    ref_code_len,
+                )
+                ref_code = ref_code[:ref_code_len]
+            if not isinstance(ref_code, torch.Tensor):
+                ref_code_len = 0
+            else:
+                ref_code_len = int(ref_code.shape[0])
+                audio_codes = torch.cat([ref_code.to(audio_codes.device), audio_codes], dim=0)
         else:
             ref_code_len = 0
         # Code2Wav expects codebook-major flat: [Q*num_frames]
         codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
-        additional_information = {"left_context_size": [ref_code_len]} if ref_code_len > 0 else None
+        additional_information: dict[str, Any] = {}
+        if ref_code_len > 0:
+            additional_information["left_context_size"] = [ref_code_len]
+        # Propagate speaker and language from the original prompt so they are
+        # available as runtime_additional_information in later pipeline stages,
+        # consistent with qwen3-omni and qwen2.5-omni stage input processors.
+        speaker = extract_speaker_from_prompt(prompt, index=i)
+        if speaker is not None:
+            additional_information["speaker"] = speaker
+        language = extract_language_from_prompt(prompt, index=i)
+        if language is not None:
+            additional_information["language"] = language
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
-                additional_information=additional_information,
+                additional_information=additional_information if additional_information else None,
             )
         )
     return code2wav_inputs
@@ -91,7 +152,6 @@ def talker2code2wav_async_chunk(
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
     elif not finished:
-        # Some steps may not produce pooling_output. Only flush on finish.
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -115,22 +175,18 @@ def talker2code2wav_async_chunk(
             initial_chunk_size = int(entry.list_data[0])
             per_request_override = True
 
-    # Dynamic IC: always derived from chunk_size, recomputed every call to adapt to load.
+    # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
     if not per_request_override:
-        max_ic = max_ic_for_chunk_size(chunk_size)
-        active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
-        capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
-        initial_chunk_size = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
-        logger.debug(
-            "Dynamic IC: active=%d, capacity=%d, max_ic=%d, ic=%d, cs=%d, req=%s, keys=%d",
-            active,
-            capacity,
-            max_ic,
-            initial_chunk_size,
-            chunk_size,
-            request_id,
-            len(transfer_manager.code_prompt_token_ids),
-        )
+        _ic_cache = getattr(transfer_manager, "_cached_ic", None)
+        if _ic_cache is None:
+            _ic_cache = {}
+            transfer_manager._cached_ic = _ic_cache
+        if request_id not in _ic_cache:
+            max_ic = max_ic_for_chunk_size(chunk_size)
+            active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
+            capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
+            _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
+        initial_chunk_size = _ic_cache[request_id]
 
     if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
         raise ValueError(
@@ -152,7 +208,7 @@ def talker2code2wav_async_chunk(
         if finished:
             return {
                 "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "finished": True,
             }
         return None
 
@@ -181,18 +237,34 @@ def talker2code2wav_async_chunk(
     left_context_size = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Prepend ref_code to the first decoder window only.
-    if transfer_manager.put_req_chunk[request_id] == 0:
-        ref_code = request_payload.pop(request_id, None)
-        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-            ref_frames = ref_code.tolist()
-            window_frames = ref_frames + window_frames
-            left_context_size += len(ref_frames)
+    # Prepend ref_code as decoder context for every chunk so the vocoder
+    # maintains voice-clone speaker identity throughout the stream.  The HF
+    # reference decodes ref_code + all_codes in one pass; without ref_code
+    # context on later chunks the decoder loses speaker identity and produces
+    # distorted audio.  Use `.get()` (not `.pop()`) to keep ref_code for
+    # subsequent chunks.
+    ref_code = request_payload.get(request_id)
+    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+        ref_frames = ref_code.tolist()
+        window_frames = ref_frames + window_frames
+        left_context_size += len(ref_frames)
 
-    code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    num_quantizers = len(window_frames[0])
+    num_frames = len(window_frames)
+    code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
 
-    return {
+    info: dict[str, Any] = {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,
-        "finished": torch.tensor(finished, dtype=torch.bool),
+        "finished": finished,
     }
+    # Propagate speaker and language from the request so they are available
+    # as runtime_additional_information in subsequent pipeline stages, consistent
+    # with qwen3-omni and qwen2.5-omni stage input processors.
+    speaker = extract_speaker_from_request(request)
+    if speaker is not None:
+        info["speaker"] = speaker
+    language = extract_language_from_request(request)
+    if language is not None:
+        info["language"] = language
+    return info

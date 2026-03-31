@@ -814,11 +814,13 @@ class MiMoAudioForConditionalGeneration(
                 )
             )
 
-            audio_tensor = self.generate_audio(code)
+            audio_result = self.token2wav(codes=code, **kwargs)
+            if isinstance(audio_result, OmniOutput):
+                return audio_result
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
-                    "model_outputs": audio_tensor.reshape(1, -1) if audio_tensor is not None else audio_tensor
+                    "model_outputs": audio_result.reshape(1, -1) if audio_result is not None else audio_result
                 },
             )
 

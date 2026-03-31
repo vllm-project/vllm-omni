@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from vllm.v1.worker.workspace import init_workspace_manager
-from vllm_ascend.worker.worker import NPUWorker
 
+from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
 from vllm_omni.platforms.npu.worker.npu_generation_model_runner import NPUGenerationModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 
-class NPUGenerationWorker(OmniWorkerMixin, NPUWorker):
+class NPUGenerationWorker(OmniWorkerMixin, OmniNPUWorkerBase):
     """NPU generation worker for code2wav stage in Omni model."""
 
     def init_device(self):

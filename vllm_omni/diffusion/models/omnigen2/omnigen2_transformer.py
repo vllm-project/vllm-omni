@@ -5,24 +5,22 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.activations import get_activation
 from diffusers.models.embeddings import Timesteps, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from einops import rearrange, repeat
-from torch.nn import RMSNorm
+from vllm.model_executor.layers.activation import get_act_and_mul_fn
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
     QKVParallelLinear,
+    RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 
 logger = logging.getLogger(__name__)
-
-
-def swiglu(x, y):
-    return F.silu(x.float(), inplace=False).to(x.dtype) * y
 
 
 class OmniGen2Attention(nn.Module):
@@ -53,7 +51,6 @@ class OmniGen2Attention(nn.Module):
         self.norm_k = RMSNorm(self.head_dim, eps=eps)
 
         self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
-
         self.attn = Attention(
             num_heads=num_heads,
             head_size=self.head_dim,
@@ -78,22 +75,19 @@ class OmniGen2Attention(nn.Module):
         Returns:
             torch.Tensor: Processed hidden states after attention computation
         """
-        batch_size, sequence_length, _ = hidden_states.shape
+        batch_size = hidden_states.shape[0]
 
         # Get Query-Key-Value Pair
         qkv, _ = self.to_qkv(hidden_states)
 
-        q_dim = self.num_heads * self.head_dim
-        kv_dim = self.num_kv_heads * self.head_dim
-
-        query = qkv[..., :q_dim]
-        key = qkv[..., q_dim : q_dim + kv_dim]
-        value = qkv[..., q_dim + kv_dim : q_dim + 2 * kv_dim]
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
         # Reshape tensors for attention computation
-        query = query.view(batch_size, sequence_length, self.num_heads, self.head_dim)
-        key = key.view(batch_size, sequence_length, self.num_kv_heads, self.head_dim)
-        value = value.view(batch_size, sequence_length, self.num_kv_heads, self.head_dim)
+        query = query.unflatten(-1, (self.num_heads, -1))
+        key = key.unflatten(-1, (self.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.num_kv_heads, -1))
 
         # Apply Query-Key normalization
         if self.norm_q is not None:
@@ -163,14 +157,6 @@ class TimestepEmbedding(nn.Module):
             self.post_act = None
         else:
             self.post_act = get_activation(post_act_fn)
-
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        nn.init.normal_(self.linear_1.weight, std=0.02)
-        nn.init.zeros_(self.linear_1.bias)
-        nn.init.normal_(self.linear_2.weight, std=0.02)
-        nn.init.zeros_(self.linear_2.bias)
 
     def forward(self, sample, condition=None):
         if condition is not None:
@@ -293,7 +279,7 @@ class LuminaLayerNormContinuous(nn.Module):
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
         elif norm_type == "rms_norm":
-            self.norm = RMSNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
+            self.norm = RMSNorm(embedding_dim, eps=eps)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
@@ -340,32 +326,31 @@ class LuminaFeedForward(nn.Module):
         ffn_dim_multiplier: float | None = None,
     ):
         super().__init__()
-        self.swiglu = swiglu
 
         # custom hidden_size factor multiplier
         if ffn_dim_multiplier is not None:
             inner_dim = int(ffn_dim_multiplier * inner_dim)
         inner_dim = multiple_of * ((inner_dim + multiple_of - 1) // multiple_of)
 
-        self.linear_1 = nn.Linear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             dim,
-            inner_dim,
+            [inner_dim, inner_dim],
             bias=False,
+            return_bias=False,
         )
-        self.linear_2 = nn.Linear(
+        self.act_fn = get_act_and_mul_fn("silu")
+        self.down_proj = RowParallelLinear(
             inner_dim,
             dim,
             bias=False,
-        )
-        self.linear_3 = nn.Linear(
-            dim,
-            inner_dim,
-            bias=False,
+            input_is_parallel=True,
+            return_bias=False,
         )
 
     def forward(self, x):
-        h1, h2 = self.linear_1(x), self.linear_3(x)
-        return self.linear_2(self.swiglu(h1, h2))
+        x = self.gate_up_proj(x)
+        x = self.act_fn(x)
+        return self.down_proj(x)
 
 
 class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
@@ -394,12 +379,6 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
             RMSNorm(text_feat_dim, eps=norm_eps),
             nn.Linear(text_feat_dim, hidden_size, bias=True),
         )
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        nn.init.trunc_normal_(self.caption_embedder[1].weight, std=0.02)
-        nn.init.zeros_(self.caption_embedder[1].bias)
 
     def forward(
         self,
@@ -642,25 +621,6 @@ class OmniGen2TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
 
-    def initialize_weights(self) -> None:
-        """
-        Initialize the weights of the transformer block.
-
-        Uses Xavier uniform initialization for linear layers and zero initialization for biases.
-        """
-        nn.init.xavier_uniform_(self.attn.to_q.weight)
-        nn.init.xavier_uniform_(self.attn.to_k.weight)
-        nn.init.xavier_uniform_(self.attn.to_v.weight)
-        nn.init.xavier_uniform_(self.attn.to_out[0].weight)
-
-        nn.init.xavier_uniform_(self.feed_forward.linear_1.weight)
-        nn.init.xavier_uniform_(self.feed_forward.linear_2.weight)
-        nn.init.xavier_uniform_(self.feed_forward.linear_3.weight)
-
-        if self.modulation:
-            nn.init.zeros_(self.norm1.linear.weight)
-            nn.init.zeros_(self.norm1.linear.bias)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -740,18 +700,18 @@ class OmniGen2Transformer2DModel(nn.Module):
         patch_size: int = 2,
         in_channels: int = 16,
         out_channels: int | None = None,
-        hidden_size: int = 2304,
-        num_layers: int = 26,
+        hidden_size: int = 2520,
+        num_layers: int = 32,
         num_refiner_layers: int = 2,
-        num_attention_heads: int = 24,
-        num_kv_heads: int = 8,
+        num_attention_heads: int = 21,
+        num_kv_heads: int = 7,
         multiple_of: int = 256,
         ffn_dim_multiplier: float | None = None,
         norm_eps: float = 1e-5,
-        axes_dim_rope: tuple[int, int, int] = (32, 32, 32),
-        axes_lens: tuple[int, int, int] = (300, 512, 512),
-        text_feat_dim: int = 1024,
-        timestep_scale: float = 1.0,
+        axes_dim_rope: tuple[int, int, int] = (40, 40, 40),
+        axes_lens: tuple[int, int, int] = (1024, 1664, 1664),
+        text_feat_dim: int = 2048,
+        timestep_scale: float = 1000.0,
     ) -> None:
         """Initialize the OmniGen2 transformer model."""
         super().__init__()
@@ -872,27 +832,6 @@ class OmniGen2Transformer2DModel(nn.Module):
 
         # Add learnable embeddings to distinguish different images
         self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))  # support max 5 ref images
-
-        self.initialize_weights()
-
-    def initialize_weights(self) -> None:
-        """
-        Initialize the weights of the model.
-
-        Uses Xavier uniform initialization for linear layers.
-        """
-        nn.init.xavier_uniform_(self.x_embedder.weight)
-        nn.init.constant_(self.x_embedder.bias, 0.0)
-
-        nn.init.xavier_uniform_(self.ref_image_patch_embedder.weight)
-        nn.init.constant_(self.ref_image_patch_embedder.bias, 0.0)
-
-        nn.init.zeros_(self.norm_out.linear_1.weight)
-        nn.init.zeros_(self.norm_out.linear_1.bias)
-        nn.init.zeros_(self.norm_out.linear_2.weight)
-        nn.init.zeros_(self.norm_out.linear_2.bias)
-
-        nn.init.normal_(self.image_index_embedding, std=0.02)
 
     def img_patch_embed_and_refine(
         self,
@@ -1182,6 +1121,9 @@ class OmniGen2Transformer2DModel(nn.Module):
             (".to_qkv", ".to_q", "q"),
             (".to_qkv", ".to_k", "k"),
             (".to_qkv", ".to_v", "v"),
+            # feed-forward
+            (".feed_forward.gate_up_proj", ".feed_forward.linear_1", 0),
+            (".feed_forward.gate_up_proj", ".feed_forward.linear_3", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -1197,6 +1139,9 @@ class OmniGen2Transformer2DModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # feed_forward.linear_2 -> feed_forward.down_proj rename
+                if ".feed_forward.linear_2." in name:
+                    name = name.replace(".feed_forward.linear_2.", ".feed_forward.down_proj.")
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
