@@ -1450,10 +1450,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
             if not speaker:
                 raise ValueError("CustomVoice requires additional_information.speaker.")
-            spk_id_map = getattr(self.talker_config, "spk_id", None) or {}
+            spk_id_map = {k.lower(): v for k, v in (getattr(self.talker_config, "spk_id", None) or {}).items()}
             if speaker not in spk_id_map:
                 raise ValueError(f"Unsupported speaker: {speaker}")
-            spk_id = spk_id_map[speaker.lower()]
+            spk_id = spk_id_map[speaker]
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
             spk_embed = self.embed_input_ids(spk_tensor)
