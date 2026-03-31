@@ -10,7 +10,7 @@ Cache-DiT is used in place of TeaCache for single-card and CFG tests.
 
 Uses the 1.3B variant for faster CI testing.
 
-Feature matrix (following the Adding a Diffusion Model guide §5.2):
+Coverage:
   Single GPU:
     - Cache-DiT + layerwise CPU offload
   Two GPUs:
@@ -21,18 +21,17 @@ Feature matrix (following the Adding a Diffusion Model guide §5.2):
     - Cache-DiT + HSDP = 2 + VAE-Patch-Parallel = 2
 """
 
-import time
-
 import pytest
-import requests
 
-from tests.conftest import OmniServer, OmniServerParams
+from tests.conftest import (
+    OmniServer,
+    OmniServerParams,
+    OpenAIClientHandler,
+)
 from tests.utils import hardware_marks
 
 MODEL = "Wan-AI/Wan2.1-VACE-1.3B-diffusers"
 PROMPT = "A cat walking slowly across a sunlit garden path"
-VIDEO_TIMEOUT_S = 900.0
-VIDEO_POLL_INTERVAL_S = 2.0
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
@@ -136,40 +135,6 @@ def _get_vace_feature_cases():
     ]
 
 
-def _video_api_url(server: OmniServer, suffix: str = "") -> str:
-    return f"http://{server.host}:{server.port}/v1/videos{suffix}"
-
-
-def _create_video_job(server: OmniServer, *, prompt: str | None = None, **overrides) -> requests.Response:
-    payload = {
-        "prompt": prompt or PROMPT,
-        "width": 480,
-        "height": 320,
-        "num_frames": 5,
-        "fps": 8,
-        "num_inference_steps": 2,
-        "guidance_scale": 5.0,
-        "seed": 42,
-    }
-    payload.update(overrides)
-    fields = [(key, (None, str(value))) for key, value in payload.items() if value is not None]
-    return requests.post(_video_api_url(server), files=fields, timeout=VIDEO_TIMEOUT_S)
-
-
-def _wait_for_video_completed(server: OmniServer, video_id: str) -> dict:
-    deadline = time.time() + VIDEO_TIMEOUT_S
-    while time.time() < deadline:
-        resp = requests.get(_video_api_url(server, f"/{video_id}"), timeout=VIDEO_TIMEOUT_S)
-        assert resp.status_code == 200, resp.text
-        data = resp.json()
-        if data["status"] == "completed":
-            return data
-        if data["status"] == "failed":
-            raise AssertionError(f"Video job {video_id} failed: {data}")
-        time.sleep(VIDEO_POLL_INTERVAL_S)
-    raise AssertionError(f"Timed out waiting for video job {video_id}")
-
-
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
@@ -177,31 +142,20 @@ def _wait_for_video_completed(server: OmniServer, video_id: str) -> dict:
     _get_vace_feature_cases(),
     indirect=True,
 )
-def test_wan_2_1_vace(omni_server: OmniServer):
+def test_wan_2_1_vace(omni_server: OmniServer, openai_client: OpenAIClientHandler):
     """Test VACE T2V generation with all supported diffusion acceleration features."""
-    create_resp = _create_video_job(omni_server)
-    assert create_resp.status_code == 200, create_resp.text
-
-    created = create_resp.json()
-    video_id = created["id"]
-
-    try:
-        completed = _wait_for_video_completed(omni_server, video_id)
-        assert completed["file_name"] is not None
-
-        # Download and verify the generated video is a valid MP4
-        download_resp = requests.get(
-            _video_api_url(omni_server, f"/{video_id}/content"),
-            timeout=VIDEO_TIMEOUT_S,
-        )
-        assert download_resp.status_code == 200, download_resp.text
-        assert download_resp.headers["content-type"].startswith("video/mp4")
-        content = download_resp.content
-        assert len(content) > 32, f"Video payload too small: {len(content)} bytes"
-        assert content[4:8] == b"ftyp", "Not a valid MP4 file"
-    finally:
-        # Best-effort cleanup
-        try:
-            requests.delete(_video_api_url(omni_server, f"/{video_id}"), timeout=30)
-        except Exception:
-            pass
+    openai_client.send_video_diffusion_request(
+        {
+            "model": MODEL,
+            "form_data": {
+                "prompt": PROMPT,
+                "height": 480,
+                "width": 320,
+                "num_frames": 5,
+                "fps": 8,
+                "num_inference_steps": 2,
+                "guidance_scale": 5.0,
+                "seed": 42,
+            },
+        }
+    )

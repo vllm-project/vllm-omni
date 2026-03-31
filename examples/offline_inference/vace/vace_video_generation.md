@@ -2,7 +2,10 @@
 
 [VACE](https://github.com/ali-vilab/VACE) (Video All-in-one Creation Engine) supports multiple video tasks through a single model.
 
-Supported models: `Wan-AI/Wan2.1-VACE-1.3B-diffusers`, `Wan-AI/Wan2.1-VACE-14B-diffusers`
+| Model | Architecture | Model Weights (bf16) | HuggingFace |
+|-------|-------------|----------------------|-------------|
+| Wan2.1-VACE (1.3B) | Wan2.1 | ~10 GB | [Wan-AI/Wan2.1-VACE-1.3B-diffusers](https://huggingface.co/Wan-AI/Wan2.1-VACE-1.3B-diffusers) |
+| Wan2.1-VACE (14B) | Wan2.1 | ~38 GB | [Wan-AI/Wan2.1-VACE-14B-diffusers](https://huggingface.co/Wan-AI/Wan2.1-VACE-14B-diffusers) |
 
 ## Text-to-Video (T2V)
 
@@ -63,12 +66,23 @@ python vace_video_generation.py \
   --output r2v_output.mp4
 ```
 
-## Sequence Parallelism (2 GPUs)
+## Key Arguments
 
-```bash
-python vace_video_generation.py \
-  --mode t2v \
-  --prompt "A robot in a warehouse" \
-  --ulysses-degree 2 \
-  --output t2v_sp2.mp4
-```
+- `--mode`: VACE task mode (`t2v`, `i2v`, `flf2v`, `inpaint`, `r2v`).
+- `--model`: Model ID (default: `Wan-AI/Wan2.1-VACE-1.3B-diffusers`).
+- `--image`: Input image for I2V, inpainting, and R2V modes.
+- `--last-image`: Last frame image for FLF2V mode.
+- `--prompt`: Text description of desired video.
+- `--height/--width`: Output resolution (default 480x832). Dimensions should be multiples of 16.
+- `--num-frames`: Number of frames (default 81).
+- `--guidance-scale`: CFG scale (default 5.0).
+- `--flow-shift`: Scheduler flow shift (default 5.0).
+- `--num-inference-steps`: Number of denoising steps (default 30).
+- `--fps`: Frames per second for the saved MP4 (default 16).
+- `--output`: Path to save the generated video.
+- `--vae-use-tiling`: Enable VAE tiling for memory optimization.
+- `--ulysses-degree`: Ulysses sequence parallelism degree for multi-GPU.
+- `--cfg-parallel-size`: CFG parallel size for multi-GPU.
+- `--tensor-parallel-size`: Tensor parallel size.
+
+> If you encounter OOM errors, try `--vae-use-tiling` or multi-GPU parallelism options.

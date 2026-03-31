@@ -23,9 +23,6 @@ Usage examples:
 
   # R2V (reference image guided)
   python vace_video_generation.py --mode r2v --image ref.jpg --prompt "..."
-
-  # With sequence parallelism (2 GPUs)
-  python vace_video_generation.py --mode t2v --ulysses-degree 2 --prompt "..."
 """
 
 import argparse

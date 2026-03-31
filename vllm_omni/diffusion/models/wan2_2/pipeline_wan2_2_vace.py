@@ -98,7 +98,9 @@ def get_wan22_vace_pre_process_func(od_config: OmniDiffusionConfig):
                 continue
 
             # Handle reference images for R2V
-            ref_images = multi_modal_data.get("reference_images")
+            # "image" is the standard key from online serving (SupportImageInput convention)
+            # "reference_images" is the offline API key for backwards compatibility
+            ref_images = multi_modal_data.get("image") or multi_modal_data.get("reference_images")
             if ref_images is not None:
                 if isinstance(ref_images, str):
                     ref_images = [PIL.Image.open(ref_images).convert("RGB")]
