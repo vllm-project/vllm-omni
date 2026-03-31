@@ -986,8 +986,23 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
-    # Keep Whisper on CPU to avoid consuming GPU memory in tests.
-    model = whisper.load_model("small", device="cpu")
+    # Multi-GPU: use last visible device to avoid colliding with default cuda:0; single GPU uses 0.
+    cuda_device_index = None
+    if torch.cuda.is_available():
+        n = torch.cuda.device_count()
+        if n == 1:
+            cuda_device_index = 0
+        elif n > 1:
+            cuda_device_index = n - 1
+
+    if cuda_device_index is not None:
+        torch.cuda.set_device(cuda_device_index)
+        device = f"cuda:{cuda_device_index}"
+        use_cuda = True
+    else:
+        use_cuda = False
+        device = "cpu"
+    model = whisper.load_model("small", device=device)
     try:
         text = model.transcribe(
             output_path,
@@ -998,6 +1013,9 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
     finally:
         del model
         gc.collect()
+        if use_cuda:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     return text or ""
 
