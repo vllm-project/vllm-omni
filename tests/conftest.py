@@ -48,6 +48,7 @@ from vllm.utils.network_utils import get_open_port
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -1065,7 +1066,7 @@ def convert_audio_to_text(audio_data):
     Convert base64 encoded audio data to text using speech recognition.
     """
     audio_data = base64.b64decode(audio_data)
-    output_path = f"./test_{int(time.time())}.wav"
+    output_path = f"./test_{uuid.uuid4().hex}.wav"
     with open(output_path, "wb") as audio_file:
         audio_file.write(audio_data)
 
@@ -1089,8 +1090,24 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
-    # Keep Whisper on CPU to avoid consuming GPU memory in tests.
-    model = whisper.load_model("small", device="cpu")
+    # Multi-GPU: use last visible device to avoid colliding with default device 0; single device uses 0.
+    device_index = None
+    if current_omni_platform.is_available():
+        n = current_omni_platform.get_device_count()
+        if n == 1:
+            device_index = 0
+        elif n > 1:
+            device_index = n - 1
+
+    if device_index is not None:
+        torch_device = current_omni_platform.get_torch_device(device_index)
+        current_omni_platform.set_device(torch_device)
+        device = str(torch_device)
+        use_accelerator = True
+    else:
+        use_accelerator = False
+        device = "cpu"
+    model = whisper.load_model("small", device=device)
     try:
         text = model.transcribe(
             output_path,
@@ -1101,6 +1118,9 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
     finally:
         del model
         gc.collect()
+        if use_accelerator:
+            current_omni_platform.synchronize()
+            current_omni_platform.empty_cache()
 
     return text or ""
 

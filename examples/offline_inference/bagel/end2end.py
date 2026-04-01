@@ -101,7 +101,7 @@ def main():
 
     if not prompts:
         # Default prompt for text2img test if none provided
-        prompts = ["<|im_start|>A cute cat<|im_end|>"]
+        prompts = ["A cute cat"]
         print(f"[Info] No prompts provided, using default: {prompts}")
     omni_outputs = []
 
