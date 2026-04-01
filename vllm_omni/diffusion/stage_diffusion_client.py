@@ -78,6 +78,7 @@ class StageDiffusionClient:
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._rpc_results: dict[str, Any] = {}
         self._pending_rpcs: set[str] = set()
+        self._tasks: dict[str, asyncio.Task] = {}
 
         logger.info("[StageDiffusionClient] Stage-%s initialized (batch_size=%d)", self.stage_id, batch_size)
 
