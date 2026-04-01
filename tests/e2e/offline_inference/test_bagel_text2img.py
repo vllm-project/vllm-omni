@@ -80,19 +80,17 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_steps: int = 15) -> list:
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
     """Configure sampling parameters for Bagel text2img generation.
 
     Args:
         omni: The Omni instance to get default params from.
-        max_tokens: Maximum tokens for the first stage.
         num_inference_steps: Number of inference steps for the diffusion stage.
 
     Returns:
         Configured sampling params list.
     """
     params_list = omni.default_sampling_params_list
-    params_list[0].max_tokens = max_tokens  # type: ignore
     if len(params_list) > 1:
         params_list[1].num_inference_steps = num_inference_steps  # type: ignore
         params_list[1].extra_args = {  # type: ignore
