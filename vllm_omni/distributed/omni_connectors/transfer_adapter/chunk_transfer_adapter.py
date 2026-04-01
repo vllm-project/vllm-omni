@@ -52,7 +52,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
@@ -94,7 +94,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
+        self._cancelled_load_reqs.discard(request.request_id)
         self._pending_load_reqs.append(request)
+        with self._recv_cond:
+            self._recv_cond.notify()
 
     def save_async(
         self,
@@ -116,6 +119,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_finished": request.is_finished(),
         }
         self._pending_save_reqs.append(task)
+        with self._save_cond:
+            self._save_cond.notify()
 
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
@@ -205,9 +210,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
-        request_id = request.external_req_id
-        chunk_id = self.put_req_chunk[request_id]
-        connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
+        external_req_id = request.external_req_id
+        chunk_id = self.put_req_chunk[external_req_id]
+        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data = None
         if self.custom_process_next_stage_input_func:
@@ -233,15 +238,48 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         if success:
-            self.put_req_chunk[request_id] += 1
+            self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
 
         if is_finished:
-            self.code_prompt_token_ids.pop(request_id, None)
+            self.cleanup_sender(external_req_id)
 
     ########################################################################
     # Cleanup
     ########################################################################
+
+    def cleanup_receiver(self, request_id: str) -> None:
+        """Reclaim receiver-side per-request state (keyed by internal id).
+
+        Safe to call from the scheduler even when ``save_async()`` has
+        enqueued work that the background thread has not yet processed,
+        because it only touches receiver-side dictionaries.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+        """
+        self.finished_requests.discard(request_id)
+        self.get_req_chunk.pop(request_id, None)
+        self.requests_with_ready_chunks.discard(request_id)
+        self.request_ids_mapping.pop(request_id, None)
+
+        self._cancelled_load_reqs.add(request_id)
+        self._finished_load_reqs.discard(request_id)
+
+    def cleanup_sender(self, external_req_id: str) -> None:
+        """Reclaim sender-side per-request state (keyed by external id).
+
+        Must only be called after the terminal chunk has actually been
+        sent (i.e. from ``_send_single_request``), not before.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+        """
+        self.put_req_chunk.pop(external_req_id, None)
+        self.request_payload.pop(external_req_id, None)
+        self.code_prompt_token_ids.pop(external_req_id, None)
+
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            cached_ic.pop(external_req_id, None)
 
     def cleanup(
         self,
@@ -260,18 +298,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if external_req_id is None:
             external_req_id = self.request_ids_mapping.get(request_id, request_id)
 
-        self.finished_requests.discard(request_id)
-        self.get_req_chunk.pop(request_id, None)
-        self.requests_with_ready_chunks.discard(request_id)
-        self.request_ids_mapping.pop(request_id, None)
-
-        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
-        self._pending_load_reqs = remaining
-        self._finished_load_reqs.discard(request_id)
-
-        self.put_req_chunk.pop(external_req_id, None)
-        self.request_payload.pop(external_req_id, None)
-        self.code_prompt_token_ids.pop(external_req_id, None)
+        self.cleanup_receiver(request_id)
+        self.cleanup_sender(external_req_id)
 
     ########################################################################
     # Schedule Helper
@@ -295,6 +323,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
+            request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
 
     def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:

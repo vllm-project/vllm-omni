@@ -129,8 +129,17 @@ The first run loads model weights. Subsequent runs are faster:
 --stage-init-timeout 900  # Increase timeout for slow storage
 ```
 
+### `Transformers does not recognize this architecture` Error
+
+Your have to upgrade `transformers` package to `5.3.0` or above:
+
+```
+pip install --upgrade transformers
+```
+
 ## Requirements
 
 - vLLM-Omni with GLM-Image support
 - CUDA-capable GPU (recommended: H100/A100 with 80GB)
 - GLM-Image model weights
+- `transformers` v5.3.0 or above

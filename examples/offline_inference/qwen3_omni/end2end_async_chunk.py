@@ -231,52 +231,47 @@ async def run_single_request(
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
         ):
-            if not isinstance(omni_output.request_output, list):
-                outputs_list = [omni_output.request_output]
-            else:
-                outputs_list = omni_output.request_output
+            output = omni_output.request_output
+            if omni_output.final_output_type == "text":
+                if stage_0_first_output_ts is None:
+                    stage_0_first_output_ts = time.perf_counter()
+                text_output = output.outputs[0].text
+                if output.finished:
+                    text_parts.append(text_output)
+            elif omni_output.final_output_type == "audio":
+                mm_out = output.outputs[0].multimodal_output
+                if mm_out and "audio" in mm_out:
+                    if first_audio_ts is None:
+                        first_audio_ts = time.perf_counter()
+                    if audio_sr is None and "sr" in mm_out:
+                        sr_val = mm_out["sr"]
+                        audio_sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                        samplerate = audio_sr
+                    audio_data = mm_out["audio"]
+                    if isinstance(audio_data, list):
+                        new_chunks = audio_data[audio_list_consumed:]
+                        audio_list_consumed = len(audio_data)
+                    elif isinstance(audio_data, torch.Tensor):
+                        new_chunks = [audio_data]
+                        audio_last_tensor = audio_data
+                    else:
+                        new_chunks = []
 
-            for output in outputs_list:
-                if omni_output.final_output_type == "text":
-                    if stage_0_first_output_ts is None:
-                        stage_0_first_output_ts = time.perf_counter()
-                    text_output = output.outputs[0].text
-                    if output.finished:
-                        text_parts.append(text_output)
-                elif omni_output.final_output_type == "audio":
-                    mm_out = output.outputs[0].multimodal_output
-                    if mm_out and "audio" in mm_out:
-                        if first_audio_ts is None:
-                            first_audio_ts = time.perf_counter()
-                        if audio_sr is None and "sr" in mm_out:
-                            sr_val = mm_out["sr"]
-                            audio_sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-                            samplerate = audio_sr
-                        audio_data = mm_out["audio"]
-                        if isinstance(audio_data, list):
-                            new_chunks = audio_data[audio_list_consumed:]
-                            audio_list_consumed = len(audio_data)
-                        elif isinstance(audio_data, torch.Tensor):
-                            new_chunks = [audio_data]
-                            audio_last_tensor = audio_data
-                        else:
-                            new_chunks = []
-
-                        if stream_audio_to_disk and new_chunks:
-                            if sf_writer is None:
-                                sf_writer = sf.SoundFile(
-                                    wav_file,
-                                    mode="w",
-                                    samplerate=samplerate,
-                                    channels=1,
-                                    subtype="FLOAT",
-                                )
-                            for chunk in new_chunks:
-                                chunk_np = chunk.float().detach().cpu().numpy().flatten()
-                                sf_writer.write(chunk_np)
-                                audio_samples_written += len(chunk_np)
-                        else:
-                            audio_chunks.extend(new_chunks)
+                    if stream_audio_to_disk and new_chunks:
+                        if sf_writer is None:
+                            sf_writer = sf.SoundFile(
+                                wav_file,
+                                mode="w",
+                                samplerate=samplerate,
+                                channels=1,
+                                subtype="FLOAT",
+                            )
+                        for chunk in new_chunks:
+                            chunk_np = chunk.float().detach().cpu().numpy().flatten()
+                            sf_writer.write(chunk_np)
+                            audio_samples_written += len(chunk_np)
+                    else:
+                        audio_chunks.extend(new_chunks)
     finally:
         if sf_writer is not None:
             sf_writer.close()

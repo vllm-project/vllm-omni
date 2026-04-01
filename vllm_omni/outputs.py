@@ -62,6 +62,12 @@ class OmniRequestOutput:
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
     _custom_output: dict[str, Any] = field(default_factory=dict)
 
+    # profiling data
+    stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # memory usage info
+    peak_memory_mb: float = 0.0
+
     @classmethod
     def from_pipeline(
         cls,
@@ -98,6 +104,8 @@ class OmniRequestOutput:
         multimodal_output: dict[str, Any] | None = None,
         custom_output: dict[str, Any] | None = None,
         final_output_type: str = "image",
+        stage_durations: dict[str, float] | None = None,
+        peak_memory_mb: float = 0.0,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -109,6 +117,8 @@ class OmniRequestOutput:
             latents: Optional latent tensors
             multimodal_output: Optional multimodal output dict
             custom_output: Optional custom output dict (e.g. latent trajectories, prompt embeds)
+            stage_durations: Optional stage durations (execution time of each stage) dict
+            peak_memory_mb: Peak memory usage in MB
 
         Returns:
             OmniRequestOutput configured for diffusion mode
@@ -122,6 +132,8 @@ class OmniRequestOutput:
             metrics=metrics or {},
             _multimodal_output=multimodal_output or {},
             _custom_output=custom_output or {},
+            stage_durations=stage_durations or {},
+            peak_memory_mb=peak_memory_mb,
             finished=True,
         )
 
@@ -135,14 +147,12 @@ class OmniRequestOutput:
         if self.request_output is None:
             return self._multimodal_output
 
-        request_outputs = self.request_output if isinstance(self.request_output, list) else [self.request_output]
-        for req_out in request_outputs:
-            # Check completion outputs first (where multimodal_output is attached)
-            for output in getattr(req_out, "outputs", []):
-                if mm := getattr(output, "multimodal_output", None):
-                    return mm
-            if mm := getattr(req_out, "multimodal_output", None):
+        # Check completion outputs first (where multimodal_output is attached)
+        for output in getattr(self.request_output, "outputs", []):
+            if mm := getattr(output, "multimodal_output", None):
                 return mm
+        if mm := getattr(self.request_output, "multimodal_output", None):
+            return mm
         return self._multimodal_output
 
     @property
@@ -273,6 +283,8 @@ class OmniRequestOutput:
             f"metrics={self.metrics}",
             f"multimodal_output={self._multimodal_output}",
             f"custom_output={self._custom_output}",
+            f"stage_durations={self.stage_durations}",
+            f"peak_memory_mb={self.peak_memory_mb}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
