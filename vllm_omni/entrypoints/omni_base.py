@@ -142,11 +142,11 @@ class OmniBase(PDDisaggregationMixin):
     @property
     def is_running(self) -> bool:
         return self.engine.is_alive()
-    
+
     def check_health(self) -> None:
         if not self.engine.is_alive():
             raise EngineDeadError("Orchestrator process is not alive")
-    
+
     def resolve_sampling_params_list(
         self,
         sampling_params_list: Sequence[Any] | Any | None,
