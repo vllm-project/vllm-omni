@@ -239,6 +239,7 @@ def start_gpu_oom_hog(
             line = proc.stdout.readline().strip()
             if line:
                 logs.append(line)
+                print(f"[oom-sidecar][gpu={device}] {line}", flush=True)
                 if line.startswith("READY:"):
                     return OomHandle(
                         proc=proc,
@@ -253,6 +254,8 @@ def start_gpu_oom_hog(
             break
 
     proc.terminate()
+    if logs:
+        print(f"[oom-sidecar][gpu={device}] startup logs: {' | '.join(logs)}", flush=True)
     raise TimeoutError(f"OOM sidecar startup timeout. logs={logs}")
 
 
