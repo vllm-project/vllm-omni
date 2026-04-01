@@ -6,6 +6,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.utils import hardware_test
+
 
 class TestPreLookaheadLayer:
     """Tests for PreLookaheadLayer."""
@@ -63,6 +65,7 @@ class TestDiTAttention:
 
         return DiTAttention(dim=512, heads=8, dim_head=64, dropout=0.0)
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, attention):
         """Test attention output shape."""
@@ -73,6 +76,7 @@ class TestDiTAttention:
 
         assert out.shape == x.shape
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_with_mask(self, attention):
         """Test attention with mask."""
@@ -87,6 +91,7 @@ class TestDiTAttention:
         # Masked positions should be zero
         assert torch.allclose(out[:, -3:], torch.zeros_like(out[:, -3:]))
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_qkv_projections(self, attention):
         """Test that Q/K/V projections exist and have correct dimensions."""
@@ -107,6 +112,7 @@ class TestDiTBlock:
 
         return DiTBlock(dim=512, heads=8, dim_head=64, ff_mult=4, dropout=0.0)
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, block):
         """Test block output shape."""
@@ -118,6 +124,7 @@ class TestDiTBlock:
 
         assert out.shape == x.shape
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_adalayernorm_modulation(self, block):
         """Test that AdaLayerNorm modulates based on timestep."""
@@ -153,6 +160,7 @@ class TestDiT:
             long_skip_connection=True,
         )
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, dit):
         """Test DiT forward output shape."""
@@ -168,6 +176,7 @@ class TestDiT:
 
         assert out.shape == (batch, mel_dim, seq_len)
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_timestep_embedding(self, dit):
         """Test that different timesteps produce different outputs."""
@@ -241,6 +250,7 @@ class TestCFM:
 class TestSDPAFallback:
     """Test SDPA fallback for float32 inputs."""
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_float32_uses_sdpa(self):
         """Test that float32 inputs use SDPA fallback."""

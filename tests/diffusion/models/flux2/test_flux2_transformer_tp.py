@@ -25,6 +25,7 @@ def setup_tp_group():
 class TestFlux2TransformerWeightLoading:
     """Test Flux2Transformer weight loading functionality"""
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_weight_loading_tp2(self, setup_tp_group):
         """Verify weights load correctly with TP=2"""
@@ -136,6 +137,7 @@ class TestFlux2RopePositionEmbedding:
 class TestFlux2PackedModuleMapping:
     """Test Flux2 packed module mapping functionality"""
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_packed_module_mapping(self, setup_tp_group):
         """Verify to_qkv packing matches HF checkpoint"""
@@ -213,6 +215,7 @@ class TestFlux2PackedModuleMapping:
             f"add_kv_proj weight dimension should be {expected_add_kv_shape}, got {attn_block.add_kv_proj.weight.shape}"
         )
 
+    @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_packed_mapping_edge_cases(self, setup_tp_group):
         """Test edge cases for packed mapping"""
