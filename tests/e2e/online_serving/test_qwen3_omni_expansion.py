@@ -26,7 +26,7 @@ from tests.utils import hardware_test
 model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 AUDIO_KEY = ["test"]
-IMAGE_KEY = ["square", "quadrate"]
+IMAGE_KEY = ["square", "quadrate", "rectangle"]
 VIDEO_KEY = ["sphere", "globe", "circle", "round", "ball"]
 
 
