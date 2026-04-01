@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import pytest
 
@@ -85,6 +85,21 @@ def _get_mix_prompt() -> str:
     return "What is recited in the audio? What is in this image? Describe the video briefly."
 
 
+class _HasServeArgs(Protocol):
+    serve_args: list[str]
+
+
+def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | None:
+    """Read effective stage yaml path from server CLI (OmniServer does not expose it as an attribute)."""
+    args: list[str] = omni_server.serve_args
+    for i, arg in enumerate(args):
+        if arg == "--stage-configs-path" and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--stage-configs-path="):
+            return arg.split("=", 1)[1]
+    return None
+
+
 def _parse_stage_devices(stage_config_path: str) -> str:
     text = Path(stage_config_path).read_text(encoding="utf-8")
     raw_devices: list[str] = re.findall(r"^\s*devices:\s*\"?([0-9,\s]+)\"?\s*$", text, flags=re.MULTILINE)
@@ -133,7 +148,9 @@ def test_scenarios_json_loads() -> None:
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_reliability_gpu_oom_injection(omni_server, openai_client) -> None:
     """Inject GPU OOM from test code and verify request fails during injection."""
-    device_spec = _resolve_oom_device_spec(OOM_INJECTION_CONFIG, omni_server.stage_config_path)
+    device_spec = _resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
+    )
     handle = inject_gpu_oom(
         device=device_spec,
         target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
@@ -186,7 +203,9 @@ def test_reliability_gpu_oom_injection(omni_server, openai_client) -> None:
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_reliability_gpu_oom_text_to_text(omni_server, openai_client) -> None:
     """OOM reliability case aligned with qwen3_omni text_to_text request style."""
-    device_spec = _resolve_oom_device_spec(OOM_INJECTION_CONFIG, omni_server.stage_config_path)
+    device_spec = _resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
+    )
     handle = inject_gpu_oom(
         device=device_spec,
         target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
