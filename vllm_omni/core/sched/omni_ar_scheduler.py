@@ -95,8 +95,19 @@ class OmniARScheduler(VLLMScheduler):
             return False
 
         criteria_type = self.kv_transfer_criteria.get("type")
+        if (
+            self.kv_transfer_criteria.get("stop_after_transfer", True)
+            and request.request_id in self.transfer_triggered_requests
+        ):
+            # For split pipelines that only need the transferred KV
+            # snapshot, stop AR decode once KV extraction has completed.
+            # This frees stage-0 resources without requiring an
+            # orchestrator-side abort.
+            if request.request_id not in self.active_kv_transfers:
+                request.status = RequestStatus.FINISHED_STOPPED
+                return True
+            return False
 
-        # Universal duplicate check for once semantics
         if request.request_id in self.transfer_triggered_requests:
             return False
 
@@ -456,6 +467,23 @@ class OmniARScheduler(VLLMScheduler):
             kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
             if kv_extracted_ids:
                 for req_id in kv_extracted_ids:
+                    # Emit a kv_ready signal so the orchestrator can forward
+                    # the request to the DiT stage immediately after KV
+                    # extraction, without waiting for AR decode to finish.
+                    req = self.requests.get(req_id)
+                    if req is not None and not req.is_finished():
+                        eco = engine_core_outputs.get(req.client_index)
+                        if eco is None:
+                            eco = EngineCoreOutputs()
+                            engine_core_outputs[req.client_index] = eco
+                        eco.outputs.append(
+                            EngineCoreOutput(
+                                request_id=req_id,
+                                new_token_ids=[],
+                                kv_transfer_params={"kv_ready": True},
+                            )
+                        )
+
                     # Mark transfer as finished
                     if req_id in self.active_kv_transfers:
                         self.active_kv_transfers.remove(req_id)
