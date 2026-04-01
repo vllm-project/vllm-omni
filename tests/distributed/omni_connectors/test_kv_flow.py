@@ -3,6 +3,7 @@ import torch
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    KVCacheTransferData,
     OmniKVCacheConfig,
     OmniKVTransferManager,
 )
@@ -60,6 +61,16 @@ def common_constants():
     }
 
 
+def _decode_stored_payload(data):
+    if isinstance(data, torch.Tensor) and data.dtype == torch.uint8 and data.dim() == 1:
+        return KVCacheTransferData.from_bytes(data.cpu().numpy().tobytes())
+
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return KVCacheTransferData.from_bytes(data)
+
+    return data
+
+
 def test_manager_extraction(kv_config, mock_connector, common_constants):
     """Test extraction and sending logic in OmniKVTransferManager."""
     num_layers = common_constants["num_layers"]
@@ -95,7 +106,7 @@ def test_manager_extraction(kv_config, mock_connector, common_constants):
     expected_key = f"stage1->stage2:{full_request_id}"
     assert expected_key in mock_connector.store
 
-    data = mock_connector.store[expected_key]
+    data = _decode_stored_payload(mock_connector.store[expected_key])
     assert data["request_id"] == req_id
     assert "layer_blocks" in data
     assert len(data["layer_blocks"]["key_cache"]) == num_layers
@@ -135,7 +146,7 @@ def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_const
     expected_key = f"stage1->stage2:{full_request_id}"
     assert expected_key in mock_connector.store
 
-    data = mock_connector.store[expected_key]
+    data = _decode_stored_payload(mock_connector.store[expected_key])
     expected_shape = (seq_len, num_heads, head_dim)
     for idx in range(len(kv_caches)):
         assert data["layer_blocks"]["key_cache"][idx].shape == expected_shape
@@ -165,7 +176,7 @@ def test_manager_extraction_mismatched_kv_block_counts(kv_config, mock_connector
     expected_key = f"stage1->stage2:{full_request_id}"
     assert expected_key in mock_connector.store
 
-    data = mock_connector.store[expected_key]
+    data = _decode_stored_payload(mock_connector.store[expected_key])
     expected_shape = (2 * block_size, num_heads, head_dim)
     assert data["layer_blocks"]["key_cache"][0].shape == expected_shape
     assert data["layer_blocks"]["value_cache"][0].shape == expected_shape
