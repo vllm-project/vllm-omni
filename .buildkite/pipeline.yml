@@ -15,7 +15,7 @@ steps:
     key: upload-ready-pipeline
     if: build.branch != "main" && build.pull_request.labels includes "ready"
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-ready.yml
+      - buildkite-agent pipeline upload .buildkite/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -23,7 +23,7 @@ steps:
   - label: "Upload Merge Pipeline"
     depends_on: image-build
     key: upload-merge-pipeline
-    if: build.branch == "main" && build.env("NIGHTLY") != "1"
+    if: build.branch == "main" && build.env("NIGHTLY") != "1" && build.pull_request.labels includes "ready"
     commands:
       - buildkite-agent pipeline upload .buildkite/test-merge.yml
     agents:
