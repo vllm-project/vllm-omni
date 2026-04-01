@@ -5,6 +5,7 @@ steps:
       queue: "linux-aarch64-a2b3-gy006-test"
     env:
       VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
+      IMAGE_NAME: "vllm-omni-ci-npu"
       # buildkitd 远程连接配置
       BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd.svc.cluster.local:1234"
     command: |
@@ -51,19 +52,19 @@ steps:
       echo "--- Image built: ${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar"
       ls -lh "${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar"
 
-      # 保存镜像路径供后续步骤使用
-      echo "IMAGE_TARBALL=${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar" >> /tmp/buildkit-env.txt
-      echo "CACHE_DIR=${builder_cache_dir}" >> /tmp/buildkit-env.txt
+      # 保存镜像路径和标签供后续步骤使用（/tmp 在 Pod 中共享）
+      {
+        echo "IMAGE_TARBALL=${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar"
+        echo "IMAGE_NAME=${IMAGE_NAME}"
+        echo "IMAGE_TAG=${VLLM_IMAGE_TAG}"
+        echo "CACHE_DIR=${builder_cache_dir}"
+      } > /tmp/buildkit-env.txt
+      cat /tmp/buildkit-env.txt
 
   - label: "Upload Test Pipeline"
     depends_on: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
     command: |
-      if [[ "${BUILDKITE_BRANCH}" == "main" ]]; then
-        echo "--- 上传 merge 测试 pipeline"
-        buildkite-agent pipeline upload .buildkite/test-npu-merge.yaml
-      else
-        echo "--- 上传 ready 测试 pipeline"
-        buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml
-      fi
+      buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml
+      
