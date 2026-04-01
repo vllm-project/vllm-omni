@@ -241,6 +241,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     self.segment_finished_requests.add(req_id)
 
                 new_ids = payload_data.get("codes", {}).get("audio")
+                if new_ids is None:
+                    # Legacy flat key emitted by some TTS stages (e.g. TADA);
+                    # upstream prefers nested "codes.audio".
+                    new_ids = payload_data.get("code_predictor_codes")
                 has_tensor_codes = isinstance(new_ids, torch.Tensor)
                 use_tensor_codes = has_tensor_codes and new_ids.ndim >= 2
                 if use_tensor_codes:
