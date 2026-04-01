@@ -1,43 +1,59 @@
 steps:
-  - label: ":buildkit: Build NPU Test Image"
+  - label: ":buildkit: Build NPU Test Image (buildctl)"
     key: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
     env:
-      # 启用 Docker BuildKit 支持完整的缓存和并行构建
-      DOCKER_BUILDKIT: "1"
-      # 动态镜像标签以 commit 哈希标识
       VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
+      # buildkitd 远程连接配置
+      BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd.svc.cluster.local:1234"
     command: |
       set -ex
 
       # 从 agent 名称提取索引用于缓存目录
-      # BUILDKITE_AGENT_NAME 格式: {hostname}-{agent_idx}-{npu_card_num}cards
       agent_idx=$(echo "${BUILDKITE_AGENT_NAME}" | awk -F'-' '{print $(NF-1)}')
       echo "--- Agent index: ${agent_idx}"
 
-      builder_name="cachebuilder${agent_idx}"
-      builder_cache_dir="/mnt/docker-cache${agent_idx}"
+      builder_cache_dir="/mnt/buildkit-cache${agent_idx}"
       mkdir -p ${builder_cache_dir}
 
-      echo "--- Building with Buildkit caching"
-      echo "Builder: ${builder_name}"
+      echo "--- Building with buildctl + buildkitd"
+      echo "buildkitd address: ${BUILDKITD_ADDR}"
       echo "Cache directory: ${builder_cache_dir}"
 
-      # 配置 GitHub 代理（buildkit 会使用 git clone）
+      # 配置 GitHub 代理
       git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
 
-      # 使用 buildkit 构建，启用本地缓存加速后续构建
-      # docker build 是直接在 agent 节点上运行，使用 host 的 Docker daemon
-      docker build \
-        --builder ${builder_name} \
-        --cache-from type=local,src=${builder_cache_dir} \
-        --cache-to type=local,dest=${builder_cache_dir},mode=max \
-        -t vllm-omni-ci-npu:${VLLM_IMAGE_TAG} \
-        -t vllm-omni-ci-npu:latest \
-        -f ./docker/Dockerfile_test.npu \
-        --progress=plain \
-        .
+      # 确保 buildctl 可用
+      if ! command -v buildctl &> /dev/null; then
+        echo "Installing buildctl..."
+        mkdir -p /tmp/buildkit
+        BUILDKIT_VERSION="v0.13.0"
+        wget -q https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-arm64.tar.gz -O /tmp/buildkit.tar.gz
+        tar -xzf /tmp/buildkit.tar.gz -C /tmp/buildkit
+        sudo cp /tmp/buildkit/bin/buildctl /usr/local/bin/
+      fi
+
+      # 使用 buildctl 构建：输出 OCI 格式到本地缓存
+      buildctl \
+        --addr="${BUILDKITD_ADDR}" \
+        --tlsca="/certs/ca.pem" \
+        --tlscert="/certs/cert.pem" \
+        --tlskey="/certs/key.pem" \
+        build \
+        --frontend dockerfile.v0 \
+        --local context=. \
+        --local dockerfile=./docker \
+        --opt filename=Dockerfile_test.npu \
+        --output type=oci,dest="${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar" \
+        --progress=plain
+
+      echo "--- Image built: ${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar"
+      ls -lh "${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar"
+
+      # 保存镜像路径供后续步骤使用
+      echo "IMAGE_TARBALL=${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar" >> /tmp/buildkit-env.txt
+      echo "CACHE_DIR=${builder_cache_dir}" >> /tmp/buildkit-env.txt
 
   - label: "Upload Test Pipeline"
     depends_on: image-build
