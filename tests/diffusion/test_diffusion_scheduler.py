@@ -398,6 +398,7 @@ class TestDiffusionEngine:
         with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
             engine._dummy_run()
 
+
 class TestStepScheduler:
     def setup_method(self) -> None:
         self.scheduler: StepScheduler = StepScheduler()
@@ -704,9 +705,10 @@ class TestStepScheduler:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.executor = Mock()
         engine._rpc_lock = threading.Lock()
+        engine.abort_queue = queue.Queue()
 
         request = _make_request("sleepy")
-        expected = DiffusionOutput(output=None)
+        runner_output = _make_request_output("sched-sleepy")
         state = Mock(sched_req_id="sched-sleepy", req=request)
         sched_output = Mock(
             scheduled_new_reqs=[NewRequestData.from_state(state)],
@@ -722,18 +724,19 @@ class TestStepScheduler:
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=CachedRequestData.make_empty(),
                 scheduled_req_ids=[],
+                finished_req_ids=[],
                 is_empty=True,
             ),
             sched_output,
         ]
         engine.scheduler.has_requests.return_value = True
         engine.scheduler.update_from_output.return_value = {"sched-sleepy"}
-        engine.executor.add_req.return_value = expected
+        engine.execute_fn = Mock(return_value=runner_output)
 
         with patch("vllm_omni.diffusion.diffusion_engine.time.sleep") as sleep_mock:
             output = engine.add_req_and_wait_for_response(request)
 
-        assert output is expected
+        assert output is runner_output.result
         sleep_mock.assert_called_once_with(0.001)
-        engine.executor.add_req.assert_called_once_with(request)
+        engine.execute_fn.assert_called_once_with(sched_output)
         engine.scheduler.pop_request_state.assert_called_once_with("sched-sleepy")
