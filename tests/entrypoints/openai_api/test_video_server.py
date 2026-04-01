@@ -735,3 +735,156 @@ def test_extra_params_merged_with_existing_extra_args(test_client, mocker: Mocke
     assert captured.extra_args["flow_shift"] == 0.5
     assert captured.extra_args["use_zero_init"] is True
     assert captured.extra_args["zero_steps"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Sync endpoint tests (POST /v1/videos/sync)
+# ---------------------------------------------------------------------------
+
+
+def _mock_encode_video_bytes(mocker: MockerFixture, return_value: bytes = b"fake-video-bytes"):
+    """Mock the raw-bytes encoder used by the sync video path."""
+    return mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=return_value,
+    )
+
+
+def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
+    """Sync endpoint should block until generation finishes and return raw
+    video bytes with metadata headers."""
+    _mock_encode_video_bytes(mocker, b"fake-video-bytes")
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "A cat running across the street.",
+            "size": "640x360",
+            "seconds": "2",
+            "fps": "12",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "video/mp4"
+    assert response.content == b"fake-video-bytes"
+    assert response.headers["x-request-id"].startswith("video_sync-")
+    assert response.headers["x-model"] == "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+    assert float(response.headers["x-inference-time-s"]) >= 0
+
+
+def test_sync_i2v_returns_video_bytes(test_client, mocker: MockerFixture):
+    """Sync I2V endpoint should accept an uploaded reference image and return
+    raw video bytes."""
+    image_bytes = _make_test_image_bytes((48, 32))
+    _mock_encode_video_bytes(mocker, b"i2v-video-data")
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "A bear playing with yarn."},
+        files={"input_reference": ("input.png", image_bytes, "image/png")},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"i2v-video-data"
+    assert response.headers["content-type"] == "video/mp4"
+
+
+def test_sync_i2v_with_image_reference(test_client, mocker: MockerFixture):
+    """Sync I2V endpoint should accept a JSON image_reference field."""
+    _mock_encode_video_bytes(mocker, b"ref-video")
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "A fox running through snow.",
+            "image_reference": json.dumps({"image_url": _make_test_image_data_url((40, 24))}),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"ref-video"
+
+
+def test_sync_missing_handler_returns_503():
+    app = FastAPI()
+    app.include_router(router)
+    app.state.openai_serving_video = None
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/videos/sync",
+        data={"prompt": "no handler"},
+    )
+    assert response.status_code == 503
+    assert "not initialized" in response.json()["detail"].lower()
+
+
+def test_sync_missing_prompt_returns_422(test_client):
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"size": "320x240"},
+    )
+    assert response.status_code == 422
+
+
+def test_sync_rejects_both_references(test_client):
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "bad refs",
+            "image_reference": '{"image_url": "https://example.com/cat.png"}',
+        },
+        files={"input_reference": ("input.png", _make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 400
+    assert "either input_reference or image_reference" in response.json()["detail"].lower()
+
+
+def test_sync_generation_error_returns_500(test_client, mocker: MockerFixture):
+    """If the underlying generation raises, the sync endpoint should return 500."""
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        side_effect=RuntimeError("GPU exploded"),
+    )
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "will fail"},
+    )
+    assert response.status_code == 500
+    assert "GPU exploded" in response.json()["detail"]
+
+
+def test_sync_does_not_create_store_entry(test_client, mocker: MockerFixture):
+    """The sync endpoint should NOT leave any record in VIDEO_STORE — it is
+    stateless by design."""
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "stateless test"},
+    )
+    assert response.status_code == 200
+    loop = asyncio.new_event_loop()
+    try:
+        stored = loop.run_until_complete(api_server.VIDEO_STORE.list_values())
+    finally:
+        loop.close()
+    assert len(stored) == 0
+
+
+def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
+    """Sampling parameters should propagate to the engine through the sync path."""
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "param pass",
+            "num_inference_steps": "30",
+            "guidance_scale": "6.5",
+            "seed": "42",
+        },
+    )
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.num_inference_steps == 30
+    assert captured.guidance_scale == 6.5
+    assert captured.seed == 42
