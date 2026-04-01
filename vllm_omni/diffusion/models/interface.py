@@ -58,6 +58,36 @@ class SupportsStepExecution(Protocol):
         """Decode output after denoise loop."""
 
 
+@runtime_checkable
+class SupportsModuleOffload(Protocol):
+    """Declares which submodules participate in sequential CPU offload.
+
+    The offload system uses mutual exclusion: when one group runs,
+    the other is moved to CPU.  Pipelines must declare both groups
+    because only the pipeline knows its own architecture.
+
+    ``_dit_modules``: attribute names of denoising submodules (kept
+    on GPU during the diffusion loop).
+
+    ``_encoder_modules``: attribute names of encoder/vision
+    submodules (offloaded to CPU during the diffusion loop).
+
+    ``_vae_modules``: attribute names of VAE(s) (always kept on GPU,
+    not part of the mutual exclusion hooks).
+
+    Example::
+
+        class MyPipeline(nn.Module, SupportsModuleOffload):
+            _dit_modules: ClassVar[list[str]] = ["transformer"]
+            _encoder_modules: ClassVar[list[str]] = ["text_encoder", "vit"]
+            _vae_modules: ClassVar[list[str]] = ["vae"]
+    """
+
+    _dit_modules: ClassVar[list[str]]
+    _encoder_modules: ClassVar[list[str]]
+    _vae_modules: ClassVar[list[str]]
+
+
 def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 
