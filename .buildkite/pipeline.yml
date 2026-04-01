@@ -1,15 +1,43 @@
 steps:
-  - label: ":docker: Build NPU Image"
+  - label: ":buildkit: Build NPU Test Image"
     key: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
-    plugins:
-      - docker#v5.2.0:
-          image: "docker:24.0"
-          volumes:
-            - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      # 启用 Docker BuildKit 支持完整的缓存和并行构建
+      DOCKER_BUILDKIT: "1"
+      # 动态镜像标签以 commit 哈希标识
+      VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
     command: |
-      docker build -t vllm-omni-ci-npu -f ./docker/Dockerfile_test.npu .
+      set -ex
+
+      # 从 agent 名称提取索引用于缓存目录
+      # BUILDKITE_AGENT_NAME 格式: {hostname}-{agent_idx}-{npu_card_num}cards
+      agent_idx=$(echo "${BUILDKITE_AGENT_NAME}" | awk -F'-' '{print $(NF-1)}')
+      echo "--- Agent index: ${agent_idx}"
+
+      builder_name="cachebuilder${agent_idx}"
+      builder_cache_dir="/mnt/docker-cache${agent_idx}"
+      mkdir -p ${builder_cache_dir}
+
+      echo "--- Building with Buildkit caching"
+      echo "Builder: ${builder_name}"
+      echo "Cache directory: ${builder_cache_dir}"
+
+      # 配置 GitHub 代理（buildkit 会使用 git clone）
+      git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
+
+      # 使用 buildkit 构建，启用本地缓存加速后续构建
+      # docker build 是直接在 agent 节点上运行，使用 host 的 Docker daemon
+      docker build \
+        --builder ${builder_name} \
+        --cache-from type=local,src=${builder_cache_dir} \
+        --cache-to type=local,dest=${builder_cache_dir},mode=max \
+        -t vllm-omni-ci-npu:${VLLM_IMAGE_TAG} \
+        -t vllm-omni-ci-npu:latest \
+        -f ./docker/Dockerfile_test.npu \
+        --progress=plain \
+        .
 
   - label: "Upload Test Pipeline"
     depends_on: image-build
