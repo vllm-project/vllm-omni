@@ -9,7 +9,7 @@ import struct
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import soundfile as sf
@@ -44,10 +44,14 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 # TTS Configuration
-_VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
-_QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
-_FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
-_TTS_MODEL_STAGES: set[str] = _VOXTRAL_TTS_MODEL_STAGES | _QWEN3_TTS_MODEL_STAGES | _FISH_TTS_MODEL_STAGES
+TTSModelType = Literal["qwen3_tts", "voxtral_tts", "fish_tts", "vibevoice_tts"]
+_TTS_MODEL_TYPE_BY_STAGE: dict[str, TTSModelType] = {
+    "audio_generation": "voxtral_tts",
+    "qwen3_tts": "qwen3_tts",
+    "fish_speech_slow_ar": "fish_tts",
+    "vibevoice_tts": "vibevoice_tts",
+}
+_TTS_MODEL_STAGES = set(_TTS_MODEL_TYPE_BY_STAGE)
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -158,12 +162,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Find and cache the TTS stage (if any) during initialization
         self._tts_stage = self._find_tts_stage()
-        self._is_tts = self._tts_stage is not None
-        self._is_fish_speech = (
-            self._tts_stage is not None
-            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None) == "fish_speech_slow_ar"
-        )
         self._fish_speech_tokenizer = None
+        self._vibevoice_processor = None
 
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
@@ -229,18 +229,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return stage
         return None
 
-    def _detect_tts_model_type(self) -> str | None:
+    def _detect_tts_model_type(self) -> TTSModelType | None:
         """Detect TTS model type from the stage's model_stage attribute."""
         if self._tts_stage is None:
             return None
         model_stage = getattr(self._tts_stage.engine_args, "model_stage", None)
-        if model_stage in _QWEN3_TTS_MODEL_STAGES:
-            return "qwen3_tts"
-        if model_stage in _VOXTRAL_TTS_MODEL_STAGES:
-            return "voxtral_tts"
-        if model_stage in _FISH_TTS_MODEL_STAGES:
-            return "fish_tts"
-        return None
+        return _TTS_MODEL_TYPE_BY_STAGE.get(model_stage)
 
     def _compute_max_instructions_length(self) -> int:
         """Compute max instructions length with precedence: CLI > stage config > default.
@@ -263,25 +257,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
-        try:
-            if self._tts_model_type == "voxtral_tts":
-                config = self.engine_client.model_config.hf_config.audio_config
-            else:
-                # Default is qwen3_tts path
-                config = self.engine_client.model_config.hf_config.talker_config
+        if self._tts_model_type in {"fish_tts", "vibevoice_tts"}:
+            return set()
 
-            # Check for speakers in either spk_id or speaker_id
-            for attr_name in ["spk_id", "speaker_id"]:
-                if isinstance(config, dict):
-                    speakers_dict = config.get(attr_name)
-                else:
-                    speakers_dict = getattr(config, attr_name, None)
-                if speakers_dict and isinstance(speakers_dict, dict):
-                    return {speaker.lower() for speaker in speakers_dict.keys()}
+        hf_config = self.engine_client.model_config.hf_config
+        if self._tts_model_type == "voxtral_tts":
+            config = (
+                hf_config.get("audio_config")
+                if isinstance(hf_config, dict)
+                else getattr(hf_config, "audio_config", None)
+            )
+        elif self._tts_model_type in {None, "qwen3_tts"}:
+            config = (
+                hf_config.get("talker_config")
+                if isinstance(hf_config, dict)
+                else getattr(hf_config, "talker_config", None)
+            )
+        else:
+            raise AssertionError(f"Unsupported TTS model type: {self._tts_model_type}")
+        if config is None:
+            return set()
 
-            logger.warning("No speakers found in config (checked spk_id and speaker_id)")
-        except Exception as e:
-            logger.warning(f"Could not load speakers from model config: {e}")
+        for attr_name in ("spk_id", "speaker_id"):
+            speakers = config.get(attr_name) if isinstance(config, dict) else getattr(config, attr_name, None)
+            if isinstance(speakers, dict):
+                return {speaker.lower() for speaker in speakers}
 
         return set()
 
@@ -694,17 +694,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         logger.info(f"Deleted voice '{name}' and associated files")
         return True
 
-    def _is_tts_model(self) -> bool:
-        """Check if the current model is a supported TTS model."""
-        return any(stage.engine_args.model_stage in _TTS_MODEL_STAGES for stage in self.engine_client.stage_configs)
-
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
-        if self._tts_model_type == "voxtral_tts":
-            return self._validate_voxtral_tts_request(request)
-        if self._tts_model_type == "fish_tts":
-            return self._validate_fish_tts_request(request)
-        return self._validate_qwen_tts_request(request)
+        match self._tts_model_type:
+            case "voxtral_tts":
+                return self._validate_voxtral_tts_request(request)
+            case "fish_tts":
+                return self._validate_fish_tts_request(request)
+            case "vibevoice_tts":
+                return self._validate_vibevoice_tts_request(request)
+            case "qwen3_tts" | None:
+                return self._validate_qwen_tts_request(request)
+            case _:
+                raise AssertionError(f"Unsupported TTS model type: {self._tts_model_type}")
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
@@ -872,6 +874,32 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
             if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+
+        return None
+
+    def _validate_vibevoice_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate VibeVoice-TTS request parameters. Returns error message or None."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+
+        if request.voice is not None:
+            voice_name = request.voice.lower()
+            if voice_name not in self.uploaded_speakers:
+                return (
+                    "VibeVoice-TTS currently supports uploaded voice samples only. "
+                    "Provide 'ref_audio' directly or upload a voice and use its name via 'voice'."
+                )
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > 65536:
+                return "max_new_tokens cannot exceed 65536 for VibeVoice-TTS"
 
         return None
 
@@ -1086,6 +1114,138 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return params
 
+    # ---- VibeVoice TTS helpers ----
+
+    def _get_vibevoice_processor(self):
+        if self._vibevoice_processor is not None:
+            return self._vibevoice_processor
+
+        from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+
+        model_path = self.engine_client.model_config.model
+        self._vibevoice_processor = VibeVoiceProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+        )
+        if getattr(self._vibevoice_processor, "tokenizer", None) is not None:
+            self._vibevoice_processor.tokenizer.padding_side = "left"
+        return self._vibevoice_processor
+
+    @staticmethod
+    def _unwrap_vibevoice_single(value: Any) -> Any:
+        if isinstance(value, list) and value and isinstance(value[0], list):
+            return value[0]
+        return value
+
+    @staticmethod
+    def _normalize_vibevoice_script(text: str) -> str:
+        normalized_lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            speaker_match = re.match(r"^Speaker\s+(\d+)\s*:\s*(.*)$", line, re.IGNORECASE)
+            if speaker_match:
+                speaker_id = speaker_match.group(1)
+                speaker_text = speaker_match.group(2).strip()
+            else:
+                speaker_id = "1"
+                speaker_text = line
+            if not speaker_text:
+                continue
+            normalized_lines.append(f"Speaker {speaker_id}: {speaker_text}")
+        return "\n".join(normalized_lines)
+
+    def _get_vibevoice_target_sample_rate(self, processor: Any) -> int:
+        audio_processor = getattr(processor, "audio_processor", None)
+        for attr_name in ("sampling_rate", "target_sample_rate"):
+            value = getattr(audio_processor, attr_name, None)
+            if value:
+                return int(value)
+
+        hf_config = self.engine_client.model_config.hf_config
+        if isinstance(hf_config, dict):
+            target_sample_rate = hf_config.get("target_sample_rate")
+        else:
+            target_sample_rate = getattr(hf_config, "target_sample_rate", None)
+        return int(target_sample_rate or 24000)
+
+    def _align_vibevoice_voice_samples(
+        self,
+        processor: Any,
+        voice_samples: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not voice_samples:
+            return []
+
+        target_sample_rate = self._get_vibevoice_target_sample_rate(processor)
+        aligned_samples: list[dict[str, Any]] = []
+        for sample in voice_samples:
+            if not isinstance(sample, dict):
+                continue
+            wav = np.asarray(sample.get("samples") or [], dtype=np.float32)
+            sample_rate = int(sample.get("sample_rate") or target_sample_rate)
+            if wav.size == 0:
+                continue
+            if sample_rate != target_sample_rate:
+                import librosa
+
+                wav = librosa.resample(wav, orig_sr=sample_rate, target_sr=target_sample_rate)
+                sample_rate = target_sample_rate
+            aligned_samples.append(
+                {
+                    "samples": wav.astype(np.float32).tolist(),
+                    "sample_rate": sample_rate,
+                }
+            )
+        return aligned_samples
+
+    async def _resolve_vibevoice_voice_samples(self, request: OpenAICreateSpeechRequest) -> list[dict[str, Any]]:
+        if request.ref_audio is None and request.voice is None:
+            return []
+
+        ref_audio_source = request.ref_audio
+        if ref_audio_source is None:
+            ref_audio_source = self._get_uploaded_audio_data(request.voice.lower())
+            assert ref_audio_source is not None, f"Uploaded voice '{request.voice}' is missing audio data"
+
+        wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
+        return [
+            {
+                "samples": wav_list,
+                "sample_rate": int(sr),
+            }
+        ]
+
+    async def _build_vibevoice_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        processor = self._get_vibevoice_processor()
+        normalized_text = self._normalize_vibevoice_script(request.input)
+        voice_samples = self._align_vibevoice_voice_samples(
+            processor,
+            await self._resolve_vibevoice_voice_samples(request),
+        )
+        processor_voice_samples = None
+        if voice_samples:
+            processor_voice_samples = [np.asarray(sample["samples"], dtype=np.float32) for sample in voice_samples]
+
+        encoding = processor(
+            text=normalized_text,
+            voice_samples=processor_voice_samples,
+            padding=False,
+            return_tensors=None,
+        )
+        full_tokens = [int(token) for token in self._unwrap_vibevoice_single(encoding["input_ids"])]
+        speech_input_mask = [bool(flag) for flag in self._unwrap_vibevoice_single(encoding["speech_input_mask"])]
+        assert len(full_tokens) == len(speech_input_mask)
+
+        return {
+            "prompt_token_ids": full_tokens,
+            "additional_information": {
+                "voice_samples": voice_samples,
+                "speech_input_mask": speech_input_mask,
+            },
+        }
+
     # ---- Voxtral TTS helpers ----
 
     async def _build_voxtral_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -1193,63 +1353,65 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        if self._is_fish_speech:
-            validation_error = self._validate_fish_tts_request(request)
-            if validation_error:
-                raise ValueError(validation_error)
-            ref_audio_data = None
-            if request.ref_audio is not None:
-                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                ref_audio_data = (wav_list, sr)
-            prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
+        model_type = self._tts_model_type
+        if model_type is None:
             tts_params = {}
-        elif self._is_tts:
+            prompt = {"prompt": request.input}
+        else:
             validation_error = self._validate_tts_request(request)
             if validation_error:
                 raise ValueError(validation_error)
 
-            if self._tts_model_type == "voxtral_tts":
-                prompt = await self._build_voxtral_prompt(request)
-                tts_params = {}
-            else:
-                tts_params = self._build_tts_params(request)
-                # Resolve ref_audio (explicit or auto-set for uploaded voices)
-                # to [[wav_list, sr]] so the model doesn't re-decode base64.
-                ref_audio_source = request.ref_audio
-                if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
-                    # Uploaded voice: ref_audio was auto-set as [base64_data_url]
-                    ref_audio_source = tts_params["ref_audio"][0]
-                if ref_audio_source is not None and isinstance(ref_audio_source, str):
-                    wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
-                    tts_params["ref_audio"] = [[wav_list, sr]]
+            match model_type:
+                case "fish_tts":
+                    ref_audio_data = None
+                    if request.ref_audio is not None:
+                        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                        ref_audio_data = (wav_list, sr)
+                    prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
+                    tts_params = {}
+                case "voxtral_tts":
+                    prompt = await self._build_voxtral_prompt(request)
+                    tts_params = {}
+                case "vibevoice_tts":
+                    prompt = await self._build_vibevoice_prompt(request)
+                    tts_params = {}
+                case "qwen3_tts":
+                    tts_params = self._build_tts_params(request)
+                    ref_audio_source = request.ref_audio
+                    if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
+                        ref_audio_source = tts_params["ref_audio"][0]
+                    if ref_audio_source is not None:
+                        assert isinstance(ref_audio_source, str)
+                        wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
+                        tts_params["ref_audio"] = [[wav_list, sr]]
 
-                ph_len = self._estimate_prompt_len(tts_params)
-                prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
-        else:
-            tts_params = {}
-            prompt = {"prompt": request.input}
+                    ph_len = self._estimate_prompt_len(tts_params)
+                    prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
+                case _:
+                    raise AssertionError(f"Unsupported TTS model type: {model_type}")
 
         request_id = f"speech-{random_uuid()}"
-        if self._is_fish_speech:
-            model_type = "fish_speech"
-        elif self._tts_model_type == "voxtral_tts":
-            model_type = "voxtral_tts"
-        elif self._is_tts:
-            model_type = tts_params.get("task_type", ["unknown"])[0]
+        if model_type is None:
+            logged_model_type = "generic"
+        elif model_type == "fish_tts":
+            logged_model_type = "fish_speech"
+        elif model_type == "qwen3_tts":
+            logged_model_type = tts_params["task_type"][0]
         else:
-            model_type = "generic"
+            logged_model_type = model_type
         logger.info(
             "TTS speech request %s: text=%r, model=%s",
             request_id,
             request.input[:50] + "..." if len(request.input) > 50 else request.input,
-            model_type,
+            logged_model_type,
         )
 
         sampling_params_list = self.engine_client.default_sampling_params_list
 
         # Fish defaults come from stage_configs YAML. Only override when the caller
         # explicitly requests a different generation length.
-        if self._is_fish_speech and request.max_new_tokens is not None and sampling_params_list:
+        if model_type == "fish_tts" and request.max_new_tokens is not None and sampling_params_list:
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)

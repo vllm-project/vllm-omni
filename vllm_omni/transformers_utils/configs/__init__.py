@@ -17,6 +17,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FishSpeechConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "FishSpeechSlowARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "FishSpeechFastARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
+    "VibeVoiceConfig": "vllm_omni.transformers_utils.configs.vibevoice",
+    "VibeVoiceAcousticTokenizerConfig": "vllm_omni.transformers_utils.configs.vibevoice",
+    "VibeVoiceSemanticTokenizerConfig": "vllm_omni.transformers_utils.configs.vibevoice",
+    "VibeVoiceDiffusionHeadConfig": "vllm_omni.transformers_utils.configs.vibevoice",
 }
 
 __all__ = [
@@ -27,6 +31,10 @@ __all__ = [
     "FishSpeechConfig",
     "FishSpeechSlowARConfig",
     "FishSpeechFastARConfig",
+    "VibeVoiceConfig",
+    "VibeVoiceAcousticTokenizerConfig",
+    "VibeVoiceSemanticTokenizerConfig",
+    "VibeVoiceDiffusionHeadConfig",
 ]
 
 
@@ -47,3 +55,4 @@ def __dir__():
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa: F401, E402

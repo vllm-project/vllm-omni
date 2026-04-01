@@ -152,6 +152,11 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    "VibeVoiceTTSForConditionalGeneration": (
+        "vibevoice_tts",
+        "vibevoice_tts",
+        "VibeVoiceTTSForConditionalGeneration",
+    ),
 }
 
 

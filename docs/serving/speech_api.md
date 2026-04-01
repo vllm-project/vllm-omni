@@ -5,6 +5,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **VibeVoice-TTS** (`microsoft/VibeVoice-1.5B`) -- Single-stage TTS. Supports plain text or `Speaker N:` scripts plus single-speaker voice prompting. Output: 24 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -33,6 +34,14 @@ vllm-omni serve fishaudio/s2-pro \
 # Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
+
+# VibeVoice-TTS
+vllm serve microsoft/VibeVoice-1.5B \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/vibevoice_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -128,6 +137,12 @@ Content-Type: application/json
 | `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
+
+For VibeVoice:
+
+- Plain text input is normalized to a single-speaker script (`Speaker 1:`).
+- `voice` accepts an uploaded voice sample.
+- `ref_audio` accepts a single reference clip.
 
 ### Response Format
 
@@ -348,6 +363,18 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output cloned.wav
 ```
 
+### VibeVoice Single-Speaker
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "microsoft/VibeVoice-1.5B",
+        "input": "Hello from VibeVoice",
+        "voice": "custom_voice_1"
+    }' --output vibevoice_single.wav
+```
+
 ## Batch Speech Generation
 
 The batch endpoint synthesizes multiple texts in a single request, returning all results as JSON with base64-encoded audio.
@@ -531,6 +558,12 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
+
+### VibeVoice-TTS
+
+| Model | Description |
+|-------|-------------|
+| `microsoft/VibeVoice-1.5B` | 1.5B single-stage TTS. Supports plain text, `Speaker N:` scripts, and single-speaker prompting via uploaded `voice` or `ref_audio`. |
 
 ## Error Responses
 
