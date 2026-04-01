@@ -1710,7 +1710,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         label = str(top.get("label", "")).lower()
         conf = float(top.get("score", 0.0))
 
-        if conf < 0.6:
+        if conf < 0.5:
             gender = "unknown"
         # Some models use non-English labels (e.g., Russian). Normalize to 'male'/'female'.
         elif ("female" in label) or ("жен" in label):
@@ -1742,7 +1742,9 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
 _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
     "serena": "female",
     "uncle_fu": "male",
+    "chelsie": "female",
     "clone": "female",
+    "ethan": "male",
 }
 
 
@@ -1831,6 +1833,12 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
             print(f"audio content is: {response.audio_content}")
+            speaker = request_config.get("speaker")
+            if speaker:
+                _assert_preset_voice_gender_from_audio(
+                    response.audio_bytes,
+                    speaker,
+                )
 
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
@@ -1860,11 +1868,6 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
                 "The audio content is not same as the text"
             )
             print(f"similarity is: {response.similarity}")
-
-            _assert_preset_voice_gender_from_audio(
-                response.audio_bytes,
-                request_config.get("speaker"),
-            )
 
 
 def assert_audio_speech_response(

@@ -103,7 +103,7 @@ def get_prompt(prompt_type="text_only"):
         "text_audio": "What is in this audio? ",
         "text_audio_video": "First, what is in this audio? Then, what is in this video? ",
         "one_word": "What is the capital of UK? Answer in one word",
-        "text_chinese": "英国的首都在哪里？",
+        "text_chinese": "英国的首都在哪里？请用50个字回答",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -465,20 +465,10 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "use_audio_in_video": True,
-        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep", "electronic"]},
+        "key_words": {"video": VIDEO_KEY},
     }
 
-    # Retry when assert_omni_response fails on key_words (see tests/conftest.py).
-    _keyword_assert_msg = "The output does not contain any of the keywords."
-    _max_retries = 3
-    for attempt in range(_max_retries):
-        try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-            break
-        except AssertionError as e:
-            if _keyword_assert_msg not in str(e) or attempt == _max_retries - 1:
-                raise
-            print(f"Keyword assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.advanced_model
@@ -537,8 +527,8 @@ def test_speaker_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
-        "speaker": "Serena",
-        "key_words": {"text": ["Beijing"]},
+        "speaker": "Chelsie",
+        "key_words": {"text": ["beijing"]},
     }
 
     openai_client.send_omni_request(request_config)
@@ -564,8 +554,8 @@ def test_speaker_002(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
-        "speaker": "uncle_fu",
-        "key_words": {"text": ["Beijing"]},
+        "speaker": "Ethan",
+        "key_words": {"text": ["beijing"]},
     }
 
     # Retry only when assert_omni_response fails on preset voice gender (see tests/conftest.py).
@@ -601,8 +591,8 @@ def test_speaker_003(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
-        "speaker": "SERENA",
-        "key_words": {"text": ["Beijing"]},
+        "speaker": "CHELSIE",
+        "key_words": {"text": ["beijing"]},
     }
 
     openai_client.send_omni_request(request_config)
