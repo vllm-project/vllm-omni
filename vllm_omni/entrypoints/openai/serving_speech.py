@@ -894,6 +894,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "VibeVoice-TTS currently supports uploaded voice samples only. "
                     "Provide 'ref_audio' directly or upload a voice and use its name via 'voice'."
                 )
+            if self._get_uploaded_audio_data(voice_name) is None:
+                return f"Audio file for uploaded voice '{request.voice}' is missing or corrupted"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -1207,7 +1209,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_audio_source = request.ref_audio
         if ref_audio_source is None:
             ref_audio_source = self._get_uploaded_audio_data(request.voice.lower())
-            assert ref_audio_source is not None, f"Uploaded voice '{request.voice}' is missing audio data"
+            if ref_audio_source is None:
+                raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
 
         wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
         return [
@@ -1409,9 +1412,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         sampling_params_list = self.engine_client.default_sampling_params_list
 
-        # Fish defaults come from stage_configs YAML. Only override when the caller
-        # explicitly requests a different generation length.
-        if model_type == "fish_tts" and request.max_new_tokens is not None and sampling_params_list:
+        # Fish and VibeVoice defaults come from stage_configs YAML. Only override
+        # when the caller explicitly requests a different generation length.
+        if model_type in {"fish_tts", "vibevoice_tts"} and request.max_new_tokens is not None and sampling_params_list:
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
