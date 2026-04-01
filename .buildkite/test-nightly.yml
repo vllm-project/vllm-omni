@@ -6,16 +6,10 @@ steps:
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - |
-        set +e
-        pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "advanced_model" --run-level "advanced_model"
-        EXIT1=$$?
-        pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "advanced_model" --run-level "advanced_model"
-        EXIT2=$$?
-        pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
-        EXIT3=$$?
-        pytest -s -v tests/e2e/offline_inference/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
-        EXIT4=$$?
-        exit $$((EXIT1 | EXIT2 | EXIT3 | EXIT4))
+        pytest -s -v \
+          tests/examples/ \
+          tests/e2e/online_serving/test_*_expansion.py \
+          -m "advanced_model and H100 and omni" --run-level "advanced_model"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -57,8 +51,7 @@ steps:
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-      - pytest -s -v tests/examples/ -m "advanced_model and L4 and omni" --run-level "advanced_model"
-      - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and L4 and omni" --run-level "advanced_model"
+      - pytest -s -v tests/examples/ tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and L4 and omni" --run-level "advanced_model"
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
