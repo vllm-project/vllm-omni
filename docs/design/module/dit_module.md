@@ -192,7 +192,7 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting = deque()
         self._running = []
         self._finished_req_ids = set()
-        self._max_batch_size = 1
+        self.max_num_running_reqs = 1
 ```
 
 **Design Features**:
@@ -201,7 +201,7 @@ class _BaseScheduler(SchedulerInterface):
 
 - **Shared cleanup logic**: Request-id registration, finish handling, and state removal are centralized instead of duplicated in each policy.
 
-- **Current constraint**: `_max_batch_size` remains `1` because the current engine path is still synchronous request-mode execution.
+- **Current constraint**: `max_num_running_reqs` remains `1` because the current engine path is still synchronous request-mode execution.
 
 #### 2.4 Current `RequestScheduler` Policy
 
