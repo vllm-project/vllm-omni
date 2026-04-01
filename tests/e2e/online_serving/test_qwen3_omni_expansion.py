@@ -103,7 +103,7 @@ def get_prompt(prompt_type="text_only"):
         "text_audio": "What is in this audio? ",
         "text_audio_video": "First, what is in this audio? Then, what is in this video? ",
         "one_word": "What is the capital of UK? Answer in one word",
-        "text_chinese": "英国的首都在哪里？请用50个字回答",
+        "text_chinese": "北京，中国的首都，是一座融合了长城等历史地点与现代建筑的国际化大都市，充满了独特的文化与活力。请重复这句话。",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -618,7 +618,7 @@ def test_language_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
-        "key_words": {"text": ["伦敦"]},
+        "key_words": {"text": ["北京"]},
     }
 
     openai_client.send_omni_request(request_config)
