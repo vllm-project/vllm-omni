@@ -160,11 +160,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("code_predictor_codes", [])
                 request.prompt_token_ids = new_ids
-                # Pass additional fields (like left_context_size) to the request
-                # Only pass chunk context metadata in additional_information
-                request.additional_information = {}
-                if "left_context_size" in payload_data:
-                    request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                # Pass all metadata fields to the request's additional_information
+                # so models can receive tensors and scalars via runtime_additional_information.
+                _skip = {"code_predictor_codes", "finished"}
+                request.additional_information = {
+                    k: v for k, v in payload_data.items() if k not in _skip
+                }
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
