@@ -174,7 +174,7 @@ steps:
                 pytest -s -v tests/engine/test_async_omni_engine_abort.py
         '
     agents:
-      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+      queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT

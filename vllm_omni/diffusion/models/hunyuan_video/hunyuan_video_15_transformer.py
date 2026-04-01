@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
 
@@ -544,11 +545,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
     }
 
-    @staticmethod
-    def _is_transformer_block(name: str, module) -> bool:
-        return "transformer_blocks" in name and name.split(".")[-1].isdigit()
-
-    _hsdp_shard_conditions = [_is_transformer_block]
+    _hsdp_shard_conditions = [is_transformer_block_module]
 
     def __init__(
         self,
