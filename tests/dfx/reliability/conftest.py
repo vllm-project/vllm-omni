@@ -147,7 +147,8 @@ strict = sys.argv[4] == "1"
 torch.cuda.init()
 torch.cuda.set_device(device)
 props = torch.cuda.get_device_properties(device)
-target_bytes = int(props.total_memory * target_ratio)
+free_before, total_bytes = torch.cuda.mem_get_info(device)
+target_bytes = int(free_before * target_ratio)
 chunk_bytes = 256 * 1024 * 1024
 chunks = []
 allocated = 0
@@ -163,11 +164,28 @@ while allocated < target_bytes:
         break
 
 achieved_ratio = allocated / max(1, props.total_memory)
-if strict and achieved_ratio < target_ratio:
-    print(f"ERROR:achieved_ratio={achieved_ratio:.4f}", flush=True)
+achieved_free_ratio = allocated / max(1, int(free_before))
+if strict and achieved_free_ratio < target_ratio:
+    print(
+        "ERROR:"
+        f"achieved_free_ratio={achieved_free_ratio:.4f};"
+        f"achieved_total_ratio={achieved_ratio:.4f};"
+        f"free_before={int(free_before)};"
+        f"target_bytes={target_bytes};"
+        f"allocated={allocated}",
+        flush=True,
+    )
     sys.exit(2)
 
-print(f"READY:achieved_ratio={achieved_ratio:.4f}", flush=True)
+print(
+    "READY:"
+    f"achieved_free_ratio={achieved_free_ratio:.4f};"
+    f"achieved_total_ratio={achieved_ratio:.4f};"
+    f"free_before={int(free_before)};"
+    f"target_bytes={target_bytes};"
+    f"allocated={allocated}",
+    flush=True,
+)
 time.sleep(hold_seconds)
 print("DONE", flush=True)
 """
@@ -192,7 +210,12 @@ def start_gpu_oom_hog(
     strict: bool = True,
     poll_interval_sec: float = 0.2,
 ) -> OomHandle:
-    """Start a CUDA sidecar process that occupies GPU memory to trigger OOM."""
+    """Start a CUDA sidecar process that occupies GPU memory to trigger OOM.
+
+    Note:
+        ``target_mem_ratio`` is evaluated against free memory at injection start
+        (not total GPU memory), i.e. success gate is ``allocated / free_before``.
+    """
     if os.name == "nt":
         raise RuntimeError("CUDA OOM sidecar is intended for Linux CI/runtime.")
     if not (0.1 <= target_mem_ratio < 1.0):
