@@ -109,6 +109,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _diffusion_mode: bool = False
     _diffusion_engine: Optional["AsyncOmniDiffusion"] = None
     _diffusion_model_name: str = ""
+    _supported_speakers: set[str] | None = None
 
     @classmethod
     def for_diffusion(
@@ -134,6 +135,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         return instance
+
+    def _get_supported_speakers(self) -> set[str]:
+        """Load supported speakers from model config (cached)."""
+        if self._supported_speakers is not None:
+            return self._supported_speakers
+        try:
+            hf_config = self.model_config.hf_config
+            # Qwen3-Omni: talker_config.speaker_id
+            for config_attr in ["talker_config"]:
+                config = getattr(hf_config, config_attr, None)
+                if config is None:
+                    continue
+                for spk_attr in ["speaker_id", "spk_id"]:
+                    speakers_dict = (
+                        config.get(spk_attr) if isinstance(config, dict) else getattr(config, spk_attr, None)
+                    )
+                    if speakers_dict and isinstance(speakers_dict, dict):
+                        self._supported_speakers = {s.lower() for s in speakers_dict}
+                        return self._supported_speakers
+        except Exception as e:
+            logger.warning("Could not load speakers from model config: %s", e)
+        self._supported_speakers = set()
+        return self._supported_speakers
 
     async def create_chat_completion(
         self,
@@ -536,9 +560,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         speaker = getattr(request, "speaker", None)
         if speaker is not None and isinstance(speaker, str) and speaker.strip():
+            normalized = speaker.lower().strip()
+            supported = self._get_supported_speakers()
+            if supported and normalized not in supported:
+                raise ValueError(f"Invalid speaker '{speaker}'. Supported: {', '.join(sorted(supported))}")
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
                 engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["speaker"] = [speaker.lower().strip()]
+            engine_prompt["additional_information"]["speaker"] = [normalized]
 
         language = getattr(request, "language", None)
         if language is not None and isinstance(language, str) and language.strip():
