@@ -1,6 +1,6 @@
 [
   {
-    "test_name": "qwen3_omni_abnormal_then_ok",
+    "test_name": "qwen3_omni_reliability_async_chunk",
     "server_params": {
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "stage_config_name": "qwen3_omni_ci.yaml",
@@ -20,52 +20,13 @@
           "2": ["custom_process_input_func"]
         }
       }
-    },
-    "scenario": {
-      "type": "abnormal_input",
-      "fault_params": {
-        "variants": ["malformed_json", "invalid_messages_type"]
-      },
-      "expect": {
-        "fault_http_status_class": "4xx",
-        "process_alive": true,
-        "min_post_success": 1
-      },
-      "recovery_request": {
-        "content_text": "What is the capital of China? Reply with one word.",
-        "key_words": { "text": ["beijing"] },
-        "modalities": ["text"],
-        "stream": false
-      }
     }
   },
   {
-    "test_name": "qwen3_omni_abnormal_then_ok_no_async_chunk",
+    "test_name": "qwen3_omni_reliability_default",
     "server_params": {
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-      "stage_config_name": "qwen3_omni_ci.yaml",
-      "delete": {
-        "stage_args": {
-          "2": ["custom_process_input_func"]
-        }
-      }
-    },
-    "scenario": {
-      "type": "abnormal_input",
-      "fault_params": {
-        "variants": ["malformed_json", "invalid_messages_type"]
-      },
-      "expect": {
-        "fault_http_status_class": "4xx",
-        "process_alive": true,
-        "min_post_success": 1
-      },
-      "recovery_request": {
-        "content_text": "What is the capital of China? Reply with one word.",
-        "key_words": { "text": ["beijing"] },
-        "modalities": ["text"],
-        "stream": false
-      }
+      "stage_config_name": "qwen3_omni_ci.yaml"
     }
   }
 ]

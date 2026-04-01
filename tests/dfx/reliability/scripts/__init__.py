@@ -1,1 +1,1 @@
-"""L5(b) reliability scripts (RFC: fault_inject + test_reliability)."""
+"""L5(b) reliability scripts (fault injection + test entry)."""

@@ -3,7 +3,7 @@
 See [RFC-dfx-l5-reliability.md](../../../docs/contributing/rfc/RFC-dfx-l5-reliability.md).
 
 - Scenarios: `tests/scenarios.json`
-- Fault helpers: `scripts/fault_inject.py`
+- Fault helpers: `conftest.py`
 - Pytest entry: `scripts/test_reliability.py`
 
 ```bash

@@ -1,36 +1,47 @@
 """
 L5(b) reliability integration tests (RFC: test_reliability.py).
 
-Loads ``tests/dfx/reliability/tests/scenarios.json``, runs ``fault_inject`` by scenario
-type, then validates recovery via ``openai_client``.
+Loads ``tests/dfx/reliability/tests/scenarios.json``, runs callable fault-injection
+helpers from ``tests.dfx.reliability.conftest``, then validates request behavior.
 """
 
 from __future__ import annotations
 
 import copy
-import os
-import time
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServerParams, dummy_messages_from_mix_data
+from tests.conftest import (
+    OmniServerParams,
+    dummy_messages_from_mix_data,
+    generate_synthetic_audio,
+    generate_synthetic_image,
+    generate_synthetic_video,
+)
 from tests.dfx.conftest import create_unique_server_params, load_configs
-from tests.dfx.reliability.scripts.fault_inject import (
-    assert_fault_http_expectation,
-    build_recovery_result,
-    inject_abnormal_input_faults,
+from tests.dfx.reliability.conftest import (
+    inject_gpu_oom,
+    stop_gpu_oom_hogs,
 )
 from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
 REL_DIR = Path(__file__).resolve().parent.parent
 SCENARIOS_PATH = REL_DIR / "tests" / "scenarios.json"
-# Reuse e2e stage configs (same as prior test_abnormal_input.py)
+# Reuse e2e stage configs for reliability tests.
 E2E_STAGE_CONFIGS_DIR = REL_DIR.parent.parent / "e2e" / "stage_configs"
+OOM_INJECTION_CONFIG = {
+    # Optional: set to "0,1,2" for explicit multi-GPU injection.
+    # If omitted, devices are auto-derived from stage yaml runtime.devices.
+    # "device": "0,1,2",
+    "target_mem_ratio": 0.95,
+    "hold_seconds": 45,
+    "startup_timeout_sec": 20,
+    "strict": True,
+}
 
 
 def _configs_with_platform_stage_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -70,11 +81,35 @@ def _get_system_prompt() -> dict:
     }
 
 
+def _get_mix_prompt() -> str:
+    return "What is recited in the audio? What is in this image? Describe the video briefly."
+
+
+def _parse_stage_devices(stage_config_path: str) -> str:
+    text = Path(stage_config_path).read_text(encoding="utf-8")
+    raw_devices: list[str] = re.findall(r"^\s*devices:\s*\"?([0-9,\s]+)\"?\s*$", text, flags=re.MULTILINE)
+    devices: set[int] = set()
+    for item in raw_devices:
+        for token in item.split(","):
+            token = token.strip()
+            if token:
+                devices.add(int(token))
+    if not devices:
+        raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
+    return ",".join(str(x) for x in sorted(devices))
+
+
+def _resolve_oom_device_spec(config: dict[str, Any], stage_config_path: str | None) -> str:
+    explicit = config.get("device")
+    if explicit is not None:
+        return str(explicit)
+    if not stage_config_path:
+        raise ValueError("OOM device is not configured and stage_config_path is empty.")
+    return _parse_stage_devices(stage_config_path)
+
+
 CONFIGS = _load_reliability_configs()
-ABNORMAL_SCENARIOS = [c for c in CONFIGS if c.get("scenario", {}).get("type") == "abnormal_input"]
-_UNIQUE_PARAMS = (
-    create_unique_server_params(ABNORMAL_SCENARIOS, E2E_STAGE_CONFIGS_DIR) if ABNORMAL_SCENARIOS else []
-)
+_UNIQUE_PARAMS = create_unique_server_params(CONFIGS, E2E_STAGE_CONFIGS_DIR) if CONFIGS else []
 TEST_PARAMS = [OmniServerParams(model=m, stage_config_path=p) for _, m, p in _UNIQUE_PARAMS]
 
 
@@ -89,56 +124,97 @@ def test_scenarios_json_loads() -> None:
 @pytest.mark.slow
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(
-    not (ABNORMAL_SCENARIOS and TEST_PARAMS),
-    reason="no abnormal_input scenarios or server params",
+    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
+    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
 )
+@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_reliability_abnormal_input(omni_server, openai_client) -> None:
-    """
-    fault_inject (abnormal_input) + expect 4xx + recovery request via openai_client.
-
-    RecoveryResult is recorded for observability (RFC); assertions are explicit below.
-    """
-    scenario = next(
-        (c for c in ABNORMAL_SCENARIOS if c["server_params"]["model"] == omni_server.model),
-        ABNORMAL_SCENARIOS[0],
+def test_reliability_gpu_oom_injection(omni_server, openai_client) -> None:
+    """Inject GPU OOM from test code and verify request fails during injection."""
+    device_spec = _resolve_oom_device_spec(OOM_INJECTION_CONFIG, omni_server.stage_config_path)
+    handle = inject_gpu_oom(
+        device=device_spec,
+        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
+        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
+        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
+        strict=OOM_INJECTION_CONFIG["strict"],
     )
-    sc = scenario["scenario"]
-    fault_params = sc["fault_params"]
-    expect = sc["expect"]
-    recovery = sc["recovery_request"]
+    try:
+        video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+        audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+        messages = dummy_messages_from_mix_data(
+            system_prompt=_get_system_prompt(),
+            video_data_url=video_data_url,
+            image_data_url=image_data_url,
+            audio_data_url=audio_data_url,
+            content_text=_get_mix_prompt(),
+        )
+        request_config = {
+            "model": omni_server.model,
+            "messages": messages,
+            "stream": True,
+            "key_words": {
+                "audio": ["test"],
+            },
+        }
+        raised = False
+        try:
+            openai_client.send_omni_request(request_config, request_num=1)
+        except Exception as exc:
+            raised = True
+            text = str(exc).lower()
+            assert any(
+                key in text for key in ("oom", "out of memory", "cuda", "internal", "500", "timeout", "connection")
+            ), f"unexpected error under OOM injection: {exc}"
+        assert raised, "expected request failure during GPU OOM injection"
+    finally:
+        stop_gpu_oom_hogs(handle)
 
-    host, port = omni_server.host, omni_server.port
-    fault = inject_abnormal_input_faults(host, port, omni_server.model, fault_params)
-    assert_fault_http_expectation(fault.http_statuses, expect)
 
-    t0 = time.perf_counter()
-    messages = dummy_messages_from_mix_data(
-        system_prompt=_get_system_prompt(),
-        content_text=recovery["content_text"],
+@pytest.mark.slow
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
+    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
+)
+@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+def test_reliability_gpu_oom_text_to_text(omni_server, openai_client) -> None:
+    """OOM reliability case aligned with qwen3_omni text_to_text request style."""
+    device_spec = _resolve_oom_device_spec(OOM_INJECTION_CONFIG, omni_server.stage_config_path)
+    handle = inject_gpu_oom(
+        device=device_spec,
+        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
+        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
+        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
+        strict=OOM_INJECTION_CONFIG["strict"],
     )
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": recovery.get("stream", False),
-        "modalities": recovery.get("modalities", ["text"]),
-        "key_words": recovery.get("key_words", {}),
-    }
-    openai_client.send_omni_request(request_config, request_num=1)
-    elapsed = time.perf_counter() - t0
-
-    min_ok = int(expect.get("min_post_success", 1))
-    assert min_ok >= 1
-    recovery_result = build_recovery_result(
-        recovered=True,
-        recovery_time_sec=elapsed,
-        health_check_ok=True,
-        post_fault_success_count=1,
-        post_fault_error_count=0,
-        notes=fault.notes,
-    )
-    assert recovery_result.recovered
-    assert recovery_result.health_check_ok
-    assert recovery_result.post_fault_success_count >= min_ok
+    try:
+        messages = dummy_messages_from_mix_data(
+            system_prompt=_get_system_prompt(),
+            content_text="What is the capital of China? Answer in 20 words.",
+        )
+        request_config = {
+            "model": omni_server.model,
+            "messages": messages,
+            "stream": False,
+            "modalities": ["text"],
+            "key_words": {"text": ["beijing"]},
+        }
+        raised = False
+        try:
+            openai_client.send_omni_request(request_config, request_num=1)
+        except Exception as exc:
+            raised = True
+            text = str(exc).lower()
+            assert any(
+                key in text for key in ("oom", "out of memory", "cuda", "internal", "500", "timeout", "connection")
+            ), f"unexpected error under OOM injection: {exc}"
+        assert raised, "expected request failure during GPU OOM injection"
+    finally:
+        stop_gpu_oom_hogs(handle)
