@@ -1,4 +1,4 @@
-# .buildkite/pipeline-npu-nightly.yaml
+# .buildkite/test-npu-nightly.yaml
 # L4: NPU nightly tests - full regression and performance benchmarks
 steps:
   - group: "NPU Tests (L4 - Nightly)"
@@ -6,136 +6,308 @@ steps:
       - label: ":full_moon: NPU A2B3: Smoke Test (1 card)"
         agents:
           queue: "linux-aarch64-a2b3-gy006-test"
+        plugins:
+          - kubernetes#v1.0:
+              image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+              podSpec:
+                nodeSelector:
+                  kubernetes.io/arch: arm64
+                containers:
+                  - name: test
+                    volumeMounts:
+                      - name: davinci0
+                        mountPath: /dev/davinci0
+                      - name: davinci-manager
+                        mountPath: /dev/davinci_manager
+                      - name: devmm-svm
+                        mountPath: /dev/devmm_svm
+                      - name: hisi-hdc
+                        mountPath: /dev/hisi_hdc
+                      - name: ascend-dcmi
+                        mountPath: /usr/local/dcmi
+                      - name: ascend-npu-smi
+                        mountPath: /usr/local/bin/npu-smi
+                      - name: ascend-driver-lib
+                        mountPath: /usr/local/Ascend/driver/lib64
+                      - name: ascend-driver-version
+                        mountPath: /usr/local/Ascend/driver/version.info
+                      - name: ascend-install-info
+                        mountPath: /etc/ascend_install.info
+                volumes:
+                  - name: davinci0
+                    hostPath:
+                      path: /dev/davinci0
+                  - name: davinci-manager
+                    hostPath:
+                      path: /dev/davinci_manager
+                  - name: devmm-svm
+                    hostPath:
+                      path: /dev/devmm_svm
+                  - name: hisi-hdc
+                    hostPath:
+                      path: /dev/hisi_hdc
+                  - name: ascend-dcmi
+                    hostPath:
+                      path: /usr/local/dcmi
+                  - name: ascend-npu-smi
+                    hostPath:
+                      path: /usr/local/bin/npu-smi
+                  - name: ascend-driver-lib
+                    hostPath:
+                      path: /usr/local/Ascend/driver/lib64
+                  - name: ascend-driver-version
+                    hostPath:
+                      path: /usr/local/Ascend/driver/version.info
+                  - name: ascend-install-info
+                    hostPath:
+                      path: /etc/ascend_install.info
         command: |
-          set -ex
-          source /tmp/buildkit-env.txt
-
-          if ! command -v nerdctl &> /dev/null; then
-            mkdir -p /tmp/nerdctl-install
-            NERDCTL_VERSION="v1.7.2"
-            wget -q https://github.com/containerd/nerdctl/releases/download/${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-arm64.tar.gz -O /tmp/nerdctl-install/nerdctl.tar.gz
-            tar -xzf /tmp/nerdctl-install/nerdctl.tar.gz -C /tmp/nerdctl-install
-            sudo mv /tmp/nerdctl-install/nerdctl /usr/local/bin/
-          fi
-
-          nerdctl load -i "${IMAGE_TARBALL}"
-
-          nerdctl run --rm \
-            -v /dev/davinci0:/dev/davinci0 \
-            -v /dev/davinci_manager:/dev/davinci_manager \
-            -v /dev/devmm_svm:/dev/devmm_svm \
-            -v /dev/hisi_hdc:/dev/hisi_hdc \
-            -v /usr/local/dcmi:/usr/local/dcmi:ro \
-            -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
-            -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/:ro \
-            -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro \
-            -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
-            "${IMAGE_NAME}:${IMAGE_TAG}" \
-            bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh && pip install -e . && VLLM_USE_MODELSCOPE=True pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py"
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+          pip install -e .
+          VLLM_USE_MODELSCOPE=True pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
         timeout_in_minutes: 60
         soft_fail: true
 
       - label: ":full_moon: NPU A2B3: Full Model Regression (2 cards)"
         agents:
           queue: "linux-aarch64-a2b3-gy006-test"
+        plugins:
+          - kubernetes#v1.0:
+              image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+              podSpec:
+                nodeSelector:
+                  kubernetes.io/arch: arm64
+                containers:
+                  - name: test
+                    volumeMounts:
+                      - name: davinci0
+                        mountPath: /dev/davinci0
+                      - name: davinci1
+                        mountPath: /dev/davinci1
+                      - name: davinci-manager
+                        mountPath: /dev/davinci_manager
+                      - name: devmm-svm
+                        mountPath: /dev/devmm_svm
+                      - name: hisi-hdc
+                        mountPath: /dev/hisi_hdc
+                      - name: ascend-dcmi
+                        mountPath: /usr/local/dcmi
+                      - name: ascend-npu-smi
+                        mountPath: /usr/local/bin/npu-smi
+                      - name: ascend-driver-lib
+                        mountPath: /usr/local/Ascend/driver/lib64
+                      - name: ascend-driver-version
+                        mountPath: /usr/local/Ascend/driver/version.info
+                      - name: ascend-install-info
+                        mountPath: /etc/ascend_install.info
+                volumes:
+                  - name: davinci0
+                    hostPath:
+                      path: /dev/davinci0
+                  - name: davinci1
+                    hostPath:
+                      path: /dev/davinci1
+                  - name: davinci-manager
+                    hostPath:
+                      path: /dev/davinci_manager
+                  - name: devmm-svm
+                    hostPath:
+                      path: /dev/devmm_svm
+                  - name: hisi-hdc
+                    hostPath:
+                      path: /dev/hisi_hdc
+                  - name: ascend-dcmi
+                    hostPath:
+                      path: /usr/local/dcmi
+                  - name: ascend-npu-smi
+                    hostPath:
+                      path: /usr/local/bin/npu-smi
+                  - name: ascend-driver-lib
+                    hostPath:
+                      path: /usr/local/Ascend/driver/lib64
+                  - name: ascend-driver-version
+                    hostPath:
+                      path: /usr/local/Ascend/driver/version.info
+                  - name: ascend-install-info
+                    hostPath:
+                      path: /etc/ascend_install.info
         command: |
-          set -ex
-          source /tmp/buildkit-env.txt
-
-          if ! command -v nerdctl &> /dev/null; then
-            mkdir -p /tmp/nerdctl-install
-            NERDCTL_VERSION="v1.7.2"
-            wget -q https://github.com/containerd/nerdctl/releases/download/${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-arm64.tar.gz -O /tmp/nerdctl-install/nerdctl.tar.gz
-            tar -xzf /tmp/nerdctl-install/nerdctl.tar.gz -C /tmp/nerdctl-install
-            sudo mv /tmp/nerdctl-install/nerdctl /usr/local/bin/
-          fi
-
-          nerdctl load -i "${IMAGE_TARBALL}"
-
-          nerdctl run --rm \
-            -v /dev/davinci0:/dev/davinci0 \
-            -v /dev/davinci1:/dev/davinci1 \
-            -v /dev/davinci_manager:/dev/davinci_manager \
-            -v /dev/devmm_svm:/dev/devmm_svm \
-            -v /dev/hisi_hdc:/dev/hisi_hdc \
-            -v /usr/local/dcmi:/usr/local/dcmi:ro \
-            -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
-            -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/:ro \
-            -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro \
-            -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
-            "${IMAGE_NAME}:${IMAGE_TAG}" \
-            bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh && pip install -e . && VLLM_USE_MODELSCOPE=True pytest -s -v -m \"npu\" --run-level advanced_model"
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+          pip install -e .
+          VLLM_USE_MODELSCOPE=True pytest -s -v -m "npu" --run-level advanced_model
         timeout_in_minutes: 120
         soft_fail: true
 
       - label: ":full_moon: NPU A2B3: Qwen3-TTS Non-Async-Chunk (2 cards)"
         agents:
           queue: "linux-aarch64-a2b3-gy006-test"
+        plugins:
+          - kubernetes#v1.0:
+              image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+              podSpec:
+                nodeSelector:
+                  kubernetes.io/arch: arm64
+                containers:
+                  - name: test
+                    volumeMounts:
+                      - name: davinci0
+                        mountPath: /dev/davinci0
+                      - name: davinci1
+                        mountPath: /dev/davinci1
+                      - name: davinci-manager
+                        mountPath: /dev/davinci_manager
+                      - name: devmm-svm
+                        mountPath: /dev/devmm_svm
+                      - name: hisi-hdc
+                        mountPath: /dev/hisi_hdc
+                      - name: ascend-dcmi
+                        mountPath: /usr/local/dcmi
+                      - name: ascend-npu-smi
+                        mountPath: /usr/local/bin/npu-smi
+                      - name: ascend-driver-lib
+                        mountPath: /usr/local/Ascend/driver/lib64
+                      - name: ascend-driver-version
+                        mountPath: /usr/local/Ascend/driver/version.info
+                      - name: ascend-install-info
+                        mountPath: /etc/ascend_install.info
+                volumes:
+                  - name: davinci0
+                    hostPath:
+                      path: /dev/davinci0
+                  - name: davinci1
+                    hostPath:
+                      path: /dev/davinci1
+                  - name: davinci-manager
+                    hostPath:
+                      path: /dev/davinci_manager
+                  - name: devmm-svm
+                    hostPath:
+                      path: /dev/devmm_svm
+                  - name: hisi-hdc
+                    hostPath:
+                      path: /dev/hisi_hdc
+                  - name: ascend-dcmi
+                    hostPath:
+                      path: /usr/local/dcmi
+                  - name: ascend-npu-smi
+                    hostPath:
+                      path: /usr/local/bin/npu-smi
+                  - name: ascend-driver-lib
+                    hostPath:
+                      path: /usr/local/Ascend/driver/lib64
+                  - name: ascend-driver-version
+                    hostPath:
+                      path: /usr/local/Ascend/driver/version.info
+                  - name: ascend-install-info
+                    hostPath:
+                      path: /etc/ascend_install.info
         command: |
-          set -ex
-          source /tmp/buildkit-env.txt
-
-          if ! command -v nerdctl &> /dev/null; then
-            mkdir -p /tmp/nerdctl-install
-            NERDCTL_VERSION="v1.7.2"
-            wget -q https://github.com/containerd/nerdctl/releases/download/${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-arm64.tar.gz -O /tmp/nerdctl-install/nerdctl.tar.gz
-            tar -xzf /tmp/nerdctl-install/nerdctl.tar.gz -C /tmp/nerdctl-install
-            sudo mv /tmp/nerdctl-install/nerdctl /usr/local/bin/
-          fi
-
-          nerdctl load -i "${IMAGE_TARBALL}"
-
-          nerdctl run --rm \
-            -v /dev/davinci0:/dev/davinci0 \
-            -v /dev/davinci1:/dev/davinci1 \
-            -v /dev/davinci_manager:/dev/davinci_manager \
-            -v /dev/devmm_svm:/dev/devmm_svm \
-            -v /dev/hisi_hdc:/dev/hisi_hdc \
-            -v /usr/local/dcmi:/usr/local/dcmi:ro \
-            -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
-            -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/:ro \
-            -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro \
-            -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
-            "${IMAGE_NAME}:${IMAGE_TAG}" \
-            bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh && pip install -e . && VLLM_USE_MODELSCOPE=True pytest -s -v tests/e2e/online_serving/test_qwen3_tts.py -m \"npu\" -k \"not AsyncChunk\""
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+          pip install -e .
+          VLLM_USE_MODELSCOPE=True pytest -s -v tests/e2e/online_serving/test_qwen3_tts.py -m "npu" -k "not AsyncChunk"
         timeout_in_minutes: 60
         soft_fail: true
 
       - label: ":full_moon: NPU A2B3: Distributed Full Regression (8 cards)"
         agents:
           queue: "linux-aarch64-a2b3-gy006-test"
+        plugins:
+          - kubernetes#v1.0:
+              image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+              podSpec:
+                nodeSelector:
+                  kubernetes.io/arch: arm64
+                containers:
+                  - name: test
+                    volumeMounts:
+                      - name: davinci0
+                        mountPath: /dev/davinci0
+                      - name: davinci1
+                        mountPath: /dev/davinci1
+                      - name: davinci2
+                        mountPath: /dev/davinci2
+                      - name: davinci3
+                        mountPath: /dev/davinci3
+                      - name: davinci4
+                        mountPath: /dev/davinci4
+                      - name: davinci5
+                        mountPath: /dev/davinci5
+                      - name: davinci6
+                        mountPath: /dev/davinci6
+                      - name: davinci7
+                        mountPath: /dev/davinci7
+                      - name: davinci-manager
+                        mountPath: /dev/davinci_manager
+                      - name: devmm-svm
+                        mountPath: /dev/devmm_svm
+                      - name: hisi-hdc
+                        mountPath: /dev/hisi_hdc
+                      - name: ascend-dcmi
+                        mountPath: /usr/local/dcmi
+                      - name: ascend-npu-smi
+                        mountPath: /usr/local/bin/npu-smi
+                      - name: ascend-driver-lib
+                        mountPath: /usr/local/Ascend/driver/lib64
+                      - name: ascend-driver-version
+                        mountPath: /usr/local/Ascend/driver/version.info
+                      - name: ascend-install-info
+                        mountPath: /etc/ascend_install.info
+                volumes:
+                  - name: davinci0
+                    hostPath:
+                      path: /dev/davinci0
+                  - name: davinci1
+                    hostPath:
+                      path: /dev/davinci1
+                  - name: davinci2
+                    hostPath:
+                      path: /dev/davinci2
+                  - name: davinci3
+                    hostPath:
+                      path: /dev/davinci3
+                  - name: davinci4
+                    hostPath:
+                      path: /dev/davinci4
+                  - name: davinci5
+                    hostPath:
+                      path: /dev/davinci5
+                  - name: davinci6
+                    hostPath:
+                      path: /dev/davinci6
+                  - name: davinci7
+                    hostPath:
+                      path: /dev/davinci7
+                  - name: davinci-manager
+                    hostPath:
+                      path: /dev/davinci_manager
+                  - name: devmm-svm
+                    hostPath:
+                      path: /dev/devmm_svm
+                  - name: hisi-hdc
+                    hostPath:
+                      path: /dev/hisi_hdc
+                  - name: ascend-dcmi
+                    hostPath:
+                      path: /usr/local/dcmi
+                  - name: ascend-npu-smi
+                    hostPath:
+                      path: /usr/local/bin/npu-smi
+                  - name: ascend-driver-lib
+                    hostPath:
+                      path: /usr/local/Ascend/driver/lib64
+                  - name: ascend-driver-version
+                    hostPath:
+                      path: /usr/local/Ascend/driver/version.info
+                  - name: ascend-install-info
+                    hostPath:
+                      path: /etc/ascend_install.info
         command: |
-          set -ex
-          source /tmp/buildkit-env.txt
-
-          if ! command -v nerdctl &> /dev/null; then
-            mkdir -p /tmp/nerdctl-install
-            NERDCTL_VERSION="v1.7.2"
-            wget -q https://github.com/containerd/nerdctl/releases/download/${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-arm64.tar.gz -O /tmp/nerdctl-install/nerdctl.tar.gz
-            tar -xzf /tmp/nerdctl-install/nerdctl.tar.gz -C /tmp/nerdctl-install
-            sudo mv /tmp/nerdctl-install/nerdctl /usr/local/bin/
-          fi
-
-          nerdctl load -i "${IMAGE_TARBALL}"
-
-          nerdctl run --rm \
-            -v /dev/davinci0:/dev/davinci0 \
-            -v /dev/davinci1:/dev/davinci1 \
-            -v /dev/davinci2:/dev/davinci2 \
-            -v /dev/davinci3:/dev/davinci3 \
-            -v /dev/davinci4:/dev/davinci4 \
-            -v /dev/davinci5:/dev/davinci5 \
-            -v /dev/davinci6:/dev/davinci6 \
-            -v /dev/davinci7:/dev/davinci7 \
-            -v /dev/davinci_manager:/dev/davinci_manager \
-            -v /dev/devmm_svm:/dev/devmm_svm \
-            -v /dev/hisi_hdc:/dev/hisi_hdc \
-            -v /usr/local/dcmi:/usr/local/dcmi:ro \
-            -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
-            -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/:ro \
-            -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro \
-            -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
-            "${IMAGE_NAME}:${IMAGE_TAG}" \
-            bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh && pip install -e . && VLLM_USE_MODELSCOPE=True pytest -s -v -m \"distributed_npu\" --run-level advanced_model"
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+          pip install -e .
+          VLLM_USE_MODELSCOPE=True pytest -s -v -m "distributed_npu" --run-level advanced_model
         timeout_in_minutes: 120
         soft_fail: true

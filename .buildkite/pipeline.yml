@@ -1,26 +1,20 @@
 steps:
-  - label: ":buildkit: Build NPU Test Image (buildctl)"
+  - label: ":buildkit: Build and Push NPU Test Image"
     key: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
     env:
       VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
       IMAGE_NAME: "vllm-omni-ci-npu"
+      IMAGE_REGISTRY: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry"
       # buildkitd 远程连接配置
       BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd.svc.cluster.local:1234"
     command: |
       set -ex
 
-      # 从 agent 名称提取索引用于缓存目录
-      agent_idx=$(echo "${BUILDKITE_AGENT_NAME}" | awk -F'-' '{print $(NF-1)}')
-      echo "--- Agent index: ${agent_idx}"
-
-      builder_cache_dir="/mnt/buildkit-cache${agent_idx}"
-      mkdir -p ${builder_cache_dir}
-
-      echo "--- Building with buildctl + buildkitd"
+      echo "--- Building and pushing NPU Test Image"
+      echo "Image: ${IMAGE_REGISTRY}/${IMAGE_NAME}:${VLLM_IMAGE_TAG}"
       echo "buildkitd address: ${BUILDKITD_ADDR}"
-      echo "Cache directory: ${builder_cache_dir}"
 
       # 配置 GitHub 代理
       git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
@@ -35,7 +29,7 @@ steps:
         sudo cp /tmp/buildkit/bin/buildctl /usr/local/bin/
       fi
 
-      # 使用 buildctl 构建：输出 OCI 格式到本地缓存
+      # 使用 buildctl 构建并推送到 SWR
       buildctl \
         --addr="${BUILDKITD_ADDR}" \
         --tlsca="/certs/ca.pem" \
@@ -46,20 +40,11 @@ steps:
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile_test.npu \
-        --output type=oci,dest="${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar" \
+        --output type=image,name=${IMAGE_REGISTRY}/${IMAGE_NAME}:${VLLM_IMAGE_TAG},push=true \
         --progress=plain
 
-      echo "--- Image built: ${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar"
-      ls -lh "${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar"
-
-      # 保存镜像路径和标签供后续步骤使用（/tmp 在 Pod 中共享）
-      {
-        echo "IMAGE_TARBALL=${builder_cache_dir}/image-${VLLM_IMAGE_TAG}.tar"
-        echo "IMAGE_NAME=${IMAGE_NAME}"
-        echo "IMAGE_TAG=${VLLM_IMAGE_TAG}"
-        echo "CACHE_DIR=${builder_cache_dir}"
-      } > /tmp/buildkit-env.txt
-      cat /tmp/buildkit-env.txt
+      echo "--- Image pushed successfully"
+      echo "${IMAGE_REGISTRY}/${IMAGE_NAME}:${VLLM_IMAGE_TAG}"
 
   - label: "Upload Test Pipeline"
     depends_on: image-build
