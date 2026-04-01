@@ -2,8 +2,25 @@ steps:
   - label: "🧪 Simple Unit Test"
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
-    plugins:
-      - docker#v5.2.0:
-          image: "vllm-omni-ci-npu:latest"
     command: |
-      timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
+      set -ex
+
+      # 从 agent 名称提取索引
+      agent_idx=$(echo "${BUILDKITE_AGENT_NAME}" | awk -F'-' '{print $(NF-1)}')
+
+      # 加载从 pipeline.yml 构建的 OCI 镜像
+      image_tarball="/mnt/buildkit-cache${agent_idx}/image-${BUILDKITE_COMMIT}.tar"
+      docker load -i "${image_tarball}"
+
+      # 运行测试容器
+      docker run --rm \
+        -v /dev/davinci0:/dev/davinci0 \
+        -v /dev/davinci_manager:/dev/davinci_manager \
+        -v /dev/devmm_svm:/dev/devmm_svm \
+        -v /dev/hisi_hdc:/dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi:ro \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/:ro \
+        -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
+        vllm-omni-ci-npu:latest \
+        timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
