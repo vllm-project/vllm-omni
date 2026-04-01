@@ -194,12 +194,16 @@ class StageDiffusionClient:
         sampling_params: OmniDiffusionSamplingParams,
     ) -> None:
         try:
-            result = await self._engine.generate_batch(
-                prompts,
-                sampling_params,
-                request_id,
+            self._request_socket.send(
+                self._encoder.encode(
+                    {
+                        "type": "add_batch_request",
+                        "request_id": request_id,
+                        "prompts": prompts,
+                        "sampling_params": self._sampling_params_to_dict(sampling_params),
+                    }
+                )
             )
-            await self._output_queue.put(result)
         except Exception as e:
             logger.exception(
                 "[StageDiffusionClient] Stage-%s batch req=%s failed: %s",

@@ -29,10 +29,10 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackEncoder,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
@@ -111,17 +111,8 @@ class StageDiffusionProc:
     # Request processing
     # ------------------------------------------------------------------
 
-    async def _process_request(
-        self,
-        request_id: str,
-        prompt: Any,
-        sampling_params_dict: dict,
-    ) -> OmniRequestOutput:
-        """Build a diffusion request and run DiffusionEngine.step()."""
-        # Reconstruct LoRARequest if needed.
-        # LoRARequest is a msgspec.Struct with array_like=True,
-        # so it deserializes as a list (not dict). Use msgspec.convert
-        # to handle both list and dict representations.
+    def _reconstruct_sampling_params(self, sampling_params_dict: dict) -> OmniDiffusionSamplingParams:
+        """Reconstruct OmniDiffusionSamplingParams from a dict, handling LoRA."""
         lora_req = sampling_params_dict.get("lora_request")
         if lora_req is not None:
             from vllm.lora.request import LoRARequest
@@ -129,7 +120,16 @@ class StageDiffusionProc:
             if not isinstance(lora_req, LoRARequest):
                 sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
 
-        sampling_params = OmniDiffusionSamplingParams(**sampling_params_dict)
+        return OmniDiffusionSamplingParams(**sampling_params_dict)
+
+    async def _process_request(
+        self,
+        request_id: str,
+        prompt: Any,
+        sampling_params_dict: dict,
+    ) -> OmniRequestOutput:
+        """Build a diffusion request and run DiffusionEngine.step()."""
+        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
 
         request = OmniDiffusionRequest(
             prompts=[prompt],
@@ -143,6 +143,62 @@ class StageDiffusionProc:
         if not result.request_id:
             result.request_id = request_id
         return result
+
+    async def _process_batch_request(
+        self,
+        request_id: str,
+        prompts: list[Any],
+        sampling_params_dict: dict,
+    ) -> OmniRequestOutput:
+        """Build a batched diffusion request and run DiffusionEngine.step().
+
+        All prompts are processed in a single step() call.  The per-prompt
+        results are merged into one :class:`OmniRequestOutput` whose
+        ``images`` list contains every generated image, matching the
+        contract expected by the orchestrator and tests.
+        """
+        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
+
+        request = OmniDiffusionRequest(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            request_ids=[request_id] * len(prompts),
+        )
+
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(self._executor, self._engine.step, request)
+
+        # Merge per-prompt results into a single combined output.
+        all_images: list = []
+        merged_mm: dict[str, Any] = {}
+        merged_metrics: dict[str, Any] = {}
+        merged_durations: dict[str, float] = {}
+        peak_mem = 0.0
+        latents = None
+        final_output_type = "image"
+
+        for r in results:
+            all_images.extend(r.images)
+            merged_mm.update(r._multimodal_output)
+            merged_metrics.update(r.metrics)
+            merged_durations.update(r.stage_durations)
+            peak_mem = max(peak_mem, r.peak_memory_mb)
+            if latents is None and r.latents is not None:
+                latents = r.latents
+            if r.final_output_type != "image":
+                final_output_type = r.final_output_type
+
+        return OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=all_images,
+            prompt=prompts[0] if len(prompts) == 1 else None,
+            metrics=merged_metrics,
+            latents=latents,
+            multimodal_output=merged_mm or None,
+            final_output_type=final_output_type,
+            stage_durations=merged_durations,
+            peak_memory_mb=peak_mem,
+        )
 
     # ------------------------------------------------------------------
     # Collective RPC dispatch
@@ -304,6 +360,36 @@ class StageDiffusionProc:
                         _dispatch_request(
                             request_id,
                             msg["prompt"],
+                            msg["sampling_params"],
+                        )
+                    )
+                    tasks[request_id] = task
+
+                elif msg_type == "add_batch_request":
+                    request_id = msg["request_id"]
+
+                    async def _dispatch_batch(rid: str, prompts: list, sp_dict: dict) -> None:
+                        try:
+                            result = await self._process_batch_request(rid, prompts, sp_dict)
+                            await response_socket.send(
+                                encoder.encode({"type": "result", "output": result})
+                            )
+                        except Exception as e:
+                            logger.exception("Batch diffusion request %s failed: %s", rid, e)
+                            await response_socket.send(
+                                encoder.encode({
+                                    "type": "error",
+                                    "request_id": rid,
+                                    "error": str(e),
+                                })
+                            )
+                        finally:
+                            tasks.pop(rid, None)
+
+                    task = asyncio.create_task(
+                        _dispatch_batch(
+                            request_id,
+                            msg["prompts"],
                             msg["sampling_params"],
                         )
                     )
