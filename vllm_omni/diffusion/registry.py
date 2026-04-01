@@ -256,6 +256,11 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "Cosmos2_5_PredictBasePipeline": (
+        "cosmos",
+        "pipeline_cosmos_predict2_5",
+        "CosmosPredict25Pipeline",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -488,6 +493,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
+    "Cosmos2_5_PredictBasePipeline": "get_cosmos_predict25_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
