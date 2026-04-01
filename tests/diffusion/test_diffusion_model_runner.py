@@ -63,7 +63,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     )
     return runner
 
-
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypatch):
     """Guard cache diagnostics with runtime backend state to avoid stale-config crashes."""
     runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
@@ -84,6 +84,7 @@ def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypa
     assert cache_summary_calls == []
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeypatch):
     class _EnabledCacheBackend:
         def is_enabled(self):

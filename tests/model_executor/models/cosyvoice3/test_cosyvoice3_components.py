@@ -63,6 +63,7 @@ class TestDiTAttention:
 
         return DiTAttention(dim=512, heads=8, dim_head=64, dropout=0.0)
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, attention):
         """Test attention output shape."""
         batch, seq_len, dim = 2, 16, 512
@@ -72,6 +73,7 @@ class TestDiTAttention:
 
         assert out.shape == x.shape
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_with_mask(self, attention):
         """Test attention with mask."""
         batch, seq_len, dim = 2, 16, 512
@@ -85,6 +87,7 @@ class TestDiTAttention:
         # Masked positions should be zero
         assert torch.allclose(out[:, -3:], torch.zeros_like(out[:, -3:]))
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_qkv_projections(self, attention):
         """Test that Q/K/V projections exist and have correct dimensions."""
         assert hasattr(attention, "to_q")
@@ -104,6 +107,7 @@ class TestDiTBlock:
 
         return DiTBlock(dim=512, heads=8, dim_head=64, ff_mult=4, dropout=0.0)
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, block):
         """Test block output shape."""
         batch, seq_len, dim = 2, 16, 512
@@ -114,6 +118,7 @@ class TestDiTBlock:
 
         assert out.shape == x.shape
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_adalayernorm_modulation(self, block):
         """Test that AdaLayerNorm modulates based on timestep."""
         batch, seq_len, dim = 1, 8, 512
@@ -148,6 +153,7 @@ class TestDiT:
             long_skip_connection=True,
         )
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, dit):
         """Test DiT forward output shape."""
         batch, mel_dim, seq_len = 1, 80, 32
@@ -162,6 +168,7 @@ class TestDiT:
 
         assert out.shape == (batch, mel_dim, seq_len)
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_timestep_embedding(self, dit):
         """Test that different timesteps produce different outputs."""
         batch, mel_dim, seq_len = 1, 80, 16
@@ -234,6 +241,7 @@ class TestCFM:
 class TestSDPAFallback:
     """Test SDPA fallback for float32 inputs."""
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_float32_uses_sdpa(self):
         """Test that float32 inputs use SDPA fallback."""
         from vllm_omni.diffusion.attention.layer import Attention
