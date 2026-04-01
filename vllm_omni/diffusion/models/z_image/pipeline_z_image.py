@@ -170,7 +170,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         self.text_encoder = AutoModel.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self._execution_device)
         self.vae = DistributedAutoencoderKL.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
         ).to(self._execution_device)
