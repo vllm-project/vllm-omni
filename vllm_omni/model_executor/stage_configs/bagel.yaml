@@ -98,7 +98,12 @@ runtime:
         zmq_port: 50051
         protocol: "rdma"
         device_name: ""
-        memory_pool_size: 2147483648
+        # Memory pool for RDMA-registered buffers.
+        # Supports both CPU pinned memory ("cpu") and GPU VRAM ("cuda").
+        # CPU mode works on all topologies; GPU mode (GPUDirect RDMA) requires
+        # NIC-GPU direct PCIe connectivity (PIX topology).
+        # Recommended: 4 GB for CPU, 2 GB for GPU (to conserve VRAM).
+        memory_pool_size: 4294967296   # 4 GB
         memory_pool_device: "cpu"
 
   edges:
