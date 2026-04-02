@@ -200,6 +200,8 @@ class Orchestrator:
 
             if msg_type == "add_request":
                 await self._handle_add_request(msg)
+            elif msg_type == "streaming_update":
+                await self._handle_streaming_update(msg)
             elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
             elif msg_type == "abort":
@@ -658,6 +660,34 @@ class Orchestrator:
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
+
+    async def _handle_streaming_update(self, msg: dict[str, Any]) -> None:
+        """Handle a streaming_update message for an existing request."""
+        stage_id = 0
+        request_id = msg["request_id"]
+        request = msg["prompt"]
+
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            logger.warning(
+                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
+                request_id,
+            )
+            fallback_msg = dict(msg)
+            fallback_msg["type"] = "add_request"
+            await self._handle_add_request(fallback_msg)
+            return
+
+        if "sampling_params_list" in msg and msg["sampling_params_list"]:
+            req_state.sampling_params_list = msg["sampling_params_list"]
+
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        stage_client = self.stage_clients[stage_id]
+        if stage_client.stage_type == "diffusion":
+            params = req_state.sampling_params_list[stage_id]
+            await stage_client.add_request_async(request_id, request, params)
+        else:
+            await stage_client.add_request_async(request)
 
     async def _prewarm_async_chunk_stages(
         self,
