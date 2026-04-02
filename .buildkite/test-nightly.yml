@@ -107,7 +107,7 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Diffusion Model Wan22 completed Test with H100"
+  - label: ":full_moon: Diffusion Model (Wan2.2) Test with H100"
     timeout_in_minutes: 90
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -148,7 +148,7 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Diffusion Model Test with L4"
+  - label: ":full_moon: Diffusion Model Test"
     timeout_in_minutes: 60
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -170,7 +170,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
 
-  - label: ":full_moon: Documentation Example Code Test with H100"
+  - label: ":full_moon: Doc Example Code Test with H100"
     timeout_in_minutes: 60
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -212,7 +212,7 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Omni Model Perf Test & Test Case Statistics"
+  - label: ":full_moon: Omni Model Perf Test & Testcase Statistics with H100"
     key: nightly-omni-performance
     timeout_in_minutes: 180
     depends_on: upload-nightly-pipeline
@@ -390,9 +390,9 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Qwen-Image Diffusion Perf Test with H100"
+  - label: ":full_moon: Diffusion Perf Test with H100"
     key: nightly-qwen-image-performance
-    timeout_in_minutes: 300
+    timeout_in_minutes: 180
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:
