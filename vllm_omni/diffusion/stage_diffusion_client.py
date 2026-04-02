@@ -214,7 +214,7 @@ class StageDiffusionClient:
         finally:
             self._tasks.pop(request_id, None)
 
-    def get_diffusion_output_async(self) -> OmniRequestOutput | None:
+    def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
         self._drain_responses()
         try:
             return self._output_queue.get_nowait()
