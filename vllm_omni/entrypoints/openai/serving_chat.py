@@ -82,6 +82,7 @@ from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.utils.collection_utils import as_list
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
 from vllm_omni.entrypoints.openai.utils import parse_lora_request
@@ -275,6 +276,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             output_modalities if output_modalities is not None else self.engine_client.output_modalities
         )
 
+        num_inference_steps = None
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
@@ -308,6 +310,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     extra_body = request.model_extra or {}
                 height = extra_body.get("height")
                 width = extra_body.get("width")
+                num_inference_steps = extra_body.get("num_inference_steps")
+                if num_inference_steps is not None:
+                    try:
+                        num_inference_steps = int(num_inference_steps)
+                    except Exception:
+                        num_inference_steps = None
                 if "size" in extra_body:
                     try:
                         size_str = extra_body["size"]
@@ -371,14 +379,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
 
-                # Apply user-specified height/width to diffusion stage(s) for image generation
-                if _image_gen_height is not None or _image_gen_width is not None:
+                # Apply user-specified overrides to diffusion stage(s) for image generation
+                if _image_gen_height is not None or _image_gen_width is not None or num_inference_steps is not None:
                     for idx, sp in enumerate(sampling_params_list):
-                        # Diffusion stages typically have height/width attributes
                         if hasattr(sp, "height") and _image_gen_height is not None:
                             sp.height = _image_gen_height
                         if hasattr(sp, "width") and _image_gen_width is not None:
                             sp.width = _image_gen_width
+                        if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
+                            sp.num_inference_steps = num_inference_steps
 
                 self._log_inputs(
                     request_id,
@@ -2093,6 +2102,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Qwen-Image-Layered parameters
             layers = extra_body.get("layers")
             resolution = extra_body.get("resolution")
+
+            try:
+                layers = validate_layered_layers(layers)
+            except ValueError as e:
+                return self._create_error_response(str(e), status_code=400)
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
