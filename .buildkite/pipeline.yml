@@ -32,15 +32,15 @@ steps:
       # 使用 buildctl 构建并推送到 SWR
       buildctl \
         --addr="${BUILDKITD_ADDR}" \
-        --tlscacert=/certs/ca.pem \
-        --tlscert=/certs/cert.pem \
-        --tlskey=/certs/key.pem \
+        --tlscacert=/vault/secrets/ca.pem \
+        --tlscert=/vault/secrets/cert.pem \
+        --tlskey=/vault/secrets/key.pem \
         build \
         --frontend dockerfile.v0 \
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile_test.npu \
-        --secret id=dockerconfig,src=/certs/config.json \
+        --secret id=dockerconfig,src=/vault/secrets/config.json \
         --output type=image,name=${IMAGE_REGISTRY}/${IMAGE_NAME}:${VLLM_IMAGE_TAG},push=true \
         --progress=plain
 
