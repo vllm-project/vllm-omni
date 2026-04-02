@@ -19,13 +19,8 @@ import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_GENERATE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "vllm_omni"
-    / "entrypoints"
-    / "cli"
-    / "generate.py"
-)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_GENERATE_PATH = _REPO_ROOT / "vllm_omni" / "entrypoints" / "cli" / "generate.py"
 
 
 def _stub_package(monkeypatch: pytest.MonkeyPatch, name: str) -> types.ModuleType:

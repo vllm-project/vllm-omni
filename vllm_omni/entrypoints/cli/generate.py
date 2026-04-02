@@ -52,9 +52,8 @@ class OmniGenerateCommand(CLISubcommand):
         from vllm_omni.platforms import current_omni_platform
 
         # 1. torch.Generator for reproducible generation
-        generator = torch.Generator(
-            device=current_omni_platform.device_type
-        ).manual_seed(args.seed)
+        device_type = current_omni_platform.device_type
+        generator = torch.Generator(device=device_type).manual_seed(args.seed)
 
         # 2. Parallel config (only tensor_parallel_size exposed in MVP)
         parallel_config = DiffusionParallelConfig(
