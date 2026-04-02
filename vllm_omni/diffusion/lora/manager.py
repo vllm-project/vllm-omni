@@ -218,10 +218,16 @@ class DiffusionLoRAManager:
             lora_scale: The external scale for the LoRA adapter.
         """
         if lora_request is None:
+            if self._active_adapter_id is None:
+                logger.debug("No lora_request provided and adapters are already inactive")
+                return
             logger.debug("No lora_request provided, deactivating all LoRA adapters")
             self._deactivate_all_adapters()
             return
         elif math.isclose(0.0, lora_scale):
+            if self._active_adapter_id is None:
+                logger.debug("Received LoRA scale 0 with adapters already inactive")
+                return
             logger.warning("Received a request with LoRA scale 0; deactivating all LoRA adapters")
             self._deactivate_all_adapters()
             return
@@ -605,6 +611,9 @@ class DiffusionLoRAManager:
         self._update_adapter_scale(adapter_id, scale)
 
     def _deactivate_all_adapters(self) -> None:
+        if self._active_adapter_id is None:
+            logger.debug("All adapters already inactive")
+            return
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)

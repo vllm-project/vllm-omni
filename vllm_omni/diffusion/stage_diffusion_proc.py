@@ -21,7 +21,7 @@ from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.utils import shutdown
 
-from vllm_omni.diffusion.data import TransformerConfig
+from vllm_omni.diffusion.data import TransformerConfig, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
@@ -334,6 +334,12 @@ class StageDiffusionProc:
             try:
                 result = await self._process_request(request_id, prompt, sampling_params_dict)
                 await response_socket.send(encoder.encode({"type": "result", "output": result}))
+            except DiffusionRequestAbortedError as e:
+                logger.info(
+                    "request_id: %s aborted: %s",
+                    request_id,
+                    str(e),
+                )
             except Exception as e:
                 logger.exception("Diffusion request %s failed: %s", request_id, e)
                 await response_socket.send(
@@ -373,6 +379,12 @@ class StageDiffusionProc:
                             result = await self._process_batch_request(rid, prompts, sp_dict)
                             await response_socket.send(
                                 encoder.encode({"type": "result", "output": result})
+                            )
+                        except DiffusionRequestAbortedError as e:
+                            logger.info(
+                                "request_id: %s aborted: %s",
+                                rid,
+                                str(e),
                             )
                         except Exception as e:
                             logger.exception("Batch diffusion request %s failed: %s", rid, e)
