@@ -52,7 +52,9 @@ class OmniGenerateCommand(CLISubcommand):
         from vllm_omni.platforms import current_omni_platform
 
         # 1. torch.Generator for reproducible generation
-        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+        generator = torch.Generator(
+            device=current_omni_platform.device_type
+        ).manual_seed(args.seed)
 
         # 2. Parallel config (only tensor_parallel_size exposed in MVP)
         parallel_config = DiffusionParallelConfig(
@@ -96,12 +98,13 @@ class OmniGenerateCommand(CLISubcommand):
         # 6. Save images
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = output_path.suffix or ".png"
         if len(images) == 1:
-            images[0].save(output_path)
-            print(f"Saved image to {output_path}")
+            save_path = output_path if output_path.suffix else output_path.with_suffix(suffix)
+            images[0].save(save_path)
+            print(f"Saved image to {save_path}")
         else:
             stem = output_path.stem
-            suffix = output_path.suffix or ".png"
             for i, img in enumerate(images):
                 save_path = output_path.parent / f"{stem}_{i}{suffix}"
                 img.save(save_path)
@@ -125,34 +128,107 @@ class OmniGenerateCommand(CLISubcommand):
 
         # Accept --omni so argparse doesn't reject it
         # (actual dispatch happens in main.py before subcommand parsing)
-        parser.add_argument("--omni", action="store_true", help=argparse.SUPPRESS)
+        parser.add_argument(
+            "--omni",
+            action="store_true",
+            help=argparse.SUPPRESS,
+        )
 
         # Required
-        parser.add_argument("--model", type=str, required=True, help="Diffusion model name or path.")
-        parser.add_argument("--prompt", type=str, required=True, help="Text prompt for image generation.")
+        parser.add_argument(
+            "--model",
+            type=str,
+            required=True,
+            help="Diffusion model name or path.",
+        )
+        parser.add_argument(
+            "--prompt",
+            type=str,
+            required=True,
+            help="Text prompt for image generation.",
+        )
 
         # Output
-        parser.add_argument("--output", type=str, default="output.png", help="Output image path (default: output.png).")
+        parser.add_argument(
+            "--output",
+            type=str,
+            default="output.png",
+            help="Output image path (default: output.png).",
+        )
 
         # Generation parameters
-        parser.add_argument("--height", type=int, default=1024, help="Image height (default: 1024).")
-        parser.add_argument("--width", type=int, default=1024, help="Image width (default: 1024).")
         parser.add_argument(
-            "--num-inference-steps", type=int, default=50, help="Number of denoising steps (default: 50)."
+            "--height",
+            type=int,
+            default=1024,
+            help="Image height (default: 1024).",
         )
-        parser.add_argument("--guidance-scale", type=float, default=4.0, help="CFG guidance scale (default: 4.0).")
         parser.add_argument(
-            "--cfg-scale", type=float, default=4.0, help="True CFG scale for Qwen-Image (default: 4.0)."
+            "--width",
+            type=int,
+            default=1024,
+            help="Image width (default: 1024).",
         )
-        parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
-        parser.add_argument("--num-images", type=int, default=1, help="Number of images to generate (default: 1).")
-        parser.add_argument("--negative-prompt", type=str, default=None, help="Negative prompt for CFG.")
+        parser.add_argument(
+            "--num-inference-steps",
+            type=int,
+            default=50,
+            help="Number of denoising steps (default: 50).",
+        )
+        parser.add_argument(
+            "--guidance-scale",
+            type=float,
+            default=4.0,
+            help="CFG guidance scale (default: 4.0).",
+        )
+        parser.add_argument(
+            "--cfg-scale",
+            type=float,
+            default=4.0,
+            help="True CFG scale for Qwen-Image (default: 4.0).",
+        )
+        parser.add_argument(
+            "--seed",
+            type=int,
+            default=42,
+            help="Random seed (default: 42).",
+        )
+        parser.add_argument(
+            "--num-images",
+            type=int,
+            default=1,
+            help="Number of images to generate (default: 1).",
+        )
+        parser.add_argument(
+            "--negative-prompt",
+            type=str,
+            default=None,
+            help="Negative prompt for CFG.",
+        )
 
         # Hardware / loading
-        parser.add_argument("--tensor-parallel-size", type=int, default=1, help="Tensor parallelism size (default: 1).")
-        parser.add_argument("--stage-configs-path", type=str, default=None, help="Path to stage config YAML.")
-        parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
-        parser.add_argument("--enable-cpu-offload", action="store_true", help="Enable CPU offloading.")
+        parser.add_argument(
+            "--tensor-parallel-size",
+            type=int,
+            default=1,
+            help="Tensor parallelism size (default: 1).",
+        )
+        parser.add_argument(
+            "--stage-configs-path",
+            type=str,
+            default=None,
+            help="Path to stage config YAML.",
+        )
+        parser.add_argument(
+            "--enforce-eager",
+            action="store_true",
+            help="Disable torch.compile.",
+        )
+        parser.add_argument(
+            "--enable-cpu-offload",
+            action="store_true",
+            help="Enable CPU offloading.",
+        )
 
         return parser
 
