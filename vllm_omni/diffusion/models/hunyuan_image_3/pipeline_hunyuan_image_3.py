@@ -149,13 +149,12 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             "time_embed_2",
             "final_layer.model",
         ]
-
-        device_str = f"{get_local_device()}"
+        device = get_local_device()
         named_modules = dict(self.named_modules())
         for prefix in non_model_layer_prefixes:
             mod = named_modules.get(prefix)
             if mod:
-                mod.to(device_str)
+                mod.to(device)
 
         unexpected_keywords = [
             "guidance_emb",
