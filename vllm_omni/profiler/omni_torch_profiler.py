@@ -18,11 +18,12 @@ from vllm.profiler.wrapper import WorkerProfiler
 logger = init_logger(__name__)
 
 # NPU has its custom profiler
-TorchProfilerActivity = Literal["CPU", "CUDA", "XPU", "NPU"]
+TorchProfilerActivity = Literal["CPU", "CUDA", "XPU", "NPU", "MUSA"]
 TorchProfilerActivityMap = {
     "CPU": torch.profiler.ProfilerActivity.CPU,
     "CUDA": torch.profiler.ProfilerActivity.CUDA,
     "XPU": torch.profiler.ProfilerActivity.XPU,
+    "MUSA": torch.profiler.ProfilerActivity.CUDA,
 }
 
 
