@@ -7,7 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from huggingface_hub import snapshot_download,hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 
 DEPENDENCY_REPO = "https://github.com/bytedance/DreamID-V.git"
 DEPENDENCY_BRANCH = "omni"
@@ -94,7 +94,7 @@ def main(output_dir: str):
     os.makedirs(transformer_dir, exist_ok=True)
 
     print("Downloading transformer/config.json from Wan-AI/Wan2.2-TI2V-5B-Diffusers...")
-    transformer_config_path = hf_hub_download(
+    hf_hub_download(
         repo_id="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         filename="transformer/config.json",
         local_dir=output_dir,
