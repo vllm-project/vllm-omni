@@ -47,7 +47,10 @@ def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
     client.stage_id = 0
     client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
     client._omni_kv_config = None
+    client._kv_sender_info = None
+    client._kv_sender_initialized = False
     client._kv_sender_host = client._resolve_contact_host()
+    client._initialize_kv_sender_endpoint()
 
     assert client.get_kv_sender_info() == {
         "host": "10.20.30.40",
@@ -60,8 +63,11 @@ def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeyp
     client.stage_id = 1
     client.client_addresses = {"input_address": "tcp://127.0.0.1:1234"}
     client._omni_kv_config = None
+    client._kv_sender_info = None
+    client._kv_sender_initialized = False
     monkeypatch.setattr(client, "_detect_local_ip", lambda: "192.168.0.12")
     client._kv_sender_host = client._resolve_contact_host()
+    client._initialize_kv_sender_endpoint()
 
     assert client.get_kv_sender_info() == {
         "host": "192.168.0.12",
@@ -73,6 +79,8 @@ def test_stage_engine_core_client_uses_connector_config_for_sender_port():
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 3
     client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client._kv_sender_info = None
+    client._kv_sender_initialized = False
     client._omni_kv_config = {
         "omni_from_stage": "3",
         "connector_config": {
@@ -83,6 +91,7 @@ def test_stage_engine_core_client_uses_connector_config_for_sender_port():
         },
     }
     client._kv_sender_host = client._resolve_contact_host()
+    client._initialize_kv_sender_endpoint()
 
     assert client.get_kv_sender_info() == {
         "host": "10.20.30.99",
