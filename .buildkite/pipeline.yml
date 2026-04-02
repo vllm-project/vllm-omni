@@ -3,6 +3,40 @@ steps:
     key: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
+    plugins:
+      - kubernetes#v1.0:
+          metadata:
+            annotations:
+              vault.hashicorp.com/agent-init-first: "true"
+              vault.hashicorp.com/agent-inject: "true"
+              vault.hashicorp.com/agent-inject-perms-ca.pem: "0400"
+              vault.hashicorp.com/agent-inject-perms-cert.pem: "0400"
+              vault.hashicorp.com/agent-inject-perms-config.json: "0400"
+              vault.hashicorp.com/agent-inject-perms-key.pem: "0400"
+              vault.hashicorp.com/agent-inject-secret-ca.pem: internal/data/ascend/buildkitd
+              vault.hashicorp.com/agent-inject-secret-cert.pem: internal/data/ascend/buildkitd
+              vault.hashicorp.com/agent-inject-secret-config.json: internal/data/ascend/buildkitd
+              vault.hashicorp.com/agent-inject-secret-key.pem: internal/data/ascend/buildkitd
+              vault.hashicorp.com/agent-inject-template-ca.pem: "{{- with secret \"internal/data/ascend/buildkitd\" -}}\n{{ .Data.data.RootCA }}\n{{- end }}"
+              vault.hashicorp.com/agent-inject-template-cert.pem: "{{- with secret \"internal/data/ascend/buildkitd\" -}}\n{{ .Data.data.ClientCaCert }}\n{{- end }}"
+              vault.hashicorp.com/agent-inject-template-config.json: "{{- with secret \"internal/data/ascend/buildkitd\" -}}\n{{ .Data.data.dockerConfig }}\n{{- end }}"
+              vault.hashicorp.com/agent-inject-template-key.pem: "{{- with secret \"internal/data/ascend/buildkitd\" -}}\n{{ .Data.data.ClientCaKey }}\n{{- end }}"
+              vault.hashicorp.com/agent-pre-populate-only: "true"
+              vault.hashicorp.com/agent-run-as-group: "1000"
+              vault.hashicorp.com/agent-run-as-user: "1000"
+              vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+              vault.hashicorp.com/role: ascend-gha-runners
+              vault.hashicorp.com/tls-skip-verify: "true"
+          pod_spec_patch:
+            volumes:
+            - name: token-vol
+              projected:
+                defaultMode: 420
+                sources:
+                - serviceAccountToken:
+                    audience: api
+                    expirationSeconds: 600
+                    path: token
     env:
       VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
       IMAGE_NAME: "vllm-omni-ci-npu"
