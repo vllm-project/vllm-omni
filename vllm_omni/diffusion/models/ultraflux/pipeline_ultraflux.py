@@ -58,12 +58,12 @@ def get_ultraflux_post_process_func(
 
 
 def calculate_shift(
-    image_seq_len,
+    image_seq_len: int,
     base_seq_len: int = 256,
     max_seq_len: int = 4096,
     base_shift: float = 0.5,
     max_shift: float = 1.16,
-):
+) -> float:
     """
     Calculate shift parameter for timestep sampling based on image sequence length.
 
