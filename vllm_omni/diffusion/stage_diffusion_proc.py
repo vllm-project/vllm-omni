@@ -557,10 +557,7 @@ def spawn_diffusion_proc(
     deadline = time.monotonic() + 10
     while not proc.is_alive():
         if proc.exitcode is not None:
-            raise RuntimeError(
-                f"StageDiffusionProc failed to start "
-                f"(exit code {proc.exitcode})"
-            )
+            raise RuntimeError(f"StageDiffusionProc failed to start (exit code {proc.exitcode})")
         if time.monotonic() > deadline:
             raise TimeoutError("StageDiffusionProc did not become alive within 10s")
         time.sleep(0.01)

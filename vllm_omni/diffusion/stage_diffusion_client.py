@@ -149,7 +149,9 @@ class StageDiffusionClient:
         elif not isinstance(sampling_params, dict):
             raise TypeError(f"sampling_params is not a dict but {sampling_params.__class__.__name__}")
         else:
-            result = {k: v for k, v in sampling_params.items() if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS}
+            result = {
+                k: v for k, v in sampling_params.items() if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS
+            }
 
         # Preserve the generator's seed across the process boundary so
         # the subprocess can recreate deterministic random state.
@@ -241,10 +243,7 @@ class StageDiffusionClient:
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
             if self._proc is not None and not self._proc.is_alive():
-                raise RuntimeError(
-                    f"StageDiffusionProc died unexpectedly "
-                    f"(exit code {self._proc.exitcode})"
-                )
+                raise RuntimeError(f"StageDiffusionProc died unexpectedly (exit code {self._proc.exitcode})")
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
