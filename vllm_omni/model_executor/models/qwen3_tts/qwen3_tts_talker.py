@@ -1362,12 +1362,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     xvec_only = not in_context_mode
             ref_code = None
             if voice_clone_prompt is not None:
-                ref_code = _as_singleton(voice_clone_prompt.get("ref_code"))
+                # Keep the full ref_code payload. For cached prompts this may be
+                # a 2D Python list (frames x quantizers), and unwrapping it as a
+                # singleton would silently drop all but the first frame.
+                ref_code = voice_clone_prompt.get("ref_code")
             ref_code_t = None
             if isinstance(ref_code, torch.Tensor):
                 ref_code_t = ref_code
             elif isinstance(ref_code, np.ndarray):
                 ref_code_t = torch.from_numpy(ref_code)
+            elif isinstance(ref_code, list) and ref_code:
+                ref_code_t = torch.tensor(ref_code, dtype=torch.long)
             if isinstance(ref_code_t, torch.Tensor):
                 if ref_code_t.ndim == 3:
                     ref_code_t = ref_code_t[0]
