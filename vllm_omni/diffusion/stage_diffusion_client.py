@@ -135,16 +135,37 @@ class StageDiffusionClient:
         Uses ``dataclasses.fields`` + ``getattr`` instead of ``asdict``
         to avoid deep-copying large tensors, and skips fields that
         cannot cross process boundaries.
+
+        When a ``torch.Generator`` is present but ``seed`` is not set,
+        the generator's initial seed is extracted so the subprocess can
+        recreate an equivalent generator via ``diffusion_model_runner``.
         """
         if is_dataclass(sampling_params) and not isinstance(sampling_params, type):
-            return {
+            result = {
                 f.name: getattr(sampling_params, f.name)
                 for f in fields(sampling_params)
                 if f.name not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS
             }
-        if not isinstance(sampling_params, dict):
+        elif not isinstance(sampling_params, dict):
             raise TypeError(f"sampling_params is not a dict but {sampling_params.__class__.__name__}")
-        return {k: v for k, v in sampling_params.items() if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS}
+        else:
+            result = {k: v for k, v in sampling_params.items() if k not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS}
+
+        # Preserve the generator's seed across the process boundary so
+        # the subprocess can recreate deterministic random state.
+        if result.get("seed") is None:
+            generator = (
+                getattr(sampling_params, "generator", None)
+                if not isinstance(sampling_params, dict)
+                else sampling_params.get("generator")
+            )
+            if generator is not None:
+                if isinstance(generator, list) and generator:
+                    generator = generator[0]
+                if hasattr(generator, "initial_seed"):
+                    result["seed"] = generator.initial_seed()
+
+        return result
 
     # ------------------------------------------------------------------
     # Public API (matches the interface the Orchestrator expects)
