@@ -66,7 +66,9 @@ def _make_engine(num_gpus: int = 1):
     sched.initialize(Mock())
     engine.scheduler = sched
     engine.executor = executor
-    engine._rpc_lock = threading.Lock()
+    engine._rpc_lock = threading.RLock()
+    engine.abort_queue = queue.Queue()
+    engine.execute_fn = executor.execute_request
     return engine, executor, req_q, res_q
 
 
@@ -80,7 +82,7 @@ def _start_worker(req_q, res_q, count=2):
             req = req_q.get(timeout=10)
             method = req.get("method", "")
             args = req.get("args", ())
-            if method == "generate" and args and hasattr(args[0], "request_ids"):
+            if method in {"generate", "execute_model"} and args and hasattr(args[0], "request_ids"):
                 tag = f"result_for_{args[0].request_ids[0]}"
             elif args:
                 tag = f"result_for_{args[0]}"
@@ -116,11 +118,11 @@ def _inject_interleave(executor):
     return a_enqueued, b_complete
 
 
-# ──────────────────── bug-reproduction: concurrent add_req ────────────────
+# ───────────────── concurrent request execution ─────────────────
 
 
-class TestConcurrentAddReqBug:
-    """Two concurrent ``add_req_and_wait_for_response()`` calls swap results."""
+class TestConcurrentRequestExecution:
+    """Concurrent request execution should not swap results."""
 
     def test_results_are_correctly_routed(self):
         engine, executor, req_q, res_q = _make_engine()
@@ -151,11 +153,11 @@ class TestConcurrentAddReqBug:
         assert results["B"].error == "result_for_B"
 
 
-# ──────────────── bug-reproduction: concurrent collective_rpc ─────────────
+# ───────────────── concurrent collective RPC ─────────────────
 
 
-class TestConcurrentCollectiveRpcBug:
-    """Two concurrent ``collective_rpc()`` calls swap results."""
+class TestConcurrentCollectiveRpc:
+    """Concurrent ``collective_rpc()`` calls should not swap results."""
 
     def test_results_are_correctly_routed(self):
         engine, executor, req_q, res_q = _make_engine()
@@ -192,11 +194,11 @@ class TestConcurrentCollectiveRpcBug:
         assert results["B"].error == "result_for_call_B"
 
 
-# ──────── bug-reproduction: add_req vs collective_rpc concurrently ────────
+# ──────────── concurrent request execution and collective RPC ────────────
 
 
-class TestConcurrentAddReqVsCollectiveRpcBug:
-    """``add_req`` and ``collective_rpc`` running concurrently swap results."""
+class TestConcurrentRequestExecutionAndCollectiveRpc:
+    """Request execution and ``collective_rpc()`` should not swap results."""
 
     def test_results_are_correctly_routed(self):
         engine, executor, req_q, res_q = _make_engine()
@@ -205,7 +207,7 @@ class TestConcurrentAddReqVsCollectiveRpcBug:
 
         results: dict[str, object] = {}
 
-        def _a():  # add_req path
+        def _a():  # request execution path
             results["A"] = engine.add_req_and_wait_for_response(_mock_request("A"))
 
         def _b():  # collective_rpc path
@@ -230,10 +232,10 @@ class TestConcurrentAddReqVsCollectiveRpcBug:
         assert results["B"].error == "result_for_call_B"
 
 
-# ─────────────── backward-compatibility (serial) tests ────────────────────
+# ─────────────────────── serial operation coverage ───────────────────────
 
 
-class TestSerialOperations:
+class TestSerialEngineOperations:
     """Verify correct behaviour for single-threaded (serial) usage.
 
     These tests must pass both **before** and **after** any concurrency fix
@@ -385,18 +387,18 @@ class TestCollectiveRpcTimeoutWhileLockHeld:
 
         executor._result_mq.dequeue = _hanging_dequeue
 
-        # Thread running add_req — acquires the lock, enqueues, then
+        # Thread running request execution — acquires the lock, enqueues, then
         # blocks on dequeue forever (worker hang).
-        def _stalled_add_req():
+        def _stalled_request_execution():
             try:
                 engine.add_req_and_wait_for_response(_mock_request("stalled"))
             except Exception:
                 pass
 
-        t = threading.Thread(target=_stalled_add_req, daemon=True)
+        t = threading.Thread(target=_stalled_request_execution, daemon=True)
         t.start()
 
-        # Wait until add_req is truly inside the lock and blocking.
+        # Wait until request execution is truly inside the lock and blocking.
         add_req_blocked.wait(5)
 
         # collective_rpc should time out at lock acquisition, not hang.
