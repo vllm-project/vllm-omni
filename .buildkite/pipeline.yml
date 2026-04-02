@@ -47,8 +47,8 @@ steps:
       set -ex
 
       echo "--- Building and pushing NPU Test Image"
-      echo "Image: ${IMAGE_REGISTRY}/${IMAGE_NAME}:${VLLM_IMAGE_TAG}"
-      echo "buildkitd address: ${BUILDKITD_ADDR}"
+      echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+      echo "buildkitd address: $${BUILDKITD_ADDR}"
 
       # 配置 GitHub 代理
       git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
@@ -58,14 +58,14 @@ steps:
         echo "Installing buildctl..."
         mkdir -p /tmp/buildkit
         BUILDKIT_VERSION="v0.29.0"
-        wget -q "https://gh-proxy.test.osinfra.cn/https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-arm64.tar.gz" -O /tmp/buildkit.tar.gz
+        wget -q "https://gh-proxy.test.osinfra.cn/https://github.com/moby/buildkit/releases/download/$${BUILDKIT_VERSION}/buildkit-$${BUILDKIT_VERSION}.linux-arm64.tar.gz" -O /tmp/buildkit.tar.gz
         tar -xzf /tmp/buildkit.tar.gz -C /tmp/buildkit
         sudo cp /tmp/buildkit/bin/buildctl /usr/local/bin/
       fi
 
       # 使用 buildctl 构建并推送到 SWR
       buildctl \
-        --addr="${BUILDKITD_ADDR}" \
+        --addr="$${BUILDKITD_ADDR}" \
         --tlscacert=/vault/secrets/ca.pem \
         --tlscert=/vault/secrets/cert.pem \
         --tlskey=/vault/secrets/key.pem \
@@ -75,11 +75,11 @@ steps:
         --local dockerfile=./docker \
         --opt filename=Dockerfile_test.npu \
         --secret id=dockerconfig,src=/vault/secrets/config.json \
-        --output type=image,name=${IMAGE_REGISTRY}/${IMAGE_NAME}:${VLLM_IMAGE_TAG},push=true \
+        --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
         --progress=plain
 
       echo "--- Image pushed successfully"
-      echo "${IMAGE_REGISTRY}/${IMAGE_NAME}:${VLLM_IMAGE_TAG}"
+      echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
 
   - label: "Upload Test Pipeline"
     depends_on: image-build

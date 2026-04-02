@@ -2,11 +2,12 @@ steps:
   - label: "🧪 NPU Unit Test"
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
-
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:$${BUILDKITE_COMMIT}"
     plugins:
-      - kubernetes#v1.0:
-          image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
-
+      - kubernetes:
+          podSpecPatch:
+            imagePullSecrets:
+            - name: swr-secret
     command: |
       set -ex
 
