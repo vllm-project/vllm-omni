@@ -21,7 +21,7 @@ from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.utils import shutdown
 
-from vllm_omni.diffusion.data import TransformerConfig, DiffusionRequestAbortedError
+from vllm_omni.diffusion.data import DiffusionRequestAbortedError, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
@@ -377,9 +377,7 @@ class StageDiffusionProc:
                     async def _dispatch_batch(rid: str, prompts: list, sp_dict: dict) -> None:
                         try:
                             result = await self._process_batch_request(rid, prompts, sp_dict)
-                            await response_socket.send(
-                                encoder.encode({"type": "result", "output": result})
-                            )
+                            await response_socket.send(encoder.encode({"type": "result", "output": result}))
                         except DiffusionRequestAbortedError as e:
                             logger.info(
                                 "request_id: %s aborted: %s",
@@ -389,11 +387,13 @@ class StageDiffusionProc:
                         except Exception as e:
                             logger.exception("Batch diffusion request %s failed: %s", rid, e)
                             await response_socket.send(
-                                encoder.encode({
-                                    "type": "error",
-                                    "request_id": rid,
-                                    "error": str(e),
-                                })
+                                encoder.encode(
+                                    {
+                                        "type": "error",
+                                        "request_id": rid,
+                                        "error": str(e),
+                                    }
+                                )
                             )
                         finally:
                             tasks.pop(rid, None)
