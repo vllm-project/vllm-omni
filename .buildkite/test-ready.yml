@@ -21,8 +21,14 @@ steps:
     depends_on: upload-ready-pipeline
     commands:       
       - "timeout 10m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' --ignore=tests/e2e"
+      - |
+        timeout 15m bash -c '
+                pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' --ignore=tests/e2e
+                pytest -v -s tests/diffusion/distributed/test_ulysses_uaa_perf.py
+                pytest -v -s tests/diffusion/test_diffusion_step_pipeline.py -m 'core_model and cuda and L4'
+        '
     agents:
-      queue: "gpu_1_queue"
+      queue: "gpu_4_queue"
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
