@@ -1,61 +1,46 @@
 steps:
-  - label: "🧪 Simple Unit Test"
+  - label: "🧪 NPU Unit Test"
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
+
     plugins:
       - kubernetes#v1.0:
           image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
-          podSpec:
-            nodeSelector:
-              kubernetes.io/arch: arm64
-            containers:
-              - name: test
-                volumeMounts:
-                  - name: davinci0
-                    mountPath: /dev/davinci0
-                  - name: davinci-manager
-                    mountPath: /dev/davinci_manager
-                  - name: devmm-svm
-                    mountPath: /dev/devmm_svm
-                  - name: hisi-hdc
-                    mountPath: /dev/hisi_hdc
-                  - name: ascend-dcmi
-                    mountPath: /usr/local/dcmi
-                  - name: ascend-npu-smi
-                    mountPath: /usr/local/bin/npu-smi
-                  - name: ascend-driver-lib
-                    mountPath: /usr/local/Ascend/driver/lib64
-                  - name: ascend-driver-version
-                    mountPath: /usr/local/Ascend/driver/version.info
-                  - name: ascend-install-info
-                    mountPath: /etc/ascend_install.info
-            volumes:
-              - name: davinci0
-                hostPath:
-                  path: /dev/davinci0
-              - name: davinci-manager
-                hostPath:
-                  path: /dev/davinci_manager
-              - name: devmm-svm
-                hostPath:
-                  path: /dev/devmm_svm
-              - name: hisi-hdc
-                hostPath:
-                  path: /dev/hisi_hdc
-              - name: ascend-dcmi
-                hostPath:
-                  path: /usr/local/dcmi
-              - name: ascend-npu-smi
-                hostPath:
-                  path: /usr/local/bin/npu-smi
-              - name: ascend-driver-lib
-                hostPath:
-                  path: /usr/local/Ascend/driver/lib64
-              - name: ascend-driver-version
-                hostPath:
-                  path: /usr/local/Ascend/driver/version.info
-              - name: ascend-install-info
-                hostPath:
-                  path: /etc/ascend_install.info
+
     command: |
-      timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
+      set -ex
+
+      echo "--- Container information"
+      uname -a
+      python3 --version
+
+      echo "--- Verifying NPU device mounts"
+      ls -l /dev/davinci0
+      ls -l /dev/davinci_manager
+      ls -l /dev/devmm_svm
+      ls -l /dev/hisi_hdc
+
+      echo "--- Verifying npu-smi"
+      ls -l /usr/local/bin/npu-smi
+      npu-smi info
+
+      echo "--- Verifying Ascend runtime"
+      source /usr/local/Ascend/ascend-toolkit/set_env.sh
+      source /usr/local/Ascend/nnal/atb/set_env.sh
+
+      python3 - <<'PY'
+      import torch
+      print("torch version:", torch.__version__)
+      print("torch.npu available:", torch.npu.is_available())
+
+      if not torch.npu.is_available():
+          raise RuntimeError("NPU is not available inside test container")
+      PY
+
+      echo "--- Running pytest"
+      timeout 20m pytest -v -s -m 'core_model and npu' \
+        --cov=vllm_omni \
+        --cov-branch \
+        --cov-report=term-missing \
+        --cov-report=html \
+        --cov-report=xml
