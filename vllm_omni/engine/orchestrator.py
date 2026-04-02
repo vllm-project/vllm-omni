@@ -477,25 +477,29 @@ class Orchestrator:
             ),
         )
 
-    def _build_kv_sender_info(self, sender_stage_id: int) -> dict[int, dict[str, Any]] | None:
+    def _build_kv_sender_info(self, sender_stage_ids: list[int]) -> dict[int, dict[str, Any]] | None:
         """Build per-request sender info for diffusion KV-transfer receivers."""
-        if sender_stage_id < 0 or sender_stage_id >= self.num_stages:
-            return None
+        sender_infos: dict[int, dict[str, Any]] = {}
+        for sender_stage_id in dict.fromkeys(sender_stage_ids):
+            if sender_stage_id < 0 or sender_stage_id >= self.num_stages:
+                continue
 
-        sender_stage = self.stage_clients[sender_stage_id]
-        get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
-        if not callable(get_sender_info):
-            return None
+            sender_stage = self.stage_clients[sender_stage_id]
+            get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
+            if not callable(get_sender_info):
+                continue
 
-        sender_info = get_sender_info()
-        if not sender_info:
-            logger.warning(
-                "[Orchestrator] Stage-%s has no KV sender info available",
-                sender_stage_id,
-            )
-            return None
+            sender_info = get_sender_info()
+            if not sender_info:
+                logger.warning(
+                    "[Orchestrator] Stage-%s has no KV sender info available",
+                    sender_stage_id,
+                )
+                continue
 
-        return {sender_stage_id: sender_info}
+            sender_infos[sender_stage_id] = sender_info
+
+        return sender_infos or None
 
     async def _forward_to_next_stage(
         self,
@@ -542,7 +546,8 @@ class Orchestrator:
                         req_id,
                     )
 
-            kv_sender_info = self._build_kv_sender_info(sender_stage_id=stage_id)
+            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [stage_id])
+            kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
             if isinstance(diffusion_prompt, list):
                 await next_client.add_batch_request_async(
                     req_id,
@@ -758,10 +763,8 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             if next_client.stage_type == "diffusion":
-                source_stage_id = next_stage_id - 1
-                if getattr(next_client, "engine_input_source", None):
-                    source_stage_id = next_client.engine_input_source[0]
-                kv_sender_info = self._build_kv_sender_info(sender_stage_id=source_stage_id)
+                source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [next_stage_id - 1])
+                kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
                 await next_client.add_request_async(
                     request_id,
                     req_state.prompt,

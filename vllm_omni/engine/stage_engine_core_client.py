@@ -176,7 +176,6 @@ class StageEngineCoreClient(AsyncMPClient):
         if self._kv_sender_initialized:
             return
         self._kv_sender_initialized = True
-
         connector_config = self._get_kv_connector_config()
         if connector_config is None or connector_config.get("role") != "sender":
             return

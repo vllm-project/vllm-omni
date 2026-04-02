@@ -19,6 +19,10 @@ else:
 
 logger = get_connector_logger(__name__)
 
+# Reserve a separate port range for KV-transfer sockets so they do not
+# collide with request-forwarding endpoints that share the same base port.
+KV_TRANSFER_PORT_OFFSET = 100
+
 
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,
@@ -66,7 +70,7 @@ def create_connectors_from_config(
     """
     purpose_port_offsets = {
         "request_forwarding": 0,
-        "kv_transfer": 100,
+        "kv_transfer": KV_TRANSFER_PORT_OFFSET,
     }
     port_offset = purpose_port_offsets.get(purpose, 0)
     orchestrator_port_offset = 200

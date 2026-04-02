@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unified OmniConnector and KV cache transfer management."""
 
+import json
+import struct
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -12,6 +14,7 @@ from vllm.logger import init_logger
 
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec
+from .utils.initialization import KV_TRANSFER_PORT_OFFSET
 from .utils.kv_utils import normalize_layer_kv
 
 logger = init_logger(__name__)
@@ -48,9 +51,6 @@ class KVCacheTransferData:
 
     def to_bytes(self) -> bytes:
         """Convert to compact binary format for fast transfer."""
-        import json
-        import struct
-
         tensors_desc: list[dict[str, Any]] = []
         tensor_bufs: list[bytes] = []
         data_offset = 0
@@ -91,9 +91,6 @@ class KVCacheTransferData:
 
     def to_gpu_tensor(self) -> torch.Tensor:
         """Convert to a packed GPU tensor for raw-data connectors."""
-        import json
-        import struct
-
         tensors_desc: list[dict[str, Any]] = []
         gpu_tensors: list[torch.Tensor] = []
         data_offset = 0
@@ -154,9 +151,6 @@ class KVCacheTransferData:
     @staticmethod
     def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
         """Reconstruct KV cache data from the packed bytes format."""
-        import json
-        import struct
-
         raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
         header_len = struct.unpack(">I", raw_mv[:4])[0]
         header = json.loads(bytes(raw_mv[4 : 4 + header_len]))
@@ -199,9 +193,6 @@ class KVCacheTransferData:
     @staticmethod
     def from_bytes_gpu(gpu_tensor: torch.Tensor) -> dict[str, Any]:
         """Reconstruct KV cache data from a packed GPU tensor."""
-        import json
-        import struct
-
         header_len = struct.unpack(">I", gpu_tensor[:4].cpu().numpy().tobytes())[0]
         header_bytes = gpu_tensor[4 : 4 + header_len].cpu().numpy().tobytes()
         header = json.loads(header_bytes)
@@ -334,8 +325,6 @@ class OmniKVTransferManager:
             if cfg and (c_type := cfg.get("type")):
                 try:
                     c_extra = {k: v for k, v in cfg.items() if k != "type"}
-                    kv_transfer_port_offset = 100
-
                     if c_type == "MooncakeTransferEngineConnector":
                         base_port = c_extra.get("zmq_port", 50051)
                         c_extra["from_stage"] = (
@@ -348,16 +337,16 @@ class OmniKVTransferManager:
                             from_stage = self.config.from_stage
                             if from_stage is not None:
                                 try:
-                                    c_extra["zmq_port"] = base_port + kv_transfer_port_offset + int(from_stage)
+                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET + int(from_stage)
                                 except (TypeError, ValueError):
-                                    c_extra["zmq_port"] = base_port + kv_transfer_port_offset
+                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET
                         elif self.config.need_recv_cache:
                             c_extra["role"] = "receiver"
                             from_stage = self.config.from_stage
-                            sender_port = base_port + kv_transfer_port_offset
+                            sender_port = base_port + KV_TRANSFER_PORT_OFFSET
                             if from_stage is not None:
                                 try:
-                                    sender_port = base_port + kv_transfer_port_offset + int(from_stage)
+                                    sender_port = base_port + KV_TRANSFER_PORT_OFFSET + int(from_stage)
                                 except (TypeError, ValueError):
                                     pass
                             c_extra.setdefault("sender_host", c_extra.get("host", "127.0.0.1"))

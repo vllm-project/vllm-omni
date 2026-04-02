@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +46,7 @@ def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 0
     client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client._omni_kv_config = None
     client._kv_sender_host = client._resolve_contact_host()
 
     assert client.get_kv_sender_info() == {
@@ -57,6 +59,7 @@ def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeyp
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 1
     client.client_addresses = {"input_address": "tcp://127.0.0.1:1234"}
+    client._omni_kv_config = None
     monkeypatch.setattr(client, "_detect_local_ip", lambda: "192.168.0.12")
     client._kv_sender_host = client._resolve_contact_host()
 
@@ -66,8 +69,28 @@ def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeyp
     }
 
 
-@pytest.mark.asyncio
-async def test_forward_to_diffusion_attaches_kv_sender_info():
+def test_stage_engine_core_client_uses_connector_config_for_sender_port():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 3
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client._omni_kv_config = {
+        "omni_from_stage": "3",
+        "connector_config": {
+            "type": "MooncakeTransferEngineConnector",
+            "role": "sender",
+            "host": "10.20.30.99",
+            "zmq_port": 51000,
+        },
+    }
+    client._kv_sender_host = client._resolve_contact_host()
+
+    assert client.get_kv_sender_info() == {
+        "host": "10.20.30.99",
+        "zmq_port": 51103,
+    }
+
+
+def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     sender_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
@@ -87,7 +110,7 @@ async def test_forward_to_diffusion_attaches_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-1", finished=True)
-    await Orchestrator._forward_to_next_stage(orchestrator, "req-1", 0, output, req_state)
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-1", 0, output, req_state))
 
     assert sender_stage.engine_outputs == [output]
     assert diffusion_stage.calls[0]["request_id"] == "req-1"
@@ -97,8 +120,36 @@ async def test_forward_to_diffusion_attaches_kv_sender_info():
     assert req_state.stage_submit_ts[1] > 0
 
 
-@pytest.mark.asyncio
-async def test_prewarm_diffusion_attaches_kv_sender_info():
+def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
+    orchestrator = object.__new__(Orchestrator)
+    source_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
+    previous_stage = _DummySenderStage({"host": "10.0.0.9", "zmq_port": 59999})
+    diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+
+    orchestrator.num_stages = 3
+    orchestrator.stage_clients = [source_stage, previous_stage, diffusion_stage]
+    orchestrator._companion_map = {}
+    orchestrator.stage_vllm_configs = [None, None, None]
+    orchestrator.output_processors = [None, None, None]
+
+    params = OmniDiffusionSamplingParams()
+    req_state = OrchestratorRequestState(
+        request_id="req-3",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[SamplingParams(max_tokens=4), SamplingParams(max_tokens=4), params],
+        final_stage_id=2,
+    )
+
+    output = SimpleNamespace(request_id="req-3", finished=True)
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-3", 1, output, req_state))
+
+    assert previous_stage.engine_outputs == [output]
+    assert diffusion_stage.calls[0]["kv_sender_info"] == {
+        0: {"host": "10.0.0.2", "zmq_port": 50151},
+    }
+
+
+def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     sender_stage = _DummySenderStage({"host": "10.0.0.3", "zmq_port": 50151})
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
@@ -114,7 +165,7 @@ async def test_prewarm_diffusion_attaches_kv_sender_info():
     )
 
     stage0_request = SimpleNamespace(prompt_token_ids=[1, 2, 3])
-    await Orchestrator._prewarm_async_chunk_stages(orchestrator, "req-2", stage0_request, req_state)
+    asyncio.run(Orchestrator._prewarm_async_chunk_stages(orchestrator, "req-2", stage0_request, req_state))
 
     assert diffusion_stage.calls[0]["request_id"] == "req-2"
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
