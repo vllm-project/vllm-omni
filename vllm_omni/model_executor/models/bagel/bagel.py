@@ -41,6 +41,7 @@ from vllm.multimodal.processing import (
 )
 from vllm.transformers_utils.processors.bagel import BagelProcessor
 
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.bagel.autoencoder import (
     AutoEncoderParams,
     DiagonalGaussian,
@@ -439,7 +440,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self._end_of_image_id = int(_tok.convert_tokens_to_ids("<|vision_end|>"))
 
         self._vae_token_mask: torch.Tensor | None = None
-
+        self.device = get_local_device()
         self._install_mot_modules(config)
 
     def _install_mot_modules(self, config):
@@ -627,7 +628,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             )
             pos_embed = self.latent_pos_embed([vae_position_ids])
             packed_timesteps = torch.tensor([timestep], device=padded_latent.device)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with torch.amp.autocast(self.device.type, dtype=torch.bfloat16):
                 timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
             vae_embeds = self.vae2llm(latent) + timestep_embeds + pos_embed
 

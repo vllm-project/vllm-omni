@@ -171,7 +171,7 @@ stage_args:
 - `custom_process_next_stage_input_func: str`: Path to custom chunk processing function; receives `(transfer_manager, pooling_output, request)`. For qwen3-omni: `thinker2talker_async_chunk`, `talker2code2wav_async_chunk`
 - `stage_connector_config: dict`: Connector configuration
 - `worker_type: str`: Model type, e.g. `"ar"` or `"generation"` (used by OmniChunkTransferAdapter for mode-specific payload handling)
-- `max_batch_size: int`: Maximum batch size for the stage
+- `max_num_seqs: int`: Maximum number of sequences for concurrent processing in the stage
 
 
 ### Connector Configuration
@@ -195,9 +195,9 @@ stage_args:
   - stage_id: 2  # code2wav stage
     runtime:
       devices: "1"
-      max_batch_size: 64  # Enables batched audio generation
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 64  # Enables batched audio generation
 ```
 
 ## Related Files

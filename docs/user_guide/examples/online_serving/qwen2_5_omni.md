@@ -149,6 +149,15 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 
 ## Run Local Web UI Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
 This Web UI demo allows users to interact with the model through a web browser.
 
 ### Running Gradio Demo
@@ -222,10 +231,6 @@ sudo apt install ffmpeg
 ??? abstract "gradio_demo.py"
     ``````py
     --8<-- "examples/online_serving/qwen2_5_omni/gradio_demo.py"
-    ``````
-??? abstract "openai_chat_completion_client_for_multimodal_generation.py"
-    ``````py
-    --8<-- "examples/online_serving/qwen2_5_omni/openai_chat_completion_client_for_multimodal_generation.py"
     ``````
 ??? abstract "run_curl_multimodal_generation.sh"
     ``````sh

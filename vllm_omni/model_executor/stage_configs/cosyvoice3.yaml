@@ -5,6 +5,7 @@
 
 stage_args:
   - stage_id: 0
+    is_comprehension: true
     runtime:
       devices: 0
     engine_args:

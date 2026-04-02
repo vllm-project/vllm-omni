@@ -238,8 +238,24 @@ def main(args: argparse.Namespace) -> None:
     if args.negative_prompt:
         prompt_dict["negative_prompt"] = args.negative_prompt
 
+    # Build cache-dit config if requested
+    cache_config = None
+    if args.cache_backend == "cache_dit":
+        cache_config = {
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 4,
+            "residual_diff_threshold": 0.24,
+            "max_continuous_cached_steps": 3,
+            "enable_taylorseer": False,
+            "taylorseer_order": 1,
+            "scm_steps_mask_policy": None,
+            "scm_steps_policy": "dynamic",
+        }
+
     # Initialize Omni with multistage config
     print("\nInitializing Omni with multistage pipeline...")
+    print(f"  Cache backend: {args.cache_backend or 'None (no acceleration)'}")
     start_time = time.time()
 
     omni = Omni(
@@ -247,6 +263,10 @@ def main(args: argparse.Namespace) -> None:
         stage_configs_path=config_path,
         log_stats=args.enable_stats,
         stage_init_timeout=args.stage_init_timeout,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
+        enable_cache_dit_summary=getattr(args, "enable_cache_dit_summary", False),
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     init_time = time.time() - start_time
@@ -443,6 +463,20 @@ def parse_args() -> argparse.Namespace:
         help="Number of images to generate (default: 1)",
     )
 
+    # Cache acceleration
+    parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["cache_dit"],
+        help="Cache backend for DiT acceleration. Default: None (no cache).",
+    )
+    parser.add_argument(
+        "--enable-cache-dit-summary",
+        action="store_true",
+        help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
+
     # Runtime options
     parser.add_argument(
         "--enable-stats",
@@ -462,6 +496,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Enable verbose output",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
 
     return parser.parse_args()

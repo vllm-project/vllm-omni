@@ -10,9 +10,9 @@ stage_args:
     stage_type: llm  # Use llm stage type for AR stages
     runtime:
       devices: "0"
-      max_batch_size: 64
     engine_args:
       model_stage: thinker
+      max_num_seqs: 64
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -41,9 +41,9 @@ stage_args:
     stage_type: llm  # Use llm stage type for AR stages
     runtime:
       devices: "1"
-      max_batch_size: 64
     engine_args:
       model_stage: talker
+      max_num_seqs: 64
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -72,9 +72,9 @@ stage_args:
     stage_type: llm  # Use llm stage type for AR stages
     runtime:
       devices: "1"
-      max_batch_size: 32
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 32
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler

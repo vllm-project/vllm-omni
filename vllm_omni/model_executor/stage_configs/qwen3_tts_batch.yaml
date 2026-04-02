@@ -1,6 +1,6 @@
 # Same as qwen3_tts.yaml with batched talker and code2wav.
-# Stage 0: max_batch_size 4, stage 1: max_batch_size 4.
-# max_batch_size must be a power of two to align with CUDA graph capture sizes
+# Stage 0: max_num_seqs 4, stage 1: max_num_seqs 4.
+# max_num_seqs must be a power of two to align with CUDA graph capture sizes
 # (stage 0) and must match --batch-size in end2end.py / benchmark scripts.
 async_chunk: true
 stage_args:
@@ -9,9 +9,9 @@ stage_args:
     is_comprehension: true
     runtime:
       devices: "0"
-      max_batch_size: 4
     engine_args:
       model_stage: qwen3_tts
+      max_num_seqs: 4
       model_arch: Qwen3TTSTalkerForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -41,9 +41,9 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 4
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 4
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
@@ -55,9 +55,9 @@ stage_args:
       gpu_memory_utilization: 0.2
       distributed_executor_backend: "mp"
       # Must be divisible by num_code_groups and cover (left_context + chunk).
-      max_num_batched_tokens: 8192
-      # async_chunk appends windows per step; max_model_len must cover accumulated stream.
-      max_model_len: 32768
+      max_num_batched_tokens: 65536
+      # Flat codec prompt can exceed 32k tokens (Q * frames); align with max_tokens below.
+      max_model_len: 65536
     engine_input_source: [0]
     final_output: true
     final_output_type: audio
