@@ -680,7 +680,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         update_dict: dict[str, dict] = {}
 
         voice_type = info_dict.get("speaker")
-        logger.info("talker_preprocess_prefill speaker: %s", voice_type)
         if voice_type is not None and isinstance(voice_type, (list, tuple)) and len(voice_type) > 0:
             voice_type = voice_type[0]
         if not isinstance(voice_type, str) or not voice_type.strip():
