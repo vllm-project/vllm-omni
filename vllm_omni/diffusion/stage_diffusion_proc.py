@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import time
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
@@ -289,22 +290,17 @@ class StageDiffusionProc:
             )
             return all(results) if isinstance(results, list) else results
 
-        if method in {"start_profile", "stop_profile", "sleep", "wake_up"}:
-            return await loop.run_in_executor(
-                self._executor,
-                self._engine.collective_rpc,
-                method,
-                timeout,
-                args,
-                kwargs or {},
-                None,
-            )
-
-        return {
-            "supported": False,
-            "todo": True,
-            "reason": (f"Diffusion stage collective_rpc method {method} is not implemented yet"),
-        }
+        # Fall back to DiffusionEngine.collective_rpc for all other methods
+        # (e.g. worker extension RPCs like "test_extension_name").
+        return await loop.run_in_executor(
+            self._executor,
+            self._engine.collective_rpc,
+            method,
+            timeout,
+            args,
+            kwargs or {},
+            None,
+        )
 
     # ------------------------------------------------------------------
     # ZMQ event loop
@@ -557,6 +553,17 @@ def spawn_diffusion_proc(
         },
     )
     proc.start()
+    # Wait for the process to become alive before returning.
+    deadline = time.monotonic() + 10
+    while not proc.is_alive():
+        if proc.exitcode is not None:
+            raise RuntimeError(
+                f"StageDiffusionProc failed to start "
+                f"(exit code {proc.exitcode})"
+            )
+        if time.monotonic() > deadline:
+            raise TimeoutError("StageDiffusionProc did not become alive within 10s")
+        time.sleep(0.01)
     return proc, handshake_address, request_address, response_address
 
 

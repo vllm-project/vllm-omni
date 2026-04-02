@@ -219,6 +219,11 @@ class StageDiffusionClient:
         try:
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
+            if self._proc is not None and not self._proc.is_alive():
+                raise RuntimeError(
+                    f"StageDiffusionProc died unexpectedly "
+                    f"(exit code {self._proc.exitcode})"
+                )
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:

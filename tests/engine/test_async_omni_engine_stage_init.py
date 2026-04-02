@@ -113,6 +113,7 @@ def test_attach_llm_stage_uses_omni_input_preprocessor(monkeypatch):
         executor_class=object,
         engine_manager=object(),
         coordinator=object(),
+        proc=None,
         addresses=types.SimpleNamespace(
             inputs=["inproc://input"],
             outputs=["inproc://output"],
