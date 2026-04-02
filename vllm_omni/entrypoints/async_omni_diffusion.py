@@ -113,7 +113,7 @@ class AsyncOmniDiffusion:
                 od_config.update_multimodal_support()
 
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
-                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+                od_config.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
@@ -121,7 +121,7 @@ class AsyncOmniDiffusion:
             if cfg is None:
                 raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
 
-            od_config.tf_model_config = TransformerConfig.from_dict(cfg)
+            od_config.set_tf_model_config(TransformerConfig.from_dict(cfg))
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
             # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
