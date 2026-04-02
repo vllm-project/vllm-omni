@@ -265,6 +265,82 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     assert req.kv_metadata["seq_len"] == seq_len
 
 
+def test_manager_reception_prefers_parent_request_id_for_batched_request(kv_config, mock_connector, common_constants):
+    """Batched diffusion requests must fetch KV using the parent/global request ID."""
+    num_layers = common_constants["num_layers"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    seq_len = common_constants["seq_len"]
+    parent_req_id = common_constants["req_id"]
+
+    expected_shape = (seq_len, num_heads, head_dim)
+    key_cache = [torch.randn(expected_shape) for _ in range(num_layers)]
+    value_cache = [torch.randn(expected_shape) for _ in range(num_layers)]
+
+    data_to_receive = {
+        "request_id": parent_req_id,
+        "layer_blocks": {"key_cache": key_cache, "value_cache": value_cache},
+        "metadata": {"seq_len": seq_len},
+        "block_ids": [],
+    }
+
+    manager = OmniKVTransferManager(kv_config)
+    manager._connector = mock_connector
+
+    full_request_id = f"omni_stage1_to_stage2_kv_cache_{parent_req_id}"
+    store_key = f"stage1->stage2:{full_request_id}"
+    mock_connector.store[store_key] = data_to_receive
+
+    req = OmniDiffusionRequest(
+        prompts=["prompt-a", "prompt-b"],
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_ids=[f"{parent_req_id}-0", f"{parent_req_id}-1"],
+        request_id=parent_req_id,
+    )
+
+    success = manager.receive_kv_cache(req, target_device=torch.device("cpu"))
+
+    assert success
+    assert req.kv_metadata["seq_len"] == seq_len
+    assert torch.allclose(req.past_key_values.key_cache[0], key_cache[0])
+
+
+def test_receive_multi_kv_cache_uses_parent_request_id_for_cfg_collection(kv_config):
+    manager = OmniKVTransferManager(kv_config)
+
+    seen = {}
+
+    def collect_cfg(request_id, cfg_request_ids, kv_transfer_manager, target_device):
+        seen["request_id"] = request_id
+        seen["cfg_request_ids"] = cfg_request_ids
+        seen["kv_transfer_manager"] = kv_transfer_manager
+        seen["target_device"] = target_device
+        return {"cfg_text_kv_metadata": {"ok": True}}
+
+    req = OmniDiffusionRequest(
+        prompts=["prompt-a", "prompt-b"],
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_ids=["req-parent-0", "req-parent-1"],
+        request_id="req-parent",
+    )
+    req.sampling_params.cfg_kv_request_ids = {"cfg_text": "req-parent__cfg_text"}
+
+    manager.receive_kv_cache = lambda request, target_device=None: request is req
+
+    success = manager.receive_multi_kv_cache(
+        req,
+        cfg_kv_collect_func=collect_cfg,
+        target_device=torch.device("cpu"),
+    )
+
+    assert success
+    assert seen["request_id"] == "req-parent"
+    assert seen["cfg_request_ids"] == {"cfg_text": "req-parent__cfg_text"}
+    assert seen["kv_transfer_manager"] is manager
+    assert seen["target_device"] == torch.device("cpu")
+    assert req.sampling_params.cfg_text_kv_metadata == {"ok": True}
+
+
 def test_integration_flow(common_constants):
     """Simulate extraction -> connector -> reception."""
     num_layers = common_constants["num_layers"]

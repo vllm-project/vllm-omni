@@ -770,6 +770,16 @@ class OmniKVTransferManager:
             if hasattr(req, "sampling_params") and req.sampling_params is not None:
                 req.sampling_params.kv_metadata = data["metadata"]
 
+    @staticmethod
+    def _resolve_request_id(req: Any) -> str | None:
+        """Resolve the logical request ID used for KV transfer lookups."""
+        request_id = getattr(req, "request_id", None)
+        if request_id:
+            return request_id
+        if hasattr(req, "request_ids") and req.request_ids:
+            return req.request_ids[0]
+        return None
+
     # Legacy compatibility method
     def receive_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
         """Receive KV cache and populate request object (legacy interface).
@@ -785,11 +795,7 @@ class OmniKVTransferManager:
         if kv_sender_info:
             self.update_sender_info(kv_sender_info)
 
-        request_id = getattr(req, "request_id", None)
-        if not request_id and hasattr(req, "request_ids") and req.request_ids:
-            # Adaptation for new OmniDiffusionRequest which has list of prompts/ids
-            request_id = req.request_ids[0]
-
+        request_id = self._resolve_request_id(req)
         if not request_id:
             logger.warning("Request has no ID, cannot receive KV cache")
             return False
@@ -828,9 +834,7 @@ class OmniKVTransferManager:
 
         cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
         if cfg_ids and cfg_kv_collect_func:
-            request_id = getattr(req, "request_id", None) or (
-                req.request_ids[0] if hasattr(req, "request_ids") and req.request_ids else None
-            )
+            request_id = self._resolve_request_id(req)
             try:
                 cfg_kvs = cfg_kv_collect_func(
                     request_id,

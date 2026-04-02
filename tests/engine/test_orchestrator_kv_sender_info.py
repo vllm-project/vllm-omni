@@ -99,6 +99,30 @@ def test_stage_engine_core_client_uses_connector_config_for_sender_port():
     }
 
 
+def test_stage_engine_core_client_preserves_explicit_loopback_sender_host():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 2
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client._kv_sender_info = None
+    client._kv_sender_initialized = False
+    client._omni_kv_config = {
+        "omni_from_stage": "2",
+        "connector_config": {
+            "type": "MooncakeTransferEngineConnector",
+            "role": "sender",
+            "host": "127.0.0.1",
+            "zmq_port": 51000,
+        },
+    }
+    client._kv_sender_host = client._resolve_contact_host()
+    client._initialize_kv_sender_endpoint()
+
+    assert client.get_kv_sender_info() == {
+        "host": "127.0.0.1",
+        "zmq_port": 51102,
+    }
+
+
 def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     sender_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
