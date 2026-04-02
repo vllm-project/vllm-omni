@@ -108,7 +108,11 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech import (
+    OmniOpenAIServingSpeech,
+    VoiceCacheUnsupportedError,
+    VoiceNotFoundError,
+)
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
@@ -1130,6 +1134,64 @@ async def upload_voice(
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
         return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
+
+
+@router.post(
+    "/v1/audio/voices/{name}/cache",
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": dict},
+        HTTPStatus.NOT_FOUND.value: {"model": dict},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": dict},
+    },
+)
+async def create_voice_cache(
+    name: str,
+    raw_request: Request,
+    force: bool = Query(
+        False,
+        description=(
+            "Force rebuild even if cache exists or is processing. "
+            "WARNING: maintenance/debug capability. Non-atomic write may "
+            "corrupt an existing valid cache if rebuild fails mid-write."
+        ),
+    ),
+):
+    """Pre-compute voice clone prompt for an uploaded voice.
+
+    Triggers GPU-side speaker embedding extraction and reference audio
+    codec encoding on the TTS worker. Results are cached as safetensors
+    for faster subsequent TTS requests.
+
+    Only supports audio-uploaded voices (not direct-embedding uploads).
+    """
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+    try:
+        result = await handler.create_voice_cache(name, force=force)
+        return JSONResponse(content=result)
+    except VoiceNotFoundError as e:
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=HTTPStatus.NOT_FOUND.value,
+        )
+    except VoiceCacheUnsupportedError as e:
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except ValueError as e:
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except Exception as e:
+        logger.exception(f"Failed to create voice cache for '{name}': {e}")
+        return JSONResponse(
+            content={"success": False, "error": f"Internal error: {str(e)}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
 
 
 @router.delete(

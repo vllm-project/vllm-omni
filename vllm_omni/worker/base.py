@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
@@ -154,3 +155,41 @@ class OmniGPUWorkerBase(GPUWorker):
             )
 
         return int(self.available_kv_cache_memory_bytes)
+
+    @torch.inference_mode()
+    def create_voice_clone_prompt(
+        self,
+        wav_samples: list[float],
+        sample_rate: int,
+        ref_text: str | None = None,
+    ) -> dict:
+        """RPC handler: extract speaker embedding + ref_code on GPU.
+
+        Only effective for Qwen3-TTS talker models with speaker_encoder.
+        Returns plain Python types only (must survive msgspec IPC).
+        """
+        model = self.model_runner.model
+
+        if not hasattr(model, "_extract_speaker_embedding"):
+            raise NotImplementedError(f"{type(model).__name__} does not support speaker embedding extraction")
+
+        wav_np = np.array(wav_samples, dtype=np.float32)
+        icl_mode = ref_text is not None and ref_text.strip() != ""
+
+        if icl_mode and not hasattr(model, "_encode_ref_audio_to_code"):
+            raise NotImplementedError(f"{type(model).__name__} does not support ref audio codec encoding")
+
+        spk = model._extract_speaker_embedding(wav_np, sample_rate)
+
+        ref_code_list = None
+        if icl_mode:
+            ref_code_t = model._encode_ref_audio_to_code(wav_np, sample_rate)
+            ref_code_list = ref_code_t.cpu().tolist()
+
+        return {
+            "ref_spk_embedding": spk.cpu().tolist(),
+            "ref_code": ref_code_list,
+            "x_vector_only_mode": not icl_mode,
+            "icl_mode": icl_mode,
+            "ref_text": ref_text.strip() if icl_mode else None,
+        }

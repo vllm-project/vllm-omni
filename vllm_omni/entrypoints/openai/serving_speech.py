@@ -44,6 +44,15 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+
+class VoiceNotFoundError(ValueError):
+    """Raised when the requested voice does not exist in uploaded_speakers."""
+
+
+class VoiceCacheUnsupportedError(ValueError):
+    """Raised when voice cache generation is not supported (wrong model/source)."""
+
+
 # TTS Configuration
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
@@ -213,6 +222,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "Re-upload voices after each restart if needed."
         )
         self._tts_tokenizer = None
+        self._direct_embedding_cache: dict[str, list[float]] = {}
+
+        logger.warning(
+            "Uploaded voices are ephemeral and will be lost on server restart. "
+            "Re-upload voices after each restart if needed."
+        )
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
 
@@ -636,6 +651,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "original_filename": audio_file.filename,
             "file_size": file_size,
             "ref_text": ref_text,
+            "cache_status": "pending",
+            "cache_file": None,
+            "cache_generated_at": None,
             "embedding_source": "audio",
         }
 
@@ -729,11 +747,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "mime_type": "application/x-safetensors",
             "original_filename": filename,
             "file_size": file_path.stat().st_size,
+            "cache_status": "ready",
+            "cache_file": str(file_path),
+            "cache_generated_at": float(timestamp),
             "embedding_source": "direct",
             "embedding_dim": emb_dim,
         }
 
         self.uploaded_speakers[voice_name_lower] = speaker_data
+        self._direct_embedding_cache[voice_name_lower] = embedding
         self.supported_speakers.add(voice_name_lower)
 
         logger.info(f"Uploaded voice '{name}' from speaker embedding ({emb_dim}-dim)")
@@ -765,16 +787,289 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         speaker_info = self.uploaded_speakers.pop(voice_name_lower)
         self.supported_speakers.discard(voice_name_lower)
 
-        # Clean up audio file on disk
-        file_path = speaker_info.get("file_path")
-        if file_path:
+        self._direct_embedding_cache.pop(voice_name_lower, None)
+
+        # Clean up associated files on disk
+        file_paths = {
+            path_str
+            for path_str in (speaker_info.get("file_path"), speaker_info.get("cache_file"))
+            if isinstance(path_str, str) and path_str
+        }
+        for file_path in file_paths:
             try:
                 Path(file_path).unlink(missing_ok=True)
             except Exception as e:
-                logger.warning(f"Failed to delete audio file for '{name}': {e}")
+                logger.warning(f"Failed to delete file for '{name}': {e}")
 
         logger.info(f"Deleted voice '{name}'")
         return True
+
+    # ---- Voice cache generation ----
+
+    _PROCESSING_TIMEOUT_S = 300  # 5 minutes
+
+    async def create_voice_cache(self, voice_name: str, force: bool = False) -> dict:
+        """Pre-compute voice clone prompt (speaker embedding + ref_code) for an uploaded voice.
+
+        Sends an RPC to the TTS stage worker to run GPU-side extraction, then
+        persists the result as safetensors for faster subsequent TTS requests.
+        """
+
+        # ── Front-gate checks ──
+        if self._tts_model_type != "qwen3_tts":
+            raise VoiceCacheUnsupportedError("Voice cache generation is only supported for Qwen3-TTS models")
+        if not hasattr(self.engine_client, "collective_rpc"):
+            raise VoiceCacheUnsupportedError("Voice cache generation requires multi-stage engine (AsyncOmni)")
+
+        voice_key = voice_name.lower()
+        if voice_key not in self.uploaded_speakers:
+            raise VoiceNotFoundError(f"Voice '{voice_name}' not found")
+        speaker_info = self.uploaded_speakers[voice_key]
+
+        if speaker_info.get("embedding_source") == "direct":
+            raise VoiceCacheUnsupportedError(
+                f"Voice '{voice_name}' uses pre-computed embedding. "
+                "Cache generation only supports audio-uploaded voices."
+            )
+
+        # ── State guards ──
+        current_status = speaker_info.get("cache_status")
+
+        if current_status == "processing" and not force:
+            # Timeout guard with type defence (metadata comes from JSON, no schema)
+            # NOTE: cache_generated_at serves as "processing start time" here;
+            # on success _save_voice_cache() overwrites it with completion time.
+            started_at = speaker_info.get("cache_generated_at")
+            try:
+                started_at = float(started_at) if started_at is not None else None
+            except (TypeError, ValueError):
+                started_at = None
+                logger.warning(
+                    "Invalid cache_generated_at for voice %s, treating as stale",
+                    voice_name,
+                )
+            if started_at is not None and (time.time() - started_at) < self._PROCESSING_TIMEOUT_S:
+                return {
+                    "voice": voice_name,
+                    "cache_status": "processing",
+                    "message": "Cache generation in progress",
+                }
+            logger.warning(
+                "Processing state for voice %s timed out or stale, allowing rebuild",
+                voice_name,
+            )
+
+        if current_status == "ready" and not force:
+            cached = self._load_cached_voice_prompt(voice_key)
+            if cached is not None:
+                return {
+                    "voice": voice_name,
+                    "cache_status": "ready",
+                    "message": "Cache already exists and is valid",
+                }
+            logger.warning("Cache for voice %s is invalid, rebuilding", voice_name)
+
+        # ── Mark processing (verify disk write + sync in-memory timestamp) ──
+        # Preserve previous status so we can restore it on pre-save failure
+        # instead of unconditionally marking as "failed" (which would invalidate
+        # a still-valid cache if the rebuild fails before writing anything).
+        previous_status = current_status or "pending"
+        previous_cache_generated_at = speaker_info.get("cache_generated_at")
+        now = time.time()
+        self.uploaded_speakers[voice_key]["cache_status"] = "processing"
+        self.uploaded_speakers[voice_key]["cache_generated_at"] = now
+
+        # ── Main body: on failure, restore previous status if save hasn't started ──
+        save_attempted = False
+        try:
+            # 1. Read audio (missing file_path is a data-corruption issue, not 404)
+            file_path_str = speaker_info.get("file_path")
+            if not file_path_str:
+                raise ValueError(
+                    f"Metadata for voice '{voice_name}' has no file_path. "
+                    f"Delete this voice via DELETE /v1/audio/voices/{voice_name} "
+                    "and re-upload."
+                )
+            file_path = Path(file_path_str)
+            if not file_path.is_file():
+                raise ValueError(
+                    f"Audio file for voice '{voice_name}' is missing from disk. "
+                    f"Delete this voice via DELETE /v1/audio/voices/{voice_name} "
+                    "then re-upload via POST /v1/audio/voices before generating cache."
+                )
+            wav_np, sr = sf.read(file_path)
+            wav_np = np.asarray(wav_np, dtype=np.float32)
+            if wav_np.ndim > 1:
+                wav_np = np.mean(wav_np, axis=-1)
+
+            # 2. RPC to stage 0 worker
+            tts_stage_id = self._tts_stage.stage_id
+            ref_text = speaker_info.get("ref_text")
+            # msgspec IPC requires plain Python types; numpy arrays do not
+            # survive this RPC boundary, so the waveform must be converted.
+            results = await self.engine_client.collective_rpc(
+                method="create_voice_clone_prompt",
+                args=(wav_np.tolist(), int(sr), ref_text),
+                stage_ids=[tts_stage_id],
+            )
+
+            # 3. Merge multi-rank results + validate
+            payload = self._extract_rpc_payload(results)
+
+            # 5. Persist (writes safetensors + updates metadata to ready)
+            # WARNING: _save_voice_cache() is NOT atomic (no tmp+rename).
+            # force rebuild on failure may corrupt a previously valid cache.
+            save_attempted = True
+            if not self._save_voice_cache(voice_key, speaker_info, file_path, payload):
+                raise ValueError(f"Failed to save voice cache for '{voice_name}'")
+
+        except Exception:
+            # If save hasn't been attempted yet, the old cache file is untouched
+            # — restore previous status and timestamp instead of marking "failed".
+            if save_attempted:
+                self._set_cache_status(voice_key, "failed")
+            else:
+                self._rollback_cache_state(voice_key, previous_status, previous_cache_generated_at)
+            raise
+
+        return {"voice": voice_name, "cache_status": "ready"}
+
+    @staticmethod
+    def _extract_rpc_payload(results: list) -> dict:
+        """Extract and validate single-stage RPC payload from collective_rpc."""
+        if not results:
+            raise ValueError("Empty RPC response")
+        stage_result = results[0]
+        # Orchestrator error dict
+        if isinstance(stage_result, dict) and stage_result.get("supported") is False:
+            raise ValueError(f"Stage RPC failed: {stage_result.get('error', 'unknown')}")
+        if isinstance(stage_result, dict) and stage_result.get("todo"):
+            raise ValueError(f"Stage RPC not supported: {stage_result.get('reason', 'unknown')}")
+        # Multi-rank: take rank 0 (all ranks produce identical output)
+        if isinstance(stage_result, list):
+            if not stage_result:
+                raise ValueError("Stage RPC returned empty worker results")
+            payload = stage_result[0]
+        else:
+            payload = stage_result
+        if not isinstance(payload, dict) or "ref_spk_embedding" not in payload:
+            raise ValueError(f"Invalid RPC payload: {type(payload)}")
+        return payload
+
+    def _set_cache_status(self, voice_key: str, status: str) -> None:
+        """Update cache_status in the in-memory uploaded-speakers cache."""
+        if voice_key in self.uploaded_speakers:
+            self.uploaded_speakers[voice_key]["cache_status"] = status
+
+    def _rollback_cache_state(self, voice_key: str, status: str, cache_generated_at: Any) -> None:
+        """Restore cache_status and cache_generated_at after a pre-save failure."""
+        if voice_key in self.uploaded_speakers:
+            self.uploaded_speakers[voice_key]["cache_status"] = status
+            self.uploaded_speakers[voice_key]["cache_generated_at"] = cache_generated_at
+
+    def _cache_file_path_for_speaker(self, speaker_info: dict[str, Any]) -> Path | None:
+        cache_file = speaker_info.get("cache_file")
+        if isinstance(cache_file, str) and cache_file:
+            return Path(cache_file)
+        file_path = speaker_info.get("file_path")
+        if isinstance(file_path, str) and file_path:
+            return Path(file_path).with_suffix(".safetensors")
+        return None
+
+    def _save_voice_cache(self, voice_key: str, speaker_info: dict[str, Any], audio_file_path: Path, payload: dict) -> bool:
+        try:
+            from safetensors.torch import save_file
+        except ImportError:
+            raise ValueError("safetensors is required for voice cache generation")
+
+        cache_file_path = audio_file_path.with_suffix(".safetensors")
+        if not _validate_path_within_directory(cache_file_path, self.uploaded_speakers_dir):
+            raise ValueError("Illegal cache path outside voice samples directory")
+
+        tensors: dict[str, torch.Tensor] = {
+            "__len__": torch.tensor(1, dtype=torch.int64),
+            "item_0_ref_spk_embedding": torch.tensor(payload["ref_spk_embedding"], dtype=torch.float32),
+            "item_0_has_ref_code": torch.tensor(int(payload["ref_code"] is not None), dtype=torch.int8),
+            "item_0_x_vector_only_mode": torch.tensor(int(payload["x_vector_only_mode"]), dtype=torch.int8),
+            "item_0_icl_mode": torch.tensor(int(payload["icl_mode"]), dtype=torch.int8),
+        }
+        if payload["ref_code"] is not None:
+            tensors["item_0_ref_code"] = torch.tensor(payload["ref_code"], dtype=torch.long)
+
+        metadata: dict[str, str] = {}
+        if payload.get("ref_text") is not None:
+            metadata["item_0_ref_text"] = str(payload["ref_text"])
+
+        save_file(tensors, str(cache_file_path), metadata=metadata)
+        speaker_info["cache_status"] = "ready"
+        speaker_info["cache_file"] = str(cache_file_path)
+        speaker_info["cache_generated_at"] = time.time()
+        return True
+
+    def _load_cached_voice_prompt(self, voice_name: str) -> dict[str, Any] | None:
+        speaker_key = voice_name.lower()
+        speaker_info = self.uploaded_speakers.get(speaker_key)
+        if not speaker_info or speaker_info.get("cache_status") != "ready":
+            return None
+
+        cache_file_path = self._cache_file_path_for_speaker(speaker_info)
+        if cache_file_path is None:
+            return None
+        if not _validate_path_within_directory(cache_file_path, self.uploaded_speakers_dir):
+            logger.error("Illegal cache path outside voice samples directory: %s", cache_file_path)
+            return None
+        if not cache_file_path.is_file() or cache_file_path.suffix != ".safetensors":
+            return None
+
+        try:
+            from safetensors import safe_open
+
+            with safe_open(cache_file_path, framework="pt", device="cpu") as f:
+                metadata = f.metadata()
+                ref_spk_embedding = f.get_tensor("item_0_ref_spk_embedding")
+                has_ref_code = bool(f.get_tensor("item_0_has_ref_code").item())
+                ref_code = f.get_tensor("item_0_ref_code") if has_ref_code else None
+                return {
+                    "ref_spk_embedding": ref_spk_embedding.tolist(),
+                    "ref_code": ref_code.tolist() if ref_code is not None else None,
+                    "x_vector_only_mode": bool(f.get_tensor("item_0_x_vector_only_mode").item()),
+                    "icl_mode": bool(f.get_tensor("item_0_icl_mode").item()),
+                    "ref_text": metadata.get("item_0_ref_text"),
+                }
+        except Exception as e:
+            logger.warning("Failed to load voice cache for %s: %s", voice_name, e)
+            return None
+
+    def _get_direct_embedding_list(self, voice_name: str, speaker_info: dict[str, Any]) -> list[float]:
+        voice_key = voice_name.lower()
+        cached = self._direct_embedding_cache.get(voice_key)
+        if cached is not None:
+            return cached
+
+        cache_file_str = speaker_info.get("cache_file")
+        if not cache_file_str:
+            raise ValueError(
+                f"Metadata for voice '{voice_name}' has no cache_file. "
+                f"Delete this voice via DELETE /v1/audio/voices/{voice_name} and re-upload."
+            )
+        emb_path = Path(cache_file_str)
+        if not _validate_path_within_directory(emb_path, self.uploaded_speakers_dir):
+            raise ValueError("Illegal cache path outside voice samples directory")
+        if not emb_path.is_file() or emb_path.suffix != ".safetensors":
+            raise ValueError(f"Embedding file for voice '{voice_name}' missing or corrupted")
+
+        from safetensors.torch import load_file
+
+        tensors = load_file(str(emb_path))
+        if "speaker_embedding" not in tensors:
+            raise ValueError(f"Embedding file for voice '{voice_name}' has no speaker_embedding key")
+        emb_tensor = tensors["speaker_embedding"]
+        if emb_tensor.ndim != 1:
+            raise ValueError(f"speaker_embedding unexpected shape: {emb_tensor.shape}")
+
+        embedding = emb_tensor.tolist()
+        self._direct_embedding_cache[voice_key] = embedding
+        return embedding
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -896,21 +1191,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         )
             else:
                 # Handle the case where request.voice is NOT None
-                pass
-                # voice is not None
                 voice_lower = request.voice.lower()
                 if voice_lower in self.uploaded_speakers:
-                    # Check if data file exists for uploaded speaker
                     speaker_info = self.uploaded_speakers[voice_lower]
-                    file_path = Path(speaker_info["file_path"])
-                    if not file_path.exists():
-                        return f"Data file for uploaded speaker '{request.voice}' not found on disk"
-                    # For embedding-uploaded voices, verify the cache is ready
-                    if speaker_info.get("embedding_source") == "direct":
-                        cache_file = speaker_info.get("cache_file")
-                        if not cache_file or not Path(cache_file).exists():
-                            status = speaker_info.get("cache_status", "unknown")
-                            return f"Speaker embedding for '{request.voice}' is not yet ready (cache_status='{status}')"
+                    # If voice has a usable cache (direct embedding or ready audio cache),
+                    # skip file existence check — TTS can proceed with cached prompt alone.
+                    # Actual cache validity is verified later in _build_tts_params().
+                    has_usable_cache = speaker_info.get("embedding_source") == "direct" or (
+                        speaker_info.get("embedding_source", "audio") == "audio"
+                        and speaker_info.get("cache_status") == "ready"
+                    )
+                    if not has_usable_cache:
+                        file_path_str = speaker_info.get("file_path")
+                        if not file_path_str or not Path(file_path_str).is_file():
+                            return (
+                                f"Audio file for uploaded speaker '{request.voice}' "
+                                "not found on disk and no cache is available. "
+                                f"Delete this voice via DELETE /v1/audio/voices/{request.voice} "
+                                "then re-upload via POST /v1/audio/voices and "
+                                f"generate cache via POST /v1/audio/voices/{request.voice}/cache"
+                            )
                 else:
                     # need ref_audio for built-in speaker
                     if request.ref_audio is None:
@@ -1125,6 +1425,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
 
+    def _fallback_to_raw_audio(self, voice_name: str, speaker_info: dict, params: dict) -> None:
+        """Original behavior: base64 raw audio → ref_audio."""
+        audio_data = self._get_uploaded_audio_data(voice_name)
+        if not audio_data:
+            raise ValueError(f"Audio file for '{voice_name}' missing or corrupted")
+        stored_ref_text = speaker_info.get("ref_text")
+        params["ref_audio"] = [audio_data]
+        params["task_type"] = ["Base"]
+        params["voice_created_at"] = [speaker_info.get("created_at", 0)]
+        if stored_ref_text:
+            params["ref_text"] = [stored_ref_text]
+            params["x_vector_only_mode"] = [False]
+        else:
+            params["x_vector_only_mode"] = [True]
+        logger.info("Fallback to raw ref_audio for: %s (icl=%s)", voice_name, bool(stored_ref_text))
+
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.
 
@@ -1148,39 +1464,65 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             params["language"] = ["Auto"]
 
-        # Speaker (voice)
+        # Speaker (voice) — with cache-aware uploaded voice handling
+        _uploaded_voice_resolved = False
+
         if request.voice is not None:
             params["speaker"] = [request.voice]
 
-            # Uploaded voices use task_type="Base" (CustomVoice requires built-in spk_id).
-            # If ref_text was provided at upload time, use in-context cloning; otherwise x_vector only.
             if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
                 speaker_info = self.uploaded_speakers[request.voice.lower()]
+                embedding_source = speaker_info.get("embedding_source", "audio")
 
-                # Check if this voice was uploaded with a pre-computed embedding.
-                # Populate request.speaker_embedding so the existing code path
-                # (below) handles voice_clone_prompt and x_vector_only_mode.
-                embedding = self._get_uploaded_speaker_embedding(request.voice)
-                if embedding is not None:
-                    request.speaker_embedding = embedding
+                if embedding_source == "direct":
+                    # ── Direct embedding: safetensors → speaker_embedding ──
                     params["task_type"] = ["Base"]
-                    logger.info("Auto-set speaker_embedding for uploaded voice: %s", request.voice)
-                else:
-                    audio_data = self._get_uploaded_audio_data(request.voice)
-                    if not audio_data:
-                        raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
-                    stored_ref_text = speaker_info.get("ref_text")
-                    params["ref_audio"] = [audio_data]
-                    params["task_type"] = ["Base"]
-                    params["voice_created_at"] = [speaker_info.get("created_at", 0)]
-                    if stored_ref_text:
-                        params["ref_text"] = [stored_ref_text]
-                        params["x_vector_only_mode"] = [False]
+                    params["voice_clone_prompt"] = [
+                        {"ref_spk_embedding": self._get_direct_embedding_list(request.voice, speaker_info)}
+                    ]
+                    params["x_vector_only_mode"] = [True]
+                    _uploaded_voice_resolved = True
+                    logger.info("Using direct embedding for voice: %s", request.voice)
+
+                elif speaker_info.get("cache_status") == "ready" and embedding_source == "audio":
+                    # ── Audio + cached prompt ──
+                    cached = self._load_cached_voice_prompt(request.voice)
+                    if cached is not None:
+                        # All values must be plain Python types (no Tensor in nested dicts for IPC)
+                        vcp: dict[str, Any] = {
+                            "ref_spk_embedding": cached["ref_spk_embedding"],
+                            "icl_mode": cached["icl_mode"],
+                        }
+                        if cached["ref_code"] is not None:
+                            vcp["ref_code"] = cached["ref_code"]
+                        params["task_type"] = ["Base"]
+                        params["voice_clone_prompt"] = [vcp]
+                        params["x_vector_only_mode"] = [cached["x_vector_only_mode"]]
+                        if cached["ref_text"]:
+                            params["ref_text"] = [cached["ref_text"]]
+                        _uploaded_voice_resolved = True
+                        logger.info(
+                            "Using cached voice_clone_prompt for: %s (icl=%s)",
+                            request.voice,
+                            cached["icl_mode"],
+                        )
                     else:
-                        params["x_vector_only_mode"] = [True]
-                    logger.info(
-                        "Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text)
-                    )
+                        # Cache corrupted: check if raw audio exists before fallback
+                        logger.warning("Cache corrupted for voice %s, attempting fallback", request.voice)
+                        raw_path_str = speaker_info.get("file_path")
+                        if not raw_path_str or not Path(raw_path_str).is_file():
+                            raise ValueError(
+                                f"Cache for voice '{request.voice}' is corrupted "
+                                "and original audio file is also missing. "
+                                f"Delete this voice via DELETE /v1/audio/voices/{request.voice} "
+                                "then re-upload via POST /v1/audio/voices and rebuild cache via "
+                                f"POST /v1/audio/voices/{request.voice}/cache?force=true"
+                            )
+                        self._fallback_to_raw_audio(request.voice, speaker_info, params)
+
+                else:
+                    # ── No cache (pending/failed/processing): raw audio path ──
+                    self._fallback_to_raw_audio(request.voice, speaker_info, params)
 
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice
@@ -1191,22 +1533,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             params["instruct"] = [""]
 
-        # Voice clone: ref_audio resolved in create_speech(), not here.
-        if request.ref_text is not None:
-            params["ref_text"] = [request.ref_text]
-        if request.speaker_embedding is not None:
-            # Store as plain float list (not tensor) so it survives msgspec
-            # serialization through the EngineCore IPC boundary.  The talker's
-            # _build_prompt_embeds converts it back to a tensor on the GPU.
-            params["voice_clone_prompt"] = [
-                {
-                    "ref_spk_embedding": list(request.speaker_embedding),
-                }
-            ]
-            # speaker_embedding implies x_vector_only_mode
-            params["x_vector_only_mode"] = [True]
-        elif request.x_vector_only_mode is not None:
-            params["x_vector_only_mode"] = [request.x_vector_only_mode]
+        # ref_text / x_vector_only_mode / speaker_embedding
+        # Skip when uploaded voice already resolved — prevents request params from
+        # overriding cached ref_text (must match ref_code) and x_vector_only_mode.
+        if not _uploaded_voice_resolved:
+            if request.ref_text is not None:
+                params["ref_text"] = [request.ref_text]
+            if request.speaker_embedding is not None:
+                params["voice_clone_prompt"] = [{"ref_spk_embedding": list(request.speaker_embedding)}]
+                params["x_vector_only_mode"] = [True]
+            elif request.x_vector_only_mode is not None:
+                params["x_vector_only_mode"] = [request.x_vector_only_mode]
 
         # Generation parameters
         if request.max_new_tokens is not None:
