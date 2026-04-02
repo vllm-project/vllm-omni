@@ -24,7 +24,9 @@ dreamid_omni/
 │   ├── models_t5_umt5-xxl-enc-bf16.pth
 │   ├── Wan2.2_VAE.pth
 │
-├── model_index.json # create by download_dreamid_omni.py
+├── model_index.json
+└── transformer/
+    └── config.json   # create by download_dreamid_omni.py
 ```
 
 ### Run the Inference
