@@ -7,7 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import snapshot_download
 
 DEPENDENCY_REPO = "https://github.com/bytedance/DreamID-V.git"
 DEPENDENCY_BRANCH = "omni"
@@ -89,17 +89,13 @@ def main(output_dir: str):
         json.dump(data, f, indent=2)
 
     print(f"model_index.json created at {os.path.join(output_dir, 'model_index.json')}")
-    # Download transformer config for Wan2.2-TI2V-5B from HuggingFace
+    
     transformer_dir = os.path.join(output_dir, "transformer")
     os.makedirs(transformer_dir, exist_ok=True)
+    with open(os.path.join(transformer_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    print(f"transformer/config.json created at {os.path.join(transformer_dir, 'config.json')}")
 
-    print("Downloading transformer/config.json from Wan-AI/Wan2.2-TI2V-5B-Diffusers...")
-    hf_hub_download(
-        repo_id="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        filename="transformer/config.json",
-        local_dir=output_dir,
-        local_dir_use_symlinks=False,
-    )
     # now we download the dependency code
     download_dependency()
 
