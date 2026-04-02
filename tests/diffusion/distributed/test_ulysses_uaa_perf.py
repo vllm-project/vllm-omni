@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch.distributed as dist
-from vllm_omni.utils import hardware_test
+from tests.utils import hardware_test
 
 from vllm_omni.diffusion.attention.parallel.ulysses import (
     _all_gather_int,
