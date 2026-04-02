@@ -26,6 +26,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import (
+    _SHM_TENSOR_THRESHOLD,
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
 )
@@ -687,8 +688,12 @@ class TestEngine:
 
 @pytest.mark.cpu
 class TestIPC:
-    def test_pack_unpack_runner_output_shm(self):
-        tensor = torch.zeros(300_000, dtype=torch.float32)
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_pack_unpack_runner_output_shm(self, dtype):
+        # Use a tensor above the SHM threshold
+        numel = _SHM_TENSOR_THRESHOLD // dtype.itemsize + 1
+        tensor = torch.zeros(numel, dtype=dtype)
+        assert tensor.nelement() * tensor.element_size() > _SHM_TENSOR_THRESHOLD
         output = RunnerOutput(req_id="req-1", finished=True, result=DiffusionOutput(output=tensor))
 
         packed = pack_diffusion_output_shm(output)
@@ -697,7 +702,28 @@ class TestIPC:
 
         unpacked = unpack_diffusion_output_shm(packed)
         assert isinstance(unpacked.result.output, torch.Tensor)
+        assert unpacked.result.output.dtype == dtype
         torch.testing.assert_close(unpacked.result.output, tensor)
+
+    def test_pack_unpack_multidim(self):
+        tensor = torch.randn(1, 3, 512, 512, dtype=torch.bfloat16)
+        assert tensor.nelement() * tensor.element_size() > _SHM_TENSOR_THRESHOLD
+        output = RunnerOutput(req_id="req-2", finished=True, result=DiffusionOutput(output=tensor))
+
+        packed = pack_diffusion_output_shm(output)
+        unpacked = unpack_diffusion_output_shm(packed)
+        assert unpacked.result.output.shape == tensor.shape
+        torch.testing.assert_close(unpacked.result.output, tensor)
+
+    def test_small_tensor_not_packed(self):
+        # Use a tensor below the SHM threshold
+        numel = _SHM_TENSOR_THRESHOLD // torch.float32.itemsize - 1
+        tensor = torch.zeros(numel, dtype=torch.float32)
+        assert tensor.nelement() * tensor.element_size() <= _SHM_TENSOR_THRESHOLD
+        output = RunnerOutput(req_id="req-3", finished=True, result=DiffusionOutput(output=tensor))
+
+        packed = pack_diffusion_output_shm(output)
+        assert isinstance(packed.result.output, torch.Tensor)
 
 
 @pytest.mark.cpu

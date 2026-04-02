@@ -28,20 +28,16 @@ def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
     """
     from multiprocessing import shared_memory
 
-    import numpy as np
-
-    tensor = tensor.detach().cpu().contiguous()
-    arr = tensor.numpy()
-    nbytes = arr.nbytes
+    tensor = tensor.detach().contiguous()
+    nbytes = tensor.nelement() * tensor.element_size()
     shm = shared_memory.SharedMemory(create=True, size=nbytes)
-    shm_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf[:nbytes])
-    np.copyto(shm_arr, arr)
+    shm_tensor = torch.frombuffer(shm.buf, dtype=tensor.dtype, count=tensor.nelement())
+    shm_tensor.reshape(tensor.shape).copy_(tensor)
     handle = {
         "__tensor_shm__": True,
         "name": shm.name,
         "shape": list(tensor.shape),
-        "torch_dtype": str(tensor.dtype),
-        "numpy_dtype": str(arr.dtype),
+        "torch_dtype": tensor.dtype,
         "nbytes": nbytes,
     }
     shm.close()
@@ -52,13 +48,11 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     """Reconstruct a tensor from a shared-memory handle and free the segment."""
     from multiprocessing import shared_memory
 
-    import numpy as np
-
     shm = shared_memory.SharedMemory(name=handle["name"])
     try:
-        np_dtype = np.dtype(handle["numpy_dtype"])
-        arr = np.ndarray(handle["shape"], dtype=np_dtype, buffer=shm.buf[: handle["nbytes"]])
-        tensor = torch.from_numpy(arr.copy())
+        dtype = handle["torch_dtype"]
+        shm_tensor = torch.frombuffer(shm.buf, dtype=dtype, count=handle["nbytes"] // dtype.itemsize)
+        tensor = shm_tensor.clone().reshape(handle["shape"])
     finally:
         shm.close()
         shm.unlink()
