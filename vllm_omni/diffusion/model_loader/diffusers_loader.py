@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Generator, Iterable
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -33,6 +33,9 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.registry import initialize_model
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -332,11 +335,59 @@ class DiffusersPipelineLoader:
             weights_scale_not_loaded = {name for name in weights_not_loaded if name.endswith("weight_scale")}
             weights_not_loaded = weights_not_loaded - weights_scale_not_loaded
             if weights_not_loaded:
-                raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
+                self._check_unloaded_weights(weights_not_loaded)
             if weights_scale_not_loaded:
                 logger.warning(
                     f"Following weight_scale weights were not initialized from checkpoint: {weights_scale_not_loaded}"
                 )
+
+    @staticmethod
+    def _is_expected_quantized_weight(name: str) -> bool:
+        """Return True if *name* is a quantization-specific parameter.
+
+        Quantization methods (GPTQ, AWQ, FP8, GGUF, Autoround, etc.) create extra
+        parameters that have no counterpart in an unquantized checkpoint.
+        These are expected to be absent and should not trigger a load error.
+        """
+        # Weight suffixes that quantization methods register in the model but
+        # are not present in unquantized checkpoints.
+        _QUANTIZED_WEIGHT_SUFFIXES = (
+            # GPTQ / AWQ / AutoRound – g_idx is optional (not all checkpoints include it)
+            ".g_idx",
+            # FP8
+            ".weight_scale",
+            ".weight_scale_inv",
+            ".input_scale",
+            # GGUF
+            ".qweight_type",
+            # INT8  (weight_scale already covered above)
+        )
+        return name.endswith(_QUANTIZED_WEIGHT_SUFFIXES)
+
+    def _check_unloaded_weights(
+        self,
+        weights_not_loaded: set[str],
+    ) -> None:
+        """Validate unloaded weights, tolerating expected quantization artifacts.
+
+        For quantized models, weights matching known quant-specific suffixes
+        are logged as a warning.  Any *other* missing weight raises
+        ``ValueError`` regardless of quantization.
+        """
+        od_config = getattr(self, "od_config", None)
+        if od_config is None or od_config.quantization_config is None:
+            raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
+
+        expected_missing = {w for w in weights_not_loaded if self._is_expected_quantized_weight(w)}
+        unexpected_missing = weights_not_loaded - expected_missing
+
+        if expected_missing:
+            logger.warning(
+                "Following weights were not initialized from checkpoint (expected for quantized models): %s",
+                expected_missing,
+            )
+        if unexpected_missing:
+            raise ValueError(f"Following weights were not initialized from checkpoint: {unexpected_missing}")
 
     def _is_gguf_quantization(self, od_config: OmniDiffusionConfig) -> bool:
         quant_config = od_config.quantization_config
