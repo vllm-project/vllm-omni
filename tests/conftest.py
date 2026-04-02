@@ -2680,7 +2680,7 @@ class OpenAIClientHandler:
 
         return responses
 
-    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[DiffusionResponse]:
         """
         Send OpenAI requests for diffusion models.
 
@@ -2688,9 +2688,9 @@ class OpenAIClientHandler:
             request_config: Request configuration dictionary containing parameters like model, messages
             request_num: Number of requests to send concurrently, defaults to 1 (single request)
         Returns:
-            List[OmniResponse]: List of response objects
+            List[DiffusionResponse]: List of response objects
         """
-        responses = []
+        responses: list[DiffusionResponse] = []
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
         extra_body = request_config.get("extra_body", None)
