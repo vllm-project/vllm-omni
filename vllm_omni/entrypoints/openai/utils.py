@@ -57,7 +57,9 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None
 
 def get_supported_speakers_from_hf_config(hf_config: Any) -> set[str]:
     """Extract supported speaker names from a model hf_config."""
-    config = hf_config.get("talker_config") if isinstance(hf_config, dict) else getattr(hf_config, "talker_config", None)
+    config = (
+        hf_config.get("talker_config") if isinstance(hf_config, dict) else getattr(hf_config, "talker_config", None)
+    )
     if config is None:
         return set()
 

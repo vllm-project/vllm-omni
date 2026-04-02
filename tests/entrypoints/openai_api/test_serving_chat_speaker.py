@@ -108,6 +108,4 @@ def test_create_chat_completion_converts_value_error_to_error_response(serving_c
     result = asyncio.run(serving_chat.create_chat_completion(request))
 
     assert result == "error-response"
-    serving_chat.create_error_response.assert_called_once_with(
-        "Invalid speaker 'uncle_fu'. Supported: ethan, vivian"
-    )
+    serving_chat.create_error_response.assert_called_once_with("Invalid speaker 'uncle_fu'. Supported: ethan, vivian")
