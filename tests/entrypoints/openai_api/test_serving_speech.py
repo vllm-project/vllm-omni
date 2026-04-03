@@ -233,17 +233,20 @@ def test_app(mocker: MockerFixture):
         uploaded_voices = []
         if hasattr(speech_server, "uploaded_speakers"):
             for voice_name, info in speech_server.uploaded_speakers.items():
-                uploaded_voices.append(
-                    {
-                        "name": info.get("name", voice_name),
-                        "consent": info.get("consent", ""),
-                        "created_at": info.get("created_at", 0),
-                        "file_size": info.get("file_size", 0),
-                        "mime_type": info.get("mime_type", ""),
-                        "embedding_source": info.get("embedding_source", "audio"),
-                        "embedding_dim": info.get("embedding_dim"),
-                    }
-                )
+                voice_entry = {
+                    "name": info.get("name", voice_name),
+                    "consent": info.get("consent", ""),
+                    "created_at": info.get("created_at", 0),
+                    "file_size": info.get("file_size", 0),
+                    "mime_type": info.get("mime_type", ""),
+                    "embedding_source": info.get("embedding_source", "audio"),
+                    "embedding_dim": info.get("embedding_dim"),
+                }
+                if info.get("ref_text"):
+                    voice_entry["ref_text"] = info["ref_text"]
+                if info.get("speaker_description"):
+                    voice_entry["speaker_description"] = info["speaker_description"]
+                uploaded_voices.append(voice_entry)
         return {"voices": speakers, "uploaded_voices": uploaded_voices}
 
     app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
@@ -255,7 +258,8 @@ def test_app(mocker: MockerFixture):
         speaker_embedding: str | None = Form(None),
         consent: str = Form(...),
         name: str = Form(...),
-        ref_text: str = Form(None),
+        ref_text: str | None = Form(None),
+        speaker_description: str | None = Form(None),
     ):
         try:
             if speaker_embedding is not None and audio_sample is not None:
@@ -263,7 +267,13 @@ def test_app(mocker: MockerFixture):
             if speaker_embedding is not None:
                 result = await speech_server.upload_voice_embedding(speaker_embedding, consent, name)
             elif audio_sample is not None:
-                result = await speech_server.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+                result = await speech_server.upload_voice(
+                    audio_sample,
+                    consent,
+                    name,
+                    ref_text=ref_text,
+                    speaker_description=speaker_description,
+                )
             else:
                 raise ValueError("Either 'audio_sample' or 'speaker_embedding' must be provided")
             return {"success": True, "voice": result}
@@ -396,6 +406,44 @@ class TestSpeechAPI:
         assert result["voice"]["name"] == "test_voice_rt"
         assert result["voice"].get("ref_text") == "Hello world transcript"
         response = client.delete("/v1/audio/voices/test_voice_rt")
+
+    def test_upload_voice_with_speaker_description(self, client, tmp_path):
+        """Test voice upload with speaker_description stores and returns the description."""
+        # Pre-cleanup in case a previous test run left this voice behind
+        client.delete("/v1/audio/voices/test_voice_vd")
+
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_vd", "speaker_description": "  warm, energetic narrator  "}
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        try:
+            assert response.status_code == 200
+            result = response.json()
+            assert result["success"] is True
+            assert result["voice"]["name"] == "test_voice_vd"
+            assert result["voice"].get("speaker_description") == "warm, energetic narrator"
+        finally:
+            client.delete("/v1/audio/voices/test_voice_vd")
+
+    def test_upload_voice_speaker_description_in_listing(self, client):
+        """Test that speaker_description survives the upload → list round-trip."""
+        client.delete("/v1/audio/voices/test_voice_sd_list")
+
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_sd_list", "speaker_description": "calm female narrator"}
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        try:
+            assert response.status_code == 200
+
+            listing = client.get("/v1/audio/voices").json()
+            uploaded = {v["name"]: v for v in listing["uploaded_voices"]}
+            assert "test_voice_sd_list" in uploaded
+            assert uploaded["test_voice_sd_list"]["speaker_description"] == "calm female narrator"
+        finally:
+            client.delete("/v1/audio/voices/test_voice_sd_list")
 
     def test_upload_voice_file_too_large(self, client):
         """Test voice upload with file exceeding size limit."""
@@ -850,6 +898,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": None,
+                "created_at": 1711234567.89,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -862,6 +911,7 @@ class TestTTSMethods:
             assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
             assert params["x_vector_only_mode"] == [True]
             assert params["task_type"] == ["Base"]
+            assert params["voice_created_at"] == [1711234567.89]
             assert "ref_text" not in params
 
     def test_build_tts_params_with_uploaded_voice_ref_text(self, speech_server):
@@ -872,6 +922,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": "Hello world transcript",
+                "created_at": 1711234567.89,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -885,6 +936,7 @@ class TestTTSMethods:
             assert params["x_vector_only_mode"] == [False]
             assert params["task_type"] == ["Base"]
             assert params["ref_text"] == ["Hello world transcript"]
+            assert params["voice_created_at"] == [1711234567.89]
 
     def test_build_tts_params_without_uploaded_voice(self, speech_server):
         """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""

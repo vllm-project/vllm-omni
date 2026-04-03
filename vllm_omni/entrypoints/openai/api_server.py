@@ -1031,17 +1031,20 @@ async def list_voices(raw_request: Request):
     uploaded_speakers = []
     if hasattr(handler, "uploaded_speakers"):
         for voice_name, info in handler.uploaded_speakers.items():
-            uploaded_speakers.append(
-                {
-                    "name": info.get("name", voice_name),
-                    "consent": info.get("consent", ""),
-                    "created_at": info.get("created_at", 0),
-                    "file_size": info.get("file_size", 0),
-                    "mime_type": info.get("mime_type", ""),
-                    "embedding_source": info.get("embedding_source", "audio"),
-                    "embedding_dim": info.get("embedding_dim"),
-                }
-            )
+            voice_entry = {
+                "name": info.get("name", voice_name),
+                "consent": info.get("consent", ""),
+                "created_at": info.get("created_at", 0),
+                "file_size": info.get("file_size", 0),
+                "mime_type": info.get("mime_type", ""),
+                "embedding_source": info.get("embedding_source", "audio"),
+                "embedding_dim": info.get("embedding_dim"),
+            }
+            if info.get("ref_text"):
+                voice_entry["ref_text"] = info["ref_text"]
+            if info.get("speaker_description"):
+                voice_entry["speaker_description"] = info["speaker_description"]
+            uploaded_speakers.append(voice_entry)
 
     return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
 
@@ -1060,7 +1063,8 @@ async def upload_voice(
     speaker_embedding: str | None = Form(None),
     consent: str = Form(...),
     name: str = Form(...),
-    ref_text: str = Form(None),
+    ref_text: str | None = Form(None),
+    speaker_description: str | None = Form(None),
 ):
     """Upload a new voice for voice cloning.
 
@@ -1079,6 +1083,11 @@ async def upload_voice(
         speaker_embedding: JSON-encoded float list. Mutually exclusive with audio_sample.
         consent: Consent recording ID
         name: Name for the new voice
+        ref_text: Optional transcript of the audio for ICL (in-context
+            learning) mode. When provided, voice clone requests using this
+            voice will produce higher quality results.
+        speaker_description: Optional free-form description of the voice
+            (e.g. "warm speaker", "energetic narrator").
         raw_request: Raw FastAPI request
 
     Returns:
@@ -1096,7 +1105,13 @@ async def upload_voice(
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
-            result = await handler.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+            result = await handler.upload_voice(
+                audio_sample,
+                consent,
+                name,
+                ref_text=ref_text,
+                speaker_description=speaker_description,
+            )
         else:
             return base(raw_request).create_error_response(
                 message="Either 'audio_sample' or 'speaker_embedding' must be provided"
