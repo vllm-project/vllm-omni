@@ -180,9 +180,7 @@ class KVCacheTransferData:
 
         header_len = struct.unpack(">I", raw_mv[:4])[0]
         if header_len > len(raw_mv) - 4:
-            raise ValueError(
-                f"Corrupted KV payload: header_len={header_len} exceeds buffer size={len(raw_mv)}"
-            )
+            raise ValueError(f"Corrupted KV payload: header_len={header_len} exceeds buffer size={len(raw_mv)}")
 
         return json.loads(bytes(raw_mv[4 : 4 + header_len])), raw_mv[4 + header_len :]
 
@@ -197,9 +195,7 @@ class KVCacheTransferData:
 
         header_len = struct.unpack(">I", gpu_tensor[:4].cpu().numpy().tobytes())[0]
         if header_len > total_bytes - 4:
-            raise ValueError(
-                f"Corrupted KV payload: header_len={header_len} exceeds buffer size={total_bytes}"
-            )
+            raise ValueError(f"Corrupted KV payload: header_len={header_len} exceeds buffer size={total_bytes}")
 
         header_bytes = gpu_tensor[4 : 4 + header_len].cpu().numpy().tobytes()
         return json.loads(header_bytes), 4 + header_len
@@ -461,7 +457,9 @@ class OmniKVTransferManager:
         """Get connector (compatibility wrapper for existing code)."""
         return self.connector
 
-    def _resolve_sender_info(self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None) -> dict[str, Any] | None:
+    def _resolve_sender_info(
+        self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None
+    ) -> dict[str, Any] | None:
         if not sender_info:
             return None
 
