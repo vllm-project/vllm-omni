@@ -15,14 +15,14 @@ import time
 import pytest
 import requests
 
-# Disable proxy for local test server requests
-NO_PROXY = {"http": None, "https": None}
-
 from tests.conftest import (
     OmniServer,
     OmniServerParams,
 )
 from tests.utils import hardware_marks
+
+# Disable proxy for local test server requests
+NO_PROXY = {"http": None, "https": None}
 
 MODEL = "Lightricks/LTX-2"
 PROMPT = "A cinematic close-up of ocean waves at golden hour."
@@ -119,9 +119,7 @@ def test_ltx2(
             raise AssertionError(f"Video generation failed: {status_data}")
         time.sleep(VIDEO_POLL_INTERVAL_S)
     else:
-        raise AssertionError(
-            f"Timed out waiting for video generation. Last status: {last_status}"
-        )
+        raise AssertionError(f"Timed out waiting for video generation. Last status: {last_status}")
 
     # Verify download returns a valid MP4
     download_resp = requests.get(
@@ -134,6 +132,4 @@ def test_ltx2(
     assert len(download_resp.content) > 32, (
         f"Downloaded video payload is unexpectedly small: {len(download_resp.content)} bytes"
     )
-    assert download_resp.content[4:8] == b"ftyp", (
-        "Downloaded payload does not look like an MP4 file."
-    )
+    assert download_resp.content[4:8] == b"ftyp", "Downloaded payload does not look like an MP4 file."
