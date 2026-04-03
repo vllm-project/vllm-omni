@@ -16,16 +16,26 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "CUDA Unit Test"
-    timeout_in_minutes: 10
+  - label: "CUDA Unit Test with single card"
     depends_on: upload-ready-pipeline
     commands:
-      - |
-        timeout 10m bash -c "
-                pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' --ignore=tests/e2e
-                pytest -v -s tests/diffusion/distributed/test_ulysses_uaa_perf.py
-                pytest -v -s tests/diffusion/test_diffusion_step_pipeline.py -m 'core_model and cuda and L4'
-        "
+      - timeout 10m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' --ignore=tests/e2e --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "CUDA Unit Test with multi cards"
+    depends_on: upload-ready-pipeline
+    commands:
+      - timeout 10m pytest -v -s tests/diffusion/test_diffusion_step_pipeline.py tests/diffusion/distributed/test_ulysses_uaa_perf.py -m 'core_model and cuda and L4 and distributed_cuda' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
     agents:
       queue: "gpu_4_queue"
     plugins:
