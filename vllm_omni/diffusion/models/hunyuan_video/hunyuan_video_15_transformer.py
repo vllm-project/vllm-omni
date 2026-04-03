@@ -436,6 +436,9 @@ class HunyuanVideo15Attention(nn.Module):
         attn_metadata = None
         ctx = get_forward_context()
         if ctx.sp_active and encoder_hidden_states is not None:
+            # Under Ulysses SP, encoder tokens are passed via joint_*
+            # metadata so they can be head-sliced separately from the
+            # all-to-all'd video tokens in UlyssesParallelAttention.
             attn_metadata = AttentionMetadata(
                 joint_query=encoder_query,
                 joint_key=encoder_key,
@@ -748,10 +751,11 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         encoder_hidden_states = torch.stack(new_encoder_hidden_states)
         encoder_attention_mask = torch.stack(new_encoder_attention_mask)
 
-        # Create explicit attn_mask for image tokens when SP auto_pad is active
-        hidden_states_mask = None
+        # Create explicit attn_mask for image tokens when SP auto_pad is active.
+        # Cache the mask since it is identical across denoising steps.
         ctx = get_forward_context()
-        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        hidden_states_mask = getattr(self, "_cached_sp_mask", None)
+        if hidden_states_mask is None and ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
             padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
             hidden_states_mask = torch.ones(
                 batch_size,
@@ -760,6 +764,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 device=hidden_states.device,
             )
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+            self._cached_sp_mask = hidden_states_mask
 
         for block in self.transformer_blocks:
             hidden_states, encoder_hidden_states = block(
