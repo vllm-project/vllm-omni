@@ -493,7 +493,8 @@ class OmniKVTransferManager:
 
         if candidates:
             logger.warning(
-                "Ambiguous sender_info for sender_stage_id=%s: expected caller to resolve a single sender entry, got %s",
+                "Ambiguous sender_info for sender_stage_id=%s: "
+                "expected caller to resolve a single sender entry, got %s",
                 sender_stage_id,
                 sender_info,
             )
