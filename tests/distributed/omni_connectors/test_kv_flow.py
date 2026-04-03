@@ -1,6 +1,7 @@
 import json
 import struct
 
+import numpy as np
 import pytest
 import torch
 
@@ -202,6 +203,17 @@ def test_update_sender_info_uses_configured_source_stage():
 
     assert manager.config.connector_config["sender_host"] == "10.0.0.2"
     assert manager.config.connector_config["sender_zmq_port"] == 50152
+
+
+def test_clone_received_payload_tensors_breaks_buffer_alias():
+    payload, key_tensor = _make_serialized_payload()
+    raw = np.frombuffer(bytearray(payload), dtype=np.uint8)
+    data = KVCacheTransferData.from_bytes(memoryview(raw))
+
+    OmniKVTransferManager._clone_received_payload_tensors(data)
+    raw[:] = 0
+
+    assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
 
 
 def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_constants):

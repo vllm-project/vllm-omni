@@ -501,6 +501,19 @@ class OmniKVTransferManager:
             )
         return None
 
+    @staticmethod
+    def _clone_received_payload_tensors(data: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(data, dict) or "layer_blocks" not in data:
+            return data
+
+        layer_blocks = data["layer_blocks"]
+        for cache_name in ("key_cache", "value_cache"):
+            cache_list = layer_blocks.get(cache_name, [])
+            for idx, tensor in enumerate(cache_list):
+                if isinstance(tensor, torch.Tensor):
+                    cache_list[idx] = tensor.clone()
+        return data
+
     def update_sender_info(self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None) -> None:
         """Update receiver-side sender info before loading remote KV cache."""
         if not self.config.need_recv_cache:
@@ -817,6 +830,9 @@ class OmniKVTransferManager:
                                 managed_buffer = None
                             else:
                                 data = KVCacheTransferData.from_bytes(memoryview(buf_tensor.numpy()))
+                                data = self._clone_received_payload_tensors(data)
+                                raw_data.release()
+                                managed_buffer = None
                         except Exception as e:
                             logger.error("Failed to deserialize KV cache from ManagedBuffer: %s", e)
                             if managed_buffer is not None:
@@ -841,8 +857,6 @@ class OmniKVTransferManager:
                                         continue
                                     if target_device is not None and tensor.device != target_device:
                                         cache_list[i] = tensor.to(target_device).contiguous()
-                                    elif managed_buffer is not None:
-                                        cache_list[i] = tensor.clone()
                     finally:
                         if managed_buffer is not None:
                             managed_buffer.release()
