@@ -60,7 +60,7 @@ steps:
         BUILDKIT_VERSION="v0.29.0"
         wget -q "https://gh-proxy.test.osinfra.cn/https://github.com/moby/buildkit/releases/download/$${BUILDKIT_VERSION}/buildkit-$${BUILDKIT_VERSION}.linux-arm64.tar.gz" -O /tmp/buildkit.tar.gz
         tar -xzf /tmp/buildkit.tar.gz -C /tmp/buildkit
-        sudo cp /tmp/buildkit/bin/buildctl /usr/local/bin/
+        cp /tmp/buildkit/bin/buildctl /usr/local/bin/
       fi
 
       # 使用 buildctl 构建并推送到 SWR
