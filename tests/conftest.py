@@ -48,6 +48,7 @@ from vllm.utils.network_utils import get_open_port
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -688,8 +689,112 @@ def generate_synthetic_audio(
     return result
 
 
-def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> dict[str, Any]:
-    """Generate synthetic video with bouncing balls and return base64 string."""
+def _mux_mp4_bytes_with_synthetic_audio(
+    video_mp4_bytes: bytes,
+    *,
+    num_frames: int,
+    fps: float = 30.0,
+    sample_rate: int = 48000,
+) -> bytes:
+    """
+    Mux a video-only MP4 with mono TTS audio from :func:`generate_synthetic_audio` (AAC).
+
+    Audio length is at least the video duration in whole seconds (rounded up); ffmpeg
+    ``-shortest`` trims to the video when the WAV is longer.
+
+    Uses ffmpeg from ``imageio_ffmpeg`` when available, else ``ffmpeg`` on PATH.
+    If TTS or mux fails, returns ``video_mp4_bytes`` unchanged.
+
+    Mux subprocess does **not** use ``capture_output=True``: ffmpeg can block writing
+    to a full stderr pipe while :func:`subprocess.run` waits for exit (classic deadlock).
+    """
+    duration_sec = num_frames / fps if fps > 0 else 0.0
+    # generate_synthetic_audio(duration=int) uses at least 1s of buffer internally
+    duration_int = max(1, int(math.ceil(duration_sec)))
+
+    try:
+        audio_result = generate_synthetic_audio(
+            duration=duration_int,
+            num_channels=1,
+            sample_rate=sample_rate,
+            save_to_file=False,
+        )
+        audio_pcm = audio_result["np_array"]
+    except Exception as e:
+        logger.warning("Synthetic video: generate_synthetic_audio failed (%s); using video-only MP4.", e)
+        return video_mp4_bytes
+
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_exe = "ffmpeg"
+
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="syn_vid_mux_") as tmp:
+            vid_path = os.path.join(tmp, "video.mp4")
+            wav_path = os.path.join(tmp, "audio.wav")
+            out_path = os.path.join(tmp, "out.mp4")
+            with open(vid_path, "wb") as f:
+                f.write(video_mp4_bytes)
+            sf.write(wav_path, audio_pcm, sample_rate, format="WAV", subtype="PCM_16")
+            cmd = [
+                ffmpeg_exe,
+                "-y",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                vid_path,
+                "-i",
+                wav_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                out_path,
+            ]
+            subprocess.run(
+                cmd,
+                check=True,
+                stdin=subprocess.DEVNULL,
+                timeout=300,
+            )
+            with open(out_path, "rb") as f:
+                return f.read()
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ) as e:
+        logger.warning("Synthetic video: audio mux failed (%s); using video-only MP4.", e)
+        return video_mp4_bytes
+
+
+def generate_synthetic_video(
+    width: int,
+    height: int,
+    num_frames: int,
+    save_to_file: bool = False,
+    *,
+    embed_audio: bool = False,
+) -> dict[str, Any]:
+    """Generate synthetic video with bouncing balls and base64 MP4.
+
+    When ``embed_audio`` is True, muxes mono AAC from :func:`generate_synthetic_audio`
+    (TTS + ffmpeg) into the MP4; otherwise returns video-only MP4 (faster when tests do
+    not need an audio track).
+    """
 
     import cv2
     import imageio
@@ -762,13 +867,13 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
     result = {
         "np_array": video_array,
     }
-    video_bytes = None
     saved_file_path = None
 
+    fps = 30
     buffer = io.BytesIO()
     writer_kwargs = {
         "format": "mp4",
-        "fps": 30,
+        "fps": fps,
         "codec": "libx264",
         "quality": 7,
         "pixelformat": "yuv420p",
@@ -787,32 +892,31 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
         ],
     }
 
-    if save_to_file:
-        import datetime
-
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"video_{width}x{height}_{timestamp}.mp4"
-        try:
-            with imageio.get_writer(output_path, **writer_kwargs) as writer:
-                for frame in video_frames:
-                    writer.append_data(frame)
-
-            saved_file_path = output_path
-            print(f"Video saved to: {saved_file_path}")
-            with open(output_path, "rb") as f:
-                video_bytes = f.read()
-
-        except Exception as e:
-            print(f"Warning: Failed to save video to file {output_path}: {e}")
-            save_to_file = False
-
-    if not save_to_file or video_bytes is None:
+    try:
         with imageio.get_writer(buffer, **writer_kwargs) as writer:
             for frame in video_frames:
                 writer.append_data(frame)
-
         buffer.seek(0)
-        video_bytes = buffer.read()
+        video_only_bytes = buffer.read()
+    except Exception as e:
+        print(f"Warning: Failed to encode synthetic video: {e}")
+        raise
+
+    if embed_audio:
+        video_bytes = _mux_mp4_bytes_with_synthetic_audio(video_only_bytes, num_frames=num_frames, fps=float(fps))
+    else:
+        video_bytes = video_only_bytes
+
+    if save_to_file:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"video_{width}x{height}_{timestamp}.mp4"
+        try:
+            with open(output_path, "wb") as f:
+                f.write(video_bytes)
+            saved_file_path = output_path
+            print(f"Video saved to: {saved_file_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save video to file {output_path}: {e}")
 
     base64_video = base64.b64encode(video_bytes).decode("utf-8")
 
@@ -962,7 +1066,7 @@ def convert_audio_to_text(audio_data):
     Convert base64 encoded audio data to text using speech recognition.
     """
     audio_data = base64.b64decode(audio_data)
-    output_path = f"./test_{int(time.time())}.wav"
+    output_path = f"./test_{uuid.uuid4().hex}.wav"
     with open(output_path, "wb") as audio_file:
         audio_file.write(audio_data)
 
@@ -986,8 +1090,24 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
-    # Keep Whisper on CPU to avoid consuming GPU memory in tests.
-    model = whisper.load_model("small", device="cpu")
+    # Multi-GPU: use last visible device to avoid colliding with default device 0; single device uses 0.
+    device_index = None
+    if current_omni_platform.is_available():
+        n = current_omni_platform.get_device_count()
+        if n == 1:
+            device_index = 0
+        elif n > 1:
+            device_index = n - 1
+
+    if device_index is not None:
+        torch_device = current_omni_platform.get_torch_device(device_index)
+        current_omni_platform.set_device(torch_device)
+        device = str(torch_device)
+        use_accelerator = True
+    else:
+        use_accelerator = False
+        device = "cpu"
+    model = whisper.load_model("small", device=device)
     try:
         text = model.transcribe(
             output_path,
@@ -998,6 +1118,9 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
     finally:
         del model
         gc.collect()
+        if use_accelerator:
+            current_omni_platform.synchronize()
+            current_omni_platform.empty_cache()
 
     return text or ""
 
@@ -1019,18 +1142,6 @@ def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
     output_path = f"./test_{uuid.uuid4().hex}.wav"
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
-    text = convert_audio_file_to_text(output_path)
-    return text
-
-
-def merge_base64_and_convert_to_text(base64_list):
-    """
-    Merge a list of base64 encoded audio data and convert to text.
-    """
-    merged_audio = _merge_base64_audio_to_segment(base64_list)
-    output_path = f"./test_{uuid.uuid4().hex}.wav"
-    merged_audio.export(output_path, format="wav")
-    print(f"audio data is saved: {output_path}")
     text = convert_audio_file_to_text(output_path)
     return text
 
@@ -1262,10 +1373,12 @@ def modify_stage_config(
                 # Direct top-level key
                 config[key] = value
 
-    # Save to new file with timestamp
-    timestamp = int(time.time())
+    # Unique suffix: multiple modify_stage_config calls in one process often run
+    # within the same second (e.g. test_qwen3_omni_expansion imports both
+    # get_chunk_config and get_batch_token_config). int(time.time()) would collide
+    # and the later write would overwrite the earlier YAML on disk.
     base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
-    output_path = f"{base_name}_{timestamp}.yaml"
+    output_path = f"{base_name}_{time.time_ns()}.yaml"
 
     with open(output_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
@@ -1617,7 +1730,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         label = str(top.get("label", "")).lower()
         conf = float(top.get("score", 0.0))
 
-        if conf < 0.6:
+        if conf < 0.5:
             gender = "unknown"
         # Some models use non-English labels (e.g., Russian). Normalize to 'male'/'female'.
         elif ("female" in label) or ("жен" in label):
@@ -1644,6 +1757,34 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     except Exception as exc:  # pragma: no cover - best-effort fallback
         print(f"Warning: gender classification failed, returning 'unknown': {exc}")
         return "unknown"
+
+
+_PRESET_VOICE_GENDER_MAP: dict[str, str] = {
+    "serena": "female",
+    "uncle_fu": "male",
+    "chelsie": "female",
+    "clone": "female",
+    "ethan": "male",
+}
+
+
+def _assert_preset_voice_gender_from_audio(
+    audio_bytes: bytes | None,
+    voice_name: str | None,
+) -> None:
+    """If ``voice_name`` matches a known preset, assert classifier gender matches (skip when unknown)."""
+    if not voice_name or not audio_bytes:
+        return
+    key = str(voice_name).lower()
+    expected_gender = _PRESET_VOICE_GENDER_MAP.get(key)
+    if expected_gender is None:
+        return
+    estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
+    print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
+    if estimated_gender != "unknown":
+        assert estimated_gender == expected_gender, (
+            f"{voice_name!r} is expected {expected_gender}, but estimated gender is {estimated_gender!r}"
+        )
 
 
 # Threshold aligned with _compute_pcm_hnr_db docstring (clean clone vs distorted).
@@ -1712,6 +1853,12 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
             print(f"audio content is: {response.audio_content}")
+            speaker = request_config.get("speaker")
+            if speaker:
+                _assert_preset_voice_gender_from_audio(
+                    response.audio_bytes,
+                    speaker,
+                )
 
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
@@ -1724,18 +1871,22 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
             keywords = keywords_dict.get(word_type)
             if "text" in modalities:
                 if keywords:
-                    assert any(keyword in response.text_content.lower() for keyword in keywords), (
+                    text_lower = response.text_content.lower()
+                    assert any(str(kw).lower() in text_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
             else:
                 if keywords:
-                    assert any(keyword in response.audio_content.lower() for keyword in keywords), (
+                    audio_lower = response.audio_content.lower()
+                    assert any(str(kw).lower() in audio_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
 
-        # Verify similarity
+        # Verify similarity (Whisper transcript vs streamed/detokenized text)
         if "text" in modalities and "audio" in modalities:
-            assert response.similarity > 0.9, "The audio content is not same as the text"
+            assert response.similarity is not None and response.similarity > 0.9, (
+                "The audio content is not same as the text"
+            )
             print(f"similarity is: {response.similarity}")
 
 
@@ -1781,24 +1932,12 @@ def assert_audio_speech_response(
                 f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
             )
 
-        # Voice gender consistency check:
+        # Voice gender consistency check (preset names in ``_PRESET_VOICE_GENDER_MAP``).
         # When the estimator returns 'unknown', we treat it as inconclusive and do NOT fail the test.
-        voice = (request_config.get("voice") or "").lower()
-        if voice and response.audio_bytes:
-            estimated_gender = _estimate_voice_gender_from_audio(response.audio_bytes)
-            voice_gender_map = {
-                # adjust this mapping to your actual voice names
-                "serena": "female",
-                "uncle_fu": "male",
-                "clone": "female",
-            }
-            expected_gender = voice_gender_map.get(voice)
-            if expected_gender is not None:
-                print(f"Estimated voice gender from audio: {estimated_gender} (voice='{voice}')")
-                if estimated_gender != "unknown":
-                    assert estimated_gender == expected_gender, (
-                        f"Voice '{voice}' is expected {expected_gender}, but estimated gender is '{estimated_gender}'"
-                    )
+        _assert_preset_voice_gender_from_audio(
+            response.audio_bytes,
+            request_config.get("voice"),
+        )
 
 
 def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
@@ -1914,7 +2053,11 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = merge_base64_and_convert_to_text(audio_data)
+                    merged_seg = _merge_base64_audio_to_segment(audio_data)
+                    wav_buf = BytesIO()
+                    merged_seg.export(wav_buf, format="wav")
+                    result.audio_bytes = wav_buf.getvalue()
+                    audio_content = convert_audio_bytes_to_text(result.audio_bytes)
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
@@ -1969,7 +2112,8 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = convert_audio_to_text(audio_data)
+                    result.audio_bytes = base64.b64decode(audio_data)
+                    audio_content = convert_audio_bytes_to_text(result.audio_bytes)
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
@@ -2135,7 +2279,12 @@ class OpenAIClientHandler:
         Send OpenAI requests.
 
         Args:
-            request_config: Request configuration dictionary containing parameters like model, messages, stream
+            request_config: Request configuration dictionary containing parameters like model, messages, stream.
+                Optional ``use_audio_in_video`` (bool): when true, sets
+                ``extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}`` for Qwen-Omni video+audio
+                extraction.
+                Optional top-level ``speaker`` (str): Qwen3-Omni preset TTS speaker name; sent as
+                ``extra_body["speaker"]`` to ``chat.completions.create``.
             request_num: Number of requests, defaults to 1 (single request)
 
         Returns:
@@ -2146,14 +2295,27 @@ class OpenAIClientHandler:
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
 
+        extra_body: dict[str, Any] = {}
+        if "speaker" in request_config:
+            extra_body["speaker"] = request_config["speaker"]
+        if request_config.get("use_audio_in_video"):
+            mm = dict(extra_body.get("mm_processor_kwargs") or {})
+            mm["use_audio_in_video"] = True
+            extra_body["mm_processor_kwargs"] = mm
+        extra_body_arg: dict[str, Any] | None = extra_body if extra_body else None
+
+        create_kwargs: dict[str, Any] = {
+            "model": request_config.get("model"),
+            "messages": request_config.get("messages"),
+            "stream": stream,
+            "modalities": modalities,
+        }
+        if extra_body_arg is not None:
+            create_kwargs["extra_body"] = extra_body_arg
+
         if request_num == 1:
             # Send single request
-            chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"),
-                messages=request_config.get("messages"),
-                stream=stream,
-                modalities=modalities,
-            )
+            chat_completion = self.client.chat.completions.create(**create_kwargs)
 
             if stream:
                 response = self._process_stream_omni_response(chat_completion)
@@ -2167,12 +2329,15 @@ class OpenAIClientHandler:
             # Send concurrent requests: run create + process in worker so e2e_latency includes full round-trip.
             def _one_omni_request():
                 start = time.perf_counter()
-                chat_completion = self.client.chat.completions.create(
-                    model=request_config.get("model"),
-                    messages=request_config.get("messages"),
-                    modalities=modalities,
-                    stream=stream,
-                )
+                worker_kwargs: dict[str, Any] = {
+                    "model": request_config.get("model"),
+                    "messages": request_config.get("messages"),
+                    "modalities": modalities,
+                    "stream": stream,
+                }
+                if extra_body_arg is not None:
+                    worker_kwargs["extra_body"] = extra_body_arg
+                chat_completion = self.client.chat.completions.create(**worker_kwargs)
                 if stream:
                     response = self._process_stream_omni_response(chat_completion)
                 else:

@@ -36,6 +36,45 @@ cd examples/online_serving/qwen3_omni
 python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --query-type use_image --port 8091 --host "localhost"
 ```
 
+#### Realtime WebSocket client (`openai_realtime_client.py`)
+
+[`openai_realtime_client.py`](./openai_realtime_client.py) connects to **`ws://<host>:<port>/v1/realtime`**, uploads a local audio file as **PCM16 mono @ 16 kHz** chunks (OpenAI-style `input_audio_buffer.append` / `commit`), and prints **streaming transcription** (`transcription.delta` / `transcription.done`).
+
+**Dependencies:**
+
+```bash
+pip install websockets librosa numpy
+```
+
+(ffmpeg may be required by `librosa` for some formats; see the FAQ below.)
+
+**From this directory** (`examples/online_serving/qwen3_omni`):
+
+```bash
+python openai_realtime_client.py \
+  --host localhost \
+  --port 8091 \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --audio_path /path/to/your.wav
+```
+
+If `--audio_path` is omitted, the script uses a bundled default clip (`mary_had_lamb` via vLLM assets).
+
+**Arguments:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `localhost` | API server host |
+| `--port` | `8000` | API server port (match your `vllm serve` port, e.g. `8091`) |
+| `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (also sent in `session.update`) |
+| `--audio_path` | *(optional)* | Path to input audio; resampled to 16 kHz mono inside the client |
+
+Ensure the vLLM-Omni server is running with realtime support for this endpoint, for example:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
 The Python client supports the following command-line arguments:
 
 - `--query-type` (or `-q`): Query type (default: `use_video`). Options: `text`, `use_audio`, `use_image`, `use_video`

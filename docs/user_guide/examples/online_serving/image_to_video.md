@@ -37,11 +37,44 @@ artifact, poll the job status and then download the completed file from the
 content endpoint.
 
 The main endpoints are:
-- `POST /v1/videos`: create a video generation job
+- `POST /v1/videos`: create a video generation job (async)
+- `POST /v1/videos/sync`: generate a video and return raw bytes (sync, for benchmarks)
 - `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
 - `GET /v1/videos`: list stored video jobs
 - `GET /v1/videos/{video_id}/content`: download the generated video file
 - `DELETE /v1/videos/{video_id}`: delete the job and any stored output
+
+## Sync API (Benchmark / Testing)
+
+`POST /v1/videos/sync` is a synchronous alternative that blocks until generation
+completes and returns the raw video bytes (`video/mp4`) directly in the response
+body. It is designed for benchmark and testing scenarios where one-shot
+request/response latency measurement is needed.
+
+The sync endpoint accepts the same form parameters as `POST /v1/videos`. It does
+not create any stored job record — the response is purely the generated video
+file. Metadata is returned via response headers:
+
+- `X-Request-Id`: unique identifier for this generation request
+- `X-Model`: model name used for generation
+- `X-Inference-Time-S`: wall-clock inference time in seconds
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A bear playing with yarn, smooth motion" \
+  -F "input_reference=@/path/to/input.png" \
+  -F "size=832x480" \
+  -F "num_frames=33" \
+  -F "fps=16" \
+  -F "negative_prompt=low quality, blurry, static" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=1.0" \
+  -F "guidance_scale_2=1.0" \
+  -F "boundary_ratio=0.875" \
+  -F "flow_shift=12.0" \
+  -F "seed=42" \
+  -o sync_i2v_output.mp4
+```
 
 ## Storage
 
