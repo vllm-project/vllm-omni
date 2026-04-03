@@ -7,6 +7,12 @@ import queue
 import threading
 import time
 from collections.abc import Iterable
+from concurrent.futures import (
+    Future,
+    InvalidStateError,
+    TimeoutError as FutureTimeoutError,
+)
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -61,8 +67,56 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+@dataclass(slots=True)
+class _AddRequestCmd:
+    """Command payload for a newly submitted diffusion request.
+
+    External threads never mutate scheduler state directly. They submit the
+    request plus a reply future to the queue, and the dedicated core loop
+    thread becomes the sole owner of request lifecycle transitions.
+    """
+
+    request: OmniDiffusionRequest
+    future: Future[DiffusionOutput]
+
+
+@dataclass(slots=True)
+class _AbortCmd:
+    """Command payload for aborting one or more public request ids."""
+
+    request_ids: list[str]
+
+
+@dataclass(slots=True)
+class _RpcCmd:
+    """Command payload for an executor collective RPC."""
+
+    method: str
+    timeout: float | None
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    unique_reply_rank: int | None
+    future: Future[Any]
+
+
+@dataclass(slots=True)
+class _ShutdownCmd:
+    """Command telling the core loop to reject new work and exit quickly."""
+
+
+_DiffusionCmd = _AddRequestCmd | _AbortCmd | _RpcCmd | _ShutdownCmd
+
+
 class DiffusionEngine:
-    """The diffusion engine for vLLM-Omni diffusion models."""
+    """Diffusion engine for vLLM-Omni diffusion models.
+
+    Scheduler coordination is owned by a dedicated in-process core loop thread.
+    Caller threads only enqueue commands and wait on futures, which removes the
+    old caller-driven busy loop and the global RPC lock.
+    """
+
+    CORE_READY_TIMEOUT_S = 30.0
+    CORE_THREAD_JOIN_TIMEOUT_S = 10.0
 
     def __init__(
         self,
@@ -72,7 +126,8 @@ class DiffusionEngine:
         """Initialize the diffusion engine.
 
         Args:
-            config: The configuration for the diffusion engine.
+            od_config: The configuration for the diffusion engine.
+            scheduler: Optional scheduler implementation to install.
         """
         self.od_config = od_config
 
@@ -86,11 +141,12 @@ class DiffusionEngine:
             StepScheduler() if self.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
-        self._rpc_lock = threading.RLock()
-        self.abort_queue: queue.Queue[str] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
+        self._start_core_thread()
+
         try:
+            self._wait_for_core_ready()
             self._dummy_run()
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
@@ -98,20 +154,309 @@ class DiffusionEngine:
             raise e
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+        """Run one synchronous diffusion request end to end."""
         diffusion_engine_start_time = time.perf_counter()
+        request, preprocess_time = self._prepare_step_request(request)
 
-        # Apply pre-processing if available
+        exec_start_time = time.perf_counter()
+        output = self.add_req_and_wait_for_response(request)
+        exec_total_time = time.perf_counter() - exec_start_time
+
+        return self._materialize_step_outputs(
+            request=request,
+            output=output,
+            preprocess_time=preprocess_time,
+            exec_total_time=exec_total_time,
+            diffusion_engine_start_time=diffusion_engine_start_time,
+        )
+
+    @staticmethod
+    def make_engine(
+        config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ) -> DiffusionEngine:
+        """Factory method to create a DiffusionEngine instance.
+
+        Args:
+            config: The configuration for the diffusion engine.
+
+        Returns:
+            An instance of DiffusionEngine.
+        """
+        return DiffusionEngine(config, scheduler=scheduler)
+
+    def submit_request(self, request: OmniDiffusionRequest) -> Future[DiffusionOutput]:
+        """Submit a diffusion request to the queue-backed core loop.
+
+        Args:
+            request: The fully prepared diffusion request to schedule.
+
+        Returns:
+            A future that resolves to the terminal ``DiffusionOutput``.
+
+        Notes:
+            The latched core-loop error is checked before the shutdown flag so
+            new callers observe the original crash reason instead of a generic
+            closed error whenever the owner thread exits unexpectedly.
+        """
+        future: Future[DiffusionOutput] = Future()
+        if self._core_loop_error is not None:
+            future.set_exception(self._clone_exception(self._core_loop_error))
+            return future
+        if self._shutdown_requested.is_set():
+            future.set_exception(RuntimeError("DiffusionEngine is closed."))
+            return future
+
+        self._cmd_queue.put(_AddRequestCmd(request=request, future=future))
+        self._fail_submitted_future_if_owner_gone(future)
+        return future
+
+    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        """Synchronously submit a request and wait for its final result."""
+        return self.submit_request(request).result()
+
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        """Start or stop torch profiling on all diffusion workers.
+
+        Args:
+            is_start: True to start profiling, False to stop.
+            profile_prefix: Optional prefix for trace filename (vLLM compat).
+
+        Note:
+            Matches vLLM's worker.profile() signature for consistency.
+            Traces are saved automatically via on_trace_ready callback.
+        """
+        if is_start:
+            if profile_prefix is None:
+                profile_prefix = f"diffusion_{int(time.time())}"
+            logger.info(f"Starting diffusion profiling with prefix: {profile_prefix}")
+        else:
+            logger.info("Stopping diffusion profiling...")
+
+        try:
+            self.collective_rpc(method="profile", args=(is_start, profile_prefix))
+        except Exception as e:
+            action = "start" if is_start else "stop"
+            logger.error(f"Failed to {action} profiling on workers", exc_info=True)
+            if is_start:
+                raise RuntimeError(f"Could not {action} profiler: {e}") from e
+
+    def _dummy_run(self):
+        """A dummy run to warm up the model."""
+        num_inference_steps = 1
+        height = 1024
+        width = 1024
+        if supports_image_input(self.od_config.model_class_name):
+            # Provide a dummy image input if the model supports it
+            color_format = image_color_format(self.od_config.model_class_name)
+            dummy_image = PIL.Image.new(color_format, (width, height))
+        else:
+            dummy_image = None
+
+        if supports_audio_input(self.od_config.model_class_name):
+            audio_sr = 16000
+            audio_duration_sec = 4
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+        else:
+            dummy_audio = None
+
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
+        }
+        req = OmniDiffusionRequest(
+            prompts=[prompt],
+            request_ids=["dummy_req_id"],
+            sampling_params=OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                # Keep warmup path minimal and robust across text encoders.
+                # Some models may fail when warmup implicitly triggers
+                # classifier-free guidance with an empty negative prompt.
+                guidance_scale=0.0,
+                num_outputs_per_prompt=1,
+                # Disable CFG for warmup to avoid triggering CFG parallel
+                # validation when cfg_parallel_size > 1.
+                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+            ),
+        )
+        logger.info("dummy run to warm up the model")
+        request, _ = self._prepare_step_request(req)
+        output = self.add_req_and_wait_for_response(request)
+        if output.error:
+            raise RuntimeError(f"Dummy run failed: {output.error}")
+
+    def submit_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Future[Any]:
+        """Submit an executor collective RPC to the core loop."""
+        assert isinstance(method, str), "Only string method names are supported for now"
+
+        future: Future[Any] = Future()
+        if self._core_loop_error is not None:
+            future.set_exception(self._clone_exception(self._core_loop_error))
+            return future
+        if self._shutdown_requested.is_set():
+            future.set_exception(RuntimeError("DiffusionEngine is closed."))
+            return future
+
+        self._cmd_queue.put(
+            _RpcCmd(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs or {},
+                unique_reply_rank=unique_reply_rank,
+                future=future,
+            )
+        )
+        self._fail_submitted_future_if_owner_gone(future)
+        return future
+
+    def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Call a method on worker processes and wait for the result."""
+        future = self.submit_rpc(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            unique_reply_rank=unique_reply_rank,
+        )
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(f"RPC call to {method} timed out.") from exc
+
+    def close(self) -> None:
+        """Stop the core loop and best-effort release engine resources.
+
+        Shutdown is intentionally fail-fast. The owner thread is asked to exit,
+        then joined for a bounded amount of time. If it cannot make progress
+        quickly enough, ``close()`` forcefully fails still-pending futures so
+        blocked callers do not hang forever behind a stuck executor call.
+        """
+        failure = RuntimeError("DiffusionEngine is closed.")
+
+        shutdown_requested = getattr(self, "_shutdown_requested", None)
+        if shutdown_requested is not None:
+            shutdown_requested.set()
+
+        cmd_queue = getattr(self, "_cmd_queue", None)
+        if cmd_queue is not None:
+            try:
+                cmd_queue.put_nowait(_ShutdownCmd())
+            except Exception:
+                pass
+
+        core_thread = getattr(self, "_core_thread", None)
+        if core_thread is not None and core_thread.is_alive():
+            core_thread.join(timeout=self.CORE_THREAD_JOIN_TIMEOUT_S)
+            if core_thread.is_alive():
+                logger.warning(
+                    "DiffusionEngine core thread did not exit within %.1f seconds.",
+                    self.CORE_THREAD_JOIN_TIMEOUT_S,
+                )
+                # The owner thread is still blocked, so perform a last-resort
+                # cleanup from the caller thread to wake blocked submitters.
+                self._fail_pending_futures(failure)
+                self._fail_queued_command_futures(failure)
+            else:
+                # The core thread already ran its own finally block, but a new
+                # submitter may still have raced with shutdown after that
+                # cleanup completed. Sweep the queue one last time.
+                self._fail_queued_command_futures(self._owner_unavailable_error())
+        elif core_thread is not None:
+            self._fail_queued_command_futures(self._owner_unavailable_error())
+        elif core_thread is None:
+            # Tests may construct a partially initialized engine without the core loop.
+            self._best_effort_shutdown_components()
+
+    def abort(self, request_id: str | Iterable[str]) -> None:
+        """Request abortion of one or more public request ids."""
+        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+        if not request_ids:
+            return
+        self._cmd_queue.put(_AbortCmd(request_ids=request_ids))
+
+    def _start_core_thread(self) -> None:
+        """Allocate core-loop state and start the owner thread.
+
+        ``_pending_futures`` belongs to the core loop logically, but
+        ``close()`` may perform a last-resort cleanup if the owner thread is
+        stuck and cannot service shutdown in time.
+        """
+        self._cmd_queue: queue.Queue[_DiffusionCmd] = queue.Queue()
+        self._pending_futures: dict[str, Future[DiffusionOutput]] = {}
+        self._shutdown_requested = threading.Event()
+        self._core_ready = threading.Event()
+        self._core_loop_error: RuntimeError | None = None
+        self._core_stopping = False
+        self._in_step_execution = False
+        self._core_thread = threading.Thread(
+            target=self._run_core_loop,
+            name="DiffusionEngineCore",
+            daemon=True,
+        )
+        self._core_thread.start()
+
+    def _wait_for_core_ready(self) -> None:
+        """Wait until the owner thread is ready to consume commands.
+
+        Raises:
+            RuntimeError: If the core thread does not reach its ready point
+                before the initialization timeout expires.
+        """
+        if self._core_ready.wait(timeout=self.CORE_READY_TIMEOUT_S):
+            return
+        raise RuntimeError(
+            f"DiffusionEngine core loop did not become ready within {self.CORE_READY_TIMEOUT_S:.1f}s."
+        )
+
+    def _prepare_step_request(
+        self,
+        request: OmniDiffusionRequest,
+    ) -> tuple[OmniDiffusionRequest, float]:
+        """Apply optional preprocessing before the request enters scheduling."""
         preprocess_time = 0.0
         if self.pre_process_func is not None:
             preprocess_start_time = time.perf_counter()
             request = self.pre_process_func(request)
             preprocess_time = time.perf_counter() - preprocess_start_time
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+        return request, preprocess_time
 
-        exec_start_time = time.perf_counter()
-        output = self.add_req_and_wait_for_response(request)
-        exec_total_time = time.perf_counter() - exec_start_time
+    def _materialize_step_outputs(
+        self,
+        request: OmniDiffusionRequest,
+        output: DiffusionOutput,
+        preprocess_time: float,
+        exec_total_time: float,
+        diffusion_engine_start_time: float,
+    ) -> list[OmniRequestOutput]:
+        """Convert a terminal output into ``OmniRequestOutput`` objects.
 
+        Notes:
+            This helper intentionally preserves the existing ``step()`` behavior,
+            including current metrics keys, CPU offload semantics, warmup
+            behavior, and output assembly logic. The core-loop refactor only
+            changes request coordination, not user-visible diffusion output
+            formatting.
+        """
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
@@ -276,218 +621,380 @@ class DiffusionEngine:
 
             return results
 
-    @staticmethod
-    def make_engine(
-        config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ) -> DiffusionEngine:
-        """Factory method to create a DiffusionEngine instance.
+    def _run_core_loop(self) -> None:
+        """Run the dedicated owner loop for scheduler and executor coordination.
 
-        Args:
-            config: The configuration for the diffusion engine.
+        The loop alternates between two modes:
+        - idle: block on the command queue until new work arrives
+        - active: drain commands, run one scheduler/execute/update cycle, repeat
 
-        Returns:
-            An instance of DiffusionEngine.
+        Any unexpected exception is latched and converted into failures for all
+        pending futures so no caller can remain blocked forever.
         """
-        return DiffusionEngine(config, scheduler=scheduler)
-
-    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        with self._rpc_lock:
-            target_sched_req_id = self.scheduler.add_request(request)
-
-            # keep scheduling and executing until the target request is finished
-            while True:
-                self._process_aborts_queue()
-                sched_output = self.scheduler.schedule()
-                if sched_output.is_empty:
-                    if target_sched_req_id in sched_output.finished_req_ids:
-                        return self._finalize_finished_request(target_sched_req_id)
-                    if not self.scheduler.has_requests():
-                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
+        self._core_ready.set()
+        try:
+            while not self._core_stopping:
+                if self.scheduler.has_requests():
+                    # Keep ingesting external commands while there is runnable
+                    # scheduler state. This allows new requests, aborts and RPCs
+                    # to arrive concurrently with long-running worker execution.
+                    self._drain_commands(block=False)
+                    if not self._core_stopping and self.scheduler.has_requests():
+                        self._step_engine_once()
                     continue
 
-                # NOTE: add_req_and_wait_for_response() is synchronous, and
-                # the scheduler currently enforces _max_batch_size = 1 (see
-                # vllm_omni/diffusion/sched/base_scheduler.py), so we directly
-                # take the single scheduled request here.
-                sched_req_id = sched_output.scheduled_req_ids[0]
-                try:
-                    runner_output = self.execute_fn(sched_output)
-                except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
-                    runner_output = RunnerOutput(
-                        req_id=sched_req_id,
-                        step_index=None,
-                        finished=True,
-                        result=DiffusionOutput(error=str(exc)),
-                    )
-
-                self._process_aborts_queue()
-
-                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-                if target_sched_req_id in finished_req_ids:
-                    return self._finalize_finished_request(
-                        target_sched_req_id,
-                        runner_output=runner_output,
-                        missing_result_error="Diffusion execution finished without a final output.",
-                    )
-
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
-        """Start or stop torch profiling on all diffusion workers.
-
-        Args:
-            is_start: True to start profiling, False to stop.
-            profile_prefix: Optional prefix for trace filename (vLLM compat).
-
-        Note:
-            Matches vLLM's worker.profile() signature for consistency.
-            Traces are saved automatically via on_trace_ready callback.
-        """
-        if is_start:
-            if profile_prefix is None:
-                profile_prefix = f"diffusion_{int(time.time())}"
-            logger.info(f"Starting diffusion profiling with prefix: {profile_prefix}")
-        else:
-            logger.info("Stopping diffusion profiling...")
-
-        try:
-            self.collective_rpc(method="profile", args=(is_start, profile_prefix))
-        except Exception as e:
-            action = "start" if is_start else "stop"
-            logger.error(f"Failed to {action} profiling on workers", exc_info=True)
-            if is_start:
-                raise RuntimeError(f"Could not {action} profiler: {e}") from e
-
-    def _dummy_run(self):
-        """A dummy run to warm up the model."""
-        num_inference_steps = 1
-        height = 1024
-        width = 1024
-        if supports_image_input(self.od_config.model_class_name):
-            # Provide a dummy image input if the model supports it
-            color_format = image_color_format(self.od_config.model_class_name)
-            dummy_image = PIL.Image.new(color_format, (width, height))
-        else:
-            dummy_image = None
-
-        if supports_audio_input(self.od_config.model_class_name):
-            audio_sr = 16000
-            audio_duration_sec = 4
-            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
-            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
-        else:
-            dummy_audio = None
-
-        prompt: OmniTextPrompt = {
-            "prompt": "dummy run",
-            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
-        }
-        req = OmniDiffusionRequest(
-            prompts=[prompt],
-            request_ids=["dummy_req_id"],
-            sampling_params=OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                # Keep warmup path minimal and robust across text encoders.
-                # Some models may fail when warmup implicitly triggers
-                # classifier-free guidance with an empty negative prompt.
-                guidance_scale=0.0,
-                num_outputs_per_prompt=1,
-                # Disable CFG for warmup to avoid triggering CFG parallel
-                # validation when cfg_parallel_size > 1.
-                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-            ),
-        )
-        logger.info("dummy run to warm up the model")
-        request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
-        if output.error:
-            raise RuntimeError(f"Dummy run failed: {output.error}")
-
-    def collective_rpc(
-        self,
-        method: str,
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict | None = None,
-        unique_reply_rank: int | None = None,
-    ) -> Any:
-        """Call a method on worker processes and get results immediately.
-
-        Args:
-            method: The method name (str) to execute on workers
-            timeout: Optional timeout in seconds
-            args: Positional arguments for the method
-            kwargs: Keyword arguments for the method
-            unique_reply_rank: If set, only get reply from this rank
-
-        Returns:
-            Single result if unique_reply_rank is provided, otherwise list of results
-        """
-        assert isinstance(method, str), "Only string method names are supported for now"
-
-        deadline = None if timeout is None else time.monotonic() + timeout
-        acquired = False
-        try:
-            if deadline is None:
-                self._rpc_lock.acquire()
-                acquired = True
-            else:
-                lock_timeout = max(0, deadline - time.monotonic())
-                acquired = self._rpc_lock.acquire(timeout=lock_timeout)
-            if not acquired:
-                raise TimeoutError(f"RPC call to {method} timed out waiting for engine lock.")
-
-            rpc_timeout = None if deadline is None else max(0, deadline - time.monotonic())
-            if deadline is not None and rpc_timeout <= 0:
-                raise TimeoutError(f"RPC call to {method} timed out.")
-
-            return self.executor.collective_rpc(
-                method=method,
-                timeout=rpc_timeout,
-                args=args,
-                kwargs=kwargs,
-                unique_reply_rank=unique_reply_rank,
+                # When there is no unfinished request we park on the queue,
+                # which removes the old busy-wait behavior entirely.
+                self._drain_commands(block=True)
+        except BaseException as exc:
+            logger.error("DiffusionEngine core loop crashed.", exc_info=True)
+            self._core_loop_error = RuntimeError(
+                f"DiffusionEngine core loop exited unexpectedly: {exc}"
             )
+            self._shutdown_requested.set()
         finally:
-            if acquired:
-                self._rpc_lock.release()
+            # The thread may crash before a submitter gets past the constructor's
+            # wait. Setting the event again here guarantees the waiter is
+            # released even on a startup failure path.
+            self._core_ready.set()
+            if self._core_loop_error is not None:
+                failure = self._clone_exception(self._core_loop_error)
+            elif self._shutdown_requested.is_set():
+                failure = RuntimeError("DiffusionEngine is closed.")
+            else:
+                failure = RuntimeError("DiffusionEngine core loop exited unexpectedly.")
+            self._fail_pending_futures(failure)
+            self._fail_queued_command_futures(failure)
+            self._best_effort_shutdown_components()
 
-    def close(self) -> None:
-        if hasattr(self, "scheduler"):
-            self.scheduler.close()
-        if hasattr(self, "executor"):
-            self.executor.shutdown()
+    def _drain_commands(self, block: bool) -> None:
+        """Drain queued commands on the owner thread.
 
-    def abort(self, request_id: str | Iterable[str]) -> None:
-        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
-        for req_id in request_ids:
-            self.abort_queue.put(req_id)
+        Args:
+            block: If ``True``, wait for at least one command before returning.
+                Otherwise only process commands that are already queued.
+        """
+        should_block = block
+        while not self._core_stopping:
+            try:
+                cmd = self._cmd_queue.get() if should_block else self._cmd_queue.get_nowait()
+            except queue.Empty:
+                return
 
-    def _process_aborts_queue(self) -> None:
-        if self.abort_queue.empty():
+            should_block = False
+            self._handle_command(cmd)
+
+    def _handle_command(self, cmd: _DiffusionCmd) -> None:
+        """Dispatch one command on the owner thread."""
+        if isinstance(cmd, _AddRequestCmd):
+            self._handle_add_request_command(cmd)
+            return
+        if isinstance(cmd, _AbortCmd):
+            self._handle_abort_command(cmd)
+            return
+        if isinstance(cmd, _RpcCmd):
+            self._handle_rpc_command(cmd)
+            return
+        if isinstance(cmd, _ShutdownCmd):
+            self._handle_shutdown_command()
+            return
+        raise TypeError(f"Unsupported diffusion command: {type(cmd)!r}")
+
+    def _handle_add_request_command(self, cmd: _AddRequestCmd) -> None:
+        """Register a newly submitted request with the scheduler."""
+        if cmd.future.cancelled():
+            return
+        if self._core_loop_error is not None:
+            self._try_set_future_exception(cmd.future, self._clone_exception(self._core_loop_error))
+            return
+        if self._shutdown_requested.is_set():
+            self._try_set_future_exception(cmd.future, RuntimeError("DiffusionEngine is closed."))
             return
 
-        request_ids: list[str] = []
-        while not self.abort_queue.empty():
-            ids = self.abort_queue.get_nowait()
-            request_ids.extend((ids,) if isinstance(ids, str) else ids)
+        try:
+            sched_req_id = self.scheduler.add_request(cmd.request)
+        except Exception as exc:
+            self._try_set_future_exception(cmd.future, exc)
+            return
+        except BaseException as exc:
+            self._try_set_future_exception(
+                cmd.future,
+                RuntimeError(f"Diffusion scheduler add_request failed: {exc}"),
+            )
+            raise
 
-        self._abort_requests(request_ids)
+        # Future ownership starts here and stays on the core thread until the
+        # request reaches a terminal state, unless close() must force cleanup.
+        self._pending_futures[sched_req_id] = cmd.future
 
-    def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
-        request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+    def _handle_abort_command(self, cmd: _AbortCmd) -> None:
+        """Abort queued or running requests by public request id.
+
+        Waiting requests can be resolved immediately because they have not been
+        handed to the executor yet. Running requests rely on the second command
+        drain inside ``_step_engine_once()`` so the aborted state is visible
+        before ``scheduler.update_from_output()`` finalizes the runner output.
+        """
+        waiting_req_ids: list[str] = []
 
         sched_req_ids: list[str] = []
-        for request_id in dict.fromkeys(request_ids):
+        for request_id in dict.fromkeys(cmd.request_ids):
             sched_req_id = self.scheduler.get_sched_req_id(request_id)
             if sched_req_id is not None:
                 sched_req_ids.append(sched_req_id)
 
         for sched_req_id in dict.fromkeys(sched_req_ids):
-            if self.scheduler.get_request_state(sched_req_id) is not None:
-                self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+            state = self.scheduler.get_request_state(sched_req_id)
+            if state is None or state.is_finished():
+                continue
+
+            was_waiting = state.status != DiffusionRequestStatus.RUNNING
+            self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+            if was_waiting:
+                waiting_req_ids.append(sched_req_id)
+
+        for sched_req_id in waiting_req_ids:
+            self._resolve_finished_request(sched_req_id, runner_output=None)
+
+    def _handle_rpc_command(self, cmd: _RpcCmd) -> None:
+        """Execute a worker RPC if the caller is still waiting for it.
+
+        Notes:
+            ``Future.set_running_or_notify_cancel()`` is the key queue-based
+            replacement for the old engine-lock timeout semantics. If a
+            timed-out caller already cancelled the future, the RPC is skipped
+            entirely.
+        """
+        if cmd.future.cancelled():
+            return
+        if self._core_loop_error is not None:
+            self._try_set_future_exception(cmd.future, self._clone_exception(self._core_loop_error))
+            return
+        if self._shutdown_requested.is_set():
+            self._try_set_future_exception(cmd.future, RuntimeError("DiffusionEngine is closed."))
+            return
+        if not cmd.future.set_running_or_notify_cancel():
+            return
+
+        try:
+            result = self.executor.collective_rpc(
+                method=cmd.method,
+                timeout=cmd.timeout,
+                args=cmd.args,
+                kwargs=cmd.kwargs,
+                unique_reply_rank=cmd.unique_reply_rank,
+            )
+        except Exception as exc:
+            self._try_set_future_exception(cmd.future, exc)
+            return
+        except BaseException as exc:
+            self._try_set_future_exception(
+                cmd.future,
+                RuntimeError(f"DiffusionEngine RPC {cmd.method!r} failed: {exc}"),
+            )
+            raise
+
+        self._try_set_future_result(cmd.future, result)
+
+    def _handle_shutdown_command(self) -> None:
+        """Mark the engine closed and begin fast shutdown.
+
+        Shutdown remains fail-fast, but if the command is observed from the
+        second command drain inside ``_step_engine_once()``, we defer failing
+        request futures until the current runner output has been folded back
+        into scheduler state. This avoids discarding a result that is already
+        available on the CPU while still rejecting all remaining work.
+        """
+        self._shutdown_requested.set()
+        self._core_stopping = True
+
+        failure = RuntimeError("DiffusionEngine is closed.")
+        # If shutdown arrives from the second drain inside _step_engine_once(),
+        # keep pending request futures intact for a moment so the already
+        # returned runner output can still resolve whatever finished work is
+        # recoverable. Any leftover futures are then failed by
+        # _run_core_loop()'s finally block during teardown.
+        if not self._in_step_execution:
+            self._fail_pending_futures(failure)
+        self._fail_queued_command_futures(failure)
+
+    def _step_engine_once(self) -> None:
+        """Run one scheduler/execute/update cycle on the owner thread.
+
+        The order here is intentional:
+        1. schedule runnable work
+        2. execute one runner call
+        3. drain commands that arrived during execution
+        4. update scheduler state from the runner output
+        5. resolve any finished request futures
+
+        The second drain between execute and update is what lets a running
+        request observe an abort before ``update_from_output()`` commits the
+        runner result as successfully completed.
+        """
+        sched_output = self.scheduler.schedule()
+        if sched_output.is_empty:
+            return
+
+        self._in_step_execution = True
+        try:
+            sched_req_id = sched_output.scheduled_req_ids[0]
+            try:
+                runner_output = self.execute_fn(sched_output)
+            except Exception as exc:
+                # Convert unexpected execution failures into a synthetic terminal
+                # runner output so the scheduler can still drive the request to a
+                # FINISHED_ERROR state instead of leaking lifecycle ownership.
+                logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
+                runner_output = RunnerOutput(
+                    req_id=sched_req_id,
+                    step_index=None,
+                    finished=True,
+                    result=DiffusionOutput(error=str(exc)),
+                )
+
+            # Process abort / RPC / shutdown commands that arrived while
+            # execute_fn() was blocked on worker-side execution before we fold
+            # the runner output back into scheduler state.
+            self._drain_commands(block=False)
+
+            finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+            for finished_req_id in finished_req_ids:
+                self._resolve_finished_request(finished_req_id, runner_output=runner_output)
+        finally:
+            self._in_step_execution = False
+
+    def _resolve_finished_request(
+        self,
+        sched_req_id: str,
+        runner_output: RunnerOutput | None,
+    ) -> None:
+        """Finalize scheduler state and complete the matching caller future."""
+        future = self._pending_futures.pop(sched_req_id, None)
+        try:
+            output = self._finalize_finished_request(
+                sched_req_id,
+                runner_output=runner_output,
+                missing_result_error="Diffusion execution finished without a final output.",
+            )
+        except BaseException as exc:
+            # A buggy third-party scheduler could lose the request state between
+            # update_from_output() and finalization. If that happens, fail the
+            # waiting caller future before re-raising so the core-loop crash
+            # path does not orphan a blocked submitter forever.
+            if future is not None:
+                self._try_set_future_exception(
+                    future,
+                    RuntimeError(
+                        f"Failed to finalize diffusion request {sched_req_id}: {exc}"
+                    ),
+                )
+            raise
+
+        if future is not None:
+            self._try_set_future_result(future, output)
+
+    def _fail_pending_futures(self, error: Exception) -> None:
+        """Fail every request future that is still pending."""
+        pending_futures = list(self._pending_futures.values())
+        self._pending_futures.clear()
+        for future in pending_futures:
+            self._try_set_future_exception(future, self._clone_exception(error))
+
+    def _fail_queued_command_futures(self, error: Exception) -> None:
+        """Fail command futures still sitting in the queue."""
+        while True:
+            try:
+                cmd = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            if isinstance(cmd, (_AddRequestCmd, _RpcCmd)):
+                self._try_set_future_exception(cmd.future, self._clone_exception(error))
+
+    def _best_effort_shutdown_components(self) -> None:
+        """Close scheduler and executor without masking the original failure."""
+        if hasattr(self, "scheduler"):
+            try:
+                self.scheduler.close()
+            except Exception:
+                logger.warning("Failed to close diffusion scheduler cleanly.", exc_info=True)
+        if hasattr(self, "executor"):
+            try:
+                self.executor.shutdown()
+            except Exception:
+                logger.warning("Failed to shut down diffusion executor cleanly.", exc_info=True)
+
+    def _try_set_future_result(self, future: Future[Any], result: Any) -> None:
+        """Best-effort future completion that tolerates benign cross-thread races.
+
+        ``close()`` may force cleanup from a caller thread while the core loop
+        is simultaneously unwinding the same request. If another thread wins
+        the completion race after our ``done()`` check but before
+        ``set_result()`` runs, ``InvalidStateError`` simply means the future
+        was already resolved.
+        """
+        if future.done():
+            return
+        try:
+            future.set_result(result)
+        except InvalidStateError:
+            return
+
+    def _try_set_future_exception(self, future: Future[Any], error: BaseException) -> None:
+        """Best-effort exception completion that ignores benign state races."""
+        if future.done():
+            return
+        try:
+            future.set_exception(error)
+        except InvalidStateError:
+            return
+
+    def _fail_submitted_future_if_owner_gone(self, future: Future[Any]) -> None:
+        """Fail a just-enqueued command if the core thread already exited.
+
+        This defends against a small check-then-enqueue race: the caller can
+        observe an open engine, enqueue a command, and only then discover that
+        the core loop has already exited and will never consume the queue
+        entry. A second shutdown or crash check is required even while the
+        core thread still reports itself alive, because the owner may already
+        be in its teardown path and no longer willing to accept new work.
+        Turning that race into an immediate future failure avoids a
+        permanently blocked caller.
+        """
+        core_thread = getattr(self, "_core_thread", None)
+        shutdown_requested = getattr(self, "_shutdown_requested", None)
+        is_shutting_down = (
+            shutdown_requested.is_set() if shutdown_requested is not None else False
+        )
+
+        if (
+            core_thread is not None
+            and core_thread.is_alive()
+            and self._core_loop_error is None
+            and not is_shutting_down
+        ):
+            return
+
+        error = self._owner_unavailable_error()
+        self._try_set_future_exception(future, self._clone_exception(error))
+        self._fail_queued_command_futures(error)
+
+    def _owner_unavailable_error(self) -> Exception:
+        """Return the most specific error that explains why the owner is gone."""
+        if self._core_loop_error is not None:
+            return self._core_loop_error
+        if self._shutdown_requested.is_set():
+            return RuntimeError("DiffusionEngine is closed.")
+        return RuntimeError("DiffusionEngine core loop is not running.")
+
+    @staticmethod
+    def _clone_exception(error: Exception) -> Exception:
+        """Create a fresh exception instance before attaching it to a future."""
+        try:
+            return error.__class__(*error.args)
+        except Exception:
+            return RuntimeError(str(error))
 
     def _finalize_finished_request(
         self,
