@@ -167,6 +167,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
+        if self._tts_model_type == "vibevoice_tts":
+            self._vibevoice_processor = self._init_vibevoice_processor()
 
         # Cache TTS configuration values (computed once, reused per request)
         self._max_instructions_length = self._compute_max_instructions_length()
@@ -1118,19 +1120,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     # ---- VibeVoice TTS helpers ----
 
-    def _get_vibevoice_processor(self):
-        if self._vibevoice_processor is not None:
-            return self._vibevoice_processor
-
+    def _init_vibevoice_processor(self):
         from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 
         model_path = self.engine_client.model_config.model
-        self._vibevoice_processor = VibeVoiceProcessor.from_pretrained(
+        processor = VibeVoiceProcessor.from_pretrained(
             model_path,
             trust_remote_code=True,
         )
-        if getattr(self._vibevoice_processor, "tokenizer", None) is not None:
-            self._vibevoice_processor.tokenizer.padding_side = "left"
+        if getattr(processor, "tokenizer", None) is not None:
+            processor.tokenizer.padding_side = "left"
+        return processor
+
+    def _get_vibevoice_processor(self):
+        if self._vibevoice_processor is None:
+            self._vibevoice_processor = self._init_vibevoice_processor()
         return self._vibevoice_processor
 
     @staticmethod
@@ -1384,8 +1388,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     ref_audio_source = request.ref_audio
                     if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
                         ref_audio_source = tts_params["ref_audio"][0]
-                    if ref_audio_source is not None:
-                        assert isinstance(ref_audio_source, str)
+                    if isinstance(ref_audio_source, str):
                         wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
                         tts_params["ref_audio"] = [[wav_list, sr]]
 

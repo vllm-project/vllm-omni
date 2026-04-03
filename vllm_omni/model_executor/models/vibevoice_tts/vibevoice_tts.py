@@ -423,6 +423,8 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
     def _encode_voice_prompt_samples(
         self, voice_samples: list[dict[str, Any]], device: torch.device
     ) -> torch.Tensor | None:
+        import librosa
+
         processed_wavs: list[np.ndarray] = []
         token_lengths: list[int] = []
         for sample in voice_samples:
@@ -434,8 +436,6 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
                 continue
             wav = self._audio_normalizer(wav)
             if sample_rate != self._sample_rate:
-                import librosa
-
                 wav = librosa.resample(wav, orig_sr=sample_rate, target_sr=self._sample_rate)
             processed_wavs.append(wav.astype(np.float32))
             token_lengths.append(int(math.ceil(len(wav) / self._speech_tok_compress_ratio)))
