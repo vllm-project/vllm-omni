@@ -108,7 +108,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
             for req_id, data in finished_reqs.items():
                 try:
-                    model_meta = self.model.get_kv_transfer_metadata(req_id)
+                    req_idx = self.input_batch.req_id_to_index.get(req_id)
+                    num_computed = (
+                        int(self.input_batch.num_computed_tokens_cpu[req_idx]) if req_idx is not None else None
+                    )
+                    model_meta = self.model.get_kv_transfer_metadata(
+                        req_id,
+                        num_computed_tokens=num_computed,
+                    )
                     if model_meta:
                         existing = data.get("custom_metadata") or {}
                         existing.update(model_meta)
@@ -265,6 +272,19 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+
+        # Let the model adjust inputs before forward (e.g. restore input_ids
+        # for multimodal position detection, fix decode position offsets).
+        if hasattr(self.model, "prepare_runner_inputs"):
+            input_ids, positions = self.model.prepare_runner_inputs(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                req_ids=req_ids[:num_reqs],
+                num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[i]) for i in range(num_reqs)],
+                num_scheduled_tokens=[int(num_scheduled_tokens_np[i]) for i in range(num_reqs)],
+                input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
+            )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible

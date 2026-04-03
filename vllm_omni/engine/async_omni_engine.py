@@ -728,14 +728,15 @@ class AsyncOmniEngine:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
 
-            # Run through same input processing as the main prompt
+            companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
+
             if isinstance(companion_prompt, dict):
                 _inject_global_id(companion_prompt, cid)
 
             request = self.input_processor.process_inputs(
                 request_id=cid,
                 prompt=companion_prompt,
-                params=stage0_params,
+                params=companion_params,
                 supported_tasks=self.supported_tasks,
             )
             request = _upgrade_to_omni_request(request, companion_prompt)
@@ -756,7 +757,7 @@ class AsyncOmniEngine:
                     "parent_id": parent_id,
                     "role": ep.role,
                     "prompt": request,
-                    "sampling_params_list": sampling_params_list,
+                    "sampling_params_list": companion_spl,
                 }
             )
 
