@@ -21,6 +21,29 @@ logger = init_logger(__name__)
 
 LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
+_SAFE_TORCH_DTYPES = {
+    name: dtype
+    for name in (
+        "bool",
+        "uint8",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "float16",
+        "float32",
+        "float64",
+        "bfloat16",
+        "complex64",
+        "complex128",
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if isinstance((dtype := getattr(torch, name, None)), torch.dtype)
+}
+
 
 @dataclass
 class OmniKVCacheConfig:
@@ -68,6 +91,7 @@ class KVCacheTransferData:
                 tensors_desc.append(
                     {
                         "n": f"{cache_name}_{layer_idx}",
+                        "i": layer_idx,
                         "d": dtype_str,
                         "s": list(t.shape),
                         "o": data_offset,
@@ -111,6 +135,7 @@ class KVCacheTransferData:
                 tensors_desc.append(
                     {
                         "n": f"{cache_name}_{layer_idx}",
+                        "i": layer_idx,
                         "d": dtype_str,
                         "s": list(t.shape),
                         "o": data_offset,
@@ -191,6 +216,31 @@ class KVCacheTransferData:
         return offset, nbytes
 
     @staticmethod
+    def _resolve_torch_dtype(dtype_name: Any) -> torch.dtype:
+        torch_dtype = _SAFE_TORCH_DTYPES.get(str(dtype_name))
+        if torch_dtype is None:
+            raise ValueError(f"Unsupported dtype in KV payload: {dtype_name}")
+        return torch_dtype
+
+    @staticmethod
+    def _resolve_layer_idx(info: dict[str, Any], num_layers: int) -> int:
+        layer_idx = info.get("i")
+        if layer_idx is None:
+            name = info.get("n")
+            if isinstance(name, str) and name.startswith("key_cache_"):
+                layer_idx = int(name.removeprefix("key_cache_"))
+            elif isinstance(name, str) and name.startswith("value_cache_"):
+                layer_idx = int(name.removeprefix("value_cache_"))
+            else:
+                raise ValueError(f"Invalid KV tensor name in payload: {name}")
+
+        if not isinstance(layer_idx, int):
+            raise ValueError(f"Invalid layer index in KV payload: {layer_idx}")
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise ValueError(f"Invalid layer index in KV payload: {layer_idx} (num_layers={num_layers})")
+        return layer_idx
+
+    @staticmethod
     def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
         """Reconstruct KV cache data from the packed bytes format."""
         raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
@@ -205,7 +255,7 @@ class KVCacheTransferData:
                 continue
 
             name: str = info["n"]
-            torch_dtype = getattr(torch, info["d"])
+            torch_dtype = KVCacheTransferData._resolve_torch_dtype(info["d"])
             offset, nbytes = KVCacheTransferData._validate_tensor_span(name, info, len(tensor_data_mv))
             t = (
                 torch.frombuffer(
@@ -217,7 +267,7 @@ class KVCacheTransferData:
                 .view(torch_dtype)
                 .reshape(info["s"])
             )
-            layer_idx = int(name.split("_")[-1])
+            layer_idx = KVCacheTransferData._resolve_layer_idx(info, num_layers)
             if name.startswith("key_cache_"):
                 key_cache[layer_idx] = t
             elif name.startswith("value_cache_"):
@@ -245,11 +295,11 @@ class KVCacheTransferData:
                 continue
 
             name: str = info["n"]
-            torch_dtype = getattr(torch, info["d"])
+            torch_dtype = KVCacheTransferData._resolve_torch_dtype(info["d"])
             offset, nbytes = KVCacheTransferData._validate_tensor_span(name, info, tensor_data_bytes)
             t = gpu_tensor[data_start + offset : data_start + offset + nbytes].clone()
             t = t.view(torch_dtype).reshape(info["s"])
-            layer_idx = int(name.split("_")[-1])
+            layer_idx = KVCacheTransferData._resolve_layer_idx(info, num_layers)
             if name.startswith("key_cache_"):
                 key_cache[layer_idx] = t
             elif name.startswith("value_cache_"):

@@ -161,6 +161,29 @@ def test_from_bytes_rejects_out_of_bounds_tensor_span():
         KVCacheTransferData.from_bytes_gpu(torch.tensor(list(bad_payload), dtype=torch.uint8))
 
 
+def test_from_bytes_rejects_unsupported_dtype():
+    payload, _ = _make_serialized_payload()
+    bad_payload = _rewrite_serialized_header(payload, lambda header: header["td"][0].update({"d": "cuda"}))
+
+    with pytest.raises(ValueError, match="Unsupported dtype"):
+        KVCacheTransferData.from_bytes(bad_payload)
+
+    with pytest.raises(ValueError, match="Unsupported dtype"):
+        KVCacheTransferData.from_bytes_gpu(torch.tensor(list(bad_payload), dtype=torch.uint8))
+
+
+def test_from_bytes_uses_explicit_layer_index_descriptor():
+    payload, key_tensor = _make_serialized_payload()
+    payload_with_explicit_index = _rewrite_serialized_header(
+        payload,
+        lambda header: header["td"][0].update({"n": "key_cache_extra_suffix", "i": 0}),
+    )
+
+    data = KVCacheTransferData.from_bytes(payload_with_explicit_index)
+
+    assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
+
+
 def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_constants):
     """Test extraction with tuple layout."""
     num_layers = common_constants["num_layers"]
