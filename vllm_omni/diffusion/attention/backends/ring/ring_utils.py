@@ -82,7 +82,7 @@ def _update_out_and_lse(
         out = out - F.sigmoid(block_lse - lse) * (out - block_out)
         lse = lse - F.logsigmoid(lse - block_lse)
     except RuntimeError as e:
-        logger.error("ERROR in _update_out_and_lse: %s", e)
+        logger.error("_update_out_and_lse failed: %s", e)
         logger.error("out: %s, lse: %s", out.shape, lse.shape)
         logger.error("block_out: %s, block_lse: %s", block_out.shape, block_lse.shape)
         # raise e
