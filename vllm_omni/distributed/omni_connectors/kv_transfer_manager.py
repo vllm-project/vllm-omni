@@ -691,10 +691,8 @@ class OmniKVTransferManager:
         if not from_stage or not to_stage:
             raise ValueError("Transfer stages (omni_from_stage, omni_to_stage) not configured")
 
-        import time as _time
-
         kv_data.request_id = transfer_req_id
-        serialization_start = _time.perf_counter()
+        serialization_start = time.perf_counter()
         transfer_data: torch.Tensor | bytes | dict[str, Any]
         supports_raw = getattr(self.connector, "supports_raw_data", False)
 
@@ -711,12 +709,12 @@ class OmniKVTransferManager:
                 data_dict["request_id"] = transfer_req_id
                 transfer_data = data_dict
 
-        serialization_ms = (_time.perf_counter() - serialization_start) * 1000
+        serialization_ms = (time.perf_counter() - serialization_start) * 1000
         logger.info("KV cache serialized for %s in %.1f ms", transfer_req_id, serialization_ms)
 
-        transfer_start = _time.perf_counter()
+        transfer_start = time.perf_counter()
         success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", transfer_data)
-        elapsed = _time.perf_counter() - transfer_start
+        elapsed = time.perf_counter() - transfer_start
 
         if success:
             mbps = (size / 1024 / 1024) / elapsed if elapsed > 0 else 0
@@ -801,6 +799,8 @@ class OmniKVTransferManager:
 
         timeout = self.config.recv_timeout
         start_time = time.time()
+        poll_interval = 0.01
+        max_poll_interval = 0.5
 
         logger.info(f"Wait for KV cache for request {request_id} from stage {from_stage} to {to_stage}...")
 
@@ -874,7 +874,8 @@ class OmniKVTransferManager:
                     logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
                     return None, 0
 
-                time.sleep(0.01)
+                time.sleep(poll_interval)
+                poll_interval = min(poll_interval * 2, max_poll_interval)
 
         except Exception as e:
             logger.error(f"Error receiving KV cache for {request_id}: {e}")

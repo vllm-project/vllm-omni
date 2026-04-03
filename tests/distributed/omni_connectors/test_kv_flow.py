@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm_omni.distributed.omni_connectors.kv_transfer_manager as kv_transfer_manager_module
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     KVCacheTransferData,
@@ -214,6 +215,40 @@ def test_clone_received_payload_tensors_breaks_buffer_alias():
     raw[:] = 0
 
     assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
+
+
+def test_receive_kv_cache_uses_exponential_backoff(monkeypatch):
+    config = OmniKVCacheConfig(
+        connector_config={"type": "mock"},
+        from_stage="sender",
+        stage_id="receiver",
+        need_recv_cache=True,
+        recv_timeout=0.3,
+    )
+    manager = OmniKVTransferManager(config)
+
+    class _NeverReadyConnector:
+        def get(self, **kwargs):
+            del kwargs
+            return None
+
+    manager._connector = _NeverReadyConnector()
+
+    now = {"value": 0.0}
+    sleep_intervals = []
+
+    monkeypatch.setattr(kv_transfer_manager_module.time, "time", lambda: now["value"])
+
+    def _fake_sleep(interval: float) -> None:
+        sleep_intervals.append(interval)
+        now["value"] += interval
+
+    monkeypatch.setattr(kv_transfer_manager_module.time, "sleep", _fake_sleep)
+
+    data, size = manager.receive_kv_cache_for_request("req-backoff")
+
+    assert (data, size) == (None, 0)
+    assert sleep_intervals == pytest.approx([0.01, 0.02, 0.04, 0.08, 0.16])
 
 
 def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_constants):
