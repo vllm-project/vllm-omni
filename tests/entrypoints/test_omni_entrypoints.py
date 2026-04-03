@@ -379,6 +379,19 @@ def test_openai_serving_models_can_consume_async_omni_compat_attrs():
     assert serving_models.input_processor is input_processor
 
 
+def test_get_diffusion_od_config_returns_diffusion_stage_config():
+    diffusion_od_config = object()
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        stage_clients=[
+            SimpleNamespace(stage_type="llm"),
+            SimpleNamespace(stage_type="diffusion", _engine=SimpleNamespace(od_config=diffusion_od_config)),
+        ]
+    )
+
+    assert omni.get_diffusion_od_config() is diffusion_od_config
+
+
 @pytest.mark.asyncio
 async def test_async_omni_yields_only_final_stage_outputs(monkeypatch: pytest.MonkeyPatch):
     engine = FakeAsyncOmniEngine(

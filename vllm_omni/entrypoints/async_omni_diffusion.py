@@ -18,21 +18,13 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.data import DiffusionRequestAbortedError, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.registry import diffusion_model_requires_transformer_config
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
-
-try:
-    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
-except ImportError:
-
-    class DiffusionRequestAbortedError(Exception):
-        """Compatibility fallback for branches without DiffusionRequestAbortedError."""
-
 
 logger = init_logger(__name__)
 

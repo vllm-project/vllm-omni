@@ -326,11 +326,18 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
         cfg_img_scale = extra_args.get("cfg_img_scale", 1.5)
 
+        cfg_interval = extra_args.get("cfg_interval", (0.4, 1.0))
+        cfg_renorm_type = extra_args.get("cfg_renorm_type", "global")
+        cfg_renorm_min = extra_args.get("cfg_renorm_min", 0.0)
+
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
             cfg_text_scale=cfg_text_scale,
             cfg_img_scale=cfg_img_scale,
+            cfg_interval=cfg_interval,
+            cfg_renorm_type=cfg_renorm_type,
+            cfg_renorm_min=cfg_renorm_min,
         )
 
         gen_context = {
@@ -387,7 +394,12 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         else:
             image_input = (
-                None if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {}).get("image")
+                None
+                if isinstance(first_prompt, str)
+                else (
+                    (first_prompt.get("multi_modal_data") or {}).get("image")
+                    or (first_prompt.get("multi_modal_data") or {}).get("img2img")
+                )
             )
             if image_input and not isinstance(image_input, list):
                 image_input = [image_input]

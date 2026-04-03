@@ -33,7 +33,7 @@ stage_args:
     temperature: 0.4
     top_p: 0.9
     top_k: 1
-    max_tokens: 100
+    max_tokens: 150
     seed: 42
     ignore_eos: False
     detokenize: True
@@ -74,7 +74,7 @@ stage_args:
     devices: "1"
   engine_args:
     model_stage: code2wav
-    max_num_seqs: 1
+    max_num_seqs: 5
     model_arch: Qwen3OmniMoeForConditionalGeneration
     worker_type: generation
     scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
