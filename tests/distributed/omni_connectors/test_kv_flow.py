@@ -184,6 +184,26 @@ def test_from_bytes_uses_explicit_layer_index_descriptor():
     assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
 
 
+def test_update_sender_info_uses_configured_source_stage():
+    config = OmniKVCacheConfig(
+        connector_config={"type": "mock"},
+        stage_id=2,
+        engine_input_source=[1],
+        need_recv_cache=True,
+    )
+    manager = OmniKVTransferManager(config)
+
+    manager.update_sender_info(
+        {
+            0: {"host": "10.0.0.1", "zmq_port": 50151},
+            1: {"host": "10.0.0.2", "zmq_port": 50152},
+        }
+    )
+
+    assert manager.config.connector_config["sender_host"] == "10.0.0.2"
+    assert manager.config.connector_config["sender_zmq_port"] == 50152
+
+
 def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_constants):
     """Test extraction with tuple layout."""
     num_layers = common_constants["num_layers"]

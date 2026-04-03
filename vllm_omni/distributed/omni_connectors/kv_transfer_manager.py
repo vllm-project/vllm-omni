@@ -461,18 +461,52 @@ class OmniKVTransferManager:
         """Get connector (compatibility wrapper for existing code)."""
         return self.connector
 
-    def update_sender_info(self, sender_info: dict[str, Any]) -> None:
+    def _resolve_sender_info(self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None) -> dict[str, Any] | None:
+        if not sender_info:
+            return None
+
+        if "host" in sender_info:
+            return sender_info
+
+        if not isinstance(sender_info, dict):
+            return None
+
+        preferred_keys: list[str | int] = []
+        if sender_stage_id is None:
+            recv_from, _ = self.recv_stages
+            sender_stage_id = recv_from
+
+        if sender_stage_id is not None:
+            preferred_keys.append(sender_stage_id)
+            preferred_keys.append(str(sender_stage_id))
+            try:
+                preferred_keys.append(int(sender_stage_id))
+            except (TypeError, ValueError):
+                pass
+
+        for key in dict.fromkeys(preferred_keys):
+            info = sender_info.get(key)
+            if isinstance(info, dict) and "host" in info:
+                return info
+
+        candidates = [info for info in sender_info.values() if isinstance(info, dict) and "host" in info]
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if candidates:
+            logger.warning(
+                "Ambiguous sender_info for sender_stage_id=%s: expected caller to resolve a single sender entry, got %s",
+                sender_stage_id,
+                sender_info,
+            )
+        return None
+
+    def update_sender_info(self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None) -> None:
         """Update receiver-side sender info before loading remote KV cache."""
         if not self.config.need_recv_cache:
             return
 
-        actual_info = sender_info
-        if sender_info and "host" not in sender_info:
-            for _, info in sender_info.items():
-                if isinstance(info, dict) and "host" in info:
-                    actual_info = info
-                    break
-
+        actual_info = self._resolve_sender_info(sender_info, sender_stage_id=sender_stage_id)
         if not actual_info or "host" not in actual_info:
             logger.warning("Invalid sender_info format: %s", sender_info)
             return
@@ -882,7 +916,7 @@ class OmniKVTransferManager:
         """
         kv_sender_info = getattr(req, "kv_sender_info", None)
         if kv_sender_info:
-            self.update_sender_info(kv_sender_info)
+            self.update_sender_info(kv_sender_info, sender_stage_id=self.recv_stages[0])
 
         request_id = self._resolve_request_id(req)
         if not request_id:
