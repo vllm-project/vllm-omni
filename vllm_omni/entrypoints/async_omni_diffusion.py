@@ -110,7 +110,6 @@ class AsyncOmniDiffusion:
             if config_dict is not None:
                 if od_config.model_class_name is None:
                     od_config.model_class_name = config_dict.get("_class_name", None)
-                    od_config.model_config = {k: v for k, v in config_dict.items() if k != "_class_name"}
                 od_config.update_multimodal_support()
 
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
