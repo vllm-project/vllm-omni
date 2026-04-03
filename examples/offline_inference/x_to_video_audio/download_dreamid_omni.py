@@ -89,7 +89,7 @@ def main(output_dir: str):
         json.dump(data, f, indent=2)
 
     print(f"model_index.json created at {os.path.join(output_dir, 'model_index.json')}")
-    
+
     transformer_dir = os.path.join(output_dir, "transformer")
     os.makedirs(transformer_dir, exist_ok=True)
     with open(os.path.join(transformer_dir, "config.json"), "w", encoding="utf-8") as f:
