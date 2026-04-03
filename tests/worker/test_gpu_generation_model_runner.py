@@ -129,18 +129,18 @@ def test_sample_tokens_dict_list_batched():
 
 
 def test_sample_tokens_tensor_mismatched_batch_raises():
-    """Tensor with wrong batch dim should raise AssertionError."""
+    """Tensor with wrong batch dim should raise ValueError."""
     multimodal_outputs = torch.randn(2, 4)
     runner = _make_runner(multimodal_outputs, num_reqs=3)
 
-    with pytest.raises(AssertionError, match="num_reqs"):
+    with pytest.raises(ValueError, match="num_reqs"):
         GPUGenerationModelRunner.sample_tokens(runner)
 
 
 def test_sample_tokens_list_mismatched_batch_raises():
-    """List with wrong length should raise AssertionError."""
+    """List with wrong length should raise ValueError."""
     multimodal_outputs = [torch.randn(4), torch.randn(4)]
     runner = _make_runner(multimodal_outputs, num_reqs=3)
 
-    with pytest.raises(AssertionError, match="num_reqs"):
+    with pytest.raises(ValueError, match="num_reqs"):
         GPUGenerationModelRunner.sample_tokens(runner)

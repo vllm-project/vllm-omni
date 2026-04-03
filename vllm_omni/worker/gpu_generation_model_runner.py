@@ -359,16 +359,19 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs, (
-                f"Tensor multimodal_outputs batch dim ({multimodal_outputs.shape[0]}) "
-                f"!= num_reqs ({self.input_batch.num_reqs})"
-            )
+            if multimodal_outputs.shape[0] != self.input_batch.num_reqs:
+                raise ValueError(
+                    f"Tensor multimodal_outputs batch dim ({multimodal_outputs.shape[0]}) "
+                    f"!= num_reqs ({self.input_batch.num_reqs})"
+                )
             for i in range(self.input_batch.num_reqs):
                 pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == self.input_batch.num_reqs, (
-                f"List multimodal_outputs length ({len(multimodal_outputs)}) != num_reqs ({self.input_batch.num_reqs})"
-            )
+            if len(multimodal_outputs) != self.input_batch.num_reqs:
+                raise ValueError(
+                    f"List multimodal_outputs length ({len(multimodal_outputs)}) "
+                    f"!= num_reqs ({self.input_batch.num_reqs})"
+                )
             for out in multimodal_outputs:
                 pooler_output.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
