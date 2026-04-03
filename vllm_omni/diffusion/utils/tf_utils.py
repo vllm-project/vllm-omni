@@ -52,3 +52,27 @@ def get_transformer_config_kwargs(
             pass
 
     return filtered_params
+
+
+def find_module_with_attr(model, attr_name="transformer"):
+    """
+    This function searches for a module in the model that has the specified attribute.
+    If the model itself has the attribute, it returns the model.
+    If none of the modules have the attribute, it returns None.
+    """
+    if hasattr(model, attr_name):
+        return model
+
+    for _, child in model.named_children():
+        if hasattr(child, attr_name):
+            return child
+
+    return None
+
+
+def get_transformer_from_pipeline(pipeline: Any):
+    pipe = find_module_with_attr(pipeline, attr_name="transformer")
+
+    if pipe is not None:
+        return pipe.transformer
+    return None

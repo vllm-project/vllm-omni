@@ -578,9 +578,11 @@ class Flux2Transformer2DModel(nn.Module):
         guidance_embeds: bool = True,
     ):
         super().__init__()
+        self.guidance_embeds = guidance_embeds
         self.stacked_params_mapping = None
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+
         self.config = SimpleNamespace(
             patch_size=patch_size,
             in_channels=in_channels,

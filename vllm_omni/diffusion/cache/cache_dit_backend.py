@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 
 logger = init_logger(__name__)
 
@@ -533,7 +534,7 @@ def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], No
 
 def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for LTX2 pipelines (audio-video transformer blocks)."""
-    transformer = pipeline.transformer
+    transformer = get_transformer_from_pipeline(pipeline)
 
     db_cache_config = _build_db_cache_config(cache_config)
 
@@ -566,11 +567,12 @@ def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], N
     )
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        transformer = get_transformer_from_pipeline(pipeline)
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
             cache_dit.refresh_context(
-                pipeline.transformer,
+                transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
@@ -613,8 +615,9 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
     )
 
     # Enable cache-dit on the transformer
+    transformer = get_transformer_from_pipeline(pipeline)
     cache_dit.enable_cache(
-        pipeline.transformer,
+        transformer,
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
     )
@@ -626,11 +629,12 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
             pipeline: The diffusion pipeline instance.
             num_inference_steps: New number of inference steps.
         """
+        transformer = get_transformer_from_pipeline(pipeline)
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
             cache_dit.refresh_context(
-                pipeline.transformer,
+                transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
@@ -1211,6 +1215,8 @@ CUSTOM_DIT_ENABLERS.update(
         "StableDiffusion3Pipeline": enable_cache_for_sd3,
         "LTX2Pipeline": enable_cache_for_ltx2,
         "LTX2ImageToVideoPipeline": enable_cache_for_ltx2,
+        "LTX2TwoStagesPipeline": enable_cache_for_ltx2,
+        "LTX2ImageToVideoTwoStagesPipeline": enable_cache_for_ltx2,
         "BagelPipeline": enable_cache_for_bagel,
         "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,

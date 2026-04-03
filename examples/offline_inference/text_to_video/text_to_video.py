@@ -56,8 +56,13 @@ def parse_args() -> argparse.Namespace:
         "Examples: Wan-AI/Wan2.2-T2V-A14B-Diffusers, "
         "hunyuanvideo-community/HunyuanVideo-1.5-480p_t2v",
     )
+    parser.add_argument(
+        "--model-class-name",
+        default=None,
+        help="Override model class name (e.g., LTX2TwoStagesVideoPipeline).",
+    )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt (Wan2.2 only).")
+    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -185,6 +190,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    model_class_name = args.model_class_name
 
     preset = _detect_preset(args.model)
     for key, default_val in preset.items():
@@ -229,6 +235,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
