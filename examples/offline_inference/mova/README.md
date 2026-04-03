@@ -22,6 +22,8 @@ python examples/offline_inference/mova/end2end.py \
 
 - Currently supports MOVA-360p with I2VA (image-to-video-audio) mode.
 - Default resolution: 352x640 (360p).
+- Use detailed prompts for meaningful quality evaluation; short prompts can produce unstable outputs.
+- The CLI defaults to `50` denoising steps, which is the recommended quality setting for MOVA.
 - `--enable-cpu-offload` is recommended for GPUs with less than ~80GB VRAM. Each video DiT is ~43GB (bf16), so two video DiTs + other components exceed single 48GB GPU memory. The pipeline swaps components between CPU and GPU during inference.
 - With CPU offload, requires ~90GB system RAM (two 14B video DiTs + other components).
 - Without CPU offload, all components must fit in GPU memory simultaneously (~80GB+).

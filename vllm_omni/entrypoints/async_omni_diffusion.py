@@ -20,6 +20,7 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.registry import diffusion_model_requires_transformer_config
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.lora.request import LoRARequest
@@ -111,14 +112,15 @@ class AsyncOmniDiffusion:
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
                 if tf_config_dict is not None:
                     od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
-                elif od_config.model_class_name in ("MOVA", "DreamIDOmniPipeline"):
-                    # Multi-component models have no single transformer/ subfolder
-                    # (e.g. MOVA: video_dit/, audio_dit/, dual_tower_bridge/)
+                elif not diffusion_model_requires_transformer_config(od_config.model_class_name):
+                    # Multi-component pipelines may not expose a canonical
+                    # transformer/config.json. Let the registered pipeline load
+                    # its own component configs instead.
                     od_config.tf_model_config = TransformerConfig()
                 else:
                     raise FileNotFoundError(
                         f"transformer/config.json not found for model {od_config.model}. "
-                        "If this is a multi-component model, add its class name to the allowlist above."
+                        "If this is a multi-component model, mark it in the diffusion registry metadata."
                     )
             else:
                 raise FileNotFoundError("model_index.json not found")

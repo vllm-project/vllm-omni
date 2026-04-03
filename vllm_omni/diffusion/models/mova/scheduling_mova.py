@@ -337,8 +337,29 @@ class FlowMatchPairScheduler(FlowMatchScheduler):
     def timestep_to_sigma(self, timestep: torch.Tensor | float) -> torch.Tensor:
         """Return the sigma for a given timestep via nearest-neighbor lookup."""
         t_value = float(timestep)
-        t_cpu = torch.tensor(t_value)
-        idx = torch.argmin((self.train_timesteps - t_cpu).abs())
+
+        # Prefer the active paired schedule so visual/audio-specific shift overrides
+        # map back to the sigma sequence actually used for denoising.
+        schedule_timesteps = self.pair_timesteps
+        schedule_sigmas = self.pair_sigmas
+
+        if schedule_timesteps is not None and schedule_sigmas is not None:
+            flat_timesteps = schedule_timesteps.reshape(-1)
+            flat_sigmas = schedule_sigmas.reshape(-1)
+            t_tensor = flat_timesteps.new_tensor(t_value)
+            idx = torch.argmin((flat_timesteps - t_tensor).abs())
+            return flat_sigmas[idx]
+
+        if self.timesteps is not None and self.sigmas is not None:
+            t_tensor = self.timesteps.new_tensor(t_value)
+            idx = torch.argmin((self.timesteps - t_tensor).abs())
+            return self.sigmas[idx]
+
+        if self.train_timesteps is None or self.train_sigmas is None:
+            raise RuntimeError("Scheduler has no cached timesteps/sigmas")
+
+        t_tensor = self.train_timesteps.new_tensor(t_value)
+        idx = torch.argmin((self.train_timesteps - t_tensor).abs())
         return self.train_sigmas[idx]
 
     def step_from_to(

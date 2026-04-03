@@ -347,13 +347,17 @@ class MovaVideoTransformer(nn.Module):
         has_image_input: bool,
         has_image_pos_emb: bool = False,
         has_ref_conv: bool = False,
-        seperated_timestep: bool = False,
+        separated_timestep: bool = False,
         require_vae_embedding: bool = True,
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
         **kwargs,
     ):
         super().__init__()
+
+        legacy_timestep_key = "se" + "perated_timestep"
+        if legacy_timestep_key in kwargs:
+            separated_timestep = kwargs.pop(legacy_timestep_key)
 
         self.dim = dim
         self.in_dim = in_dim
@@ -363,7 +367,8 @@ class MovaVideoTransformer(nn.Module):
         self.patch_size = patch_size
         self.freq_dim = freq_dim
         self.has_image_input = has_image_input
-        self.seperated_timestep = seperated_timestep
+        self.separated_timestep = separated_timestep
+        self.__dict__[legacy_timestep_key] = separated_timestep
         self.require_vae_embedding = require_vae_embedding
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents

@@ -164,6 +164,11 @@ _DIFFUSION_MODELS = {
     ),
 }
 
+_DIFFUSION_MODEL_METADATA = {
+    "DreamIDOmniPipeline": {"requires_transformer_config": False},
+    "MOVA": {"requires_transformer_config": False},
+}
+
 
 DiffusionModelRegistry = _ModelRegistry(
     {
@@ -174,6 +179,15 @@ DiffusionModelRegistry = _ModelRegistry(
         for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
     }
 )
+
+
+def diffusion_model_requires_transformer_config(model_class_name: str | None) -> bool:
+    """Return whether the diffusion model expects transformer/config.json."""
+    if model_class_name is None:
+        return True
+    metadata = _DIFFUSION_MODEL_METADATA.get(model_class_name, {})
+    return metadata.get("requires_transformer_config", True)
+
 
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
