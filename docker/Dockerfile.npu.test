@@ -1,5 +1,5 @@
-ARG VLLM_ASCEND_IMAGE=docker.io/quay.io/ascend/vllm-ascend
-ARG VLLM_ASCEND_TAG=v0.17.0rc1
+ARG VLLM_ASCEND_IMAGE=swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/quay.io/ascend/vllm-ascend
+ARG VLLM_ASCEND_TAG=v0.17.0rc1-linuxarm64
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
 
 ARG APP_DIR=/vllm-workspace/vllm-omni
