@@ -26,6 +26,7 @@ steps:
               vault.hashicorp.com/agent-run-as-user: "1000"
               vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
               vault.hashicorp.com/role: ascend-gha-runners
+              vault.hashicorp.com/secret-volume-path: /home/user/.docker/
               vault.hashicorp.com/tls-skip-verify: "true"
           podSpecPatch:
             volumes:
@@ -64,17 +65,18 @@ steps:
       fi
 
       # 使用 buildctl 构建并推送到 SWR
+      export DOCKER_CONFIG=/home/user/.docker
       buildctl \
         --addr="$${BUILDKITD_ADDR}" \
-        --tlscacert=/vault/secrets/ca.pem \
-        --tlscert=/vault/secrets/cert.pem \
-        --tlskey=/vault/secrets/key.pem \
+        --tlscacert=/home/user/.docker/ca.pem \
+        --tlscert=/home/user/.docker/cert.pem \
+        --tlskey=/home/user/.docker/key.pem \
         build \
         --frontend dockerfile.v0 \
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile.npu.test \
-        --secret id=dockerconfig,src=/vault/secrets/config.json \
+        --secret id=dockerconfig,src=/home/user/.docker/config.json \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
         --progress=plain
 
