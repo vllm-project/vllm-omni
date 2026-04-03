@@ -115,7 +115,7 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise Exception(f"{output.error}")
+            raise RuntimeError(f"{output.error}")
         logger.info("Generation completed successfully.")
 
         if output.output is None:

@@ -180,7 +180,7 @@ def log_mel_spectrogram(
     HOP_LENGTH = 160
 
     if not torch.is_tensor(audio):
-        raise Exception(f"audio is not tensor {type(audio)}")
+        raise TypeError(f"audio is not tensor {type(audio)}")
 
     if device is not None:
         audio = audio.to(device)
