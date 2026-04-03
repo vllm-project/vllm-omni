@@ -224,11 +224,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._tts_tokenizer = None
         self._direct_embedding_cache: dict[str, list[float]] = {}
 
-        logger.warning(
-            "Uploaded voices are ephemeral and will be lost on server restart. "
-            "Re-upload voices after each restart if needed."
-        )
-
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
 
         # Batch configuration
@@ -786,7 +781,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         speaker_info = self.uploaded_speakers.pop(voice_name_lower)
         self.supported_speakers.discard(voice_name_lower)
-
         self._direct_embedding_cache.pop(voice_name_lower, None)
 
         # Clean up associated files on disk

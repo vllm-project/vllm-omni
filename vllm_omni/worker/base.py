@@ -166,7 +166,8 @@ class OmniGPUWorkerBase(GPUWorker):
         """RPC handler: extract speaker embedding + ref_code on GPU.
 
         Only effective for Qwen3-TTS talker models with speaker_encoder.
-        Returns plain Python types only (must survive msgspec IPC).
+        Both inputs and outputs must stay as plain Python types to survive
+        msgspec IPC (e.g. no numpy arrays in wav_samples).
         """
         model = self.model_runner.model
 
