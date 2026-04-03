@@ -5,7 +5,6 @@
 Main entry points for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
-- [vllm_omni.entrypoints.async_omni_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.cfg_companion_tracker.CfgCompanionTracker][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
