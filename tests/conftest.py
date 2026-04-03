@@ -1730,12 +1730,8 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         label = str(top.get("label", "")).lower()
         conf = float(top.get("score", 0.0))
 
-        if conf < 0.9:
-            print(
-                f"gender classifier: label={label}, conf={conf:.3f}, below confidence threshold; returning unknown"
-                + (f", median_f0={median_f0:.1f}Hz" if median_f0 is not None else "")
-            )
-            return "unknown"
+        if conf < 0.5:
+            gender = "unknown"
         # Some models use non-English labels (e.g., Russian). Normalize to 'male'/'female'.
         elif ("female" in label) or ("жен" in label):
             gender = "female"
@@ -1746,10 +1742,10 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
 
         # Debias: wav2vec2 gender heads often call TTS / band-limited male speech "female".
         # Low median F0 (~speech male range) + female label -> trust pitch when score is not overwhelming.
-        if gender == "female" and median_f0 is not None and median_f0 < 165.0 and conf < 0.97:
+        if gender == "female" and median_f0 is not None and median_f0 < 165.0 and conf < 0.88:
             print(f"gender pitch assist: reclassifying female->male (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
             gender = "male"
-        elif gender == "male" and median_f0 is not None and median_f0 > 230.0 and conf < 0.97:
+        elif gender == "male" and median_f0 is not None and median_f0 > 230.0 and conf < 0.88:
             print(f"gender pitch assist: reclassifying male->female (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
             gender = "female"
 

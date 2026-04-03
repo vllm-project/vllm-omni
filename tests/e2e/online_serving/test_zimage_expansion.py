@@ -96,7 +96,7 @@ def _get_diffusion_feature_cases():
                     "--enable-layerwise-offload",
                     "--use-hsdp",
                     "--hsdp-shard-size",
-                    "4",
+                    "2",
                 ],
             ),
             id="layerwise_hsdp",
