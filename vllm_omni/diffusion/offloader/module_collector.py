@@ -22,7 +22,7 @@ class ModuleDiscovery:
     """Discovers pipeline components for offloading"""
 
     DIT_ATTRS = ["transformer", "transformer_2", "dit", "language_model", "transformer_blocks"]
-    ENCODER_ATTRS = ["text_encoder", "text_encoder_2", "text_encoder_3", "image_encoder"]
+    ENCODER_ATTRS = ["text_encoder", "text_encoder_2", "text_encoder_3", "image_encoder", "vision_language_encoder"]
     VAE_ATTRS = ["vae"]
 
     @staticmethod

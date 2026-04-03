@@ -93,6 +93,29 @@ class SequentialOffloadHook(ModelHook):
 
         self._move_params(module, self.device, non_blocking=False)
 
+    def _move_inputs_to_device(self, args, kwargs, device):
+        """Move all tensor inputs to the target device."""
+
+        def to_device(obj):
+            if isinstance(obj, torch.Tensor):
+                if obj.device.type != device.type or obj.device.index != device.index:
+                    return obj.to(device)
+                return obj
+            elif isinstance(obj, list):
+                return [to_device(item) for item in obj]
+            elif isinstance(obj, tuple):
+                return tuple(to_device(item) for item in obj)
+            elif isinstance(obj, dict):
+                return {k: to_device(v) for k, v in obj.items()}
+            elif hasattr(obj, "to") and callable(getattr(obj, "to")):
+                try:
+                    return obj.to(device)
+                except Exception as e:
+                    logger.debug("Failed to move %s to device: %s", type(obj).__name__, e)
+            return obj
+
+        return to_device(args), to_device(kwargs)
+
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU
         for target in self.offload_targets:
@@ -101,6 +124,9 @@ class SequentialOffloadHook(ModelHook):
         # Load current module to GPU
         self._to_gpu(module)
         current_omni_platform.synchronize()
+
+        # Ensure all inputs are on the same device as the module
+        args, kwargs = self._move_inputs_to_device(args, kwargs, self.device)
 
         logger.debug(
             "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",
