@@ -35,7 +35,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .configuration_fish_speech import FishSpeechConfig, FishSpeechFastARConfig, FishSpeechSlowARConfig
-from .dac_encoder import _load_dac_codec, encode_reference_audio
+from .dac_encoder import _load_dac_codec, encode_reference_audio_codes
 from .fish_speech_fast_ar import FishSpeechFastAR
 from .prompt_utils import build_fish_voice_clone_prompt_ids
 
@@ -530,12 +530,13 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         ref_audio_wav = np.load(ref_audio_path)
         os.remove(ref_audio_path)
 
-        semantic_token_ids = encode_reference_audio(
+        ref_codes_fq = encode_reference_audio_codes(
             self.model_path,
             ref_audio_wav,
             ref_audio_sr,
             device=self.codebook_embeddings.weight.device,
         )
+        semantic_token_ids = (ref_codes_fq[:, 0] + self._semantic_begin_id).tolist()
         prompt_ids, _, _ = build_fish_voice_clone_prompt_ids(
             tokenizer,
             text,
@@ -547,7 +548,37 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             dtype=torch.long,
             device=self.codebook_embeddings.weight.device,
         )
-        return self.embed_input_ids(prompt_ids.unsqueeze(0)).squeeze(0).to(dtype=torch.bfloat16)
+        embeds = self.embed_input_ids(prompt_ids.unsqueeze(0)).squeeze(0).to(dtype=torch.bfloat16)
+
+        audio_start_id = tokenizer.convert_tokens_to_ids("<|audio_start|>")
+        audio_end_id = tokenizer.convert_tokens_to_ids("<|audio_end|>")
+        start_pos = (prompt_ids == int(audio_start_id)).nonzero(as_tuple=False)
+        end_pos = (prompt_ids == int(audio_end_id)).nonzero(as_tuple=False)
+        if start_pos.numel() == 0 or end_pos.numel() == 0:
+            return embeds
+        s = int(start_pos[0].item()) + 1
+        e = int(end_pos[0].item())
+        if e <= s:
+            return embeds
+
+        frames_in_prompt = e - s
+        if ref_codes_fq.device != embeds.device:
+            ref_codes_fq = ref_codes_fq.to(device=embeds.device, dtype=torch.long)
+        frames = min(int(ref_codes_fq.shape[0]), int(frames_in_prompt))
+        if frames <= 0:
+            return embeds
+
+        q = min(int(ref_codes_fq.shape[1]), self._num_codebooks)
+        offsets = (torch.arange(q, device=embeds.device, dtype=torch.long) * self._codebook_size).unsqueeze(0)
+        ref_codes_slice = ref_codes_fq[:frames, :q]
+        if bool((ref_codes_slice < 0).any().item()):
+            logger.warning("Fish Speech structured clone saw negative DAC codes; clamping them to zero")
+        code_with_offset = ref_codes_slice.clamp(min=0) + offsets
+        codebook_sum = self.codebook_embeddings(code_with_offset).sum(dim=1).to(dtype=embeds.dtype)
+
+        result = embeds.clone()
+        result[s : s + frames] = (result[s : s + frames] + codebook_sum) / math.sqrt(self._num_codebooks + 1)
+        return result.to(dtype=torch.bfloat16)
 
     # -------------------- GPU-side MTP fast-path --------------------
 
