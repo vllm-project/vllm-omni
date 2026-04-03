@@ -76,6 +76,10 @@ class StageEngineCoreProc(EngineCoreProc):
             set_process_title(f"StageEngineCoreProc_DP{dp_rank}")
             decorate_logs()
 
+            # the current vllm-omni does not support data parallelism,
+            # so we set the data parallel size to 1.
+            # [TODO] support data parallelism in the future.
+            # https://github.com/vllm-project/vllm-omni/issues/984
             parallel_config.data_parallel_size = 1
             parallel_config.data_parallel_size_local = 1
             parallel_config.data_parallel_rank = 0
