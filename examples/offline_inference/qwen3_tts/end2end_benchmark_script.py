@@ -29,10 +29,12 @@ class QueryResult(NamedTuple):
     model_name: str
 
 
+_model_cache: dict[str, Any] = {}
+
+
 def _estimate_prompt_len(
     additional_information: dict[str, Any],
     model_name: str,
-    _cache: dict[str, Any] = {},
 ) -> int:
     """Estimate prompt_token_ids placeholder length for the Talker stage."""
     try:
@@ -41,7 +43,7 @@ def _estimate_prompt_len(
             Qwen3TTSTalkerForConditionalGeneration,
         )
 
-        if model_name not in _cache:
+        if model_name not in _model_cache:
             from transformers import AutoTokenizer
 
             tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left", fix_mistral_regex=True)
@@ -49,8 +51,6 @@ def _estimate_prompt_len(
 
             speech_tok = None
             try:
-                import os
-
                 from transformers.utils import cached_file
 
                 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_tokenizer import Qwen3TTSTokenizer
@@ -65,9 +65,9 @@ def _estimate_prompt_len(
             except Exception as e:
                 logger.debug("Could not load speech tokenizer: %s", e)
 
-            _cache[model_name] = (tok, getattr(cfg, "talker_config", None), speech_tok)
+            _model_cache[model_name] = (tok, getattr(cfg, "talker_config", None), speech_tok)
 
-        tok, tcfg, speech_tok = _cache[model_name]
+        tok, tcfg, speech_tok = _model_cache[model_name]
         task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
 
         def _estimate_ref_code_len(ref_audio: object) -> int | None:
@@ -316,11 +316,16 @@ def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
     audio_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
     out_wav = os.path.join(output_dir, f"output_{request_id}.wav")
     sf.write(out_wav, audio_tensor.float().cpu().numpy().flatten(), samplerate=sr, format="WAV")
-    logger.info(f"Saved audio to {out_wav}")
+    logger.info("Saved audio to %s", out_wav)
 
 
 class _SummaryCollector:
-    """Monkey-patches omni._log_summary_and_cleanup to capture summary dicts."""
+    """Monkey-patches omni._log_summary_and_cleanup to capture summary dicts.
+
+    NOTE: This relies on a private method ``_log_summary_and_cleanup`` which may
+    break if the upstream Omni implementation is refactored.  If Omni exposes a
+    public hook for summary collection in the future, prefer that instead.
+    """
 
     def __init__(self, omni):
         self.omni = omni
@@ -518,16 +523,16 @@ async def main_streaming(args):
                     n = len(audio) if isinstance(audio, list) else (0 if audio is None else 1)
                     if chunk_idx == 0:
                         ttfa_ms = (t_now - t_req_start) * 1000
-                        logger.info(f"Request {request_id}: chunk {chunk_idx} samples={n} TTFA={ttfa_ms:.1f}ms")
+                        logger.info("Request %s: chunk %d samples=%d TTFA=%.1fms", request_id, chunk_idx, n, ttfa_ms)
                     else:
                         dt_ms = (t_now - t_prev) * 1000
-                        logger.info(f"Request {request_id}: chunk {chunk_idx} samples={n} inter_chunk={dt_ms:.1f}ms")
+                        logger.info("Request %s: chunk %d samples=%d inter_chunk=%.1fms", request_id, chunk_idx, n, dt_ms)
                     t_prev = t_now
                     chunk_idx += 1
                 else:
                     t_end = time.perf_counter()
                     total_ms = (t_end - t_req_start) * 1000
-                    logger.info(f"Request {request_id}: done total={total_ms:.1f}ms chunks={chunk_idx}")
+                    logger.info("Request %s: done total=%.1fms chunks=%d", request_id, total_ms, chunk_idx)
                     _save_wav(output_dir, request_id, mm)
         elapsed = time.perf_counter() - t_start
         round_times.append(elapsed)
