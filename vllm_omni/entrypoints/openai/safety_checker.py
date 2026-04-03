@@ -49,9 +49,11 @@ class SafetyChecker:
         if not images:
             return []
         self._ensure_loaded()
+        all_preds = self._pipeline(images)
+        if images and not isinstance(all_preds[0], list):
+            all_preds = [all_preds]
         results = []
-        for img in images:
-            preds = self._pipeline(img)
+        for preds in all_preds:
             nsfw_score = next((r["score"] for r in preds if r["label"] == "nsfw"), 0.0)
             results.append((nsfw_score < _NSFW_THRESHOLD, nsfw_score))
         return results

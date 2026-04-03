@@ -8,38 +8,23 @@ imports (vllm._C) that require CUDA. If the production _check_safety
 logic changes, these tests must be updated manually.
 """
 
-import importlib.util
-import os
+import asyncio
 from http import HTTPStatus
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import PIL.Image
 import pytest
 from fastapi import HTTPException, Request
 
-# Load SafetyChecker module without triggering vllm_omni.__init__
-_SC_PATH = os.path.join(
-    os.path.dirname(__file__),
-    os.pardir,
-    os.pardir,
-    os.pardir,
-    "vllm_omni",
-    "entrypoints",
-    "openai",
-    "safety_checker.py",
-)
-_spec = importlib.util.spec_from_file_location("safety_checker", os.path.abspath(_SC_PATH))
-_sc_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_sc_mod)
 
-
-def _check_safety(images, raw_request):
+async def _check_safety(images, raw_request):
     """Mirror of api_server._check_safety for testing without heavy imports."""
     checker = getattr(raw_request.app.state, "safety_checker", None)
     if checker is None:
         return
     try:
-        results = checker.check_images(images)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, checker.check_images, images)
     except Exception as e:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
@@ -64,6 +49,11 @@ def _make_request(safety_checker=None):
     return request
 
 
+class _ImmediateLoop:
+    async def run_in_executor(self, _executor, func, *args):
+        return func(*args)
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 class TestSafetyCheckBehavior:
@@ -73,8 +63,9 @@ class TestSafetyCheckBehavior:
         checker.check_images.return_value = [(False, 0.9)]
         request = _make_request(safety_checker=checker)
 
-        with pytest.raises(HTTPException) as exc_info:
-            _check_safety([_make_image()], request)
+        with patch("asyncio.get_running_loop", return_value=_ImmediateLoop()):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(_check_safety([_make_image()], request))
         assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
         assert "unsafe" in exc_info.value.detail.lower()
 
@@ -84,13 +75,14 @@ class TestSafetyCheckBehavior:
         checker.check_images.return_value = [(True, 0.1)]
         request = _make_request(safety_checker=checker)
 
-        _check_safety([_make_image()], request)  # should not raise
+        with patch("asyncio.get_running_loop", return_value=_ImmediateLoop()):
+            asyncio.run(_check_safety([_make_image()], request))  # should not raise
 
     def test_generate_no_checker_skips(self):
         """safety_checker=None -> no filtering."""
         request = _make_request(safety_checker=None)
 
-        _check_safety([_make_image()], request)  # should not raise
+        asyncio.run(_check_safety([_make_image()], request))  # should not raise
 
     def test_checker_failure_returns_503(self):
         """checker inference raises -> HTTP 503."""
@@ -98,8 +90,9 @@ class TestSafetyCheckBehavior:
         checker.check_images.side_effect = RuntimeError("model failed")
         request = _make_request(safety_checker=checker)
 
-        with pytest.raises(HTTPException) as exc_info:
-            _check_safety([_make_image()], request)
+        with patch("asyncio.get_running_loop", return_value=_ImmediateLoop()):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(_check_safety([_make_image()], request))
         assert exc_info.value.status_code == HTTPStatus.SERVICE_UNAVAILABLE.value
         assert "unavailable" in exc_info.value.detail.lower()
 
@@ -109,8 +102,9 @@ class TestSafetyCheckBehavior:
         checker.check_images.return_value = [(True, 0.1), (False, 0.7)]
         request = _make_request(safety_checker=checker)
 
-        with pytest.raises(HTTPException) as exc_info:
-            _check_safety([_make_image(), _make_image()], request)
+        with patch("asyncio.get_running_loop", return_value=_ImmediateLoop()):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(_check_safety([_make_image(), _make_image()], request))
         assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
 
     def test_edit_safe_returns_ok(self):
@@ -119,4 +113,5 @@ class TestSafetyCheckBehavior:
         checker.check_images.return_value = [(True, 0.1), (True, 0.2)]
         request = _make_request(safety_checker=checker)
 
-        _check_safety([_make_image(), _make_image()], request)
+        with patch("asyncio.get_running_loop", return_value=_ImmediateLoop()):
+            asyncio.run(_check_safety([_make_image(), _make_image()], request))

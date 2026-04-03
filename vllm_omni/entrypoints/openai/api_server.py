@@ -1332,7 +1332,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 
-        _check_safety(images, raw_request)
+        await _check_safety(images, raw_request)
 
         # Encode images to base64
         image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
@@ -1538,7 +1538,7 @@ async def edit_images(
         images = _extract_images_from_result(result)
         logger.info(f"Successfully generated {len(images)} image(s)")
 
-        _check_safety(images, raw_request)
+        await _check_safety(images, raw_request)
 
         # Encode images to base64
         image_data = [
@@ -1710,13 +1710,14 @@ def _update_if_not_none(object: Any, key: str, val: Any) -> None:
         setattr(object, key, val)
 
 
-def _check_safety(images: list[Any], raw_request: Request) -> None:
+async def _check_safety(images: list[Any], raw_request: Request) -> None:
     """Raise HTTPException if any image is flagged as unsafe."""
     checker = getattr(raw_request.app.state, "safety_checker", None)
     if checker is None:
         return
     try:
-        results = checker.check_images(images)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, checker.check_images, images)
     except Exception as e:
         logger.error("Safety checker inference failed: %s", e)
         raise HTTPException(
