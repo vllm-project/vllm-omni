@@ -35,7 +35,7 @@ steps:
   - label: "CUDA Unit Test with multi cards"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 10m pytest -v -s tests/diffusion/test_diffusion_step_pipeline.py tests/diffusion/distributed/test_ulysses_uaa_perf.py -m 'core_model and cuda and L4 and distributed_cuda' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
+      - timeout 10m pytest -v -s -m 'core_model and cuda and L4 and distributed_cuda' --ignore=tests/e2e --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
     agents:
       queue: "gpu_4_queue"
     plugins:
