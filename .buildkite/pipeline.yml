@@ -73,7 +73,7 @@ steps:
         --frontend dockerfile.v0 \
         --local context=. \
         --local dockerfile=./docker \
-        --opt filename=Dockerfile_test.npu \
+        --opt filename=Dockerfile.npu.test \
         --secret id=dockerconfig,src=/vault/secrets/config.json \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
         --progress=plain
