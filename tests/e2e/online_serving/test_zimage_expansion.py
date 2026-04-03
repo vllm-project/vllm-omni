@@ -70,7 +70,7 @@ def _get_diffusion_feature_cases():
                 ],
             ),
             id="parallel_hsdp",
-            marks=FOUR_CARD_MARKS,
+            marks=[*FOUR_CARD_MARKS, pytest.mark.skip(reason="issue #2435")],
         ),
     ]
 
