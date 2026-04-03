@@ -26,6 +26,14 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
+try:
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+except ImportError:
+
+    class DiffusionRequestAbortedError(Exception):
+        """Compatibility fallback for branches without DiffusionRequestAbortedError."""
+
+
 logger = init_logger(__name__)
 
 
@@ -39,6 +47,15 @@ def _weak_close_async_omni_diffusion(engine: DiffusionEngine, executor: ThreadPo
         executor.shutdown(wait=False)
     except Exception:
         pass
+
+
+def _set_tf_model_config(od_config: OmniDiffusionConfig, tf_model_config: TransformerConfig) -> None:
+    """Use the config setter when available, otherwise assign directly."""
+    set_config = getattr(od_config, "set_tf_model_config", None)
+    if callable(set_config):
+        set_config(tf_model_config)
+        return
+    od_config.tf_model_config = tf_model_config
 
 
 class AsyncOmniDiffusion:
@@ -111,12 +128,12 @@ class AsyncOmniDiffusion:
 
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
                 if tf_config_dict is not None:
-                    od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+                    _set_tf_model_config(od_config, TransformerConfig.from_dict(tf_config_dict))
                 elif not diffusion_model_requires_transformer_config(od_config.model_class_name):
                     # Multi-component pipelines may not expose a canonical
                     # transformer/config.json. Let the registered pipeline load
                     # its own component configs instead.
-                    od_config.tf_model_config = TransformerConfig()
+                    _set_tf_model_config(od_config, TransformerConfig())
                 else:
                     raise FileNotFoundError(
                         f"transformer/config.json not found for model {od_config.model}. "
@@ -129,7 +146,7 @@ class AsyncOmniDiffusion:
             if cfg is None:
                 raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
 
-            od_config.tf_model_config = TransformerConfig.from_dict(cfg)
+            _set_tf_model_config(od_config, TransformerConfig.from_dict(cfg))
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
             # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
@@ -263,6 +280,10 @@ class AsyncOmniDiffusion:
             finished=True,
         )
 
+    def get_diffusion_od_config(self) -> OmniDiffusionConfig:
+        """Return the diffusion config used by this engine."""
+        return self.od_config
+
     # ------------------------------------------------------------------
     # Public generate API
     # ------------------------------------------------------------------
@@ -316,6 +337,11 @@ class AsyncOmniDiffusion:
                 request,
             )
             result = result[0]
+        except asyncio.CancelledError:
+            self.engine.abort(request_id)
+            raise
+        except DiffusionRequestAbortedError:
+            raise
         except Exception as e:
             logger.error("Generation failed for request %s: %s", request_id, e)
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
