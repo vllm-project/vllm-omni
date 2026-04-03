@@ -7,7 +7,6 @@ import os
 import pytest
 
 
-
 @pytest.fixture(scope="module")
 def safety_checker_module():
     """Load safety_checker.py directly without importing vllm_omni.__init__."""
