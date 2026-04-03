@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Final, Optional, cast
+from typing import Any, Final, cast
 
 import jinja2
 import torch
@@ -89,9 +89,6 @@ from vllm_omni.entrypoints.openai.utils import parse_lora_request
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
-if TYPE_CHECKING:
-    from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
-
 logger = init_logger(__name__)
 
 
@@ -107,13 +104,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     # Diffusion mode attributes
     _diffusion_mode: bool = False
-    _diffusion_engine: Optional["AsyncOmniDiffusion"] = None
+    _diffusion_engine: AsyncOmni | None = None
     _diffusion_model_name: str = ""
 
     @classmethod
     def for_diffusion(
         cls,
-        diffusion_engine: "AsyncOmniDiffusion",
+        diffusion_engine: AsyncOmni,
         model_name: str,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
@@ -2153,7 +2150,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if resolution is not None:
                 gen_params.resolution = resolution
 
-            # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
+            # Parse per-request LoRA.
             if lora_body and isinstance(lora_body, dict):
                 try:
                     lora_req, lora_scale = parse_lora_request(lora_body)
@@ -2187,26 +2184,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
 
             # Generate image
-            # Handle both AsyncOmniDiffusion (returns OmniRequestOutput) and AsyncOmni (returns AsyncGenerator)
-            if isinstance(self._diffusion_engine, AsyncOmni):
-                diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
-                result = None
-                async for output in diffusion_engine.generate(
-                    prompt=gen_prompt,
-                    sampling_params_list=[gen_params],  # Pass as single-stage params
-                    request_id=request_id,
-                ):
-                    result = output
-                if result is None:
-                    return self._create_error_response("No output generated from AsyncOmni")
-            else:
-                # AsyncOmniDiffusion: direct call
-                diffusion_engine = cast(AsyncOmniDiffusion, self._diffusion_engine)
-                result = await diffusion_engine.generate(
-                    prompt=gen_prompt,
-                    sampling_params=gen_params,
-                    request_id=request_id,
-                )
+            diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
+            result = None
+            async for output in diffusion_engine.generate(
+                prompt=gen_prompt,
+                sampling_params_list=[gen_params],  # Pass as single-stage params
+                request_id=request_id,
+            ):
+                result = output
+            if result is None:
+                return self._create_error_response("No output generated from AsyncOmni")
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])
