@@ -114,7 +114,6 @@ class AsyncOmniDiffusion:
 
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
                 od_config.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
-                od_config.model_config = tf_config_dict
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
