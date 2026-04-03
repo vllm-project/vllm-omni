@@ -79,6 +79,7 @@ class StageDiffusionClient:
         self._rpc_results: dict[str, Any] = {}
         self._pending_rpcs: set[str] = set()
         self._tasks: dict[str, asyncio.Task] = {}
+        self._shutting_down = False
 
         logger.info("[StageDiffusionClient] Stage-%s initialized (batch_size=%d)", self.stage_id, batch_size)
 
@@ -242,7 +243,7 @@ class StageDiffusionClient:
         try:
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
-            if self._proc is not None and not self._proc.is_alive():
+            if not self._shutting_down and self._proc is not None and not self._proc.is_alive():
                 raise RuntimeError(f"StageDiffusionProc died unexpectedly (exit code {self._proc.exitcode})")
             return None
 
@@ -313,6 +314,7 @@ class StageDiffusionClient:
             self._pending_rpcs.discard(rpc_id)
 
     def shutdown(self) -> None:
+        self._shutting_down = True
         try:
             self._request_socket.send(self._encoder.encode({"type": "shutdown"}))
         except Exception:
