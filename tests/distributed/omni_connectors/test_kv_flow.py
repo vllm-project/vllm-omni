@@ -1,3 +1,6 @@
+import json
+import struct
+
 import pytest
 import torch
 
@@ -71,6 +74,25 @@ def _decode_stored_payload(data):
     return data
 
 
+def _make_serialized_payload() -> tuple[bytes, torch.Tensor]:
+    key_tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    payload = KVCacheTransferData(
+        request_id="req-payload",
+        layer_blocks={"key_cache": [key_tensor], "value_cache": [None]},
+        block_ids=[1],
+        metadata={"seq_len": 3},
+    ).to_bytes()
+    return payload, key_tensor
+
+
+def _rewrite_serialized_header(payload: bytes, mutate_header) -> bytes:
+    header_len = struct.unpack(">I", payload[:4])[0]
+    header = json.loads(payload[4 : 4 + header_len])
+    mutate_header(header)
+    new_header = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return struct.pack(">I", len(new_header)) + new_header + payload[4 + header_len :]
+
+
 def test_manager_extraction(kv_config, mock_connector, common_constants):
     """Test extraction and sending logic in OmniKVTransferManager."""
     num_layers = common_constants["num_layers"]
@@ -115,6 +137,28 @@ def test_manager_extraction(kv_config, mock_connector, common_constants):
     # Note: Manager detaches and moves to CPU
     expected_shape = (seq_len, num_heads, head_dim)
     assert data["layer_blocks"]["key_cache"][0].shape == expected_shape
+
+
+def test_from_bytes_rejects_out_of_bounds_header_len():
+    payload, _ = _make_serialized_payload()
+    bad_payload = struct.pack(">I", len(payload)) + payload[4:]
+
+    with pytest.raises(ValueError, match="header_len"):
+        KVCacheTransferData.from_bytes(bad_payload)
+
+    with pytest.raises(ValueError, match="header_len"):
+        KVCacheTransferData.from_bytes_gpu(torch.tensor(list(bad_payload), dtype=torch.uint8))
+
+
+def test_from_bytes_rejects_out_of_bounds_tensor_span():
+    payload, _ = _make_serialized_payload()
+    bad_payload = _rewrite_serialized_header(payload, lambda header: header["td"][0].update({"o": 4096}))
+
+    with pytest.raises(ValueError, match="tensor span"):
+        KVCacheTransferData.from_bytes(bad_payload)
+
+    with pytest.raises(ValueError, match="tensor span"):
+        KVCacheTransferData.from_bytes_gpu(torch.tensor(list(bad_payload), dtype=torch.uint8))
 
 
 def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_constants):

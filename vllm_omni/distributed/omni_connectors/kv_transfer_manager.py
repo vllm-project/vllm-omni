@@ -149,13 +149,52 @@ class KVCacheTransferData:
         return output
 
     @staticmethod
+    def _load_header_from_memoryview(raw_mv: memoryview) -> tuple[dict[str, Any], memoryview]:
+        if len(raw_mv) < 4:
+            raise ValueError("Corrupted KV payload: missing 4-byte header length")
+
+        header_len = struct.unpack(">I", raw_mv[:4])[0]
+        if header_len > len(raw_mv) - 4:
+            raise ValueError(
+                f"Corrupted KV payload: header_len={header_len} exceeds buffer size={len(raw_mv)}"
+            )
+
+        return json.loads(bytes(raw_mv[4 : 4 + header_len])), raw_mv[4 + header_len :]
+
+    @staticmethod
+    def _load_header_from_tensor(gpu_tensor: torch.Tensor) -> tuple[dict[str, Any], int]:
+        if gpu_tensor.dtype != torch.uint8 or gpu_tensor.dim() != 1:
+            raise ValueError("Packed GPU KV payload must be a 1-D uint8 tensor")
+
+        total_bytes = int(gpu_tensor.numel())
+        if total_bytes < 4:
+            raise ValueError("Corrupted KV payload: missing 4-byte header length")
+
+        header_len = struct.unpack(">I", gpu_tensor[:4].cpu().numpy().tobytes())[0]
+        if header_len > total_bytes - 4:
+            raise ValueError(
+                f"Corrupted KV payload: header_len={header_len} exceeds buffer size={total_bytes}"
+            )
+
+        header_bytes = gpu_tensor[4 : 4 + header_len].cpu().numpy().tobytes()
+        return json.loads(header_bytes), 4 + header_len
+
+    @staticmethod
+    def _validate_tensor_span(name: str, info: dict[str, Any], tensor_data_bytes: int) -> tuple[int, int]:
+        offset = info["o"]
+        nbytes = info["b"]
+        if offset < 0 or nbytes < 0 or offset + nbytes > tensor_data_bytes:
+            raise ValueError(
+                f"Corrupted KV payload tensor span for {name}: "
+                f"offset={offset}, bytes={nbytes}, tensor_data_bytes={tensor_data_bytes}"
+            )
+        return offset, nbytes
+
+    @staticmethod
     def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
         """Reconstruct KV cache data from the packed bytes format."""
         raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
-        header_len = struct.unpack(">I", raw_mv[:4])[0]
-        header = json.loads(bytes(raw_mv[4 : 4 + header_len]))
-        data_start = 4 + header_len
-        tensor_data_mv = raw_mv[data_start:]
+        header, tensor_data_mv = KVCacheTransferData._load_header_from_memoryview(raw_mv)
 
         num_layers = header["nl"]
         key_cache: list[torch.Tensor | None] = [None] * num_layers
@@ -167,12 +206,13 @@ class KVCacheTransferData:
 
             name: str = info["n"]
             torch_dtype = getattr(torch, info["d"])
+            offset, nbytes = KVCacheTransferData._validate_tensor_span(name, info, len(tensor_data_mv))
             t = (
                 torch.frombuffer(
                     tensor_data_mv,
                     dtype=torch.uint8,
-                    offset=info["o"],
-                    count=info["b"],
+                    offset=offset,
+                    count=nbytes,
                 )
                 .view(torch_dtype)
                 .reshape(info["s"])
@@ -193,14 +233,12 @@ class KVCacheTransferData:
     @staticmethod
     def from_bytes_gpu(gpu_tensor: torch.Tensor) -> dict[str, Any]:
         """Reconstruct KV cache data from a packed GPU tensor."""
-        header_len = struct.unpack(">I", gpu_tensor[:4].cpu().numpy().tobytes())[0]
-        header_bytes = gpu_tensor[4 : 4 + header_len].cpu().numpy().tobytes()
-        header = json.loads(header_bytes)
-        data_start = 4 + header_len
+        header, data_start = KVCacheTransferData._load_header_from_tensor(gpu_tensor)
 
         num_layers = header["nl"]
         key_cache: list[torch.Tensor | None] = [None] * num_layers
         value_cache: list[torch.Tensor | None] = [None] * num_layers
+        tensor_data_bytes = int(gpu_tensor.numel()) - data_start
 
         for info in header["td"]:
             if info.get("x"):
@@ -208,7 +246,8 @@ class KVCacheTransferData:
 
             name: str = info["n"]
             torch_dtype = getattr(torch, info["d"])
-            t = gpu_tensor[data_start + info["o"] : data_start + info["o"] + info["b"]].clone()
+            offset, nbytes = KVCacheTransferData._validate_tensor_span(name, info, tensor_data_bytes)
+            t = gpu_tensor[data_start + offset : data_start + offset + nbytes].clone()
             t = t.view(torch_dtype).reshape(info["s"])
             layer_idx = int(name.split("_")[-1])
             if name.startswith("key_cache_"):
