@@ -223,3 +223,4 @@ extend-ignore-identifiers-re = [
 ue = "ue"
 semantics = "semantics"
 fullset = "fullset"
+Vai = "Vai"
