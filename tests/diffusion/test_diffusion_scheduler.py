@@ -686,6 +686,15 @@ class TestStepScheduler:
 
         request = _make_request("timing")
 
+        # perf_counter call order in step() (pre_process_func is None, so no
+        # preprocess calls):
+        #   0 → diffusion_engine_start_time
+        #   1 → exec_start_time
+        #   2 → exec_total_time  (exec = 2-1 = 1.0 s → 1000 ms)
+        #   3 → postprocess_start_time
+        #   4 → postprocess_time (post = 4-3 = 1.0 s)
+        #   5 → step_total_ms log line
+        #   6 → diffusion_engine_total_time_ms in metrics (total = 6-0 = 6.0 s → 6000 ms)
         with (
             patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False),
             patch(

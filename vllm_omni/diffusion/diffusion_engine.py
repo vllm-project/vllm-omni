@@ -229,14 +229,13 @@ class DiffusionEngine:
             for i, prompt in enumerate(request.prompts):
                 request_id = request.request_ids[i] if i < len(request.request_ids) else ""
 
-                # Get images for this request
                 num_outputs = request.sampling_params.num_outputs_per_prompt
                 start_idx = output_idx
                 end_idx = start_idx + num_outputs
-                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
                 output_idx = end_idx
 
                 if is_audio_output:
+                    # Slice batched tensor directly; batch dim is preserved.
                     request_audio_payload = outputs[start_idx:end_idx] if outputs is not None else None
                     results.append(
                         OmniRequestOutput.from_diffusion(
@@ -252,6 +251,7 @@ class DiffusionEngine:
                         ),
                     )
                 else:
+                    request_outputs = outputs[start_idx:end_idx] if start_idx < len(outputs) else []
                     mm_output = {}
                     if audio_payload is not None:
                         sliced_audio = audio_payload
