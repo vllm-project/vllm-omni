@@ -7,11 +7,8 @@ import queue
 import threading
 import time
 from collections.abc import Iterable
-from concurrent.futures import (
-    Future,
-    InvalidStateError,
-    TimeoutError as FutureTimeoutError,
-)
+from concurrent.futures import Future, InvalidStateError
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any
 
@@ -422,9 +419,7 @@ class DiffusionEngine:
         """
         if self._core_ready.wait(timeout=self.CORE_READY_TIMEOUT_S):
             return
-        raise RuntimeError(
-            f"DiffusionEngine core loop did not become ready within {self.CORE_READY_TIMEOUT_S:.1f}s."
-        )
+        raise RuntimeError(f"DiffusionEngine core loop did not become ready within {self.CORE_READY_TIMEOUT_S:.1f}s.")
 
     def _prepare_step_request(
         self,
@@ -770,9 +765,7 @@ class DiffusionEngine:
                 self._drain_commands(block=True)
         except BaseException as exc:
             logger.error("DiffusionEngine core loop crashed.", exc_info=True)
-            self._core_loop_error = RuntimeError(
-                f"DiffusionEngine core loop exited unexpectedly: {exc}"
-            )
+            self._core_loop_error = RuntimeError(f"DiffusionEngine core loop exited unexpectedly: {exc}")
             self._shutdown_requested.set()
         finally:
             # The thread may crash before a submitter gets past the constructor's
@@ -1007,9 +1000,7 @@ class DiffusionEngine:
             if future is not None:
                 self._try_set_future_exception(
                     future,
-                    RuntimeError(
-                        f"Failed to finalize diffusion request {sched_req_id}: {exc}"
-                    ),
+                    RuntimeError(f"Failed to finalize diffusion request {sched_req_id}: {exc}"),
                 )
             raise
 
@@ -1086,9 +1077,7 @@ class DiffusionEngine:
         """
         core_thread = getattr(self, "_core_thread", None)
         shutdown_requested = getattr(self, "_shutdown_requested", None)
-        is_shutting_down = (
-            shutdown_requested.is_set() if shutdown_requested is not None else False
-        )
+        is_shutting_down = shutdown_requested.is_set() if shutdown_requested is not None else False
 
         if (
             core_thread is not None

@@ -105,9 +105,7 @@ class TestCoreLoopRequestExecution:
         engine = _make_engine(execute_fn=execute_fn)
         try:
             thread_a = threading.Thread(
-                target=lambda: results.setdefault(
-                    "A", engine.add_req_and_wait_for_response(_make_request("A"))
-                ),
+                target=lambda: results.setdefault("A", engine.add_req_and_wait_for_response(_make_request("A"))),
                 daemon=True,
             )
             thread_a.start()
