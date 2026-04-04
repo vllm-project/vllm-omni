@@ -26,8 +26,8 @@ steps:
       npu-smi info
 
       echo "--- Verifying Ascend runtime"
-      source /usr/local/Ascend/ascend-toolkit/set_env.sh
-      source /usr/local/Ascend/nnal/atb/set_env.sh
+      . /usr/local/Ascend/ascend-toolkit/set_env.sh
+      . /usr/local/Ascend/nnal/atb/set_env.sh
 
       python3 - <<'PY'
       import torch
