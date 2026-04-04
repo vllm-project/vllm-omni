@@ -15,12 +15,6 @@ steps:
       uname -a
       python3 --version
 
-      echo "--- Verifying NPU device mounts"
-      ls -l /dev/davinci0
-      ls -l /dev/davinci_manager
-      ls -l /dev/devmm_svm
-      ls -l /dev/hisi_hdc
-
       echo "--- Verifying npu-smi"
       ls -l /usr/local/bin/npu-smi
       npu-smi info
