@@ -495,7 +495,7 @@ class StageDiffusionProc:
             nonlocal shutdown_requested
             if not shutdown_requested:
                 shutdown_requested = True
-                raise SystemExit()
+                raise SystemExit(128 + signum)
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)

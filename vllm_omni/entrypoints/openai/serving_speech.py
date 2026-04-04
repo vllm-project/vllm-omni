@@ -1642,3 +1642,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             succeeded=succeeded,
             failed=len(final_results) - succeeded,
         )
+
+
+ServingSpeech = OmniOpenAIServingSpeech

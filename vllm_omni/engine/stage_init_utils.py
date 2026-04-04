@@ -467,6 +467,35 @@ def initialize_diffusion_stage(
     return StageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
 
 
+def _shutdown_or_close_resource(resource: Any, resource_name: str, stage_id: int) -> None:
+    """vLLM CoreEngineProcManager / coordinators use ``shutdown()``, not ``close()``."""
+    if resource is None:
+        return
+    shutdown = getattr(resource, "shutdown", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception as cleanup_error:
+            logger.warning(
+                "[stage_init] Failed to shutdown launched %s for stage %s: %s",
+                resource_name,
+                stage_id,
+                cleanup_error,
+            )
+        return
+    close = getattr(resource, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as cleanup_error:
+            logger.warning(
+                "[stage_init] Failed to close launched %s for stage %s: %s",
+                resource_name,
+                stage_id,
+                cleanup_error,
+            )
+
+
 def close_started_llm_stage(started: StartedLlmStage) -> None:
     """Terminate the subprocess owned by a launched stage that never attached."""
     if started.proc is None:

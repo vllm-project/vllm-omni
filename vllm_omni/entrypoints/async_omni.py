@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, Iterable, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from vllm import TokensPrompt
@@ -88,7 +88,12 @@ class AsyncOmni(EngineClient, OmniBase):
         else:
             vllm_config = self.engine.stage_vllm_configs[stage_index]
             io_processor_plugin = vllm_config.model_config.io_processor_plugin
-            self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+            renderer = self.renderer
+            if renderer is None:
+                from vllm.renderers import renderer_from_config
+
+                renderer = renderer_from_config(vllm_config)
+            self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
 
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
@@ -159,6 +164,10 @@ class AsyncOmni(EngineClient, OmniBase):
         tokenization_kwargs: dict[str, Any] | None = None,
         sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         output_modalities: list[str] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 

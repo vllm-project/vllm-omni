@@ -29,6 +29,7 @@ from mistral_common.tokens.tokenizers.audio import Audio, AudioEncoder
 from transformers import BatchFeature
 from transformers.tokenization_utils_base import TextInput
 from vllm.config import VllmConfig
+from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsMultiModal
@@ -39,7 +40,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
     NestedTensors,

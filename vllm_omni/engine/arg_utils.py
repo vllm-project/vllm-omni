@@ -1,6 +1,8 @@
 import argparse
 import dataclasses
+import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -135,6 +137,30 @@ class OmniEngineArgs(EngineArgs):
         self._omni_models_registered = True
         return True
 
+    def _patch_empty_hf_config(self, model_type: str) -> None:
+        """For models with empty config.json (e.g. CosyVoice3), create a
+        patched config in a temp directory with model_type set so that
+        transformers AutoConfig.from_pretrained can resolve the config class.
+        Sets self.hf_config_path to point to the patched directory."""
+        try:
+            from transformers import PretrainedConfig
+
+            config_dict, _ = PretrainedConfig.get_config_dict(self.model)
+            if config_dict.get("model_type"):
+                return  # config.json already has model_type, no patching needed
+        except Exception:
+            return  # can't load config, let vLLM handle the error
+
+        # Create a temp dir with a patched config.json
+        temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")
+        config_dict["model_type"] = model_type
+        config_dict.setdefault("architectures", [self.model_arch])
+        with open(os.path.join(temp_dir, "config.json"), "w") as f:
+            json.dump(config_dict, f)
+        self.hf_config_path = temp_dir
+        self._temp_config_dir = temp_dir
+        logger.info("Patched empty HF config with model_type=%s at %s", model_type, temp_dir)
+
     def create_model_config(self) -> OmniModelConfig:
         """Create an OmniModelConfig from these engine arguments.
         Returns:
@@ -163,6 +189,18 @@ class OmniEngineArgs(EngineArgs):
                     model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                     if model_type is not None:
                         self.hf_overrides.setdefault("model_type", model_type)
+
+            # For models whose HF config.json is empty or lacks model_type
+            # (e.g. CosyVoice3), AutoConfig.from_pretrained fails because it
+            # cannot determine which config class to use from the empty dict.
+            # hf_overrides alone is not enough since transformers reads
+            # model_type from config_dict before applying overrides.
+            # Workaround: create a patched config.json in a temp directory
+            # and point hf_config_path to it so vLLM reads model_type from it.
+            if not self.hf_config_path:
+                model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
+                if model_type is not None:
+                    self._patch_empty_hf_config(model_type)
 
         # Auto-detect tokenizer for models that store it in a subdirectory
         # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
@@ -200,7 +238,15 @@ class OmniEngineArgs(EngineArgs):
                         logger.warning("Failed to download tokenizer subfolder: %s", e)
 
         # Build the vLLM config first, then use it to create the Omni config.
-        model_config = super().create_model_config()
+        try:
+            model_config = super().create_model_config()
+        finally:
+            # Clean up temp config dir if we created one
+            if hasattr(self, "_temp_config_dir"):
+                import shutil
+
+                shutil.rmtree(self._temp_config_dir, ignore_errors=True)
+                del self._temp_config_dir
 
         omni_config = OmniModelConfig.from_vllm_model_config(
             model_config=model_config,

@@ -1664,6 +1664,7 @@ class TestFishSpeechServing:
         assert all(allowed_special is None for _, _, allowed_special in tokenizer.calls)
 
     def test_build_fish_clone_prompt_normalizes_text_fields(self, fish_speech_server):
+        fish_speech_server._fish_speech_tokenizer = _FakeFishTokenizer()
         fish_speech_server._estimate_fish_prompt_len = MagicMock(return_value=123)
 
         request = OpenAICreateSpeechRequest(

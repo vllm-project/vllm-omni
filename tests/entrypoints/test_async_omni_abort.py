@@ -13,8 +13,8 @@ def test_generate_accepts_request_after_repeated_cancellations():
         submitted_request_ids = []
         aborted_request_batches = []
 
-        async def fake_add_request_async(*, request_id, prompt, sampling_params_list, final_stage_id):
-            del prompt, sampling_params_list, final_stage_id
+        async def fake_add_request_async(*, request_id, prompt, sampling_params_list, final_stage_id, **kwargs):
+            del prompt, sampling_params_list, final_stage_id, kwargs
             submitted_request_ids.append(request_id)
 
         async def fake_abort_async(request_ids):

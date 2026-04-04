@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -652,6 +652,12 @@ class AsyncOmniEngine:
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        lora_request: Any = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
         message_type: str = "add_request",
@@ -686,11 +692,19 @@ class AsyncOmniEngine:
                 params=params,
                 supported_tasks=self.supported_tasks,
                 arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
                 resumable=resumable,
             )
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = _upgrade_to_omni_request(request, prompt)
+
+            if reasoning_ended is not None:
+                request.reasoning_ended = reasoning_ended
 
             # Restore external_req_id to the original user-facing request_id.
             # InputProcessor.process_inputs() renames request_id to an internal
@@ -973,6 +987,12 @@ class AsyncOmniEngine:
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        lora_request: Any = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
     ) -> None:
@@ -990,6 +1010,12 @@ class AsyncOmniEngine:
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             arrival_time=arrival_time,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            reasoning_ended=reasoning_ended,
             resumable=resumable,
         )
         if self.request_queue is None:
@@ -1013,6 +1039,12 @@ class AsyncOmniEngine:
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        lora_request: Any = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
     ) -> None:
@@ -1024,6 +1056,12 @@ class AsyncOmniEngine:
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             arrival_time=arrival_time,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            reasoning_ended=reasoning_ended,
             resumable=resumable,
         )
 
