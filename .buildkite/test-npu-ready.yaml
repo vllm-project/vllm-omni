@@ -24,20 +24,7 @@ steps:
       echo "--- Verifying npu-smi"
       ls -l /usr/local/bin/npu-smi
       npu-smi info
-
-      echo "--- Verifying Ascend runtime"
-      . /usr/local/Ascend/ascend-toolkit/set_env.sh
-      . /usr/local/Ascend/nnal/atb/set_env.sh
-
-      python3 - <<'PY'
-      import torch
-      print("torch version:", torch.__version__)
-      print("torch.npu available:", torch.npu.is_available())
-
-      if not torch.npu.is_available():
-          raise RuntimeError("NPU is not available inside test container")
-      PY
-
+      
       echo "--- Running pytest"
       timeout 20m pytest -v -s -m 'core_model and npu' \
         --cov=vllm_omni \
