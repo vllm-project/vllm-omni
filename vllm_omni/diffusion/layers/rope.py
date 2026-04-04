@@ -81,6 +81,45 @@ def _restore_batch_dim(x: torch.Tensor, squeezed: bool) -> torch.Tensor:
     return x
 
 
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor | None = None,
+    unsqueeze_dim: int = 1,
+    mla: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Rotary Position Embedding to query and key tensors (LLM-style).
+
+    Args:
+        q: Query tensor.
+        k: Key tensor.
+        cos: Cosine part of the rotary embedding.
+        sin: Sine part of the rotary embedding.
+        position_ids: Position indices for cos/sin gathering. None to skip.
+        unsqueeze_dim: Dimension along which to unsqueeze cos/sin for broadcasting.
+        mla: If True, apply Multi-head Latent Attention reshape before rotation
+            (interleaved-to-half layout conversion).
+    """
+    if position_ids is not None:
+        cos = cos[position_ids]
+        sin = sin[position_ids]
+
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    if mla:
+        b, h, s, d = q.shape
+        q = q.reshape(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+        b, h, s, d = k.shape
+        k = k.reshape(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 class RotaryEmbedding(CustomOp):
     """
     rotary positional embedding.
