@@ -18,6 +18,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Sequence
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -31,7 +32,6 @@ from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
-from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
@@ -44,6 +44,10 @@ from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage_engine_core_proc import (
+    complete_stage_handshake,
+    spawn_stage_core,
+)
 from vllm_omni.engine.stage_init_utils import (
     StartedLlmStage,
     acquire_device_locks,
@@ -63,8 +67,20 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
 )
+from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _patch_generation_config_if_needed(model_config: Any) -> None:
+    """Ensure try_get_generation_config won't crash for models whose HF
+    config.json lacks model_type (e.g. CosyVoice3). We probe it once;
+    if it raises, we monkey-patch the method to return None."""
+    try:
+        model_config.try_get_generation_config()
+    except Exception:
+        model_config.try_get_generation_config = lambda: {}
 
 
 def _inject_kv_stage_info(stage_cfg: Any, stage_id: int) -> None:
@@ -296,8 +312,6 @@ class AsyncOmniEngine:
         omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
     ) -> StartedLlmStage:
         """Launch one LLM stage to READY state in a helper thread."""
-        from vllm_omni.platforms import current_omni_platform
-
         started_stage: StartedLlmStage | None = None
         lock_fds: list[int] = []
         device_control_env = current_omni_platform.device_control_env_var
@@ -333,21 +347,17 @@ class AsyncOmniEngine:
                         engine_args_dict,
                         stage_init_timeout,
                     )
-                    addresses = get_engine_zmq_addresses(vllm_config)
-                    launch_cm = launch_core_engines(
+                    addresses, proc, handshake_address = spawn_stage_core(
                         vllm_config=vllm_config,
                         executor_class=executor_class,
                         log_stats=False,
-                        addresses=addresses,
                     )
-                    engine_manager, coordinator, addresses = launch_cm.__enter__()
                     started_stage = StartedLlmStage(
                         stage_id=metadata.stage_id,
                         metadata=metadata,
                         vllm_config=vllm_config,
                         executor_class=executor_class,
-                        engine_manager=engine_manager,
-                        coordinator=coordinator,
+                        proc=proc,
                         addresses=addresses,
                     )
                 finally:
@@ -357,7 +367,7 @@ class AsyncOmniEngine:
                         current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
             logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
-            launch_cm.__exit__(None, None, None)
+            complete_stage_handshake(proc, handshake_address, addresses, vllm_config)
             logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
             assert started_stage is not None
             return started_stage
@@ -388,11 +398,9 @@ class AsyncOmniEngine:
                 executor_class=started.executor_class,
                 metadata=started.metadata,
                 client_addresses=client_addresses,
-                engine_manager=started.engine_manager,
-                coordinator=started.coordinator,
+                proc=started.proc,
             )
-            started.engine_manager = None
-            started.coordinator = None
+            started.proc = None
         except Exception:
             close_started_llm_stage(started)
             raise
@@ -411,7 +419,20 @@ class AsyncOmniEngine:
             )
             input_processor = None
             if started.stage_id == 0:
+                # Some omni models (e.g. CosyVoice3) have an empty HF
+                # config.json without model_type, which causes
+                # try_get_generation_config -> AutoConfig.from_pretrained
+                # to raise ValueError. Patch it to return None so
+                # InputProcessor doesn't crash.
+                _patch_generation_config_if_needed(started.vllm_config.model_config)
                 input_processor = InputProcessor(vllm_config=started.vllm_config)
+                # Use omni preprocessor so text-only prompts with
+                # mm_processor_kwargs (e.g. GLM-Image t2i target_h/target_w)
+                # still go through multimodal processor path.
+                input_processor.input_preprocessor = OmniInputPreprocessor(
+                    vllm_config=started.vllm_config,
+                    renderer=input_processor.renderer,
+                )
         except Exception:
             try:
                 stage_client.shutdown()
@@ -428,6 +449,7 @@ class AsyncOmniEngine:
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors in orchestrator thread and assign to self."""
+        device_control_env = current_omni_platform.device_control_env_var
 
         num_stages = self.num_stages
         stage_clients: list[Any | None] = [None] * num_stages
@@ -468,24 +490,32 @@ class AsyncOmniEngine:
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
 
                     if metadata.stage_type == "diffusion":
-                        setup_stage_devices(stage_id, metadata.runtime_cfg)
-                        omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-                        if omni_conn_cfg:
-                            from vllm_omni.entrypoints.utils import inject_omni_kv_config
+                        with llm_stage_launch_lock:
+                            previous_visible_devices = os.environ.get(device_control_env)
+                            try:
+                                setup_stage_devices(stage_id, metadata.runtime_cfg)
+                                omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+                                if omni_conn_cfg:
+                                    from vllm_omni.entrypoints.utils import inject_omni_kv_config
 
-                            inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                        _inject_kv_stage_info(stage_cfg, stage_id)
-                        stage_clients[stage_id] = initialize_diffusion_stage(
-                            self.model,
-                            stage_cfg,
-                            metadata,
-                            batch_size=self.diffusion_batch_size,
-                        )
-                        logger.info(
-                            "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
-                            stage_id,
-                            self.diffusion_batch_size,
-                        )
+                                    inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                                _inject_kv_stage_info(stage_cfg, stage_id)
+                                stage_clients[stage_id] = initialize_diffusion_stage(
+                                    self.model,
+                                    stage_cfg,
+                                    metadata,
+                                    batch_size=self.diffusion_batch_size,
+                                )
+                                logger.info(
+                                    "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
+                                    stage_id,
+                                    self.diffusion_batch_size,
+                                )
+                            finally:
+                                if previous_visible_devices is None:
+                                    current_omni_platform.unset_device_control_env_var()
+                                else:
+                                    current_omni_platform.set_device_control_env_var(previous_visible_devices)
                         continue
 
                     llm_stage_ids.append(stage_id)
@@ -618,9 +648,13 @@ class AsyncOmniEngine:
         self,
         request_id: str,
         prompt: EngineCoreRequest | PromptType,
+        prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        *,
+        resumable: bool = False,
+        message_type: str = "add_request",
     ) -> dict[str, Any]:
         """Build an add_request message after stage-0 preprocessing."""
         effective_sampling_params_list = (
@@ -652,6 +686,7 @@ class AsyncOmniEngine:
                 params=params,
                 supported_tasks=self.supported_tasks,
                 arrival_time=arrival_time,
+                resumable=resumable,
             )
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
@@ -666,9 +701,10 @@ class AsyncOmniEngine:
             request.external_req_id = request_id
 
             # Register with stage 0's output processor.
+            output_prompt_text = prompt_text
             self.output_processors[0].add_request(
                 request=request,
-                prompt=prompt,
+                prompt=output_prompt_text,
                 parent_req=None,
                 request_index=0,
                 queue=None,
@@ -676,7 +712,7 @@ class AsyncOmniEngine:
             prompt = request
 
         return {
-            "type": "add_request",
+            "type": message_type,
             "request_id": request_id,
             "prompt": prompt,
             "original_prompt": original_prompt,
@@ -705,14 +741,15 @@ class AsyncOmniEngine:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
 
-            # Run through same input processing as the main prompt
+            companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
+
             if isinstance(companion_prompt, dict):
                 _inject_global_id(companion_prompt, cid)
 
             request = self.input_processor.process_inputs(
                 request_id=cid,
                 prompt=companion_prompt,
-                params=stage0_params,
+                params=companion_params,
                 supported_tasks=self.supported_tasks,
             )
             request = _upgrade_to_omni_request(request, companion_prompt)
@@ -733,7 +770,7 @@ class AsyncOmniEngine:
                     "parent_id": parent_id,
                     "role": ep.role,
                     "prompt": request,
-                    "sampling_params_list": sampling_params_list,
+                    "sampling_params_list": companion_spl,
                 }
             )
 
@@ -802,6 +839,7 @@ class AsyncOmniEngine:
         if parallel_config is None:
             ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
             ring_degree = normalized_kwargs.get("ring_degree") or 1
+            ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
@@ -819,6 +857,7 @@ class AsyncOmniEngine:
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
+                ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 use_hsdp=use_hsdp,
@@ -841,6 +880,7 @@ class AsyncOmniEngine:
                     "max_num_seqs": 1,
                     "parallel_config": parallel_config,
                     "model_class_name": kwargs.get("model_class_name", None),
+                    "step_execution": kwargs.get("step_execution", False),
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
                     "cache_backend": cache_backend,
@@ -857,6 +897,15 @@ class AsyncOmniEngine:
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
                     "quantization": kwargs.get("quantization", None),
                     "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+                    **(
+                        {
+                            "profiler_config": asdict(kwargs["profiler_config"])
+                            if hasattr(kwargs["profiler_config"], "__dataclass_fields__")
+                            else kwargs["profiler_config"]
+                        }
+                        if kwargs.get("profiler_config") is not None
+                        else {}
+                    ),
                 },
                 "final_output": True,
                 "final_output_type": "image",
@@ -920,9 +969,12 @@ class AsyncOmniEngine:
         self,
         request_id: str,
         prompt: EngineCoreRequest | PromptType,
+        prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        *,
+        resumable: bool = False,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
 
@@ -934,9 +986,11 @@ class AsyncOmniEngine:
         msg = self._build_add_request_message(
             request_id=request_id,
             prompt=prompt,
+            prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             arrival_time=arrival_time,
+            resumable=resumable,
         )
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
@@ -955,17 +1009,70 @@ class AsyncOmniEngine:
         self,
         request_id: str,
         prompt: EngineCoreRequest | PromptType,
+        prompt_text: str | None = None,
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        *,
+        resumable: bool = False,
     ) -> None:
         """Async add_request API."""
         self.add_request(
             request_id=request_id,
             prompt=prompt,
+            prompt_text=prompt_text,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             arrival_time=arrival_time,
+            resumable=resumable,
+        )
+
+    def add_streaming_update(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType,
+        prompt_text: str | None = None,
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+        arrival_time: float | None = None,
+        *,
+        resumable: bool = True,
+    ) -> None:
+        """Send an incremental streaming update for an existing request."""
+        msg = self._build_add_request_message(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_text=prompt_text,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+            arrival_time=arrival_time,
+            resumable=resumable,
+            message_type="streaming_update",
+        )
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        self.request_queue.sync_q.put_nowait(msg)
+
+    async def add_streaming_update_async(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType,
+        prompt_text: str | None = None,
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+        arrival_time: float | None = None,
+        *,
+        resumable: bool = True,
+    ) -> None:
+        """Async wrapper for add_streaming_update()."""
+        self.add_streaming_update(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_text=prompt_text,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+            arrival_time=arrival_time,
+            resumable=resumable,
         )
 
     def try_get_output(self, timeout: float = 0.001) -> dict[str, Any] | None:
@@ -975,6 +1082,8 @@ class AsyncOmniEngine:
         try:
             return self.output_queue.sync_q.get(timeout=timeout)
         except queue.Empty:
+            if not self.is_alive():
+                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
     async def try_get_output_async(self) -> dict[str, Any] | None:
@@ -984,6 +1093,8 @@ class AsyncOmniEngine:
         try:
             return self.output_queue.sync_q.get_nowait()
         except queue.Empty:
+            if not self.is_alive():
+                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
     def get_stage_metadata(self, stage_id: int) -> dict[str, Any]:

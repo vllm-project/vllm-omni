@@ -201,6 +201,15 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ulysses_degree.",
         )
         omni_config_group.add_argument(
+            "--ulysses-mode",
+            type=str,
+            default="strict",
+            choices=["strict", "advanced_uaa"],
+            help="Ulysses sequence-parallel mode for diffusion models. "
+            "'strict' keeps the original divisibility requirements; "
+            "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",
@@ -257,6 +266,11 @@ class OmniServeCommand(CLISubcommand):
             "--enable-cache-dit-summary",
             action="store_true",
             help="Enable cache-dit summary logging after diffusion forward passes.",
+        )
+        omni_config_group.add_argument(
+            "--step-execution",
+            action="store_true",
+            help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
 
         # VAE memory optimization parameters

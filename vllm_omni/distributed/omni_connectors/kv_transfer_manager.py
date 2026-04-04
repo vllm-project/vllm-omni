@@ -531,3 +531,93 @@ class OmniKVTransferManager:
                 logger.exception("Failed to collect CFG KV caches for %s", request_id)
 
         return primary_ok
+
+    def receive_multi_kv_cache_distributed(
+        self,
+        req: Any,
+        cfg_kv_collect_func: Callable | None = None,
+        target_device: torch.device | None = None,
+    ) -> bool:
+        """Broadcast-aware wrapper around :meth:`receive_multi_kv_cache`.
+
+        SharedMemory connector is single-reader: once rank 0 consumes the
+        segment it is deleted.  For multi-GPU stages (e.g. sequence-parallel)
+        only rank 0 receives; the result is then broadcast to every other
+        rank via the world process-group.
+
+        For single-worker stages this is equivalent to calling
+        :meth:`receive_multi_kv_cache` directly.
+        """
+        from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+        world = get_world_group()
+
+        if world.world_size <= 1:
+            return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
+
+        # --- rank 0: receive to CPU (needed for pickle-based broadcast) ---
+        if world.rank_in_group == 0:
+            self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
+
+            kv_payload: dict[str, object] = {}
+            for attr in ("past_key_values", "kv_metadata"):
+                val = getattr(req, attr, None)
+                if val is not None:
+                    kv_payload[attr] = val
+
+            if hasattr(req, "sampling_params") and req.sampling_params is not None:
+                for key in list(vars(req.sampling_params).keys()):
+                    if (key.startswith("cfg_") and key.endswith("_past_key_values")) or key in (
+                        "past_key_values",
+                        "kv_metadata",
+                    ):
+                        val = getattr(req.sampling_params, key, None)
+                        if val is not None:
+                            kv_payload[f"sp.{key}"] = val
+
+            payload_list = [kv_payload]
+            # Use broadcast_object_list (pickle-based) instead of broadcast_tensor_dict
+            # because the KV cache is a heterogeneous nested structure (NaiveCache objects
+            # with metadata + tensors), not a flat tensor dict.  This runs once before
+            # the denoising loop so the serialization cost is negligible.
+            torch.distributed.broadcast_object_list(payload_list, src=world.ranks[0], group=world.cpu_group)
+            kv_payload = payload_list[0]
+        else:
+            payload_list: list[dict[str, object] | None] = [None]
+            torch.distributed.broadcast_object_list(payload_list, src=world.ranks[0], group=world.cpu_group)
+            kv_payload = payload_list[0]
+
+        # --- apply on ALL ranks (rank 0 also needs CPU→GPU move) ---
+        if not kv_payload:
+            return False
+
+        for attr in ("past_key_values", "kv_metadata"):
+            val = kv_payload.get(attr)
+            if val is not None:
+                if target_device is not None:
+                    val = _move_to_device(val, target_device)
+                setattr(req, attr, val)
+
+        if hasattr(req, "sampling_params") and req.sampling_params is not None:
+            for key, val in kv_payload.items():
+                if key.startswith("sp."):
+                    if target_device is not None:
+                        val = _move_to_device(val, target_device)
+                    setattr(req.sampling_params, key[3:], val)
+
+        return True
+
+
+def _move_to_device(obj: object, device: torch.device) -> object:
+    """Recursively move tensors inside a KV cache object to *device*."""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device).contiguous() if obj.device != device else obj
+    if hasattr(obj, "__dict__"):
+        for k, v in vars(obj).items():
+            setattr(obj, k, _move_to_device(v, device))
+        return obj
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_move_to_device(v, device) for v in obj]
+    return obj

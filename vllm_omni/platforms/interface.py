@@ -15,6 +15,7 @@ class OmniPlatformEnum(Enum):
     ROCM = "rocm"
     NPU = "npu"
     XPU = "xpu"
+    MUSA = "musa"
     UNSPECIFIED = "unspecified"
 
 
@@ -40,6 +41,9 @@ class OmniPlatform(Platform):
 
     def is_rocm(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.ROCM
+
+    def is_musa(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.MUSA
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -124,6 +128,16 @@ class OmniPlatform(Platform):
         import os
 
         os.environ.pop(cls.device_control_env_var, None)
+
+    @classmethod
+    def get_profiler_cls(cls) -> str:
+        """Get the profiler class for this platform.
+
+        Returns:
+            Fully qualified class path of the profiler.
+            Default returns the base OmniTorchProfilerWrapper.
+        """
+        return "vllm_omni.profiler.omni_torch_profiler.OmniTorchProfilerWrapper"
 
 
 class UnspecifiedOmniPlatform(OmniPlatform):

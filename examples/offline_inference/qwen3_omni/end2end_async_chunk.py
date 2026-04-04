@@ -382,7 +382,6 @@ async def run_all(args):
             stage_configs_path=args.stage_configs_path,
             log_stats=args.log_stats,
             stage_init_timeout=args.stage_init_timeout,
-            enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         )
 
         # Use default sampling params from stage config (they are pre-configured
@@ -584,11 +583,6 @@ def parse_args():
         type=int,
         default=16000,
         help="Sampling rate for audio loading.",
-    )
-    parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
     )
     return parser.parse_args()
 

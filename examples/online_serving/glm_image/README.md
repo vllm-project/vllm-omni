@@ -70,90 +70,41 @@ The default yaml configuration deploys AR on GPU 0 and DiT on GPU 1. You can use
 
 ### Text-to-Image
 
-Generate images from text prompts:
-
-**Using Python client**
-
 ```bash
 python openai_chat_client.py \
     --prompt "A photorealistic mountain landscape at sunset" \
     --height 1024 \
     --width 1024 \
     --output landscape.png
-```
 
-**Using curl**
-
-```bash
-curl -s http://localhost:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "user", "content": "A beautiful sunset over the ocean with sailing boats"}
-    ],
-    "extra_body": {
-      "height": 1024,
-      "width": 1024,
-      "num_inference_steps": 50,
-      "guidance_scale": 1.5,
-      "seed": 42
-    }
-  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
-```
-
-Or use the script:
-
-```bash
+# Or use the curl script:
 bash run_curl_text_to_image.sh "A futuristic city skyline at night"
 ```
 
 ### Image-to-Image (Image Editing)
-
-Edit images with text instructions:
-
-**Using Python client**
 
 ```bash
 python openai_chat_client.py \
     --prompt "Convert this image to watercolor style" \
     --image input.png \
     --output watercolor.png
-```
 
-**Using curl**
-
-```bash
-IMG_B64=$(base64 < input.png | tr -d '\n')
-
-curl -s http://localhost:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d @- <<EOF | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
-{
-  "messages": [{
-    "role": "user",
-    "content": [
-      {"type": "text", "text": "Convert this image to watercolor style"},
-      {"type": "image_url", "image_url": {"url": "data:image/png;base64,'$IMG_B64'"}}
-    ]
-  }],
-  "extra_body": {
-    "height": 1024,
-    "width": 1024,
-    "num_inference_steps": 50,
-    "guidance_scale": 1.5,
-    "seed": 42
-  }
-}
-EOF
-```
-
-Or use the script:
-
-```bash
+# Or use the curl script:
 bash run_curl_image_edit.sh input.png "Convert to watercolor style"
 ```
 
-## Generation Parameters (extra_body)
+For general-purpose request methods (curl, OpenAI SDK, Python `requests`), see
+the [Text-to-Image](../text_to_image/README.md) and
+[Image-to-Image](../image_to_image/README.md) guides.
+
+## Generation Parameters
+
+When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
+JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK.
+When using the dedicated `/v1/images/generations` or `/v1/images/edits`
+endpoints, pass the supported generation controls as top-level fields directly.
+For image dimensions and count, use `size` and `n` rather than `height` or
+`width`.
 
 | Parameter             | Type  | Default | Description                         |
 | --------------------- | ----- | ------- | ----------------------------------- |
@@ -161,7 +112,7 @@ bash run_curl_image_edit.sh input.png "Convert to watercolor style"
 | `width`               | int   | 1024    | Image width in pixels               |
 | `num_inference_steps` | int   | 50      | Number of diffusion denoising steps |
 | `guidance_scale`      | float | 1.5     | Classifier-free guidance scale      |
-| `seed`                | int   | 42      | Random seed for reproducibility     |
+| `seed`                | int   | None    | Optional random seed; `/v1/images/*` generates one server-side if omitted |
 | `negative_prompt`     | str   | None    | Negative prompt                     |
 
 ## Response Format
@@ -245,3 +196,9 @@ gpu_memory_utilization: 0.5
 ```
 
 - The first request may be slow due to model warmup. Subsequent requests will be faster.
+
+- If you encounter `Transformers does not recognize this architecture` error, your have to upgrade `transformers` package to `5.3.0` or above:
+
+```
+pip install --upgrade transformers
+```

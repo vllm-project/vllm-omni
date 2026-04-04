@@ -109,8 +109,6 @@ async def async_request_chat_completions(
                 resp_json = await response.json()
                 output.response_body = resp_json
                 output.success = True
-                if "peak_memory_mb" in resp_json:
-                    output.peak_memory_mb = resp_json["peak_memory_mb"]
                 try:
                     choices = resp_json.get("choices", [])
                     if choices and isinstance(choices, list):
@@ -120,7 +118,8 @@ async def async_request_chat_completions(
                             if content and isinstance(content, list) and len(content) > 0:
                                 first_item = content[0]
                                 if isinstance(first_item, dict):
-                                    output.stage_durations = first_item.get("stage_durations")
+                                    output.stage_durations = first_item.get("stage_durations") or {}
+                                    output.peak_memory_mb = first_item.get("peak_memory_mb", 0.0)
                 except (IndexError, TypeError, AttributeError):
                     pass
             else:
