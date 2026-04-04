@@ -2,7 +2,7 @@ steps:
   - label: "🧪 NPU Unit Test"
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
-    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:$${BUILDKITE_COMMIT}"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
     plugins:
       - kubernetes:
           podSpecPatch:
