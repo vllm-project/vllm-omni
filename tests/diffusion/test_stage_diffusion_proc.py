@@ -20,7 +20,21 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_proc(engine: object) -> StageDiffusionProc:
-    """Create a lightweight StageDiffusionProc with a test utility executor."""
+    """Build a minimal ``StageDiffusionProc`` wired to a fake engine.
+
+    The production constructor creates a real diffusion engine and helper
+    executor during initialization. These tests only need the proc-side bridge
+    logic, so they replace the engine with a lightweight test double and keep
+    a small utility executor for the CPU-side helper path.
+
+    Args:
+        engine: Fake engine object that exposes just the attributes used by the
+            proc methods under test.
+
+    Returns:
+        A proc instance whose internal engine and executor are safe to use in
+        unit tests without starting a real model stack.
+    """
     proc = StageDiffusionProc(model="mock-model", od_config=Mock())
     proc._engine = engine
     proc._utility_executor = ThreadPoolExecutor(max_workers=2)
@@ -32,7 +46,18 @@ def _make_proc(engine: object) -> StageDiffusionProc:
 
 @pytest.mark.asyncio
 async def test_process_request_submits_second_request_while_first_waits() -> None:
-    """Ensure proc request submission no longer serializes on one step thread."""
+    """Verify request submission is no longer serialized by one worker thread.
+
+    The old bridge path wrapped the entire request lifecycle inside a single
+    ``run_in_executor(..., engine.step, ...)`` call. That design meant a first
+    request could occupy the only worker thread and prevent a second request
+    from even reaching ``engine.submit_request()``.
+
+    This regression test keeps the first engine future unresolved, starts a
+    second request, and asserts that both requests are submitted before either
+    future completes. That proves the proc bridge now only offloads the CPU
+    helper work and lets the engine core loop own request lifetime.
+    """
     first_future: Future[DiffusionOutput] = Future()
     second_future: Future[DiffusionOutput] = Future()
     first_submitted = asyncio.Event()
@@ -40,6 +65,7 @@ async def test_process_request_submits_second_request_while_first_waits() -> Non
     submit_calls: list[str] = []
 
     def prepare_request(request):
+        """Return the prepared request unchanged for bridge-only testing."""
         return request, 0.0
 
     def materialize_outputs(
@@ -49,6 +75,12 @@ async def test_process_request_submits_second_request_while_first_waits() -> Non
         exec_total_time,
         diffusion_engine_start_time,
     ):
+        """Convert one diffusion output into the final request output shape.
+
+        The bridge test does not care about postprocess internals; it only
+        needs a deterministic result object so the request tasks can complete
+        once the controlled futures are resolved.
+        """
         del preprocess_time, exec_total_time, diffusion_engine_start_time
         return [
             OmniRequestOutput.from_diffusion(
@@ -59,6 +91,7 @@ async def test_process_request_submits_second_request_while_first_waits() -> Non
         ]
 
     def submit_request(request):
+        """Record submission order and hand back a caller-controlled future."""
         req_id = request.request_ids[0]
         submit_calls.append(req_id)
         if req_id == "req-a":
@@ -102,7 +135,14 @@ async def test_process_request_submits_second_request_while_first_waits() -> Non
 
 @pytest.mark.asyncio
 async def test_process_batch_request_preserves_batch_merge_contract() -> None:
-    """Ensure batch postprocessing still merges per-prompt outputs correctly."""
+    """Verify batch request merging still matches the orchestrator contract.
+
+    ``_process_batch_request()`` executes a single engine submission and then
+    merges the per-prompt ``OmniRequestOutput`` objects into one combined
+    response. This test ensures the refactor did not change how images,
+    metrics, multimodal payloads, latents, durations, and output type are
+    folded back into the batch-level response.
+    """
     engine = SimpleNamespace(close=Mock())
     proc = _make_proc(engine)
     proc._reconstruct_sampling_params = Mock(return_value=OmniDiffusionSamplingParams())
@@ -147,7 +187,14 @@ async def test_process_batch_request_preserves_batch_merge_contract() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_collective_rpc_uses_submit_rpc_and_merges_lora_ids() -> None:
-    """Ensure proc RPC bridging uses the engine future path and keeps semantics."""
+    """Verify collective RPC now uses ``submit_rpc`` without changing behavior.
+
+    The proc should no longer route RPCs through a dedicated step executor.
+    Instead it should forward them to the engine's future-based RPC bridge and
+    preserve method-specific result semantics. ``list_loras`` is a good probe
+    because it requires both dispatch correctness and post-processing of
+    multi-worker replies into a sorted unique LoRA id list.
+    """
     rpc_future: Future[list[list[int] | None]] = Future()
     rpc_future.set_result([[3, 1], [2, 3], None])
     submit_rpc = Mock(return_value=rpc_future)

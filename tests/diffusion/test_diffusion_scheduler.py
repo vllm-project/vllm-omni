@@ -395,7 +395,16 @@ class TestDiffusionEngine:
             engine.step(_make_request("req-abort"))
 
     def test_materialize_step_outputs_preserves_single_and_multi_request_audio_semantics(self) -> None:
-        """Keep output slicing behavior unchanged while removing duplicate branches."""
+        """Preserve single-request and batched audio/image output semantics.
+
+        ``_materialize_step_outputs()`` was refactored to remove duplicated
+        single-request versus multi-request branches. This test locks in the
+        externally visible behavior across both shapes:
+
+        - image models still slice image and companion audio payloads per prompt
+        - audio models still emit audio through ``multimodal_output`` and mark
+          the final output type as ``audio``
+        """
         multi_engine = DiffusionEngine.__new__(DiffusionEngine)
         multi_engine.od_config = Mock(model_class_name="mock_model", enable_cpu_offload=False)
         multi_engine.post_process_func = Mock(
@@ -476,7 +485,12 @@ class TestDiffusionEngine:
         assert single_results[0].multimodal_output == {"audio": "audio-sample"}
 
     def test_materialize_step_outputs_slices_batched_audio_tensor_per_prompt(self) -> None:
-        """Split batched audio tensors per prompt when the model outputs audio."""
+        """Split batched tensor audio outputs into one payload per prompt.
+
+        Audio-first models can return one batched tensor rather than a Python
+        list of payloads. The refactor keeps that supported by slicing along
+        the batch dimension so each prompt receives only its own waveform.
+        """
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.od_config = Mock(model_class_name="mock_audio_model", enable_cpu_offload=False)
         engine.post_process_func = None
@@ -514,7 +528,13 @@ class TestDiffusionEngine:
         assert torch.equal(results[1].multimodal_output["audio"], torch.tensor([3.0, 4.0]))
 
     def test_materialize_step_outputs_moves_nested_outputs_to_cpu(self) -> None:
-        """Recursively offload nested tensor outputs before postprocessing."""
+        """Recursively offload nested tensor structures before postprocessing.
+
+        CPU offload should not depend on the model returning a flat tensor.
+        This test uses a nested tuple/dict structure to verify that every
+        tensor is moved off device before the post-process hook receives the
+        payload, matching the memory-safety goal of the refactor.
+        """
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.od_config = Mock(model_class_name="mock_model", enable_cpu_offload=True)
         captured: dict[str, object] = {}
@@ -583,7 +603,13 @@ class TestDiffusionEngine:
         assert output.abort_message == "Request req-abort aborted."
 
     def test_batch_child_abort_aborts_entire_scheduler_request(self) -> None:
-        """Aborting any child request id in a batch should abort the whole sched req."""
+        """Abort the full scheduler request when any child request id is aborted.
+
+        Public callers abort by external request id, while the scheduler tracks
+        one internal id for the whole batched submission. This test verifies
+        that aborting a single child id still resolves the shared batch future
+        as aborted and removes the scheduler state exactly once.
+        """
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(Mock())
@@ -602,7 +628,13 @@ class TestDiffusionEngine:
         assert engine.scheduler.get_request_state(sched_req_id) is None
 
     def test_double_abort_is_idempotent(self) -> None:
-        """Submitting the same abort twice should not raise or leak futures."""
+        """Treat duplicate abort commands as a harmless no-op after the first.
+
+        Stage-level cancellation can race with caller-side cancellation, so the
+        engine may observe the same request id multiple times. The abort path
+        must therefore be idempotent: no exception, no future leak, and no
+        attempt to resurrect already-finished scheduler state.
+        """
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(Mock())
@@ -653,7 +685,13 @@ class TestDiffusionEngine:
         assert engine._pending_futures == {}
 
     def test_fail_pending_futures_ignores_invalid_state_race(self) -> None:
-        """Ignore InvalidStateError if another thread wins the completion race."""
+        """Ignore benign future completion races during shutdown cleanup.
+
+        ``close()`` can fail futures from a caller thread while the core loop
+        is simultaneously unwinding the same request. If another thread wins
+        the race just before ``set_exception()`` executes, the cleanup helper
+        should swallow ``InvalidStateError`` and keep teardown progressing.
+        """
         engine = DiffusionEngine.__new__(DiffusionEngine)
         racing_future = Mock(spec=Future)
         racing_future.done.return_value = False
@@ -702,7 +740,12 @@ class TestDiffusionEngine:
             engine._wait_for_core_ready()
 
     def test_submit_request_fails_if_core_loop_is_already_gone(self) -> None:
-        """Reject a request queued after the owner thread has already exited."""
+        """Fail fast when a caller submits work after the owner thread is gone.
+
+        The queue/core-loop design removes busy-waiting, but it also means work
+        can be enqueued after the owner has exited unless the submit path does a
+        post-enqueue liveness check. This test locks in that protection.
+        """
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine._cmd_queue = queue.Queue()
         engine._shutdown_requested = threading.Event()
