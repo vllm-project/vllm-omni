@@ -18,7 +18,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
 )
 from vllm.config import ModelConfig, VllmConfig
-from vllm.inputs.data import PromptType, TokensPrompt
+from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP, SupportsRealtime

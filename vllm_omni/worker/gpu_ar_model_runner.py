@@ -137,8 +137,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
 
-        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(scheduler_output.preempted_req_ids)
+        if has_kv_transfer_group():
+            kv_connector_metadata = scheduler_output.kv_connector_metadata
+            if kv_connector_metadata is not None:
+                get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -146,7 +148,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
-            self._update_states(scheduler_output)
+            deferred_state_corrections_fn = self._update_states(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -417,6 +419,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
         )
         self.kv_connector_output = kv_connector_output
 
+        if deferred_state_corrections_fn:
+            deferred_state_corrections_fn()
+
         return None
 
     @torch.inference_mode()
@@ -474,8 +479,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+
         self._draft_token_ids = None
         self._draft_token_req_ids = None
+        self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
@@ -515,7 +523,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
-                        spec_decode_common_attn_metadata,
+                        self.optimistic_seq_lens_cpu,
                         sampled_token_ids,
                         self.requests,
                         self.input_batch,

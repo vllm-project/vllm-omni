@@ -390,6 +390,16 @@ steps:
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
           pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py tests/e2e/offline_inference/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
         '
+
+  - label: "CosyVoice3-TTS E2E Test"
+    timeout_in_minutes: 20
+    depends_on: upload-merge-pipeline
+    commands:
+      - |
+        timeout 20m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts.py -m "advanced_model" --run-level "advanced_model"
+        '
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -408,6 +418,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:

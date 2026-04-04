@@ -244,7 +244,20 @@ class StageDiffusionClient:
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
             if not self._shutting_down and self._proc is not None and not self._proc.is_alive():
-                raise RuntimeError(f"StageDiffusionProc died unexpectedly (exit code {self._proc.exitcode})")
+                exitcode = self._proc.exitcode
+                # One final drain – the last ZMQ frame may have arrived
+                # between the first drain and the is_alive() check.
+                self._drain_responses()
+                try:
+                    return self._output_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                if exitcode is not None and exitcode > 128:
+                    sig = exitcode - 128
+                    logger.warning("StageDiffusionProc was killed by signal %d; treating as external shutdown.", sig)
+                    self._shutting_down = True
+                    return None
+                raise RuntimeError(f"StageDiffusionProc died unexpectedly (exit code {exitcode})")
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:

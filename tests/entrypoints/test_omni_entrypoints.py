@@ -113,6 +113,7 @@ class FakeAsyncOmniEngine:
         sampling_params_list: list[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        **kwargs: Any,
     ) -> None:
         msg = {
             "request_id": request_id,

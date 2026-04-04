@@ -233,17 +233,20 @@ def test_app(mocker: MockerFixture):
         uploaded_voices = []
         if hasattr(speech_server, "uploaded_speakers"):
             for voice_name, info in speech_server.uploaded_speakers.items():
-                uploaded_voices.append(
-                    {
-                        "name": info.get("name", voice_name),
-                        "consent": info.get("consent", ""),
-                        "created_at": info.get("created_at", 0),
-                        "file_size": info.get("file_size", 0),
-                        "mime_type": info.get("mime_type", ""),
-                        "embedding_source": info.get("embedding_source", "audio"),
-                        "embedding_dim": info.get("embedding_dim"),
-                    }
-                )
+                voice_entry = {
+                    "name": info.get("name", voice_name),
+                    "consent": info.get("consent", ""),
+                    "created_at": info.get("created_at", 0),
+                    "file_size": info.get("file_size", 0),
+                    "mime_type": info.get("mime_type", ""),
+                    "embedding_source": info.get("embedding_source", "audio"),
+                    "embedding_dim": info.get("embedding_dim"),
+                }
+                if info.get("ref_text"):
+                    voice_entry["ref_text"] = info["ref_text"]
+                if info.get("speaker_description"):
+                    voice_entry["speaker_description"] = info["speaker_description"]
+                uploaded_voices.append(voice_entry)
         return {"voices": speakers, "uploaded_voices": uploaded_voices}
 
     app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
@@ -255,7 +258,8 @@ def test_app(mocker: MockerFixture):
         speaker_embedding: str | None = Form(None),
         consent: str = Form(...),
         name: str = Form(...),
-        ref_text: str = Form(None),
+        ref_text: str | None = Form(None),
+        speaker_description: str | None = Form(None),
     ):
         try:
             if speaker_embedding is not None and audio_sample is not None:
@@ -263,7 +267,13 @@ def test_app(mocker: MockerFixture):
             if speaker_embedding is not None:
                 result = await speech_server.upload_voice_embedding(speaker_embedding, consent, name)
             elif audio_sample is not None:
-                result = await speech_server.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+                result = await speech_server.upload_voice(
+                    audio_sample,
+                    consent,
+                    name,
+                    ref_text=ref_text,
+                    speaker_description=speaker_description,
+                )
             else:
                 raise ValueError("Either 'audio_sample' or 'speaker_embedding' must be provided")
             return {"success": True, "voice": result}
@@ -396,6 +406,44 @@ class TestSpeechAPI:
         assert result["voice"]["name"] == "test_voice_rt"
         assert result["voice"].get("ref_text") == "Hello world transcript"
         response = client.delete("/v1/audio/voices/test_voice_rt")
+
+    def test_upload_voice_with_speaker_description(self, client, tmp_path):
+        """Test voice upload with speaker_description stores and returns the description."""
+        # Pre-cleanup in case a previous test run left this voice behind
+        client.delete("/v1/audio/voices/test_voice_vd")
+
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_vd", "speaker_description": "  warm, energetic narrator  "}
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        try:
+            assert response.status_code == 200
+            result = response.json()
+            assert result["success"] is True
+            assert result["voice"]["name"] == "test_voice_vd"
+            assert result["voice"].get("speaker_description") == "warm, energetic narrator"
+        finally:
+            client.delete("/v1/audio/voices/test_voice_vd")
+
+    def test_upload_voice_speaker_description_in_listing(self, client):
+        """Test that speaker_description survives the upload → list round-trip."""
+        client.delete("/v1/audio/voices/test_voice_sd_list")
+
+        audio_content = b"fake audio content" * 1000
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_sd_list", "speaker_description": "calm female narrator"}
+
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        try:
+            assert response.status_code == 200
+
+            listing = client.get("/v1/audio/voices").json()
+            uploaded = {v["name"]: v for v in listing["uploaded_voices"]}
+            assert "test_voice_sd_list" in uploaded
+            assert uploaded["test_voice_sd_list"]["speaker_description"] == "calm female narrator"
+        finally:
+            client.delete("/v1/audio/voices/test_voice_sd_list")
 
     def test_upload_voice_file_too_large(self, client):
         """Test voice upload with file exceeding size limit."""
@@ -850,6 +898,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": None,
+                "created_at": 1711234567.89,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -862,6 +911,7 @@ class TestTTSMethods:
             assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
             assert params["x_vector_only_mode"] == [True]
             assert params["task_type"] == ["Base"]
+            assert params["voice_created_at"] == [1711234567.89]
             assert "ref_text" not in params
 
     def test_build_tts_params_with_uploaded_voice_ref_text(self, speech_server):
@@ -872,6 +922,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": "Hello world transcript",
+                "created_at": 1711234567.89,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -885,6 +936,7 @@ class TestTTSMethods:
             assert params["x_vector_only_mode"] == [False]
             assert params["task_type"] == ["Base"]
             assert params["ref_text"] == ["Hello world transcript"]
+            assert params["voice_created_at"] == [1711234567.89]
 
     def test_build_tts_params_without_uploaded_voice(self, speech_server):
         """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""
@@ -1612,6 +1664,7 @@ class TestFishSpeechServing:
         assert all(allowed_special is None for _, _, allowed_special in tokenizer.calls)
 
     def test_build_fish_clone_prompt_normalizes_text_fields(self, fish_speech_server):
+        fish_speech_server._fish_speech_tokenizer = _FakeFishTokenizer()
         fish_speech_server._estimate_fish_prompt_len = MagicMock(return_value=123)
 
         request = OpenAICreateSpeechRequest(
@@ -1820,3 +1873,115 @@ class TestWAVStreaming:
         for fmt in unsupported_formats:
             response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": fmt})
             assert response.status_code == 422
+
+
+# ---- CosyVoice3 Serving Tests ----
+
+
+@pytest.fixture
+def cosyvoice3_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(model="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
+    mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="cosyvoice3_talker"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestCosyVoice3Serving:
+    def test_cosyvoice3_model_type_detection(self, cosyvoice3_server):
+        assert cosyvoice3_server._tts_model_type == "cosyvoice3"
+        assert cosyvoice3_server._is_tts is True
+        assert cosyvoice3_server._is_cosyvoice3 is True
+
+    def test_cosyvoice3_stage_registered(self):
+        from vllm_omni.entrypoints.openai.serving_speech import (
+            _COSYVOICE3_TTS_MODEL_STAGES,
+            _TTS_MODEL_STAGES,
+        )
+
+        assert "cosyvoice3_talker" in _COSYVOICE3_TTS_MODEL_STAGES
+        assert "cosyvoice3_talker" in _TTS_MODEL_STAGES
+
+    def test_validate_cosyvoice3_empty_input(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(input="", ref_audio="data:audio/wav;base64,abc", ref_text="hello")
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "empty" in error.lower()
+
+    def test_validate_cosyvoice3_missing_ref_audio(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="hello")
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "ref_audio" in error.lower()
+
+    def test_validate_cosyvoice3_missing_ref_text(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "ref_text" in error.lower()
+
+    def test_validate_cosyvoice3_invalid_ref_audio_format(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="/local/path.wav", ref_text="hello")
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "url" in error.lower() or "format" in error.lower()
+
+    def test_validate_cosyvoice3_valid_request(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(
+            input="Hello world",
+            ref_audio="data:audio/wav;base64,abc123",
+            ref_text="Reference transcript",
+        )
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is None
+
+    def test_validate_cosyvoice3_max_new_tokens_range(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="hello",
+            max_new_tokens=0,
+        )
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "max_new_tokens" in error
+
+    def test_prepare_speech_generation_cosyvoice3(self, cosyvoice3_server):
+        cosyvoice3_server._build_cosyvoice3_prompt = AsyncMock(
+            return_value={
+                "prompt": "Hello",
+                "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
+                "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
+            }
+        )
+
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+        )
+        request_id, generator, tts_params = asyncio.run(cosyvoice3_server._prepare_speech_generation(request))
+
+        assert request_id.startswith("speech-")
+        assert generator == "generator"
+        assert tts_params == {}
+        cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()

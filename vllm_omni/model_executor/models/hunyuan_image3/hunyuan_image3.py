@@ -20,6 +20,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group
+from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.linear import (
@@ -58,7 +59,6 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.image import rgba_to_rgb
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
     MultiModalKwargsItems,

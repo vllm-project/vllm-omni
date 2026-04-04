@@ -1,7 +1,7 @@
 import os
 import types
 from collections import Counter
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
@@ -145,12 +145,21 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     if isinstance(obj, set):
         return list(obj)
     # Handle dataclass objects
-    # Note: asdict() recursively converts nested dataclasses but not Counter objects,
-    # so we need to recursively process the result
-    if is_dataclass(obj):
-        result = asdict(obj)
-        # Recursively process the result to convert any Counter objects
-        return _convert_dataclasses_to_dict(result)
+    # Use field iteration instead of asdict() to:
+    # 1. Only include init fields (non-init fields cause "unexpected kwarg" errors)
+    # 2. Skip None values matching field defaults (avoids Pydantic validation
+    #    failures when None is explicitly passed for non-Optional typed fields,
+    #    e.g. CompilationConfig.cudagraph_capture_sizes: list[int] = None)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        result = {}
+        for f in fields(obj):
+            if not f.init:
+                continue
+            value = getattr(obj, f.name)
+            if value is None and f.default is None:
+                continue
+            result[f.name] = _convert_dataclasses_to_dict(value)
+        return result
     # Handle dictionaries (recurse into values) and filter out callables(cause error in OmegaConf.create)
     # Note: This must come AFTER Counter check since Counter is a dict subclass
     if isinstance(obj, dict):
