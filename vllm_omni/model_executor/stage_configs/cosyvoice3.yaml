@@ -9,16 +9,16 @@ stage_args:
     runtime:
       devices: 0
     engine_args:
-      model_stage: talker
+      model_stage: cosyvoice3_talker
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       model_arch: CosyVoice3Model
       trust_remote_code: true
-      gpu_memory_utilization: 0.4
+      gpu_memory_utilization: 0.2
       engine_output_type: latent  # Output speech tokens for chunk aware flow matching
       disable_hybrid_kv_cache_manager: true
       enable_prefix_caching: false
-      enforce_eager: false
+      enforce_eager: true
       mm_processor_cache_gb: 0
       skip_mm_profiling: true
       dtype: "float32"
@@ -27,14 +27,14 @@ stage_args:
     runtime:
       devices: 0
     engine_args:
-      model_stage: code2wav
+      model_stage: cosyvoice3_code2wav
       model_arch: CosyVoice3Model
       trust_remote_code: true
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       engine_output_type: latent
-      gpu_memory_utilization: 0.2
-      enforce_eager: false  # CUDA graphs don't work with dynamic runtime_info access
+      gpu_memory_utilization: 0.1
+      enforce_eager: true  # CUDA graphs don't work with dynamic conv shapes in code2wav
       disable_hybrid_kv_cache_manager: true
       enable_prefix_caching: false
       skip_mm_profiling: true

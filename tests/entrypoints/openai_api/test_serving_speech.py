@@ -1872,3 +1872,115 @@ class TestWAVStreaming:
         for fmt in unsupported_formats:
             response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": fmt})
             assert response.status_code == 422
+
+
+# ---- CosyVoice3 Serving Tests ----
+
+
+@pytest.fixture
+def cosyvoice3_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(model="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
+    mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="cosyvoice3_talker"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestCosyVoice3Serving:
+    def test_cosyvoice3_model_type_detection(self, cosyvoice3_server):
+        assert cosyvoice3_server._tts_model_type == "cosyvoice3"
+        assert cosyvoice3_server._is_tts is True
+        assert cosyvoice3_server._is_cosyvoice3 is True
+
+    def test_cosyvoice3_stage_registered(self):
+        from vllm_omni.entrypoints.openai.serving_speech import (
+            _COSYVOICE3_TTS_MODEL_STAGES,
+            _TTS_MODEL_STAGES,
+        )
+
+        assert "cosyvoice3_talker" in _COSYVOICE3_TTS_MODEL_STAGES
+        assert "cosyvoice3_talker" in _TTS_MODEL_STAGES
+
+    def test_validate_cosyvoice3_empty_input(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(input="", ref_audio="data:audio/wav;base64,abc", ref_text="hello")
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "empty" in error.lower()
+
+    def test_validate_cosyvoice3_missing_ref_audio(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="hello")
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "ref_audio" in error.lower()
+
+    def test_validate_cosyvoice3_missing_ref_text(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "ref_text" in error.lower()
+
+    def test_validate_cosyvoice3_invalid_ref_audio_format(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="/local/path.wav", ref_text="hello")
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "url" in error.lower() or "format" in error.lower()
+
+    def test_validate_cosyvoice3_valid_request(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(
+            input="Hello world",
+            ref_audio="data:audio/wav;base64,abc123",
+            ref_text="Reference transcript",
+        )
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is None
+
+    def test_validate_cosyvoice3_max_new_tokens_range(self, cosyvoice3_server):
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="hello",
+            max_new_tokens=0,
+        )
+        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        assert error is not None
+        assert "max_new_tokens" in error
+
+    def test_prepare_speech_generation_cosyvoice3(self, cosyvoice3_server):
+        cosyvoice3_server._build_cosyvoice3_prompt = AsyncMock(
+            return_value={
+                "prompt": "Hello",
+                "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
+                "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
+            }
+        )
+
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+        )
+        request_id, generator, tts_params = asyncio.run(cosyvoice3_server._prepare_speech_generation(request))
+
+        assert request_id.startswith("speech-")
+        assert generator == "generator"
+        assert tts_params == {}
+        cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()

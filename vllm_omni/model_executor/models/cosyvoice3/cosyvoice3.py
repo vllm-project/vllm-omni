@@ -66,6 +66,12 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         if cached_model_dir == model_dir:
             return
 
+        # If model_dir is an HF repo ID (not a local path), resolve to cache
+        if not os.path.isdir(model_dir):
+            from huggingface_hub import snapshot_download
+
+            model_dir = snapshot_download(model_dir)
+
         import onnxruntime
 
         from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
@@ -266,9 +272,14 @@ class CosyVoice3Model(
         self.config = vllm_config.model_config.hf_config
         self.have_multimodal_outputs = True
         self.model_stage = vllm_config.model_config.model_stage
-        self.model_dir = vllm_config.model_config.model
+        model_dir = vllm_config.model_config.model
+        if not os.path.isdir(model_dir):
+            from huggingface_hub import snapshot_download
+
+            model_dir = snapshot_download(model_dir)
+        self.model_dir = model_dir
         self.model = None
-        if self.model_stage == "talker":
+        if self.model_stage == "cosyvoice3_talker":
             # Initialize talker stage (text to speech tokens)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_talker import CosyVoice3LM, VLLMQwen2Encoder
 
@@ -286,7 +297,7 @@ class CosyVoice3Model(
             # KV cache is now managed externally by vLLM's PagedAttention
             # No need for self.llm_cache
             self.model = self.talker
-        elif self.model_stage == "code2wav":
+        elif self.model_stage == "cosyvoice3_code2wav":
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
@@ -322,7 +333,7 @@ class CosyVoice3Model(
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
-        if self.model_stage == "talker":
+        if self.model_stage == "cosyvoice3_talker":
             logits = self.model.llm_decoder(hidden_states)
             vocab_size = self.config.vocab_size
             pad_size = vocab_size - logits.size(-1)
@@ -337,7 +348,7 @@ class CosyVoice3Model(
             raise RuntimeError(f"compute_logits is only valid for {self.model_stage}.")
 
     def embed_multimodal(self, **kwargs: object) -> torch.Tensor:
-        if self.model_stage == "talker":
+        if self.model_stage == "cosyvoice3_talker":
             speech_token = kwargs["speech_token"]
             speech_token_emb = self.model.speech_embedding(speech_token)
             return speech_token_emb
@@ -350,7 +361,7 @@ class CosyVoice3Model(
         multimodal_embeddings=None,
         is_multimodal=None,
     ) -> torch.Tensor:
-        if self.model_stage == "talker":
+        if self.model_stage == "cosyvoice3_talker":
             if is_multimodal is not None and any(is_multimodal):
                 embed_tokens = self.model.llm.model.embed_tokens(input_ids)
                 sos = self.model.speech_embedding.weight[self.model.sos].reshape(1, -1)
@@ -363,7 +374,7 @@ class CosyVoice3Model(
             else:
                 embed_tokens = self.model.speech_embedding.weight[input_ids]
             return embed_tokens
-        elif self.model_stage == "code2wav":
+        elif self.model_stage == "cosyvoice3_code2wav":
             assert input_ids.dim() == 1
             hidden = int(self.config.hidden_size)
             return torch.zeros(
@@ -381,7 +392,7 @@ class CosyVoice3Model(
         additional_information: dict[str, object] | None = None,
         **kwargs: object,
     ) -> OmniOutput:
-        if self.model_stage == "talker":
+        if self.model_stage == "cosyvoice3_talker":
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
 
@@ -399,7 +410,7 @@ class CosyVoice3Model(
                 }
 
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
-        elif self.model_stage == "code2wav":
+        elif self.model_stage == "cosyvoice3_code2wav":
             runtime_info = kwargs.get("runtime_additional_information", [])
             if not runtime_info:
                 length = 30 * 24000
@@ -420,13 +431,13 @@ class CosyVoice3Model(
 
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"audio": tts_speech},
+                multimodal_outputs={"audio": tts_speech, "sr": 22050},
             )
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        if self.model_stage == "talker":
+        if self.model_stage == "cosyvoice3_talker":
             # Load weights for text to speech LM stage using vLLM's weight loading
             llm_weight_path = os.path.join(self.model_dir, "llm.pt")
             device = next(self.parameters()).device
@@ -460,7 +471,7 @@ class CosyVoice3Model(
             self.model.llm_decoder.load_state_dict(llm_decoder_state)
 
             self.model.to(device).eval()
-        elif self.model_stage == "code2wav":
+        elif self.model_stage == "cosyvoice3_code2wav":
             # Load weights for code2wav stage (flow + hift)
             device = next(self.parameters()).device
             self.code2wav.load_weights(self.model_dir, device)
