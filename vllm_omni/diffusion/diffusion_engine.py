@@ -193,6 +193,7 @@ class DiffusionEngine:
         if self.pre_process_func is not None:
             preprocess_start_time = time.perf_counter()
             request = self.pre_process_func(request)
+            request.refresh_canonical_prompts()
             preprocess_time = time.perf_counter() - preprocess_start_time
             logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
 
@@ -698,6 +699,7 @@ class DiffusionEngine:
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req
+        request.refresh_canonical_prompts()
         output = self.add_req_and_wait_for_response(request)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")

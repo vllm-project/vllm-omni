@@ -20,6 +20,7 @@ from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels, router
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -1217,6 +1218,33 @@ def test_image_edit_parameter_pass(async_omni_test_client):
         assert img.format.lower() == "jpeg"
         assert data["output_format"] == "jpeg"
         assert data["size"] == "16x24"
+
+
+def test_image_edit_online_prompt_payload_is_canonicalizable(async_omni_test_client):
+    """Online image edit payloads should already be compatible with request canonicalization."""
+    img_bytes = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "replace the background",
+            "size": "16x24",
+        },
+    )
+
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    req = OmniDiffusionRequest(
+        prompts=[engine.captured_prompt],
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+    )
+
+    first_prompt = req.canonical_prompts[0]
+    assert first_prompt["prompt"] == "replace the background"
+    assert first_prompt["negative_prompt"] is None
+    assert "multi_modal_data" in first_prompt
+    assert "img2img" in first_prompt["multi_modal_data"]
 
 
 def test_image_edit_layers_and_resolution(async_omni_test_client):

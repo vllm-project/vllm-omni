@@ -651,16 +651,14 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         # 1. Get preprocessed image from request (pre-processing is done in DiffusionEngine)
         # Override parameters from request if provided
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
                 """Taking only the first image for now.""",
             )
-        first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-        negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
+        first_prompt = req.canonical_prompts[0]
+        prompt = first_prompt["prompt"]
+        negative_prompt = first_prompt.get("negative_prompt")
 
         layers = req.sampling_params.layers if req.sampling_params.layers is not None else layers
         resolution = req.sampling_params.resolution if req.sampling_params.resolution is not None else resolution
@@ -683,9 +681,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             else num_images_per_prompt
         )
 
-        if not isinstance(first_prompt, str) and "preprocessed_image" in (
-            additional_information := first_prompt.get("additional_information", {})
-        ):
+        if "preprocessed_image" in (additional_information := first_prompt.get("additional_information", {})):
             prompt_image = additional_information.get("prompt_image")
             image = additional_information.get("preprocessed_image")
             image = image.to(dtype=self.text_encoder.dtype)  # Now we get the type

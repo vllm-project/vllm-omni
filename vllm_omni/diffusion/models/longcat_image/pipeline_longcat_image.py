@@ -496,13 +496,8 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         cfg_renorm_min: float | None = 0.0,
         enable_prompt_rewrite: bool | None = True,
     ) -> DiffusionOutput:
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
-            negative_prompt = None
-        elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+        prompt = req.get_prompt_texts() or prompt
+        negative_prompt = req.get_negative_prompt_texts()
 
         height = req.sampling_params.height or height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or width or self.default_sample_size * self.vae_scale_factor
@@ -521,7 +516,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         enable_cfg_renorm = req.sampling_params.extra_args.get("enable_cfg_renorm", enable_cfg_renorm)
         cfg_renorm_min = req.sampling_params.extra_args.get("cfg_renorm_min", cfg_renorm_min)
 
-        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
+        req_prompt_embeds = [p.get("prompt_embeds") for p in req.canonical_prompts]
         if any(p is not None for p in req_prompt_embeds):
             # If at list one prompt is provided as an embedding,
             # Then assume that the user wants to provide embeddings for all prompts, and enter this if block
@@ -529,9 +524,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
             # And `torch.stack` automatically raises an exception for us
             prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
-        req_negative_prompt_embeds = [
-            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
-        ]
+        req_negative_prompt_embeds = [p.get("negative_prompt_embeds") for p in req.canonical_prompts]
         if any(p is not None for p in req_negative_prompt_embeds):
             negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
