@@ -970,7 +970,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return Path(file_path).with_suffix(".safetensors")
         return None
 
-    def _save_voice_cache(self, voice_key: str, speaker_info: dict[str, Any], audio_file_path: Path, payload: dict) -> bool:
+    def _save_voice_cache(
+        self,
+        voice_key: str,
+        speaker_info: dict[str, Any],
+        audio_file_path: Path,
+        payload: dict,
+    ) -> bool:
         try:
             from safetensors.torch import save_file
         except ImportError:

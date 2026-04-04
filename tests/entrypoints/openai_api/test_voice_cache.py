@@ -85,6 +85,22 @@ def _direct_speaker_info(**extra: Any) -> dict[str, Any]:
     return info
 
 
+def _cached_prompt_payload(
+    *,
+    ref_code: list[list[int]] | None = None,
+    x_vector_only_mode: bool = True,
+    icl_mode: bool = False,
+    ref_text: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "ref_spk_embedding": [0.1] * 1024,
+        "ref_code": ref_code,
+        "x_vector_only_mode": x_vector_only_mode,
+        "icl_mode": icl_mode,
+        "ref_text": ref_text,
+    }
+
+
 # ── Cache generation tests ──
 
 
@@ -128,7 +144,7 @@ class TestCreateVoiceCache:
     async def test_create_cache_idempotent(self, server):
         """ready + valid cache -> returns already exists."""
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=[MagicMock()])
+        server._load_cached_voice_prompt = MagicMock(return_value=_cached_prompt_payload())
         result = await server.create_voice_cache("v")
         assert result["cache_status"] == "ready"
         assert "already exists" in result["message"]
@@ -137,8 +153,7 @@ class TestCreateVoiceCache:
     async def test_create_cache_ready_corrupted_rebuilds(self, server):
         """ready but cache file corrupted -> rebuild (will fail at audio read in this test)."""
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=None)
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
+        server._load_cached_voice_prompt = MagicMock(return_value=None)
         # Will fail at file read since file doesn't exist
         with pytest.raises(ValueError, match="missing from disk"):
             await server.create_voice_cache("v")
@@ -156,7 +171,6 @@ class TestCreateVoiceCache:
         server.uploaded_speakers = {
             "v": _audio_speaker_info(cache_status="processing", cache_generated_at=time.time() - 600)
         }
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
         with pytest.raises(ValueError, match="missing from disk"):
             await server.create_voice_cache("v")
 
@@ -164,7 +178,6 @@ class TestCreateVoiceCache:
     async def test_create_cache_force_bypasses_processing(self, server):
         """force=True + processing -> allows rebuild (fails at file read)."""
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="processing", cache_generated_at=time.time())}
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
         with pytest.raises(ValueError, match="missing from disk"):
             await server.create_voice_cache("v", force=True)
 
@@ -174,23 +187,13 @@ class TestCreateVoiceCache:
         server.uploaded_speakers = {
             "v": _audio_speaker_info(cache_status="processing", cache_generated_at="not_a_number")
         }
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
         with pytest.raises(ValueError, match="missing from disk"):
-            await server.create_voice_cache("v")
-
-    @pytest.mark.asyncio
-    async def test_create_cache_metadata_write_failure(self, server):
-        """update_speaker returns False -> ValueError before RPC."""
-        server.uploaded_speakers = {"v": _audio_speaker_info()}
-        server.metadata_manager.update_speaker = MagicMock(return_value=False)
-        with pytest.raises(ValueError, match="Failed to update metadata"):
             await server.create_voice_cache("v")
 
     @pytest.mark.asyncio
     async def test_create_cache_audio_missing(self, server):
         """Voice exists but audio file is gone -> ValueError (not 404)."""
         server.uploaded_speakers = {"v": _audio_speaker_info()}
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
         with pytest.raises(ValueError, match="missing from disk"):
             await server.create_voice_cache("v")
 
@@ -200,7 +203,6 @@ class TestCreateVoiceCache:
         info = _audio_speaker_info()
         del info["file_path"]
         server.uploaded_speakers = {"v": info}
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
         with pytest.raises(ValueError, match="no file_path"):
             await server.create_voice_cache("v")
 
@@ -208,9 +210,7 @@ class TestCreateVoiceCache:
     async def test_create_cache_success_e2e(self, server):
         """Full success path: audio read + RPC + save -> ready."""
         server.uploaded_speakers = {"v": _audio_speaker_info()}
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
-        server._voice_cache_manager.save_voice_cache = MagicMock(return_value=True)
-        server._refresh_uploaded_speakers = MagicMock()
+        server._save_voice_cache = MagicMock(return_value=True)
 
         rpc_payload = {
             "ref_spk_embedding": [0.1] * 1024,
@@ -228,8 +228,7 @@ class TestCreateVoiceCache:
             result = await server.create_voice_cache("v")
 
         assert result["cache_status"] == "ready"
-        server._voice_cache_manager.save_voice_cache.assert_called_once()
-        server._refresh_uploaded_speakers.assert_called_once()
+        server._save_voice_cache.assert_called_once()
 
 
 # ── Failure rollback tests ──
@@ -244,7 +243,6 @@ class TestCacheFailureRollback:
     async def test_failure_rollback_sf_read(self, server):
         """sf.read failure (pre-save) -> cache_status restored to previous, not failed."""
         server.uploaded_speakers = {"v": _audio_speaker_info()}
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
 
         with (
             patch("pathlib.Path.is_file", return_value=True),
@@ -262,8 +260,7 @@ class TestCacheFailureRollback:
         server.uploaded_speakers = {
             "v": _audio_speaker_info(cache_status="ready"),
         }
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=[MagicMock()])
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
+        server._load_cached_voice_prompt = MagicMock(return_value=_cached_prompt_payload())
 
         with (
             patch("pathlib.Path.is_file", return_value=True),
@@ -279,7 +276,6 @@ class TestCacheFailureRollback:
     async def test_failure_rollback_rpc(self, server):
         """RPC failure (pre-save) -> cache_status restored to previous."""
         server.uploaded_speakers = {"v": _audio_speaker_info()}
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
 
         with (
             patch("pathlib.Path.is_file", return_value=True),
@@ -294,9 +290,8 @@ class TestCacheFailureRollback:
 
     @pytest.mark.asyncio
     async def test_failure_rollback_save(self, server):
-        """save_voice_cache failure -> cache_status rolled back to failed."""
+        """_save_voice_cache failure -> cache_status rolled back to failed."""
         server.uploaded_speakers = {"v": _audio_speaker_info()}
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
 
         rpc_payload = {
             "ref_spk_embedding": [0.1] * 1024,
@@ -311,7 +306,7 @@ class TestCacheFailureRollback:
             patch("soundfile.read", return_value=([0.0] * 100, 16000)),
         ):
             server.engine_client.collective_rpc.return_value = [[rpc_payload]]
-            server._voice_cache_manager.save_voice_cache = MagicMock(return_value=False)
+            server._save_voice_cache = MagicMock(return_value=False)
             with pytest.raises(ValueError, match="Failed to save"):
                 await server.create_voice_cache("v")
 
@@ -409,18 +404,17 @@ class TestBuildTtsParamsWithCache:
     def test_tts_uses_cached_prompt(self, server):
         """When cache is ready + valid, params should use voice_clone_prompt, not ref_audio."""
         from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-        from vllm_omni.model_executor.models.qwen3_tts.voice_cache_manager import VoiceClonePromptItem
 
-        item = VoiceClonePromptItem(
-            ref_code=torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
-            ref_spk_embedding=torch.randn(1024),
-            x_vector_only_mode=False,
-            icl_mode=True,
-            ref_text="hello transcript",
-        )
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready", ref_text="hello transcript")}
         server.supported_speakers = {"v"}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=[item])
+        server._load_cached_voice_prompt = MagicMock(
+            return_value=_cached_prompt_payload(
+                ref_code=[[1, 2], [3, 4]],
+                x_vector_only_mode=False,
+                icl_mode=True,
+                ref_text="hello transcript",
+            )
+        )
 
         req = OpenAICreateSpeechRequest(input="Hello", voice="v")
         params = server._build_tts_params(req)
@@ -437,18 +431,10 @@ class TestBuildTtsParamsWithCache:
     def test_tts_cached_no_override_ref_text(self, server):
         """Request-level ref_text should NOT override cached ref_text."""
         from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-        from vllm_omni.model_executor.models.qwen3_tts.voice_cache_manager import VoiceClonePromptItem
 
-        item = VoiceClonePromptItem(
-            ref_code=None,
-            ref_spk_embedding=torch.randn(1024),
-            x_vector_only_mode=True,
-            icl_mode=False,
-            ref_text=None,
-        )
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
         server.supported_speakers = {"v"}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=[item])
+        server._load_cached_voice_prompt = MagicMock(return_value=_cached_prompt_payload())
 
         req = OpenAICreateSpeechRequest(input="Hello", voice="v", ref_text="should_be_ignored")
         params = server._build_tts_params(req)
@@ -459,18 +445,10 @@ class TestBuildTtsParamsWithCache:
     def test_tts_cached_no_override_xvec_mode(self, server):
         """Request-level x_vector_only_mode should NOT override cached mode."""
         from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-        from vllm_omni.model_executor.models.qwen3_tts.voice_cache_manager import VoiceClonePromptItem
 
-        item = VoiceClonePromptItem(
-            ref_code=None,
-            ref_spk_embedding=torch.randn(1024),
-            x_vector_only_mode=True,
-            icl_mode=False,
-            ref_text=None,
-        )
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
         server.supported_speakers = {"v"}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=[item])
+        server._load_cached_voice_prompt = MagicMock(return_value=_cached_prompt_payload())
 
         req = OpenAICreateSpeechRequest(input="Hello", voice="v", x_vector_only_mode=False)
         params = server._build_tts_params(req)
@@ -484,7 +462,7 @@ class TestBuildTtsParamsWithCache:
 
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
         server.supported_speakers = {"v"}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=None)
+        server._load_cached_voice_prompt = MagicMock(return_value=None)
 
         with (
             patch.object(server, "_get_uploaded_audio_data", return_value="data:audio/wav;base64,abc"),
@@ -501,7 +479,7 @@ class TestBuildTtsParamsWithCache:
 
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
         server.supported_speakers = {"v"}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=None)
+        server._load_cached_voice_prompt = MagicMock(return_value=None)
 
         req = OpenAICreateSpeechRequest(input="Hello", voice="v")
         with pytest.raises(ValueError, match="corrupted.*also missing"):
@@ -522,18 +500,10 @@ class TestBuildTtsParamsWithCache:
     def test_tts_xvec_only_no_ref_text(self, server):
         """Audio voice with no ref_text -> xvec-only cache."""
         from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-        from vllm_omni.model_executor.models.qwen3_tts.voice_cache_manager import VoiceClonePromptItem
 
-        item = VoiceClonePromptItem(
-            ref_code=None,
-            ref_spk_embedding=torch.randn(1024),
-            x_vector_only_mode=True,
-            icl_mode=False,
-            ref_text=None,
-        )
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
         server.supported_speakers = {"v"}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=[item])
+        server._load_cached_voice_prompt = MagicMock(return_value=_cached_prompt_payload())
 
         req = OpenAICreateSpeechRequest(input="Hello", voice="v")
         params = server._build_tts_params(req)
@@ -731,7 +701,6 @@ class TestVoiceCacheHandlerContract:
     def test_route_audio_missing_returns_400(self, app_and_server):
         client, server = app_and_server
         server.uploaded_speakers = {"v": _audio_speaker_info()}
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
         resp = client.post("/v1/audio/voices/v/cache")
         assert resp.status_code == 400
         assert "missing from disk" in resp.json()["error"]
@@ -739,7 +708,7 @@ class TestVoiceCacheHandlerContract:
     def test_route_ready_returns_200(self, app_and_server):
         client, server = app_and_server
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=[MagicMock()])
+        server._load_cached_voice_prompt = MagicMock(return_value=_cached_prompt_payload())
         resp = client.post("/v1/audio/voices/v/cache")
         assert resp.status_code == 200
         assert resp.json()["cache_status"] == "ready"
@@ -755,8 +724,7 @@ class TestVoiceCacheHandlerContract:
         """force=true should bypass ready guard (fails at file read here)."""
         client, server = app_and_server
         server.uploaded_speakers = {"v": _audio_speaker_info(cache_status="ready")}
-        server._voice_cache_manager.load_cached_voice_prompt = MagicMock(return_value=[MagicMock()])
-        server.metadata_manager.update_speaker = MagicMock(return_value=True)
+        server._load_cached_voice_prompt = MagicMock(return_value=_cached_prompt_payload())
         resp = client.post("/v1/audio/voices/v/cache?force=true")
         # Should try to rebuild (and fail at file read), returning 400
         assert resp.status_code == 400
