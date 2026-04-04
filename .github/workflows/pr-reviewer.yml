@@ -24,12 +24,12 @@ jobs:
        github.event.comment.author_association == 'OWNER')
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5.3.0
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -54,7 +54,7 @@ jobs:
 
       - name: Upload review logs
         if: always()
-        uses: actions/upload-artifact@v4.4.3
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: pr-review-logs-${{ github.event.issue.number || github.event.pull_request.number }}
           path: /tmp/pr_review_*.log

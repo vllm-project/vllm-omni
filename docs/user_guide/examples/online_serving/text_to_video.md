@@ -37,15 +37,47 @@ artifact, poll the job status and then download the completed file from the
 content endpoint.
 
 The main endpoints are:
-- `POST /v1/videos`: create a video generation job
+- `POST /v1/videos`: create a video generation job (async)
+- `POST /v1/videos/sync`: generate a video and return raw bytes (sync, for benchmarks)
 - `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
 - `GET /v1/videos`: list stored video jobs
 - `GET /v1/videos/{video_id}/content`: download the generated video file
 - `DELETE /v1/videos/{video_id}`: delete the job and any stored output
 
+## Sync API (Benchmark / Testing)
+
+`POST /v1/videos/sync` is a synchronous alternative that blocks until generation
+completes and returns the raw video bytes (`video/mp4`) directly in the response
+body. It is designed for benchmark and testing scenarios where one-shot
+request/response latency measurement is needed.
+
+The sync endpoint accepts the same form parameters as `POST /v1/videos`. It does
+not create any stored job record — the response is purely the generated video
+file. Metadata is returned via response headers:
+
+- `X-Request-Id`: unique identifier for this generation request
+- `X-Model`: model name used for generation
+- `X-Inference-Time-S`: wall-clock inference time in seconds
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
+  -F "size=832x480" \
+  -F "num_frames=33" \
+  -F "fps=16" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=4.0" \
+  -F "guidance_scale_2=4.0" \
+  -F "boundary_ratio=0.875" \
+  -F "flow_shift=5.0" \
+  -F "seed=42" \
+  -o sync_t2v_output.mp4
+```
+
 ## Storage
 
 Generated video files are stored on local disk by the async video API.
+Local file storage behavior can be controlled via the following environment variables:
 
 - `VLLM_OMNI_STORAGE_PATH`: directory used for generated files (default: `/tmp/storage`)
 - `VLLM_OMNI_STORAGE_MAX_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
@@ -147,7 +179,7 @@ curl -X POST http://localhost:8091/v1/videos \
 
 ## Create Response Format
 
-`POST /v1/videos` returns a job record.
+`POST /v1/videos` returns a job record, not inline base64 video data.
 
 ```json
 {
@@ -204,6 +236,10 @@ done
 
 ## Example materials
 
+??? abstract "run_curl_hunyuan_video_15.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_video/run_curl_hunyuan_video_15.sh"
+    ``````
 ??? abstract "run_curl_text_to_video.sh"
     ``````sh
     --8<-- "examples/online_serving/text_to_video/run_curl_text_to_video.sh"
@@ -211,4 +247,8 @@ done
 ??? abstract "run_server.sh"
     ``````sh
     --8<-- "examples/online_serving/text_to_video/run_server.sh"
+    ``````
+??? abstract "run_server_hunyuan_video_15.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_video/run_server_hunyuan_video_15.sh"
     ``````

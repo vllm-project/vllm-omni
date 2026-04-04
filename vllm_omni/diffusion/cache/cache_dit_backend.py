@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 
 logger = init_logger(__name__)
 
@@ -61,14 +62,16 @@ def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
         max_cached_steps=cache_config.max_cached_steps,
         max_continuous_cached_steps=cache_config.max_continuous_cached_steps,
         residual_diff_threshold=cache_config.residual_diff_threshold,
+        force_refresh_step_hint=cache_config.force_refresh_step_hint,
+        force_refresh_step_policy=cache_config.force_refresh_step_policy,
     )
 
 
 def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for Wan2.2 dual-transformer architecture.
+    """Enable cache-dit for Wan2.2 single or dual-transformer architecture.
 
-    Wan2.2 uses two transformers (transformer and transformer_2) that need
-    to be enabled together using BlockAdapter.
+    Wan2.2 can use single or dual transformers (transformer and transformer_2) that need
+    to be enabled using BlockAdapter.
 
     Args:
         pipeline: The Wan2.2 pipeline instance.
@@ -77,6 +80,43 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
     Returns:
         A refresh function that can be called to update cache context with new num_inference_steps.
     """
+
+    if getattr(pipeline, "transformer_2", None) is None:
+        logger.info("transformer_2 not found, enabling cache-dit for single transformer mode")
+        db_cache_config = _build_db_cache_config(cache_config)
+        cache_dit.enable_cache(
+            BlockAdapter(
+                transformer=pipeline.transformer,
+                blocks=[pipeline.transformer.blocks],
+                forward_pattern=[ForwardPattern.Pattern_2],
+                params_modifiers=[
+                    ParamsModifier(cache_config=db_cache_config),
+                ],
+                has_separate_cfg=True,
+            ),
+            cache_config=db_cache_config,
+        )
+
+        def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+            """Refresh cache context for single transformer."""
+            if cache_config.scm_steps_mask_policy is None:
+                cache_dit.refresh_context(
+                    pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose
+                )
+            else:
+                cache_dit.refresh_context(
+                    pipeline.transformer,
+                    cache_config=DBCacheConfig().reset(
+                        num_inference_steps=num_inference_steps,
+                        steps_computation_mask=cache_dit.steps_mask(
+                            mask_policy=cache_config.scm_steps_mask_policy, total_steps=num_inference_steps
+                        ),
+                        steps_computation_policy=cache_config.scm_steps_policy,
+                    ),
+                    verbose=verbose,
+                )
+
+        return refresh_cache_context
 
     cache_dit.enable_cache(
         BlockAdapter(
@@ -494,7 +534,7 @@ def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], No
 
 def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for LTX2 pipelines (audio-video transformer blocks)."""
-    transformer = pipeline.transformer
+    transformer = get_transformer_from_pipeline(pipeline)
 
     db_cache_config = _build_db_cache_config(cache_config)
 
@@ -527,11 +567,12 @@ def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], N
     )
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        transformer = get_transformer_from_pipeline(pipeline)
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
             cache_dit.refresh_context(
-                pipeline.transformer,
+                transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
@@ -574,8 +615,9 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
     )
 
     # Enable cache-dit on the transformer
+    transformer = get_transformer_from_pipeline(pipeline)
     cache_dit.enable_cache(
-        pipeline.transformer,
+        transformer,
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
     )
@@ -587,11 +629,12 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
             pipeline: The diffusion pipeline instance.
             num_inference_steps: New number of inference steps.
         """
+        transformer = get_transformer_from_pipeline(pipeline)
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
             cache_dit.refresh_context(
-                pipeline.transformer,
+                transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
@@ -1054,6 +1097,36 @@ def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], 
     return refresh_cache_context
 
 
+def enable_cache_for_glm_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for GLM-Image pipeline.
+
+    GLM-Image processes prompt and image by calling the transformer before the
+    denoising loop. When an input image is provided (editing mode), the cache must
+    be force-refreshed after the preprocessing step so stale hidden states are
+    discarded. Set force_refresh_step_hint = 1 for editing, None for text-to-image.
+    """
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator_config = None
+    if cache_config.enable_taylorseer:
+        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=cache_config.taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={cache_config.taylorseer_order}")
+
+    logger.info(
+        f"Enabling cache-dit on GLM-Image transformer: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
+        f"force_refresh_step_hint={db_cache_config.force_refresh_step_hint}, "
+    )
+
+    cache_dit.enable_cache(
+        pipeline.transformer,
+        cache_config=db_cache_config,
+        calibrator_config=calibrator_config,
+    )
+
+
 def enable_cache_for_flux2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for Flux.2-dev pipeline.
 
@@ -1142,7 +1215,10 @@ CUSTOM_DIT_ENABLERS.update(
         "StableDiffusion3Pipeline": enable_cache_for_sd3,
         "LTX2Pipeline": enable_cache_for_ltx2,
         "LTX2ImageToVideoPipeline": enable_cache_for_ltx2,
+        "LTX2TwoStagesPipeline": enable_cache_for_ltx2,
+        "LTX2ImageToVideoTwoStagesPipeline": enable_cache_for_ltx2,
         "BagelPipeline": enable_cache_for_bagel,
+        "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,
     }
 )

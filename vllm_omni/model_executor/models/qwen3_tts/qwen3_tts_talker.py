@@ -27,6 +27,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, 
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
@@ -406,6 +407,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
+        # In-memory LRU cache for voice extraction artifacts (Base voice clone).
+        self._voice_cache = VoiceEmbeddingCache()
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -700,7 +704,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         info: dict[str, Any] = additional_information or {}
         text = _first(info.get("text"), "")
         language = _first(info.get("language"), "Auto")
-        speaker = _first(info.get("speaker"), "")
+        speaker = _first(info.get("speaker"), "").lower().strip()
         instruct = _first(info.get("instruct"), "")
         non_streaming_mode_raw = _first(info.get("non_streaming_mode"), None)
 
@@ -1122,7 +1126,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         )
         # Prefer GPU for encoder if available; otherwise keep CPU.
         dev = next(self.parameters()).device
-        if getattr(dev, "type", None) == "cuda":
+        if dev.type != "cpu":
             try:
                 tok.model.to(dev)
                 tok.device = dev
@@ -1326,6 +1330,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
+
+            # Voice cache: only for uploaded voices (created_at > 0)
+            _voice_cache_key = None
+            if voice_clone_prompt is None:
+                _speaker_list = info_dict.get("speaker")
+                if isinstance(_speaker_list, list) and _speaker_list:
+                    _voice_name = str(_speaker_list[0]).lower()
+                    _voice_created_at = float((info_dict.get("voice_created_at") or [0])[0])
+                    if _voice_created_at > 0:
+                        _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only, _voice_created_at)
+                    _cached = self._voice_cache.get(_voice_cache_key) if _voice_cache_key is not None else None
+                    if _cached is not None:
+                        voice_clone_prompt = {
+                            "ref_code": _cached.get("ref_code"),
+                            "ref_spk_embedding": _cached.get("ref_spk_embedding"),
+                            "icl_mode": _cached.get("icl_mode"),
+                        }
+                        _voice_cache_key = None  # hit -> don't store again
+
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
                 icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
@@ -1357,17 +1380,36 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_code_prompt = ref_code_t
 
             # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
+            # NOTE: Do NOT use _as_singleton here — the embedding may be a plain
+            # float list (from API via msgspec IPC) that _as_singleton would
+            # destructively unwrap to a single scalar.
             spk = None
             if voice_clone_prompt is not None:
-                spk = _as_singleton(voice_clone_prompt.get("ref_spk_embedding"))
+                spk = voice_clone_prompt.get("ref_spk_embedding")
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
+            elif isinstance(spk, (list, np.ndarray)):
+                # Plain list/array from API (survived msgspec IPC serialization).
+                speaker_embed = torch.tensor(spk, dtype=torch.bfloat16, device=input_ids.device).view(1, 1, -1)
             else:
                 ref_audio_list = info_dict.get("ref_audio")
                 if not isinstance(ref_audio_list, list) or not ref_audio_list:
                     raise ValueError("Base requires `ref_audio`.")
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+
+            # Cache miss: store extraction result
+            if _voice_cache_key is not None and speaker_embed is not None:
+                self._voice_cache.put(
+                    _voice_cache_key,
+                    {
+                        "ref_code": ref_code_prompt.detach().cpu()
+                        if isinstance(ref_code_prompt, torch.Tensor)
+                        else None,
+                        "ref_spk_embedding": speaker_embed.detach().cpu().reshape(-1),
+                        "icl_mode": in_context_mode,
+                    },
+                )
 
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
@@ -1438,13 +1480,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     )
 
         elif task_type == "CustomVoice":
-            speaker = (info_dict.get("speaker") or [""])[0]
-            if not isinstance(speaker, str) or not speaker.strip():
+            _speaker_raw = info_dict.get("speaker") or [""]
+            speaker = (
+                ((_speaker_raw[0] if isinstance(_speaker_raw, (list, tuple)) else _speaker_raw) or "").lower().strip()
+            )
+            if not speaker:
                 raise ValueError("CustomVoice requires additional_information.speaker.")
-            spk_id_map = getattr(self.talker_config, "spk_id", None) or {}
-            if speaker.lower() not in spk_id_map:
+            spk_id_map = {k.lower(): v for k, v in (getattr(self.talker_config, "spk_id", None) or {}).items()}
+            if speaker not in spk_id_map:
                 raise ValueError(f"Unsupported speaker: {speaker}")
-            spk_id = spk_id_map[speaker.lower()]
+            spk_id = spk_id_map[speaker]
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
             spk_embed = self.embed_input_ids(spk_tensor)

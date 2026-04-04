@@ -16,7 +16,7 @@ except ImportError:
 
 
 import torch
-from vllm.inputs.data import EmbedsPrompt, TextPrompt, TokenInputs, TokensPrompt
+from vllm.inputs import EmbedsPrompt, TextPrompt, TokensInput, TokensPrompt
 
 
 class OmniTextPrompt(TextPrompt):
@@ -59,10 +59,10 @@ class OmniTokensPrompt(TokensPrompt):
     additional_information: NotRequired[dict[str, Any]]
 
 
-class OmniTokenInputs(TokenInputs):
+class OmniTokenInputs(TokensInput):
     """Token inputs with optional embeddings and additional information.
 
-    Extends TokenInputs to support prompt embeddings and additional
+    Extends TokensInput to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:
@@ -234,8 +234,9 @@ class OmniDiffusionSamplingParams:
     step_index: int | None = None
     boundary_ratio: float | None = None
 
-    # Scheduler parameters
-    num_inference_steps: int = 50
+    # Scheduler parameters – ``None`` means "not explicitly set by the caller";
+    # each pipeline's ``forward()`` decides its own model-specific default.
+    num_inference_steps: int | None = None
     guidance_scale: float = 0.0
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None

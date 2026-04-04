@@ -14,10 +14,6 @@ def __getattr__(name: str):
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         return AsyncOmni
-    if name == "AsyncOmniDiffusion":
-        from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
-
-        return AsyncOmniDiffusion
     if name == "Omni":
         from vllm_omni.entrypoints.omni import Omni
 
@@ -27,6 +23,5 @@ def __getattr__(name: str):
 
 __all__ = [
     "AsyncOmni",
-    "AsyncOmniDiffusion",
     "Omni",
 ]

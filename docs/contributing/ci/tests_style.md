@@ -73,7 +73,6 @@ vllm_omni/                                    tests/
 │   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
 │
 ├── entrypoints/                        →     ├── entrypoints/
-│   ├── async_omni_diffusion.py                 │   ├── test_async_omni_diffusion_config.py  ✅
 │   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
 │   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
 │   │   └── ...                                  │   │   └── test_*.py                  ⬜
@@ -130,9 +129,11 @@ vllm_omni/                                    tests/
 │
 └── e2e (tests side only)               →     ├── e2e/
                                                ├── online_serving/                     ✅ non-empty
+                                               │   ├── test_qwen2_5_omni.py
                                                │   ├── test_async_omni.py
                                                │   ├── test_qwen3_omni.py
                                                │   ├── test_qwen3_omni_expansion.py
+                                               │   ├── test_mimo_audio.py
                                                │   ├── test_image_gen_edit.py
                                                │   ├── test_images_generations_lora.py
                                                │   └── stage_configs/
@@ -157,6 +158,12 @@ vllm_omni/                                    tests/
                                                        ├── qwen3_omni_ci.yaml
                                                        ├── bagel_*.yaml
                                                        └── npu/, rocm/, etc.
+examples/                                     tests
+│                                             └── examples
+├── online_serving/                     →         ├── online_serving/
+│   └── {doc_page_title}/README.md                │   └── test_{doc_page_title}.py  ⬜
+└── offline_inference/                  →         └── offline_inference/
+    └── {doc_page_title}/README.md                    └── test_{doc_page_title}.py  ⬜
 ```
 
 

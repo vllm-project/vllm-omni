@@ -53,6 +53,11 @@ def omni_snapshot_download(model_id: str) -> str:
         )
     except huggingface_hub.errors.RepositoryNotFoundError:
         logger.warning("Repository not found for '%s'.", model_id)
+    except PermissionError:
+        logger.warning(
+            "Permission denied when downloading '%s'. Assuming the model is already cached locally.",
+            model_id,
+        )
 
     return model_id
 
@@ -74,6 +79,7 @@ class OmniBase:
         log_stats = kwargs.pop("log_stats", False)
         async_chunk = kwargs.pop("async_chunk", False)
         output_modalities = kwargs.pop("output_modalities", None)
+        diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
@@ -82,6 +88,7 @@ class OmniBase:
         self.log_stats = log_stats
         self.async_chunk = async_chunk
         self.output_modalities = output_modalities or []
+        self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
         logger.info("[%s] Initializing with model %s", self.__class__.__name__, model)
         st = time.time()
@@ -90,6 +97,7 @@ class OmniBase:
             engine_args=engine_args,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
+            diffusion_batch_size=diffusion_batch_size,
             **kwargs,
         )
         self._shutdown_called = False
@@ -239,6 +247,7 @@ class OmniBase:
         req_id = result.get("request_id")
         engine_outputs = result.get("engine_outputs")
         stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
+        peak_memory_mb = getattr(result["engine_outputs"], "peak_memory_mb", 0.0)
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")
@@ -268,11 +277,13 @@ class OmniBase:
 
         images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
         return OmniRequestOutput(
+            request_id=req_id or "",
             stage_id=stage_id,
             final_output_type=stage_meta["final_output_type"],
             request_output=engine_outputs,
             images=images,
             stage_durations=stage_durations,
+            peak_memory_mb=peak_memory_mb,
         )
 
     def shutdown(self) -> None:
@@ -281,6 +292,37 @@ class OmniBase:
 
     def close(self) -> None:
         self.shutdown()
+
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
+        """Start profiling specified stages.
+
+        Uses vLLM-compatible profile(is_start=True, profile_prefix) interface.
+
+        Args:
+            profile_prefix: Optional prefix for the trace file names.
+            stages: List of stage IDs to profile. If None, profiles all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.engine.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        """Stop profiling specified stages.
+
+        Uses vLLM-compatible profile(is_start=False) interface.
+
+        Args:
+            stages: List of stage IDs to profile. If None, stops all stages.
+
+        Returns:
+            List of results from each stage.
+        """
+        return self.engine.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     def _shutdown_base(self) -> None:
         if getattr(self, "_shutdown_called", False):

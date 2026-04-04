@@ -685,6 +685,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
 
         negative_text_ids = None
         if do_classifier_free_guidance:
+            negative_prompt = negative_prompt if negative_prompt is not None else ""
             negative_prompt_embeds, negative_text_ids = self.encode_prompt(
                 prompt=negative_prompt,
                 prompt_embeds=negative_prompt_embeds,

@@ -1,7 +1,7 @@
 steps:
 
 - label: "Diffusion Model Test"
-  timeout_in_minutes: 20
+  timeout_in_minutes: 30
   agent_pool: mi325_2
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
@@ -11,7 +11,7 @@ steps:
     - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
 
 - label: "Diffusion Images API LoRA E2E"
-  timeout_in_minutes: 20
+  timeout_in_minutes: 30
   agent_pool: mi325_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
