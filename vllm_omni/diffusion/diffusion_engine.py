@@ -482,13 +482,13 @@ class DiffusionEngine:
                 ``list``, or ``dict`` structures that contain tensors.
 
         Returns:
-            A payload with every tensor moved to CPU using non-blocking
-            transfers where possible.
+            A payload with every tensor moved to CPU before postprocessing
+            consumes it.
         """
         if isinstance(output_data, torch.Tensor):
             if output_data.device.type == "cpu":
                 return output_data
-            return output_data.to("cpu", non_blocking=True)
+            return output_data.to("cpu")
         if isinstance(output_data, tuple):
             return tuple(self._move_output_to_cpu(item) for item in output_data)
         if isinstance(output_data, list):
