@@ -255,9 +255,8 @@ class DiffusionEngine:
 
         if supports_audio_input(self.od_config.model_class_name):
             audio_sr = 16000
-            audio_duration_sec = 4
-            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
-            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+            dummy_audio_duration_sec = 2
+            dummy_audio = np.random.randn(audio_sr * dummy_audio_duration_sec).astype(np.float32)
         else:
             dummy_audio = None
 
@@ -440,6 +439,181 @@ class DiffusionEngine:
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
         return request, preprocess_time
 
+    def _build_step_metrics(
+        self,
+        request: OmniDiffusionRequest,
+        *,
+        preprocess_ms: float,
+        exec_ms: float,
+        postprocess_ms: float,
+        total_ms: float,
+    ) -> dict[str, float | int]:
+        """Build the public diffusion metrics emitted by ``step()``.
+
+        Args:
+            request: Logical diffusion request whose sampling parameters are
+                mirrored into the telemetry payload.
+            preprocess_ms: Time spent in the optional preprocessing hook.
+            exec_ms: Time spent waiting for the scheduled diffusion execution.
+            postprocess_ms: Time spent converting the terminal diffusion output
+                into public response objects.
+            total_ms: End-to-end wall-clock time for the entire step call.
+
+        Returns:
+            A metrics dictionary with grouped key names for timings and request
+            parameters.
+
+        Notes:
+            All timing values are passed in from the caller after it has frozen
+            the measurement boundaries. This helper must not call
+            ``time.perf_counter()`` on its own, or the metrics payload would
+            drift from the logged step breakdown.
+        """
+        return {
+            "time_preprocess_ms": preprocess_ms,
+            "time_exec_ms": exec_ms,
+            "time_postprocess_ms": postprocess_ms,
+            "time_total_ms": total_ms,
+            "param_num_outputs_per_prompt": int(request.sampling_params.num_outputs_per_prompt),
+            "param_resolution": int(request.sampling_params.resolution),
+        }
+
+    def _move_output_to_cpu(self, output_data: Any) -> Any:
+        """Recursively move diffusion outputs to CPU for postprocessing.
+
+        Args:
+            output_data: Terminal diffusion output payload. Some models return
+                a single tensor, while others may return nested ``tuple``,
+                ``list``, or ``dict`` structures that contain tensors.
+
+        Returns:
+            A payload with every tensor moved to CPU using non-blocking
+            transfers where possible.
+        """
+        if isinstance(output_data, torch.Tensor):
+            if output_data.device.type == "cpu":
+                return output_data
+            return output_data.to("cpu", non_blocking=True)
+        if isinstance(output_data, tuple):
+            return tuple(self._move_output_to_cpu(item) for item in output_data)
+        if isinstance(output_data, list):
+            return [self._move_output_to_cpu(item) for item in output_data]
+        if isinstance(output_data, dict):
+            return {key: self._move_output_to_cpu(value) for key, value in output_data.items()}
+        return output_data
+
+    def _extract_audio_slice(
+        self,
+        audio_payload: Any,
+        *,
+        start_idx: int,
+        end_idx: int,
+        num_outputs: int,
+    ) -> Any:
+        """Slice the shared audio payload down to one logical request.
+
+        Args:
+            audio_payload: Combined audio payload returned by postprocessing.
+                Depending on the backend, this may be a Python sequence or an
+                array-like object with a leading batch dimension.
+            start_idx: Inclusive start offset for the current request.
+            end_idx: Exclusive end offset for the current request.
+            num_outputs: Number of outputs requested for the current prompt.
+
+        Returns:
+            The audio payload belonging to the current logical request.
+        """
+        sliced_audio = audio_payload
+
+        if isinstance(audio_payload, (list, tuple)):
+            sliced_audio = audio_payload[start_idx:end_idx]
+            if len(sliced_audio) == 1:
+                sliced_audio = sliced_audio[0]
+        elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
+            if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
+                sliced_audio = audio_payload[start_idx:end_idx]
+                if num_outputs == 1:
+                    sliced_audio = sliced_audio[0]
+        else:
+            logger.warning(
+                "Audio payload of type %s does not support per-request slicing; "
+                "reusing the original payload for request range [%d:%d).",
+                type(audio_payload).__name__,
+                start_idx,
+                end_idx,
+            )
+
+        return sliced_audio
+
+    def _build_request_output(
+        self,
+        *,
+        request_id: str,
+        prompt: OmniTextPrompt,
+        request_outputs: Any,
+        metrics: dict[str, float | int],
+        diffusion_output: DiffusionOutput,
+        model_outputs_audio: bool,
+        request_mm_audio: Any = None,
+    ) -> OmniRequestOutput:
+        """Build one public response object from per-request payloads.
+
+        Args:
+            request_id: Public request identifier for the logical request being
+                materialized.
+            prompt: Prompt corresponding to the logical request.
+            request_outputs: Outputs already narrowed to the current request.
+            metrics: Step-level telemetry payload shared by all prompts in the
+                same diffusion step.
+            diffusion_output: Raw terminal diffusion output that carries
+                latents and auxiliary metadata.
+            model_outputs_audio: Whether the primary model output modality is
+                audio instead of images.
+            request_mm_audio: Optional secondary audio payload attached under
+                ``multimodal_output`` for image-producing models.
+
+        Returns:
+            The final ``OmniRequestOutput`` for one logical request.
+
+        Notes:
+            Batch-scoped metadata such as ``trajectory_latents``,
+            ``custom_output``, ``stage_durations``, and ``peak_memory_mb`` is
+            intentionally copied into every per-request output. This preserves
+            the historical diffusion response contract for callers that already
+            expect those fields to be available on each logical result.
+        """
+        if model_outputs_audio:
+            request_audio_payload = request_outputs
+            if isinstance(request_outputs, (list, tuple)) and len(request_outputs) == 1:
+                request_audio_payload = request_outputs[0]
+            return OmniRequestOutput.from_diffusion(
+                request_id=request_id,
+                images=[],
+                prompt=prompt,
+                metrics=metrics,
+                latents=diffusion_output.trajectory_latents,
+                multimodal_output={"audio": request_audio_payload},
+                final_output_type="audio",
+                stage_durations=diffusion_output.stage_durations,
+                peak_memory_mb=diffusion_output.peak_memory_mb,
+            )
+
+        multimodal_output = {}
+        if request_mm_audio is not None:
+            multimodal_output["audio"] = request_mm_audio
+
+        return OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=request_outputs,
+            prompt=prompt,
+            metrics=metrics,
+            latents=diffusion_output.trajectory_latents,
+            custom_output=diffusion_output.custom_output or {},
+            multimodal_output=multimodal_output,
+            stage_durations=diffusion_output.stage_durations,
+            peak_memory_mb=diffusion_output.peak_memory_mb,
+        )
+
     def _materialize_step_outputs(
         self,
         request: OmniDiffusionRequest,
@@ -451,11 +625,10 @@ class DiffusionEngine:
         """Convert a terminal output into ``OmniRequestOutput`` objects.
 
         Notes:
-            This helper intentionally preserves the existing ``step()`` behavior,
-            including current metrics keys, CPU offload semantics, warmup
-            behavior, and output assembly logic. The core-loop refactor only
-            changes request coordination, not user-visible diffusion output
-            formatting.
+            This helper keeps ``step()`` readable by separating terminal output
+            materialization from request scheduling. It preserves the existing
+            response semantics while applying the remaining telemetry and
+            readability cleanups tracked in Issue #2335.
         """
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
@@ -480,12 +653,8 @@ class DiffusionEngine:
         # post-processing to avoid device OOM — model weights may still
         # reside on the device and leave no headroom for intermediates.
         output_data = output.output
-        if (
-            self.od_config.enable_cpu_offload
-            and isinstance(output_data, torch.Tensor)
-            and output_data.device.type != "cpu"
-        ):
-            output_data = output_data.cpu()
+        if self.od_config.enable_cpu_offload:
+            output_data = self._move_output_to_cpu(output_data)
 
         postprocess_start_time = time.perf_counter()
         outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
@@ -507,119 +676,72 @@ class DiffusionEngine:
         )
 
         # Convert to OmniRequestOutput format
-        # Ensure outputs is a list
-        if not isinstance(outputs, list):
+        model_outputs_audio = supports_audio_output(self.od_config.model_class_name)
+        if not model_outputs_audio and not isinstance(outputs, list):
             outputs = [outputs] if outputs is not None else []
 
-        metrics = {
-            "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
-            "diffusion_engine_total_time_ms": exec_total_time * 1000,
-            "image_num": int(request.sampling_params.num_outputs_per_prompt),
-            "resolution": int(request.sampling_params.resolution),
-            "postprocess_time_ms": postprocess_time * 1000,
-        }
-        if self.pre_process_func is not None:
-            metrics["preprocessing_time_ms"] = preprocess_time * 1000
+        preprocess_ms = preprocess_time * 1000
+        exec_ms = exec_total_time * 1000
+        postprocess_ms = postprocess_time * 1000
+        total_ms = step_total_ms
+        metrics = self._build_step_metrics(
+            request,
+            preprocess_ms=preprocess_ms,
+            exec_ms=exec_ms,
+            postprocess_ms=postprocess_ms,
+            total_ms=total_ms,
+        )
 
-        # Handle single request or multiple requests
-        if len(request.prompts) == 1:
-            # Single request: return single OmniRequestOutput
-            prompt = request.prompts[0]
-            request_id = request.request_ids[0] if request.request_ids else ""
+        single_request = len(request.prompts) == 1
+        results = []
+        output_idx = 0
 
-            if supports_audio_output(self.od_config.model_class_name):
-                request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        multimodal_output={"audio": request_audio_payload},
-                        final_output_type="audio",
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
+        for i, prompt in enumerate(request.prompts):
+            request_id = request.request_ids[i] if i < len(request.request_ids) else ""
+            num_outputs = request.sampling_params.num_outputs_per_prompt
+
+            if single_request:
+                request_outputs = outputs
             else:
-                mm_output = {}
-                if audio_payload is not None:
-                    mm_output["audio"] = audio_payload
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=outputs,
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        custom_output=output.custom_output or {},
-                        multimodal_output=mm_output,
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
-        else:
-            # Multiple requests: return list of OmniRequestOutput
-            # Split images based on num_outputs_per_prompt for each request
-            results = []
-            output_idx = 0
-
-            for i, prompt in enumerate(request.prompts):
-                request_id = request.request_ids[i] if i < len(request.request_ids) else ""
-
-                # Get images for this request
-                num_outputs = request.sampling_params.num_outputs_per_prompt
                 start_idx = output_idx
                 end_idx = start_idx + num_outputs
-                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
-                output_idx = end_idx
-
-                if supports_audio_output(self.od_config.model_class_name):
-                    request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=[],
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
-                            multimodal_output={"audio": request_audio_payload},
-                            final_output_type="audio",
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
-                        ),
+                if model_outputs_audio:
+                    request_outputs = self._extract_audio_slice(
+                        outputs,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        num_outputs=num_outputs,
                     )
                 else:
-                    mm_output = {}
-                    if audio_payload is not None:
-                        sliced_audio = audio_payload
-                        if isinstance(audio_payload, (list, tuple)):
-                            sliced_audio = audio_payload[start_idx:end_idx]
-                            if len(sliced_audio) == 1:
-                                sliced_audio = sliced_audio[0]
-                        elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
-                            if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
-                                sliced_audio = audio_payload[start_idx:end_idx]
-                                if num_outputs == 1:
-                                    sliced_audio = sliced_audio[0]
-                        mm_output["audio"] = sliced_audio
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=request_outputs,
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
-                            custom_output=output.custom_output or {},
-                            multimodal_output=mm_output,
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
-                        ),
-                    )
+                    request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
+                output_idx = end_idx
 
-            return results
+            request_mm_audio = None
+            if not model_outputs_audio and audio_payload is not None:
+                request_mm_audio = (
+                    audio_payload
+                    if single_request
+                    else self._extract_audio_slice(
+                        audio_payload,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        num_outputs=num_outputs,
+                    )
+                )
+
+            results.append(
+                self._build_request_output(
+                    request_id=request_id,
+                    prompt=prompt,
+                    request_outputs=request_outputs,
+                    metrics=metrics,
+                    diffusion_output=output,
+                    model_outputs_audio=model_outputs_audio,
+                    request_mm_audio=request_mm_audio,
+                )
+            )
+
+        return results
 
     def _run_core_loop(self) -> None:
         """Run the dedicated owner loop for scheduler and executor coordination.

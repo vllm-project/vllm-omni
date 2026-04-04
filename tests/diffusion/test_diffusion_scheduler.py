@@ -27,6 +27,16 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+class _FakeCudaTensor(torch.Tensor):
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda")
+
+    def to(self, *args, **kwargs) -> torch.Tensor:
+        del args, kwargs
+        return torch.tensor(self.tolist(), dtype=self.dtype)
+
+
 def _make_request(req_id: str, *, request_ids: list[str] | None = None) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompts=[f"prompt_{req_id}"],
@@ -42,6 +52,11 @@ def _make_request_output(req_id: str, *, error: str | None = None, finished: boo
         finished=finished,
         result=DiffusionOutput(output=None, error=error),
     )
+
+
+def _make_fake_cuda_tensor(values: list[float]) -> torch.Tensor:
+    base = torch.tensor(values, dtype=torch.float32)
+    return torch.Tensor._make_subclass(_FakeCudaTensor, base, require_grad=False)
 
 
 def _make_step_output(
@@ -378,6 +393,171 @@ class TestDiffusionEngine:
 
         with pytest.raises(DiffusionRequestAbortedError, match="Request req-abort aborted"):
             engine.step(_make_request("req-abort"))
+
+    def test_materialize_step_outputs_preserves_single_and_multi_request_audio_semantics(self) -> None:
+        """Keep output slicing behavior unchanged while removing duplicate branches."""
+        multi_engine = DiffusionEngine.__new__(DiffusionEngine)
+        multi_engine.od_config = Mock(model_class_name="mock_model", enable_cpu_offload=False)
+        multi_engine.post_process_func = Mock(
+            return_value={
+                "video": ["image-0", "image-1", "image-2", "image-3"],
+                "audio": ["audio-0", "audio-1", "audio-2", "audio-3"],
+            }
+        )
+        multi_request = OmniDiffusionRequest(
+            prompts=["prompt-0", "prompt-1"],
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                num_outputs_per_prompt=2,
+            ),
+            request_ids=["req-0", "req-1"],
+        )
+        multi_output = DiffusionOutput(
+            output="raw-output",
+            trajectory_latents=torch.tensor([1.0]),
+            custom_output={"trace": "kept"},
+        )
+
+        with (
+            patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False),
+            patch(
+                "vllm_omni.diffusion.diffusion_engine.time.perf_counter",
+                side_effect=[201.0, 201.2, 202.0],
+            ),
+        ):
+            multi_results = multi_engine._materialize_step_outputs(
+                request=multi_request,
+                output=multi_output,
+                preprocess_time=0.1,
+                exec_total_time=0.2,
+                diffusion_engine_start_time=200.0,
+            )
+
+        assert [result.images for result in multi_results] == [
+            ["image-0", "image-1"],
+            ["image-2", "image-3"],
+        ]
+        assert [result.multimodal_output["audio"] for result in multi_results] == [
+            ["audio-0", "audio-1"],
+            ["audio-2", "audio-3"],
+        ]
+
+        single_engine = DiffusionEngine.__new__(DiffusionEngine)
+        single_engine.od_config = Mock(model_class_name="mock_audio_model", enable_cpu_offload=False)
+        single_engine.post_process_func = None
+        single_request = OmniDiffusionRequest(
+            prompts=["prompt-audio"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_ids=["req-audio"],
+        )
+        single_output = DiffusionOutput(
+            output=["audio-sample"],
+            trajectory_latents=torch.tensor([2.0]),
+        )
+
+        with (
+            patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=True),
+            patch(
+                "vllm_omni.diffusion.diffusion_engine.time.perf_counter",
+                side_effect=[301.0, 301.1, 302.0],
+            ),
+        ):
+            single_results = single_engine._materialize_step_outputs(
+                request=single_request,
+                output=single_output,
+                preprocess_time=0.0,
+                exec_total_time=0.3,
+                diffusion_engine_start_time=300.0,
+            )
+
+        assert len(single_results) == 1
+        assert single_results[0].images == []
+        assert single_results[0].final_output_type == "audio"
+        assert single_results[0].multimodal_output == {"audio": "audio-sample"}
+
+    def test_materialize_step_outputs_slices_batched_audio_tensor_per_prompt(self) -> None:
+        """Split batched audio tensors per prompt when the model outputs audio."""
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(model_class_name="mock_audio_model", enable_cpu_offload=False)
+        engine.post_process_func = None
+        request = OmniDiffusionRequest(
+            prompts=["prompt-a", "prompt-b"],
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                num_outputs_per_prompt=1,
+            ),
+            request_ids=["req-a", "req-b"],
+        )
+        audio_batch = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]],
+            dtype=torch.float32,
+        )
+        output = DiffusionOutput(output=audio_batch)
+
+        with (
+            patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=True),
+            patch(
+                "vllm_omni.diffusion.diffusion_engine.time.perf_counter",
+                side_effect=[401.0, 401.1, 402.0],
+            ),
+        ):
+            results = engine._materialize_step_outputs(
+                request=request,
+                output=output,
+                preprocess_time=0.0,
+                exec_total_time=0.25,
+                diffusion_engine_start_time=400.0,
+            )
+
+        assert len(results) == 2
+        assert torch.equal(results[0].multimodal_output["audio"], torch.tensor([1.0, 2.0]))
+        assert torch.equal(results[1].multimodal_output["audio"], torch.tensor([3.0, 4.0]))
+
+    def test_materialize_step_outputs_moves_nested_outputs_to_cpu(self) -> None:
+        """Recursively offload nested tensor outputs before postprocessing."""
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(model_class_name="mock_model", enable_cpu_offload=True)
+        captured: dict[str, object] = {}
+
+        def post_process(output_data):
+            captured["output_data"] = output_data
+            return ["image"]
+
+        engine.post_process_func = post_process
+        request = OmniDiffusionRequest(
+            prompts=["prompt-nested"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_ids=["req-nested"],
+        )
+        output = DiffusionOutput(
+            output=(
+                _make_fake_cuda_tensor([1.0, 2.0]),
+                {
+                    "audio": _make_fake_cuda_tensor([3.0, 4.0]),
+                },
+            )
+        )
+
+        with (
+            patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False),
+            patch(
+                "vllm_omni.diffusion.diffusion_engine.time.perf_counter",
+                side_effect=[501.0, 501.1, 502.0],
+            ),
+        ):
+            results = engine._materialize_step_outputs(
+                request=request,
+                output=output,
+                preprocess_time=0.0,
+                exec_total_time=0.5,
+                diffusion_engine_start_time=500.0,
+            )
+
+        moved_output = captured["output_data"]
+        assert isinstance(moved_output, tuple)
+        assert moved_output[0].device.type == "cpu"
+        assert moved_output[1]["audio"].device.type == "cpu"
+        assert results[0].images == ["image"]
 
     def test_abort_waiting_request_completes_pending_future(self) -> None:
         """Abort a waiting request and resolve its future immediately.
