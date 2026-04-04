@@ -103,7 +103,7 @@ class LlamaRotaryEmbedding(nn.Module):
 
 
 class LlamaAttention(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, quant_config=None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -122,12 +122,14 @@ class LlamaAttention(nn.Module):
             total_num_heads=self.num_heads,
             total_num_kv_heads=self.num_key_value_heads,
             bias=config.attention_bias,
+            quant_config=quant_config,
         )
         # TP-aware: row-parallel output projection
         self.o_proj = RowParallelLinear(
             self.num_heads * self.head_dim,
             self.hidden_size,
             bias=getattr(config, "o_attention_bias", config.attention_bias),
+            quant_config=quant_config,
         )
 
     def forward(
@@ -205,7 +207,7 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, quant_config=None):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -215,12 +217,14 @@ class LlamaMLP(nn.Module):
             self.hidden_size,
             [self.intermediate_size] * 2,
             bias=config.mlp_bias,
+            quant_config=quant_config,
         )
         # TP-aware: row-parallel down projection
         self.down_proj = RowParallelLinear(
             self.intermediate_size,
             self.hidden_size,
             bias=config.mlp_bias,
+            quant_config=quant_config,
         )
         self.act_fn = nn.SiLU()
 
@@ -237,11 +241,11 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, quant_config=None):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
-        self.mlp = LlamaMLP(config)
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx, quant_config=quant_config)
+        self.mlp = LlamaMLP(config, quant_config=quant_config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

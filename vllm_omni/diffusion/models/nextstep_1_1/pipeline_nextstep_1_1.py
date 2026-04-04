@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep import (
     NextStepConfig,
     NextStepModel,
 )
+from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -169,7 +170,8 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Load model from local TP-aware code (weights loaded later via load_weights)
         config = NextStepConfig.from_json(os.path.join(model_path, "config.json"))
-        self.model = NextStepModel(config)
+        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        self.model = NextStepModel(config, quant_config=quant_config)
         self.model.eval()
 
         # Load config
