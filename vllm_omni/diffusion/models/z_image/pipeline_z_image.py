@@ -183,12 +183,12 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         text_encoder_config = AutoConfig.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self._execution_device)
+        )
         self.text_encoder = create_transformers_model(
             AutoModelForCausalLM,
             od_config,
             hf_config=text_encoder_config,
-        )
+        ).to(self._execution_device)
         if text_encoder_config.tie_word_embeddings:
             self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
 
