@@ -182,6 +182,28 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     return obj
 
 
+def _try_resolve_omni_model_type(model: str) -> str | None:
+    """Try to resolve model_type for omni models with empty config.json.
+
+    Checks if any registered omni stage config file name matches a substring
+    in the model name (e.g. 'cosyvoice3' in 'FunAudioLLM/Fun-CosyVoice3-0.5B-2512').
+    When multiple configs match, the longest stem wins to avoid ambiguity
+    (e.g. 'bagel_single_stage' over 'bagel').
+    """
+    stage_configs_dir = PROJECT_ROOT / "vllm_omni" / "model_executor" / "stage_configs"
+    if not stage_configs_dir.exists():
+        return None
+    model_lower = model.lower().replace("-", "").replace("_", "")
+    best_match: str | None = None
+    best_len = 0
+    for config_file in sorted(stage_configs_dir.glob("*.yaml")):
+        candidate = config_file.stem.replace("-", "").replace("_", "")
+        if candidate in model_lower and len(candidate) > best_len:
+            best_match = config_file.stem
+            best_len = len(candidate)
+    return best_match
+
+
 def resolve_model_config_path(model: str) -> str:
     """Resolve the stage config file path from the model name.
 
@@ -220,7 +242,11 @@ def resolve_model_config_path(model: str) -> str:
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
-                    raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
+                    # For models with empty config.json (e.g. CosyVoice3),
+                    # try matching against registered omni stage configs.
+                    model_type = _try_resolve_omni_model_type(model)
+                    if model_type is None:
+                        raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:

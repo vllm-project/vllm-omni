@@ -192,8 +192,10 @@ class CosyVoice3Code2Wav(nn.Module):
         # Create mask
         mask = (~make_pad_mask(full_token_len)).unsqueeze(-1).to(embedding)
 
-        # Token embedding
-        token_emb = self.input_embedding(torch.clamp(full_token, min=0)) * mask
+        # Token embedding (clamp to valid codebook range; EOS/padding tokens may exceed vocab_size)
+        token_emb = (
+            self.input_embedding(torch.clamp(full_token, min=0, max=self.input_embedding.num_embeddings - 1)) * mask
+        )
 
         # Pre-lookahead processing
         h = self.pre_lookahead_layer(token_emb)
