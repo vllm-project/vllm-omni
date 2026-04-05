@@ -1,0 +1,77 @@
+# Stage config for Step-Audio2 CI tests
+# Stage 0: Thinker (audio understanding → text + audio tokens)
+# Stage 1: Token2Wav (audio tokens → waveform)
+
+# The following config has been verified on 2x 24GB GPU (L4/RTX3090/RTX4090).
+stage_args:
+  - stage_id: 0
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: StepAudio2ThinkerForConditionalGeneration
+      tensor_parallel_size: 1
+      hf_overrides:
+        architectures: ["Qwen2ForCausalLM"]
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      max_model_len: 4096
+      max_num_batched_tokens: 4096
+      max_num_seqs: 1
+      gpu_memory_utilization: 0.8
+      skip_mm_profiling: true
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: text  # Output text + audio tokens
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: -1
+      max_tokens: 256
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    runtime:
+      process: true
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: token2wav
+      model_arch: StepAudio2Token2WavModel
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.3
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 4096
+      engine_output_type: audio  # Output waveform
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.step_audio2.thinker2token2wav
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
