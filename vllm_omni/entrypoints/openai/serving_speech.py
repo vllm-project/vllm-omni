@@ -223,6 +223,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         self._tts_tokenizer = None
         self._direct_embedding_cache: dict[str, list[float]] = {}
+        self._audio_prompt_cache: dict[str, dict[str, Any]] = {}
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
 
@@ -782,6 +783,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         speaker_info = self.uploaded_speakers.pop(voice_name_lower)
         self.supported_speakers.discard(voice_name_lower)
         self._direct_embedding_cache.pop(voice_name_lower, None)
+        self._invalidate_audio_prompt_cache(voice_name_lower)
 
         # Clean up associated files on disk
         file_paths = {
@@ -870,6 +872,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         previous_status = current_status or "pending"
         previous_cache_generated_at = speaker_info.get("cache_generated_at")
         now = time.time()
+        self._invalidate_audio_prompt_cache(voice_key)
         self.uploaded_speakers[voice_key]["cache_status"] = "processing"
         self.uploaded_speakers[voice_key]["cache_generated_at"] = now
 
@@ -910,9 +913,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # 3. Merge multi-rank results + validate
             payload = self._extract_rpc_payload(results)
 
-            # 5. Persist (writes safetensors + updates metadata to ready)
-            # WARNING: _save_voice_cache() is NOT atomic (no tmp+rename).
-            # force rebuild on failure may corrupt a previously valid cache.
+            # 4. Persist (writes safetensors + updates metadata to ready).
+            # Save uses a tmp-file + os.replace() swap in the voice directory.
             save_attempted = True
             if not self._save_voice_cache(voice_key, speaker_info, file_path, payload):
                 raise ValueError(f"Failed to save voice cache for '{voice_name}'")
@@ -961,6 +963,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self.uploaded_speakers[voice_key]["cache_status"] = status
             self.uploaded_speakers[voice_key]["cache_generated_at"] = cache_generated_at
 
+    def _invalidate_audio_prompt_cache(self, voice_key: str) -> None:
+        """Drop any memoized audio voice-clone prompt for this voice."""
+        self._audio_prompt_cache.pop(voice_key, None)
+
     def _cache_file_path_for_speaker(self, speaker_info: dict[str, Any]) -> Path | None:
         cache_file = speaker_info.get("cache_file")
         if isinstance(cache_file, str) and cache_file:
@@ -1000,10 +1006,32 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if payload.get("ref_text") is not None:
             metadata["item_0_ref_text"] = str(payload["ref_text"])
 
-        save_file(tensors, str(cache_file_path), metadata=metadata)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=cache_file_path.parent,
+                prefix=f"{cache_file_path.stem}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                temp_path = Path(tmp.name)
+
+            save_file(tensors, str(temp_path), metadata=metadata)
+            os.replace(temp_path, cache_file_path)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
         speaker_info["cache_status"] = "ready"
         speaker_info["cache_file"] = str(cache_file_path)
         speaker_info["cache_generated_at"] = time.time()
+        self._audio_prompt_cache[voice_key] = {
+            "ref_spk_embedding": payload["ref_spk_embedding"],
+            "ref_code": payload["ref_code"],
+            "x_vector_only_mode": payload["x_vector_only_mode"],
+            "icl_mode": payload["icl_mode"],
+            "ref_text": payload.get("ref_text"),
+        }
         return True
 
     def _load_cached_voice_prompt(self, voice_name: str) -> dict[str, Any] | None:
@@ -1011,6 +1039,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         speaker_info = self.uploaded_speakers.get(speaker_key)
         if not speaker_info or speaker_info.get("cache_status") != "ready":
             return None
+
+        cached = self._audio_prompt_cache.get(speaker_key)
+        if cached is not None:
+            return cached
 
         cache_file_path = self._cache_file_path_for_speaker(speaker_info)
         if cache_file_path is None:
@@ -1029,14 +1061,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ref_spk_embedding = f.get_tensor("item_0_ref_spk_embedding")
                 has_ref_code = bool(f.get_tensor("item_0_has_ref_code").item())
                 ref_code = f.get_tensor("item_0_ref_code") if has_ref_code else None
-                return {
+                payload = {
                     "ref_spk_embedding": ref_spk_embedding.tolist(),
                     "ref_code": ref_code.tolist() if ref_code is not None else None,
                     "x_vector_only_mode": bool(f.get_tensor("item_0_x_vector_only_mode").item()),
                     "icl_mode": bool(f.get_tensor("item_0_icl_mode").item()),
                     "ref_text": metadata.get("item_0_ref_text"),
                 }
+                self._audio_prompt_cache[speaker_key] = payload
+                return payload
         except Exception as e:
+            self._invalidate_audio_prompt_cache(speaker_key)
             logger.warning("Failed to load voice cache for %s: %s", voice_name, e)
             return None
 

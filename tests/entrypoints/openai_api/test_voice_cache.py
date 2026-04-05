@@ -1,6 +1,9 @@
 """Tests for voice cache generation endpoint (issue #1760)."""
 
+import asyncio
+import os
 import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -311,6 +314,91 @@ class TestCacheFailureRollback:
                 await server.create_voice_cache("v")
 
         assert server.uploaded_speakers["v"]["cache_status"] == "failed"
+
+
+# ── Audio prompt cache tests ──
+
+
+class TestAudioPromptCache:
+    @pytest.fixture
+    def server(self, mocker: MockerFixture):
+        return _make_server(mocker)
+
+    def test_load_cached_voice_prompt_memoizes_in_memory(self, server, tmp_path):
+        """Audio cached prompt should hit disk once, then reuse in-memory payload."""
+        from safetensors.torch import save_file
+
+        cache_file = tmp_path / "voice.safetensors"
+        save_file(
+            {
+                "__len__": torch.tensor(1, dtype=torch.int64),
+                "item_0_ref_spk_embedding": torch.randn(1024),
+                "item_0_has_ref_code": torch.tensor(1, dtype=torch.int8),
+                "item_0_ref_code": torch.randint(0, 10, (2, 4), dtype=torch.int64),
+                "item_0_x_vector_only_mode": torch.tensor(0, dtype=torch.int8),
+                "item_0_icl_mode": torch.tensor(1, dtype=torch.int8),
+            },
+            str(cache_file),
+            metadata={"item_0_ref_text": "cached transcript"},
+        )
+
+        info = _audio_speaker_info(
+            file_path=str(tmp_path / "voice.wav"),
+            cache_status="ready",
+            cache_file=str(cache_file),
+        )
+        server.uploaded_speakers = {"v": info}
+        server.supported_speakers = {"v"}
+        server.uploaded_speakers_dir = tmp_path
+
+        payload1 = server._load_cached_voice_prompt("v")
+        assert payload1 is not None
+        assert payload1["ref_text"] == "cached transcript"
+
+        cache_file.unlink()
+        payload2 = server._load_cached_voice_prompt("v")
+        assert payload2 == payload1
+
+    def test_save_voice_cache_uses_atomic_replace_and_populates_memory(self, server, tmp_path):
+        """Saving cache should write via temp file + replace and warm the in-memory cache."""
+        raw_audio = tmp_path / "voice.wav"
+        raw_audio.write_bytes(b"fake-wav")
+
+        server.uploaded_speakers_dir = tmp_path
+        speaker_info = _audio_speaker_info(file_path=str(raw_audio))
+        payload = _cached_prompt_payload(
+            ref_code=[[1, 2], [3, 4]],
+            x_vector_only_mode=False,
+            icl_mode=True,
+            ref_text="hello transcript",
+        )
+
+        with patch("vllm_omni.entrypoints.openai.serving_speech.os.replace", wraps=os.replace) as replace_mock:
+            ok = server._save_voice_cache("v", speaker_info, raw_audio, payload)
+
+        assert ok is True
+        assert replace_mock.call_count == 1
+        assert Path(speaker_info["cache_file"]).is_file()
+        assert server._audio_prompt_cache["v"] == payload
+
+    def test_delete_voice_invalidates_audio_prompt_cache(self, server, tmp_path):
+        """Deleting a voice should clear any memoized audio prompt entry."""
+        raw_audio = tmp_path / "voice.wav"
+        cache_file = tmp_path / "voice.safetensors"
+        raw_audio.write_bytes(b"fake-wav")
+        cache_file.write_bytes(b"fake-cache")
+
+        info = _audio_speaker_info(
+            file_path=str(raw_audio),
+            cache_status="ready",
+            cache_file=str(cache_file),
+        )
+        server.uploaded_speakers = {"v": info}
+        server.supported_speakers = {"v"}
+        server._audio_prompt_cache["v"] = _cached_prompt_payload()
+
+        assert asyncio.run(server.delete_voice("v")) is True
+        assert "v" not in server._audio_prompt_cache
 
 
 # ── RPC payload extraction tests ──
