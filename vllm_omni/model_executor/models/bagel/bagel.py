@@ -8,7 +8,7 @@ import torch.nn as nn
 from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.inputs import MultiModalDataDict
+from vllm.inputs import ModalityData, MultiModalDataDict
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
@@ -27,7 +27,6 @@ from vllm.multimodal.inputs import (
 from vllm.multimodal.parse import (
     ImageEmbeddingItems,
     ImageProcessorItems,
-    ModalityData,
     ModalityDataItems,
     MultiModalDataItems,
     MultiModalDataParser,
