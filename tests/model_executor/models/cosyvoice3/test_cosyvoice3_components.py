@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for CosyVoice3 components."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -247,3 +249,32 @@ class TestSDPAFallback:
 
         assert out.shape == (batch, seq_len, heads, dim)
         assert out.dtype == torch.float32
+
+
+def test_code2wav_forward_finalizes_hift_tail():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+    class DummyHiFT(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.m_source = SimpleNamespace(l_linear=SimpleNamespace(weight=torch.ones(1, dtype=torch.float32)))
+            self.finalize_calls: list[bool] = []
+
+        def inference(self, speech_feat, finalize=True):
+            self.finalize_calls.append(bool(finalize))
+            return torch.zeros((speech_feat.shape[0], 1, speech_feat.shape[-1]), dtype=speech_feat.dtype), None
+
+    model = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(model)
+    model.hift = DummyHiFT()
+    model._forward_mel = lambda **_: torch.ones((1, 80, 8), dtype=torch.float32)
+
+    out = model.forward(
+        token=torch.tensor([[1, 2, 3]], dtype=torch.int32),
+        prompt_token=torch.tensor([[4, 5]], dtype=torch.int32),
+        prompt_feat=torch.ones((1, 4, 80), dtype=torch.float32),
+        embedding=torch.ones((1, 192), dtype=torch.float32),
+    )
+
+    assert out.shape == (1, 1, 8)
+    assert model.hift.finalize_calls == [True]

@@ -160,11 +160,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("code_predictor_codes", [])
                 request.prompt_token_ids = new_ids
-                # Pass additional fields (like left_context_size) to the request
-                # Only pass chunk context metadata in additional_information
-                request.additional_information = {}
-                if "left_context_size" in payload_data:
-                    request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                # Preserve previously attached request metadata (e.g. prompt
+                # conditioning tensors) and update only per-chunk fields.
+                prev_info = getattr(request, "additional_information", None)
+                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                for key, value in payload_data.items():
+                    if key in {"code_predictor_codes", "finished"}:
+                        continue
+                    info[key] = value
+                request.additional_information = info
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
@@ -240,9 +244,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            finished_flag = payload_data.get("finished")
+            is_payload_finished = False
+            if isinstance(finished_flag, torch.Tensor):
+                is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
+            elif finished_flag is not None:
+                is_payload_finished = bool(finished_flag)
+
+            # Reclaim per-request async state only after the terminal payload
+            # has been sent successfully. This avoids cleanup->save races.
+            if is_payload_finished:
+                self.cleanup(request.request_id, external_req_id)
 
         if is_finished:
-            self.cleanup_sender(external_req_id)
+            self.code_prompt_token_ids.pop(external_req_id, None)
+            cached_ic = getattr(self, "_cached_ic", None)
+            if cached_ic is not None:
+                cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Cleanup
