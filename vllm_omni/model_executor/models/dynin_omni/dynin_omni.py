@@ -182,7 +182,14 @@ class DyninOmniDummyInputsBuilder(BaseDummyInputsBuilder[DyninOmniProcessingInfo
 
 class DyninOmniMultiModalDataParser(MultiModalDataParser):
     def parse_mm_data(self, mm_data: MultiModalDataDict) -> MultiModalDataItems:
-        return super().parse_mm_data(_normalize_mm_data_aliases(mm_data))
+        normalized = _normalize_mm_data_aliases(mm_data)
+        mm_items = super().parse_mm_data(normalized)
+
+        for alias, canonical in _MODALITY_ALIASES.items():
+            if alias in mm_data and canonical in mm_items and alias not in mm_items:
+                mm_items[alias] = mm_items[canonical]
+
+        return mm_items
 
     def _get_audio_with_sr(self, audio: Any) -> tuple[np.ndarray, float | None]:
         audio_array, orig_sr = super()._get_audio_with_sr(audio)
