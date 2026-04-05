@@ -14,6 +14,12 @@ from vllm_omni.inputs.data import (
     token_inputs_omni,
 )
 
+# Backwards compat aliases
+EmbedsInputs = EmbedsInput
+SingletonInputs = SingletonInput
+
+MultiModalInputs = MultiModalInput
+
 logger = init_logger(__name__)
 
 
