@@ -7,6 +7,10 @@ class CosyVoice3Config(PretrainedConfig):
     model_type = "cosyvoice3"
 
     def __init__(self, **kwargs):
+        # Set primary speech EOS so vLLM stops generation at the right token.
+        # The official CosyVoice3 treats ALL tokens >= speech_token_size
+        # (6561-6760) as stop signals; see stop_token_ids in the YAML configs.
+        kwargs.setdefault("eos_token_id", 6562)
         super().__init__(**kwargs)
         self.sample_rate = 24000
         self.llm_input_size = 896

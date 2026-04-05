@@ -1,7 +1,7 @@
 import os
 import types
 from collections import Counter
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
@@ -17,6 +17,10 @@ from vllm_omni.platforms import current_omni_platform
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
+
+_DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
+    "GlmImagePipeline": "glm_image",
+}
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
@@ -141,12 +145,21 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     if isinstance(obj, set):
         return list(obj)
     # Handle dataclass objects
-    # Note: asdict() recursively converts nested dataclasses but not Counter objects,
-    # so we need to recursively process the result
-    if is_dataclass(obj):
-        result = asdict(obj)
-        # Recursively process the result to convert any Counter objects
-        return _convert_dataclasses_to_dict(result)
+    # Use field iteration instead of asdict() to:
+    # 1. Only include init fields (non-init fields cause "unexpected kwarg" errors)
+    # 2. Skip None values matching field defaults (avoids Pydantic validation
+    #    failures when None is explicitly passed for non-Optional typed fields,
+    #    e.g. CompilationConfig.cudagraph_capture_sizes: list[int] = None)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        result = {}
+        for f in fields(obj):
+            if not f.init:
+                continue
+            value = getattr(obj, f.name)
+            if value is None and f.default is None:
+                continue
+            result[f.name] = _convert_dataclasses_to_dict(value)
+        return result
     # Handle dictionaries (recurse into values) and filter out callables(cause error in OmegaConf.create)
     # Note: This must come AFTER Counter check since Counter is a dict subclass
     if isinstance(obj, dict):
@@ -167,6 +180,28 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
             return obj
     # Primitive types and other objects that OmegaConf can handle
     return obj
+
+
+def _try_resolve_omni_model_type(model: str) -> str | None:
+    """Try to resolve model_type for omni models with empty config.json.
+
+    Checks if any registered omni stage config file name matches a substring
+    in the model name (e.g. 'cosyvoice3' in 'FunAudioLLM/Fun-CosyVoice3-0.5B-2512').
+    When multiple configs match, the longest stem wins to avoid ambiguity
+    (e.g. 'bagel_single_stage' over 'bagel').
+    """
+    stage_configs_dir = PROJECT_ROOT / "vllm_omni" / "model_executor" / "stage_configs"
+    if not stage_configs_dir.exists():
+        return None
+    model_lower = model.lower().replace("-", "").replace("_", "")
+    best_match: str | None = None
+    best_len = 0
+    for config_file in sorted(stage_configs_dir.glob("*.yaml")):
+        candidate = config_file.stem.replace("-", "").replace("_", "")
+        if candidate in model_lower and len(candidate) > best_len:
+            best_match = config_file.stem
+            best_len = len(candidate)
+    return best_match
 
 
 def resolve_model_config_path(model: str) -> str:
@@ -207,7 +242,11 @@ def resolve_model_config_path(model: str) -> str:
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
-                    raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
+                    # For models with empty config.json (e.g. CosyVoice3),
+                    # try matching against registered omni stage configs.
+                    model_type = _try_resolve_omni_model_type(model)
+                    if model_type is None:
+                        raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
@@ -218,13 +257,16 @@ def resolve_model_config_path(model: str) -> str:
             )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
-    model_type_str = f"{model_type}.yaml"
+    if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
+        normalized_model_type = _DIFFUSERS_CLASS_TO_CONFIG[model_type]
+    else:
+        normalized_model_type = model_type.replace("-", "_")
+    model_type_str = f"{normalized_model_type}.yaml"
     complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
-    # Fall back to default config
-    stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
+    stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):
         return None
@@ -293,6 +335,100 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     return stage_args
 
 
+def filter_stages(
+    config_path: str | None,
+    stage_configs: list,
+    kwargs: dict | None,
+) -> list:
+    """Filter stage configs by mode when YAML defines a `modes` section.
+
+    The YAML can define, e.g.:
+
+        modes:
+          - mode: text-to-image
+            stages: [1]
+          - mode: image-to-text
+            stages: [0]
+
+    When users pass `mode="image-to-text"` into Omni(**kwargs), only the stages
+    listed for that mode are returned. If no mode is provided, defaults to
+    "text-to-image". If no modes are defined or filtering fails, returns the
+    original stage_configs unchanged.
+
+    Args:
+        config_path: Path to the YAML config (used to read `modes`).
+        stage_configs: Loaded list of stage configs.
+        kwargs: Engine/caller kwargs; may contain "mode".
+
+    Returns:
+        Filtered list of stage configs (or original list if filtering not applied).
+    """
+    if not stage_configs or config_path is None:
+        return stage_configs
+
+    try:
+        cfg = load_yaml_config(config_path)
+        yaml_modes = getattr(cfg, "modes", None)
+        if yaml_modes is None:
+            return stage_configs
+
+        mode_to_stage_ids: dict[str, list[int]] = {}
+        if yaml_modes is not None:
+            for entry in yaml_modes:
+                mode_name = None
+                stages = None
+                if hasattr(entry, "mode") or hasattr(entry, "stages"):
+                    mode_name = getattr(entry, "mode", None)
+                    stages = getattr(entry, "stages", None)
+                elif isinstance(entry, dict):
+                    mode_name = entry.get("mode")
+                    stages = entry.get("stages")
+
+                if mode_name is None or stages is None:
+                    continue
+
+                if isinstance(stages, int):
+                    stage_list = [stages]
+                else:
+                    stage_list = list(stages)
+
+                mode_to_stage_ids[str(mode_name)] = [int(sid) for sid in stage_list]
+
+        # No modes section or empty mapping: use all stages and return early.
+        active_mode: str | None = None
+        if isinstance(kwargs, dict):
+            active_mode = kwargs.get("mode")
+
+        if active_mode is None:
+            active_mode = "text-to-image"
+
+        if active_mode not in mode_to_stage_ids:
+            logger.warning(
+                "Requested mode '%s' not found in config '%s'; available modes: %s. Using all stages.",
+                active_mode,
+                config_path,
+                sorted(mode_to_stage_ids.keys()),
+            )
+            return stage_configs
+
+        allowed_ids = set(mode_to_stage_ids[active_mode])
+        filtered_stage_configs = [sc for sc in stage_configs if getattr(sc, "stage_id", None) in allowed_ids]
+        if not filtered_stage_configs:
+            logger.warning(
+                "Mode '%s' in config '%s' resolved to stage ids %s, but none matched loaded stage_args. "
+                "Falling back to all stages.",
+                active_mode,
+                config_path,
+                sorted(allowed_ids),
+            )
+            return stage_configs
+
+        return filtered_stage_configs
+    except Exception as e:
+        logger.warning("Failed to apply mode-based stage filtering: %s", e)
+        return stage_configs
+
+
 def load_and_resolve_stage_configs(
     model: str,
     stage_configs_path: str | None,
@@ -323,6 +459,9 @@ def load_and_resolve_stage_configs(
     else:
         config_path = stage_configs_path
         stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
+
+    stage_configs = filter_stages(config_path, stage_configs, kwargs)
+    logger.debug(f"stage_configs: {stage_configs}")
 
     return config_path, stage_configs
 

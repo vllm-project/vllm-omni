@@ -213,7 +213,9 @@ class FishSpeechDACDecoder(nn.Module):
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
-        parsed_ctx_frames: list[int] = []
+        num_req = len(request_ids_list)
+        parsed_ctx_frames = [0] * num_req
+        parsed_total_frames = [0] * num_req
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
@@ -226,7 +228,6 @@ class FishSpeechDACDecoder(nn.Module):
 
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
-                parsed_ctx_frames.append(0)
                 continue
             ctx_frames = left_context_size[i]
             flat = req_ids
@@ -238,15 +239,13 @@ class FishSpeechDACDecoder(nn.Module):
                         n,
                         q,
                     )
-                parsed_ctx_frames.append(0)
                 continue
             frames = n // q
             codes_qf = flat.reshape(q, frames)
-            parsed_ctx_frames.append(ctx_frames)
+            parsed_ctx_frames[i] = ctx_frames
+            parsed_total_frames[i] = frames
             valid_codes_qf.append(codes_qf)
             valid_indices.append(i)
-
-        num_req = len(request_ids_list)
         if not valid_codes_qf:
             return OmniOutput(
                 text_hidden_states=None,
@@ -297,11 +296,17 @@ class FishSpeechDACDecoder(nn.Module):
 
         for j, idx in enumerate(valid_indices):
             ctx_frames = parsed_ctx_frames[idx]
+            total_frames = parsed_total_frames[idx]
             audio_len = int(audio_lengths[j].item()) if audio_lengths.numel() > j else int(wav_batch.shape[-1])
             wav = wav_batch[j, 0, :audio_len]
             # Trim context frames (left overlap for streaming).
             if ctx_frames > 0:
-                cut = ctx_frames * self._hop_length
+                # Decode length may deviate from (frames * hop_length) due to model
+                # internals (padding/rounding). Use proportional trimming to keep
+                # overlap removal aligned with the actual decoded length.
+                denom = max(int(total_frames), 1)
+                cut = int(ctx_frames / denom * wav.shape[0])
+                cut = max(0, min(cut, int(wav.shape[0])))
                 if cut < wav.shape[0]:
                     wav = wav[cut:]
                 else:

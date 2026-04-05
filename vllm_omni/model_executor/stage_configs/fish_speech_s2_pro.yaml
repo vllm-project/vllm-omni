@@ -2,6 +2,7 @@ async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm
+    is_comprehension: true
     runtime:
       devices: "0"
       max_batch_size: 16
@@ -27,7 +28,7 @@ stage_args:
       temperature: 0.8
       top_k: 30
       top_p: 0.9
-      max_tokens: 200
+      max_tokens: 2048
       seed: 42
       detokenize: false
       repetition_penalty: 1.0

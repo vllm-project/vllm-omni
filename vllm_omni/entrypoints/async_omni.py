@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, Iterable, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from vllm.engine.protocol import EngineClient
+from vllm import TokensPrompt
+from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
+from vllm.renderers.inputs.preprocess import extract_prompt_components
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -29,6 +32,7 @@ from vllm_omni.outputs import OmniRequestOutput
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
     from vllm.tokenizers import TokenizerLike
+    from vllm.v1.engine import PauseMode
 
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
@@ -66,7 +70,7 @@ class AsyncOmni(EngineClient, OmniBase):
         ...     print(output)
     """
 
-    def __init__(self, model: str, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
@@ -84,7 +88,12 @@ class AsyncOmni(EngineClient, OmniBase):
         else:
             vllm_config = self.engine.stage_vllm_configs[stage_index]
             io_processor_plugin = vllm_config.model_config.io_processor_plugin
-            self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+            renderer = self.renderer
+            if renderer is None:
+                from vllm.renderers import renderer_from_config
+
+                renderer = renderer_from_config(vllm_config)
+            self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
 
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
@@ -117,6 +126,23 @@ class AsyncOmni(EngineClient, OmniBase):
         """Compatibility helper for call sites expecting async vllm config access."""
         return self.vllm_config
 
+    def get_diffusion_od_config(self) -> Any | None:
+        """Return the diffusion-stage config when the pipeline has one."""
+        for stage_client in self.engine.stage_clients:
+            if getattr(stage_client, "stage_type", None) != "diffusion":
+                continue
+
+            od_config = getattr(stage_client, "od_config", None)
+            if od_config is not None:
+                return od_config
+
+            inner_engine = getattr(stage_client, "_engine", None)
+            od_config = getattr(inner_engine, "od_config", None)
+            if od_config is not None:
+                return od_config
+
+        return None
+
     @property
     def model_config(self):
         """Return the model config for the comprehension stage when present."""
@@ -129,28 +155,45 @@ class AsyncOmni(EngineClient, OmniBase):
 
     async def generate(
         self,
-        prompt: OmniPromptType,
-        request_id: str,
-        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
+        prompt: OmniPromptType | AsyncGenerator[StreamingInput, None] | list[OmniPromptType],
+        sampling_params: Any = None,
+        request_id: str = "",
         *,
+        prompt_text: str | None = None,
+        lora_request: Any = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         output_modalities: list[str] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Generate outputs for the given prompt asynchronously.
+        """Generate outputs for the given prompt(s) asynchronously.
 
-        Coordinates multi-stage pipeline execution. Processes the prompt through
-        all stages in the pipeline and yields outputs as they become available.
+        Coordinates multi-stage pipeline execution. Processes the prompt
+        through all stages in the pipeline and yields outputs as they become
+        available.
+
+        **Batch mode (diffusion only):**
+        When *prompt* is a ``list``, all prompts are dispatched in a single
+        ``DiffusionEngine.step()`` call at the diffusion stage.  The combined
+        result is yielded as one ``OmniRequestOutput`` with all generated
+        images.  Only a single *request_id* is used for the whole batch.
 
         Args:
-            prompt: Prompt to process. Can be a text string, token IDs,
-                or multimodal prompt.
-            request_id: Unique identifier for this request
-            sampling_params_list: List of SamplingParams, one for each stage.
+            prompt: A single prompt **or** a list of prompts.  A list
+                triggers batch mode when the diffusion stage is reached.
+            request_id: Unique identifier for this request.
+            sampling_params_list: List of SamplingParams, one per stage.
                 Must have the same length as the number of stages.
-                If None, uses default sampling params for each stage.
+                If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
+            In batch mode the diffusion stage yields one output containing
+            all generated images.
 
         Raises:
             ValueError: If sampling_params_list has incorrect length.
@@ -161,6 +204,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
         logger.debug(f"[AsyncOmni] generate() called for request {request_id}")
 
+        input_stream_task: asyncio.Task | None = None
         try:
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
@@ -184,13 +228,22 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
 
-            # Add request to stage 0 (Orchestrator handles all stage transitions)
-            await self.engine.add_request_async(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params_list=sampling_params_list,
-                final_stage_id=final_stage_id_for_e2e,
-            )
+            # Add request(s) to stage 0. For streaming inputs, submit
+            # chunks incrementally through streaming_update.
+            if isinstance(prompt, AsyncGenerator):
+                input_stream_task = await self._add_streaming_input_request(
+                    request_id=request_id,
+                    input_stream=prompt,
+                    sampling_params_list=sampling_params_list,
+                    final_stage_id=final_stage_id_for_e2e,
+                )
+            else:
+                await self.engine.add_request_async(
+                    request_id=request_id,
+                    prompt=prompt,
+                    sampling_params_list=sampling_params_list,
+                    final_stage_id=final_stage_id_for_e2e,
+                )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
@@ -213,9 +266,118 @@ class AsyncOmni(EngineClient, OmniBase):
             self._log_summary_and_cleanup(request_id)
 
         except (asyncio.CancelledError, GeneratorExit):
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
             await self.abort(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
+        except Exception as e:
+            await self.abort(request_id)
+            logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
+            raise
+
+    async def _add_streaming_input_request(
+        self,
+        *,
+        request_id: str,
+        input_stream: AsyncGenerator[StreamingInput, None],
+        sampling_params_list: Sequence[OmniSamplingParams],
+        final_stage_id: int,
+    ) -> asyncio.Task:
+        """Submit a streaming input generator as incremental stage-0 updates."""
+        if not sampling_params_list:
+            raise ValueError("sampling_params_list cannot be empty for streaming input")
+        # only check thinker's sampling params now
+        stage0_params = sampling_params_list[0]
+        self._validate_streaming_input_sampling_params(stage0_params)
+
+        req_state = self.request_states[request_id]
+
+        if not stage0_params.skip_clone:
+            stage0_params = stage0_params.clone()
+            stage0_params.skip_clone = True
+        stage0_params.output_kind = RequestOutputKind.DELTA
+
+        has_submitted_first_chunk = False
+
+        async def handle_inputs() -> None:
+            nonlocal has_submitted_first_chunk
+            cancelled = False
+            try:
+                async for chunk in input_stream:
+                    chunk_params = getattr(chunk, "sampling_params", None) or stage0_params
+                    self._validate_streaming_input_sampling_params(chunk_params)
+                    chunk_sampling_params_list = list(sampling_params_list)
+                    chunk_sampling_params_list[0] = chunk_params
+                    chunk_prompt = chunk.prompt
+                    prompt_text, _, _ = extract_prompt_components(self.model_config, chunk_prompt)
+
+                    if not has_submitted_first_chunk:
+                        await self.engine.add_request_async(
+                            request_id=request_id,
+                            prompt=chunk_prompt,
+                            prompt_text=prompt_text,
+                            sampling_params_list=chunk_sampling_params_list,
+                            final_stage_id=final_stage_id,
+                            resumable=True,
+                        )
+                        has_submitted_first_chunk = True
+                    else:
+                        await self.engine.add_streaming_update_async(
+                            request_id=request_id,
+                            prompt=chunk_prompt,
+                            prompt_text=prompt_text,
+                            sampling_params_list=chunk_sampling_params_list,
+                            final_stage_id=final_stage_id,
+                            resumable=True,
+                        )
+            except (asyncio.CancelledError, GeneratorExit):
+                cancelled = True
+            except Exception as error:
+                await req_state.queue.put({"request_id": request_id, "error": error})
+            finally:
+                if not cancelled:
+                    # Send empty final request to indicate that inputs have
+                    # finished. Don't send if canceled (session was aborted).
+                    final_sampling_params_list = list(sampling_params_list)
+                    final_sampling_params_list[0] = stage0_params
+                    final_prompt = TokensPrompt(prompt_token_ids=[0])
+
+                    if has_submitted_first_chunk:
+                        await self.engine.add_streaming_update_async(
+                            request_id=request_id,
+                            prompt=final_prompt,
+                            prompt_text=None,
+                            sampling_params_list=final_sampling_params_list,
+                            final_stage_id=final_stage_id,
+                            resumable=False,
+                        )
+                    else:
+                        await self.engine.add_request_async(
+                            request_id=request_id,
+                            prompt=final_prompt,
+                            prompt_text=None,
+                            sampling_params_list=final_sampling_params_list,
+                            final_stage_id=final_stage_id,
+                            resumable=False,
+                        )
+
+        input_stream_task = asyncio.create_task(handle_inputs())
+        req_state.input_stream_task = input_stream_task
+        return input_stream_task
+
+    @staticmethod
+    def _validate_streaming_input_sampling_params(params: OmniSamplingParams) -> None:
+        if (
+            not isinstance(params, SamplingParams)
+            or params.n > 1
+            or params.output_kind == RequestOutputKind.FINAL_ONLY
+            or params.stop
+        ):
+            raise ValueError(
+                "Input streaming is currently supported only for SamplingParams "
+                "with n == 1, output_kind != FINAL_ONLY, and without stop strings."
+            )
 
     async def encode(
         self,
@@ -226,6 +388,7 @@ class AsyncOmni(EngineClient, OmniBase):
         trace_headers: dict[str, str] | None = None,
         priority: int = 0,
         tokenization_kwargs: dict[str, Any] | None = None,
+        reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
         """EngineClient.encode() stub.
 
@@ -396,6 +559,7 @@ class AsyncOmni(EngineClient, OmniBase):
     async def pause_generation(
         self,
         *,
+        mode: PauseMode = "abort",
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
     ) -> None:
@@ -427,19 +591,30 @@ class AsyncOmni(EngineClient, OmniBase):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(self, stages: list[int] | None = None) -> list[Any]:
+    async def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        stages: list[int] | None = None,
+    ) -> list[Any]:
         """Start profiling specified stages.
 
-        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
+        Uses vLLM-compatible profile(is_start=True, profile_prefix) interface.
+
+        Args:
+            profile_prefix: Optional prefix for the trace file names.
+            stages: List of stage IDs to profile. If None, profiles all stages.
         """
-        return await self.collective_rpc(method="start_profile", stage_ids=stages)
+        return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
 
     async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Stop profiling specified stages.
 
-        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
+        Uses vLLM-compatible profile(is_start=False) interface.
+
+        Args:
+            stages: List of stage IDs to profile. If None, stops all stages.
         """
-        return await self.collective_rpc(method="stop_profile", stage_ids=stages)
+        return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache for all stages.
@@ -467,7 +642,7 @@ class AsyncOmni(EngineClient, OmniBase):
         logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
         return True
 
-    async def sleep(self, level: int = 1) -> None:
+    async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         """Sleep all stages.
 
         Best-effort: unsupported stages will emit a TODO result.
@@ -584,7 +759,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== Shutdown ====================
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown the engine."""
         if self.final_output_task is not None:
             self.final_output_task.cancel()

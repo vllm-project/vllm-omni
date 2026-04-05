@@ -4,6 +4,7 @@ async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm
+    is_comprehension: true
     runtime:
       devices: "0"
     engine_args:
@@ -14,7 +15,7 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
       trust_remote_code: true
-      async_scheduling: false
+      async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
       gpu_memory_utilization: 0.3
@@ -45,10 +46,10 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
-      async_scheduling: false
+      async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 8192
       max_model_len: 32768

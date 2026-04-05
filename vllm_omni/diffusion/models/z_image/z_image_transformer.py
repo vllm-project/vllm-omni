@@ -580,6 +580,12 @@ class ZImageTransformer2DModel(CachedTransformer):
 
     _repeated_blocks = ["ZImageTransformerBlock"]
 
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return "layers" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     # Sequence Parallelism for Z-Image (following diffusers' _cp_plan pattern)
     # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,
     # Z-Image uses `unified_prepare` module's split_output to shard unified tensors.
@@ -623,6 +629,11 @@ class ZImageTransformer2DModel(CachedTransformer):
         quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
+        # NOTE: `DiffusersPipelineLoader.load_model()` initializes this module
+        # under `set_default_torch_dtype(od_config.dtype)`, so using the current
+        # default dtype keeps `self.dtype` consistent with the actually loaded
+        # weights. This dtype is used by the pipeline to cast inputs.
+        self.dtype = torch.get_default_dtype()
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.all_patch_size = all_patch_size

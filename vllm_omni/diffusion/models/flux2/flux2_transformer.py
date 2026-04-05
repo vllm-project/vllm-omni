@@ -209,9 +209,10 @@ class Flux2Attention(nn.Module):
                 [context_len, hidden_states.shape[1] - context_len],
                 dim=1,
             )
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            # Contiguous for FP8 quantization in RowParallelLinear
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
 
-        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[0](hidden_states.contiguous())
         hidden_states = self.to_out[1](hidden_states)
 
         if encoder_hidden_states is not None:
@@ -577,9 +578,11 @@ class Flux2Transformer2DModel(nn.Module):
         guidance_embeds: bool = True,
     ):
         super().__init__()
+        self.guidance_embeds = guidance_embeds
         self.stacked_params_mapping = None
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+
         self.config = SimpleNamespace(
             patch_size=patch_size,
             in_channels=in_channels,
