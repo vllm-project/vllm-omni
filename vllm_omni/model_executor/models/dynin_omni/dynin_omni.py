@@ -10,9 +10,10 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs import MultiModalDataDict
+from vllm.inputs import MultiModalInput as MultiModalInputs
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.inputs import MultiModalDataDict, MultiModalInput as MultiModalInputs
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
