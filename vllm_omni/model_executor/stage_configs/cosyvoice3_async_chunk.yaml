@@ -21,7 +21,7 @@ stage_args:
       engine_output_type: latent
       disable_hybrid_kv_cache_manager: true
       enable_prefix_caching: false
-      enforce_eager: false
+      enforce_eager: true
       mm_processor_cache_gb: 0
       skip_mm_profiling: true
       dtype: "float32"
@@ -47,7 +47,7 @@ stage_args:
       trust_remote_code: true
       engine_output_type: latent
       gpu_memory_utilization: 0.2
-      enforce_eager: false
+      enforce_eager: true
       disable_hybrid_kv_cache_manager: true
       enable_prefix_caching: false
       skip_mm_profiling: true
