@@ -81,16 +81,19 @@ def _make_code2wav_model(
 def _make_talker_model() -> CosyVoice3Model:
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
-    model.model_stage = "talker"
+    model.model_stage = "cosyvoice3_talker"
     model.config = SimpleNamespace(
         llm={
+            "speech_token_size": 6561,
+            "eos_token_id": 6562,
             "sampling": {
                 "top_p": 0.8,
                 "top_k": 25,
                 "win_size": 10,
                 "tau_r": 0.1,
-            }
-        }
+            },
+        },
+        vocab_size=151923,
     )
     return model
 
