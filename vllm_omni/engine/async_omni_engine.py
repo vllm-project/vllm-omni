@@ -716,6 +716,8 @@ class AsyncOmniEngine:
 
             # Register with stage 0's output processor.
             output_prompt_text = prompt_text
+            if output_prompt_text is None and isinstance(original_prompt, dict):
+                output_prompt_text = original_prompt.get("prompt")
             self.output_processors[0].add_request(
                 request=request,
                 prompt=output_prompt_text,
