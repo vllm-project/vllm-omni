@@ -93,6 +93,7 @@ def dynin_t2s_openai_client(openai_client, monkeypatch):
     )
     return openai_client
 
+
 def _build_t2i_messages(prompt: str) -> list[dict]:
     return [{"role": "user", "content": [{"type": "text", "text": f"<|t2i|> {prompt}"}]}]
 
@@ -116,6 +117,7 @@ def _build_i2i_messages(prompt: str) -> list[dict]:
         }
     ]
 
+
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
@@ -131,6 +133,7 @@ def test_send_i2i_request_001(omni_server, openai_client) -> None:
     }
     openai_client.send_diffusion_request(request_config)
 
+
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
@@ -142,6 +145,7 @@ def test_send_t2i_request_001(omni_server, openai_client) -> None:
         "modalities": ["image"],
     }
     openai_client.send_diffusion_request(request_config)
+
 
 @pytest.mark.core_model
 @pytest.mark.omni
