@@ -316,10 +316,6 @@ class OmniARScheduler(VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
-                    if self.chunk_transfer_adapter is not None:
-                        self.chunk_transfer_adapter.cleanup_receiver(
-                            request.request_id,
-                        )
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
