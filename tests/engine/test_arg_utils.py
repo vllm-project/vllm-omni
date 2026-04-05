@@ -113,6 +113,7 @@ def test_stage_specific_text_config_override():
     # values we want to pull through the text config helper
     stage_text_config = vllm_config.hf_text_config
     vllm_config.hf_text_config = Mock()
+    vllm_config.hf_text_config.quantization_config = None
     stage_text_config.sliding_window = 4096
     stage_text_config.attention_chunk_size = 2048
 

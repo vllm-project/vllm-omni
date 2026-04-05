@@ -167,7 +167,6 @@ class OmniARScheduler(VLLMScheduler):
                     block_ids=nr.block_ids,
                     num_computed_tokens=nr.num_computed_tokens,
                     lora_request=nr.lora_request,
-                    prefill_token_ids=nr.prefill_token_ids,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
                     additional_information=(getattr(request, "additional_information", None) if request else None),
@@ -303,10 +302,6 @@ class OmniARScheduler(VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
-                    if self.chunk_transfer_adapter is not None:
-                        self.chunk_transfer_adapter.cleanup_receiver(
-                            request.request_id,
-                        )
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:

@@ -183,9 +183,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
         logger.info(f"Loaded {len(self.uploaded_speakers)} uploaded speakers")
 
-        # Batch configuration
-        self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
-
         # Load speech tokenizer codec parameters for prompt length estimation
         self._codec_frame_rate: float | None = self._load_codec_frame_rate()
 
