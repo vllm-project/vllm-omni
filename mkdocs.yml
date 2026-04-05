@@ -59,6 +59,7 @@ hooks:
   - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
   - docs/mkdocs/hooks/generate_examples.py
+  - docs/mkdocs/hooks/generate_argparse.py
 
 # Exclude include files from navigation warnings
 exclude_docs: |
@@ -75,6 +76,8 @@ plugins:
       # exclude files
       exclude:
         - api/*
+        # Hook-generated content under docs/generated/ is gitignored; no git history for per-file dates.
+        - generated/**
         - user_guide/examples/**
         - contributing/design_documents/api_design_template.md
         - DOCS_GUIDE.md
@@ -95,6 +98,7 @@ plugins:
         - "re:vllm_omni\\._.*"  # Internal modules
         - "vllm_omni.diffusion.models.qwen_image"  # avoid importing vllm in mkdocs building
         - "vllm_omni.diffusion.quantization"  # avoid importing vllm in mkdocs building
+        - "vllm_omni.quantization"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.async_diffusion"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai.protocol"  # avoid importing vllm in mkdocs building
@@ -121,7 +125,7 @@ plugins:
           - https://numpy.org/doc/stable/objects.inv
           # Temporarily disabled due to decompression errors
           # - https://pytorch.org/docs/stable/objects.inv
-          - https://psutil.readthedocs.io/en/stable/objects.inv
+          - https://psutil.readthedocs.io/stable/objects.inv
 
 markdown_extensions:
   - attr_list

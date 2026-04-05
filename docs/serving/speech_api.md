@@ -1,6 +1,10 @@
 # Speech API
 
-vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation using Qwen3-TTS models.
+vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation. Supported TTS models include:
+
+- **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
+- **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
+- **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -9,9 +13,26 @@ Each server instance runs a single model (specified at startup via `vllm serve <
 ### Start the Server
 
 ```bash
-# CustomVoice model (predefined speakers)
+# Qwen3-TTS: CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
+
+# Fish Speech S2 Pro
+vllm-omni serve fishaudio/s2-pro \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml \
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager \
+    --gpu-memory-utilization 0.9
+
+# Voxtral TTS
+vllm serve mistralai/Voxtral-4B-TTS-2603 \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -96,6 +117,8 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
+| `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
+| `stream` | bool | false | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
@@ -103,7 +126,7 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ref_audio` | string | null | Reference audio (URL or base64 data URL) |
+| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
@@ -121,8 +144,141 @@ Lists available voices for the loaded model.
 
 ```json
 {
-    "voices": ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"]
+    "voices": ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian", "custom_voice_1"],
+    "uploaded_voices": [
+        {
+            "name": "custom_voice_1",
+            "consent": "user_consent_id",
+            "created_at": 1738660000,
+            "file_size": 1024000,
+            "mime_type": "audio/wav",
+            "ref_text": "The exact transcript of the audio sample.",
+            "speaker_description": "warm narrator"
+        }
+    ]
 }
+```
+
+`uploaded_voices` is always present (empty list when no custom voices have been uploaded). Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
+
+```
+POST /v1/audio/voices
+Content-Type: multipart/form-data
+```
+
+Upload a new voice sample for voice cloning in Base task TTS requests.
+
+**Form Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4) |
+| `consent` | string | Yes | Consent recording ID |
+| `name` | string | Yes | Name for the new voice |
+| `ref_text` | string | No | Transcript of the audio. When provided, enables in-context voice cloning (higher quality). Without it, only the speaker embedding is extracted. |
+| `speaker_description` | string | No | Free-form description of the voice (e.g. "warm narrator", "energetic presenter"). Stored as metadata and returned in `GET /v1/audio/voices`. |
+
+**Response Example:**
+
+```json
+{
+  "success": true,
+  "voice": {
+    "name": "custom_voice_1",
+    "consent": "user_consent_id",
+    "created_at": 1738660000,
+    "mime_type": "audio/wav",
+    "file_size": 1024000,
+    "ref_text": "The exact transcript of the audio sample.",
+    "speaker_description": "warm narrator"
+  }
+}
+```
+
+Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
+
+**Usage Example:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/voices \
+  -F "audio_sample=@/path/to/voice_sample.wav" \
+  -F "consent=user_consent_id" \
+  -F "name=custom_voice_1" \
+  -F "ref_text=The exact transcript of the audio sample." \
+  -F "speaker_description=warm narrator"
+```
+
+## Streaming Text Input (WebSocket)
+
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally and generates audio per sentence as boundaries are detected.
+
+> Note: text input is always streamed incrementally. Audio output remains sentence-scoped:
+> use `stream_audio=false` for one binary frame per sentence, or `stream_audio=true` for one or more PCM chunks per sentence.
+
+### WebSocket Protocol
+
+Client -> Server:
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "session.config", ...}` | Session configuration (sent once, first message) |
+| `{"type": "input.text", "text": "..."}` | Text chunk |
+| `{"type": "input.done"}` | End of input, flushes remaining buffer |
+
+Server -> Client:
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for a sentence |
+| Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
+| `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for a sentence |
+| `{"type": "session.done", "total_sentences": N}` | Session complete |
+| `{"type": "error", "message": "..."}` | Non-fatal error |
+
+### Session Config Parameters
+
+All REST API parameters are supported, plus:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `stream_audio` | bool | false | Stream one or more PCM chunks per sentence over WebSocket |
+| `split_granularity` | string | "sentence" | Text splitting granularity |
+
+
+```bash
+DELETE /v1/audio/voices/{name}
+```
+
+Delete an uploaded voice sample.
+
+**Path Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | Yes | Name of the voice to delete |
+
+**Response Example:**
+
+```json
+{
+  "success": true,
+  "message": "Voice 'custom_voice_1' deleted successfully"
+}
+```
+
+**Error Response (404 Not Found):**
+
+```json
+{
+  "success": false,
+  "error": "Voice 'unknown_voice' not found"
+}
+```
+
+**Usage Example:**
+
+```bash
+curl -X DELETE http://localhost:8091/v1/audio/voices/custom_voice_1
 ```
 
 ## Examples
@@ -184,7 +340,196 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output cloned.wav
 ```
 
+### Upload Voice
+
+Upload voice (speaker embedding only):
+```bash
+curl -X POST http://localhost:8091/v1/audio/voices \
+  -F "audio_sample=@/path/to/voice_sample.wav" \
+  -F "consent=user_consent_id" \
+  -F "name=custom_voice_1"
+```
+
+Upload voice with transcript (in-context cloning, higher quality):
+```bash
+curl -X POST http://localhost:8091/v1/audio/voices \
+  -F "audio_sample=@/path/to/voice_sample.wav" \
+  -F "consent=user_consent_id" \
+  -F "name=custom_voice_2" \
+  -F "ref_text=The exact transcript of the audio sample."
+```
+
+### Use Uploaded Voice
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a cloned voice",
+        "voice": "custom_voice_1"
+    }' --output cloned.wav
+```
+
+## Batch Speech Generation
+
+The batch endpoint synthesizes multiple texts in a single request, returning all results as JSON with base64-encoded audio.
+
+### Endpoint
+
+```
+POST /v1/audio/speech/batch
+Content-Type: application/json
+```
+
+### Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `items` | array | **required** | List of items to synthesize (1–32) |
+| `model` | string | server's model | Model to use |
+| `voice` | string | null | Default voice for all items |
+| `response_format` | string | "wav" | Default audio format for all items |
+| `speed` | float | 1.0 | Default playback speed (0.25–4.0) |
+| `task_type` | string | null | Default TTS task type |
+| `language` | string | null | Default language |
+| `instructions` | string | null | Default voice style instructions |
+| `ref_audio` | string | null | Default reference audio (Base task) |
+| `ref_text` | string | null | Default reference transcript (Base task) |
+| `max_new_tokens` | integer | null | Default max tokens |
+
+Each item in the `items` array requires only `input` (the text). All other fields are optional and override the batch-level defaults when set:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `input` | string | **required** — text to synthesize |
+| `voice` | string | Override voice for this item |
+| `response_format` | string | Override format for this item |
+| `speed` | float | Override speed for this item |
+| `task_type` | string | Override task type |
+| `language` | string | Override language |
+| `instructions` | string | Override instructions |
+| `ref_audio` | string | Override reference audio |
+| `ref_text` | string | Override reference transcript |
+| `max_new_tokens` | integer | Override max tokens |
+
+### Response Format
+
+```json
+{
+    "id": "speech-batch-abc123",
+    "results": [
+        {
+            "index": 0,
+            "status": "success",
+            "audio_data": "<base64-encoded audio>",
+            "media_type": "audio/wav"
+        },
+        {
+            "index": 1,
+            "status": "error",
+            "error": "Input text cannot be empty"
+        }
+    ],
+    "total": 2,
+    "succeeded": 1,
+    "failed": 1
+}
+```
+
+### Examples
+
+**Basic batch with shared defaults:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech/batch \
+    -H "Content-Type: application/json" \
+    -d '{
+        "items": [
+            {"input": "Hello, how are you?"},
+            {"input": "Goodbye, see you later!"}
+        ],
+        "voice": "vivian",
+        "language": "English"
+    }'
+```
+
+**Per-item overrides (different voices and formats):**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech/batch \
+    -H "Content-Type: application/json" \
+    -d '{
+        "items": [
+            {"input": "Hello!", "voice": "vivian", "response_format": "mp3"},
+            {"input": "你好！", "voice": "ryan", "language": "Chinese"}
+        ],
+        "response_format": "wav"
+    }'
+```
+
+**Voice cloning with shared reference audio (Base task):**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech/batch \
+    -H "Content-Type: application/json" \
+    -d '{
+        "items": [
+            {"input": "First sentence in the cloned voice."},
+            {"input": "Second sentence in the cloned voice."}
+        ],
+        "task_type": "Base",
+        "ref_audio": "https://example.com/reference.wav",
+        "ref_text": "Transcript of the reference audio"
+    }'
+```
+
+Setting `ref_audio` at the batch level applies it to all items, avoiding the need to repeat it per item.
+
+**Decoding the response in Python:**
+
+```python
+import base64
+import httpx
+
+response = httpx.post(
+    "http://localhost:8091/v1/audio/speech/batch",
+    json={
+        "items": [
+            {"input": "First sentence."},
+            {"input": "Second sentence."},
+        ],
+        "voice": "vivian",
+    },
+    timeout=300.0,
+)
+
+for result in response.json()["results"]:
+    if result["status"] == "success":
+        audio_bytes = base64.b64decode(result["audio_data"])
+        with open(f"output_{result['index']}.wav", "wb") as f:
+            f.write(audio_bytes)
+```
+
+### Configuration
+
+| Parameter | Source | Default | Description |
+|-----------|--------|---------|-------------|
+| `tts_batch_max_items` | engine kwarg | 32 | Maximum number of items per batch request |
+
+All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
+
+For best throughput, use a batch-optimized stage config with `max_batch_size > 1`:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_batch.yaml \
+    --omni --port 8091 --trust-remote-code --enforce-eager
+```
+
+The default `qwen3_tts.yaml` uses `max_batch_size: 1` (single request). The `qwen3_tts_batch.yaml` config sets `max_batch_size: 4` for ~4x throughput.
+
 ## Supported Models
+
+### Qwen3-TTS
 
 | Model | Task Type | Description |
 |-------|-----------|-------------|
@@ -193,6 +538,20 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base | Voice cloning from reference audio |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | CustomVoice | Smaller/faster variant |
 | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Base | Smaller/faster variant for voice cloning |
+
+### Fish Speech S2 Pro
+
+| Model | Description |
+|-------|-------------|
+| `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
+
+Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech online serving example](../user_guide/examples/online_serving/fish_speech.md) for details.
+
+### Voxtral TTS
+
+| Model | Description |
+|-------|-------------|
+| `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
 
 ## Error Responses
 

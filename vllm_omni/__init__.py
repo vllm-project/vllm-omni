@@ -20,12 +20,11 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     # Allow importing vllm_omni without vllm (e.g., documentation builds)
     patch = None  # type: ignore
 
+# Register custom configs (AutoConfig, AutoTokenizer) as early as possible.
+from vllm_omni.transformers_utils import configs as _configs  # noqa: F401, E402
 
 from .config import OmniModelConfig
-from .entrypoints.async_omni import AsyncOmni
-
-# Main entry points
-from .entrypoints.omni import Omni
+from .entrypoints import AsyncOmni, Omni
 
 from .version import __version__, __version_tuple__  # isort:skip
 

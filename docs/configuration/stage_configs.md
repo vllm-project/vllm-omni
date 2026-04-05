@@ -18,7 +18,7 @@ If users want to modify some part of it. The custom stage_configs file can be in
 For offline (Assume necessary dependencies have ben imported):
 ```python
 model_name = "Qwen/Qwen2.5-Omni-7B"
-omni_llm = OmniLLM(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
+omni = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
 ```
 
 For online serving:
@@ -30,15 +30,15 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to
 
 Below is a specific example of stage_configs.yaml in Qwen2.5-omni.
 ```python
-# stage config for running qwen2.5-omni with architecture of OmniLLM.
+# stage config for running qwen2.5-omni with AsyncOmniEngine + Orchestrator runtime.
 stage_args:
   - stage_id: 0 # mark the unique id for each stage
     runtime: # The disaggregated configuration
       process: true  # Run this stage in a separate process
       devices: "0" # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
-      max_batch_size: 1 # the batch_size for offline inference
     engine_args: # Engine arguments for a certain engine
       model_stage: thinker
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration # The model implementation registered in model_executor/models/registry.py
       worker_type: ar # The specific worker used
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler # The specific scehduler used
@@ -62,9 +62,9 @@ stage_args:
     runtime:
       process: true
       devices: "1"
-      max_batch_size: 3
     engine_args:
       model_stage: talker
+      max_num_seqs: 3
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -88,9 +88,9 @@ stage_args:
     runtime:
       process: true
       devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
-      max_batch_size: 1
     engine_args:
       model_stage: code2wav
+      max_num_seqs: 1
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
@@ -135,6 +135,14 @@ Each stage in the `stage_args` list contains the following configuration options
 
 A unique identifier for each stage in the multi-stage pipeline. Stages are numbered sequentially starting from 0, and this ID is used to reference stages in inter-stage dependencies (e.g., `engine_input_source`).
 
+### `prompt_expand_func` (Optional)
+
+A custom Python function hook for the LLM stage (Stage 0) that expands a single incoming prompt object into multiple prompts. This is primarily used for multi-modal Classifier-Free Guidance (CFG), where it generates the necessary companion requests (like a negative text prompt) and tags them with internal roles (e.g., `cfg_text`). This ensures the upstream LLM generates the needed contextual hidden states for both the conditional and unconditional generations simultaneously.
+
+### `cfg_kv_collect_func` (Optional)
+
+A custom Python function hook for downstream diffusion stages (Stage 1+) to collect, map, and process the KV caches transferred from the companion requests fired by `prompt_expand_func`. It aggregates the hidden condition states cleanly (e.g., binding them as `cfg_text_past_key_values` and `cfg_text_kv_metadata`), allowing the diffusion runtime to perform CFG smoothly without redundantly evaluating text paths on the DiT workers.
+
 ### `runtime`
 
 Configuration for disaggregated execution of the stage, controlling how the stage is deployed and executed.
@@ -151,9 +159,9 @@ Visible devices for this stage, specified as a string. This controls which GPU d
 
 Default: `"0"`
 
-#### `runtime.max_batch_size`
+#### `engine_args.max_num_seqs`
 
-The maximum batch size for offline inference in this stage. This limits how many sequences can be processed together in a single batch during offline inference operations.
+The maximum number of sequences for concurrent processing in this stage. For LLM stages, this controls the vLLM scheduler's maximum concurrent sequences. For all stage types, this also controls how many tasks can be batched together in the task processing loop.
 
 Default: `1`
 
@@ -273,3 +281,15 @@ Default: `True`
 Penalty applied to tokens that have already appeared in the generated sequence. Values greater than 1.0 discourage repetition, while values less than 1.0 encourage it. A value of 1.0 applies no penalty.
 
 Default: `1.1`
+
+### `tts_args` (TTS stages only)
+
+Configuration for Text-to-Speech specific parameters. This section is only applicable to TTS model stages (e.g., `qwen3_tts`).
+
+#### `tts_args.max_instructions_length`
+
+Maximum character length for voice style/emotion instructions. Instructions exceeding this limit will be rejected with a validation error.
+
+Default: `500`
+
+This value can be overridden at runtime using the `--tts-max-instructions-length` CLI parameter when starting the server.

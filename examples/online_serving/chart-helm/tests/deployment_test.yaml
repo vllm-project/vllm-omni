@@ -1,0 +1,181 @@
+suite: test deployment
+templates:
+  - deployment.yaml
+tests:
+  - it: should create deployment with default omni command
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Deployment
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: vllm-omni
+      - equal:
+          path: spec.template.spec.containers[0].command[0]
+          value: vllm
+      - equal:
+          path: spec.template.spec.containers[0].command[1]
+          value: serve
+      - equal:
+          path: spec.template.spec.containers[0].command[2]
+          value: Tongyi-MAI/Z-Image-Turbo
+      - equal:
+          path: spec.template.spec.containers[0].command[3]
+          value: "--omni"
+      - equal:
+          path: spec.template.spec.containers[0].command[4]
+          value: "--host"
+      - equal:
+          path: spec.template.spec.containers[0].command[5]
+          value: "0.0.0.0"
+      - equal:
+          path: spec.template.spec.containers[0].command[6]
+          value: "--port"
+      - equal:
+          path: spec.template.spec.containers[0].command[7]
+          value: "8000"
+
+  - it: should use custom model when set
+    set:
+      model: "Qwen/Qwen2.5-Omni-7B"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command[2]
+          value: Qwen/Qwen2.5-Omni-7B
+
+  - it: should include omniArgs flags in command
+    set:
+      omniArgs:
+        vaeUseSlicing: true
+        vaeUseTiling: true
+        enableCpuOffload: true
+        numGpus: 2
+        cacheBackend: "tea_cache"
+        workerBackend: "ray"
+        extraArgs:
+          - "--enable-layerwise-offload"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: "--vae-use-slicing"
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: "--vae-use-tiling"
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: "--enable-cpu-offload"
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: "--num-gpus"
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: "--cache-backend"
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: "--worker-backend"
+      - contains:
+          path: spec.template.spec.containers[0].command
+          content: "--enable-layerwise-offload"
+
+  - it: should use full command override when image.command is set
+    set:
+      image:
+        command:
+          - "custom-binary"
+          - "--flag"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command[0]
+          value: custom-binary
+      - equal:
+          path: spec.template.spec.containers[0].command[1]
+          value: "--flag"
+
+  - it: should mount shm and model-cache volumes
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: shm
+            mountPath: /dev/shm
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: model-cache
+            mountPath: /cache
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 8Gi
+
+  - it: should use PVC for model-cache when modelCache is enabled
+    set:
+      modelCache:
+        enabled: true
+        storageSize: "50Gi"
+        accessModes:
+          - ReadWriteOnce
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: model-cache
+            persistentVolumeClaim:
+              claimName: RELEASE-NAME-model-cache
+
+  - it: should use emptyDir for model-cache when modelCache is disabled
+    set:
+      modelCache:
+        enabled: false
+        storageSize: "50Gi"
+        accessModes:
+          - ReadWriteOnce
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: model-cache
+            emptyDir: {}
+
+  - it: should set HF_HOME environment variable
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: HF_HOME
+            value: /cache/huggingface
+
+  - it: should set HF_TOKEN env when hfToken is provided
+    set:
+      hfToken: "hf_test_token_123"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-hf-token
+                key: token
+
+  - it: should create custom init containers when specified
+    set:
+      extraInit:
+        initContainers:
+          - name: my-init
+            image: busybox:latest
+            command: ["echo", "init"]
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.initContainers
+          count: 1
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: my-init
+      - equal:
+          path: spec.template.spec.initContainers[0].image
+          value: busybox:latest

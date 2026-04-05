@@ -36,5 +36,4 @@ vllm-omni serve "$MODEL" \
     --port 8091 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
-    --enforce-eager \
     --omni
