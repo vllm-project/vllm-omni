@@ -38,7 +38,9 @@ from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import 
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.platforms import current_omni_platform
@@ -98,7 +100,9 @@ def get_hunyuan_video_15_i2v_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
-class HunyuanVideo15I2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
+class HunyuanVideo15I2VPipeline(
+    nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+):
     support_image_input = True
     color_format = "RGB"
 
@@ -198,6 +202,10 @@ class HunyuanVideo15I2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):
@@ -520,61 +528,64 @@ class HunyuanVideo15I2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
-        for i, t in enumerate(timesteps):
-            self._current_timestep = t
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                self._current_timestep = t
 
-            latent_model_input = torch.cat([latents, cond_latents, mask], dim=1)
-            timestep = t.expand(latent_model_input.shape[0]).to(latent_model_input.dtype)
+                latent_model_input = torch.cat([latents, cond_latents, mask], dim=1)
+                timestep = t.expand(latent_model_input.shape[0]).to(latent_model_input.dtype)
 
-            timestep_r = None
-            if self.use_meanflow:
-                if i == len(timesteps) - 1:
-                    timestep_r = torch.tensor([0.0], device=device)
-                else:
-                    timestep_r = timesteps[i + 1]
-                timestep_r = timestep_r.expand(latents.shape[0]).to(latents.dtype)
+                timestep_r = None
+                if self.use_meanflow:
+                    if i == len(timesteps) - 1:
+                        timestep_r = torch.tensor([0.0], device=device)
+                    else:
+                        timestep_r = timesteps[i + 1]
+                    timestep_r = timestep_r.expand(latents.shape[0]).to(latents.dtype)
 
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep,
-                "timestep_r": timestep_r,
-                "encoder_hidden_states": prompt_embeds,
-                "encoder_attention_mask": prompt_embeds_mask,
-                "encoder_hidden_states_2": prompt_embeds_2,
-                "encoder_attention_mask_2": prompt_embeds_mask_2,
-                "image_embeds": image_embeds,
-                "return_dict": False,
-            }
-
-            negative_kwargs = None
-            if do_cfg and negative_prompt_embeds is not None:
-                # For I2V CFG, negative still uses image embeds (only text is unconditional)
-                negative_kwargs = {
+                positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
                     "timestep_r": timestep_r,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "encoder_attention_mask": negative_prompt_embeds_mask,
-                    "encoder_hidden_states_2": negative_prompt_embeds_2,
-                    "encoder_attention_mask_2": negative_prompt_embeds_mask_2,
+                    "encoder_hidden_states": prompt_embeds,
+                    "encoder_attention_mask": prompt_embeds_mask,
+                    "encoder_hidden_states_2": prompt_embeds_2,
+                    "encoder_attention_mask_2": prompt_embeds_mask_2,
                     "image_embeds": image_embeds,
                     "return_dict": False,
                 }
 
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_cfg and negative_kwargs is not None,
-                true_cfg_scale=guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=req.sampling_params.cfg_normalize,
-            )
+                negative_kwargs = None
+                if do_cfg and negative_prompt_embeds is not None:
+                    # For I2V CFG, negative still uses image embeds (only text is unconditional)
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "timestep_r": timestep_r,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_attention_mask": negative_prompt_embeds_mask,
+                        "encoder_hidden_states_2": negative_prompt_embeds_2,
+                        "encoder_attention_mask_2": negative_prompt_embeds_mask_2,
+                        "image_embeds": image_embeds,
+                        "return_dict": False,
+                    }
 
-            latents = self.scheduler_step_maybe_with_cfg(
-                noise_pred,
-                t,
-                latents,
-                do_true_cfg=do_cfg and negative_kwargs is not None,
-            )
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_cfg and negative_kwargs is not None,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=req.sampling_params.cfg_normalize,
+                )
+
+                latents = self.scheduler_step_maybe_with_cfg(
+                    noise_pred,
+                    t,
+                    latents,
+                    do_true_cfg=do_cfg and negative_kwargs is not None,
+                )
+
+                pbar.update()
 
         self._current_timestep = None
 
