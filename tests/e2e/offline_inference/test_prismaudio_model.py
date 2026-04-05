@@ -384,6 +384,9 @@ async def test_prismaudio_real_model_e2e_smoke(tmp_path: Path) -> None:
     assert audio.shape[2] > 0
     if expected_num_samples > 0:
         assert audio.shape[2] == expected_num_samples
+    assert not np.isnan(audio).any(), "Audio output contains NaN values"
+    assert not np.isinf(audio).any(), "Audio output contains Inf values"
+    assert np.any(audio != 0), "Audio output is all zeros (silence)"
 
     print(
         "\n[PrismAudio E2E]"
@@ -482,6 +485,9 @@ async def test_prismaudio_real_model_with_runtime_preprocessing_e2e_smoke(tmp_pa
     assert audio.shape[2] > 0
     if expected_num_samples > 0:
         assert audio.shape[2] == expected_num_samples
+    assert not np.isnan(audio).any(), "Audio output contains NaN values"
+    assert not np.isinf(audio).any(), "Audio output contains Inf values"
+    assert np.any(audio != 0), "Audio output is all zeros (silence)"
 
     print(
         "\n[PrismAudio E2E Runtime Preprocessing]"
@@ -566,6 +572,9 @@ async def test_prismaudio_real_model_with_factory_backed_video_text_e2e_smoke(tm
     assert audio.shape[2] > 0
     if expected_num_samples > 0:
         assert audio.shape[2] == expected_num_samples
+    assert not np.isnan(audio).any(), "Audio output contains NaN values"
+    assert not np.isinf(audio).any(), "Audio output contains Inf values"
+    assert np.any(audio != 0), "Audio output is all zeros (silence)"
 
     print(
         "\n[PrismAudio E2E Factory-Backed Video+Text]"

@@ -104,6 +104,7 @@ steps:
     depends_on: upload-ready-pipeline
     commands:
       - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_model.py
+      - timeout 20m pytest -s -v tests/e2e/offline_inference/test_prismaudio_model.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
