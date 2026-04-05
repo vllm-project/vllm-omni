@@ -27,6 +27,9 @@ I2I_PROMPT = "Transform this outdoor nature boardwalk scene into a painting styl
 
 TEST_PARAMS = [OmniServerParams(model=MODEL, stage_config_path=STAGE_CONFIG)]
 
+_STAGE_COUNT = 3
+_I2I_STAGE_SAMPLING = {"max_tokens": 1, "temperature": 0.0, "top_p": 1.0, "detokenize": False}
+
 
 def _build_t2i_messages(prompt: str) -> list[dict]:
     return [{"role": "user", "content": [{"type": "text", "text": f"<|t2i|> {prompt}"}]}]
@@ -64,8 +67,22 @@ def test_send_t2i_request_001(omni_server, openai_client) -> None:
     }
     openai_client.send_diffusion_request(request_config)
 
-
 @pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+def test_send_i2i_request_001(omni_server, openai_client) -> None:
+    request_config = {
+        "model": omni_server.model,
+        "messages": _build_i2i_messages(I2I_PROMPT),
+        "modalities": ["image"],
+        "extra_body": {
+            "sampling_params_list": [dict(_I2I_STAGE_SAMPLING) for _ in range(_STAGE_COUNT)],
+        },
+    }
+    openai_client.send_diffusion_request(request_config)
+
+@pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
@@ -76,16 +93,3 @@ def test_send_t2s_request_001(omni_server, openai_client) -> None:
         "modalities": ["audio"],
     }
     openai_client.send_omni_request(request_config)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_send_i2i_request_001(omni_server, openai_client) -> None:
-    request_config = {
-        "model": omni_server.model,
-        "messages": _build_i2i_messages(I2I_PROMPT),
-        "modalities": ["image"],
-    }
-    openai_client.send_diffusion_request(request_config)
