@@ -432,7 +432,7 @@ class CosyVoice3Model(
 
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"audio": tts_speech, "sr": 22050},
+                multimodal_outputs={"audio": tts_speech, "sr": torch.tensor(22050)},
             )
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")

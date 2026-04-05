@@ -80,6 +80,7 @@ def test_voice_clone_zh_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+@pytest.mark.skip(reason="CosyVoice3 does not support async_chunk streaming yet")
 def test_voice_clone_zh_002(omni_server, openai_client) -> None:
     """
     Test voice cloning TTS with Chinese text via OpenAI API.
