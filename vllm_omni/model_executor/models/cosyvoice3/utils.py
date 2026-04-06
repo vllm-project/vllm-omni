@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 import os
 from functools import cache, lru_cache
 
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 from librosa.filters import mel as librosa_mel_fn
+
+logger = logging.getLogger(__name__)
 
 IGNORE_ID = -1
 
@@ -134,15 +137,24 @@ def mel_filters(device, n_mels: int) -> torch.Tensor:
     filters_path = os.path.join(os.path.dirname(__file__), "assets", "mel_filters.npz")
     if not os.path.exists(filters_path):
         source_url = "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
-        raise FileNotFoundError(
-            "Missing CosyVoice3 mel filter asset:\n"
-            f"  {filters_path}\n"
-            "Download it manually from:\n"
-            f"  {source_url}\n"
-            "Example:\n"
-            f"  mkdir -p {os.path.dirname(filters_path)} && "
-            f"curl -L {source_url} -o {filters_path}"
-        )
+        os.makedirs(os.path.dirname(filters_path), exist_ok=True)
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(source_url, timeout=30) as resp:
+                with open(filters_path, "wb") as f_out:
+                    f_out.write(resp.read())
+            logger.info("Downloaded mel_filters.npz from %s", source_url)
+        except Exception as e:
+            raise FileNotFoundError(
+                "Missing CosyVoice3 mel filter asset:\n"
+                f"  {filters_path}\n"
+                "Auto-download failed. Download it manually from:\n"
+                f"  {source_url}\n"
+                "Example:\n"
+                f"  mkdir -p {os.path.dirname(filters_path)} && "
+                f"curl -L {source_url} -o {filters_path}"
+            ) from e
 
     with np.load(filters_path, allow_pickle=False) as f:
         return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
@@ -180,7 +192,7 @@ def log_mel_spectrogram(
     HOP_LENGTH = 160
 
     if not torch.is_tensor(audio):
-        raise Exception(f"audio is not tensor {type(audio)}")
+        raise TypeError(f"audio is not tensor {type(audio)}")
 
     if device is not None:
         audio = audio.to(device)

@@ -62,6 +62,18 @@ FEATURE_CASES = [
         id="cfg_parallel_001",
         marks=PARALLEL_FEATURE_MARKS,
     ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            server_args=[
+                "--use-hsdp",
+                "--hsdp-shard-size",
+                "2",
+            ],
+        ),
+        id="parallel_hsdp",
+        marks=PARALLEL_FEATURE_MARKS,
+    ),
 ]
 
 

@@ -17,6 +17,7 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation im
     MultimodalAudioModelArgs,
     from_nested_dict,
 )
+from vllm_omni.platforms import current_omni_platform
 
 try:
     from flash_attn import flash_attn_func
@@ -954,7 +955,10 @@ class VoxtralTTSAudioTokenizer(nn.Module):
         if x.shape[-1] % self.patch_size != 0:
             pad_length = self.patch_size - (x.shape[-1] % self.patch_size)
             x = F.pad(x, (0, pad_length), mode="constant", value=0)
-        with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
+        with torch.autocast(
+            device_type=current_omni_platform.device_type,
+            dtype=torch.bfloat16,
+        ):
             # bf16 to use alibi bias in flash attn
             emb = self._forward_encoder(x)  # (b, d, t)
         codes = self.quantizer.encode(emb)  # (b, k, t)
@@ -1095,7 +1099,7 @@ class VoxtralTTSAudioTokenizer(nn.Module):
         for i, chunk in enumerate(all_chunks):
             padded[i, : len(chunk)] = chunk
 
-        audio_codes = padded.to(device=torch.device("cuda"))  # [B, T, K]
+        audio_codes = padded.to(device=current_omni_platform.device_type)  # [B, T, K]
         audio_values = self.decode(audio_codes.transpose(1, 2), dtype=torch.bfloat16)  # [B, 1, T_out]
         audio_values = audio_values.detach().cpu().float().squeeze(1)  # [B, T_out]
         if torch.min(audio_values) < -1.0:

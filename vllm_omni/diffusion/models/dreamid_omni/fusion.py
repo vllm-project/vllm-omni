@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.layer import Attention
 
@@ -10,6 +11,8 @@ except ImportError:
 
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.dreamid_omni.wan2_2 import WanModel, rope_apply
+
+logger = init_logger(__name__)
 
 
 class FusionModel(nn.Module):
@@ -22,14 +25,14 @@ class FusionModel(nn.Module):
         else:
             has_video = False
             self.video_model = None
-            print("Warning: No video model is provided!")
+            logger.warning("No video model is provided!")
 
         if audio_config is not None:
             self.audio_model = WanModel(**audio_config)
         else:
             has_audio = False
             self.audio_model = None
-            print("Warning: No audio model is provided!")
+            logger.warning("No audio model is provided!")
 
         if has_video and has_audio:
             assert len(self.video_model.blocks) == len(self.audio_model.blocks)

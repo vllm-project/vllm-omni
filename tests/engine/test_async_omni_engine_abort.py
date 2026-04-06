@@ -60,6 +60,7 @@ async def generate(
 
 @pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.real_hf_config
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_abort():

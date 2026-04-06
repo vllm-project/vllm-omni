@@ -11,8 +11,11 @@ import torch
 import torch.nn.functional as F
 from diffusers.utils.outputs import BaseOutput
 from transformers import AutoTokenizer
+from vllm.logger import init_logger
 
 from .hunyuan_image_3_transformer import ImageInfo, JointImageInfo, default
+
+logger = init_logger(__name__)
 
 
 class TokenizerEncodeOutput(BaseOutput):
@@ -121,7 +124,7 @@ class TokenizerWrapper:
         elif isinstance(uncond_enabled, bool):
             uncond_enabled = [uncond_enabled] * len(texts)
         if len(uncond_enabled) != len(texts):
-            print(uncond_enabled, texts)
+            logger.debug("uncond_enabled=%s, texts=%s", uncond_enabled, texts)
         assert len(uncond_enabled) == len(texts), (
             f"Length of uncond_flags should be equal to the number of texts, "
             f"but got {len(uncond_enabled)} and {len(texts)}."

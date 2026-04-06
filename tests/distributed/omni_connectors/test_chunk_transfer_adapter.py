@@ -133,6 +133,22 @@ def test_save_async(build_adapter):
     assert task["is_finished"] is False
 
 
+def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-finished", RequestStatus.FINISHED_STOPPED, external_req_id="ext-finished")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": True}
+    cleanup_calls = []
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
+
+    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": True})
+
+    assert len(cleanup_calls) == 1
+    args, _ = cleanup_calls[0]
+    assert args[0] == "req-finished"
+    assert args[1] == "ext-finished"
+
+
 def test_update_request_payload(build_adapter):
     adapter, _ = build_adapter()
 
@@ -409,3 +425,86 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     args, _ = cleanup_calls[0]
     assert args[0] == "req-s1"
     assert args[1] == "ext-s1"
+
+
+def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerFixture):
+    """OmniARScheduler should enqueue save; adapter cleanup is handled in save thread."""
+    cleanup_calls = []
+    save_calls = []
+
+    adapter_mock = mocker.MagicMock()
+    adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
+    adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
+
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    scheduler = mocker.MagicMock()
+    scheduler.chunk_transfer_adapter = adapter_mock
+    scheduler.connector = None
+    scheduler.perf_metrics = None
+    scheduler.log_stats = False
+    scheduler.recompute_kv_load_failures = False
+    scheduler.structured_output_manager = mocker.MagicMock()
+    scheduler.structured_output_manager.should_advance.return_value = False
+    scheduler.finished_req_ids_dict = {}
+    scheduler.kv_cache_manager = mocker.MagicMock()
+    scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_event_publisher = mocker.MagicMock()
+    scheduler.waiting_for_transfer_free = set()
+    scheduler.transfer_triggered_requests = set()
+    scheduler.active_kv_transfers = set()
+
+    request = _HashableRequest(
+        request_id="req-ar",
+        external_req_id="ext-ar",
+        status=RequestStatus.RUNNING,
+        is_finished=lambda: False,
+        num_computed_tokens=1,
+        num_prompt_tokens=1,
+        prompt_token_ids=[1],
+        num_output_placeholders=0,
+        sampling_params=None,
+        pooling_params=None,
+        stop_reason=None,
+        client_index=0,
+        take_events=lambda: [],
+        trace_headers=None,
+        num_cached_tokens=0,
+        num_external_computed_tokens=0,
+        num_nans_in_logits=0,
+        get_finished_reason=lambda: "stop",
+    )
+    scheduler.requests = {"req-ar": request}
+
+    scheduler._update_request_with_output = mocker.MagicMock(return_value=([], True))
+    scheduler._process_kv_transfer_trigger = mocker.MagicMock(return_value=False)
+    scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
+    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
+    scheduler.running = [request]
+    scheduler.waiting = mocker.MagicMock()
+    scheduler.waiting.remove_requests = mocker.MagicMock()
+    scheduler.make_spec_decoding_stats = mocker.MagicMock(return_value=None)
+    scheduler.make_stats = mocker.MagicMock(return_value=None)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req-ar": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=[[123]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"req-ar": 0},
+        kv_extracted_req_ids=None,
+    )
+
+    OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+
+    assert len(cleanup_calls) == 0
+    assert len(save_calls) == 1

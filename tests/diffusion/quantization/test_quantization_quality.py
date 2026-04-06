@@ -118,8 +118,12 @@ def _generate_image(omni, config: QualityTestConfig):
 
     peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
     first = outputs[0]
-    req_out = first.request_output[0] if hasattr(first, "request_output") else first
-    return req_out.images[0], peak_mem
+    if hasattr(first, "images") and first.images:
+        return first.images[0], peak_mem
+    inner = first.request_output
+    if inner is not None and hasattr(inner, "images") and inner.images:
+        return inner.images[0], peak_mem
+    raise ValueError("Could not extract image from output.")
 
 
 def _generate_video(omni, config: QualityTestConfig):

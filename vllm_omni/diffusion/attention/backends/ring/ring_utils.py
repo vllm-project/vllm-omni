@@ -5,6 +5,9 @@
 
 import torch
 import torch.nn.functional as F
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 __all__ = ["update_out_and_lse", "flatten_varlen_lse", "unflatten_varlen_lse"]
 
@@ -79,9 +82,9 @@ def _update_out_and_lse(
         out = out - F.sigmoid(block_lse - lse) * (out - block_out)
         lse = lse - F.logsigmoid(lse - block_lse)
     except RuntimeError as e:
-        print(f"ERROR in _update_out_and_lse: {e}")
-        print(f"out: {out.shape}, lse: {lse.shape}")
-        print(f"block_out: {block_out.shape}, block_lse: {block_lse.shape}")
+        logger.error("_update_out_and_lse failed: %s", e)
+        logger.error("out: %s, lse: %s", out.shape, lse.shape)
+        logger.error("block_out: %s, block_lse: %s", block_out.shape, block_lse.shape)
         # raise e
         raise e
 
