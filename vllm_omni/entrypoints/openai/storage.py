@@ -168,14 +168,14 @@ def get_storage_manager(storage_config: STORAGE_BACKENDS) -> StorageBaseManager:
     if isinstance(storage_config, FileBackend):
         if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
             manager = LocalStorageTTLManager(
-                storage_path=storage_config.storage_path,
+                storage_path=storage_config.path,
                 max_concurrency=storage_config.file_concurrency,
                 ttl_seconds=storage_config.file_ttl,
                 sweep_interval_seconds=storage_config.ttl_sweep_interval,
             )
         else:
             manager = LocalStorageManager(
-                storage_path=storage_config.storage_path, max_concurrency=storage_config.file_concurrency
+                storage_path=storage_config.path, max_concurrency=storage_config.file_concurrency
             )
     else:
         raise ValueError("No supported storage managers")

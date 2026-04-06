@@ -11,7 +11,7 @@ class FileBackend(BaseSettings):
     model_config = SettingsConfigDict(env_prefix=STORAGE_PREFIX)
 
     type: Literal["file"] = "file"
-    storage_path: str = Field(default="/tmp/storage", description="Local path to store completed files.")
+    path: str = Field(default="/tmp/storage", description="Local path to store completed files.")
     file_concurrency: int = Field(default=4, description="Maximum number of file operations permitted at a time")
     file_ttl: int | None = Field(
         default=None, description="Optional TTL (in seconds) configuration settings for locally stored files."
