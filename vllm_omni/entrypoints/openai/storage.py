@@ -3,7 +3,7 @@ import contextlib
 import os
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from tempfile import NamedTemporaryFile
 from typing import Generic, Literal, TypeVar
 
@@ -32,7 +32,7 @@ class BaseStorageHandle(Generic[K]):
 @dataclass
 class FileStorageHandle(BaseStorageHandle[Literal["path"]]):
     path: str
-    kind: Literal["path"] = "path"
+    kind: Literal["path"] = field(default="path", init=False)
 
 
 class StorageBaseManager(ABC):
