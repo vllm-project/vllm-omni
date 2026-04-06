@@ -501,7 +501,10 @@ def close_started_llm_stage(started: StartedLlmStage) -> None:
     if started.proc is None:
         return
     try:
-        terminate_alive_proc(started.proc)
+        if hasattr(started.proc, 'shutdown'):
+            started.proc.shutdown()
+        else:
+            terminate_alive_proc(started.proc)
     except Exception as cleanup_error:
         logger.warning(
             "[stage_init] Failed to terminate process for stage %s: %s",

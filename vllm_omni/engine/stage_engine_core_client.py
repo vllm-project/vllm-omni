@@ -45,8 +45,6 @@ class StageEngineCoreClient(AsyncMPClient):
         client_index: int = 0,
         *,
         metadata: StageMetadata | None = None,
-        engine_manager: Any = None,
-        coordinator: Any = None,
     ):
         """Create an async EngineCore client for a single stage.
 
@@ -180,8 +178,11 @@ class StageEngineCoreClient(AsyncMPClient):
     def shutdown(self) -> None:
         """Shutdown ZMQ connections and the subprocess."""
         super().shutdown()
-        if self._proc is not None and self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join(timeout=5)
-            if self._proc.is_alive():
-                self._proc.kill()
+        if self._proc is not None:
+            if hasattr(self._proc, 'shutdown'):
+                self._proc.shutdown()
+            elif self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=5)
+                if self._proc.is_alive():
+                    self._proc.kill()

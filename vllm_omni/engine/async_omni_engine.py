@@ -352,8 +352,7 @@ class AsyncOmniEngine:
                         metadata=metadata,
                         vllm_config=vllm_config,
                         executor_class=executor_class,
-                        engine_manager=engine_manager,
-                        coordinator=coordinator,
+                        proc=engine_manager,
                         addresses=addresses,
                     )
                 finally:
@@ -393,11 +392,9 @@ class AsyncOmniEngine:
                 executor_class=started.executor_class,
                 metadata=started.metadata,
                 client_addresses=client_addresses,
-                engine_manager=started.engine_manager,
-                coordinator=started.coordinator,
+                proc=started.proc,
             )
-            started.engine_manager = None
-            started.coordinator = None
+            started.proc = None
         except Exception:
             close_started_llm_stage(started)
             raise
