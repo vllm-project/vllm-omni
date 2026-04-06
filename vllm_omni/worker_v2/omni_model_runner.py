@@ -75,8 +75,12 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         Exclude FULL mode for tuple-returning models because
         ``run_fullgraph`` bypasses Python-level tuple intercept.
-        PIECEWISE graphs still work since the forward_fn output is
-        handled by the graph runtime (not by empty_like).
+
+        For PIECEWISE capture, the warmup pass runs with
+        ``CUDAGraphMode.NONE`` which hits ``torch.empty_like(hidden_states)``
+        in the cudagraph framework.  If the model returns a tuple, that call
+        crashes.  We temporarily wrap the model's forward to extract only the
+        tensor part during capture, then restore the original forward.
         """
         if self._exclude_full_graph:
             mgr = self.cudagraph_manager
@@ -85,6 +89,23 @@ class OmniGPUModelRunner(GPUModelRunner):
                 for i, descs in enumerate(mgr._candidates):
                     mgr._candidates[i] = [d for d in descs if d.cg_mode != CUDAGraphMode.FULL]
                 logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
+
+        # Wrap model forward during capture so tuple returns don't crash
+        # torch.empty_like() in the PIECEWISE warmup pass.
+        if self._model_returns_tuple:
+            original_forward = self.model.forward
+
+            def _capture_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
+                output = original_forward(*args, **kwargs)
+                if isinstance(output, tuple):
+                    return output[0]
+                return output
+
+            self.model.forward = _capture_forward  # type: ignore[assignment]
+            try:
+                return super().capture_model()
+            finally:
+                self.model.forward = original_forward  # type: ignore[assignment]
         return super().capture_model()
 
     # ------------------------------------------------------------------

@@ -85,6 +85,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         Set `model_stage` in vllm_config to one of: "thinker", "talker", "code2wav"
     """
 
+    realtime_max_tokens = 64
+    talker_mtp_output_key = "code_predictor_codes"
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
@@ -114,6 +117,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.model_stage = vllm_config.model_config.model_stage
 
         if self.model_stage == "thinker":
+            # Thinker forward returns (hidden_states, captured_layer_dict).
+            # Tell the v2 runner so it excludes FULL CUDA graph capture
+            # (which cannot handle tuple returns via torch.empty_like).
+            self._returns_tuple = True
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -252,7 +259,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                 msg = "Qwen3 Omni thinker get_mrope_input_positions requires mm_features"
                 raise ValueError(msg)
             return self.thinker.get_mrope_input_positions(input_tokens, mm_features)
-        return MRotaryEmbedding.get_input_positions_tensor(input_tokens, **kwargs)
+        # Talker / code2wav: no multimodal inputs, just sequential 3D positions
+        seq_len = len(input_tokens)
+        positions = torch.arange(seq_len).unsqueeze(0).expand(3, -1)
+        return positions, 0
 
     def forward(
         self,
@@ -520,7 +530,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 seq_token_counts=seq_token_counts,
             )
 
-        return audio_tensors
+        return [t.float() for t in audio_tensors]
 
     # ==================== Thinker-Talker Projection ====================
 

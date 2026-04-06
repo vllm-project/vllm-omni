@@ -167,6 +167,7 @@ class OmniARScheduler(VLLMScheduler):
                     block_ids=nr.block_ids,
                     num_computed_tokens=nr.num_computed_tokens,
                     lora_request=nr.lora_request,
+                    prefill_token_ids=nr.prefill_token_ids,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
                     additional_information=(getattr(request, "additional_information", None) if request else None),
