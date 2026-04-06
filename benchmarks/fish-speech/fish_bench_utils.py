@@ -1,4 +1,4 @@
-"""Shared benchmark infrastructure for TTS serving benchmarks.
+"""Shared benchmark infrastructure for Fish Speech serving benchmarks.
 
 Provides common dataclasses, metrics computation, streaming HTTP client,
 and result formatting used by model-specific benchmark scripts.
@@ -8,6 +8,7 @@ callback and audio parameters; everything else is handled here.
 """
 
 import asyncio
+import base64
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -99,6 +100,90 @@ def pcm_bytes_to_duration(
 ) -> float:
     """Convert raw PCM byte count to duration in seconds."""
     return num_bytes / sample_width / sample_rate
+
+
+def _is_sse_response(response: aiohttp.ClientResponse) -> bool:
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    return "text/event-stream" in content_type
+
+
+async def _read_raw_audio_stream(
+    response: aiohttp.ClientResponse,
+    *,
+    start_time: float,
+) -> tuple[int, float]:
+    first_audio_at = 0.0
+    total_bytes = 0
+
+    async for chunk in response.content.iter_any():
+        if chunk and first_audio_at <= 0:
+            first_audio_at = time.perf_counter() - start_time
+        total_bytes += len(chunk)
+
+    return total_bytes, first_audio_at
+
+
+def _extract_sse_payload(raw_event: bytes) -> bytes | None:
+    data_lines: list[bytes] = []
+    for raw_line in raw_event.splitlines():
+        line = raw_line.rstrip(b"\r")
+        if line.startswith(b"data: "):
+            data_lines.append(line[6:])
+        elif line.startswith(b"data:"):
+            data_lines.append(line[5:].lstrip())
+
+    if not data_lines:
+        return None
+    return b"\n".join(data_lines).strip()
+
+
+async def _read_sse_audio_stream(
+    response: aiohttp.ClientResponse,
+    *,
+    start_time: float,
+) -> tuple[int, float]:
+    """Decode SSE events and count raw audio bytes from base64 payloads."""
+    first_audio_at = 0.0
+    total_bytes = 0
+    pending = b""
+
+    async for chunk in response.content.iter_any():
+        if not chunk:
+            continue
+        pending += chunk
+        pending = pending.replace(b"\r\n", b"\n")
+
+        while b"\n\n" in pending:
+            raw_event, pending = pending.split(b"\n\n", 1)
+            payload_bytes = _extract_sse_payload(raw_event)
+            if payload_bytes is None:
+                continue
+            if payload_bytes == b"[DONE]":
+                return total_bytes, first_audio_at
+
+            try:
+                payload = json.loads(payload_bytes)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid SSE JSON payload: {exc}") from exc
+
+            audio = payload.get("audio")
+            if not isinstance(audio, dict):
+                continue
+
+            audio_b64 = audio.get("data")
+            if not audio_b64:
+                continue
+
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+            except Exception as exc:
+                raise ValueError(f"Invalid base64 audio chunk: {exc}") from exc
+
+            if audio_bytes and first_audio_at <= 0:
+                first_audio_at = time.perf_counter() - start_time
+            total_bytes += len(audio_bytes)
+
+    return total_bytes, first_audio_at
 
 
 # ---------------------------------------------------------------------------
@@ -242,33 +327,38 @@ async def send_streaming_request(
         async with session.post(api_url, json=payload) as response:
             if response.status != 200:
                 result.error = f"HTTP {response.status}: {await response.text()}"
-                return result
+            else:
+                if _is_sse_response(response):
+                    total_bytes, result.ttfp = await _read_sse_audio_stream(
+                        response,
+                        start_time=st,
+                    )
+                else:
+                    total_bytes, result.ttfp = await _read_raw_audio_stream(
+                        response,
+                        start_time=st,
+                    )
 
-            first_chunk = True
-            total_bytes = 0
+                result.e2e = time.perf_counter() - st
+                result.audio_bytes = total_bytes
+                result.audio_duration = pcm_bytes_to_duration(
+                    total_bytes, sample_rate, sample_width
+                )
 
-            async for chunk in response.content.iter_any():
-                if first_chunk and len(chunk) > 0:
-                    result.ttfp = time.perf_counter() - st
-                    first_chunk = False
-                total_bytes += len(chunk)
-
-            result.e2e = time.perf_counter() - st
-            result.audio_bytes = total_bytes
-            result.audio_duration = pcm_bytes_to_duration(
-                total_bytes, sample_rate, sample_width
-            )
-
-            if result.audio_duration > 0:
-                result.rtf = result.e2e / result.audio_duration
-            result.success = True
+                if total_bytes <= 0 or result.ttfp <= 0:
+                    result.error = "HTTP 200 but no audio bytes were received"
+                else:
+                    if result.audio_duration > 0:
+                        result.rtf = result.e2e / result.audio_duration
+                    result.success = True
 
     except Exception as e:
         result.error = str(e)
         result.e2e = time.perf_counter() - st
 
-    if pbar:
-        pbar.update(1)
+    finally:
+        if pbar:
+            pbar.update(1)
     return result
 
 
@@ -284,6 +374,7 @@ async def run_benchmark(
     sample_rate: int,
     sample_width: int = 2,
     num_warmups: int = 3,
+    request_timeout_s: float = 120.0,
 ) -> BenchmarkResult:
     """Run a TTS streaming benchmark at a given concurrency level.
 
@@ -302,7 +393,12 @@ async def run_benchmark(
     )
     session = aiohttp.ClientSession(
         connector=connector,
-        timeout=aiohttp.ClientTimeout(total=600),
+        timeout=aiohttp.ClientTimeout(
+            total=request_timeout_s,
+            connect=min(10.0, request_timeout_s),
+            sock_connect=min(10.0, request_timeout_s),
+            sock_read=request_timeout_s,
+        ),
     )
 
     try:
@@ -384,6 +480,7 @@ async def run_benchmark_sweep(
     sample_rate: int,
     sample_width: int = 2,
     num_warmups: int = 3,
+    request_timeout_s: float = 120.0,
     config_name: str = "benchmark",
     result_dir: str = "results",
 ) -> list[dict]:
@@ -400,6 +497,7 @@ async def run_benchmark_sweep(
             sample_rate=sample_rate,
             sample_width=sample_width,
             num_warmups=num_warmups,
+            request_timeout_s=request_timeout_s,
         )
         result.config_name = config_name
         all_results.append(asdict(result))

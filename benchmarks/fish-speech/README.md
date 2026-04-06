@@ -16,19 +16,50 @@ pip install aiohttp numpy tqdm matplotlib
 
 For sglang-omni comparison:
 ```bash
-git clone https://github.com/sgl-project/sglang-omni.git ~/Dev/sglang-omni
-cd ~/Dev/sglang-omni
+# Install sglang-omni with Fish Speech S2 Pro support and make sure
+# `sgl-omni` is available on your PATH.
+#
+# One option is a source install:
+git clone https://github.com/sgl-project/sglang-omni.git
+cd sglang-omni
 uv venv .venv -p 3.12 && source .venv/bin/activate
 uv pip install -e ".[s2pro]"
 ```
 
 ## Quick Start
 
-Run the vllm-omni benchmark with a single command:
+### 1) Start the vLLM-Omni server
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
+    "fishaudio/s2-pro" \
+    --omni --host 127.0.0.1 --port 8091 \
+    --stage-configs-path benchmarks/fish-speech/config/vllm_omni/fish_speech_s2_pro.yaml \
+    --trust-remote-code \
+    --enforce-eager
+```
+
+### 2) (Optional) Start the sglang-omni server
+
+```bash
+sgl-omni serve --model-path fishaudio/s2-pro \
+    --config benchmarks/fish-speech/config/sglang_omni/s2pro_tts.yaml \
+    --port 8000
+```
+
+### 3) Run the benchmark script
 
 ```bash
 cd benchmarks/fish-speech
+
+# vllm-omni only
 bash run_benchmark.sh
+
+# compare both running servers
+bash run_benchmark.sh --compare
+
+# only benchmark an already-running sglang-omni server
+bash run_benchmark.sh --sglang-only
 ```
 
 Results (JSON + PNG plots) are saved to `results/`.
@@ -42,29 +73,16 @@ bash run_benchmark.sh --compare
 # Only sglang-omni
 bash run_benchmark.sh --sglang-only
 
-# Custom stage config
-STAGE_CONFIG=/path/to/custom.yaml bash run_benchmark.sh
-
-# Custom GPU, prompt count, concurrency levels
-GPU_DEVICE=1 NUM_PROMPTS=20 CONCURRENCY="1 4" bash run_benchmark.sh
+# Custom prompt count, concurrency levels, or ports
+NUM_PROMPTS=20 CONCURRENCY="1 4" bash run_benchmark.sh
+PORT=8092 SGLANG_PORT=8001 bash run_benchmark.sh --compare
 ```
 
 ## Manual Steps
 
-### 1) Start the vLLM-Omni server
-
+### Run online serving benchmark against the running vLLM-Omni server
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
-    "fishaudio/s2-pro" \
-    --omni --host 127.0.0.1 --port 8091 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml \
-    --trust-remote-code --enforce-eager
-```
-
-### 2) Run online serving benchmark
-
-```bash
-python benchmarks/fish-speech/vllm_omni/bench_tts_serve.py \
+python benchmarks/fish-speech/vllm_omni/bench_fish_server.py \
     --port 8091 \
     --num-prompts 50 \
     --max-concurrency 1 4 10 \
@@ -72,16 +90,10 @@ python benchmarks/fish-speech/vllm_omni/bench_tts_serve.py \
     --result-dir results/
 ```
 
-### 3) (Optional) Run sglang-omni benchmark
+### (Optional) Run the sglang-omni benchmark client directly
 
 ```bash
-# Start sglang-omni server (in a separate terminal)
-cd ~/Dev/sglang-omni
-sgl-omni serve --model-path fishaudio/s2-pro \
-    --config examples/configs/s2pro_tts.yaml --port 8000
-
-# Run benchmark
-python benchmarks/fish-speech/sglang_omni/bench_tts_serve.py \
+python benchmarks/fish-speech/sglang_omni/bench_fish_server.py \
     --port 8000 \
     --num-prompts 50 \
     --max-concurrency 1 4 10 \
@@ -89,23 +101,32 @@ python benchmarks/fish-speech/sglang_omni/bench_tts_serve.py \
     --result-dir results/
 ```
 
-### 4) Generate comparison plots
+### Generate comparison plots
 
 ```bash
-python benchmarks/qwen3-tts/plot_results.py \
-    --results results/bench_vllm_omni_*.json results/bench_sglang_omni_*.json \
+python benchmarks/fish-speech/plot_results.py \
+    --results benchmarks/fish-speech/results/bench_vllm_omni_*.json benchmarks/fish-speech/results/bench_sglang_omni_*.json \
     --labels "vllm-omni" "sglang-omni" \
     --title "Fish Speech S2 Pro" \
-    --output results/comparison.png
+    --output benchmarks/fish-speech/results/comparison.png
 ```
 
 ## Stage Config
 
-By default, the benchmark uses the upstream stage config at `vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml`. This is a 2-stage pipeline (Slow AR -> DAC Decoder) with `async_chunk` streaming enabled, `max_num_seqs: 4` for the AR stage and `max_num_seqs: 1` for the DAC decoder. The `SharedMemoryConnector` streams codec frames (25-frame chunks with 25-frame context overlap, ~21.5 Hz codec rate).
+This benchmark vendors both serving configs under `benchmarks/fish-speech/config/`:
 
-To use a custom config, set `STAGE_CONFIG`:
+- `benchmarks/fish-speech/config/vllm_omni/fish_speech_s2_pro.yaml`
+- `benchmarks/fish-speech/config/sglang_omni/s2pro_tts.yaml`
+
+The default vllm-omni config is a 2-stage pipeline (Slow AR -> DAC Decoder) with `async_chunk` streaming enabled, `max_num_seqs: 4` for the AR stage and `max_num_seqs: 1` for the DAC decoder. The `SharedMemoryConnector` streams codec frames (25-frame chunks with 25-frame context overlap, ~21.5 Hz codec rate).
+
+To use a custom vllm-omni config, start the server with:
 ```bash
-STAGE_CONFIG=/path/to/custom.yaml bash run_benchmark.sh
+CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
+    "fishaudio/s2-pro" \
+    --omni --host 127.0.0.1 --port 8091 \
+    --stage-configs-path /path/to/custom.yaml \
+    --trust-remote-code
 ```
 
 ## Metrics
@@ -117,4 +138,4 @@ STAGE_CONFIG=/path/to/custom.yaml bash run_benchmark.sh
 
 ## Architecture Notes
 
-The benchmark scripts import shared infrastructure from `tts_bench_utils.py` (dataclasses, HTTP streaming client, metrics computation, result formatting). Only the model-specific payload construction and audio parameters live in the per-model wrappers (`vllm_omni/bench_tts_serve.py` and `sglang_omni/bench_tts_serve.py`).
+The benchmark scripts import shared infrastructure from `fish_bench_utils.py` (dataclasses, HTTP streaming client, metrics computation, result formatting). Only the model-specific payload construction and audio parameters live in the per-model wrappers (`vllm_omni/bench_fish_server.py` and `sglang_omni/bench_fish_server.py`).

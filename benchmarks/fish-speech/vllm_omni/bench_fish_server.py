@@ -4,14 +4,14 @@ Thin wrapper around the shared TTS benchmark infrastructure, providing
 fish-speech-specific payload construction and audio parameters.
 
 Usage:
-    python bench_tts_serve.py \
+    python bench_fish_server.py \
         --host 127.0.0.1 --port 8091 \
         --num-prompts 50 \
         --max-concurrency 1 4 10 \
         --result-dir results/
 
     # With voice cloning
-    python bench_tts_serve.py \
+    python bench_fish_server.py \
         --port 8091 \
         --ref-audio https://example.com/ref.wav \
         --ref-text "Reference transcript" \
@@ -27,11 +27,16 @@ from pathlib import Path
 # Allow imports from benchmarks/fish-speech/
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tts_bench_utils import run_benchmark_sweep  # noqa: E402
+from fish_bench_utils import run_benchmark_sweep  # noqa: E402
 
 # Fish Speech S2 Pro: DAC decoder outputs 44.1 kHz 16-bit mono PCM
 SAMPLE_RATE = 44100
 SAMPLE_WIDTH = 2
+REQUEST_DEFAULTS = {
+    # Match the stage config's AR generation limit explicitly so benchmark
+    # requests do not depend on server-side defaults.
+    "max_new_tokens": 2048,
+}
 
 
 def create_payload(
@@ -46,6 +51,7 @@ def create_payload(
         "stream": True,
         "response_format": "pcm",
     }
+    payload.update(REQUEST_DEFAULTS)
     if ref_audio:
         payload["ref_audio"] = ref_audio
     if ref_text:
@@ -67,6 +73,7 @@ def parse_args():
         default=[1, 4, 10],
     )
     parser.add_argument("--num-warmups", type=int, default=3)
+    parser.add_argument("--request-timeout", type=float, default=120.0)
     parser.add_argument("--ref-audio", type=str, default=None)
     parser.add_argument("--ref-text", type=str, default=None)
     parser.add_argument("--config-name", type=str, default="vllm_omni")
@@ -90,6 +97,7 @@ async def main():
         sample_rate=SAMPLE_RATE,
         sample_width=SAMPLE_WIDTH,
         num_warmups=args.num_warmups,
+        request_timeout_s=args.request_timeout,
         config_name=args.config_name,
         result_dir=args.result_dir,
     )
