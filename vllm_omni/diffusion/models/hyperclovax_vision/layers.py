@@ -65,11 +65,13 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pe: torch.Tenso
     """Attention with rotary position embedding and Flash Attention optimization."""
     q, k = apply_rope(q, k, pe)
 
-    # Use Flash Attention when available (Ampere+), otherwise let PyTorch pick
+    # Explicitly request Flash Attention backend on Ampere+ GPUs.
+    # Falls back to PyTorch's default SDPA selection on other hardware.
     if FLASH_ATTN_AVAILABLE and q.is_cuda:
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             x = F.scaled_dot_product_attention(q, k, v)
     else:
+        # Let PyTorch choose the best available SDPA kernel (math, mem-efficient, etc.)
         x = F.scaled_dot_product_attention(q, k, v)
 
     x = rearrange(x, "B H L D -> B L (H D)")
