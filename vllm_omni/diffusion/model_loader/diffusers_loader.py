@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     maybe_download_from_modelscope,
     multi_thread_safetensors_weights_iterator,
+    runai_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -183,13 +184,20 @@ class DiffusersPipelineLoader:
         )
 
         od_config = self.od_config
+        use_runai = use_safetensors and od_config is not None and getattr(od_config, "enable_runai_streamer", False)
         use_multithread = (
             use_safetensors
             and od_config is not None
             and getattr(od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
         )
-        if use_multithread:
+        if use_runai:
+            sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
+            weights_iterator = runai_safetensors_weights_iterator(
+                sorted_hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+            )
+        elif use_multithread:
             num_threads = getattr(od_config, "num_weight_load_threads", 4)
             # Keep deterministic shard order before passing to vLLM helper.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)

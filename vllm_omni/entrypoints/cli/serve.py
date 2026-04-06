@@ -331,6 +331,12 @@ class OmniServeCommand(CLISubcommand):
             default=4,
             help="Number of threads for parallel weight loading (default: 4).",
         )
+        omni_config_group.add_argument(
+            "--enable-runai-streamer",
+            action="store_true",
+            default=False,
+            help="Use RunAI Model Streamer for loading diffusion safetensors weights.",
+        )
 
         # diffusion model offload parameters
         omni_config_group.add_argument(
