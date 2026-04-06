@@ -252,8 +252,11 @@ async def run_single_request(
                         new_chunks = audio_data[audio_list_consumed:]
                         audio_list_consumed = len(audio_data)
                     elif isinstance(audio_data, torch.Tensor):
-                        new_chunks = [audio_data]
-                        audio_last_tensor = audio_data
+                        if audio_data is not audio_last_tensor:
+                            new_chunks = [audio_data]
+                            audio_last_tensor = audio_data
+                        else:
+                            new_chunks = []
                     else:
                         new_chunks = []
 
@@ -287,7 +290,10 @@ async def run_single_request(
     if text_parts:
         text_file = os.path.join(output_dir, f"{request_id}.txt")
         with open(text_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(text_parts))
+            f.write("Prompt:\n")
+            f.write(str(prompt) + "\n")
+            f.write("vllm_text_output:\n")
+            f.write("\n".join(text_parts).strip() + "\n")
         result["saved_files"].append(text_file)
         print(
             f"[Request {request_id}] Text saved to {text_file} "

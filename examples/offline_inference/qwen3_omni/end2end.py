@@ -241,7 +241,7 @@ def get_use_audio_in_video_query() -> QueryResult:
             "prompt": prompt,
             "multi_modal_data": {
                 "video": asset.np_ndarrays,
-                "audio": audio,
+                "audio": (audio, 16000),
             },
             "mm_processor_kwargs": {
                 "use_audio_in_video": True,
