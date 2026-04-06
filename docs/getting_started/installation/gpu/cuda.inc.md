@@ -116,15 +116,15 @@ docker run --runtime nvidia --gpus 2 \
 #### Build docker image
 
 ```bash
-DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.ci -t vllm-omni-cuda .
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cuda -t vllm-omni-cuda .
 ```
 
 If you want to specify the base vLLM version:
 
 ```bash
 DOCKER_BUILDKIT=1 docker build \
-  -f docker/Dockerfile.ci \
-  --build-arg VLLM_BASE_TAG=v0.15.0 \
+  -f docker/Dockerfile.cuda \
+  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.18.0 \
   -t vllm-omni-cuda .
 ```
 
@@ -132,8 +132,11 @@ DOCKER_BUILDKIT=1 docker build \
 
 ##### Launch with OpenAI API Server
 
+!!! note
+    The model `Qwen/Qwen3-Omni-30B-A3B-Instruct` requires significant GPU memory. The example below has been verified on 2 x H100's.
+
 ```bash
-docker run --runtime nvidia --gpus all \
+docker run --runtime nvidia --gpus 2 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
@@ -145,7 +148,7 @@ docker run --runtime nvidia --gpus all \
 ##### Launch with interactive session for development
 
 ```bash
-docker run --runtime nvidia --gpus all -it \
+docker run --runtime nvidia --gpus all -it --rm \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
