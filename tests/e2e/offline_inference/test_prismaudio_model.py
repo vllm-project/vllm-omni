@@ -12,7 +12,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 
 from tests.utils import hardware_test
 from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import (
@@ -21,6 +20,7 @@ from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import (
     load_prismaudio_conditioning_data,
     load_prismaudio_state_dict,
 )
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -86,6 +86,25 @@ def _build_video_path_prompt(video_path: Path, caption_cot: str) -> dict[str, ob
             "caption_cot": caption_cot,
         },
     }
+
+
+async def _collect_async_omni_generate(
+    omni: AsyncOmni,
+    *,
+    prompt: object,
+    request_id: str,
+    sampling_params: OmniDiffusionSamplingParams,
+) -> OmniRequestOutput:
+    last_output: OmniRequestOutput | None = None
+    async for output in omni.generate(
+        prompt=prompt,
+        sampling_params_list=[sampling_params],
+        request_id=request_id,
+    ):
+        last_output = output
+    if last_output is None:
+        raise RuntimeError(f"No output received for request {request_id}")
+    return last_output
 
 
 def _runtime_factory_scale(video_path: str, caption_cot: str) -> float:
@@ -336,7 +355,7 @@ async def test_prismaudio_real_model_e2e_smoke(tmp_path: Path) -> None:
     expected_num_samples = int(model_config.get("sample_size", 0))
 
     init_start = time.perf_counter()
-    diffusion = AsyncOmniDiffusion(
+    diffusion = AsyncOmni(
         model=str(local_model_dir),
         model_config={"prismaudio_model_config_path": str(official_config_path)},
         model_paths={
@@ -364,14 +383,15 @@ async def test_prismaudio_real_model_e2e_smoke(tmp_path: Path) -> None:
         prompt = _build_conditioning_path_prompt(features_path)
 
         inference_start = time.perf_counter()
-        result = await diffusion.generate(
+        result = await _collect_async_omni_generate(
+            diffusion,
             prompt=prompt,
-            sampling_params=sampling_params,
             request_id="prismaudio-e2e-smoke",
+            sampling_params=sampling_params,
         )
         inference_elapsed_s = time.perf_counter() - inference_start
     finally:
-        diffusion.close()
+        diffusion.shutdown()
 
     assert isinstance(result, OmniRequestOutput)
     assert result.final_output_type == "audio"
@@ -424,7 +444,7 @@ async def test_prismaudio_real_model_with_runtime_preprocessing_e2e_smoke(tmp_pa
 
     init_start = time.perf_counter()
     try:
-        diffusion = AsyncOmniDiffusion(
+        diffusion = AsyncOmni(
             model=str(local_model_dir),
             model_config={
                 "prismaudio_model_config_path": str(official_config_path),
@@ -463,16 +483,17 @@ async def test_prismaudio_real_model_with_runtime_preprocessing_e2e_smoke(tmp_pa
 
         inference_start = time.perf_counter()
         try:
-            result = await diffusion.generate(
+            result = await _collect_async_omni_generate(
+                diffusion,
                 prompt=prompt,
-                sampling_params=sampling_params,
                 request_id="prismaudio-e2e-runtime-preprocessing-smoke",
+                sampling_params=sampling_params,
             )
         except (ModuleNotFoundError, RuntimeError) as exc:
             pytest.skip(f"PrismAudio runtime preprocessing stack is not runnable in this environment: {exc}")
         inference_elapsed_s = time.perf_counter() - inference_start
     finally:
-        diffusion.close()
+        diffusion.shutdown()
 
     assert isinstance(result, OmniRequestOutput)
     assert result.final_output_type == "audio"
@@ -520,7 +541,7 @@ async def test_prismaudio_real_model_with_factory_backed_video_text_e2e_smoke(tm
     expected_num_samples = int(model_config.get("sample_size", 0))
 
     init_start = time.perf_counter()
-    diffusion = AsyncOmniDiffusion(
+    diffusion = AsyncOmni(
         model=str(local_model_dir),
         model_config={
             "prismaudio_model_config_path": str(official_config_path),
@@ -552,14 +573,15 @@ async def test_prismaudio_real_model_with_factory_backed_video_text_e2e_smoke(tm
         prompt = _build_video_path_prompt(video_path, caption_cot)
 
         inference_start = time.perf_counter()
-        result = await diffusion.generate(
+        result = await _collect_async_omni_generate(
+            diffusion,
             prompt=prompt,
-            sampling_params=sampling_params,
             request_id="prismaudio-e2e-factory-backed-video-text-smoke",
+            sampling_params=sampling_params,
         )
         inference_elapsed_s = time.perf_counter() - inference_start
     finally:
-        diffusion.close()
+        diffusion.shutdown()
 
     assert isinstance(result, OmniRequestOutput)
     assert result.final_output_type == "audio"
