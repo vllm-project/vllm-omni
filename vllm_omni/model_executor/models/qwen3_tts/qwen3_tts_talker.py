@@ -1124,14 +1124,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             speech_tokenizer_dir,
             torch_dtype=torch.bfloat16,
         )
-        # Prefer GPU for encoder if available; otherwise keep CPU.
+        # Only move encoder to GPU; the decoder is unused by Talker (which
+        # only calls tok.encode()) and would otherwise waste bf16 VRAM.
+        # NOTE: after this point the tokenizer instance is encode-only;
+        # calling tok.decode() will fail because tok.model.decoder is None.
         dev = next(self.parameters()).device
         if dev.type != "cpu":
             try:
-                tok.model.to(dev)
+                del tok.model.decoder
+                tok.model.decoder = None
+                tok.model.encoder.to(dev)
                 tok.device = dev
             except Exception as e:
-                raise RuntimeError(f"Failed to move speech tokenizer to {dev}: {e}") from e
+                raise RuntimeError(f"Failed to move speech tokenizer encoder to {dev}: {e}") from e
         else:
             tok.device = dev
         self._speech_tokenizer = tok

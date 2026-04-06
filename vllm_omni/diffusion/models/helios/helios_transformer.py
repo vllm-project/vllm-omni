@@ -576,7 +576,7 @@ class HeliosTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["HeliosTransformerBlock"]
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
