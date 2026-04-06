@@ -320,9 +320,9 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-    omni_llm = Omni(
+    omni = Omni(
         model=model_name,
-        log_stats=args.enable_stats,
+        log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
@@ -378,9 +378,11 @@ def main(args):
             prompt["modalities"] = output_modalities
 
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
-    if profiler_enabled:
-        omni_llm.start_profile(stages=[0])
-    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
+    if profiler_enabled and hasattr(omni, "start_profile"):
+        omni.start_profile(stages=[0])
+    elif profiler_enabled:
+        print("[Warn] VLLM_TORCH_PROFILER_DIR is set, but current engine does not support profiler controls.")
+    omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
@@ -389,43 +391,42 @@ def main(args):
     total_requests = len(prompts)
     processed_count = 0
     for stage_outputs in omni_generator:
+        output = stage_outputs.request_output
         if stage_outputs.final_output_type == "text":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                text_output = output.outputs[0].text
-                # Save aligned text file per request
-                prompt_text = output.prompt
-                out_txt = os.path.join(output_dir, f"{request_id}.txt")
-                lines = []
-                lines.append("Prompt:\n")
-                lines.append(str(prompt_text) + "\n")
-                lines.append("vllm_text_output:\n")
-                lines.append(str(text_output).strip() + "\n")
-                try:
-                    with open(out_txt, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception as e:
-                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
-                print(f"Request ID: {request_id}, Text saved to {out_txt}")
+            request_id = output.request_id
+            text_output = output.outputs[0].text
+            # Save aligned text file per request
+            prompt_text = output.prompt
+            out_txt = os.path.join(output_dir, f"{request_id}.txt")
+            lines = []
+            lines.append("Prompt:\n")
+            lines.append(str(prompt_text) + "\n")
+            lines.append("vllm_text_output:\n")
+            lines.append(str(text_output).strip() + "\n")
+            try:
+                with open(out_txt, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+            except Exception as e:
+                print(f"[Warn] Failed writing text file {out_txt}: {e}")
+            print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                audio_tensor = output.outputs[0].multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-                sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
-                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+            request_id = output.request_id
+            audio_tensor = output.outputs[0].multimodal_output["audio"]
+            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+            sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
+            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
-        processed_count += len(stage_outputs.request_output)
-        if profiler_enabled and processed_count >= total_requests:
+        processed_count += 1
+        if profiler_enabled and hasattr(omni, "stop_profile") and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
-            omni_llm.stop_profile()
+            omni.stop_profile()
 
             print("[Info] Waiting 30s for workers to write massive trace files to disk...")
             time.sleep(30)
             print("[Info] Trace export wait finished.")
 
-    omni_llm.close()
+    omni.close()
 
 
 def parse_args():
@@ -439,7 +440,7 @@ def parse_args():
         help="Query type.",
     )
     parser.add_argument(
-        "--enable-stats",
+        "--log-stats",
         action="store_true",
         default=False,
         help="Enable writing detailed statistics (default: disabled)",

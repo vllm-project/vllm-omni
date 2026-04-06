@@ -1,20 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# temporary for compatibility with vllm_omni.entrypoints.omni_stage.py
-# and vllm_omni.entrypoints.omni_llm.py
-
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-import torch
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.request import Request, RequestStatus
-
-if TYPE_CHECKING:
-    from .connectors.base import OmniConnectorBase
-
-from vllm_omni.entrypoints.stage_utils import OmniStageTaskType
+from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
 
@@ -30,7 +20,7 @@ def try_send_via_connector(
     sampling_params: Any,
     original_prompt: Any,
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
-    metrics: Any,
+    metrics: OrchestratorAggregator,
 ) -> bool:
     """
     Attempts to send data via OmniConnector.
@@ -41,12 +31,26 @@ def try_send_via_connector(
     try:
         t0 = time.time()
 
+        # Strip non-serializable multimodal feature fields from original_prompt
+        # before including it in metadata.  After stage-0 runs, the TokPrompt
+        # returned by render_chat_async may carry processed multimodal features
+        # (mm_kwargs, mm_placeholders, mm_hashes) that contain MultiModalKwargsItems
+        # objects, which are not supported by OmniMsgpackEncoder.  The receiving
+        # side (try_recv_via_connector) only extracts "engine_inputs" from the
+        # payload and never uses "original_prompt", so stripping these fields
+        # only affects debug metadata and is safe.
+        _MM_FEATURE_KEYS = frozenset({"mm_kwargs", "mm_placeholders", "mm_hashes"})
+        if isinstance(original_prompt, dict) and any(k in original_prompt for k in _MM_FEATURE_KEYS):
+            safe_prompt = {k: v for k, v in original_prompt.items() if k not in _MM_FEATURE_KEYS}
+        else:
+            safe_prompt = original_prompt
+
         # Prepare data for connector
         payload_data = {
             "engine_inputs": next_inputs,
             "sampling_params": sampling_params,
             "metadata": {
-                "original_prompt": original_prompt,
+                "original_prompt": safe_prompt,
                 "stage_transition": f"{stage_id}->{next_stage_id}",
                 "timestamp": time.time(),
             },
@@ -58,7 +62,7 @@ def try_send_via_connector(
         if success:
             # Send lightweight notification via queue
             notify_payload = {
-                "type": OmniStageTaskType.GENERATE,
+                "type": "generate",
                 "request_id": req_id,
                 "sampling_params": sampling_params,
                 "from_connector": True,
@@ -177,178 +181,6 @@ def try_recv_via_connector(
             # but for Stage-0 seed it should be there.
             # We'll return None to let caller handle error if strictly required.
             return None, None
-
-
-def update_request_payload(connector: "OmniConnectorBase", req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
-    """Update the payload data for a request in the connector.
-
-    Args:
-        connector: OmniConnectorBase instance
-        req_id: Request ID to update
-        payload_data: New payload data to store
-    """
-    origin_payload = connector.request_payload[req_id]
-    for key, value in payload_data.items():
-        if key == "finished":
-            continue
-        elif isinstance(value, torch.Tensor) and key in origin_payload:
-            payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
-        elif isinstance(value, list) and key in origin_payload:
-            payload_data[key] = origin_payload[key] + value
-
-    connector.request_payload[req_id] = payload_data
-    return payload_data
-
-
-def get_chunk(
-    connector: "OmniConnectorBase",
-    scheduler_output: SchedulerOutput,
-) -> None:
-    """Retrieve a chunk of pooling output.
-
-    Args:
-        connector: OmniConnectorBase instance
-        scheduler_output: Partial scheduler output dictionary
-
-    Returns:
-        None: This function modifies scheduler_output in place
-    """
-    stage_id = connector.stage_id
-    if stage_id == 0:
-        return
-
-    target_stage_id = stage_id - 1
-    # Handle new requests
-    for new_req_data in scheduler_output.scheduled_new_reqs:
-        connector.request_ids_mapping[new_req_data.req_id] = new_req_data.external_req_id
-        req_id = new_req_data.external_req_id
-        chunk_id = connector.get_requests[req_id]
-        connector_get_key = f"{req_id}_{target_stage_id}_{chunk_id}"
-        payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
-        if payload_data:
-            new_req_data.additional_information = payload_data
-            connector.request_payload[req_id] = payload_data
-            if payload_data.get("finished"):
-                connector.finished_requests.add(req_id)
-
-    # Handle cached/running requests
-    cached_reqs = scheduler_output.scheduled_cached_reqs
-    if not hasattr(cached_reqs, "additional_information"):
-        cached_reqs.additional_information = {}
-
-    for i, cached_req_id in enumerate(cached_reqs.req_ids):
-        req_id = connector.request_ids_mapping.get(cached_req_id, cached_req_id)
-        if req_id in connector.finished_requests:
-            continue
-        chunk_id = connector.get_requests[req_id]
-        connector_get_key = f"{req_id}_{target_stage_id}_{chunk_id}"
-        payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
-        if payload_data:
-            payload_data = update_request_payload(connector, req_id, payload_data)
-            cached_reqs.additional_information[cached_req_id] = payload_data
-            if payload_data.get("finished"):
-                connector.finished_requests.add(req_id)
-
-
-def get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key):
-    # TODO: add correct check mechanism for the payload_data
-    max_wait = 300
-    for _ in range(max_wait):
-        result = connector.get(
-            from_stage=str(target_stage_id),
-            to_stage=str(stage_id),
-            get_key=connector_get_key,
-        )
-        payload_data = None
-        if result:
-            payload_data, size = result
-            if payload_data:
-                connector.request_prompt_token_ids[req_id] = payload_data.get("thinker_input_ids", [])
-                connector.get_requests[req_id] += 1
-                logger.debug("[Stage-%d] Received one chunk for request %s", stage_id, connector_get_key)
-                break
-        time.sleep(0.01)
-    return payload_data
-
-
-def get_chunk_for_generation(
-    connector: "OmniConnectorBase",
-    request: Request,
-) -> None:
-    """Retrieve a chunk of pooling output.
-
-    Args:
-        connector: OmniConnectorBase instance
-        request: Request object
-
-    Returns:
-        None: This function modifies request in place
-    """
-    stage_id = connector.stage_id
-    target_stage_id = stage_id - 1
-    request_id = request.external_req_id
-
-    if request_id in connector.finished_requests:
-        return
-
-    chunk_id = connector.get_requests[request_id]
-    connector_get_key = f"{request_id}_{target_stage_id}_{chunk_id}"
-    payload_data = get_through_connector(connector, target_stage_id, stage_id, request_id, connector_get_key)
-    if not payload_data:
-        return
-
-    if payload_data.get("finished"):
-        connector.finished_requests.add(request_id)
-        request.status = RequestStatus.FINISHED_STOPPED
-    request.prompt_token_ids = payload_data.get("code_predictor_codes", [])
-    request.num_computed_tokens = 0
-
-
-def put_chunk(
-    connector: "OmniConnectorBase",
-    pooling_output: dict[str, Any],
-    request: Request,
-    custom_process_input_func: Callable[[dict[str, Any], Request], dict[str, Any] | None] | None = None,
-) -> None:
-    """Store a chunk of pooling output.
-
-    Args:
-        connector: OmniConnectorBase instance
-        pooling_output: Partial pooling output dictionary
-        request: Request object
-        custom_process_input_func: Optional custom function to process input
-
-    Returns:
-        None: This function sends data via connector
-    """
-    stage_id = connector.stage_id
-    next_stage_id = stage_id + 1
-    request_id = request.external_req_id
-    chunk_id = connector.put_requests[request_id]
-    connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
-    payload_data = None
-
-    # TODO: add default process_input_func to handle the payload_data ?
-    if custom_process_input_func:
-        try:
-            payload_data = custom_process_input_func(
-                connector=connector,
-                pooling_output=pooling_output,
-                request=request,
-            )
-        except Exception as e:
-            logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
-
-        if not payload_data:
-            return
-
-        success, size, metadata = connector.put(
-            from_stage=str(stage_id), to_stage=str(next_stage_id), put_key=connector_put_key, data=payload_data
-        )
-
-        if success:
-            connector.put_requests[request_id] += 1
-            logger.debug("[Stage-%d] Sent %s", stage_id, connector_put_key)
 
 
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:

@@ -8,11 +8,19 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationResponse,
     ResponseFormat,
 )
+from vllm_omni.entrypoints.openai.protocol.videos import (
+    VideoData,
+    VideoGenerationRequest,
+    VideoGenerationResponse,
+)
 
 __all__ = [
     "ImageData",
     "ImageGenerationRequest",
     "ImageGenerationResponse",
     "ResponseFormat",
+    "VideoData",
+    "VideoGenerationRequest",
+    "VideoGenerationResponse",
     "OmniChatCompletionStreamResponse",
 ]

@@ -8,9 +8,9 @@ stage_args:
 - stage_id: 0
   runtime:
     devices: "0"
-    max_batch_size: 5
   engine_args:
     model_stage: thinker
+    max_num_seqs: 5
     model_arch: Qwen3OmniMoeForConditionalGeneration
     worker_type: ar
     scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -22,8 +22,10 @@ stage_args:
     max_num_batched_tokens: 32768
     max_model_len: 32768
     enable_prefix_caching: false
+    mm_processor_cache_gb: 0
     hf_config_name: thinker_config
     tensor_parallel_size: 1
+    load_format: dummy
   final_output: true
   final_output_type: text
   is_comprehension: true
@@ -31,7 +33,7 @@ stage_args:
     temperature: 0.4
     top_p: 0.9
     top_k: 1
-    max_tokens: 100
+    max_tokens: 150
     seed: 42
     ignore_eos: False
     detokenize: True
@@ -40,13 +42,13 @@ stage_args:
 - stage_id: 1
   runtime:
     devices: "1"
-    max_batch_size: 5
   engine_args:
     model_stage: talker
+    max_num_seqs: 5
     model_arch: Qwen3OmniMoeForConditionalGeneration
     worker_type: ar
     scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.5
     enforce_eager: false
     trust_remote_code: true
     engine_output_type: latent  # Output codec codes for code2wav
@@ -55,6 +57,7 @@ stage_args:
     max_model_len: 32768
     distributed_executor_backend: "mp"
     hf_config_name: talker_config
+    load_format: dummy
   engine_input_source: [0]
   custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
   default_sampling_params:
@@ -69,9 +72,9 @@ stage_args:
 - stage_id: 2
   runtime:
     devices: "1"
-    max_batch_size: 1
   engine_args:
     model_stage: code2wav
+    max_num_seqs: 5
     model_arch: Qwen3OmniMoeForConditionalGeneration
     worker_type: generation
     scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
@@ -84,6 +87,7 @@ stage_args:
     max_num_batched_tokens: 100000
     hf_config_name: thinker_config
     async_scheduling: false
+    load_format: dummy
   engine_input_source: [1]
   custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
   final_output: true

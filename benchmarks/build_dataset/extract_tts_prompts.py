@@ -56,7 +56,7 @@ def main():
         "-o", "--output", type=str, default="prompts.txt", help="Output txt file path (default: prompts.txt)"
     )
     parser.add_argument(
-        "-n", "--num_lines", type=int, required=True, help="Number of lines to extract from the beginning"
+        "-n", "--num-lines", type=int, required=True, help="Number of lines to extract from the beginning"
     )
 
     args = parser.parse_args()

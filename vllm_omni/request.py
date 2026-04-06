@@ -82,7 +82,6 @@ class OmniRequest(Request):
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
-            eos_token_id=request.eos_token_id,
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
             cache_salt=request.cache_salt,
@@ -91,4 +90,5 @@ class OmniRequest(Request):
             block_hasher=block_hasher,
             additional_information=request.additional_information,
             resumable=request.resumable,
+            reasoning_ended=request.reasoning_ended,
         )

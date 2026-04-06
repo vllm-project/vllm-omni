@@ -17,8 +17,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
-    Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
     Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
@@ -37,6 +35,10 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
+    Qwen2_5OmniThinkerDummyInputsBuilder,
+    Qwen2_5OmniThinkerMultiModalProcessor,
+)
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.platforms import current_omni_platform
 
@@ -110,6 +112,15 @@ class Qwen2_5OmniForConditionalGeneration(
             if t2w_token_end_id:
                 self.model.set_suppress_start_id(t2w_token_end_id + 1)
             self.requires_raw_input_tokens = True
+
+            # Initialize thinker_embedding from config (random weights).
+            # For load_format: dummy this is the final state;
+            # for normal loading, load_weights() overwrites with real weights.
+            self.thinker_embedding = nn.Embedding(
+                self.thinker_config.text_config.vocab_size,
+                self.thinker_config.text_config.hidden_size,
+            )
+            self._init_special_tokens_embeddings()
 
         elif self.model_stage == "code2wav":
             self.thinker = None
@@ -626,7 +637,7 @@ class Qwen2_5OmniForConditionalGeneration(
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 
     def _get_embed_text_spk_token(self, voice_type: str):
-        if voice_type not in self.embed_text_spk_tokens:
+        if not hasattr(self, "embed_text_spk_tokens") or voice_type not in self.embed_text_spk_tokens:
             return self.embed_text_bos_token
         return self.embed_text_spk_tokens[voice_type]
 
@@ -695,7 +706,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
         # TODO(Peiqi): add voice_type support
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
-            voice_type=self.voice_type,
+            speaker=self.voice_type,
             output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
             output_token_ids=thinker_output_token_ids,
             thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
@@ -709,7 +720,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
     def _thinker_to_talker_prefill(
         self,
-        voice_type: str,
+        speaker: str,
         output_prompt_embeds,
         output_token_ids,
         thinker_prompt_embeds,
@@ -724,7 +735,7 @@ class Qwen2_5OmniForConditionalGeneration(
         prompt_embeds = torch.cat(
             [
                 thinker_prompt_embeds,
-                self._get_embed_text_spk_token(voice_type) + self.embed_codec_pad_token,
+                self._get_embed_text_spk_token(speaker) + self.embed_codec_pad_token,
                 output_prompt_embeds[:1] + self.embed_codec_bos_token,
             ],
             dim=0,

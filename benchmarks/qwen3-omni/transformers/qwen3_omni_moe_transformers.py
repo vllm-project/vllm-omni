@@ -227,17 +227,17 @@ def print_stats(stats: dict):
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-Omni Benchmark Script")
     parser.add_argument(
-        "--prompts_file",
+        "--prompts-file",
         type=str,
         default="benchmark/build_dataset/top100.txt",
         help="Path to the prompts file (one prompt per line)",
     )
     parser.add_argument(
-        "--output_dir", type=str, default="benchmark_results", help="Directory to save benchmark results"
+        "--output-dir", type=str, default="benchmark_results", help="Directory to save benchmark results"
     )
-    parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Path to the model")
+    parser.add_argument("--model-path", type=str, default=MODEL_PATH, help="Path to the model")
     parser.add_argument("--speaker", type=str, default="Ethan", help="Speaker voice for audio output")
-    parser.add_argument("--num_prompts", type=int, default=None, help="Number of prompts to process (default: all)")
+    parser.add_argument("--num-prompts", type=int, default=None, help="Number of prompts to process (default: all)")
     args = parser.parse_args()
 
     # Load model and processor

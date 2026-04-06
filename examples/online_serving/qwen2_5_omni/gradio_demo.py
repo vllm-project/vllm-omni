@@ -6,7 +6,10 @@ import random
 from pathlib import Path
 from typing import Any
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    raise ImportError("gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'") from None
 import numpy as np
 import soundfile as sf
 import torch
@@ -15,38 +18,43 @@ from PIL import Image
 
 SEED = 42
 
+DEFAULT_SAMPLING_PARAMS = {
+    "thinker": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "max_tokens": 2048,
+        "seed": SEED,
+        "detokenize": True,
+        "repetition_penalty": 1.1,
+    },
+    "talker": {
+        "temperature": 0.9,
+        "top_p": 0.8,
+        "top_k": 40,
+        "max_tokens": 2048,
+        "seed": SEED,
+        "detokenize": True,
+        "repetition_penalty": 1.05,
+        "stop_token_ids": [8294],
+    },
+    "code2wav": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "max_tokens": 2048,
+        "seed": SEED,
+        "detokenize": True,
+        "repetition_penalty": 1.1,
+    },
+}
+
 SUPPORTED_MODELS: dict[str, dict[str, Any]] = {
+    "Qwen/Qwen2.5-Omni-3B": {
+        "sampling_params": DEFAULT_SAMPLING_PARAMS,
+    },
     "Qwen/Qwen2.5-Omni-7B": {
-        "sampling_params": {
-            "thinker": {
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": -1,
-                "max_tokens": 2048,
-                "seed": SEED,
-                "detokenize": True,
-                "repetition_penalty": 1.1,
-            },
-            "talker": {
-                "temperature": 0.9,
-                "top_p": 0.8,
-                "top_k": 40,
-                "max_tokens": 2048,
-                "seed": SEED,
-                "detokenize": True,
-                "repetition_penalty": 1.05,
-                "stop_token_ids": [8294],
-            },
-            "code2wav": {
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": -1,
-                "max_tokens": 2048,
-                "seed": SEED,
-                "detokenize": True,
-                "repetition_penalty": 1.1,
-            },
-        },
+        "sampling_params": DEFAULT_SAMPLING_PARAMS,
     },
 }
 # Ensure deterministic behavior across runs.

@@ -1,551 +1,496 @@
-"""Qwen3-Omni Code Predictor with MTP (Multi-Token Prediction) support.
+"""Qwen3-Omni Code Predictor -- optimized re-prefill, no KV cache.
 
-This module implements the code predictor component for Qwen3-Omni talker models.
-
-The code predictor generates residual RVQ (Residual Vector Quantization) codes
-autoregressively, predicting layers 1 to N based on layer-0 codes from the talker.
+* SDPA attention (F.scaled_dot_product_attention) with native GQA support
+* HF-compatible numerics (float32 RMSNorm, float32 RoPE, separate linear layers)
+* Per-call embedding buffer to avoid cross-request aliasing
+* Pre-allocated position_ids (read-only, safe to persist)
+* torch.compile (epilogue_fusion=False) on inner transformer by default
+* Inline sampling (top-k + top-p) -- no custom op overhead
 """
-
-from collections import namedtuple
-from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Cache, PretrainedConfig
-from transformers.generation.logits_process import (
-    LogitsProcessorList,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
-)
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
-from vllm.forward_context import get_forward_context
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
-# ============================================================================
-# Code Predictor Attention Layer
-# ============================================================================
+
+# ===================================================================
+# HF-numerics-compatible layers for code predictor
+# ===================================================================
+#
+# These use plain PyTorch ops (nn.Linear, manual RMSNorm in float32,
+# rotate_half RoPE) to produce outputs numerically identical to the
+# HuggingFace reference. vLLM's fused kernels (RMSNorm, QKVParallel,
+# get_rope) introduce small precision differences that compound across
+# the autoregressive steps of the code predictor, causing severe
+# audio quality degradation.
+#
+# See: https://github.com/vllm-project/vllm-omni/issues/2274
+
+
+class _RMSNorm(nn.Module):
+    """RMSNorm matching HuggingFace's implementation exactly.
+
+    Computes variance in float32 to avoid bfloat16 precision loss.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class _RotaryEmbedding(nn.Module):
+    """RoPE matching HuggingFace's implementation exactly.
+
+    Forces float32 computation for cos/sin, matching HF's torch.autocast(enabled=False).
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        rope_theta = getattr(config, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # position_ids: [batch, seq_len]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        # Force float32 (matching HF)
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class Qwen3OmniCodePredictorAttention(nn.Module):
-    """Multi-head self-attention for code predictor with vLLM optimization."""
+    """Multi-head self-attention for code predictor.
+
+    Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
+    No KV cache -- the code predictor always re-prefills the full (short)
+    sequence each AR step.
+
+    Input : [B, seq_len, hidden_size]
+    Output: [B, seq_len, hidden_size]
+    """
 
     def __init__(
         self,
         config,
-        layer_idx: int,
-        vllm_config: VllmConfig = None,
-        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
-
-        self.num_heads = config.code_predictor_config.num_attention_heads
-        self.num_key_value_heads = config.code_predictor_config.num_key_value_heads
+        cp_cfg = config.code_predictor_config
+        self.num_heads = cp_cfg.num_attention_heads
+        self.num_kv_heads = cp_cfg.num_key_value_heads
         self.head_dim = getattr(
-            config.code_predictor_config,
+            cp_cfg,
             "head_dim",
-            config.code_predictor_config.hidden_size // config.code_predictor_config.num_attention_heads,
+            cp_cfg.hidden_size // cp_cfg.num_attention_heads,
         )
-        self.hidden_size = config.code_predictor_config.hidden_size
+        self.hidden_size = cp_cfg.hidden_size
+        self.scaling = self.head_dim**-0.5
+        self._use_gqa = self.num_kv_heads != self.num_heads
 
-        if self.num_heads % self.num_key_value_heads != 0:
-            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
-
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=self.hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=self.num_heads,
-            total_num_kv_heads=self.num_key_value_heads,
+        # Separate q/k/v projections matching HF (no fused packing)
+        self.q_proj = nn.Linear(
+            self.hidden_size,
+            self.num_heads * self.head_dim,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-            disable_tp=True,
         )
-        self.o_proj = RowParallelLinear(
-            input_size=self.num_heads * self.head_dim,
-            output_size=self.hidden_size,
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-            disable_tp=True,
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=config.code_predictor_config.max_position_embeddings,
-            rope_parameters=None,
-            dual_chunk_attention_config=None,
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=False,
         )
-
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_key_value_heads * self.head_dim
-
-        # Query/Key normalization
-        self.q_norm = RMSNorm(self.head_dim, eps=config.code_predictor_config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.code_predictor_config.rms_norm_eps)
-        self.is_causal = True
-        self.config = config
-
-        self.attention_backends = ["flash_attention_2", "xformers", "eager", "sdpa"]
-        cudagraph_mode = get_current_vllm_config().compilation_config.cudagraph_mode
-        if "flash_attention_2" in ALL_ATTENTION_FUNCTIONS and cudagraph_mode.has_full_cudagraphs():
-            logger.warning(
-                f"CUDAGraphMode.{cudagraph_mode.name} is currently not supported "
-                f"with flash attention for Qwen3-Omni talker MTP."
-                f"removing flash attention from attention_backends"
-            )
-            self.attention_backends.remove("flash_attention_2")
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+        )
+        self.q_norm = _RMSNorm(self.head_dim, eps=cp_cfg.rms_norm_eps)
+        self.k_norm = _RMSNorm(self.head_dim, eps=cp_cfg.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
-        use_cache: bool = False,
-        position_ids: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
+        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
+        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
 
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
 
-        # Reshape for attention
-        q = q.reshape(bsz, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        v = v.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        cos, sin = position_embeddings
+        # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
+        cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
+        sin = sin.unsqueeze(1)
+        q = (q * cos) + (_rotate_half(q) * sin)
+        k = (k * cos) + (_rotate_half(k) * sin)
 
-        # Apply normalization
-        q = self.q_norm(q).contiguous()
-        k = self.k_norm(k).contiguous()
-        q = q.reshape(-1, self.q_size)
-        k = k.reshape(-1, self.kv_size)
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=self.scaling,
+            is_causal=True,
+            enable_gqa=self._use_gqa,
+        )
 
-        # Apply RoPE
-        q, k = self.rotary_emb(position_ids, q, k)
-
-        # Reshape for attention
-        q = q.reshape(bsz, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-
-        v_heads = v.transpose(1, 2).contiguous()
-        q_heads = q.transpose(1, 2).contiguous()
-        k_heads = k.transpose(1, 2).contiguous()
-
-        if past_key_values is not None:
-            sin, cos = self.rotary_emb.get_cos_sin(seq_len)
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            k_heads, v_heads = past_key_values.update(k_heads, v_heads, self.layer_idx, cache_kwargs)
-
-        # Try attention backends in order of preference, with runtime error handling
-        # This handles cases where the backend is registered but not actually available
-        attn_output = None
-        last_error = None
-
-        for backend_name in self.attention_backends:
-            if backend_name not in ALL_ATTENTION_FUNCTIONS:
-                continue
-
-            try:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[backend_name]
-                attn_output, _ = attention_interface(
-                    self,
-                    q_heads,
-                    k_heads,
-                    v_heads,
-                    None,
-                    dropout=0.0 if not self.training else getattr(self, "attention_dropout", 0.0),
-                    scaling=self.head_dim**-0.5,
-                    sliding_window=None,
-                    use_cache=use_cache,
-                    position_ids=position_ids[:seq_len].unsqueeze(0),
-                    output_hidden_states=True,
-                    output_attentions=False,
-                )
-                break
-            except (ValueError, ImportError, RuntimeError, AttributeError) as e:
-                # Store error and try next backend
-                last_error = e
-                continue
-
-        if attn_output is None:
-            raise RuntimeError(
-                f"All attention backends failed. Last error: {last_error}. "
-                "Please install flash-attn, or ensure PyTorch's scaled_dot_product_attention is available."
-            )
-        attn_output = attn_output.reshape(*(hidden_states.shape[:-1]), -1).contiguous()
-
-        attn_output, _ = self.o_proj(attn_output)
-        return attn_output
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.o_proj(attn_out)
+        return output
 
 
-# ============================================================================
-# Code Predictor MLP Layer
-# ============================================================================
+# ===================================================================
+#  MLP
+# ===================================================================
 
 
 class Qwen3OmniCodePredictorMLP(nn.Module):
-    """Feed-forward network for code predictor with fused gate/up projection."""
+    """SiLU-gated MLP for code predictor, matching HF's implementation."""
 
     def __init__(
         self,
         config,
-        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
         hidden_size = config.code_predictor_config.hidden_size
         intermediate_size = config.code_predictor_config.intermediate_size
 
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[intermediate_size, intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-            disable_tp=True,
-        )
-
-        self.down_proj = RowParallelLinear(
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-            disable_tp=True,
-        )
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(hidden_states)
-        gate, up = gate_up.chunk(2, dim=-1)
-        down, _ = self.down_proj(F.silu(gate) * up)
-        return down
+        return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
 
 
-# ============================================================================
-# MTP Layer (Multi-Token Prediction Layer)
-# ============================================================================
+# ===================================================================
+#  Decoder Layer
+# ===================================================================
 
 
-class Qwen3OmniCodePredictorMTPLayer(nn.Module):
-    """MTP layer for speculative decoding - predicts next residual code layer."""
+class Qwen3OmniCodePredictorDecoderLayer(nn.Module):
+    """Transformer decoder layer (SDPA, no KV cache)."""
 
     def __init__(
         self,
-        config: PretrainedConfig,
-        prefix: str,
-        model_config: ModelConfig,
-        layer_idx: int,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
+        config,
+        prefix: str = "",
     ) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
-        self.config = config
-
         self.self_attn = Qwen3OmniCodePredictorAttention(
             config,
-            layer_idx,
-            vllm_config=type(
-                "VllmConfig",
-                (),
-                {"cache_config": cache_config, "quant_config": quant_config, "model_config": model_config},
-            )(),
-            quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
         self.mlp = Qwen3OmniCodePredictorMLP(
             config,
-            quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(
-            config.code_predictor_config.hidden_size, eps=config.code_predictor_config.rms_norm_eps
-        )
-        self.post_attention_layernorm = RMSNorm(
-            config.code_predictor_config.hidden_size, eps=config.code_predictor_config.rms_norm_eps
-        )
+        cp_cfg = config.code_predictor_config
+        self.input_layernorm = _RMSNorm(cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps)
+        self.post_attention_layernorm = _RMSNorm(cp_cfg.hidden_size, eps=cp_cfg.rms_norm_eps)
 
-    def mtp_block(
+    def forward(
         self,
         hidden_states: torch.Tensor,
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
-        use_cache: bool = False,
-        position_ids: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        # Self-attention with residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, past_key_values, cache_position, use_cache, position_ids)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
-        # MLP with residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
         return hidden_states
 
 
-class Qwen3OmniCodePredictorBaseModel(nn.Module):
-    """
-    Base model for code predictor - matches HF Qwen3OmniMoeTalkerCodePredictorModel structure.
+# ===================================================================
+#  Base Transformer Model (re-prefill, no KV cache)
+# ===================================================================
 
-    This is a simple transformer that processes inputs_embeds and outputs hidden states.
+
+class Qwen3OmniCodePredictorBaseModel(nn.Module):
+    """Inner transformer for code predictor.
+
+    Signature: ``forward(inputs_embeds, position_ids) -> hidden_states``
+    -- plain Tensor in, plain Tensor out (no namedtuple).
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config.code_predictor_config
-
         self.config = config
-        self.vocab_size = config.vocab_size
-        self.num_code_groups = config.num_code_groups
 
-        # Codec embeddings (for layers 1-num_code_groups-1)
         self.codec_embedding = nn.ModuleList(
-            [
-                VocabParallelEmbedding(
-                    config.vocab_size,
-                    config.hidden_size,
-                )
-                for _ in range(config.num_code_groups - 1)
-            ]
+            [VocabParallelEmbedding(config.vocab_size, config.hidden_size) for _ in range(config.num_code_groups - 1)]
         )
 
-        # Decoder layers
         self.layers = nn.ModuleList(
             [
-                Qwen3OmniCodePredictorMTPLayer(
+                Qwen3OmniCodePredictorDecoderLayer(
                     vllm_config.model_config.hf_config,
-                    f"{prefix}.layers.{idx}",
-                    model_config=vllm_config.model_config,
-                    layer_idx=idx,
-                    cache_config=vllm_config.cache_config,
-                    quant_config=vllm_config.quant_config,
+                    prefix=f"{prefix}.layers.{idx}",
                 )
                 for idx in range(config.num_hidden_layers)
             ]
         )
-
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = _RotaryEmbedding(config)
 
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Any | None = None,
-        use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        """
-        Forward pass matching HF structure.
-
-        Args:
-            inputs_embeds: [batch, seq_len, hidden_size]
-            position_ids: Optional position IDs tensor
-            past_key_values: Optional cached key-value pairs
-            use_cache: Whether to use cache
-            cache_position: Optional cache position tensor
-            **kwargs: Additional keyword arguments
-
-        Returns:
-            Named tuple with .last_hidden_state and .past_key_values attributes
-        """
-        batch_size, seq_len, _ = inputs_embeds.shape
-        # Forward through decoder layers
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
         hidden_states = inputs_embeds
-
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
-            hidden_states = layer.mtp_block(hidden_states, past_key_values, cache_position, use_cache, position_ids)
-
-        # Final norm
+            hidden_states = layer(hidden_states, position_embeddings)
         hidden_states = self.norm(hidden_states)
-
-        # Return in HF-compatible format
-        Output = namedtuple("Output", ["last_hidden_state", "past_key_values"])
-        return Output(last_hidden_state=hidden_states, past_key_values=None)  # [batch, num_code_groups-1, hidden_size]
-
-    def get_input_embeddings(self):
-        """Return codec embeddings for HF compatibility."""
-        return self.codec_embedding
+        return hidden_states
 
 
-def code_predictor_sample(
-    logits: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    forward_context = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    logits = self.logits_processors(None, logits[:, -1])
-    probs = F.softmax(logits, dim=-1)
-    code = torch.multinomial(probs.squeeze(1), num_samples=1)  # [batch, 1]
-    return code
+# ===================================================================
+#  Code Predictor Wrapper (optimized re-prefill, persistent buffers)
+# ===================================================================
 
 
-def code_predictor_sample_fake(
-    logits: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    return torch.empty((logits.shape[0], 1), dtype=torch.int64, device=logits.device)
-
-
-direct_register_custom_op(
-    op_name="qwen3_omni_code_predictor_sample",
-    op_func=code_predictor_sample,
-    fake_impl=code_predictor_sample_fake,
-)
-
-
-@support_torch_compile
 class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
-    """
-    Code predictor wrapper matching HF structure.
+    """Optimized code predictor -- re-prefill approach, no KV cache.
 
-    Structure:
-    - self.model: Qwen3OmniCodePredictorBaseModel (transformer)
-    - self.lm_head: ModuleList of output heads
+    Each AR step forwards the full growing sequence (len 2 -> num_code_groups+1)
+    through the transformer.  The extra O(T^2) FLOPs are negligible for
+    short sequences, and this avoids all KV-cache management overhead.
+
+    Optimizations:
+      1. Per-call embedding buffer -- avoids cross-request aliasing.
+      2. Pre-allocated position_ids -- no torch.arange per step.
+      3. Cached module references -- bypass ModuleList indexing.
+      4. torch.compile on inner transformer.
+      5. Inline sampling (top-k + top-p) -- no custom op overhead.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        talker_code_predictor_config = vllm_config.model_config.hf_config
+        config = vllm_config.model_config.hf_config
+        self.config = config
         self.quant_config = vllm_config.quant_config
         self.prefix = prefix
 
-        self.config = talker_code_predictor_config
-        self.vocab_size = self.config.code_predictor_config.vocab_size
-        self.num_code_groups = self.config.code_predictor_config.num_code_groups
+        self.num_code_groups = config.code_predictor_config.num_code_groups
+        self._hidden_size = config.code_predictor_config.hidden_size
 
-        # Base transformer model (matches HF structure)
-        self.model = Qwen3OmniCodePredictorBaseModel(vllm_config=vllm_config, prefix=prefix)
+        self.model = Qwen3OmniCodePredictorBaseModel(
+            vllm_config=vllm_config,
+            prefix=prefix,
+        )
 
-        # Output heads for each residual layer (1-num_layers-1)
+        # One lm_head per residual layer (layers 1 .. G-1)
         self.lm_head = nn.ModuleList(
             [
                 nn.Linear(
-                    self.config.code_predictor_config.hidden_size,
-                    self.config.code_predictor_config.vocab_size,
+                    config.code_predictor_config.hidden_size,
+                    config.code_predictor_config.vocab_size,
                     bias=False,
                 )
                 for _ in range(self.num_code_groups - 1)
             ]
         )
-        self.logits_processors = LogitsProcessorList(
-            [
-                TopKLogitsWarper(top_k=50),
-                TopPLogitsWarper(top_p=0.8),
-            ]
-        )
 
-        compilation_config = get_current_vllm_config().compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
-        self.layer_name = prefix
+        self.set_sampling_params()
 
+        # Lazily initialised position ids (read-only, safe to persist)
+        self._pos_ids: torch.Tensor | None = None
+
+        # Cached plain-list refs (set once)
+        self._lm_heads: list | None = None
+        self._codec_embeds: list | None = None
+
+        # Model forward (optionally compiled)
+        self._model_fwd: object | None = None
+
+    def set_sampling_params(self, top_k: int = 50, top_p: float = 0.8):
+        """Configure sampling parameters to maintain consistency with previous implementation."""
+        self._top_k = top_k
+        self._top_p = top_p
+        logger.debug(f"Sampling parameters updated: top_k={top_k}, top_p={top_p}s")
+
+    # ------------------------------------------------------------------
+    #  Lazy-init helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_pos_ids(self, device: torch.device) -> None:
+        if self._pos_ids is not None and self._pos_ids.device == device:
+            return
+        max_seq = self.num_code_groups + 1
+        # [1, max_seq] for HF-style RoPE (will be expanded to [bsz, seq_len] at use)
+        self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device).unsqueeze(0)
+
+    def _ensure_cached_refs(self) -> None:
+        if self._lm_heads is not None:
+            return
+        self._lm_heads = list(self.lm_head)
+        self._codec_embeds = list(self.model.codec_embedding)
+
+    def _ensure_model_fwd(self) -> None:
+        if self._model_fwd is not None:
+            return
+        if current_omni_platform.supports_torch_inductor():
+            # torch.compile fuses RMSNorm/RoPE in ways that lose float32
+            # precision, compounding across AR steps. Use epilogue_fusion=False
+            # to disable the problematic fusions while still getting kernel
+            # fusion benefits for the linear layers and SDPA.
+            self._model_fwd = torch.compile(
+                self.model.forward,
+                dynamic=True,
+                options={
+                    "epilogue_fusion": False,
+                },
+            )
+            logger.info("code_predictor: torch.compile enabled (no epilogue fusion)")
+        else:
+            self._model_fwd = self.model.forward
+            logger.info("code_predictor: using eager mode (no torch.compile)")
+
+    # ------------------------------------------------------------------
+    #  Forward -- re-prefill + inline sampling
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
     def forward(
         self,
         layer0_code: torch.Tensor,
         layer0_embed: torch.Tensor,
         last_talker_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for code predictor.
+        """Predict residual codebooks 1..G-1 autoregressively via re-prefill.
 
         Args:
-            layer0_code:
-                Code index for code-group (layer) 0.
-                Shape: [batch_size, 1], dtype typically int64.
-
-            last_talker_hidden:
-
-                Shape: [batch_size, hidden_size].
+            layer0_code:        [bsz, 1]  int64
+            layer0_embed:       [bsz, 1, hidden_size]
+            last_talker_hidden: [bsz, 1, hidden_size]
 
         Returns:
-            pos_all_layers:
-                Predicted codes for all code groups, including `layer0_code`.
-                Shape: [batch_size, num_code_groups, 1].
-
-            current_input:
-                The final input embedding sequence after appending embeddings of all
-                predicted codes (one token per predicted layer).
-                Shape: [batch_size, num_code_groups + 2, hidden_size].
+            all_codes: [bsz, num_code_groups, 1]
+            proj_buf:  [bsz, num_code_groups + 1, hidden_size]
+                pos 0   = last_talker_hidden (NOT a codec embed)
+                pos 1   = layer0_embed
+                pos 2.. = `codec_embedding[i](predicted_code_i)`
         """
-        pos_codes = [layer0_code]  # Start with layer 0: [batch, 1]
-        try:
-            current_input = torch.cat([last_talker_hidden, layer0_embed], dim=1)  # [batch, 2, hidden_size]
-        except Exception as e:
-            print(f"Error in current_input: {e}")
-            print(f"last_talker_hidden shape: {last_talker_hidden.shape}")
-            print(f"prev_embed shape: {layer0_embed.shape}")
-            raise e
-        batch_size = current_input.shape[0]
+        bsz = int(layer0_code.shape[0])
+        device = layer0_code.device
+        dtype = last_talker_hidden.dtype
+        num_groups = self.num_code_groups
 
-        # Predict all residual layers (layers 1 to num_code_groups-1) autoregressively
-        for layer_idx in range(self.num_code_groups - 1):
-            seq_len = layer_idx + 2
-            # Compute position_ids dynamically to avoid torch.compile specializing batch_size
-            position_ids = torch.arange(seq_len, device=current_input.device, dtype=torch.int64).repeat(batch_size)
-            # Forward through code_predictor model
-            outputs = self.model(
-                inputs_embeds=current_input,
-                attention_mask=None,
-                position_ids=position_ids,
-                past_key_values=None,
-                use_cache=False,
-                cache_position=None,
-            )
-            hidden_state = outputs.last_hidden_state  # [batch, 2, hidden_size]
+        # Lazy init (read-only caches only)
+        self._ensure_pos_ids(device)
+        self._ensure_model_fwd()
+        self._ensure_cached_refs()
 
-            # Use the corresponding lm_head for this layer
-            logits = self.lm_head[layer_idx](hidden_state[:, -1:, :])
-            code = torch.ops.vllm.qwen3_omni_code_predictor_sample(logits, self.layer_name)
-            pos_codes.append(code)
-            # Update prev_embed for next layer (if not last layer)
-            # layer_idx=0 predicts layer 1, embed with codec_embedding[1]
-            new_embed = self.model.codec_embedding[layer_idx](code)  # [batch, 1, hidden_size]
-            current_input = torch.cat([current_input, new_embed], dim=1)  # [batch, 3~n, hidden_size]
-        pos_all_layers = torch.stack(pos_codes, dim=1)  # [batch, num_code_groups, 1]
-        return pos_all_layers, current_input
+        # Allocate proj_buf locally each call to avoid cross-call aliasing
+        max_seq = num_groups + 1
+        proj_buf = torch.zeros(bsz, max_seq, self._hidden_size, dtype=dtype, device=device)
+        pos_ids = self._pos_ids
+        model_fwd = self._model_fwd
+        lm_heads = self._lm_heads
+        codec_embeds = self._codec_embeds
+
+        # Output codes
+        all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
+        all_codes[:, 0] = layer0_code
+
+        # Fill buffer positions 0 & 1
+        proj_buf[:bsz, 0:1, :] = last_talker_hidden
+        proj_buf[:bsz, 1:2, :] = layer0_embed
+
+        # Autoregressive loop: predict layers 1..G-1
+        for step in range(1, num_groups):
+            seq_len = step + 1
+            projected = proj_buf[:bsz, :seq_len, :]
+            # position_ids: [batch, seq_len] for HF-style RoPE
+            step_pos_ids = pos_ids[:, :seq_len].expand(bsz, -1)
+
+            hidden_out = model_fwd(projected, step_pos_ids)
+
+            # Inline sampling: top-k -> top-p -> softmax -> multinomial
+            logits = lm_heads[step - 1](hidden_out[:, -1, :])  # [bsz, vocab]
+            if self._top_k > 0:
+                topk_vals, _ = logits.topk(self._top_k, dim=-1)
+                logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+            if self._top_p < 1.0:
+                sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                cumulative_probs = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                # Remove tokens with cumulative probability above top_p
+                remove_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= self._top_p
+                sorted_logits[remove_mask] = float("-inf")
+                logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+            probs = F.softmax(logits, dim=-1)
+            code = torch.multinomial(probs, num_samples=1)  # [bsz, 1]
+
+            all_codes[:, step] = code
+
+            # Embed predicted code -> next buffer position
+            new_embed = codec_embeds[step - 1](code)  # [batch, 1, hidden_size]
+            proj_buf[:bsz, step + 1 : step + 2, :] = new_embed
+
+        return all_codes, proj_buf[:bsz]
+
+    # ------------------------------------------------------------------
+    #  Weight loading
+    # ------------------------------------------------------------------
 
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights with mapping for fused QKV and gate_up projections.
+        """Load weights directly (no fused projection remapping needed).
 
-        Maps original HF weights (q_proj, k_proj, v_proj, gate_proj, up_proj)
-        to fused vLLM weights (qkv_proj, gate_up_proj).
+        Since we use separate nn.Linear for q/k/v/o and gate/up/down,
+        weight names match the HF checkpoint directly.
         """
-        # Mapping for fused projections
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
@@ -554,36 +499,12 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Handle stacked/fused parameters
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
+            param = params_dict.get(name)
+            if param is None:
+                continue
 
-                name = name.replace(weight_name, param_name)
-                # Skip if parameter doesn't exist (e.g., bias)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Non-stacked parameters - use default loading
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is not None:
-                    weight_loader(param, loaded_weight)
-                else:
-                    param.data.copy_(loaded_weight)
-
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
         return loaded_params

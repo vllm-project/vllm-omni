@@ -235,14 +235,18 @@ class SequenceParallelSplitHook(ModelHook):
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         """Shard outputs for split_output=True entries."""
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
         is_tensor = isinstance(output, torch.Tensor)
         is_tensor_list = isinstance(output, (list, tuple)) and all(isinstance(x, torch.Tensor) for x in output)
 
         if not is_tensor and not is_tensor_list:
             # No tensor outputs to shard
+            logger.warning_once("No tensor outputs to shard.")
             return output
 
         output_list = [output] if is_tensor else list(output)
+        actually_sharded = False
 
         for index, spm in self.metadata.items():
             if not isinstance(index, int):
@@ -252,7 +256,14 @@ class SequenceParallelSplitHook(ModelHook):
             if index >= len(output_list):
                 raise ValueError(f"Index {index} out of bounds for output of length {len(output_list)}.")
 
-            output_list[index] = self._prepare_sp_input(output_list[index], spm, self._last_args, self._last_kwargs)
+            original = output_list[index]
+            output_list[index] = self._prepare_sp_input(original, spm, self._last_args, self._last_kwargs)
+            if output_list[index] is not original:
+                actually_sharded = True
+
+        # Mark SP as active only if at least one tensor was actually sharded
+        if actually_sharded and is_forward_context_available():
+            get_forward_context()._sp_shard_depth += 1
 
         return output_list[0] if is_tensor else type(output)(output_list)
 
@@ -305,10 +316,38 @@ class SequenceParallelSplitHook(ModelHook):
             logger.warning_once(f"Expected tensor with {sp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
             return x
 
+        def _raise_strict_divisibility_error(*, dim: int, seq_len: int, sp_size: int) -> None:
+            # Keep message actionable: strict mode must be evenly shardable at the split hook level.
+            msg = (
+                "Sequence Parallel strict mode requires the sequence length to be evenly shardable at split time, "
+                f"but got seq_len={seq_len} (dim={dim}) not divisible by sequence_parallel_size={sp_size}. "
+            )
+            suggestions: list[str] = []
+            if self.config.ulysses_degree > 1:
+                suggestions.append("set parallel_config.ulysses_mode='advanced_uaa' (UAA)")
+            suggestions.append(
+                "enable auto_pad=True in the model _sp_plan (requires attention_mask support and ring_degree=1)"
+            )
+            suggestions.append("choose seq_len divisible by sequence_parallel_size (or adjust SP degrees)")
+            msg += "Try: " + "; ".join(suggestions) + "."
+            raise ValueError(msg)
+
+        def _maybe_validate_strict_divisibility(*, dim: int, seq_len: int) -> None:
+            from vllm_omni.diffusion.forward_context import get_ulysses_mode
+
+            if get_ulysses_mode(default="strict") != "strict":
+                return
+            sp_size = int(self.config.sequence_parallel_size)
+            if sp_size <= 1:
+                return
+            if seq_len < sp_size or (seq_len % sp_size) != 0:
+                _raise_strict_divisibility_error(dim=dim, seq_len=int(seq_len), sp_size=sp_size)
+
         if isinstance(sp_input, SequenceParallelInput):
             # Full split with optional auto-padding
             if sp_input.auto_pad:
                 return self._shard_with_auto_pad(x, sp_input.split_dim)
+            _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
             return sp_shard(x, sp_input.split_dim, validate=False)
         elif isinstance(sp_input, SequenceParallelPartialInput):
             # Partial split: keep text portion, split image portion
@@ -320,6 +359,7 @@ class SequenceParallelSplitHook(ModelHook):
             image_part = x.narrow(dim, text_len, x.size(dim) - text_len)
 
             # Only shard the image portion
+            _maybe_validate_strict_divisibility(dim=dim, seq_len=image_part.size(dim))
             image_part_sharded = sp_shard(image_part, dim, validate=False)
 
             # Concatenate back: [text_full, image_sharded]
@@ -445,6 +485,8 @@ class SequenceParallelGatherHook(ModelHook):
             ctx = get_forward_context()
             original_seq_len = ctx.sp_original_seq_len
 
+        actually_gathered = False
+
         for i, spm in enumerate(self.metadata):
             if spm is None:
                 continue
@@ -465,6 +507,12 @@ class SequenceParallelGatherHook(ModelHook):
                 logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
 
             output[i] = gathered
+            actually_gathered = True
+
+        # Mark SP as inactive only if at least one tensor was actually gathered
+        if actually_gathered and is_forward_context_available():
+            ctx = get_forward_context()
+            ctx._sp_shard_depth = max(0, ctx._sp_shard_depth - 1)
 
         return output[0] if is_tensor else type(output)(output)
 

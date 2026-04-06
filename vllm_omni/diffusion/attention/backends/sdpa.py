@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Literal
+
 import torch
 from vllm.logger import init_logger
 
@@ -13,17 +15,27 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 logger = init_logger(__name__)
 
 
-def _maybe_reshape_attn_mask(query: torch.Tensor, key: torch.Tensor, attn_mask: torch.Tensor | None = None):
+SDPAMaskMode = Literal["broadcast_k", "full_qk"]
+
+
+def _maybe_reshape_attn_mask(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    mask_mode: SDPAMaskMode = "broadcast_k",
+):
     """
     Reshape Attention Mask
-    [batch_size, seq_len_k] -> [batch_size, 1, seq_len_q, seq_len_k]
+    2D [batch_size, seq_len_k] ->
+      - broadcast_k: [batch_size, 1, 1, seq_len_k]
+      - full_qk: [batch_size, 1, seq_len_q, seq_len_k]
     """
     # Skip Attention Mask if all values are 1, `None` mask can speedup the computation
     if attn_mask is not None and torch.all(attn_mask != 0):
         attn_mask = None
 
     # Reshape Attention Mask
-    # [batch_size, seq_len_k] -> [batch_size, 1, seq_len_q, seq_len_k]
+    # 2D [batch_size, seq_len_k] mask only.
     if (
         attn_mask is not None
         and attn_mask.ndim == 2
@@ -32,7 +44,14 @@ def _maybe_reshape_attn_mask(query: torch.Tensor, key: torch.Tensor, attn_mask: 
     ):
         B, Sq, Skv = attn_mask.shape[0], query.shape[1], key.shape[1]
         attn_mask = attn_mask.to(torch.bool)
-        attn_mask = attn_mask.unsqueeze(1).expand(B, Sq, Skv).unsqueeze(1).contiguous()
+        if mask_mode == "full_qk":
+            # NPU path requires explicit [B, 1, Q, K] mask layout.
+            attn_mask = attn_mask.unsqueeze(1).expand(B, Sq, Skv).unsqueeze(1).contiguous()
+        elif mask_mode == "broadcast_k":
+            # CUDA-like backends prefer [B, 1, 1, K] and rely on SDPA broadcast.
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+        else:
+            raise ValueError(f"Unsupported SDPA mask mode: {mask_mode}")
     return attn_mask
 
 
@@ -70,15 +89,21 @@ class SDPAImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
 
-    def forward_cuda(
+    def _forward_impl(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
+        mask_mode: SDPAMaskMode = "broadcast_k",
     ) -> torch.Tensor:
+        # Normalize mask before permuting q/k/v.
+        # _maybe_reshape_attn_mask expects sequence length on dim=1.
+        attention_mask = None
+        if attn_metadata:
+            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
+
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
-        attention_mask = attn_metadata.attn_mask if attn_metadata else None
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
             key,
@@ -91,6 +116,15 @@ class SDPAImpl(AttentionImpl):
         out = output.permute(0, 2, 1, 3)
         return out
 
+    def forward_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+
     def forward_xpu(
         self,
         query: torch.Tensor,
@@ -98,7 +132,7 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self.forward_cuda(query, key, value, attn_metadata)
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
 
     def forward_hip(
         self,
@@ -107,7 +141,7 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self.forward_cuda(query, key, value, attn_metadata)
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
 
     def forward_npu(
         self,
@@ -116,7 +150,4 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if attn_metadata:
-            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask)
-            setattr(attn_metadata, "attn_mask", attention_mask)
-        return self.forward_cuda(query, key, value, attn_metadata)
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="full_qk")

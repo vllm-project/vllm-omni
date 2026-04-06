@@ -71,14 +71,7 @@ For additional features and advanced configurations, refer to the:
 ### Testing
 
 vLLM-Omni uses `pytest` to test the codebase.
-
-```bash
-# Run all tests
-pytest tests/
-
-# Run tests for a single test file with detailed output
-pytest -s -v tests/test_omni_llm.py
-```
+Please refer to the [test instructions](./ci/test_guide.md) for detailed testing information.
 
 !!! warning
     Currently, not all unit tests pass when run on CPU platforms. If you don't have access to a GPU platform to run unit tests locally, rely on the continuous integration system to run the tests for now.
@@ -114,7 +107,7 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 - `[CI/Build]` for build or continuous integration improvements.
 - `[Doc]` for documentation fixes and improvements.
 - `[Model]` for adding a new model or improving an existing model. Model name should appear in the title.
-- `[Frontend]` For changes on the vLLM-Omni frontend (e.g., OpenAI API server, `OmniLLM` class, etc.)
+- `[Frontend]` For changes on the vLLM-Omni frontend (e.g., OpenAI API server, `Omni`/`AsyncOmni`, etc.)
 - `[Kernel]` for changes affecting CUDA kernels or other compute kernels.
 - `[Core]` for changes in the core vLLM-Omni logic (e.g., `OmniProcessor`, `OmniARScheduler`, etc.)
 - `[Hardware][Vendor]` for hardware-specific changes. Vendor name should appear in the prefix, such as [Ascend] for Ascend NPUs.
@@ -122,6 +115,9 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 
 !!! note
     If the PR spans more than one category, please include all relevant prefixes.
+
+### Local Test
+Please run the L1 and L2 test cases locally first and attach the results before contacting us to add the "ready" label. Please refer to the [test instructions](./ci/test_guide.md) for running the test cases.
 
 ### Code Quality
 

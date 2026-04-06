@@ -1,7 +1,10 @@
 import argparse
 from functools import lru_cache
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    raise ImportError("gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'") from None
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
@@ -40,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--default-seed", type=int, default=42, help="Initial seed shown in UI.")
     parser.add_argument("--default-cfg-scale", type=float, default=4.0, help="Initial CFG scale shown in UI.")
     parser.add_argument(
-        "--num_inference_steps",
+        "--num-inference-steps",
         type=int,
         default=50,
         help="Default number of denoising steps shown in the UI.",
@@ -112,7 +115,7 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         )
         images_outputs = []
         for output in outputs:
-            req_out = output.request_output[0]
+            req_out = output.request_output
             if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
                 raise ValueError("Invalid request_output structure or missing 'images' key")
             images = req_out.images

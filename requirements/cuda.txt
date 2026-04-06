@@ -1,3 +1,5 @@
 -r common.txt
 onnxruntime>=1.23.2
-fa3-fwd==0.0.1
+fa3-fwd==0.0.2
+# nvidia-cublas-cu12 is pinned to 12.9.1.4 via force-reinstall in Dockerfile.ci
+# because torch pins its own cublas version, making it unsatisfiable at resolve time.

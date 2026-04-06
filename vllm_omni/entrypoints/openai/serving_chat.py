@@ -3,19 +3,19 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Final, Optional, cast
+from typing import Any, Final, cast
 
 import jinja2
 import torch
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
-from vllm.renderers import RendererLike
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 try:
@@ -38,7 +38,6 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse,
     ChatMessage,
 )
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
@@ -63,20 +62,15 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import should_include_usage
-from vllm.inputs.data import PromptType, TokensPrompt
+from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
-from vllm.renderers.hf import (
-    resolve_chat_template_content_format,
-)
-from vllm.renderers.hf import (
-    safe_apply_chat_template as apply_hf_chat_template,
-)
-from vllm.renderers.mistral import (
-    safe_apply_chat_template as apply_mistral_chat_template,
-)
+from vllm.reasoning import ReasoningParser
+from vllm.renderers import BaseRenderer, merge_kwargs
+from vllm.renderers.inputs import TokPrompt
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers import TokenizerLike as AnyTokenizer
 from vllm.tokenizers.mistral import (
     MistralTokenizer,
     maybe_serialize_tool_calls,
@@ -85,19 +79,15 @@ from vllm.tokenizers.mistral import (
 )
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
-from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm.utils.collection_utils import as_list, is_list_of
+from vllm.utils.collection_utils import as_list
 
-from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.utils import parse_lora_request
 from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.outputs import OmniRequestOutput
-
-if TYPE_CHECKING:
-    from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 
 logger = init_logger(__name__)
 
@@ -114,13 +104,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     # Diffusion mode attributes
     _diffusion_mode: bool = False
-    _diffusion_engine: Optional["AsyncOmniDiffusion"] = None
+    _diffusion_engine: AsyncOmni | None = None
     _diffusion_model_name: str = ""
 
     @classmethod
     def for_diffusion(
         cls,
-        diffusion_engine: "AsyncOmniDiffusion",
+        diffusion_engine: AsyncOmni,
         model_name: str,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
@@ -182,6 +172,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if tokenizer is None:
                 tokenizer = await self.engine_client.get_tokenizer()
 
+            reasoning_parser: ReasoningParser | None = None
+            if self.reasoning_parser_cls:
+                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                    request.chat_template_kwargs,
+                    self.default_chat_template_kwargs,
+                )
+                reasoning_parser = self.reasoning_parser_cls(
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                )
+
             tool_parser = self.tool_parser
 
             if isinstance(tokenizer, MistralTokenizer):
@@ -231,29 +232,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 chat_template_kwargs = request.chat_template_kwargs or {}
                 chat_template_kwargs.update(reasoning_effort=request.reasoning_effort)
 
-                (
-                    conversation,
-                    request_prompts,
-                    engine_prompts,
-                ) = await self._preprocess_chat(
+                # Merge chat_template_kwargs with defaults
+                merged_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                    chat_template_kwargs,
+                    self.default_chat_template_kwargs,
+                )
+                conversation, engine_prompts = await self._preprocess_chat(
                     request,
-                    renderer,
                     request.messages,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_content_format=self.chat_template_content_format,
+                    default_template=request.chat_template or self.chat_template,
+                    default_template_content_format=self.chat_template_content_format,
+                    default_template_kwargs=merged_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    tool_parser=tool_parser,
+                    # OMNI: Additional parameters
+                    renderer=renderer,
                     add_generation_prompt=request.add_generation_prompt,
                     continue_final_message=request.continue_final_message,
-                    tool_dicts=tool_dicts,
                     documents=getattr(request, "documents", None),
-                    chat_template_kwargs=chat_template_kwargs,
-                    default_chat_template_kwargs=self.default_chat_template_kwargs,
-                    tool_parser=tool_parser,
                     add_special_tokens=request.add_special_tokens,
                 )
             else:
                 should_include_tools = tool_dicts is not None
-                conversation, engine_prompts = self._make_request_with_harmony(request, should_include_tools)
-                request_prompts = [engine_prompt.get("prompt_token_ids", []) for engine_prompt in engine_prompts]
+                conversation, engine_prompts = self.openai_serving_render._make_request_with_harmony(
+                    request, should_include_tools
+                )
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -270,6 +273,99 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             output_modalities if output_modalities is not None else self.engine_client.output_modalities
         )
 
+        num_inference_steps = None
+        # Omni multistage image generation: Stage-0 (AR) should receive a clean
+        # text prompt (and optional conditioning image/size) so the model's own
+        # processor can construct the correct inputs.
+        # If we pass pre-tokenized chat-template ids, GLM-Image can become
+        # effectively unconditioned and produce nonsense images.
+        if request.modalities and ("image" in request.modalities):
+            try:
+                messages_as_dicts: list[dict[str, Any]] = []
+                for msg in request.messages:
+                    if hasattr(msg, "model_dump"):
+                        messages_as_dicts.append(msg.model_dump())
+                    elif isinstance(msg, dict):
+                        messages_as_dicts.append(msg)
+                    else:
+                        messages_as_dicts.append(
+                            {
+                                "role": getattr(msg, "role", "user"),
+                                "content": getattr(msg, "content", ""),
+                            }
+                        )
+                extracted_prompt, reference_images = self._extract_diffusion_prompt_and_images(messages_as_dicts)
+                if not extracted_prompt:
+                    return self.create_error_response("No text prompt found in messages")
+
+                # [NOTE] When sending request via openai client Python library,
+                #   `extra_body` is flattented and merged into the payload's root.
+                #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
+                #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
+                extra_body = getattr(request, "extra_body", None)
+                if not extra_body:
+                    extra_body = request.model_extra or {}
+                height = extra_body.get("height")
+                width = extra_body.get("width")
+                num_inference_steps = extra_body.get("num_inference_steps")
+                if num_inference_steps is not None:
+                    try:
+                        num_inference_steps = int(num_inference_steps)
+                    except Exception:
+                        num_inference_steps = None
+                if "size" in extra_body:
+                    try:
+                        size_str = extra_body["size"]
+                        if isinstance(size_str, str) and "x" in size_str.lower():
+                            w, h = size_str.lower().split("x")
+                            width, height = int(w), int(h)
+                    except Exception:
+                        pass
+                negative_prompt = extra_body.get("negative_prompt")
+
+                engine_prompt_image: dict[str, Any] | None = None
+                is_img2img = False
+                if reference_images:
+                    # Best-effort decode first reference image for i2i.
+                    try:
+                        img_bytes = base64.b64decode(reference_images[0])
+                        img = Image.open(BytesIO(img_bytes))
+                        engine_prompt_image = {"img2img": img}
+                        is_img2img = True
+                    except Exception:
+                        engine_prompt_image = None
+
+                # Override the prompts produced by chat-template preprocessing.
+                tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
+                if is_img2img:
+                    tprompt["modalities"] = ["img2img"]
+                else:
+                    tprompt["modalities"] = ["image"]
+                if negative_prompt is not None:
+                    tprompt["negative_prompt"] = negative_prompt
+                # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
+                mm_processor_kwargs: dict[str, Any] = {}
+                if height is not None:
+                    mm_processor_kwargs["target_h"] = height
+                if width is not None:
+                    mm_processor_kwargs["target_w"] = width
+                if mm_processor_kwargs:
+                    tprompt["mm_processor_kwargs"] = mm_processor_kwargs
+                if engine_prompt_image is not None:
+                    tprompt["multi_modal_data"] = engine_prompt_image
+
+                engine_prompts = [tprompt]
+                # Store height/width for applying to diffusion stage sampling params later
+                _image_gen_height = height
+                _image_gen_width = width
+            except Exception as e:
+                logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
+                _image_gen_height = None
+                _image_gen_width = None
+        else:
+            _image_gen_height = None
+            _image_gen_width = None
+
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
@@ -280,9 +376,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
 
+                # Apply user-specified overrides to diffusion stage(s) for image generation
+                if _image_gen_height is not None or _image_gen_width is not None or num_inference_steps is not None:
+                    for idx, sp in enumerate(sampling_params_list):
+                        if hasattr(sp, "height") and _image_gen_height is not None:
+                            sp.height = _image_gen_height
+                        if hasattr(sp, "width") and _image_gen_width is not None:
+                            sp.width = _image_gen_width
+                        if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
+                            sp.num_inference_steps = num_inference_steps
+
                 self._log_inputs(
                     request_id,
-                    request_prompts[i],
+                    engine_prompt,
                     params_list=sampling_params_list,
                     lora_request=lora_request,
                 )
@@ -311,6 +417,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 conversation,
                 tokenizer,
                 request_metadata,
+                reasoning_parser,
             )
 
         try:
@@ -322,6 +429,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 conversation,
                 tokenizer,
                 request_metadata,
+                reasoning_parser,
             )
         except ValueError as e:
             return self.create_error_response(e)
@@ -329,88 +437,61 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     async def _preprocess_chat(
         self,
         request: ChatLikeRequest | ResponsesRequest,
-        renderer: RendererLike,
         messages: list[ChatCompletionMessageParam],
-        chat_template: str | None,
-        chat_template_content_format: ChatTemplateContentFormatOption,
+        default_template: str | None,
+        default_template_content_format: ChatTemplateContentFormatOption,
+        default_template_kwargs: dict[str, Any] | None = None,
+        tool_dicts: list[dict[str, Any]] | None = None,
+        tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
+        # OMNI: Additional parameters for backward compatibility
+        renderer: BaseRenderer | None = None,
         add_generation_prompt: bool = True,
         continue_final_message: bool = False,
-        tool_dicts: list[dict[str, Any]] | None = None,
         documents: list[dict[str, str]] | None = None,
-        chat_template_kwargs: dict[str, Any] | None = None,
-        default_chat_template_kwargs: dict[str, Any] | None = None,
-        tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
         add_special_tokens: bool = False,
-    ) -> tuple[
-        list[ConversationMessage],
-        Sequence[PromptType],
-        list[TokensPrompt],
-    ]:
-        model_config = self.model_config
-        tokenizer = renderer.get_tokenizer() if renderer is not None else None
+    ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
+        if renderer is None:
+            renderer = self.renderer
 
-        if tokenizer is None or isinstance(tokenizer, MistralTokenizer):
-            resolved_content_format = (
-                chat_template_content_format if chat_template_content_format != "auto" else "string"
-            )
-        else:
-            resolved_content_format = resolve_chat_template_content_format(
-                chat_template,
-                tool_dicts,
-                chat_template_content_format,
-                tokenizer,
-                model_config=model_config,
-            )
-        # OMNI: Updated for vLLM v0.15.0 API - resolve_items() returns (mm_data, mm_uuids) tuple
-        conversation, mm_future = parse_chat_messages_futures(
-            messages,
-            model_config,
-            content_format=resolved_content_format,
-            mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
-        )
-
-        # Merge default_chat_template_kwargs with request-provided kwargs
-        # Request kwargs take precedence over defaults
-        merged_kwargs = self._prepare_extra_chat_template_kwargs(
-            chat_template_kwargs,
-            default_chat_template_kwargs,
-        )
-
-        _chat_template_kwargs: dict[str, Any] = dict(
-            chat_template=chat_template,
-            add_generation_prompt=add_generation_prompt,
-            continue_final_message=continue_final_message,
-            tools=tool_dicts,
-            documents=documents,
-        )
-        _chat_template_kwargs.update(merged_kwargs)
-
-        request_prompt: str | list[int]
-
-        if tokenizer is None:
-            request_prompt = "placeholder"
-        elif isinstance(tokenizer, MistralTokenizer):
-            request_prompt = apply_mistral_chat_template(
-                tokenizer,
-                messages=messages,
-                **_chat_template_kwargs,
-            )
-        else:
-            hf_chat_template_kwargs = dict(_chat_template_kwargs)
-            hf_chat_template_kwargs.pop("tools", None)
-            hf_chat_template_kwargs.pop("chat_template", None)
-            request_prompt = apply_hf_chat_template(
-                model_config=model_config,
-                tokenizer=tokenizer,
-                conversation=conversation,
+        # Keep OMNI compatibility args wired while delegating rendering
+        # to the upstream async renderer pipeline.
+        default_template_kwargs = merge_kwargs(
+            default_template_kwargs,
+            dict(
                 tools=tool_dicts,
-                chat_template=chat_template,
-                tokenize=False,
-                **hf_chat_template_kwargs,
-            )
+                documents=documents,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=continue_final_message,
+                add_special_tokens=add_special_tokens,
+                tokenize=isinstance(renderer.tokenizer, MistralTokenizer),
+            ),
+        )
 
-        # OMNI: Await the combined future to get both mm_data and mm_uuids
-        mm_data, mm_uuids = await mm_future
+        tok_params = request.build_tok_params(self.model_config)
+        chat_params = request.build_chat_params(
+            default_template,
+            default_template_content_format,
+        ).with_defaults(default_template_kwargs)
+
+        # OMNI: When use_audio_in_video=True, the qwen2_5_omni_thinker mm
+        # processor asserts that audio items are present alongside video items
+        # (inside render_chat_async).  We must inject audio_url items into the
+        # messages BEFORE calling render_chat_async so the mm processor can
+        # count them correctly during tokenisation.
+        mm_proc_kw = getattr(request, "mm_processor_kwargs", None) or {}
+        if mm_proc_kw.get("use_audio_in_video", False):
+            messages = await self._inject_audio_from_video_urls(messages)
+
+        (conversation,), (engine_prompt,) = await renderer.render_chat_async(
+            [messages],
+            chat_params,
+            tok_params,
+            prompt_extras={
+                k: v for k in ("mm_processor_kwargs", "cache_salt") if (v := getattr(request, k, None)) is not None
+            },
+        )
+
+        tokenizer = renderer.get_tokenizer()
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
@@ -428,33 +509,28 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request=request
             )
 
-        if tokenizer is None:
-            assert isinstance(request_prompt, str), (
-                "Prompt has to be a string",
-                "when the tokenizer is not initialised",
-            )
-            prompt_inputs = TokensPrompt(prompt=request_prompt, prompt_token_ids=[1])
-        elif isinstance(request_prompt, str):
-            prompt_inputs = await self._tokenize_prompt_input_async(
-                request,
-                tokenizer,
-                request_prompt,
-                add_special_tokens=add_special_tokens,
-            )
-        else:
-            # For MistralTokenizer
-            assert is_list_of(request_prompt, int), "Prompt has to be either a string or a list of token ids"
-            prompt_inputs = TokensPrompt(
-                prompt=tokenizer.decode(request_prompt),
-                prompt_token_ids=request_prompt,
-            )
-
-        engine_prompt = TokensPrompt(prompt_token_ids=prompt_inputs["prompt_token_ids"])
-        if mm_data is not None:
-            engine_prompt["multi_modal_data"] = mm_data
-
-        if mm_uuids is not None:
-            engine_prompt["multi_modal_uuids"] = mm_uuids
+        # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
+        # For image generation, we want the raw user caption instead of a rendered template.
+        # But for multimodal comprehension (img2text), we MUST keep the rendered prompt
+        # containing image tokens.
+        req_modalities = getattr(request, "modalities", [])
+        if req_modalities and ("image" in req_modalities):
+            messages_as_dicts: list[dict[str, Any]] = []
+            for msg in messages:
+                if hasattr(msg, "model_dump"):
+                    messages_as_dicts.append(msg.model_dump())
+                elif isinstance(msg, dict):
+                    messages_as_dicts.append(msg)
+                else:
+                    messages_as_dicts.append(
+                        {
+                            "role": getattr(msg, "role", "user"),
+                            "content": getattr(msg, "content", ""),
+                        }
+                    )
+            extracted_prompt, _ = self._extract_diffusion_prompt_and_images(messages_as_dicts)
+            if extracted_prompt:
+                engine_prompt["prompt"] = extracted_prompt
 
         mm_processor_kwargs = getattr(request, "mm_processor_kwargs", None)
         if mm_processor_kwargs is not None:
@@ -463,7 +539,108 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
-        return conversation, [request_prompt], [engine_prompt]
+        speaker = getattr(request, "speaker", None)
+        if speaker is not None and isinstance(speaker, str) and speaker.strip():
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["speaker"] = [speaker.lower().strip()]
+
+        language = getattr(request, "language", None)
+        if language is not None and isinstance(language, str) and language.strip():
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["language"] = [language.strip()]
+
+        return conversation, [engine_prompt]
+
+    async def _inject_audio_from_video_urls(
+        self,
+        messages: list[ChatCompletionMessageParam],
+    ) -> list[ChatCompletionMessageParam]:
+        """Pre-extract audio from video URLs and inject as audio_url content items.
+
+        When use_audio_in_video=True, the qwen2_5_omni_thinker multimodal
+        processor requires that the number of audio items equals the number of
+        video items (it subtracts mm_counts["video"] from mm_counts["audio"]).
+        The client only sends video_url items; this method adds the matching
+        audio_url items on the server side before the renderer processes them.
+        """
+        import io
+
+        from vllm_omni.entrypoints.chat_utils import extract_audio_from_video_async
+
+        new_messages: list[ChatCompletionMessageParam] = []
+        for msg in messages:
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            if not isinstance(content, list):
+                new_messages.append(msg)
+                continue
+
+            video_urls = [
+                part.get("video_url", {}).get("url")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "video_url" and part.get("video_url", {}).get("url")
+            ]
+
+            if not video_urls:
+                new_messages.append(msg)
+                continue
+
+            audios = await asyncio.gather(*(extract_audio_from_video_async(u) for u in video_urls))
+
+            audio_items: list[dict] = []
+            for audio_array, sample_rate in audios:
+                buf = io.BytesIO()
+                if soundfile is not None:
+                    soundfile.write(buf, audio_array, samplerate=int(sample_rate), format="WAV")
+                else:
+                    import struct
+
+                    import numpy as np
+
+                    audio_np = np.asarray(audio_array, dtype=np.float32)
+                    sr = int(sample_rate)
+                    num_channels = 1
+                    bits_per_sample = 32
+                    num_frames = len(audio_np)
+                    data_size = num_frames * num_channels * (bits_per_sample // 8)
+                    # Write minimal RIFF/WAV header
+                    buf.write(b"RIFF")
+                    buf.write(struct.pack("<I", 36 + data_size))
+                    buf.write(b"WAVE")
+                    buf.write(b"fmt ")
+                    buf.write(
+                        struct.pack(
+                            "<IHHIIHH",
+                            16,
+                            3,
+                            num_channels,
+                            sr,
+                            sr * num_channels * (bits_per_sample // 8),
+                            num_channels * (bits_per_sample // 8),
+                            bits_per_sample,
+                        )
+                    )
+                    buf.write(b"data")
+                    buf.write(struct.pack("<I", data_size))
+                    buf.write(audio_np.tobytes())
+
+                audio_b64 = base64.b64encode(buf.getvalue()).decode()
+                audio_items.append(
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"},
+                    }
+                )
+
+            new_content = list(content) + audio_items
+            if isinstance(msg, dict):
+                new_msg = {**msg, "content": new_content}
+            else:
+                new_msg = msg.model_copy(update={"content": new_content})
+            new_messages.append(new_msg)
+
+        return new_messages
 
     def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[SamplingParams]:
         final_sampling_params_list = []
@@ -477,10 +654,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return final_sampling_params_list
 
     def _get_comprehension_stage_index(self) -> int:
-        for idx, stage in enumerate(self.engine_client.stage_list):
+        for idx, stage in enumerate(self.engine_client.stage_configs):
             if stage.is_comprehension:
                 return idx
-        raise ValueError("No comprehension stage (is_comprehension=True) found in stage_list")
+        raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
 
     # OpenAI API standard sampling parameters that can be safely overridden.
     # These are the most commonly used parameters with compatible types
@@ -489,9 +666,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _OPENAI_SAMPLING_FIELDS: set[str] = {
         "temperature",
         "top_p",
+        "top_k",
         "max_tokens",
+        "min_tokens",
         "seed",
+        "ignore_eos",
         "stop",
+        "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
     }
@@ -559,29 +740,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     def _log_inputs(
         self,
         request_id: str,
-        inputs: PromptType,
+        inputs: PromptType | TokPrompt,
         params_list: list[SamplingParams] | None,
         lora_request: LoRARequest | None,
     ) -> None:
         if self.request_logger is None:
             return
-        prompt, prompt_token_ids, prompt_embeds = None, None, None
-        if isinstance(inputs, str):
-            prompt = inputs
-        elif isinstance(inputs, list):
-            prompt_token_ids = inputs
-        else:
-            prompt = getattr(inputs, "prompt", None)
-            prompt_token_ids = getattr(inputs, "prompt_token_ids", None)
-
-        logger.info(
-            "Received request %s: prompt: %r, params_list: %s, prompt_token_ids: %s, prompt_embeds shape: %s, lora_request: %s.",  # noqa: E501
+        components = self._extract_prompt_components(inputs)
+        self.request_logger.log_inputs(
             request_id,
-            prompt,
-            params_list,
-            prompt_token_ids,
-            prompt_embeds.shape if prompt_embeds is not None else None,
-            lora_request,
+            components.text,
+            components.token_ids,
+            components.embeds,
+            params=params_list,
+            lora_request=lora_request,
         )
 
     async def chat_completion_stream_generator(
@@ -593,6 +765,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         conversation: list[ConversationMessage],
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
+        reasoning_parser: ReasoningParser | None = None,
     ):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -634,7 +807,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
-        if tool_choice_auto or self.reasoning_parser:
+        if tool_choice_auto or reasoning_parser:
             # These are only required in "auto" tool choice case
             all_previous_token_ids = [[]] * num_choices
             # For reasoning parser and tool call all enabled
@@ -642,27 +815,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             reasoning_end_arr = [False] * num_choices
         else:
             all_previous_token_ids = None
-
-        try:
-            if self.reasoning_parser:
-                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    request.chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
-                reasoning_parser = self.reasoning_parser(
-                    tokenizer,
-                    chat_template_kwargs=chat_template_kwargs,  # type: ignore
-                )
-        except RuntimeError as e:
-            logger.exception("Error in reasoning parser creation.")
-            data = self.create_streaming_error_response(e)
-            yield f"data: {data}\n\n"
-            yield "data: [DONE]\n\n"
-            return
         # Prepare the tool parser if it's needed
         try:
             if tool_choice_auto and self.tool_parser:
-                tool_parsers: list[ToolParser | None] = [self.tool_parser(tokenizer)] * num_choices
+                tool_parsers: list[ToolParser | None] = [self.tool_parser(tokenizer, request.tools)] * num_choices
             else:
                 tool_parsers = [None] * num_choices
         except Exception as e:
@@ -675,6 +831,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
 
+        last_metrics: dict[str, Any] | None = None
         try:
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
@@ -682,6 +839,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if final_output_type not in first_iteration_dict:
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
+
+                if omni_res.metrics:
+                    last_metrics = omni_res.metrics
 
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
@@ -810,7 +970,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         delta_message: DeltaMessage | None
 
                         # just update previous_texts and previous_token_ids
-                        if tool_choice_auto or self.reasoning_parser:
+                        if tool_choice_auto or reasoning_parser:
                             assert previous_texts is not None
                             assert all_previous_token_ids is not None
                             previous_text = previous_texts[i]
@@ -877,7 +1037,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         # handle streaming deltas for tools with named tool_choice
                         elif tool_choice_function_name:
                             if (
-                                self.reasoning_parser
+                                reasoning_parser
                                 and not reasoning_end_arr[i]
                                 and not reasoning_parser.is_reasoning_end(previous_token_ids)
                             ):
@@ -907,7 +1067,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                         current_text = ""
                             else:
                                 # Just to add remaining `content`
-                                if self.reasoning_parser:
+                                if reasoning_parser:
                                     delta_text = previous_text + delta_text
                                     current_text = ""
 
@@ -943,14 +1103,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             output_token_ids = as_list(output.token_ids)
 
                             if (
-                                self.reasoning_parser is not None
+                                reasoning_parser is not None
                                 and not reasoning_end_arr[i]
                                 and res.prompt_token_ids
                                 and reasoning_parser.is_reasoning_end(res.prompt_token_ids)
                             ):
                                 reasoning_end_arr[i] = True
 
-                            if self.reasoning_parser and not reasoning_end_arr[i]:
+                            if reasoning_parser and not reasoning_end_arr[i]:
                                 delta_message = reasoning_parser.extract_reasoning_streaming(
                                     previous_text,
                                     current_text,
@@ -989,7 +1149,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                         # handle streaming deltas for tools with "auto" tool choice
                         # and reasoning parser
-                        elif tool_choice_auto and self.reasoning_parser:
+                        elif tool_choice_auto and reasoning_parser:
                             assert tool_parser is not None
                             assert reasoning_parser is not None
                             assert added_content_delta_arr is not None
@@ -1070,7 +1230,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 tools_streamed[i] = True
 
                         # when only reasoning
-                        elif self.reasoning_parser:
+                        elif reasoning_parser:
                             delta_message = reasoning_parser.extract_reasoning_streaming(
                                 previous_text,
                                 current_text,
@@ -1084,7 +1244,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             delta_message = DeltaMessage(content=delta_text)
 
                         # update the previous values for the next iteration
-                        if (tool_choice_auto or self.reasoning_parser) and not self.use_harmony:
+                        if (tool_choice_auto or reasoning_parser) and not self.use_harmony:
                             assert previous_texts is not None
                             assert all_previous_token_ids is not None
                             previous_texts[i] = current_text
@@ -1162,11 +1322,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                     latest_delta_len = len(delta_message.tool_calls[0].function.arguments)
 
                                 # get the expected call based on partial JSON
-                                # parsing which "autocompletes" the JSON
-                                expected_call = json.dumps(
-                                    tool_parser.prev_tool_call_arr[index].get("arguments", {}),
-                                    ensure_ascii=False,
-                                )
+                                # parsing which "autocompletes" the JSON.
+                                # Tool parsers (e.g. Qwen3Coder) store
+                                # arguments as a JSON string in
+                                # prev_tool_call_arr. Calling json.dumps()
+                                # on an already-serialized string would
+                                # double-serialize it (e.g. '{"k":1}' becomes
+                                # '"{\\"k\\":1}"'), which then causes the
+                                # replace() below to fail and append the
+                                # entire double-serialized string as a
+                                # spurious final delta.
+                                args = tool_parser.prev_tool_call_arr[index].get("arguments", {})
+                                if isinstance(args, str):
+                                    expected_call = args
+                                else:
+                                    expected_call = json.dumps(args, ensure_ascii=False)
 
                                 # get what we've streamed so far for arguments
                                 # for the current tool
@@ -1220,6 +1390,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices=[choice_data],
                             model=model_name,
                             modality=final_output_type,
+                            metrics=omni_res.metrics,
                         )
 
                         # handle usage stats if requested & if continuous
@@ -1269,13 +1440,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if self.enable_prompt_tokens_details and num_cached_tokens:
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=num_cached_tokens)
 
-                final_usage_chunk = ChatCompletionStreamResponse(
+                final_usage_chunk = OmniChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
                     created=created_time,
                     choices=[],
                     model=model_name,
                     usage=final_usage,
+                    metrics=last_metrics,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_unset=True, exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -1322,7 +1494,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         conversation: list[ConversationMessage],
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
-    ) -> ErrorResponse | ChatCompletionResponse:
+        reasoning_parser: ReasoningParser | None = None,
+    ) -> ErrorResponse | OmniChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
 
@@ -1344,6 +1517,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_logprobs = None
         prompt_token_ids = None
         kv_transfer_params = None
+        response_metrics: dict[str, Any] | None = None
 
         # Build requested modalities set for filtering
         requested_modalities = (
@@ -1367,7 +1541,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     prompt_logprobs,
                     prompt_token_ids,
                     kv_transfer_params,
-                ) = self._create_text_choice(request, omni_outputs, tokenizer, conversation, role)
+                ) = self._create_text_choice(
+                    request,
+                    omni_outputs,
+                    tokenizer,
+                    conversation,
+                    role,
+                    reasoning_parser,
+                )
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
             elif omni_outputs.final_output_type == "image":
@@ -1375,9 +1556,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
+            if omni_outputs.metrics:
+                response_metrics = omni_outputs.metrics
             choices.extend(choices_data)
 
-        response = ChatCompletionResponse(
+        response = OmniChatCompletionResponse(
             id=request_id,
             created=created_time,
             model=model_name,
@@ -1386,6 +1569,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_logprobs=prompt_logprobs,
             prompt_token_ids=prompt_token_ids,
             kv_transfer_params=kv_transfer_params,
+            metrics=response_metrics,
         )
 
         # Log complete response if output logging is enabled
@@ -1427,6 +1611,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         tokenizer: TokenizerLike,
         conversation: list[ConversationMessage],
         role: str,
+        reasoning_parser: ReasoningParser | None = None,
     ):
         final_res = omni_outputs.request_output
         if self.tool_call_id_type == "kimi_k2":
@@ -1454,12 +1639,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning_content, content, _ = parse_chat_output(token_ids)
+                reasoning, content, _ = parse_chat_output(token_ids)
                 if not request.include_reasoning:
-                    reasoning_content = None
+                    reasoning = None
 
                 if self.tool_parser is not None:
-                    tool_parser = self.tool_parser(tokenizer)
+                    tool_parser = self.tool_parser(tokenizer, request.tools)
                     # NOTE: We use token_ids for openai tool parser
                     tool_call_info = tool_parser.extract_tool_calls(
                         "",
@@ -1469,14 +1654,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     content = tool_call_info.content
                     message = ChatMessage(
                         role=role,
-                        reasoning_content=reasoning_content,
+                        reasoning=reasoning,
                         content=content,
                         tool_calls=tool_call_info.tool_calls,
                     )
                 else:
                     message = ChatMessage(
                         role=role,
-                        reasoning_content=reasoning_content,
+                        reasoning=reasoning,
                         content=content,
                     )
 
@@ -1494,26 +1679,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 choices.append(choice_data)
                 continue
 
-            if self.reasoning_parser:
-                try:
-                    chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                        request.chat_template_kwargs,
-                        self.default_chat_template_kwargs,
-                    )
-                    reasoning_parser = self.reasoning_parser(
-                        tokenizer,
-                        chat_template_kwargs=chat_template_kwargs,  # type: ignore
-                    )
-                except RuntimeError as e:
-                    logger.exception("Error in reasoning parser creation.")
-                    return self.create_error_response(e)
+            if reasoning_parser:
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
-                reasoning_content, content = reasoning_parser.extract_reasoning(output.text, request=request)
+                reasoning, content = reasoning_parser.extract_reasoning(output.text, request=request)
                 if not request.include_reasoning:
-                    reasoning_content = None
+                    reasoning = None
             else:
-                reasoning_content = None
+                reasoning = None
                 content = output.text
 
             auto_tools_called = False
@@ -1523,14 +1696,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
                 and request.tool_choice != "required"
             ):
-                message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
+                message = ChatMessage(role=role, reasoning=reasoning, content=content)
 
             # if the request uses tools and specified a tool choice
             elif request.tool_choice and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam:
                 tool_call_class = MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall
                 message = ChatMessage(
                     role=role,
-                    reasoning_content=reasoning_content,
+                    reasoning=reasoning,
                     content="",
                     tool_calls=[
                         tool_call_class(
@@ -1572,13 +1745,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                         for i, tool_call in enumerate(tool_calls)
                     ],
-                    reasoning_content=reasoning_content,
+                    reasoning=reasoning,
                 )
 
             # if the request doesn't use tool choice
             # OR specifies to not use a tool
             elif not request.tool_choice or request.tool_choice == "none":
-                message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
+                message = ChatMessage(role=role, reasoning=reasoning, content=content)
 
             # handle when there are tools and tool choice is auto
             elif (
@@ -1588,7 +1761,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 and self.tool_parser
             ):
                 try:
-                    tool_parser = self.tool_parser(tokenizer)
+                    tool_parser = self.tool_parser(tokenizer, request.tools)
                 except RuntimeError as e:
                     logger.exception("Error in tool parser creation.")
                     return self.create_error_response(e)
@@ -1601,7 +1774,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if tool_call_info.tools_called:
                     message = ChatMessage(
                         role=role,
-                        reasoning_content=reasoning_content,
+                        reasoning=reasoning,
                         content=tool_call_info.content,
                         tool_calls=tool_call_info.tool_calls,
                     )
@@ -1617,7 +1790,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         ret_content = tool_call_info.content
                     message = ChatMessage(
                         role=role,
-                        reasoning_content=reasoning_content,
+                        reasoning=reasoning,
                         content=ret_content,
                     )
 
@@ -1627,7 +1800,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "Error in chat_completion_full_generator - cannot determine if tools should be extracted. "
                     "Returning a standard chat completion."
                 )
-                message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
+                message = ChatMessage(role=role, reasoning=reasoning, content=content)
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
@@ -1679,12 +1852,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
         audio_data = final_res.outputs[0].multimodal_output.get("audio")
-        if stream:
-            audio_tensor = audio_data[-1].float().detach().cpu().numpy()
+        if isinstance(audio_data, list):
+            if stream:
+                audio_tensor = audio_data[-1]
+            else:
+                audio_tensor = torch.cat(audio_data, dim=-1)
         else:
-            if isinstance(audio_data, list):
-                audio_data = torch.cat(audio_data, dim=-1)
-            audio_tensor = audio_data.float().detach().cpu().numpy()
+            audio_tensor = audio_data
+        audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
@@ -1757,6 +1932,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
 
+        # Handle profiling data
+        stage_durations = omni_outputs.stage_durations
+        peak_memory_mb = omni_outputs.peak_memory_mb
+
         # Handle different image output formats
         images = []
 
@@ -1810,6 +1989,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "image_url": {
                         "url": f"data:image/png;base64,{img_base64}",
                     },
+                    "stage_durations": stage_durations,
+                    "peak_memory_mb": peak_memory_mb,
                 }
             )
 
@@ -1846,7 +2027,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return choices
 
     # ==================== Diffusion Mode Methods ====================
-
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -1878,12 +2058,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Extract prompt and images from messages
             prompt, reference_images = self._extract_diffusion_prompt_and_images(messages)
 
-            if not prompt:
-                return self._create_error_response("No text prompt found in messages")
-
             # Extract generation parameters from extra_body (preferred)
             # Reference: text_to_image.py and text_to_video.py for supported parameters
-            extra_body = getattr(request, "extra_body", None) or {}
+            # [NOTE] When sending request via openai client Python library,
+            #   `extra_body` is flattented and merged into the payload's root.
+            #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
+            #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
+            extra_body = getattr(request, "extra_body", None)
+            if not extra_body:
+                extra_body = request.model_extra or {}
 
             # Parse size if provided (supports "1024x1024" format)
             height = extra_body.get("height")
@@ -1897,19 +2080,30 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 except ValueError:
                     logger.warning("Invalid size format: %s", extra_body.get("size"))
 
-            # Get request parameters from extra_body
-            # Text-to-image parameters (ref: text_to_image.py)
-            num_inference_steps = extra_body.get("num_inference_steps", 50)
+            # Get request parameters from extra_body.
+            # Avoid hardcoded defaults here — let each pipeline's forward()
+            # method apply its own model-specific default when the user does
+            # not provide a value.
+            num_inference_steps = extra_body.get("num_inference_steps")
             guidance_scale = extra_body.get("guidance_scale")
-            true_cfg_scale = extra_body.get("true_cfg_scale")  # Qwen-Image specific
+            true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
             seed = extra_body.get("seed")
             negative_prompt = extra_body.get("negative_prompt")
             num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
-            guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
+            guidance_scale_2 = extra_body.get("guidance_scale_2")
             lora_body = extra_body.get("lora")
+
+            # Qwen-Image-Layered parameters
+            layers = extra_body.get("layers")
+            resolution = extra_body.get("resolution")
+
+            try:
+                layers = validate_layered_layers(layers)
+            except ValueError as e:
+                return self._create_error_response(str(e), status_code=400)
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
@@ -1934,50 +2128,36 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "negative_prompt": negative_prompt,
             }
             gen_params = OmniDiffusionSamplingParams(
-                num_inference_steps=num_inference_steps,
                 height=height,
                 width=width,
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
 
+            # Only override defaults when the user explicitly provides values
+            if num_inference_steps is not None:
+                gen_params.num_inference_steps = num_inference_steps
             if guidance_scale is not None:
                 gen_params.guidance_scale = guidance_scale
-
-            # Add Qwen-Image specific parameter
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
-
-            # Add video generation parameters if set
             if num_frames is not None:
                 gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:
                 gen_params.guidance_scale_2 = guidance_scale_2
+            if layers is not None:
+                gen_params.layers = layers
+            if resolution is not None:
+                gen_params.resolution = resolution
 
-            # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
+            # Parse per-request LoRA.
             if lora_body and isinstance(lora_body, dict):
                 try:
-                    lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
-                    lora_path = (
-                        lora_body.get("local_path")
-                        or lora_body.get("path")
-                        or lora_body.get("lora_path")
-                        or lora_body.get("lora_local_path")
-                    )
-                    # using "or" directly here may be buggy if `scale=0`
-                    lora_scale = lora_body.get("scale")
-                    if lora_scale is None:
-                        lora_scale = lora_body.get("lora_scale")
-                    lora_int_id = lora_body.get("int_id")
-                    if lora_int_id is None:
-                        lora_int_id = lora_body.get("lora_int_id")
-                    if lora_int_id is None and lora_path:
-                        lora_int_id = stable_lora_int_id(str(lora_path))
-                    if lora_name and lora_path:
-                        lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+                    lora_req, lora_scale = parse_lora_request(lora_body)
+                    if lora_req is not None:
                         gen_params.lora_request = lora_req
                         if lora_scale is not None:
-                            gen_params.lora_scale = float(lora_scale)
+                            gen_params.lora_scale = lora_scale
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 
@@ -2004,44 +2184,43 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
 
             # Generate image
-            # Handle both AsyncOmniDiffusion (returns OmniRequestOutput) and AsyncOmni (returns AsyncGenerator)
-            if hasattr(self._diffusion_engine, "stage_list"):
-                # AsyncOmni: iterate through async generator to get final output
-                diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
-                result = None
-                async for output in diffusion_engine.generate(
-                    prompt=gen_prompt,
-                    sampling_params_list=[gen_params],  # Pass as single-stage params
-                    request_id=request_id,
-                ):
-                    result = output
-                if result is None:
-                    return self._create_error_response("No output generated from AsyncOmni")
-            else:
-                # AsyncOmniDiffusion: direct call
-                diffusion_engine = cast(AsyncOmniDiffusion, self._diffusion_engine)
-                result = await diffusion_engine.generate(
-                    prompt=gen_prompt,
-                    sampling_params=gen_params,
-                    request_id=request_id,
-                )
+            diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
+            result = None
+            async for output in diffusion_engine.generate(
+                prompt=gen_prompt,
+                sampling_params_list=[gen_params],  # Pass as single-stage params
+                request_id=request_id,
+            ):
+                result = output
+            if result is None:
+                return self._create_error_response("No output generated from AsyncOmni")
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])
+            stage_durations = result.stage_durations
+            peak_memory_mb = result.peak_memory_mb
 
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
-            for img in images:
+            flat_images = []
+            for item in images:
+                if isinstance(item, list):
+                    flat_images.extend(item)
+                else:
+                    flat_images.append(item)
+
+            for img in flat_images:
                 with BytesIO() as buffer:
                     img.save(buffer, format="PNG")
-                    img_bytes = buffer.getvalue()
-                img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                    img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
                 image_contents.append(
                     {
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:image/png;base64,{img_base64}",
                         },
+                        "stage_durations": stage_durations,
+                        "peak_memory_mb": peak_memory_mb,
                     }
                 )
 
