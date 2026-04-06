@@ -184,7 +184,8 @@ def plot_single_summary(
 
 def print_comparison_table(all_results: list[list[dict]], labels: list[str]) -> None:
     """Print a markdown-formatted comparison table."""
-    concurrencies = sorted(set(result["concurrency"] for result in all_results[0]))
+    all_concurrencies = [set(result["concurrency"] for result in results) for results in all_results]
+    concurrencies = sorted(set.union(*all_concurrencies))
 
     print("\n## Benchmark Results\n")
     header = "| Metric | Concurrency |"
