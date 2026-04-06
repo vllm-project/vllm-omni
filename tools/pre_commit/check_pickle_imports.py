@@ -20,6 +20,8 @@ ALLOWED_FILES = {
     "tests/utils.py",
     "vllm_omni/diffusion/distributed/group_coordinator.py",
     "tests/diffusion/attention/test_attention_sp.py",
+    # cloudpickle needed to serialize arbitrary worker_cls types across processes
+    "vllm_omni/entrypoints/omni_llm.py",
 }
 
 PICKLE_RE = re.compile(

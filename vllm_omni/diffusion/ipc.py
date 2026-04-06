@@ -17,7 +17,7 @@ import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
 
-_SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
+_SHM_TENSOR_THRESHOLD = 0  # Always use SHM for CUDA tensor safety
 
 
 def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
@@ -25,19 +25,24 @@ def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
 
     The shared memory segment remains alive after this call (the local fd is
     closed, but the segment persists until ``_tensor_from_shm`` unlinks it).
+
+    BFloat16 and other numpy-incompatible dtypes are stored as raw uint8 bytes
+    and reconstructed using the stored ``torch_dtype``.
     """
     from multiprocessing import shared_memory
 
     import numpy as np
 
+    orig_dtype = tensor.dtype
     tensor = tensor.detach().cpu().contiguous()
-    original_dtype = tensor.dtype
-    # NumPy does not support bfloat16; promote to float32 for the SHM
-    # transfer and record the original dtype so _tensor_from_shm can
-    # convert back.  The round-trip is lossless for bfloat16 values.
-    if original_dtype == torch.bfloat16:
-        tensor = tensor.to(torch.float32)
-    arr = tensor.numpy()
+    # BFloat16 (and some other dtypes) are not natively supported by numpy.
+    # Use a raw uint8 byte view so data can be round-tripped without precision loss.
+    try:
+        arr = tensor.numpy()
+        use_raw_bytes = False
+    except TypeError:
+        arr = tensor.view(torch.uint8).numpy()
+        use_raw_bytes = True
     nbytes = arr.nbytes
     shm = shared_memory.SharedMemory(create=True, size=nbytes)
     shm_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf[:nbytes])
@@ -46,9 +51,10 @@ def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
         "__tensor_shm__": True,
         "name": shm.name,
         "shape": list(tensor.shape),
-        "torch_dtype": str(original_dtype),
+        "torch_dtype": str(orig_dtype),
         "numpy_dtype": str(arr.dtype),
         "nbytes": nbytes,
+        "raw_bytes": use_raw_bytes,
     }
     shm.close()
     return handle
@@ -63,19 +69,22 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     shm = shared_memory.SharedMemory(name=handle["name"])
     try:
         np_dtype = np.dtype(handle["numpy_dtype"])
-        arr = np.ndarray(handle["shape"], dtype=np_dtype, buffer=shm.buf[: handle["nbytes"]])
-        tensor = torch.from_numpy(arr.copy())
-        # Restore the original dtype if it differs from the numpy-compatible
-        # dtype used for the SHM transfer (e.g. bfloat16 → float32 → bfloat16).
-        torch_dtype_str = handle.get("torch_dtype", "")
-        if torch_dtype_str:
-            original_dtype = getattr(torch, torch_dtype_str.replace("torch.", ""), None)
-            if original_dtype is not None and tensor.dtype != original_dtype:
-                tensor = tensor.to(original_dtype)
+        if handle.get("raw_bytes"):
+            # Data was stored as raw uint8 bytes (e.g. BFloat16 round-trip).
+            byte_arr = np.ndarray(handle["nbytes"], dtype=np.uint8, buffer=shm.buf[: handle["nbytes"]])
+            raw = torch.from_numpy(byte_arr.copy())
+        else:
+            arr = np.ndarray(handle["shape"], dtype=np_dtype, buffer=shm.buf[: handle["nbytes"]])
+            raw = torch.from_numpy(arr.copy())
     finally:
         shm.close()
         shm.unlink()
-    return tensor
+    # Restore the original torch dtype (handles BF16 raw-byte round-trip).
+    torch_dtype_str = handle["torch_dtype"].replace("torch.", "")
+    torch_dtype = getattr(torch, torch_dtype_str)
+    if raw.dtype != torch_dtype or handle.get("raw_bytes"):
+        raw = raw.view(torch_dtype).reshape(handle["shape"])
+    return raw
 
 
 def _pack_tensor_if_large(val: torch.Tensor) -> torch.Tensor | dict:

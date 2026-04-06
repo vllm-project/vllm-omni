@@ -28,6 +28,8 @@ class OmniDiffusionRequest:
     request_ids: list[str] = field(default_factory=list)
     request_id: str | None = None
     kv_sender_info: dict | None = None
+    # Additional data from stage input processors (e.g. vision_tokens, audio_tokens)
+    extra: dict = field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

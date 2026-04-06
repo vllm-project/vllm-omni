@@ -1,0 +1,102 @@
+runtime:
+  connectors:
+    shared_memory_connector:
+      extra:
+        shm_threshold_bytes: 65536
+      name: SharedMemoryConnector
+  defaults:
+    max_inflight: 8
+    window_size: -1
+  edges:
+  - from: 0
+    to: 1
+    window_size: -1
+  - from: 0
+    to: 2
+    window_size: -1
+  - from: 1
+    to: 2
+    window_size: -1
+  enabled: true
+stage_args:
+- default_sampling_params:
+    detokenize: true
+    max_tokens: 2048
+    repetition_penalty: 1.0
+    seed: 42
+    temperature: 0.1
+    top_k: -1
+    top_p: 1.0
+  engine_args:
+    enable_prefix_caching: false
+    enforce_eager: true
+    engine_output_type: latent
+    gpu_memory_utilization: 0.15
+    limit_mm_per_prompt:
+      audio: 1
+      image: 1
+    max_model_len: 8192
+    max_num_seqs: 8
+    model_arch: HCXVisionV2ForCausalLM
+    model_stage: thinker
+    scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+    tensor_parallel_size: 4
+    trust_remote_code: true
+    worker_type: ar
+  final_output: true
+  final_output_type: text
+  is_comprehension: true
+  runtime:
+    devices: 0,1,2,3
+    max_batch_size: 8
+    process: true
+  stage_id: 0
+  stage_type: llm
+- custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2vision_decoder
+  default_sampling_params:
+    guidance_scale: 0.0
+    height: 768
+    num_inference_steps: 50
+    seed: 42
+    width: 768
+  engine_args:
+    distributed_executor_backend: mp
+    enforce_eager: true
+    engine_output_type: image
+    gpu_memory_utilization: 0.75
+    model_class_name: HyperCLOVAXVisionPipeline
+    model_stage: decoder/vision
+    model_subdir: decoder/vision
+    trust_remote_code: true
+  engine_input_source:
+  - 0
+  final_output: true
+  final_output_type: image
+  runtime:
+    devices: '4'
+    max_batch_size: 1
+    process: true
+  stage_id: 1
+  stage_type: diffusion
+- custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2audio_decoder
+  default_sampling_params:
+    seed: 42
+  engine_args:
+    distributed_executor_backend: mp
+    enforce_eager: true
+    engine_output_type: audio
+    gpu_memory_utilization: 0.4
+    model_class_name: HyperCLOVAXAudioPipeline
+    model_stage: decoder/audio
+    model_subdir: decoder/audio/NCZSCosybigvganDecoder.mar
+    trust_remote_code: true
+  engine_input_source:
+  - 0
+  final_output: true
+  final_output_type: audio
+  runtime:
+    devices: '5'
+    max_batch_size: 1
+    process: true
+  stage_id: 2
+  stage_type: diffusion
