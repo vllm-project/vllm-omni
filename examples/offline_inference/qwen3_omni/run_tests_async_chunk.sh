@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Qwen3-Omni end2end_async_chunk 功能测试脚本
-# 使用默认内置素材，遍历 AsyncOmni 支持的 query-type × output-modalities 组合
+# Qwen3-Omni end2end_async_chunk functional test script
+# Uses default built-in assets, iterates over AsyncOmni query-type x output-modalities combinations
 # =============================================================================
 
 set -euo pipefail
 
 export VLLM_OMNI_USE_V2_RUNNER=1
 
-MODEL_PATH="/workspace/fattysand/models/Qwen3-Omni-30B-A3B-Instruct"
+MODEL_PATH="/models/Qwen3-Omni-30B-A3B-Instruct"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 END2END="$SCRIPT_DIR/end2end_async_chunk.py"
 STAGE_CONFIGS="$SCRIPT_DIR/../../../vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml"
@@ -52,7 +52,7 @@ run_test() {
         local elapsed=$((end_time - start_time))
         echo "  => FAIL (exit code: ${exit_code}, ${elapsed}s)"
         echo "[FAIL] ${name} (exit code: ${exit_code}, ${elapsed}s)" >> "$SUMMARY_FILE"
-        # 记录最后 30 行错误信息到 summary
+        # Append last 30 lines of log to summary
         echo "  --- last 30 lines of log ---" >> "$SUMMARY_FILE"
         tail -n 30 "$log_file" >> "$SUMMARY_FILE"
         echo "  --- end ---" >> "$SUMMARY_FILE"
@@ -62,10 +62,10 @@ run_test() {
 }
 
 # =============================================================================
-# 测试用例
+# Test cases
 # =============================================================================
 
-# --- 1. 纯文本输入 ---
+# --- 1. Text-only input ---
 run_test "text_to_text" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type text --modalities text
@@ -78,7 +78,7 @@ run_test "text_to_audio" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type text --modalities audio
 
-# --- 2. 图片输入 ---
+# --- 2. Image input ---
 run_test "image_to_text" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type use_image --modalities text
@@ -87,7 +87,7 @@ run_test "image_to_text_audio" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type use_image --modalities text,audio
 
-# --- 3. 音频输入 ---
+# --- 3. Audio input ---
 run_test "audio_to_text" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type use_audio --modalities text
@@ -96,7 +96,7 @@ run_test "audio_to_text_audio" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type use_audio --modalities text,audio
 
-# --- 4. 视频输入 ---
+# --- 4. Video input ---
 run_test "video_to_text" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type use_video --modalities text
@@ -105,39 +105,39 @@ run_test "video_to_text_audio" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type use_video --modalities text,audio
 
-# --- 5. 多 prompt 批量推理 ---
+# --- 5. Multi-prompt batch inference ---
 run_test "text_to_text_batch3" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type text --modalities text --num-prompts 3
 
-# --- 6. 并发请求 (max-in-flight) ---
+# --- 6. Concurrent requests (max-in-flight) ---
 run_test "text_to_text_audio_concurrent2" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type text --modalities text,audio --num-prompts 2 --max-in-flight 2
 
-# --- 7. stream-audio-to-disk 模式 ---
+# --- 7. stream-audio-to-disk mode ---
 run_test "audio_to_text_audio_stream" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type use_audio --modalities text,audio --stream-audio-to-disk
 
-# --- 8. request-timeout 测试 (给足够长的超时，应该 PASS) ---
+# --- 8. request-timeout test (long enough timeout, should PASS) ---
 run_test "text_to_text_with_timeout" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type text --modalities text --request-timeout-s 600
 
-# --- 9. batch-timeout 测试 (给足够长的超时，应该 PASS) ---
+# --- 9. batch-timeout test (long enough timeout, should PASS) ---
 run_test "text_to_text_audio_batch_timeout" \
     --model "$MODEL_PATH" --stage-configs-path "$STAGE_CONFIGS" \
     --query-type text --modalities text,audio --batch-timeout-s 600
 
 # =============================================================================
-# 汇总
+# Summary
 # =============================================================================
 echo "========================================" | tee -a "$SUMMARY_FILE"
-echo "测试完成: 共 ${TOTAL} 项, 通过 ${PASS} 项, 失败 ${FAIL} 项" | tee -a "$SUMMARY_FILE"
+echo "Tests done: total ${TOTAL}, passed ${PASS}, failed ${FAIL}" | tee -a "$SUMMARY_FILE"
 echo "========================================" | tee -a "$SUMMARY_FILE"
 echo ""
-echo "详细日志目录: $LOG_DIR"
-echo "汇总报告: $SUMMARY_FILE"
+echo "Detailed logs: $LOG_DIR"
+echo "Summary report: $SUMMARY_FILE"
 
 exit $FAIL

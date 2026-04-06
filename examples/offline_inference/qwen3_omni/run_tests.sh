@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Qwen3-Omni end2end 功能测试脚本
-# 使用默认内置素材，遍历各种 query-type × output-modalities 组合
+# Qwen3-Omni end2end functional test script
+# Uses default built-in assets, iterates over query-type x output-modalities combinations
 # =============================================================================
 
 set -euo pipefail
 
 export VLLM_OMNI_USE_V2_RUNNER=1
 
-MODEL_PATH="/workspace/fattysand/models/Qwen3-Omni-30B-A3B-Instruct"
+MODEL_PATH="/models/Qwen3-Omni-30B-A3B-Instruct"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 END2END="$SCRIPT_DIR/end2end.py"
 LOG_DIR="$SCRIPT_DIR/test_logs"
@@ -51,7 +51,7 @@ run_test() {
         local elapsed=$((end_time - start_time))
         echo "  => FAIL (exit code: ${exit_code}, ${elapsed}s)"
         echo "[FAIL] ${name} (exit code: ${exit_code}, ${elapsed}s)" >> "$SUMMARY_FILE"
-        # 记录最后 30 行错误信息到 summary
+        # Append last 30 lines of log to summary
         echo "  --- last 30 lines of log ---" >> "$SUMMARY_FILE"
         tail -n 30 "$log_file" >> "$SUMMARY_FILE"
         echo "  --- end ---" >> "$SUMMARY_FILE"
@@ -61,10 +61,10 @@ run_test() {
 }
 
 # =============================================================================
-# 测试用例
+# Test cases
 # =============================================================================
 
-# --- 1. 纯文本输入 ---
+# --- 1. Text-only input ---
 run_test "text_to_text" \
     --model "$MODEL_PATH" --query-type text --modalities text
 
@@ -74,67 +74,67 @@ run_test "text_to_text_audio" \
 run_test "text_to_audio" \
     --model "$MODEL_PATH" --query-type text --modalities audio
 
-# --- 2. 图片输入 ---
+# --- 2. Image input ---
 run_test "image_to_text" \
     --model "$MODEL_PATH" --query-type use_image --modalities text
 
 run_test "image_to_text_audio" \
     --model "$MODEL_PATH" --query-type use_image --modalities text,audio
 
-# --- 3. 音频输入 ---
+# --- 3. Audio input ---
 run_test "audio_to_text" \
     --model "$MODEL_PATH" --query-type use_audio --modalities text
 
 run_test "audio_to_text_audio" \
     --model "$MODEL_PATH" --query-type use_audio --modalities text,audio
 
-# --- 4. 视频输入 ---
+# --- 4. Video input ---
 run_test "video_to_text" \
     --model "$MODEL_PATH" --query-type use_video --modalities text
 
 run_test "video_to_text_audio" \
     --model "$MODEL_PATH" --query-type use_video --modalities text,audio
 
-# --- 5. 多音频输入 ---
+# --- 5. Multi-audio input ---
 run_test "multi_audios_to_text" \
     --model "$MODEL_PATH" --query-type use_multi_audios --modalities text
 
 run_test "multi_audios_to_text_audio" \
     --model "$MODEL_PATH" --query-type use_multi_audios --modalities text,audio
 
-# --- 6. 混合模态输入 (音频+图片+视频) ---
+# --- 6. Mixed modality input (audio+image+video) ---
 run_test "mixed_to_text" \
     --model "$MODEL_PATH" --query-type use_mixed_modalities --modalities text
 
 run_test "mixed_to_text_audio" \
     --model "$MODEL_PATH" --query-type use_mixed_modalities --modalities text,audio
 
-# --- 7. 视频中使用音频 ---
+# --- 7. Audio from video ---
 run_test "audio_in_video_to_text" \
     --model "$MODEL_PATH" --query-type use_audio_in_video --modalities text
 
 run_test "audio_in_video_to_text_audio" \
     --model "$MODEL_PATH" --query-type use_audio_in_video --modalities text,audio
 
-# --- 8. py-generator 模式 ---
+# --- 8. py-generator mode ---
 run_test "text_to_text_generator" \
     --model "$MODEL_PATH" --query-type text --modalities text --py-generator
 
 run_test "audio_to_text_audio_generator" \
     --model "$MODEL_PATH" --query-type use_audio --modalities text,audio --py-generator
 
-# --- 9. 多 prompt 批量推理 ---
+# --- 9. Multi-prompt batch inference ---
 run_test "text_to_text_batch3" \
     --model "$MODEL_PATH" --query-type text --modalities text --num-prompts 3
 
 # =============================================================================
-# 汇总
+# Summary
 # =============================================================================
 echo "========================================" | tee -a "$SUMMARY_FILE"
-echo "测试完成: 共 ${TOTAL} 项, 通过 ${PASS} 项, 失败 ${FAIL} 项" | tee -a "$SUMMARY_FILE"
+echo "Tests done: total ${TOTAL}, passed ${PASS}, failed ${FAIL}" | tee -a "$SUMMARY_FILE"
 echo "========================================" | tee -a "$SUMMARY_FILE"
 echo ""
-echo "详细日志目录: $LOG_DIR"
-echo "汇总报告: $SUMMARY_FILE"
+echo "Detailed logs: $LOG_DIR"
+echo "Summary report: $SUMMARY_FILE"
 
 exit $FAIL
