@@ -756,7 +756,7 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
     final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     file_name = final["file_name"]
     assert file_name is not None
-    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, file_name)
+    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
     assert os.path.exists(file_path)
 
     delete_resp = test_client.delete(f"/v1/videos/{video_id}")
@@ -765,6 +765,30 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
     assert delete_resp.json()["deleted"] is True
     assert delete_resp.json()["object"] == "video.deleted"
     assert not os.path.exists(file_path)
+
+
+def test_download_completed_job_uses_storage_open_and_download_name(test_client, mocker: MockerFixture):
+    video_bytes = b"stored-video-data"
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value=base64.b64encode(video_bytes).decode("utf-8"),
+    )
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Download this video"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+
+    final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    file_name = final["file_name"]
+    assert file_name == f"{video_id}.mp4"
+
+    storage_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    assert os.path.exists(storage_path)
+
+    response = test_client.get(f"/v1/videos/{video_id}/content")
+    assert response.status_code == 200
+    assert response.content == video_bytes
+    assert response.headers["content-type"] == "video/mp4"
+    assert file_name in response.headers["content-disposition"]
 
 
 def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):

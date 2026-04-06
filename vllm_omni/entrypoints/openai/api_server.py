@@ -112,7 +112,7 @@ from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle, SaveContext
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
@@ -308,6 +308,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         app.include_router(router)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        # Start background processes
+        STORAGE_MANAGER.start()
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -2070,12 +2073,11 @@ def video_response_from_request(model_name: str, req: VideoGenerationRequest) ->
     return resp
 
 
-def _cleanup_video(video_id: str, output_path: str | None):
+async def _cleanup_video(video_id: str):
     try:
-        if output_path is not None:
-            os.remove(output_path)
+        await STORAGE_MANAGER.delete(video_id)
     except OSError:
-        logger.warning("Failed to cleanup partial video file '%s' for id=%s", output_path, video_id)
+        logger.warning("Failed to cleanup partial video file '%s'", video_id)
 
 
 async def _run_video_generation_job(
@@ -2091,32 +2093,31 @@ async def _run_video_generation_job(
 
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
-    output_path = None
     try:
         video_bytes, stage_durations, peak_memory_mb = await handler.generate_video_bytes(
             request, video_id, reference_image=reference_image
         )
 
-        file_name = f"{video_id}.{job.file_extension}"
-        output_path = await STORAGE_MANAGER.save(video_bytes, file_name)
-        logger.info("Video request %s persisted %s output file.", video_id, output_path)
+        save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
+        logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
-        await VIDEO_STORE.update_fields(
-            video_id,
-            {
-                "status": VideoGenerationStatus.COMPLETED,
-                "progress": 100,
-                "file_name": file_name,
-                "completed_at": int(time.time()),
-                "inference_time_s": time.perf_counter() - started_at,
-                "stage_durations": stage_durations,
-                "peak_memory_mb": peak_memory_mb,
-            },
-        )
+        updated_fields = {
+            "status": VideoGenerationStatus.COMPLETED,
+            "progress": 100,
+            "file_name": f"{video_id}.{job.file_extension}",
+            "completed_at": save_context.created_at,
+            "inference_time_s": time.perf_counter() - started_at,
+            "stage_durations": stage_durations,
+            "peak_memory_mb": peak_memory_mb,
+        }
+        if save_context.expires_at is not None:
+            updated_fields["expires_at"] = save_context.expires_at
+
+        await VIDEO_STORE.update_fields(video_id, updated_fields)
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
 
-        _cleanup_video(video_id, output_path)
+        await _cleanup_video(video_id)
         # TODO: It would be better to have a finite collection of errors to return rather than the exception name
         await VIDEO_STORE.update_fields(
             video_id,
@@ -2128,7 +2129,7 @@ async def _run_video_generation_job(
             },
         )
     except asyncio.CancelledError:
-        _cleanup_video(video_id, output_path)
+        await _cleanup_video(video_id)
         await VIDEO_STORE.pop(video_id)
         raise
 
@@ -2417,7 +2418,7 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     elif job.status is VideoGenerationStatus.FAILED:
         if job.file_name is not None:
             try:
-                await STORAGE_MANAGER.delete(job.file_name)
+                await STORAGE_MANAGER.delete(video_id)
             except Exception:
                 logger.warning("Failed to delete stored artifact for failed video job %s", video_id, exc_info=True)
 
@@ -2427,13 +2428,13 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     if job.file_name is None:
         raise HTTPException(status_code=409, detail="Video output not yet available. Please try again later.")
 
-    await STORAGE_MANAGER.delete(job.file_name)
+    await STORAGE_MANAGER.delete(video_id)
     await VIDEO_STORE.pop(video_id)
     return VideoDeleteResponse(id=job.id, deleted=True)
 
 
 @router.get("/v1/videos/{video_id}/content")
-async def download_video(video_id: str) -> FileResponse:
+async def download_video(video_id: str) -> Response:
     """Download the generated file for a completed video job.
 
     Args:
@@ -2456,11 +2457,19 @@ async def download_video(video_id: str) -> FileResponse:
     if not job.file_name:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
-    full_path = STORAGE_MANAGER.get_full_file_path(job.file_name)
-    if not os.path.exists(full_path):
+    file_handle = await STORAGE_MANAGER.open(video_id)
+    if file_handle is None:
         raise HTTPException(status_code=404, detail="Generated video file not found on disk")
 
-    return FileResponse(path=full_path, media_type=job.media_type, filename=job.file_name)
+    file_name = job.file_name or f"{video_id}.{job.file_extension}"
+    if isinstance(file_handle, FileStorageHandle):
+        response = FileResponse(path=file_handle.path, media_type=job.media_type, filename=file_name)
+    else:
+        raise HTTPException(
+            status_code=500, detail=f"Server generated an unsupported file storage handl for file id {video_id}"
+        )
+
+    return response
 
 
 @profiler_router.post("/start_profile")
