@@ -273,7 +273,11 @@ def resolve_model_config_path(model: str) -> str:
     return str(stage_config_path)
 
 
-def load_stage_configs_from_model(model: str, base_engine_args: dict | None = None) -> list:
+def load_stage_configs_from_model(
+    model: str,
+    base_engine_args: dict | None = None,
+    user_overrides: dict | None = None,
+) -> list:
     """Load stage configurations from model's default config file.
 
     .. deprecated::
@@ -287,6 +291,9 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict | None = No
 
     Args:
         model: Model name or path (used to determine model_type)
+        base_engine_args: Base engine arguments (CLI args + defaults)
+        user_overrides: Explicitly user-specified args that must take precedence
+            over YAML per-stage engine_args defaults
 
     Returns:
         List of stage configuration dictionaries
@@ -299,11 +306,19 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict | None = No
     stage_config_path = resolve_model_config_path(model)
     if stage_config_path is None:
         return []
-    stage_configs = load_stage_configs_from_yaml(config_path=stage_config_path, base_engine_args=base_engine_args)
+    stage_configs = load_stage_configs_from_yaml(
+        config_path=stage_config_path,
+        base_engine_args=base_engine_args,
+        user_overrides=user_overrides,
+    )
     return stage_configs
 
 
-def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None = None) -> list:
+def load_stage_configs_from_yaml(
+    config_path: str,
+    base_engine_args: dict | None = None,
+    user_overrides: dict | None = None,
+) -> list:
     """Load stage configurations from a YAML file.
 
     .. deprecated::
@@ -311,6 +326,9 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
 
     Args:
         config_path: Path to the YAML configuration file
+        base_engine_args: Base engine arguments (CLI args + defaults)
+        user_overrides: Explicitly user-specified args that must take precedence
+            over YAML per-stage engine_args defaults (e.g. --gpu-memory-utilization)
 
     Returns:
         List of stage configuration dictionaries from the file's stage_args
@@ -325,12 +343,24 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     base_engine_args = create_config(base_engine_args)
     for stage_arg in stage_args:
         base_engine_args_tmp = base_engine_args.copy()
-        # Update base_engine_args with stage-specific engine_args if they exist
+        # Update base_engine_args with stage-specific engine_args if they exist.
+        # NOTE: merge_configs gives YAML stage engine_args priority over base CLI args.
+        # user_overrides are re-applied below to ensure explicit CLI flags (e.g.
+        # --gpu-memory-utilization) are not silently ignored by YAML stage defaults.
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
             base_engine_args_tmp = create_config(merge_configs(base_engine_args_tmp, stage_arg.engine_args))
         stage_type = getattr(stage_arg, "stage_type", "llm")
         if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
             base_engine_args_tmp.async_chunk = global_async_chunk
+        # Re-apply user-specified overrides so explicit CLI flags take precedence
+        # over YAML per-stage engine_args (e.g. --gpu-memory-utilization 0.2 must
+        # override the YAML default even if the YAML hardcodes a different value).
+        if user_overrides:
+            for key, value in user_overrides.items():
+                try:
+                    base_engine_args_tmp[key] = value
+                except Exception:
+                    pass
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
 
@@ -434,6 +464,7 @@ def load_and_resolve_stage_configs(
     stage_configs_path: str | None,
     kwargs: dict | None,
     default_stage_cfg_factory: Any = None,
+    user_overrides: dict | None = None,
 ) -> tuple[str, list]:
     """Load stage configurations from model or YAML file with fallback to defaults.
 
@@ -443,13 +474,19 @@ def load_and_resolve_stage_configs(
         kwargs: Engine arguments to merge with stage configs
         default_stage_cfg_factory: Optional callable that takes no args and returns
             default stage config list when no configs are found
+        user_overrides: Explicitly user-specified args that must take precedence
+            over YAML per-stage engine_args defaults (e.g. --gpu-memory-utilization)
 
     Returns:
         Tuple of (config_path, stage_configs)
     """
     if stage_configs_path is None:
         config_path = resolve_model_config_path(model)
-        stage_configs = load_stage_configs_from_model(model, base_engine_args=kwargs)
+        stage_configs = load_stage_configs_from_model(
+            model,
+            base_engine_args=kwargs,
+            user_overrides=user_overrides,
+        )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
@@ -458,7 +495,11 @@ def load_and_resolve_stage_configs(
                 stage_configs = []
     else:
         config_path = stage_configs_path
-        stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
+        stage_configs = load_stage_configs_from_yaml(
+            stage_configs_path,
+            base_engine_args=kwargs,
+            user_overrides=user_overrides,
+        )
 
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
     logger.debug(f"stage_configs: {stage_configs}")

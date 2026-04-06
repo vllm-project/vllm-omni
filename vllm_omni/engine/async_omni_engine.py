@@ -941,12 +941,28 @@ class AsyncOmniEngine:
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
 
+        # Compute user-specified overrides by comparing kwargs against OmniEngineArgs defaults.
+        # YAML per-stage engine_args are merged with lower priority than these overrides,
+        # so explicit CLI flags like --gpu-memory-utilization are not silently ignored.
+        user_overrides: dict[str, Any] = {}
+        try:
+            from vllm_omni.engine.arg_utils import OmniEngineArgs
+
+            _default = OmniEngineArgs(model=model)
+            for f in dataclasses.fields(_default):
+                key = f.name
+                if key in kwargs and kwargs[key] != getattr(_default, key, None):
+                    user_overrides[key] = kwargs[key]
+        except Exception:
+            pass
+
         # Use the legacy config loading path (load_and_resolve_stage_configs).
         # StageConfigFactory wiring will be done in config refactor [2/N].
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
             kwargs,
+            user_overrides=user_overrides,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
         )
 
