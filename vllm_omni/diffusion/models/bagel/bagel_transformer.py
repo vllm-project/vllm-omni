@@ -944,26 +944,27 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            original_name = name
+            loaded = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict.get(name)
+                stacked_name = name.replace(weight_name, param_name)
+                param = params_dict.get(stacked_name)
                 if param is None:
-                    # Fused param doesn't exist (e.g. gate_up_proj on DiT);
-                    # restore original name and fall through to non-stacked path.
-                    name = original_name
                     break
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                name = stacked_name
+                loaded = True
                 break
-            else:
+
+            if not loaded:
                 param = params_dict.get(name)
                 if param is None:
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
 
         return loaded_params
