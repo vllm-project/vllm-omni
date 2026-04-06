@@ -407,6 +407,22 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
     the DiT's denoising loop.
     """
 
+    # LoRA packed→sublayer mapping for both standard Qwen2 projections
+    # and the MoE generation-mode projections added by _install_mot_modules().
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv_proj_moe_gen": [
+            "q_proj_moe_gen",
+            "k_proj_moe_gen",
+            "v_proj_moe_gen",
+        ],
+        "mlp_moe_gen.gate_up_proj": [
+            "mlp_moe_gen.gate_proj",
+            "mlp_moe_gen.up_proj",
+        ],
+    }
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_config
