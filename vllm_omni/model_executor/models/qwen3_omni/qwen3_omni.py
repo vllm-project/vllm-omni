@@ -344,7 +344,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # inside forward so the runner stays model-agnostic.
             seq_token_counts: list[int] | None = kwargs.get("seq_token_counts")
             buffer_list: list[dict] | None = kwargs.get("model_intermediate_buffer")
-            if seq_token_counts is not None and buffer_list is not None:
+            if seq_token_counts is not None and buffer_list is not None and hasattr(self, '_talker_v2_preprocess_and_mtp'):
                 input_ids, inputs_embeds = self._talker_v2_preprocess_and_mtp(
                     input_ids,
                     inputs_embeds,

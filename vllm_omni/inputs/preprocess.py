@@ -1,10 +1,10 @@
 from typing import Any
 
 from typing_extensions import assert_never
-from vllm.inputs.data import EmbedsInputs, SingletonInputs
+from vllm.inputs import EmbedsInput as EmbedsInputs, SingletonInput as SingletonInputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
-from vllm.multimodal.inputs import MultiModalInputs
+from vllm.inputs import MultiModalInput as MultiModalInputs
 from vllm.renderers.inputs import SingletonDictPrompt
 
 from vllm_omni.inputs.data import (

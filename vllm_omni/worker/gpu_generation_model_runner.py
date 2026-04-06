@@ -636,13 +636,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]  # type: ignore[assignment]
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
-                self.seq_lens.np[:num_reqs] = seq_lens
-                self.seq_lens.np[num_reqs:] = 0
-                self.seq_lens.copy_to_gpu()
+                self.seq_lens[:num_reqs] = seq_lens
+                self.seq_lens[num_reqs:] = 0
 
                 cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
-                self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-                self.query_start_loc.copy_to_gpu()
+                self.query_start_loc[1 : num_reqs + 1] = cum_num_tokens
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
