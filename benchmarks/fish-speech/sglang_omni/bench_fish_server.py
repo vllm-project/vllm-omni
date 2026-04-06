@@ -63,9 +63,7 @@ def create_payload(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Fish Speech S2 Pro Benchmark (sglang-omni)"
-    )
+    parser = argparse.ArgumentParser(description="Fish Speech S2 Pro Benchmark (sglang-omni)")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-prompts", type=int, default=50)

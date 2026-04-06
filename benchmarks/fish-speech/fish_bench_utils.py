@@ -11,10 +11,10 @@ import asyncio
 import base64
 import json
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 import aiohttp
 import numpy as np
@@ -341,9 +341,7 @@ async def send_streaming_request(
 
                 result.e2e = time.perf_counter() - st
                 result.audio_bytes = total_bytes
-                result.audio_duration = pcm_bytes_to_duration(
-                    total_bytes, sample_rate, sample_width
-                )
+                result.audio_duration = pcm_bytes_to_duration(total_bytes, sample_rate, sample_width)
 
                 if total_bytes <= 0 or result.ttfp <= 0:
                     result.error = "HTTP 200 but no audio bytes were received"
@@ -428,10 +426,7 @@ async def run_benchmark(
         request_prompts = [PROMPTS[i % len(PROMPTS)] for i in range(num_prompts)]
 
         # Run
-        print(
-            f"  Running {num_prompts} requests "
-            f"with concurrency={max_concurrency}..."
-        )
+        print(f"  Running {num_prompts} requests with concurrency={max_concurrency}...")
         semaphore = asyncio.Semaphore(max_concurrency)
         pbar = tqdm(total=num_prompts, desc=f"  concurrency={max_concurrency}")
 

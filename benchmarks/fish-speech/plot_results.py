@@ -8,7 +8,9 @@ Generates comparison bar charts for:
 Usage:
     # Compare two configs
     python benchmarks/fish-speech/plot_results.py \
-        --results benchmarks/fish-speech/results/bench_vllm_omni_*.json benchmarks/fish-speech/results/bench_sglang_omni_*.json \
+        --results \
+            benchmarks/fish-speech/results/bench_vllm_omni_*.json \
+            benchmarks/fish-speech/results/bench_sglang_omni_*.json \
         --labels "vllm-omni" "sglang-omni" \
         --output benchmarks/fish-speech/results/comparison.png
 
