@@ -41,6 +41,7 @@ from .hunyuan_image_3_transformer import (
     build_batch_2d_rope,
     real_batched_index_select,
 )
+from .system_prompt import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -991,10 +992,15 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         width: int = 1024,
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
-        system_prompt: str | None = None,
         generator: torch.Generator | list[torch.Generator] | None = None,
         **kwargs,
     ) -> DiffusionOutput:
+        extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
+        use_system_prompt = extra_args.get("use_system_prompt")
+        system_prompt = extra_args.get("system_prompt")
+        if use_system_prompt is not None:
+            system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
+            system_prompt = system_prompt.strip() if system_prompt is not None else ""
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         generator = req.sampling_params.generator or generator
         height = req.sampling_params.height or height
