@@ -4,6 +4,8 @@ Benchmarks for Fish Speech S2 Pro text-to-speech model, comparing vLLM-Omni stre
 
 Related issue: [#2432](https://github.com/vllm-project/vllm-omni/issues/2432)
 
+Hardware note: the benchmark results collected in this directory were measured on NVIDIA H100 PCIe GPUs. Fish Audio's S2 Pro technical report reports its official numbers on H200, so absolute latency/RTF numbers should not be compared directly without accounting for the hardware difference.
+
 ## Prerequisites
 
 ```bash
@@ -117,8 +119,11 @@ This benchmark vendors both serving configs under `benchmarks/fish-speech/config
 
 - `benchmarks/fish-speech/config/vllm_omni/fish_speech_s2_pro.yaml`
 - `benchmarks/fish-speech/config/sglang_omni/s2pro_tts.yaml`
+- `benchmarks/fish-speech/config/sglang_omni/test_s2pro.yaml`
 
 The default vllm-omni config is a 2-stage pipeline (Slow AR -> DAC Decoder) with `async_chunk` streaming enabled, `max_num_seqs: 4` for the AR stage and `max_num_seqs: 1` for the DAC decoder. The `SharedMemoryConnector` streams codec frames (25-frame chunks with 25-frame context overlap, ~21.5 Hz codec rate).
+
+For sglang-omni, `test_s2pro.yaml` mirrors the upstream minimal config at `examples/configs/s2pro_tts.yaml`. The benchmark config `s2pro_tts.yaml` expands that minimal config into an explicit stage layout. In upstream `sglang-omni`, `stream_vocoder_device` is not set in the minimal YAML, but `create_sglang_tts_engine_executor(...)` defaults it to `cpu` when omitted, so the explicit CPU setting in the benchmark config reflects the upstream default behavior rather than introducing a benchmark-only override.
 
 To use a custom vllm-omni config, start the server with:
 ```bash
