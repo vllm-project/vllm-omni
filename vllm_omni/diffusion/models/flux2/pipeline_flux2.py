@@ -1062,11 +1062,7 @@ class Flux2Pipeline(nn.Module, SupportImageInput, ProgressBarMixin, DiffusionPip
                 noise_pred = noise_pred[:, : latents.size(1) :]
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-                if latents.dtype != latents_dtype and torch.backends.mps.is_available():
-                    latents = latents.to(latents_dtype)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
