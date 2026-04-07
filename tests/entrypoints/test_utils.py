@@ -322,3 +322,16 @@ class TestLoadAndResolveStageConfigs:
         assert config_path is None
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
+
+    def test_load_and_resolve_with_distributed_executor_backend(self):
+        """Ensure executor backend survives default stage creation."""
+        kwargs = {"distributed_executor_backend": "ray"}
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model="black-forest-labs/FLUX.2-klein-4B",
+            stage_configs_path=None,
+            kwargs=kwargs,
+            default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
+        )
+        assert config_path is None
+        assert len(stage_configs) == 1
+        assert stage_configs[0]["engine_args"]["distributed_executor_backend"] == "ray"

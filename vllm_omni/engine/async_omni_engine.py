@@ -954,6 +954,11 @@ class AsyncOmniEngine:
         # Only set dtype if it was already explicitly passed and normalized
         if "dtype" in normalized_kwargs:
             stage_engine_args["dtype"] = normalized_kwargs["dtype"]
+        if (
+            "distributed_executor_backend" in normalized_kwargs
+            and normalized_kwargs["distributed_executor_backend"] is not None
+        ):
+            stage_engine_args["distributed_executor_backend"] = normalized_kwargs["distributed_executor_backend"]
 
         default_stage_cfg = [
             {
