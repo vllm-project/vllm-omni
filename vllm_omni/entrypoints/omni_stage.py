@@ -977,11 +977,20 @@ def _stage_worker(
             if stage_type == "diffusion":
                 stage_engine = cast(OmniDiffusion, stage_engine)
                 batch_engine_sampling_params = cast(OmniDiffusionSamplingParams, batch_engine_sampling_params)
-                # Diffusion generate returns results directly, not an iterator
-                diffusion_results = stage_engine.generate(
-                    batch_engine_inputs, batch_engine_sampling_params, batch_request_ids
-                )
-                gen_outputs.extend(diffusion_results)
+                # Guard against empty batches that can arise when the thinker
+                # produced no tokens for this modality (e.g. a text-only reply
+                # generates neither vision nor audio discrete tokens, so
+                # thinker2vision_decoder / thinker2audio_decoder return []).
+                # Calling generate() with an empty prompt list would raise
+                # "Cannot execute model with empty request list".
+                if not batch_engine_inputs:
+                    logger.debug("[Stage-%s] Skipping diffusion: empty input batch (no tokens from thinker)", stage_id)
+                else:
+                    # Diffusion generate returns results directly, not an iterator
+                    diffusion_results = stage_engine.generate(
+                        batch_engine_inputs, batch_engine_sampling_params, batch_request_ids
+                    )
+                    gen_outputs.extend(diffusion_results)
                 # Assign request_ids if not present
                 for idx, result in enumerate(gen_outputs):
                     if not hasattr(result, "request_id") or result.request_id is None:

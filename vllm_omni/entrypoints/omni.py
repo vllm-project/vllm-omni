@@ -1103,8 +1103,38 @@ class Omni(OmniBase):
 
                     yield output_to_yield
 
-                next_stage_id = stage_id + 1
-                if next_stage_id <= final_stage_id_to_prompt[req_id]:
+                # Fan-out routing: forward to all downstream stages that have
+                # a connector from this stage, rather than assuming a linear
+                # stage_id+1 chain.
+                #
+                # Background: HyperCLOVAX-SEED-Omni (and similar models) use a
+                # fan-out topology where the thinker (stage 0) sends vision tokens
+                # to the vision decoder (stage 1) *and* audio tokens to the audio
+                # decoder (stage 2) independently:
+                #
+                #   stage-0 (thinker) ──► stage-1 (vision decoder)
+                #                    └──► stage-2 (audio decoder)
+                #
+                # The former linear `next_stage_id = stage_id + 1` assumption
+                # caused stage-1 to incorrectly try to forward to stage-2 after
+                # completing, which raised a RuntimeError because no connector
+                # exists for the (1→2) edge.
+                #
+                # With this fix:
+                #  - After stage-0: forward only to stages that actually have
+                #    connector edges AND non-empty inputs (e.g. skip vision stage
+                #    for text-only replies that produced no vision tokens).
+                #  - After stage-1 or stage-2 (leaf nodes): no outgoing connectors
+                #    exist, so `any_forwarded` stays False and the request is
+                #    marked complete.
+                #  - Linear pipelines (0→1→2) still work because each stage has
+                #    exactly one outgoing connector.
+                downstream_stage_ids = sorted([
+                    int(to) for (frm, to) in self.connectors.keys()
+                    if frm == str(stage_id)
+                ])
+                any_forwarded = False
+                for next_stage_id in downstream_stage_ids:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     try:
                         # Derive inputs for the next stage, record preprocess time
@@ -1118,6 +1148,16 @@ class Omni(OmniBase):
                             f" at stage {next_stage_id}: {e}",
                         )
                         continue
+
+                    if not next_inputs:
+                        # No tokens for this modality (e.g. text-only reply has no
+                        # vision/audio tokens), skip forwarding to this stage.
+                        logger.debug(
+                            f"[{self._name}] No inputs for stage-{next_stage_id} "
+                            f"from stage-{stage_id}, skipping",
+                        )
+                        continue
+
                     sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
 
                     # Check if we have a connector for this edge
@@ -1146,7 +1186,9 @@ class Omni(OmniBase):
                         f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
                     )
                     remaining_by_stage[next_stage_id] += 1
-                else:
+                    any_forwarded = True
+
+                if not any_forwarded:
                     completed_requests += 1
                     if pbar:
                         final_mod = self.output_modalities[final_stage_id_to_prompt[req_id]]

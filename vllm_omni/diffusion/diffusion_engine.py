@@ -486,6 +486,20 @@ class DiffusionEngine:
             "prompt": "dummy run",
             "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
         }
+        # For HyperCLOVAX vision/audio decoders, provide dummy tokens in req.extra
+        # since these models receive discrete tokens from the thinker (not text prompts).
+        dummy_extra: dict = {}
+        model_cls = self.od_config.model_class_name
+        if model_cls == "HyperCLOVAXVisionPipeline":
+            # 729 = 27x27 discrete image tokens (DISCRETE_IMAGE_TOKEN_LENGTH)
+            dummy_extra["vision_tokens"] = [0] * 729
+        elif model_cls == "HyperCLOVAXAudioPipeline":
+            # Minimal sequence of audio tokens for warmup
+            dummy_extra["audio_tokens"] = [[0] * 10]
+            dummy_extra["speakers"] = ["fkms"]
+            dummy_extra["formats"] = ["wav"]
+            dummy_extra["ref_audio_tokens"] = [None]
+
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],

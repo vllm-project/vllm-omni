@@ -15,7 +15,12 @@ from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+# ExtractHiddenStatesProposer was introduced after vLLM v0.18.0; guard the
+# import so this runner works on the v0.18.0 base without the symbol.
+try:
+    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+except ImportError:
+    ExtractHiddenStatesProposer = None  # type: ignore[assignment,misc]
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
@@ -868,9 +873,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
             ):
+                _valid_proposers = (EagleProposer, DraftModelProposer) + (
+                    (ExtractHiddenStatesProposer,) if ExtractHiddenStatesProposer is not None else ()
+                )
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    _valid_proposers,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.

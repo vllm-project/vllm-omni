@@ -17,6 +17,14 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.spec_decode.eagle import EagleProposer
+# ExtractHiddenStatesProposer was introduced in a later vLLM commit and is not
+# present in the v0.18.0 base this branch targets.  Make the import optional so
+# the rest of the file can reference it in isinstance() checks without breaking
+# on the older base.
+try:
+    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+except ImportError:
+    ExtractHiddenStatesProposer = None  # type: ignore[assignment,misc]
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -64,6 +72,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        # Initialize KV cache manager (preserve vllm_config fallback behavior)
+        self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        # `routed_experts_initialized` gates MoE expert-routing capture in
+        # execute_model().  Read from model_config with a safe default so this
+        # runner works with models that don't set the flag (e.g. dense models).
+        self.routed_experts_initialized = getattr(self.model_config, "enable_return_routed_experts", False)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -405,8 +419,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices,
             ),
-            record_function_or_nullcontext("Forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+            record_function_or_nullcontext("gpu_model_runner: forward"),
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                # vLLM renamed the kwarg from `defer_finalize` to
+                # `clear_metadata` (with inverted semantics) in a commit after
+                # v0.18.0.  Pass the updated name to stay compatible with the
+                # base version this branch is built on.
+                clear_metadata=not defer_kv_connector_finalize,
+            ) as kv_connector_output,
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -623,37 +644,41 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
 
         spec_config = self.speculative_config
-        use_padded_batch_for_eagle = (
-            spec_config is not None and spec_config.use_eagle() and not spec_config.disable_padded_drafter_batch
-        )
-        effective_drafter_max_model_len = self.max_model_len
-        if effective_drafter_max_model_len is None:
-            effective_drafter_max_model_len = self.model_config.max_model_len
-        if (
-            spec_config is not None
-            and spec_config.draft_model_config is not None
-            and spec_config.draft_model_config.max_model_len is not None
-        ):
-            effective_drafter_max_model_len = spec_config.draft_model_config.max_model_len
-        input_fits_in_drafter = spec_decode_common_attn_metadata and (
-            spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens <= effective_drafter_max_model_len
-        )
-        if use_padded_batch_for_eagle:
-            assert self.speculative_config is not None
-            assert isinstance(self.drafter, EagleProposer)
-            sampled_token_ids = sampler_output.sampled_token_ids
-            if input_fits_in_drafter:
-                propose_draft_token_ids(sampled_token_ids)
-            elif self.valid_sampled_token_count_event is not None:
-                assert spec_decode_common_attn_metadata is not None
-                next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
-                    spec_decode_common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
+        propose_drafts_after_bookkeeping = False
+        if spec_config is not None:
+            input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
+                spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+                <= self.effective_drafter_max_model_len
+            )
+            use_gpu_toks = (
+                spec_config.use_eagle() or spec_config.uses_draft_model() or spec_config.uses_extract_hidden_states()
+            ) and not spec_config.disable_padded_drafter_batch
+            if use_gpu_toks:
+                _valid_proposers = (EagleProposer, DraftModelProposer) + (
+                    (ExtractHiddenStatesProposer,) if ExtractHiddenStatesProposer is not None else ()
                 )
-                self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+                assert isinstance(self.drafter, _valid_proposers)
+                sampled_token_ids = sampler_output.sampled_token_ids
+                if input_fits_in_drafter:
+                    propose_draft_token_ids(sampled_token_ids)
+                elif self.valid_sampled_token_count_event is not None:
+                    assert spec_decode_common_attn_metadata is not None
+                    next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+                        spec_decode_common_attn_metadata,
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        self.discard_request_mask.gpu,
+                    )
+                    self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+                    # Since we couldn't run the drafter,
+                    # just use zeros for the draft tokens.
+                    self._draft_token_ids = torch.zeros(1, device=self.device, dtype=torch.int32).expand(
+                        len(self.input_batch.req_ids), self.num_spec_tokens
+                    )
+                    self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+            else:
+                propose_drafts_after_bookkeeping = input_fits_in_drafter
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (

@@ -85,6 +85,13 @@ class HCXOmniThinkerForConditionalGeneration(
     def get_multimodal_embeddings(self, **kwargs: Any) -> MultiModalEmbeddings | None:
         return self._model.get_multimodal_embeddings(**kwargs)
 
+    def embed_multimodal(self, **kwargs: Any) -> MultiModalEmbeddings:
+        # Required by vLLM's multimodal embedding path; the base class
+        # SupportsMultiModal declares get_multimodal_embeddings(), but some
+        # call-sites (e.g. GPUModelRunner) also call embed_multimodal() directly
+        # and expect a tensor rather than the raw embedding list.
+        return self._model.embed_multimodal(**kwargs)
+
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -116,7 +123,15 @@ class HCXOmniThinkerForConditionalGeneration(
         return self._model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self._model.load_weights(weights)
+        loaded = self._model.load_weights(weights)
+        # vLLM's default_loader validates that every named_parameter() is
+        # present in the set returned by load_weights().  Because weights are
+        # stored under self._model, named_parameters() yields "_model.<name>"
+        # while the inner load_weights() returns bare "<name>".  Re-prefix the
+        # returned set so the strict-loading check passes.
+        if loaded is not None:
+            return {"_model." + name for name in loaded}
+        return loaded
 
     def get_mm_mapping(self):
         return self._model.get_mm_mapping()

@@ -25,7 +25,12 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+# ExtractHiddenStatesProposer was introduced after vLLM v0.18.0; guard the
+# import so this runner works on the v0.18.0 base without the symbol.
+try:
+    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+except ImportError:
+    ExtractHiddenStatesProposer = None  # type: ignore[assignment,misc]
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -285,7 +290,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
+                # vLLM renamed `defer_finalize` → `clear_metadata` (inverted
+                # semantics) after v0.18.0.  Use the new name unconditionally.
+                clear_metadata=not defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
@@ -759,10 +766,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
             ):
-                assert isinstance(
-                    self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                _valid_proposers = (EagleProposer, DraftModelProposer) + (
+                    (ExtractHiddenStatesProposer,) if ExtractHiddenStatesProposer is not None else ()
                 )
+                assert isinstance(self.drafter, _valid_proposers)
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
                 # Therefore only use cudagraphs if the main model uses PIECEWISE

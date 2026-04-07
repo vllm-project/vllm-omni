@@ -157,6 +157,12 @@ class OmniLLM(LLM):
 
         # Create the Engine (autoselects V0 vs V1)
         self.llm_engine = LLMEngine.from_engine_args(engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
+        # OmniLLM does not call super().__init__(), so instance attributes
+        # normally set by LLM.__init__ must be populated manually.
+        # `renderer` is accessed by several base-class helper methods; copy it
+        # from the engine when available (V1 engine exposes it, V0 does not).
+        if hasattr(self.llm_engine, "renderer"):
+            self.renderer = self.llm_engine.renderer
         self.llm_engine.output_processor = MultimodalOutputProcessor(
             tokenizer=self.llm_engine.tokenizer,
             log_stats=self.llm_engine.log_stats,
@@ -197,7 +203,10 @@ class OmniLLM(LLM):
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
 
-    def _run_engine(self, *, use_tqdm: bool | Callable[..., tqdm] = True) -> list[RequestOutput | PoolingRequestOutput]:
+    def _run_engine(self, output_type=None, *, use_tqdm: bool | Callable[..., tqdm] = True) -> list[RequestOutput | PoolingRequestOutput]:
+        # `output_type` is forwarded by the base LLM.generate() call-site
+        # (added in a later vLLM commit); accept and ignore it so the
+        # overridden signature stays compatible.
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
