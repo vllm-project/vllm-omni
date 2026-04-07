@@ -135,6 +135,13 @@ GEN_THINK_SYSTEM_PROMPT = (
     "i.e. <think> planning process here </think> image here"
 )
 
+VLM_THINK_SYSTEM_PROMPT = (
+    "You should first think about the reasoning process in the mind "
+    "and then provide the user with the answer. \n"
+    "The reasoning process is enclosed within <think> </think> tags, "
+    "i.e. <think> reasoning process here </think> answer here"
+)
+
 
 def expand_cfg_prompts_think(
     prompt: dict[str, Any] | str,

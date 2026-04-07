@@ -2,7 +2,10 @@ import argparse
 import os
 
 from vllm_omni.inputs.data import OmniPromptType
-from vllm_omni.model_executor.stage_input_processors.bagel import GEN_THINK_SYSTEM_PROMPT
+from vllm_omni.model_executor.stage_input_processors.bagel import (
+    GEN_THINK_SYSTEM_PROMPT,
+    VLM_THINK_SYSTEM_PROMPT,
+)
 
 
 def parse_args():
@@ -171,7 +174,10 @@ def main():
         elif args.modality == "img2text":
             if args.image_path:
                 loaded_image = Image.open(args.image_path).convert("RGB")
-                final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                think_prefix = f"<|im_start|>system\n{VLM_THINK_SYSTEM_PROMPT}<|im_end|>\n" if args.think else ""
+                final_prompt_text = (
+                    f"{think_prefix}<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                )
                 prompt_dict = {
                     "prompt": final_prompt_text,
                     "multi_modal_data": {"image": loaded_image},
@@ -179,7 +185,8 @@ def main():
                 }
                 formatted_prompts.append(prompt_dict)
         elif args.modality == "text2text":
-            final_prompt_text = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            think_prefix = f"<|im_start|>{VLM_THINK_SYSTEM_PROMPT}<|im_end|>" if args.think else ""
+            final_prompt_text = f"{think_prefix}<|im_start|>{p}<|im_end|><|im_start|>"
             prompt_dict = {"prompt": final_prompt_text, "modalities": ["text"]}
             formatted_prompts.append(prompt_dict)
         else:
@@ -217,15 +224,11 @@ def main():
     img_idx = 0
     for req_output in omni_outputs:
         if args.think:
-            text_output = getattr(req_output, "text", None) or getattr(req_output, "outputs", None)
-            if text_output:
-                if isinstance(text_output, list) and text_output:
-                    for out in text_output:
-                        txt = getattr(out, "text", str(out))
-                        if txt:
-                            print(f"[Think] {txt}")
-                elif isinstance(text_output, str):
-                    print(f"[Think] {text_output}")
+            ro = getattr(req_output, "request_output", None)
+            if ro and getattr(ro, "outputs", None):
+                txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
+                if txt:
+                    print(txt)
 
         images = getattr(req_output, "images", None)
 
