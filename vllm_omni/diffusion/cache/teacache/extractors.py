@@ -84,6 +84,13 @@ class CacheContext:
         extra_states: Optional dict for additional model-specific state.
             Use this for models that need to pass additional context beyond
             the standard fields.
+
+            Reserved keys:
+            - "run_full_transformer_with_single": Callable with signature
+              (hidden_states, encoder_hidden_states) -> tuple[torch.Tensor, torch.Tensor | None]
+              used by dual+single-stream models whose cacheable unit must
+              include both the main transformer blocks and follow-on
+              single-stream blocks.
     """
 
     modulated_input: torch.Tensor
@@ -672,7 +679,7 @@ def extract_flux2_klein_context(
             )
         return (h, c)
 
-    def run_flux2_full_transformer_with_single(ori_h, ori_c):
+    def run_full_transformer_with_single(ori_h, ori_c):
         h = ori_h
         c = ori_c
         for block in module.transformer_blocks:
@@ -716,7 +723,7 @@ def extract_flux2_klein_context(
         run_transformer_blocks=run_flux2_transformer_blocks,
         postprocess=postprocess,
         extra_states={
-            "run_flux2_full_transformer_with_single": run_flux2_full_transformer_with_single,
+            "run_full_transformer_with_single": run_full_transformer_with_single,
         },
     )
 
@@ -771,9 +778,7 @@ def extract_ovis_image_context(
     # ============================================================================
     # DEFINE TRANSFORMER EXECUTION (Ovis-specific)
     # ============================================================================
-    def run_ovis_transformer_blocks():
-        h = hidden_states
-        e = encoder_hidden_states
+    def run_dual_stream_transformer_blocks(h, e):
         for block in module.transformer_blocks:
             e, h = block(
                 hidden_states=h,
@@ -783,16 +788,11 @@ def extract_ovis_image_context(
             )
         return (h, e)
 
-    def run_ovis_full_transformer_with_single(ori_h, ori_e):
-        h = ori_h
-        e = ori_e
-        for block in module.transformer_blocks:
-            e, h = block(
-                hidden_states=h,
-                encoder_hidden_states=e,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-            )
+    def run_ovis_transformer_blocks():
+        return run_dual_stream_transformer_blocks(hidden_states, encoder_hidden_states)
+
+    def run_full_transformer_with_single(ori_h, ori_e):
+        h, e = run_dual_stream_transformer_blocks(ori_h, ori_e)
         for block in module.single_transformer_blocks:
             e, h = block(
                 hidden_states=h,
@@ -822,7 +822,7 @@ def extract_ovis_image_context(
         run_transformer_blocks=run_ovis_transformer_blocks,
         postprocess=postprocess,
         extra_states={
-            "run_ovis_full_transformer_with_single": run_ovis_full_transformer_with_single,
+            "run_full_transformer_with_single": run_full_transformer_with_single,
         },
     )
 

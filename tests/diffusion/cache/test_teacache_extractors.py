@@ -137,12 +137,12 @@ class TestFlux2KleinExtractor(BaseExtractorTest):
         assert callable(context.postprocess)
 
     def test_extra_states_contains_full_transformer(self, flux2_klein_module, sample_inputs):
-        """Test that extra_states contains run_flux2_full_transformer_with_single."""
+        """Test that extra_states contains the generic full-transformer override."""
         context = extract_flux2_klein_context(flux2_klein_module, **sample_inputs)
 
         assert context.extra_states is not None
-        assert "run_flux2_full_transformer_with_single" in context.extra_states
-        assert callable(context.extra_states["run_flux2_full_transformer_with_single"])
+        assert "run_full_transformer_with_single" in context.extra_states
+        assert callable(context.extra_states["run_full_transformer_with_single"])
 
     def test_without_guidance(self, flux2_klein_module, sample_inputs):
         """Test context extraction works without guidance (no CFG)."""

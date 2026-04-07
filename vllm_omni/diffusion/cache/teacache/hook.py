@@ -157,14 +157,12 @@ class TeaCacheHook(ModelHook):
                 ctx.encoder_hidden_states.clone() if ctx.encoder_hidden_states is not None else None
             )
 
-            # Handle models with additional blocks (e.g., Flux2 single_transformer_blocks)
-            if getattr(ctx, "extra_states", None) and "run_flux2_full_transformer_with_single" in ctx.extra_states:
-                run_full = ctx.extra_states["run_flux2_full_transformer_with_single"]
-                ctx.hidden_states, ctx.encoder_hidden_states = run_full(ori_hidden_states, ori_encoder_hidden_states)
-                output = ctx.hidden_states
-                state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
-            elif getattr(ctx, "extra_states", None) and "run_ovis_full_transformer_with_single" in ctx.extra_states:
-                run_full = ctx.extra_states["run_ovis_full_transformer_with_single"]
+            extra_states = ctx.extra_states or {}
+
+            # Models whose cacheable unit includes both dual-stream trunk and
+            # follow-on single-stream blocks can override the slow path here.
+            if "run_full_transformer_with_single" in extra_states:
+                run_full = extra_states["run_full_transformer_with_single"]
                 ctx.hidden_states, ctx.encoder_hidden_states = run_full(ori_hidden_states, ori_encoder_hidden_states)
                 output = ctx.hidden_states
                 state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
