@@ -91,10 +91,17 @@ Models must define the blocks attribute name for layerwise offloading:
 
 ```python
 class WanTransformer3DModel(nn.Module):
-    _layerwise_offload_blocks_attr = "blocks"  # Attribute name containing transformer blocks
+    _layerwise_offload_blocks_attrs = ["blocks"]  # Attribute names containing transformer blocks
 
     def __init__(self):
         self.blocks = nn.ModuleList([...])  # Transformer blocks
+```
+
+For models with multiple block types:
+
+```python
+class Flux2Transformer2DModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 ```
 
 ### Limitations
@@ -140,4 +147,4 @@ Factory function `get_offload_backend()` selects the appropriate backend based o
 
 **Notes:**
 - Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally
-- Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attr` pointing to transformer blocks
+- Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attrs` pointing to transformer blocks

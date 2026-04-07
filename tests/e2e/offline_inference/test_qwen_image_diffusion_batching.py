@@ -509,7 +509,7 @@ def test_diffusion_batching_async_explicit_batch(model_name: str):
     all prompts in a single engine call and returns a single combined result.
 
     The list-prompt path routes through the orchestrator's
-    ``add_batch_request_async`` → ``AsyncOmniDiffusion.generate_batch``
+    ``add_batch_request_async`` → ``AsyncOmni.generate_batch``
     and yields ONE ``OmniRequestOutput`` with ALL images combined.
     """
 
