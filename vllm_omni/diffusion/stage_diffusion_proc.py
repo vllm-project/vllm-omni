@@ -567,13 +567,14 @@ def spawn_diffusion_proc(
 def complete_diffusion_handshake(
     proc: BaseProcess,
     handshake_address: str,
+    timeout_s: int,
 ) -> None:
     """Wait for the diffusion subprocess to signal READY.
 
     On failure the process is terminated before re-raising.
     """
     try:
-        _perform_diffusion_handshake(proc, handshake_address)
+        _perform_diffusion_handshake(proc, handshake_address, timeout_s)
     except Exception:
         shutdown([proc])
         raise
@@ -582,6 +583,7 @@ def complete_diffusion_handshake(
 def _perform_diffusion_handshake(
     proc: BaseProcess,
     handshake_address: str,
+    timeout_s: int,
 ) -> None:
     """Run the handshake with the diffusion subprocess."""
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
@@ -589,7 +591,7 @@ def _perform_diffusion_handshake(
         poller.register(handshake_socket, zmq.POLLIN)
         poller.register(proc.sentinel, zmq.POLLIN)
 
-        timeout_ms = _HANDSHAKE_POLL_TIMEOUT_S * 1000
+        timeout_ms = timeout_s * 1000
         while True:
             events = dict(poller.poll(timeout=timeout_ms))
             if not events:
