@@ -353,6 +353,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     try:
         await shutdown_task
     finally:
+        app.state.openai_serving_speech.shutdown()
         sock.close()
 
 

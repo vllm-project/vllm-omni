@@ -8,6 +8,7 @@ import re
 import struct
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
+from vllm.utils.async_utils import make_async
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -153,6 +155,7 @@ def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     _diffusion_mode: bool = False
+    _tts_executor: ThreadPoolExecutor | None = None
 
     @classmethod
     def for_diffusion(
@@ -219,6 +222,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Load speech tokenizer codec parameters for prompt length estimation
         self._codec_frame_rate: float | None = self._load_codec_frame_rate()
 
+        # Shared thread pool executor for blocking TTS preprocessing
+        # operations. max_workers=1 serializes tokenizer access to avoid
+        # Rust RefCell "Already borrowed" errors from concurrent use.
+        self._tts_executor = ThreadPoolExecutor(max_workers=1)
+        self._build_voxtral_prompt_async = make_async(self._build_voxtral_prompt, executor=self._tts_executor)
+        self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
+        self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
+
     def _load_codec_frame_rate(self) -> float | None:
         """Load codec frame rate from speech tokenizer config for prompt length estimation."""
         try:
@@ -251,6 +262,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception:
             pass
         return None
+
+    def shutdown(self) -> None:
+        """Shut down the TTS thread pool executor."""
+        if self._tts_executor is not None:
+            self._tts_executor.shutdown(wait=False, cancel_futures=True)
+            self._tts_executor = None
 
     def _find_tts_stage(self):
         """Find and return the TTS stage config, or None if not found."""
@@ -1149,7 +1166,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     # ---- Voxtral TTS helpers ----
 
-    async def _build_voxtral_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+    def _build_voxtral_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build Voxtral TTS engine prompt from shared TTS parameters."""
         from mistral_common.protocol.speech.request import SpeechRequest
 
@@ -1289,7 +1306,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 ref_audio_data = (wav_list, sr)
-            prompt = self._build_fish_speech_prompt(request, ref_audio_data=ref_audio_data)
+            prompt = await self._build_fish_speech_prompt_async(request, ref_audio_data=ref_audio_data)
             tts_params = {}
         elif self._tts_model_type == "omnivoice":
             tts_params = {}
@@ -1300,7 +1317,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError(validation_error)
 
             if self._tts_model_type == "voxtral_tts":
-                prompt = await self._build_voxtral_prompt(request)
+                prompt = await self._build_voxtral_prompt_async(request)
                 tts_params = {}
             elif self._tts_model_type == "cosyvoice3":
                 prompt = await self._build_cosyvoice3_prompt(request)
@@ -1317,7 +1334,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
                     tts_params["ref_audio"] = [[wav_list, sr]]
 
-                ph_len = self._estimate_prompt_len(tts_params)
+                ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
         else:
             tts_params = {}
