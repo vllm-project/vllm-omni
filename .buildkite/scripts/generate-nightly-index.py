@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-import regex as re
+import re
 
 
 def normalize_package_name(name: str) -> str:
