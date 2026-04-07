@@ -81,6 +81,24 @@ class ImageGenerationRequest(BaseModel):
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
+    system_prompt: str | None = Field(
+        default=None, description="Custom system prompt. Used when --use_system_prompt is custom"
+    )
+    use_system_prompt: str | None = Field(
+        default=None,
+        description="System prompt type. Options: None, dynamic, en_vanilla, "
+        "en_recaption, en_think_recaption, en_unified, custom",
+    )
+
+    @field_validator("use_system_prompt")
+    @classmethod
+    def validate_use_system_prompt(cls, v):
+        """Validate system prompt type."""
+        valid_types = [None, "dynamic", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "custom"]
+        if v not in valid_types:
+            raise ValueError(f"Invalid use_system_prompt type: {v}. Must be one of: {valid_types[1:] + [None]}")
+        return v
+
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,
