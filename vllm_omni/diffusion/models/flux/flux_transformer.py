@@ -510,6 +510,7 @@ class FluxTransformer2DModel(nn.Module):
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["FluxTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:

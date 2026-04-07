@@ -29,6 +29,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -171,7 +172,7 @@ class WanRotaryPosEmbed(nn.Module):
         # Split dimensions for temporal, height, width
         h_dim = w_dim = 2 * (attention_head_dim // 6)
         t_dim = attention_head_dim - h_dim - w_dim
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        freqs_dtype = torch.float64 if current_omni_platform.supports_float64() else torch.float32
 
         freqs_cos = []
         freqs_sin = []
@@ -725,7 +726,7 @@ class WanTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["WanTransformerBlock"]
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }

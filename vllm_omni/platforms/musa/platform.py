@@ -82,6 +82,11 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         return True
 
     @classmethod
+    def supports_float64(cls) -> bool:
+        """MUSA does not support float64 yet."""
+        return False
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         """Get the torch device for MUSA platform.
 
