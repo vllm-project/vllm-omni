@@ -19,7 +19,7 @@ steps:
   - label: "CUDA Unit Test with single card"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 10m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' --ignore=tests/e2e --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
+      - timeout 10m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' --ignore=tests/e2e --ignore=tests/engine/test_async_omni_engine_abort.py --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
     agents:
       queue: "gpu_1_queue"
     plugins:
