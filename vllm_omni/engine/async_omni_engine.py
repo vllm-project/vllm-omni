@@ -42,7 +42,10 @@ from vllm_omni.engine import (
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.engine.stage_engine_core_proc import (
     complete_stage_handshake,
@@ -167,6 +170,38 @@ def _upgrade_to_omni_request(
         external_req_id=request.external_req_id,
         reasoning_ended=request.reasoning_ended,
         additional_information=additional_information,
+    )
+
+
+def _apply_omni_final_stage_metadata(
+    request: EngineCoreRequest,
+    final_stage_id: int,
+) -> EngineCoreRequest:
+    """Tag EngineCoreRequest so OmniARScheduler can skip DiT KV when final_stage_id is 0."""
+    merged: dict[str, Any] = {}
+    if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
+        merged = deserialize_additional_information(request.additional_information)
+    merged["omni_final_stage_id"] = final_stage_id
+    payload = serialize_additional_information(merged)
+    return OmniEngineCoreRequest(
+        request_id=request.request_id,
+        prompt_token_ids=request.prompt_token_ids,
+        mm_features=request.mm_features,
+        sampling_params=request.sampling_params,
+        pooling_params=request.pooling_params,
+        arrival_time=request.arrival_time,
+        lora_request=request.lora_request,
+        cache_salt=request.cache_salt,
+        data_parallel_rank=request.data_parallel_rank,
+        prompt_embeds=request.prompt_embeds,
+        client_index=request.client_index,
+        current_wave=request.current_wave,
+        priority=request.priority,
+        trace_headers=request.trace_headers,
+        resumable=request.resumable,
+        external_req_id=request.external_req_id,
+        reasoning_ended=request.reasoning_ended,
+        additional_information=payload,
     )
 
 
@@ -713,6 +748,7 @@ class AsyncOmniEngine:
             # to match the key used in Orchestrator.request_states so that
             # output routing (output.request_id lookup) can find the req_state.
             request.external_req_id = request_id
+            request = _apply_omni_final_stage_metadata(request, final_stage_id)
 
             # Register with stage 0's output processor.
             output_prompt_text = prompt_text
@@ -884,6 +920,41 @@ class AsyncOmniEngine:
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
 
+        stage_engine_args = {
+            "max_num_seqs": 1,
+            "parallel_config": parallel_config,
+            "model_class_name": kwargs.get("model_class_name", None),
+            "step_execution": kwargs.get("step_execution", False),
+            "vae_use_slicing": kwargs.get("vae_use_slicing", False),
+            "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+            "cache_backend": cache_backend,
+            "cache_config": cache_config,
+            "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
+            "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
+            "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+            "enforce_eager": kwargs.get("enforce_eager", False),
+            "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+            "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+            "worker_extension_cls": kwargs.get("worker_extension_cls", None),
+            "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
+            "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
+            "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
+            "quantization": kwargs.get("quantization", None),
+            "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            **(
+                {
+                    "profiler_config": asdict(kwargs["profiler_config"])
+                    if hasattr(kwargs["profiler_config"], "__dataclass_fields__")
+                    else kwargs["profiler_config"]
+                }
+                if kwargs.get("profiler_config") is not None
+                else {}
+            ),
+        }
+        # Only set dtype if it was already explicitly passed and normalized
+        if "dtype" in normalized_kwargs:
+            stage_engine_args["dtype"] = normalized_kwargs["dtype"]
+
         default_stage_cfg = [
             {
                 "stage_id": 0,
@@ -892,37 +963,7 @@ class AsyncOmniEngine:
                     "process": True,
                     "devices": devices,
                 },
-                "engine_args": {
-                    "max_num_seqs": 1,
-                    "parallel_config": parallel_config,
-                    "model_class_name": kwargs.get("model_class_name", None),
-                    "step_execution": kwargs.get("step_execution", False),
-                    "vae_use_slicing": kwargs.get("vae_use_slicing", False),
-                    "vae_use_tiling": kwargs.get("vae_use_tiling", False),
-                    "cache_backend": cache_backend,
-                    "cache_config": cache_config,
-                    "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
-                    "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
-                    "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-                    "enforce_eager": kwargs.get("enforce_eager", False),
-                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
-                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
-                    "worker_extension_cls": kwargs.get("worker_extension_cls", None),
-                    "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
-                    "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
-                    "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
-                    "quantization": kwargs.get("quantization", None),
-                    "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
-                    **(
-                        {
-                            "profiler_config": asdict(kwargs["profiler_config"])
-                            if hasattr(kwargs["profiler_config"], "__dataclass_fields__")
-                            else kwargs["profiler_config"]
-                        }
-                        if kwargs.get("profiler_config") is not None
-                        else {}
-                    ),
-                },
+                "engine_args": stage_engine_args,
                 "final_output": True,
                 "final_output_type": "image",
             }

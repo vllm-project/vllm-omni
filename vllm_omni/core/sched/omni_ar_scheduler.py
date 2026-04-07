@@ -64,6 +64,9 @@ class OmniARScheduler(VLLMScheduler):
 
         # Track requests that have already triggered prefill transfer to avoid duplicates
         self.transfer_triggered_requests: set[str] = set()
+
+        # Cache per-request flag to avoid repeated deserialization of additional_information
+        self._omits_kv_transfer_cache: dict[str, bool] = {}
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
@@ -82,6 +85,27 @@ class OmniARScheduler(VLLMScheduler):
                 return getattr(omni_kv_config, "kv_transfer_criteria", None)
         return None
 
+    def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
+        """True when orchestrator will not run stage 1+ for this request (e.g. text-only).
+
+        The result is cached per request to avoid repeated deserialization of
+        additional_information on every scheduler tick.
+        """
+        rid = request.request_id
+        cached = self._omits_kv_transfer_cache.get(rid)
+        if cached is not None:
+            return cached
+
+        payload = getattr(request, "additional_information", None)
+        if payload is None:
+            result = False
+        else:
+            info = deserialize_additional_information(payload)
+            result = info.get("omni_final_stage_id") == 0
+
+        self._omits_kv_transfer_cache[rid] = result
+        return result
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -89,6 +113,10 @@ class OmniARScheduler(VLLMScheduler):
         Returns False if request should continue (even if transfer was triggered).
         """
         if not self.kv_transfer_criteria:
+            return False
+
+        # Text-only requests finalize at stage 0; do not prefill-stop for DiT KV.
+        if self._request_omits_kv_transfer_to_next_stage(request):
             return False
 
         if request.request_id in self.waiting_for_transfer_free:
@@ -512,6 +540,8 @@ class OmniARScheduler(VLLMScheduler):
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
 
+        self._omits_kv_transfer_cache.pop(request.request_id, None)
+
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -638,7 +668,12 @@ class OmniARScheduler(VLLMScheduler):
                 need_send = omni_kv_config.get("need_send_cache", False)
             else:
                 need_send = getattr(omni_kv_config, "need_send_cache", False)
-        return need_send
+        if not need_send:
+            return False
+        request = self.requests.get(req_id)
+        if request is not None and self._request_omits_kv_transfer_to_next_stage(request):
+            return False
+        return True
 
     def has_requests(self) -> bool:
         """Check if there are any requests to process, including KV transfers."""
