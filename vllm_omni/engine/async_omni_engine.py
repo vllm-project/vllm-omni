@@ -1346,6 +1346,7 @@ class AsyncOmniEngine:
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
+            "trust_remote_code": kwargs.get("trust_remote_code", False),
             "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
@@ -1362,6 +1363,14 @@ class AsyncOmniEngine:
                 else {}
             ),
         }
+        if "distributed_executor_backend" in kwargs and kwargs["distributed_executor_backend"] is not None:
+            stage_engine_args["distributed_executor_backend"] = kwargs["distributed_executor_backend"]
+        if "boundary_ratio" in kwargs and kwargs["boundary_ratio"] is not None:
+            stage_engine_args["boundary_ratio"] = kwargs["boundary_ratio"]
+        if "flow_shift" in kwargs and kwargs["flow_shift"] is not None:
+            stage_engine_args["flow_shift"] = kwargs["flow_shift"]
+        if "num_gpus" in kwargs and kwargs["num_gpus"] is not None:
+            stage_engine_args["num_gpus"] = kwargs["num_gpus"]
         # Only set dtype if it was already explicitly passed and normalized
         if "dtype" in normalized_kwargs:
             stage_engine_args["dtype"] = normalized_kwargs["dtype"]
