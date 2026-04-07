@@ -920,6 +920,41 @@ class AsyncOmniEngine:
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
 
+        stage_engine_args = {
+            "max_num_seqs": 1,
+            "parallel_config": parallel_config,
+            "model_class_name": kwargs.get("model_class_name", None),
+            "step_execution": kwargs.get("step_execution", False),
+            "vae_use_slicing": kwargs.get("vae_use_slicing", False),
+            "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+            "cache_backend": cache_backend,
+            "cache_config": cache_config,
+            "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
+            "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
+            "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+            "enforce_eager": kwargs.get("enforce_eager", False),
+            "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+            "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+            "worker_extension_cls": kwargs.get("worker_extension_cls", None),
+            "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
+            "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
+            "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
+            "quantization": kwargs.get("quantization", None),
+            "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            **(
+                {
+                    "profiler_config": asdict(kwargs["profiler_config"])
+                    if hasattr(kwargs["profiler_config"], "__dataclass_fields__")
+                    else kwargs["profiler_config"]
+                }
+                if kwargs.get("profiler_config") is not None
+                else {}
+            ),
+        }
+        # Only set dtype if it was already explicitly passed and normalized
+        if "dtype" in normalized_kwargs:
+            stage_engine_args["dtype"] = normalized_kwargs["dtype"]
+
         default_stage_cfg = [
             {
                 "stage_id": 0,
@@ -928,37 +963,7 @@ class AsyncOmniEngine:
                     "process": True,
                     "devices": devices,
                 },
-                "engine_args": {
-                    "max_num_seqs": 1,
-                    "parallel_config": parallel_config,
-                    "model_class_name": kwargs.get("model_class_name", None),
-                    "step_execution": kwargs.get("step_execution", False),
-                    "vae_use_slicing": kwargs.get("vae_use_slicing", False),
-                    "vae_use_tiling": kwargs.get("vae_use_tiling", False),
-                    "cache_backend": cache_backend,
-                    "cache_config": cache_config,
-                    "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
-                    "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
-                    "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-                    "enforce_eager": kwargs.get("enforce_eager", False),
-                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
-                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
-                    "worker_extension_cls": kwargs.get("worker_extension_cls", None),
-                    "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
-                    "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
-                    "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
-                    "quantization": kwargs.get("quantization", None),
-                    "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
-                    **(
-                        {
-                            "profiler_config": asdict(kwargs["profiler_config"])
-                            if hasattr(kwargs["profiler_config"], "__dataclass_fields__")
-                            else kwargs["profiler_config"]
-                        }
-                        if kwargs.get("profiler_config") is not None
-                        else {}
-                    ),
-                },
+                "engine_args": stage_engine_args,
                 "final_output": True,
                 "final_output_type": "image",
             }
