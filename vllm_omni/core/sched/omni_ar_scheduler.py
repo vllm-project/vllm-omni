@@ -235,7 +235,10 @@ class OmniARScheduler(VLLMScheduler):
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
+            failed_kv_load_req_ids = self._handle_invalid_blocks(
+                kv_connector_output.invalid_block_ids,
+                num_scheduled_tokens,
+            )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -313,10 +316,6 @@ class OmniARScheduler(VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
-                    if self.chunk_transfer_adapter is not None:
-                        self.chunk_transfer_adapter.cleanup_receiver(
-                            request.request_id,
-                        )
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:

@@ -6,7 +6,9 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import copy
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -89,6 +91,53 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with maybe_disable_pin_memory_for_ray(self, total_bytes):
             return super()._make_buffer(*size, dtype=dtype, numpy=numpy)
 
+    def _build_model_sampler_output_token_ids(self) -> list[list[int]]:
+        """Build decoded-token history for custom model samplers.
+
+        vLLM only populates sampling_metadata.output_token_ids when penalties or
+        logits processors require it. CosyVoice3's custom RAS sampler also
+        depends on this history, so we reconstruct it directly from the input
+        batch for prefer_model_sampler models.
+        """
+        req_output_token_ids = getattr(self.input_batch, "req_output_token_ids", [])
+        req_ids = list(getattr(self.input_batch, "req_ids", []))
+        output_token_ids = [list(req_output_token_ids[idx] or []) for idx in range(len(req_ids))]
+
+        sampled_token_ids_cpu = getattr(self.input_batch, "sampled_token_ids_cpu", None)
+        async_copy_ready_event = getattr(self.input_batch, "async_copy_ready_event", None)
+        prev_req_id_to_index = getattr(self.input_batch, "prev_req_id_to_index", None)
+        if sampled_token_ids_cpu is None or not output_token_ids or prev_req_id_to_index is None:
+            return output_token_ids
+
+        sampled_token_ids: list[list[int]] | None = None
+        for index, req_id in enumerate(req_ids):
+            prev_index = prev_req_id_to_index.get(req_id)
+            if prev_index is None:
+                continue
+            req_history = output_token_ids[index]
+            if not req_history or req_history[-1] != -1:
+                continue
+            if sampled_token_ids is None:
+                assert async_copy_ready_event is not None
+                async_copy_ready_event.synchronize()
+                sampled_token_ids = sampled_token_ids_cpu.tolist()
+            new_ids = list(sampled_token_ids[prev_index])
+            if not new_ids:
+                continue
+            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
+            first_placeholder = req_history.index(-1)
+            num_placeholders = len(req_history) - first_placeholder
+            num_to_replace = min(num_sampled_ids, num_placeholders)
+            req_history[first_placeholder : first_placeholder + num_to_replace] = new_ids[:num_to_replace]
+
+        return output_token_ids
+
+    def _sampling_metadata_for_model_sampler(self, sampling_metadata):
+        output_token_ids = self._build_model_sampler_output_token_ids()
+        if output_token_ids == sampling_metadata.output_token_ids:
+            return sampling_metadata
+        return replace(sampling_metadata, output_token_ids=output_token_ids)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -137,8 +186,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
 
-        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(scheduler_output.preempted_req_ids)
+        if has_kv_transfer_group():
+            kv_connector_metadata = scheduler_output.kv_connector_metadata
+            if kv_connector_metadata is not None:
+                get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -146,7 +197,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
-            self._update_states(scheduler_output)
+            deferred_state_corrections_fn = self._update_states(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -300,6 +351,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
         with (
+            nullcontext(),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -417,7 +469,43 @@ class GPUARModelRunner(OmniGPUModelRunner):
         )
         self.kv_connector_output = kv_connector_output
 
+        if deferred_state_corrections_fn:
+            deferred_state_corrections_fn()
+
         return None
+
+    def _sample(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: Any,
+    ):
+        sampling_metadata = self.input_batch.sampling_metadata
+        if spec_decode_metadata is None:
+            model_sample = getattr(self.model, "sample", None)
+            if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
+                # Apply logit bias (min_tokens, allowed_token_ids) before
+                # the custom model sampler — the standard GPU sampler does
+                # this internally, but prefer_model_sampler bypasses it.
+                if hasattr(self.sampler, "logit_bias_state"):
+                    self.sampler.logit_bias_state.apply_logit_bias(
+                        logits,
+                        self.input_batch.expanded_idx_mapping,
+                        self.input_batch.idx_mapping_np,
+                        self.input_batch.positions[self.input_batch.logits_indices],
+                    )
+                sampler_output = model_sample(
+                    logits,
+                    self._sampling_metadata_for_model_sampler(sampling_metadata),
+                )
+                if sampler_output is not None:
+                    return sampler_output
+            self.input_batch.update_async_output_token_ids()
+            return self.sampler(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+
+        return super()._sample(logits, spec_decode_metadata)
 
     @torch.inference_mode()
     def sample_tokens(
@@ -474,8 +562,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+
         self._draft_token_ids = None
         self._draft_token_req_ids = None
+        self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
@@ -515,7 +606,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
-                        spec_decode_common_attn_metadata,
+                        self.optimistic_seq_lens_cpu,
                         sampled_token_ids,
                         self.requests,
                         self.input_batch,
