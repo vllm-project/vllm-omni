@@ -323,235 +323,235 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-      - label: "Diffusion · Wan22 T2V"
-        key: ready-e2e-diffusion-wan22-t2v
-        timeout_in_minutes: 50
-        depends_on: upload-ready-pipeline
-        commands:
-          - |
-            timeout 45m bash -c '
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m "core_model and diffusion" --run-level "core_model"
-            '
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 1
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
+  - label: "Diffusion · Wan22 T2V"
+    key: ready-e2e-diffusion-wan22-t2v
+    timeout_in_minutes: 50
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 45m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          export VLLM_IMAGE_FETCH_TIMEOUT=60
+          pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m "core_model and diffusion" --run-level "core_model"
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
                   - name: devshm
-                    emptyDir:
-                      medium: Memory
+                    mountPath: /dev/shm
                   - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
 
-      - label: "Diffusion · Bagel"
-        key: ready-e2e-diffusion-bagel
-        timeout_in_minutes: 50
-        depends_on: upload-ready-pipeline
-        commands:
-          - |
-            timeout 45m bash -c '
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_bagel.py -m "core_model and diffusion" --run-level "core_model"
-            '
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 1
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
+  - label: "Diffusion · Bagel"
+    key: ready-e2e-diffusion-bagel
+    timeout_in_minutes: 50
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 45m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          export VLLM_IMAGE_FETCH_TIMEOUT=60
+          pytest -s -v tests/e2e/online_serving/test_bagel.py -m "core_model and diffusion" --run-level "core_model"
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
                   - name: devshm
-                    emptyDir:
-                      medium: Memory
+                    mountPath: /dev/shm
                   - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
 
-      - label: "Diffusion · Qwen-Image"
-        key: ready-e2e-diffusion-qwen-image
-        timeout_in_minutes: 50
-        depends_on: upload-ready-pipeline
-        commands:
-          - |
-            timeout 45m bash -c '
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m "core_model and diffusion" --run-level "core_model"
-            '
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 1
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
+  - label: "Diffusion · Qwen-Image"
+    key: ready-e2e-diffusion-qwen-image
+    timeout_in_minutes: 50
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 45m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          export VLLM_IMAGE_FETCH_TIMEOUT=60
+          pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m "core_model and diffusion" --run-level "core_model"
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
                   - name: devshm
-                    emptyDir:
-                      medium: Memory
+                    mountPath: /dev/shm
                   - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
 
-      - label: "Diffusion · Qwen-Image-Edit"
-        key: ready-e2e-diffusion-qwen-image-edit
-        timeout_in_minutes: 50
-        depends_on: upload-ready-pipeline
-        commands:
-          - |
-            timeout 45m bash -c '
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_qwen_image_edit.py -m "core_model and diffusion" --run-level "core_model"
-            '
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 1
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
+  - label: "Diffusion · Qwen-Image-Edit"
+    key: ready-e2e-diffusion-qwen-image-edit
+    timeout_in_minutes: 50
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 45m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          export VLLM_IMAGE_FETCH_TIMEOUT=60
+          pytest -s -v tests/e2e/online_serving/test_qwen_image_edit.py -m "core_model and diffusion" --run-level "core_model"
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
                   - name: devshm
-                    emptyDir:
-                      medium: Memory
+                    mountPath: /dev/shm
                   - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
 
-      - label: "Diffusion · Qwen-Image-Layered"
-        key: ready-e2e-diffusion-qwen-image-layered
-        timeout_in_minutes: 50
-        depends_on: upload-ready-pipeline
-        commands:
-          - |
-            timeout 45m bash -c '
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_qwen_image_layered.py -m "core_model and diffusion" --run-level "core_model"
-            '
-        agents:
-          queue: "mithril-h100-pool"
-        plugins:
-          - kubernetes:
-              podSpec:
-                containers:
-                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                    resources:
-                      limits:
-                        nvidia.com/gpu: 1
-                    volumeMounts:
-                      - name: devshm
-                        mountPath: /dev/shm
-                      - name: hf-cache
-                        mountPath: /root/.cache/huggingface
-                    env:
-                      - name: HF_HOME
-                        value: /root/.cache/huggingface
-                      - name: HF_TOKEN
-                        valueFrom:
-                          secretKeyRef:
-                            name: hf-token-secret
-                            key: token
-                nodeSelector:
-                  node.kubernetes.io/instance-type: gpu-h100-sxm
-                volumes:
+  - label: "Diffusion · Qwen-Image-Layered"
+    key: ready-e2e-diffusion-qwen-image-layered
+    timeout_in_minutes: 50
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 45m bash -c '
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          export VLLM_IMAGE_FETCH_TIMEOUT=60
+          pytest -s -v tests/e2e/online_serving/test_qwen_image_layered.py -m "core_model and diffusion" --run-level "core_model"
+        '
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
                   - name: devshm
-                    emptyDir:
-                      medium: Memory
+                    mountPath: /dev/shm
                   - name: hf-cache
-                    hostPath:
-                      path: /mnt/hf-cache
-                      type: DirectoryOrCreate
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
 
   - label: "Engine Test"
     depends_on: upload-ready-pipeline
