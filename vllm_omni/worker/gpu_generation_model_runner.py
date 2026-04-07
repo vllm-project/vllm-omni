@@ -281,7 +281,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
+                sccot clear_kv_metadata
             ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(

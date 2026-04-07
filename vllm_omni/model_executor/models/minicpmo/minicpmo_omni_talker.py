@@ -459,8 +459,7 @@ class MiniCPMOOmniTalkerForConditionalGeneration(nn.Module, SupportsPP):
                 type(spk_embeds).__name__ if spk_embeds is not None else "None",
                 tts_text[:50],
             )
-            device = input_ids.device if input_ids is not None else "cuda"
-            return torch.zeros(1, 1, device=device), None
+            return None, None
 
         logger.info("Talker generating speech for text: '%s' (spk_embeds shape: %s)",
                      tts_text[:80], list(spk_embeds.shape))

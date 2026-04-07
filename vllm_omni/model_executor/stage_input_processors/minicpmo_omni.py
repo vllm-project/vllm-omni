@@ -141,7 +141,9 @@ def talker2code2wav(
                 else "N/A",
             )
 
-        additional_information = {"mel_spec": mel_spec}
+        additional_information = {}
+        if mel_spec is not None:
+            additional_information["mel_spec"] = mel_spec
 
         # Minimal dummy prompt token IDs for the AR framework (max_tokens=1)
         code2wav_inputs.append(

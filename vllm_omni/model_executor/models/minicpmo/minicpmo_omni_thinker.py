@@ -82,21 +82,32 @@ from transformers.utils import (
     requires_backends,
 )
 from vllm.config import VllmConfig
-# from vllm.config.multimodal import (
-#     AudioDummyOptions,
-#     BaseDummyOptions,
-#     ImageDummyOptions,
-#     VideoDummyOptions,
-# )
+from vllm.config.multimodal import (
+    AudioDummyOptions,
+    BaseDummyOptions,
+    ImageDummyOptions,
+    VideoDummyOptions,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import (
     flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
-    merge_multimodal_embeddings,
 )
-from vllm.utils import flatten_2d_lists
+try:
+    from vllm.model_executor.models.utils import merge_multimodal_embeddings
+except ImportError:
+    from vllm.model_executor.models.utils import (
+        _merge_multimodal_embeddings as merge_multimodal_embeddings,
+    )
+try:
+    from vllm.utils import flatten_2d_lists
+except ImportError:
+
+    def flatten_2d_lists(nested):
+        """vLLM >=0.18 removed vllm.utils.flatten_2d_lists; keep MiniCPM-o vision path working."""
+        return [x for row in nested for x in row]
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     ImageItem,
@@ -121,16 +132,21 @@ from vllm.multimodal.parse import (
 from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    MultiModalPromptUpdates,
-    PlaceholderFeaturesInfo,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
-    ResolvedPromptUpdate,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
+try:
+    from vllm.multimodal.processing import BaseDummyInputsBuilder
+except ImportError:
+    from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.tokenizer import encode_tokens
+try:
+    from vllm.transformers_utils.tokenizer import encode_tokens
+except ImportError:
+
+    def encode_tokens(tokenizer, prompt: str) -> list[int]:
+        return tokenizer.encode(prompt, add_special_tokens=False)
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 logger = init_logger(__name__)
@@ -2799,7 +2815,7 @@ def get_version_by_config(config: PretrainedConfig) -> tuple[int, ...]:
         version_str = str(version_float)
         return tuple(int(x) for x in version_str.split("."))
 
-_MAX_FRAMES_PER_VIDEO = 16
+_MAX_FRAMES_PER_VIDEO = 64
 
 class MiniCPMOOmniThinkerProcessingInfo(BaseProcessingInfo):
     """Processing info for MiniCPM-o thinker multimodal processor."""
@@ -3065,8 +3081,9 @@ class MiniCPMOOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MiniCPMOOmniT
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        # mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> MultiModalDataDict:
+        mm_options = mm_options or {}
         num_images = mm_counts.get("image", 0)
         num_videos = mm_counts.get("video", 0)
         num_audios = mm_counts.get("audio", 0)
@@ -3076,7 +3093,22 @@ class MiniCPMOOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MiniCPMOOmniT
         num_video_frames = self.info.get_num_frames_with_most_features(
             seq_len, mm_counts
         )
-        
+
+        image_opts = mm_options.get("image")
+        image_overrides = image_opts if isinstance(image_opts, ImageDummyOptions) else None
+        audio_opts = mm_options.get("audio")
+        audio_overrides = audio_opts if isinstance(audio_opts, AudioDummyOptions) else None
+        video_opts = mm_options.get("video")
+        video_overrides = video_opts if isinstance(video_opts, VideoDummyOptions) else None
+
+        if video_overrides is not None and video_overrides.num_frames:
+            num_video_frames = min(num_video_frames, video_overrides.num_frames)
+        if video_overrides is not None:
+            if video_overrides.width:
+                video_width = min(video_width, video_overrides.width)
+            if video_overrides.height:
+                video_height = min(video_height, video_overrides.height)
+
         audio_len = (
             self.info.get_max_audio_chunks_with_most_features()
             * self.info.get_default_audio_sampling_rate()
@@ -3087,21 +3119,21 @@ class MiniCPMOOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MiniCPMOOmniT
                 width=image_width,
                 height=image_height,
                 num_images=num_images,
-                # overrides=image_overrides_typed,
+                overrides=image_overrides,
             ),
             "audio": self._get_dummy_audios(
                 length=audio_len,
                 num_audios=num_audios,
-                # overrides=audio_overrides_typed,
+                overrides=audio_overrides,
             ),
             "video": [
                 self._get_dummy_images(
                     width=video_width,
                     height=video_height,
                     num_images=num_video_frames,
-                    # overrides=video_overrides_typed,
                 )
-            ]* num_videos,
+            ]
+            * num_videos,
         }
 
 
@@ -3241,7 +3273,14 @@ class MiniCPMOOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MiniCPMOOmn
         len(image_tags) == len(image_sizes) and fails if given placeholder text
         without corresponding image data (e.g. during profiling/cache-miss path).
         """
+        use_tts = hf_processor_mm_kwargs.get("use_tts", False)
+        if use_tts:
+            hf_processor_mm_kwargs = {
+                k: v for k, v in hf_processor_mm_kwargs.items() if k != "use_tts"
+            }
         if isinstance(prompt, str):
+            if use_tts:
+                prompt = prompt + self._TTS_SUFFIX
             if enable_hf_prompt_update:
                 return self._apply_hf_processor_text_mm(
                     prompt_text=prompt,
@@ -3253,6 +3292,12 @@ class MiniCPMOOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MiniCPMOOmn
             prompt_ids = encode_tokens(tokenizer, prompt)
         else:
             prompt_ids = self._apply_hf_processor_tokens_only(prompt)
+            if use_tts:
+                tokenizer = self.info.get_tokenizer()
+                tts_ids = tokenizer.convert_tokens_to_ids(
+                    ["<|spk_bos|>", "<|spk|>", "<|spk_eos|>", "<|tts_bos|>"]
+                )
+                prompt_ids = list(prompt_ids) + tts_ids
 
         mm_processed_data = self._apply_hf_processor_mm_only(
             mm_items=mm_items,
@@ -3262,6 +3307,8 @@ class MiniCPMOOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MiniCPMOOmn
 
         return prompt_ids, mm_processed_data, False
 
+    _TTS_SUFFIX = "<|spk_bos|><|spk|><|spk_eos|><|tts_bos|>"
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -3270,6 +3317,11 @@ class MiniCPMOOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MiniCPMOOmn
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         tokenizer = self.info.get_tokenizer()
+
+        use_tts = mm_kwargs.get("use_tts", False)
+        if use_tts:
+            prompt = prompt + self._TTS_SUFFIX
+            mm_kwargs = {k: v for k, v in mm_kwargs.items() if k != "use_tts"}
 
         input_ids = torch.tensor([tokenizer.encode(prompt, **tok_kwargs)])
         mm_inputs = self.process_mm_inputs(mm_data, mm_kwargs, tok_kwargs)
@@ -3938,11 +3990,47 @@ class MiniCPMOOmniThinkerForConditionalGeneration(
 
         tgt_sizes = kwargs.pop("tgt_sizes")
 
-        num_slices = [[len(p) for p in ps] for ps in pixel_values]
-        num_slices_flat = flatten_bn(torch.tensor(num_slices))
+        # vLLM 0.18 profiling batches pixel_values as a dense tensor; the HF path
+        # uses nested lists [[slice_tensor, ...], ...] per image/video.
+        if isinstance(pixel_values, torch.Tensor):
+            t = pixel_values
+            if t.ndim == 5:
+                t = flatten_bn(t)
+            if t.ndim == 4:
+                if t.shape[1] != 3:
+                    raise ValueError(
+                        "pixel_values tensor must have shape (N, 3, H, W), "
+                        f"got {tuple(t.shape)}"
+                    )
+                n = t.shape[0]
+                pixel_values = [[t[i].contiguous() for i in range(n)]]
+            elif t.ndim == 3 and t.shape[1] == 3:
+                n = t.shape[0]
+                pixel_values = [[t[i].contiguous() for i in range(n)]]
+            else:
+                raise ValueError(
+                    "Unsupported pixel_values tensor for vision parsing: "
+                    f"shape={tuple(t.shape)}"
+                )
 
-        pixel_values_flat = flatten_bn(flatten_2d_lists(pixel_values))
-        tgt_sizes_flat = flatten_bn(flatten_2d_lists(tgt_sizes), concat=True)
+        # Match vLLM MiniCPMV: count slices per image with len(ps), and flatten
+        # only the outer nesting. Do NOT use flatten_2d_lists here — flatten_bn
+        # on a flat list of (3,H,W) tensors would iterate dim 0 and split RGB.
+        num_slices_flat = torch.tensor([len(ps) for ps in pixel_values])
+        pixel_values_flat = flatten_bn(pixel_values)
+
+        if isinstance(tgt_sizes, torch.Tensor):
+            ts = tgt_sizes
+            if ts.ndim == 3:
+                tgt_sizes_flat = ts.flatten(0, 1).contiguous()
+            elif ts.ndim == 2:
+                tgt_sizes_flat = ts.contiguous()
+            else:
+                raise ValueError(
+                    f"Unsupported tgt_sizes tensor shape {tuple(ts.shape)}"
+                )
+        else:
+            tgt_sizes_flat = flatten_bn(tgt_sizes, concat=True)
 
         return MiniCPMVImagePixelInputs(
             type="pixel_values",

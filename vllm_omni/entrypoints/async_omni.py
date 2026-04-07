@@ -265,9 +265,12 @@ class AsyncOmni(OmniBase):
                     )
                     # Initialize model_config
                     self.model_config = vllm_config.model_config
-                    # Initialize io_processor
                     io_processor_plugin = self.model_config.io_processor_plugin
-                    self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+                    self.io_processor = get_io_processor(
+                        vllm_config,
+                        self.input_processor.renderer,
+                        io_processor_plugin,
+                    )
 
                     logger.info(
                         f"[{self._name}] Initialized input_processor, "

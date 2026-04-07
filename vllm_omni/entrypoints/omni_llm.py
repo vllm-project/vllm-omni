@@ -172,7 +172,11 @@ class OmniLLM(LLM):
         self.renderer = self.llm_engine.renderer
         # Load the Input/Output processor plugin if any
         io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
-        self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
+        self.io_processor = get_io_processor(
+            self.llm_engine.vllm_config,
+            self.renderer,
+            io_processor_plugin,
+        )
         self.model_config = self.llm_engine.model_config
         self.input_processor = self.llm_engine.input_processor
 

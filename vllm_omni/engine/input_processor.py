@@ -17,6 +17,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.jsontree import json_iter_leaves
+from vllm.platforms import current_platform
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.engine import (
@@ -184,7 +185,7 @@ class OmniInputProcessor(InputProcessor):
                 tokenization_kwargs=tokenization_kwargs,
             )
 
-        self._platform_validate_request(processed_inputs, params)
+        current_platform.validate_request(processed_inputs, params)
 
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
         self._validate_model_inputs(encoder_inputs, decoder_inputs)

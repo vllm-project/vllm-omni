@@ -32,7 +32,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.minicpmo.minicpmo_omni_thinker import MiniCPMOConfig
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -181,12 +181,37 @@ class MiniCPMOOmniForConditionalGeneration(
         multimodal_embeddings=None,
     ) -> torch.Tensor:
         if self.model_stage == "code2wav":
-            return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
+            tts_cfg = getattr(self.config, "tts_config", None)
+            hs = getattr(tts_cfg, "hidden_size", 768) if tts_cfg else 768
+            return torch.zeros(
+                input_ids.shape[0], hs,
+                device=input_ids.device, dtype=torch.bfloat16,
+            )
         return self.model.get_input_embeddings(input_ids, multimodal_embeddings)
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal=None,
+    ) -> torch.Tensor:
+        if self.model_stage in ("talker", "code2wav"):
+            return self.get_input_embeddings(input_ids)
+        return super().embed_input_ids(
+            input_ids, multimodal_embeddings, is_multimodal=is_multimodal
+        )
     
     def get_multimodal_embeddings(self, **kwargs):
-        # Delegate to thinker model for multimodal processing
-        return self.model.get_multimodal_embeddings(**kwargs)
+        # Delegate to the active stage submodule when it implements MM encoding.
+        mm_fn = getattr(self.model, "get_multimodal_embeddings", None)
+        if mm_fn is not None:
+            return mm_fn(**kwargs)
+        return []
+
+    def embed_multimodal(self, **kwargs: object):
+        """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
+        return self.get_multimodal_embeddings(**kwargs)
     
     def forward(
         self,
@@ -236,7 +261,7 @@ class MiniCPMOOmniForConditionalGeneration(
             if inputs_embeds is not None and inputs_embeds.device != thinker_dev:
                 inputs_embeds = inputs_embeds.to(thinker_dev)
             
-            if is_npu():
+            if current_omni_platform.is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
                 thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
                 thinker_positions = positions[0] if positions.ndim > 1 else positions
@@ -286,9 +311,10 @@ class MiniCPMOOmniForConditionalGeneration(
                 device = torch.device("cuda")
             hidden_dim = self.config.hidden_size if hasattr(self.config, "hidden_size") else 2560
 
-            # Profile/dummy run (e.g. model warmup): input_ids is None,
-            # skip TTS pipeline and return correctly-shaped dummy output.
-            if input_ids is None:
+            # Profile/dummy run: both input_ids and inputs_embeds are None.
+            # Note: SupportsMultiModal preprocessing converts input_ids to
+            # inputs_embeds, so input_ids=None alone does NOT indicate a dummy run.
+            if input_ids is None and inputs_embeds is None:
                 dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
 
@@ -334,8 +360,8 @@ class MiniCPMOOmniForConditionalGeneration(
                 device = torch.device("cuda")
             hidden_dim = self.config.hidden_size if hasattr(self.config, "hidden_size") else 2560
 
-            # Profile/dummy run: skip vocoder, return correctly-shaped dummy output
-            if input_ids is None:
+            # Profile/dummy run: both input_ids and inputs_embeds are None.
+            if input_ids is None and inputs_embeds is None:
                 dummy_hidden = torch.zeros(n_tokens, hidden_dim, device=device)
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
 
