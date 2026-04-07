@@ -114,7 +114,7 @@ class NextStepConfig(LlamaConfig):
 
 
 class NextStepModel(nn.Module):
-    def __init__(self, config: NextStepConfig):
+    def __init__(self, config: NextStepConfig, quant_config=None):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -122,7 +122,10 @@ class NextStepModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                LlamaDecoderLayer(config, layer_idx, quant_config=quant_config)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)

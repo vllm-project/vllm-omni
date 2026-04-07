@@ -169,7 +169,7 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Load model from local TP-aware code (weights loaded later via load_weights)
         config = NextStepConfig.from_json(os.path.join(model_path, "config.json"))
-        self.model = NextStepModel(config)
+        self.model = NextStepModel(config, quant_config=od_config.quantization_config)
         self.model.eval()
 
         # Load config
