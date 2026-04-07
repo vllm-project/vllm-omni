@@ -658,11 +658,13 @@ class TestTTSMethods:
         mock_engine_client.tts_max_instructions_length = None
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
-        return OmniOpenAIServingSpeech(
+        server = OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
             models=mock_models,
             request_logger=mocker.MagicMock(),
         )
+        yield server
+        server.shutdown()
 
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
@@ -1639,11 +1641,13 @@ def fish_speech_server(mocker: MockerFixture):
     mock_models = mocker.MagicMock()
     mock_models.is_base_model.return_value = True
 
-    return OmniOpenAIServingSpeech(
+    server = OmniOpenAIServingSpeech(
         engine_client=mock_engine_client,
         models=mock_models,
         request_logger=mocker.MagicMock(),
     )
+    yield server
+    server.shutdown()
 
 
 class TestFishSpeechServing:
@@ -1717,7 +1721,7 @@ class TestFishSpeechServing:
             fish_speech_server._build_fish_speech_prompt(request)
 
     def test_prepare_speech_generation_overrides_fish_default_max_tokens(self, fish_speech_server):
-        fish_speech_server._build_fish_speech_prompt = MagicMock(
+        fish_speech_server._build_fish_speech_prompt_async = AsyncMock(
             return_value={
                 "prompt_token_ids": [1, 2, 3],
                 "additional_information": {},
@@ -1730,13 +1734,14 @@ class TestFishSpeechServing:
 
         assert request_id.startswith("speech-")
         assert generator == "generator"
+        fish_speech_server._build_fish_speech_prompt_async.assert_awaited_once()
         fish_speech_server.engine_client.generate.assert_called_once()
         sampling_params_list = fish_speech_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
         assert sampling_params_list[0].max_tokens == 4096
         assert fish_speech_server.engine_client.default_sampling_params_list[0].max_tokens == 2048
 
     def test_prepare_speech_generation_uses_stage_default_max_tokens(self, fish_speech_server):
-        fish_speech_server._build_fish_speech_prompt = MagicMock(
+        fish_speech_server._build_fish_speech_prompt_async = AsyncMock(
             return_value={
                 "prompt_token_ids": [1, 2, 3],
                 "additional_information": {},
@@ -1985,3 +1990,115 @@ class TestCosyVoice3Serving:
         assert generator == "generator"
         assert tts_params == {}
         cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
+
+
+class TestTTSAsyncOffloading:
+    """Tests for event-loop-safe offloading of blocking TTS operations."""
+
+    def test_build_voxtral_prompt_is_sync(self):
+        """_build_voxtral_prompt should be a regular function, not a coroutine."""
+        assert not asyncio.iscoroutinefunction(OmniOpenAIServingSpeech._build_voxtral_prompt)
+
+    @pytest.fixture
+    def voxtral_server(self, mocker: MockerFixture):
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.model_config = mocker.MagicMock(model="mistralai/Voxtral")
+        mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        mock_engine_client.tts_batch_max_items = 32
+        mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                engine_args=SimpleNamespace(model_stage="audio_generation"),
+                tts_args={},
+            )
+        ]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        yield server
+        server.shutdown()
+
+    @pytest.fixture
+    def qwen3_tts_server(self, mocker: MockerFixture):
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.model_config = mocker.MagicMock(model="Qwen/Qwen3-TTS", hf_config=mocker.MagicMock())
+        mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        mock_engine_client.tts_batch_max_items = 32
+        mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                engine_args=SimpleNamespace(model_stage="qwen3_tts"),
+                tts_args={},
+            )
+        ]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        yield server
+        server.shutdown()
+
+    def test_prepare_speech_generation_awaits_voxtral_async(self, voxtral_server):
+        """Voxtral path in _prepare_speech_generation should call the async wrapper."""
+        voxtral_server._build_voxtral_prompt_async = AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test")
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+        voxtral_server._build_voxtral_prompt_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server):
+        """Qwen3 TTS path should call _estimate_prompt_len_async."""
+        qwen3_tts_server._validate_tts_request = MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = AsyncMock(return_value=512)
+        request = OpenAICreateSpeechRequest(input="hello")
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+        qwen3_tts_server._build_tts_params.assert_called_once()
+        qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_shutdown_is_idempotent(self, mocker: MockerFixture):
+        """Calling shutdown() twice should not raise."""
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_configs = []
+        mock_engine_client.tts_max_instructions_length = None
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        assert server._tts_executor is not None
+        server.shutdown()
+        assert server._tts_executor is None
+        server.shutdown()  # Should not raise
+        assert server._tts_executor is None
+
+    def test_diffusion_instance_shutdown_safe(self):
+        """Diffusion instances (created via for_diffusion) should have safe shutdown."""
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=MagicMock(), model_name="test-model")
+        assert server._tts_executor is None
+        server.shutdown()  # Should not raise
