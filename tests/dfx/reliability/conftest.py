@@ -163,14 +163,30 @@ while allocated < target_bytes:
     except RuntimeError:
         break
 
+# In strict mode, keep filling with smaller chunks until allocator rejects.
+# This minimizes residual free memory and makes fault-path assertions steadier.
+if strict:
+    tail_chunk_bytes = [64 * 1024 * 1024, 16 * 1024 * 1024, 4 * 1024 * 1024, 1 * 1024 * 1024]
+    for tail_bytes in tail_chunk_bytes:
+        while True:
+            req_elems = max(1, tail_bytes // 2)
+            try:
+                chunk = torch.empty((req_elems,), dtype=torch.float16, device=f"cuda:{device}")
+                chunks.append(chunk)
+                allocated += chunk.numel() * 2
+            except RuntimeError:
+                break
+
 achieved_ratio = allocated / max(1, props.total_memory)
 achieved_free_ratio = allocated / max(1, int(free_before))
+free_after, _ = torch.cuda.mem_get_info(device)
 if strict and allocated < target_bytes:
     print(
         "ERROR:"
         f"achieved_free_ratio={achieved_free_ratio:.4f};"
         f"achieved_total_ratio={achieved_ratio:.4f};"
         f"free_before={int(free_before)};"
+        f"free_after={int(free_after)};"
         f"target_bytes={target_bytes};"
         f"allocated={allocated}",
         flush=True,
@@ -182,6 +198,7 @@ print(
     f"achieved_free_ratio={achieved_free_ratio:.4f};"
     f"achieved_total_ratio={achieved_ratio:.4f};"
     f"free_before={int(free_before)};"
+    f"free_after={int(free_after)};"
     f"target_bytes={target_bytes};"
     f"allocated={allocated}",
     flush=True,
