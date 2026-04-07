@@ -3,6 +3,7 @@
 
 import math
 from collections.abc import Iterable
+from importlib.util import find_spec
 from typing import Any
 
 import torch
@@ -29,6 +30,8 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -396,6 +399,7 @@ class WanSelfAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
         )
+        self.rope = RotaryEmbedding(is_neox_style=False)
 
     def forward(
         self,
@@ -422,8 +426,12 @@ class WanSelfAttention(nn.Module):
         # Apply rotary embeddings
         if rotary_emb is not None:
             freqs_cos, freqs_sin = rotary_emb
-            query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
-            key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
+            if find_spec("mindiesd") is not None and current_omni_platform.is_npu():
+                query = self.rope(query, freqs_cos, freqs_sin)
+                key = self.rope(key, freqs_cos, freqs_sin)
+            else:
+                query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
+                key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
         # Create attention metadata if mask is provided
         attn_metadata = None
