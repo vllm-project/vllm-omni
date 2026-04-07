@@ -408,6 +408,11 @@ steps:
                 env:
                   - name: HF_HOME
                     value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
             nodeSelector:
               node.kubernetes.io/instance-type: gpu-h100-sxm
             volumes:

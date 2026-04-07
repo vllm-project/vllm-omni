@@ -348,6 +348,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
         # Pre-allocated buffers (lazily initialized on first forward).
         self._proj_buf: torch.Tensor | None = None
+        self._model_dtype: torch.dtype | None = None
 
         # torch.compile + warmup state (lazily initialized in _setup_compile).
         self._compiled_model_fwd = None
@@ -404,6 +405,10 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         """Lazily set up torch.compile with manual CUDA graph capture."""
         if self._compiled_model_fwd is not None:
             return
+        # Cache model parameter dtype so forward() doesn't need to query it
+        # on every call.  Also ensures warmup buffers match model precision
+        # even when upstream modules produce a different dtype (#2385).
+        self._model_dtype = next(self.model.parameters()).dtype
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
         if not current_omni_platform.supports_torch_inductor():
@@ -443,6 +448,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         max_seq = self._num_groups + 1
         device = next(self.model.parameters()).device
 
+        # Ensure proj_buf matches model parameter dtype to avoid dtype
+        # mismatch during warmup compilation (see #2385).
+        self._ensure_buffers(device, self._model_dtype)
         proj_buf = self._proj_buf
         for bsz in self._bucket_sizes:
             # position_ids: [batch, seq_len] for HF-style RoPE
@@ -499,13 +507,15 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         bsz = int(layer0_code.shape[0])
         num_groups = self._num_groups
         device = layer0_code.device
-        dtype = layer0_embed.dtype
 
         all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
         all_codes[:, 0] = layer0_code.reshape(bsz)
 
-        self._ensure_buffers(device, dtype)
+        # _setup_compile caches _model_dtype on first call; use it for buffers
+        # so they always match model weight precision (#2385).
         self._setup_compile()
+        dtype = self._model_dtype
+        self._ensure_buffers(device, dtype)
 
         proj_buf = self._proj_buf
         max_seq = self._num_groups + 1
@@ -525,8 +535,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         padded_bsz = self._padded_bsz(bsz)
         proj_buf[:padded_bsz].zero_()
 
-        proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1)).reshape(bsz, -1)
-        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+        proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
         full_pos_ids = self._bucket_pos_ids.get(padded_bsz)
         if full_pos_ids is None:
             full_pos_ids = torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1)

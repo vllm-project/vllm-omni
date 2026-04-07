@@ -94,8 +94,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
 
-        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(scheduler_output.preempted_req_ids)
+        if has_kv_transfer_group():
+            kv_connector_metadata = scheduler_output.kv_connector_metadata
+            if kv_connector_metadata is not None:
+                get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -104,7 +106,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         ):
             if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
-            self._update_states(scheduler_output)
+            deferred_state_corrections_fn = self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -309,6 +311,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             slot_mappings,  # OMNI: pass slot_mappings for upstream v1 API compatibility
         )
         self.kv_connector_output = kv_connector_output
+
+        if deferred_state_corrections_fn:
+            deferred_state_corrections_fn()
+
         return None
 
     @torch.inference_mode()
@@ -636,11 +642,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]  # type: ignore[assignment]
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
-                self.seq_lens.np[:num_reqs] = seq_lens
-                self.seq_lens.np[num_reqs:] = 0
-                self.seq_lens.copy_to_gpu()
+                self.seq_lens[:num_reqs] = (
+                    seq_lens
+                    if isinstance(seq_lens, int)
+                    else torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+                )
+                self.seq_lens[num_reqs:] = 0
 
-                cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+                cum_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self._arange_scratch)
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
 
@@ -696,7 +705,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
-                positions = self.positions.gpu[:num_tokens_padded]
+                positions = self.positions[:num_tokens_padded]
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None

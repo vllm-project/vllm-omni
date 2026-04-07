@@ -2036,7 +2036,7 @@ class HunyuanImage3Model(nn.Module):
         for name, loaded_weight in weights:
             # print(f"Loading weight name: {name}, tp_rank: {tp_rank}", flush=True)
             if contains_unexpected_keyword(name, unexpected_keywords):
-                print(f"Skipping unexpected weight name: {name}")
+                logger.warning("Skipping unexpected weight name: %s", name)
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue

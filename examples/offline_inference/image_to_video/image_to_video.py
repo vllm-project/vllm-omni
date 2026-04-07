@@ -490,10 +490,6 @@ def main():
         if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
             frames_np = frames_np[..., :3]
 
-        frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
-        video_tensor = torch.from_numpy(frames_u8)
-
         audio_out = None
         if audio is not None:
             if isinstance(audio, list):
@@ -507,7 +503,7 @@ def main():
                 audio_out = audio_out.float().cpu()
 
         encode_video(
-            video_tensor,
+            frames_np,
             fps=fps,
             audio=audio_out,
             audio_sample_rate=args.audio_sample_rate if audio_out is not None else None,

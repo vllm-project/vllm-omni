@@ -539,6 +539,7 @@ class WanCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            skip_sequence_parallel=True,
         )
 
     def forward(
@@ -724,7 +725,7 @@ class WanTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["WanTransformerBlock"]
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }

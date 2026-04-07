@@ -579,6 +579,7 @@ class ZImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["layers"]
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:

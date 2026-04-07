@@ -233,6 +233,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 - `consent` (required): Consent recording ID
 - `name` (required): Name for the new voice
 - `ref_text` (optional): Transcript of the audio. Enables in-context voice cloning (higher quality).
+- `speaker_description` (optional): Free-form description of the voice (e.g. "warm narrator", "energetic presenter").
 
 **Response Example:**
 ```json
@@ -243,10 +244,14 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
     "consent": "user_consent_id",
     "created_at": 1738660000,
     "mime_type": "audio/wav",
-    "file_size": 1024000
+    "file_size": 1024000,
+    "ref_text": "The exact transcript of the audio sample.",
+    "speaker_description": "warm narrator"
   }
 }
 ```
+
+Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
 
 **Usage Example:**
 ```bash
@@ -254,7 +259,8 @@ curl -X POST http://localhost:8000/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1" \
-  -F "ref_text=The exact transcript of the audio sample."
+  -F "ref_text=The exact transcript of the audio sample." \
+  -F "speaker_description=warm narrator"
 ```
 
 ### Endpoint

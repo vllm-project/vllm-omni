@@ -229,6 +229,24 @@ def _wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
     return False
 
 
+def _is_mooncake_master_available() -> bool:
+    """Check if mooncake_master binary is present and can actually execute."""
+    import shutil
+
+    binary = shutil.which("mooncake_master")
+    if binary is None:
+        return False
+    try:
+        result = subprocess.run(
+            [binary, "--help"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode != 127
+    except (subprocess.TimeoutExpired, OSError):
+        return True
+
+
 def _cleanup_mooncake_processes(timeout_secs: int = 5) -> None:
     """Clean up any existing mooncake_master processes.
 
@@ -292,6 +310,8 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_text2img_mooncake_connector(run_level):
     """Test Bagel text2img with Mooncake connector for inter-stage communication."""
+    if not _is_mooncake_master_available():
+        pytest.skip("mooncake_master is not available or cannot execute (missing shared libraries like libibverbs)")
     MOONCAKE_HOST = "127.0.0.1"
     MOONCAKE_RPC_PORT = _find_free_port()
     MOONCAKE_HTTP_PORT = _find_free_port()
