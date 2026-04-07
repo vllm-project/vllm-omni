@@ -42,7 +42,10 @@ from vllm_omni.engine import (
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.engine.stage_engine_core_proc import (
     complete_stage_handshake,
@@ -167,6 +170,38 @@ def _upgrade_to_omni_request(
         external_req_id=request.external_req_id,
         reasoning_ended=request.reasoning_ended,
         additional_information=additional_information,
+    )
+
+
+def _apply_omni_final_stage_metadata(
+    request: EngineCoreRequest,
+    final_stage_id: int,
+) -> EngineCoreRequest:
+    """Tag EngineCoreRequest so OmniARScheduler can skip DiT KV when final_stage_id is 0."""
+    merged: dict[str, Any] = {}
+    if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
+        merged = deserialize_additional_information(request.additional_information)
+    merged["omni_final_stage_id"] = final_stage_id
+    payload = serialize_additional_information(merged)
+    return OmniEngineCoreRequest(
+        request_id=request.request_id,
+        prompt_token_ids=request.prompt_token_ids,
+        mm_features=request.mm_features,
+        sampling_params=request.sampling_params,
+        pooling_params=request.pooling_params,
+        arrival_time=request.arrival_time,
+        lora_request=request.lora_request,
+        cache_salt=request.cache_salt,
+        data_parallel_rank=request.data_parallel_rank,
+        prompt_embeds=request.prompt_embeds,
+        client_index=request.client_index,
+        current_wave=request.current_wave,
+        priority=request.priority,
+        trace_headers=request.trace_headers,
+        resumable=request.resumable,
+        external_req_id=request.external_req_id,
+        reasoning_ended=request.reasoning_ended,
+        additional_information=payload,
     )
 
 
@@ -713,6 +748,7 @@ class AsyncOmniEngine:
             # to match the key used in Orchestrator.request_states so that
             # output routing (output.request_id lookup) can find the req_state.
             request.external_req_id = request_id
+            request = _apply_omni_final_stage_metadata(request, final_stage_id)
 
             # Register with stage 0's output processor.
             output_prompt_text = prompt_text
