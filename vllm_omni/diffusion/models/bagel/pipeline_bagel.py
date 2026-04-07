@@ -675,6 +675,8 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
             (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
             (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
+            (".gate_up_proj", ".gate_proj"),
+            (".gate_up_proj", ".up_proj"),
         ]
         stacked_source_names: set[str] = set()
         for name in list(allowed):
