@@ -86,11 +86,15 @@ def assert_image_diffusion_response(
             "request_type": "image",
             "extra_body": {
                 "num_outputs_per_prompt": 1,
-                "width": ...,
-                "height": ...,
+                "width": int | list[int],   # scalar = same for every output image
+                "height": int | list[int],  # or same-length lists as returned images
                 ...
             }
         }
+
+    When ``width`` / ``height`` are lists, their length must match the number of
+    decoded output images (``len(response.images)``), so each size can differ
+    (e.g. multi-reference edit with distinct expected resolutions).
     """
     assert response.images is not None, "Image response is None"
     assert len(response.images) > 0, "No images in response"
@@ -103,13 +107,31 @@ def assert_image_diffusion_response(
             f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
         )
 
-    if run_level == "advanced_model":
-        width = extra_body.get("width")
-        height = extra_body.get("height")
+    width = extra_body.get("width")
+    height = extra_body.get("height")
 
-        if width is not None or height is not None:
-            for img in response.images:
-                assert_image_valid(img, width=width, height=height)
+    if width is None and height is None:
+        return
+
+    n = len(response.images)
+    width_is_seq = isinstance(width, (list, tuple))
+    height_is_seq = isinstance(height, (list, tuple))
+
+    if width_is_seq or height_is_seq:
+        assert width_is_seq and height_is_seq, (
+            "extra_body: when using per-image sizes, both width and height must be lists "
+            f"(got width={type(width).__name__}, height={type(height).__name__})"
+        )
+        assert len(width) == len(height) == n, (
+            "extra_body width/height list lengths must match the number of output images: "
+            f"expected width/height len {n}, got len(width)={len(width)} len(height)={len(height)} "
+            f"(decoded images={n})"
+        )
+        for img, w, h in zip(response.images, width, height, strict=True):
+            assert_image_valid(img, width=int(w) if w is not None else None, height=int(h) if h is not None else None)
+    else:
+        for img in response.images:
+            assert_image_valid(img, width=width, height=height)
 
 
 def assert_video_diffusion_response(
@@ -1559,14 +1581,15 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         model = model_prefix + params.model
         port = params.port
         stage_config_path = params.stage_config_path
-        if run_level == "advanced_model" and stage_config_path is not None:
+        if run_level == "core_model" and stage_config_path is not None:
             with open(stage_config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
-            stage_config_path = modify_stage_config(
-                stage_config_path,
-                deletes={"stage_args": {stage_id: ["engine_args.load_format"] for stage_id in stage_ids}},
-            )
+            if stage_ids:
+                stage_config_path = modify_stage_config(
+                    stage_config_path,
+                    updates={"stage_args": {sid: {"engine_args.load_format": "dummy"} for sid in stage_ids}},
+                )
 
         server_args = params.server_args or []
         if params.use_omni:
@@ -1964,26 +1987,27 @@ def assert_diffusion_response(response: DiffusionResponse, request_config: dict[
     has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
     assert has_any_content, "Response contains no images, videos, or audios"
 
-    if response.images is not None:
-        assert_image_diffusion_response(
-            response=response,
-            request_config=request_config,
-            run_level=run_level,
-        )
+    if run_level == "advanced_model":
+        if response.images is not None:
+            assert_image_diffusion_response(
+                response=response,
+                request_config=request_config,
+                run_level=run_level,
+            )
 
-    if response.videos is not None:
-        assert_video_diffusion_response(
-            response=response,
-            request_config=request_config,
-            run_level=run_level,
-        )
+        if response.videos is not None:
+            assert_video_diffusion_response(
+                response=response,
+                request_config=request_config,
+                run_level=run_level,
+            )
 
-    if response.audios is not None:
-        assert_audio_diffusion_response(
-            response=response,
-            request_config=request_config,
-            run_level=run_level,
-        )
+        if response.audios is not None:
+            assert_audio_diffusion_response(
+                response=response,
+                request_config=request_config,
+                run_level=run_level,
+            )
 
 
 class OpenAIClientHandler:
@@ -2354,7 +2378,9 @@ class OpenAIClientHandler:
 
         return responses
 
-    def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_audio_speech_request(
+        self, request_config: dict[str, Any] | list[dict[str, Any]], request_num: int = 1
+    ) -> list[OmniResponse]:
         """
         Call the /v1/audio/speech endpoint using the same configuration-dict
         style as send_omni_request, but via the OpenAI Python client's
@@ -2368,152 +2394,174 @@ class OpenAIClientHandler:
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
         """
-        timeout = float(request_config.get("timeout", 120.0))
+        if isinstance(request_config, list):
+            configs = list(request_config)
+            if not configs:
+                raise ValueError("request_config list must not be empty")
+            if request_num not in (1, len(configs)):
+                raise ValueError(
+                    "When request_config is a list, request_num must be 1 (use len(list)) or "
+                    f"len(request_config)={len(configs)}, got request_num={request_num}"
+                )
+        else:
+            if request_num < 1:
+                raise ValueError("request_num must be >= 1")
+            configs = [request_config] * request_num
 
-        model = request_config["model"]
-        text_input = request_config["input"]
-        stream = bool(request_config.get("stream", False))
-        voice = request_config.get("voice", None)
+        def _build_kwargs(cfg: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+            timeout = float(cfg.get("timeout", 120.0))
+            voice = cfg.get("voice", None)
+            response_format = cfg.get("response_format", omit)
 
-        # Standard OpenAI param: use omit when not provided to keep default behavior.
-        response_format = request_config.get("response_format", omit)
+            extra_body: dict[str, Any] = {}
+            # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
+            for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens"):
+                if key in cfg:
+                    extra_body[key] = cfg[key]
 
-        # Qwen3-TTS custom fields, forwarded via extra_body.
-        extra_body: dict[str, Any] = {}
-        # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
-        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens"):
-            if key in request_config:
-                extra_body[key] = request_config[key]
+            speech_fmt: str | None = None if response_format is omit else str(response_format).lower()
+
+            kwargs: dict[str, Any] = {
+                "model": cfg["model"],
+                "input": cfg["input"],
+                "response_format": response_format,
+                "extra_body": extra_body or None,
+                "timeout": timeout,
+                "voice": voice,
+            }
+            return kwargs, speech_fmt
 
         responses: list[OmniResponse] = []
 
-        speech_fmt: str | None = None if response_format is omit else str(response_format).lower()
-
-        if request_num == 1:
+        if len(configs) == 1:
+            cfg = configs[0]
+            kwargs, speech_fmt = _build_kwargs(cfg)
+            stream = bool(cfg.get("stream", False))
             if stream:
-                # Use streaming response helper.
-                with self.client.audio.speech.with_streaming_response.create(
-                    model=model,
-                    input=text_input,
-                    response_format=response_format,
-                    extra_body=extra_body or None,
-                    timeout=timeout,
-                    voice=voice,
-                ) as resp:
+                with self.client.audio.speech.with_streaming_response.create(**kwargs) as resp:
                     omni_resp = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
             else:
-                # Non-streaming response.
-                resp = self.client.audio.speech.create(
-                    model=model,
-                    input=text_input,
-                    response_format=response_format,
-                    extra_body=extra_body or None,
-                    timeout=timeout,
-                    voice=voice,
-                )
+                resp = self.client.audio.speech.create(**kwargs)
                 omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
 
-            assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+            assert_audio_speech_response(omni_resp, cfg, run_level=self.run_level)
             responses.append(omni_resp)
             return responses
+
+        # Concurrent path: each request uses its own cfg (or repeated cfgs when caller passed a dict)
+        for cfg in configs:
+            if cfg.get("stream", False):
+                # Keep behavior simple: do not mix stream and non-stream in a single batch.
+                continue
+
+        if any(bool(cfg.get("stream", False)) for cfg in configs):
+
+            def _stream_task(cfg: dict[str, Any]):
+                kwargs, speech_fmt = _build_kwargs(cfg)
+                with self.client.audio.speech.with_streaming_response.create(**kwargs) as resp:
+                    return self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(configs)) as executor:
+                futures = [executor.submit(_stream_task, cfg) for cfg in configs]
+                for future, cfg in zip(futures, configs, strict=True):
+                    omni_resp = future.result()
+                    assert_audio_speech_response(omni_resp, cfg, run_level=self.run_level)
+                    responses.append(omni_resp)
         else:
-            # request_num > 1: concurrent requests (use same params as single-request path)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(configs)) as executor:
+                futures = []
+                speech_fmts: list[str | None] = []
+                for cfg in configs:
+                    kwargs, speech_fmt = _build_kwargs(cfg)
+                    speech_fmts.append(speech_fmt)
+                    futures.append(executor.submit(self.client.audio.speech.create, **kwargs))
 
-            if stream:
-
-                def _stream_task():
-                    with self.client.audio.speech.with_streaming_response.create(
-                        model=model,
-                        input=text_input,
-                        response_format=response_format,
-                        extra_body=extra_body or None,
-                        timeout=timeout,
-                        voice=voice,
-                    ) as resp:
-                        return self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                    futures = [executor.submit(_stream_task) for _ in range(request_num)]
-                    for future in concurrent.futures.as_completed(futures):
-                        omni_resp = future.result()
-                        assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
-                        responses.append(omni_resp)
-            else:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                    futures = []
-                    for _ in range(request_num):
-                        future = executor.submit(
-                            self.client.audio.speech.create,
-                            model=model,
-                            input=text_input,
-                            response_format=response_format,
-                            extra_body=extra_body or None,
-                            timeout=timeout,
-                            voice=voice,
-                        )
-                        futures.append(future)
-
-                    for future in concurrent.futures.as_completed(futures):
-                        resp = future.result()
-                        omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
-                        assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
-                        responses.append(omni_resp)
+                for future, cfg, speech_fmt in zip(futures, configs, speech_fmts, strict=True):
+                    resp = future.result()
+                    omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
+                    assert_audio_speech_response(omni_resp, cfg, run_level=self.run_level)
+                    responses.append(omni_resp)
 
         return responses
 
-    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_diffusion_request(
+        self, request_config: dict[str, Any] | list[dict[str, Any]], request_num: int = 1
+    ) -> list[OmniResponse]:
         """
         Send OpenAI requests for diffusion models.
 
         Args:
-            request_config: Request configuration dictionary containing parameters like model, messages
-            request_num: Number of requests to send concurrently, defaults to 1 (single request)
+            request_config: Either a single request dict, or a **list** of dicts (one per concurrent
+                request). When a list is passed, each entry is sent in parallel with its own
+                ``model`` / ``messages`` / ``extra_body`` / ``modalities``. In that case
+                ``request_num`` must be ``1`` (meaning: use ``len(request_config)``) or equal to
+                ``len(request_config)``.
+                ``extra_body`` may include ``width`` / ``height`` as ``int`` (same for every output image)
+                or as ``list[int]`` with one entry per decoded output image (see
+                ``assert_image_diffusion_response``).
+            request_num: When ``request_config`` is a **dict**: number of identical concurrent
+                requests (default 1). When ``request_config`` is a **list**: must be ``1`` or
+                ``len(request_config)`` (the number of parallel jobs is always ``len(list)``).
         Returns:
-            List[OmniResponse]: List of response objects
+            List of processed diffusion response objects (one per completed request). When
+            ``request_config`` is a list, ordering matches the input list; each response is asserted
+            with its matching dict in ``assert_diffusion_response``.
         """
-        responses = []
-        stream = request_config.get("stream", False)
-        modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
-        extra_body = request_config.get("extra_body", None)
+        if isinstance(request_config, list):
+            configs = list(request_config)
+            if not configs:
+                raise ValueError("request_config list must not be empty")
+            if request_num not in (1, len(configs)):
+                raise ValueError(
+                    "When request_config is a list, request_num must be 1 (use len(list)) or "
+                    f"len(request_config)={len(configs)}, got request_num={request_num}"
+                )
+            request_num = len(configs)
+        else:
+            if request_num < 1:
+                raise ValueError("request_num must be >= 1")
+            configs = [request_config] * request_num
 
-        if stream:
-            raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
+        for cfg in configs:
+            if cfg.get("stream", False):
+                raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
 
-        if request_num == 1:
-            # Send single request
+        responses: list = []
+
+        if len(configs) == 1:
+            cfg = configs[0]
+            modalities = cfg.get("modalities", omit)
+            extra_body = cfg.get("extra_body", None)
             chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"),
-                messages=request_config.get("messages"),
+                model=cfg.get("model"),
+                messages=cfg.get("messages"),
                 extra_body=extra_body,
                 modalities=modalities,
             )
-
             response = self._process_diffusion_response(chat_completion)
-            assert_diffusion_response(response, request_config, run_level=self.run_level)
+            assert_diffusion_response(response, cfg, run_level=self.run_level)
             responses.append(response)
+            return responses
 
-        else:
-            # Send concurrent requests
-            with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                futures = []
-
-                # Submit all request tasks
-                for _ in range(request_num):
-                    future = executor.submit(
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(configs)) as executor:
+            futures = []
+            for cfg in configs:
+                modalities = cfg.get("modalities", omit)
+                extra_body = cfg.get("extra_body", None)
+                futures.append(
+                    executor.submit(
                         self.client.chat.completions.create,
-                        model=request_config.get("model"),
-                        messages=request_config.get("messages"),
+                        model=cfg.get("model"),
+                        messages=cfg.get("messages"),
                         modalities=modalities,
                         extra_body=extra_body,
                     )
-                    futures.append(future)
-
-                # Process completed tasks
-                for future in concurrent.futures.as_completed(futures):
-                    chat_completion = future.result()
-                    response = self._process_diffusion_response(chat_completion)
-                    assert_diffusion_response(response, request_config, run_level=self.run_level)
-                    responses.append(response)
+                )
+            for future, cfg in zip(futures, configs, strict=True):
+                chat_completion = future.result()
+                response = self._process_diffusion_response(chat_completion)
+                assert_diffusion_response(response, cfg, run_level=self.run_level)
+                responses.append(response)
 
         return responses
 

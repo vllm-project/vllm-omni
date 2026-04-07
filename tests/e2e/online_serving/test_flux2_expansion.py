@@ -15,6 +15,7 @@ from tests.conftest import (
     OmniServer,
     OmniServerParams,
     OpenAIClientHandler,
+    dummy_messages_from_mix_data,
 )
 from tests.utils import hardware_marks
 
@@ -100,9 +101,10 @@ def _get_diffusion_feature_cases(model: str):
     indirect=True,
 )
 def test_flux2_klein(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+    messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
-        "messages": [{"role": "user", "content": POSITIVE_PROMPT}],
+        "messages": messages,
         "extra_body": {
             "height": 512,
             "width": 512,

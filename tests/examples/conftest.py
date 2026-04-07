@@ -179,7 +179,7 @@ class ReadmeSnippet(NamedTuple):
         return "".join(child.get("raw", "") for child in token.get("children", [])).strip()
 
 
-# [TODO] Duplicate `_write_zimage_lora` in tests/e2e/online_serving/test_images_generations_lora.py. Combine these helpers and tests/e2e/offline_inference/test_diffusion_lora.py to test/utils later
+# [TODO] Duplicate `_write_zimage_lora` in tests/diffusion/lora/test_images_generations_lora.py. Combine these helpers and tests/diffusion/lora/test_diffusion_lora.py to test/utils later
 def write_zimage_lora(adapter_dir: Path, *, q_scale: float = 0.0, k_scale: float = 0.0, v_scale: float = 0.0):
     adapter_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1,5 +1,5 @@
 # CI stage config for running MiMo-Audio in multi-stage omni runtime.
-# Based on mimo_audio.yaml with load_format: dummy for CI testing.
+# Based on mimo_audio.yaml with CI-oriented sizing.
 
 async_chunk: false
 stage_args:
@@ -23,7 +23,6 @@ stage_args:
       engine_output_type: latent
       max_model_len: 8192
       max_num_batched_tokens: 8192
-      load_format: dummy
     is_comprehension: true
     final_output: true
     final_output_type: text
@@ -56,7 +55,6 @@ stage_args:
       max_model_len: 18192
       max_num_batched_tokens: 18192
       async_scheduling: false
-      load_format: dummy
     engine_input_source: [ 0 ]
     is_comprehension: false
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav

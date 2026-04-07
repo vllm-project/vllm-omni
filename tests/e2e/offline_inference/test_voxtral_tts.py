@@ -30,7 +30,6 @@ from mistral_common.protocol.speech.request import SpeechRequest
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from vllm import SamplingParams
 
-from tests.conftest import modify_stage_config
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.omni import Omni
@@ -61,31 +60,14 @@ def _compose_request(model_name: str, text: str, voice: str) -> dict:
     }
 
 
-def _resolve_stage_config(run_level: str) -> str:
-    """Resolve stage config: strip load_format for advanced_model (real weights)."""
-    if run_level == "advanced_model":
-        return modify_stage_config(
-            STAGE_CONFIG,
-            deletes={
-                "stage_args": {
-                    0: ["engine_args.load_format"],
-                    1: ["engine_args.load_format"],
-                }
-            },
-        )
-    return STAGE_CONFIG
-
-
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_voxtral_tts_offline_basic(run_level):
+def test_voxtral_tts_offline_basic():
     """Test basic Voxtral TTS offline inference with a voice preset."""
-    stage_config = _resolve_stage_config(run_level)
-
     omni = Omni(
         model=MODEL,
-        stage_configs_path=stage_config,
+        stage_configs_path=STAGE_CONFIG,
         stage_init_timeout=300,
         enforce_eager=True,
     )
@@ -134,15 +116,13 @@ def test_voxtral_tts_offline_basic(run_level):
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_voxtral_tts_offline_streaming(run_level):
+def test_voxtral_tts_offline_streaming():
     """Test AsyncOmni streaming inference for Voxtral TTS."""
 
     async def _run():
-        stage_config = _resolve_stage_config(run_level)
-
         async_omni = AsyncOmni(
             model=MODEL,
-            stage_configs_path=stage_config,
+            stage_configs_path=STAGE_CONFIG,
             stage_init_timeout=300,
             enforce_eager=True,
         )

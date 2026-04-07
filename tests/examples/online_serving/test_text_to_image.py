@@ -132,5 +132,5 @@ def test_lora_001(omni_server: OmniServer, example_output_dir: Path, tmp_path: P
 # --- ### Using curl with LoRA (Images API) ---
 
 
-@pytest.mark.skip(reason="Covered by tests/e2e/online_serving/test_images_generations_lora.py")
+@pytest.mark.skip(reason="Covered by tests/diffusion/lora/test_images_generations_lora.py")
 def test_lora_002(): ...

@@ -65,7 +65,6 @@ tts_server_params = [
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
@@ -93,7 +92,6 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)

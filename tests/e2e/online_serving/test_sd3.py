@@ -26,21 +26,15 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--cfg-parallel-size",
-                    "2",
-                    "--tensor-parallel-size",
-                    "2",
-                ],
             ),
+            id="default",
             marks=FOUR_CARD_FEATURE_MARKS,
         ),
     ]
 
 
 @pytest.mark.advanced_model
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -49,7 +43,7 @@ def _get_diffusion_feature_cases(model: str):
     ),
     indirect=True,
 )
-def test_sd3_medium(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
     messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
