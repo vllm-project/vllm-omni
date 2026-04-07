@@ -1183,6 +1183,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             mistral_tokenizer = cached_tokenizer_from_config(self.engine_client.model_config)
             self._tts_tokenizer = mistral_tokenizer.instruct
         if voice is not None:
+            # For custom uploaded voices, mistral_common doesn't know the voice name.
+            # Resolve to reference audio data stored at upload time instead.
+            voice_lower = voice.lower()
+            if voice_lower in self.uploaded_speakers:
+                speaker_info = self.uploaded_speakers[voice_lower]
+                file_path = Path(speaker_info["file_path"])
+                if file_path.exists():
+                    with open(file_path, "rb") as f:
+                        audio_bytes = f.read()
+                    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    mime_type = speaker_info.get("mime_type", "audio/wav")
+                    ref_audio = f"data:{mime_type};base64,{audio_b64}"
+                    # Strip data URI prefix for mistral_common
+                    _, _, ref_audio = ref_audio.partition(",")
+                    tokenized = self._tts_tokenizer.encode_speech_request(
+                        SpeechRequest(input=text, ref_audio=ref_audio)
+                    )
+                    audio = tokenized.audios[0]
+                    return {
+                        "prompt_token_ids": tokenized.tokens,
+                        "multi_modal_data": {"audio": [(audio.audio_array, audio.sampling_rate)]},
+                    }
+                # Fall through to voice-name path if file is missing
             tokens = self._tts_tokenizer.encode_speech_request(SpeechRequest(input=text, voice=voice)).tokens
             return {
                 "prompt_token_ids": tokens,
