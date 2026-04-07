@@ -8,6 +8,7 @@ helpers from ``tests.dfx.reliability.conftest``, then validates request behavior
 from __future__ import annotations
 
 import copy
+import os
 import re
 from pathlib import Path
 from typing import Any, Protocol
@@ -24,6 +25,7 @@ from tests.conftest import (
 from tests.dfx.conftest import create_unique_server_params, load_configs
 from tests.dfx.reliability.conftest import (
     inject_gpu_oom,
+    inject_process_kill,
     stop_gpu_oom_hogs,
 )
 from tests.utils import hardware_test
@@ -42,6 +44,19 @@ OOM_INJECTION_CONFIG = {
     "startup_timeout_sec": 20,
     "strict": True,
 }
+FAULT_ERROR_KEYWORDS = (
+    "oom",
+    "out of memory",
+    "cuda",
+    "internal",
+    "500",
+    "503",
+    "timeout",
+    "connection",
+    "engine",
+    "orchestrator",
+    "dead",
+)
 
 
 def _configs_with_platform_stage_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -83,6 +98,35 @@ def _get_system_prompt() -> dict:
 
 def _get_mix_prompt() -> str:
     return "What is recited in the audio? What is in this image? Describe the video briefly."
+
+
+def _assert_fault_exception(exc: Exception) -> None:
+    text = str(exc).lower()
+    assert any(key in text for key in FAULT_ERROR_KEYWORDS), f"unexpected error under fault injection: {exc}"
+
+
+def _kill_runtime_process_for_fault_test() -> tuple[list[int], str]:
+    """Kill one runtime process to trigger engine-fatal style failure."""
+    patterns = (
+        "VLLM::EngineCore",
+        "vllm_omni.engine.orchestrator",
+        "EngineCore",
+    )
+    for pattern in patterns:
+        pids = inject_process_kill(
+            grep_pattern=pattern,
+            signal_name="SIGKILL",
+            limit=1,
+            allow_zero_match=True,
+        )
+        if pids:
+            return pids, pattern
+    return [], ""
+
+
+def _supports_video_generation(model_name: str) -> bool:
+    lower = model_name.lower()
+    return any(key in lower for key in ("wan", "video", "i2v", "t2v"))
 
 
 class _HasServeArgs(Protocol):
@@ -145,73 +189,30 @@ def test_scenarios_json_loads() -> None:
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
 )
 @pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_reliability_gpu_oom_injection(omni_server, openai_client) -> None:
-    """Inject GPU OOM from test code and verify request fails during injection."""
-    device_spec = _resolve_oom_device_spec(
-        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
-    )
-    handle = inject_gpu_oom(
-        device=device_spec,
-        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
-        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
-        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
-        strict=OOM_INJECTION_CONFIG["strict"],
-    )
-    try:
-        video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
-        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
-        audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
-        messages = dummy_messages_from_mix_data(
-            system_prompt=_get_system_prompt(),
-            video_data_url=video_data_url,
-            image_data_url=image_data_url,
-            audio_data_url=audio_data_url,
-            content_text=_get_mix_prompt(),
-        )
-        request_config = {
-            "model": omni_server.model,
-            "messages": messages,
-            "stream": True,
-            "key_words": {
-                "audio": ["test"],
-            },
+@pytest.mark.parametrize(
+    "oom_cfg",
+    [
+        {
+            "target_mem_ratio": OOM_INJECTION_CONFIG["target_mem_ratio"],
+            "hold_seconds": OOM_INJECTION_CONFIG["hold_seconds"],
+            "startup_timeout_sec": OOM_INJECTION_CONFIG["startup_timeout_sec"],
+            "strict": OOM_INJECTION_CONFIG["strict"],
         }
-        raised = False
-        try:
-            openai_client.send_omni_request(request_config, request_num=1)
-        except Exception as exc:
-            raised = True
-            text = str(exc).lower()
-            assert any(
-                key in text for key in ("oom", "out of memory", "cuda", "internal", "500", "timeout", "connection")
-            ), f"unexpected error under OOM injection: {exc}"
-        assert raised, "expected request failure during GPU OOM injection"
-    finally:
-        stop_gpu_oom_hogs(handle)
-
-
-@pytest.mark.slow
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
-    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
+    ],
+    ids=["oom_default"],
 )
-@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_reliability_gpu_oom_text_to_text(omni_server, openai_client) -> None:
-    """OOM reliability case aligned with qwen3_omni text_to_text request style."""
+def test_reliability_fault_gpu_oom_single_request_failure(omni_server, openai_client, oom_cfg) -> None:
+    """Generic request-fault test: OOM injection should cause request failure."""
     device_spec = _resolve_oom_device_spec(
         OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
     )
     handle = inject_gpu_oom(
         device=device_spec,
-        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
-        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
-        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
-        strict=OOM_INJECTION_CONFIG["strict"],
+        target_mem_ratio=oom_cfg["target_mem_ratio"],
+        hold_seconds=oom_cfg["hold_seconds"],
+        startup_timeout_sec=oom_cfg["startup_timeout_sec"],
+        strict=oom_cfg["strict"],
     )
     try:
         messages = dummy_messages_from_mix_data(
@@ -225,15 +226,223 @@ def test_reliability_gpu_oom_text_to_text(omni_server, openai_client) -> None:
             "modalities": ["text"],
             "key_words": {"text": ["beijing"]},
         }
-        raised = False
         try:
             openai_client.send_omni_request(request_config, request_num=1)
         except Exception as exc:
-            raised = True
-            text = str(exc).lower()
-            assert any(
-                key in text for key in ("oom", "out of memory", "cuda", "internal", "500", "timeout", "connection")
-            ), f"unexpected error under OOM injection: {exc}"
-        assert raised, "expected request failure during GPU OOM injection"
+            _assert_fault_exception(exc)
+        else:
+            pytest.fail("expected request failure during GPU OOM injection")
     finally:
         stop_gpu_oom_hogs(handle)
+
+
+@pytest.mark.slow
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
+    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
+)
+@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
+@pytest.mark.parametrize(
+    "oom_cfg",
+    [
+        {
+            "target_mem_ratio": OOM_INJECTION_CONFIG["target_mem_ratio"],
+            "hold_seconds": OOM_INJECTION_CONFIG["hold_seconds"],
+            "startup_timeout_sec": OOM_INJECTION_CONFIG["startup_timeout_sec"],
+            "strict": OOM_INJECTION_CONFIG["strict"],
+        }
+    ],
+    ids=["oom_default"],
+)
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, openai_client, oom_cfg) -> None:
+    """Large chat payload under OOM injection should fail."""
+    device_spec = _resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
+    )
+    handle = inject_gpu_oom(
+        device=device_spec,
+        target_mem_ratio=oom_cfg["target_mem_ratio"],
+        hold_seconds=oom_cfg["hold_seconds"],
+        startup_timeout_sec=oom_cfg["startup_timeout_sec"],
+        strict=oom_cfg["strict"],
+    )
+    try:
+        # Keep chat-form request but scale payload size to emulate heavy input pressure.
+        video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 161)['base64']}"
+        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+        audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(20, 1)['base64']}"
+        messages = dummy_messages_from_mix_data(
+            system_prompt=_get_system_prompt(),
+            video_data_url=video_data_url,
+            image_data_url=image_data_url,
+            audio_data_url=audio_data_url,
+            content_text=f"{_get_mix_prompt()} " * 200,
+        )
+        request_config = {
+            "model": omni_server.model,
+            "messages": messages,
+            "stream": True,
+            "key_words": {"audio": ["test"]},
+        }
+        try:
+            openai_client.send_omni_request(request_config, request_num=1)
+        except Exception as exc:
+            _assert_fault_exception(exc)
+        else:
+            pytest.fail("expected large chat payload request failure during GPU OOM injection")
+    finally:
+        stop_gpu_oom_hogs(handle)
+
+
+@pytest.mark.slow
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
+    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
+)
+@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
+@pytest.mark.parametrize(
+    "oom_cfg",
+    [
+        {
+            "target_mem_ratio": OOM_INJECTION_CONFIG["target_mem_ratio"],
+            "hold_seconds": OOM_INJECTION_CONFIG["hold_seconds"],
+            "startup_timeout_sec": OOM_INJECTION_CONFIG["startup_timeout_sec"],
+            "strict": OOM_INJECTION_CONFIG["strict"],
+        }
+    ],
+    ids=["oom_default"],
+)
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, openai_client, oom_cfg) -> None:
+    """Video-style large request under OOM injection (closer to RFC #2327 trigger path)."""
+    if not _supports_video_generation(omni_server.model):
+        pytest.skip(f"model does not look video-capable: {omni_server.model}")
+    device_spec = _resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
+    )
+    handle = inject_gpu_oom(
+        device=device_spec,
+        target_mem_ratio=oom_cfg["target_mem_ratio"],
+        hold_seconds=oom_cfg["hold_seconds"],
+        startup_timeout_sec=oom_cfg["startup_timeout_sec"],
+        strict=oom_cfg["strict"],
+    )
+    try:
+        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+        request_config = {
+            "form_data": {
+                "prompt": "Generate a realistic road-driving video with camera motion.",
+                "width": 1280,
+                "height": 720,
+                "fps": 16,
+                "num_frames": 81,
+                "guidance_scale": 1.0,
+                "flow_shift": 5.0,
+                "num_inference_steps": 4,
+                "seed": 42,
+            },
+            "image_reference": image_data_url,
+            "stream": False,
+        }
+        try:
+            openai_client.send_video_diffusion_request(request_config, request_num=1)
+        except Exception as exc:
+            _assert_fault_exception(exc)
+        else:
+            pytest.fail("expected large /v1/videos request failure during GPU OOM injection")
+    finally:
+        stop_gpu_oom_hogs(handle)
+
+
+@pytest.mark.slow
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
+    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
+)
+@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
+@pytest.mark.parametrize(
+    "oom_cfg",
+    [
+        {
+            "target_mem_ratio": OOM_INJECTION_CONFIG["target_mem_ratio"],
+            "hold_seconds": OOM_INJECTION_CONFIG["hold_seconds"],
+            "startup_timeout_sec": OOM_INJECTION_CONFIG["startup_timeout_sec"],
+            "strict": OOM_INJECTION_CONFIG["strict"],
+        }
+    ],
+    ids=["oom_default"],
+)
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, openai_client, oom_cfg) -> None:
+    """Concurrent request pressure under OOM should produce request failures."""
+    device_spec = _resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
+    )
+    handle = inject_gpu_oom(
+        device=device_spec,
+        target_mem_ratio=oom_cfg["target_mem_ratio"],
+        hold_seconds=oom_cfg["hold_seconds"],
+        startup_timeout_sec=oom_cfg["startup_timeout_sec"],
+        strict=oom_cfg["strict"],
+    )
+    try:
+        messages = dummy_messages_from_mix_data(
+            system_prompt=_get_system_prompt(),
+            content_text="What is the capital of China? Answer in 20 words.",
+        )
+        request_config = {
+            "model": omni_server.model,
+            "messages": messages,
+            "stream": False,
+            "modalities": ["text"],
+            "key_words": {"text": ["beijing"]},
+        }
+        try:
+            openai_client.send_omni_request(request_config, request_num=4)
+        except Exception as exc:
+            _assert_fault_exception(exc)
+        else:
+            pytest.fail("expected concurrent request failure under OOM injection")
+    finally:
+        stop_gpu_oom_hogs(handle)
+
+
+@pytest.mark.slow
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_request_failure(omni_server, openai_client) -> None:
+    """Engine-fatal style injection: kill one runtime process and verify request failure."""
+    pids, pattern = _kill_runtime_process_for_fault_test()
+    if not pids:
+        pytest.skip("no matching runtime process found for kill injection")
+    messages = dummy_messages_from_mix_data(
+        system_prompt=_get_system_prompt(),
+        content_text="What is the capital of China? Answer in 20 words.",
+    )
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+        "key_words": {"text": ["beijing"]},
+    }
+    try:
+        openai_client.send_omni_request(request_config, request_num=1)
+    except Exception as exc:
+        _assert_fault_exception(exc)
+    else:
+        pytest.fail(f"expected request failure after process-kill injection (pattern={pattern}, pids={pids})")
