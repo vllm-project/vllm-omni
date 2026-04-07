@@ -1152,8 +1152,8 @@ async def create_voice_cache(
         False,
         description=(
             "Force rebuild even if cache exists or is processing. "
-            "WARNING: maintenance/debug capability. Non-atomic write may "
-            "corrupt an existing valid cache if rebuild fails mid-write."
+            "WARNING: maintenance/debug capability that may invalidate the "
+            "current cache status if a rebuild fails after save starts."
         ),
     ),
 ):
