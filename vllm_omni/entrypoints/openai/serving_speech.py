@@ -48,12 +48,14 @@ _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
+_VIBEVOICE_TTS_MODEL_STAGES = {"vibevoice_audio_generation"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
     | _FISH_TTS_MODEL_STAGES
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
+    | _VIBEVOICE_TTS_MODEL_STAGES
 )
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -274,6 +276,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "cosyvoice3"
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
+        if model_stage in _VIBEVOICE_TTS_MODEL_STAGES:
+            return "vibevoice_tts"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -298,6 +302,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
         try:
+            if self._tts_model_type == "vibevoice_tts":
+                return {"alice", "bob", "carol", "dave"}
             if self._tts_model_type == "voxtral_tts":
                 config = self.engine_client.model_config.hf_config.audio_config
             else:
@@ -723,6 +729,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        if self._tts_model_type == "vibevoice_tts":
+            return self._validate_vibevoice_tts_request(request)
         if self._tts_model_type == "voxtral_tts":
             return self._validate_voxtral_tts_request(request)
         if self._tts_model_type == "fish_tts":
@@ -739,6 +747,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             or ref_audio.startswith("file://")
         ):
             return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+        return None
+
+    def _validate_vibevoice_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate VibeVoice TTS request parameters. Returns error message or None."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        if request.voice is not None:
+            request.voice = request.voice.lower()
+            if self.supported_speakers and request.voice not in self.supported_speakers:
+                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
         return None
 
     def _validate_voxtral_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -1147,6 +1170,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return params
 
+    # ---- VibeVoice TTS helpers ----
+
+    def _build_vibevoice_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build VibeVoice TTS engine prompt.
+
+        VibeVoice uses the Qwen2.5 tokenizer. The text is passed directly,
+        optionally prepended with a speaker tag.
+        """
+        text = request.input
+        voice = request.voice
+        if voice:
+            prompt_text = f"[{voice}]: {text}"
+        else:
+            prompt_text = text
+        return {"prompt": prompt_text}
+
     # ---- Voxtral TTS helpers ----
 
     async def _build_voxtral_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
@@ -1299,7 +1338,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if validation_error:
                 raise ValueError(validation_error)
 
-            if self._tts_model_type == "voxtral_tts":
+            if self._tts_model_type == "vibevoice_tts":
+                prompt = self._build_vibevoice_prompt(request)
+                tts_params = {}
+            elif self._tts_model_type == "voxtral_tts":
                 prompt = await self._build_voxtral_prompt(request)
                 tts_params = {}
             elif self._tts_model_type == "cosyvoice3":
@@ -1326,6 +1368,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
         if self._is_fish_speech:
             model_type = "fish_speech"
+        elif self._tts_model_type == "vibevoice_tts":
+            model_type = "vibevoice_tts"
         elif self._tts_model_type == "voxtral_tts":
             model_type = "voxtral_tts"
         elif self._tts_model_type == "cosyvoice3":

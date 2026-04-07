@@ -40,6 +40,9 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
             VoxtralTTSConfig,
         )
+        from vllm_omni.model_executor.models.vibevoice_tts.configuration_vibevoice_tts import (
+            VibeVoiceTTSConfig,
+        )
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -57,6 +60,7 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("omnivoice", OmniVoiceConfig),
         ("voxtral_tts", VoxtralTTSConfig),
+        ("vibevoice", VibeVoiceTTSConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
