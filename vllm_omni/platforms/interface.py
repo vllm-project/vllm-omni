@@ -118,6 +118,10 @@ class OmniPlatform(Platform):
         return True
 
     @classmethod
+    def supports_float64(cls) -> bool:
+        return True
+
+    @classmethod
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
