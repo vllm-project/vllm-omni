@@ -15,6 +15,7 @@ class OmniPlatformEnum(Enum):
     ROCM = "rocm"
     NPU = "npu"
     XPU = "xpu"
+    MUSA = "musa"
     UNSPECIFIED = "unspecified"
 
 
@@ -40,6 +41,9 @@ class OmniPlatform(Platform):
 
     def is_rocm(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.ROCM
+
+    def is_musa(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.MUSA
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:

@@ -430,13 +430,41 @@ def xpu_marks(*, res: str, num_cards: int):
         return marks + [test_distributed]
 
 
+def musa_marks(*, res: str, num_cards: int):
+    """
+    Get a collection of pytest marks to apply for `@musa_test`.
+
+    Args:
+        res: Resource type, e.g., "S5000".
+        num_cards: Number of GPU cards required.
+
+    Returns:
+        List of pytest marks to apply.
+    """
+    test_platform_detail = pytest.mark.musa
+
+    if res == "S5000":
+        test_resource = pytest.mark.S5000
+    else:
+        raise ValueError(f"Invalid MUSA resource type: {res}. Supported: S5000")
+
+    marks = [test_resource, test_platform_detail]
+
+    if num_cards == 1:
+        return marks
+    else:
+        test_distributed = pytest.mark.distributed_musa(num_cards=num_cards)
+        # TODO: add MUSA support for `skipif_musa` marker
+        return marks + [test_distributed]
+
+
 def gpu_marks(*, res: str, num_cards: int):
     """
     Get a collection of pytest marks to apply for `@gpu_test`.
     Platform is automatically determined based on resource type.
 
     Args:
-        res: Resource type, e.g., "L4", "H100" for CUDA, or "MI325" for ROCm, or "B60" for XPU.
+        res: Resource type, e.g., "L4", "H100" for CUDA, or "MI325" for ROCm, or "B60" for XPU, or "S5000" for MUSA.
         num_cards: Number of GPU cards required.
 
     Returns:
@@ -449,7 +477,9 @@ def gpu_marks(*, res: str, num_cards: int):
         return [test_platform] + rocm_marks(res=res, num_cards=num_cards)
     if res == "B60":
         return [test_platform] + xpu_marks(res=res, num_cards=num_cards)
-    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, MI325")
+    if res == "S5000":
+        return [test_platform] + musa_marks(res=res, num_cards=num_cards)
+    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, MI325, B60, S5000")
 
 
 def npu_marks(*, res: str, num_cards: int):
@@ -476,13 +506,13 @@ def npu_marks(*, res: str, num_cards: int):
 def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     """
     Get a collection of pytest marks to apply for `@hardware_test`,
-    including CUDA, ROCm, XPU, and NPU,
+    including CUDA, ROCm, XPU, NPU, and MUSA,
     based on the specified platforms and resources.
     """
     # Validate platforms
     # Don't validate platform details in this decorator
     for platform, _ in res.items():
-        if platform not in ("cuda", "rocm", "xpu", "npu"):
+        if platform not in ("cuda", "rocm", "xpu", "npu", "musa"):
             raise ValueError(f"Unsupported platform: {platform}")
 
     # Normalize num_cards
@@ -505,6 +535,8 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
         cards = num_cards_dict[platform]
         if platform == "cuda" or platform == "rocm" or platform == "xpu":
             marks = gpu_marks(res=resource, num_cards=cards)
+        elif platform == "musa":
+            marks = musa_marks(res=resource, num_cards=cards)
         elif platform == "npu":
             marks = npu_marks(res=resource, num_cards=cards)
         else:
@@ -522,15 +554,17 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
         res: Mapping from platform to resource type. Supported platforms/resources:
             - cuda: L4, H100
             - rocm: MI325
+            - xpu: B60
             - npu: A2, A3
+            - musa: S5000
         num_cards: Number of cards required. Can be:
             - int: same card count for all platforms (default: 1)
             - dict: per-platform card count, e.g., {"cuda": 2, "rocm": 2}
 
     Example:
         @hardware_test(
-            res={"cuda": "L4", "rocm": "MI325", "npu": "A2"},
-            num_cards={"cuda": 2, "rocm": 2, "npu": 2},
+            res={"cuda": "L4", "rocm": "MI325", "npu": "A2", "musa": "S5000"},
+            num_cards={"cuda": 2, "rocm": 2, "npu": 2, "musa": 2},
         )
         def test_multi_platform():
             ...

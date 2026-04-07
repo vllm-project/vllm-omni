@@ -387,7 +387,12 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         else:
             image_input = (
-                None if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {}).get("image")
+                None
+                if isinstance(first_prompt, str)
+                else (
+                    (first_prompt.get("multi_modal_data") or {}).get("image")
+                    or (first_prompt.get("multi_modal_data") or {}).get("img2img")
+                )
             )
             if image_input and not isinstance(image_input, list):
                 image_input = [image_input]

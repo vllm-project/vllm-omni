@@ -168,7 +168,6 @@ def main():
 
     params_list = omni.default_sampling_params_list
     if args.modality in ("text2img", "img2img"):
-        params_list[0].max_tokens = 1  # type: ignore
         if len(params_list) > 1:
             diffusion_params = params_list[1]
             diffusion_params.num_inference_steps = args.steps  # type: ignore

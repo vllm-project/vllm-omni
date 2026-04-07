@@ -180,7 +180,7 @@ steps:
                 pytest -s -v tests/engine/test_async_omni_engine_abort.py
         '
     agents:
-      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+      queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -271,7 +271,7 @@ steps:
               - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
                 resources:
                   limits:
-                    nvidia.com/gpu: 2
+                    nvidia.com/gpu: 1
                 volumeMounts:
                   - name: devshm
                     mountPath: /dev/shm

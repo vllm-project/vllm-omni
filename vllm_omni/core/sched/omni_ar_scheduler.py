@@ -95,43 +95,54 @@ class OmniARScheduler(VLLMScheduler):
             return False
 
         criteria_type = self.kv_transfer_criteria.get("type")
+        stop_decode_on_trigger = self.kv_transfer_criteria.get("stop_after_transfer", True)
 
-        # Universal duplicate check for once semantics
         if request.request_id in self.transfer_triggered_requests:
+            # Already triggered.  When stop_decode_on_trigger is True AND
+            # transfer was actually queued, the request was already stopped
+            # at trigger time (see below).  Any request that reaches this
+            # point either has stop_decode_on_trigger=False (continue
+            # decoding) or was not actually queued (should not be stopped).
             return False
 
         if criteria_type == "prefill_finished":
             if request.num_computed_tokens >= request.num_prompt_tokens:
-                logger.debug(f"[Omni] Request {request.request_id} triggered prefill_finished transfer (Non-Stop)")
                 self.transfer_triggered_requests.add(request.request_id)
                 self._mark_request_for_kv_transfer(request.request_id, request.num_computed_tokens)
+                actually_queued = request.request_id in self.requests_needing_kv_transfer
 
-                # Return False means "Do NOT stop the request" -> Continue Decoding
+                if stop_decode_on_trigger and actually_queued:
+                    # Stop immediately so the request is NOT scheduled in
+                    # the next step, freeing scheduling budget for companion
+                    # requests whose chunked-prefill boundaries must be
+                    # deterministic.  waiting_for_transfer_free keeps blocks
+                    # alive until the model runner finishes KV extraction.
+                    self.waiting_for_transfer_free.add(request.request_id)
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    return True
+
                 return False
 
         elif criteria_type == "special_token":
             target_token_id = self.kv_transfer_criteria.get("token_id")
             if target_token_id is not None and target_token_id in new_token_ids:
-                logger.debug(f"[Omni] Request {request.request_id} triggered special_token criteria (Non-Stop)")
-
                 self.transfer_triggered_requests.add(request.request_id)
 
-                # Calculate precise snapshot length (trim to sentinel)
-                # Find the FIRST occurrence of the sentinel
                 try:
                     idx = new_token_ids.index(target_token_id)
-                    # seq_len = tokens_before_this_step + idx + 1 (include sentinel)
-                    # request.num_computed_tokens already includes ALL new_token_ids
-                    # so we subtract (len(new_token_ids) - (idx + 1))
                     tokens_to_exclude = len(new_token_ids) - (idx + 1)
                     snapshot_len = request.num_computed_tokens - tokens_to_exclude
                 except ValueError:
                     snapshot_len = request.num_computed_tokens
 
-                # Trigger Transfer
                 self._mark_request_for_kv_transfer(request.request_id, snapshot_len)
+                actually_queued = request.request_id in self.requests_needing_kv_transfer
 
-                # Do NOT stop request
+                if stop_decode_on_trigger and actually_queued:
+                    self.waiting_for_transfer_free.add(request.request_id)
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    return True
+
                 return False
 
         return False
@@ -456,6 +467,23 @@ class OmniARScheduler(VLLMScheduler):
             kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
             if kv_extracted_ids:
                 for req_id in kv_extracted_ids:
+                    # Emit a kv_ready signal so the orchestrator can forward
+                    # the request to the DiT stage immediately after KV
+                    # extraction, without waiting for AR decode to finish.
+                    req = self.requests.get(req_id)
+                    if req is not None and not req.is_finished():
+                        eco = engine_core_outputs.get(req.client_index)
+                        if eco is None:
+                            eco = EngineCoreOutputs()
+                            engine_core_outputs[req.client_index] = eco
+                        eco.outputs.append(
+                            EngineCoreOutput(
+                                request_id=req_id,
+                                new_token_ids=[],
+                                kv_transfer_params={"kv_ready": True},
+                            )
+                        )
+
                     # Mark transfer as finished
                     if req_id in self.active_kv_transfers:
                         self.active_kv_transfers.remove(req_id)
@@ -504,9 +532,12 @@ class OmniARScheduler(VLLMScheduler):
                     # It triggered but hasn't finished yet. We MUST wait.
                     logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
                     self.waiting_for_transfer_free.add(request_id)
-                    # We do NOT mark for transfer again, just wait.
-                    kv_xfer_params = None  # No new transfer params
+                    kv_xfer_params = None
                     return kv_xfer_params
+                elif request_id in self.waiting_for_transfer_free:
+                    # Stopped immediately by stop_decode_on_trigger; blocks are
+                    # held until KV extraction completes in a future step.
+                    return None
                 else:
                     logger.debug(
                         f"[Omni] Request {request_id} finished and transfer no longer ACTIVE (extracted/acked). "

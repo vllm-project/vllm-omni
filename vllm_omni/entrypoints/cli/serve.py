@@ -267,6 +267,11 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable cache-dit summary logging after diffusion forward passes.",
         )
+        omni_config_group.add_argument(
+            "--step-execution",
+            action="store_true",
+            help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
+        )
 
         # VAE memory optimization parameters
         omni_config_group.add_argument(

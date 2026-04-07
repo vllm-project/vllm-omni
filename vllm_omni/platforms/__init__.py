@@ -105,11 +105,28 @@ def xpu_omni_platform_plugin() -> str | None:
     return "vllm_omni.platforms.xpu.platform.XPUOmniPlatform" if is_xpu else None
 
 
+def musa_omni_platform_plugin() -> str | None:
+    """Check if MUSA OmniPlatform should be activated."""
+    is_musa = False
+    logger.debug("Checking if MUSA OmniPlatform is available.")
+    try:
+        import torchada
+
+        if torchada.is_musa_platform():
+            is_musa = True
+            logger.debug("Confirmed MUSA OmniPlatform is available.")
+    except Exception as e:
+        logger.debug("MUSA OmniPlatform is not available because: %s", str(e))
+
+    return "vllm_omni.platforms.musa.platform.MUSAOmniPlatform" if is_musa else None
+
+
 builtin_omni_platform_plugins = {
     "cuda": cuda_omni_platform_plugin,
     "rocm": rocm_omni_platform_plugin,
     "npu": npu_omni_platform_plugin,
     "xpu": xpu_omni_platform_plugin,
+    "musa": musa_omni_platform_plugin,
 }
 
 
