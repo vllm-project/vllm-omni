@@ -64,6 +64,8 @@ from vllm.multimodal.processing.processor import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.magi_integration import apply_magi_to_qwen_decoder_layers
+
 try:
     import flash_attn
 except (ImportError, ModuleNotFoundError):
@@ -385,6 +387,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             )
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+
+        apply_magi_to_qwen_decoder_layers(
+            self.language_model,
+            model_tag_prefix="qwen2_5_omni_thinker",
+        )
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         mm_input_by_modality = {}

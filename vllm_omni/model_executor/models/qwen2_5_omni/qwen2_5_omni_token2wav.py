@@ -34,9 +34,12 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.magi_integration import (
+    apply_magi_to_bigvgan_amp_blocks,
+    apply_magi_to_dit_decoder_layers,
+)
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
 from vllm_omni.platforms import current_omni_platform
-
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
 def auto_docstring(func=None, **_kwargs):
@@ -1043,6 +1046,8 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
             bias=False,
         )
 
+        apply_magi_to_bigvgan_amp_blocks(self, model_tag_prefix="qwen2_5_omni_token2wav_bigvgan")
+
     def normalize_spectrogram(self, spectrogram, max_value, min_db):
         return torch.clamp(
             (2 * max_value) * ((spectrogram - min_db) / (-min_db)) - max_value,
@@ -1200,6 +1205,8 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                     look_backward_block=1 if i in config.look_backward_layers else 0,
                 )
             )
+
+        apply_magi_to_dit_decoder_layers(self, model_tag_prefix="qwen2_5_omni_token2wav_dit")
 
         self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation
         self.proj_out = nn.Linear(config.hidden_size, config.mel_dim)

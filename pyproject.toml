@@ -36,6 +36,12 @@ classifiers = [
 
 [project.optional-dependencies]
 
+# MagiCompiler (SandAI): optional whole-graph compile for Qwen2.5-Omni thinker layers.
+# Install: pip install "vllm-omni[magi]" or pip install -e /path/to/MagiCompiler
+magi = [
+    "magi_compiler @ git+https://github.com/SandAI-org/MagiCompiler.git",
+]
+
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
