@@ -165,7 +165,7 @@ while allocated < target_bytes:
 
 achieved_ratio = allocated / max(1, props.total_memory)
 achieved_free_ratio = allocated / max(1, int(free_before))
-if strict and achieved_free_ratio < target_ratio:
+if strict and allocated < target_bytes:
     print(
         "ERROR:"
         f"achieved_free_ratio={achieved_free_ratio:.4f};"
