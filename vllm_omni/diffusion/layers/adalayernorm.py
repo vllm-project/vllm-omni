@@ -1,10 +1,15 @@
 from importlib.util import find_spec
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
 
@@ -123,3 +128,102 @@ class AdaLayerNorm(CustomOp):
         shift_result, scale_result, gate_result = self.preprocess(mod_params, index)
 
         return self.layernorm(x) * (1 + scale_result) + shift_result, gate_result
+
+
+class AdaLayerNormZero(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.emb = None
+        self.silu = nn.SiLU()
+        self.linear = ReplicatedLinear(
+            embedding_dim,
+            6 * embedding_dim,
+            bias=bias,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear",
+        )
+        self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        emb = self.linear(self.silu(emb))
+        if isinstance(emb, tuple):
+            emb = emb[0]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class AdaLayerNormZeroSingle(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.linear = ReplicatedLinear(
+            embedding_dim,
+            3 * embedding_dim,
+            bias=bias,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear",
+        )
+        self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        emb = self.linear(self.silu(emb))
+        if isinstance(emb, tuple):
+            emb = emb[0]
+        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa
+
+
+class AdaLayerNormContinuous(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        conditioning_embedding_dim: int,
+        elementwise_affine: bool = False,
+        eps: float = 1e-6,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.linear = ReplicatedLinear(
+            conditioning_embedding_dim,
+            embedding_dim * 2,
+            bias=bias,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear",
+        )
+        self.norm = nn.LayerNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
+
+    def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
+        emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
+        if isinstance(emb, tuple):
+            emb = emb[0]
+        scale, shift = torch.chunk(emb, 2, dim=1)
+        x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+        return x

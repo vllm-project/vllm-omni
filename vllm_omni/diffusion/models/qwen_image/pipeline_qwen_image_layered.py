@@ -219,7 +219,7 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self.device)
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )

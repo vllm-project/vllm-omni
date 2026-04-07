@@ -50,10 +50,8 @@ stage_args:
       engine_output_type: audio
       gpu_memory_utilization: 0.2
       distributed_executor_backend: "mp"
-      # Must be divisible by num_code_groups and cover (left_context + chunk).
-      max_num_batched_tokens: 8192
-      # async_chunk appends windows per step; max_model_len must cover accumulated stream.
-      max_model_len: 32768
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
     engine_input_source: [0]
     final_output: true
     final_output_type: audio
@@ -90,7 +88,7 @@ runtime:
         connector_get_max_wait: 300
         # Align with Omni: small chunks with sufficient context overlap.
         codec_chunk_frames: 25
-        codec_left_context_frames: 25
+        codec_left_context_frames: 72
 
   edges:
     - from: 0

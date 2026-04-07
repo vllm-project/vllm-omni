@@ -29,6 +29,8 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -331,7 +333,7 @@ def retrieve_latents(encoder_output: torch.Tensor, generator: torch.Generator = 
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class Flux2Pipeline(nn.Module, SupportImageInput):
+class Flux2Pipeline(nn.Module, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     """Flux2 pipeline for text-to-image generation."""
 
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
@@ -389,6 +391,10 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
         self._guidance_scale = None
         self._attention_kwargs = None
         self._num_timesteps = None
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
         self._current_timestep = None
         self._interrupt = False
 
@@ -928,6 +934,7 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
         self._interrupt = False
+        guidance_tensor = None
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -1017,52 +1024,56 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
         )
         self._num_timesteps = len(timesteps)
 
+        # handle guidance
+        if self.transformer.guidance_embeds is not None:
+            guidance_tensor = torch.full([1], self.guidance_scale, device=device, dtype=torch.float32)
+            guidance_tensor = guidance_tensor.expand(latents.shape[0])
+
         # 7. Denoising loop
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
         self.scheduler.set_begin_index(0)
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
 
-            self._current_timestep = t
-            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                self._current_timestep = t
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-            latent_model_input = latents.to(self.transformer.dtype)
-            latent_image_ids = latent_ids
+                latent_model_input = latents.to(self.transformer.dtype)
+                latent_image_ids = latent_ids
 
-            if image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
-                latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                    latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,  # (B, image_seq_len, C)
-                timestep=timestep / 1000,
-                guidance=None,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,  # B, text_seq_len, 4
-                img_ids=latent_image_ids,  # B, image_seq_len, 4
-                joint_attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,  # (B, image_seq_len, C)
+                    timestep=timestep / 1000,
+                    guidance=guidance_tensor,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids,  # B, text_seq_len, 4
+                    img_ids=latent_image_ids,  # B, image_seq_len, 4
+                    joint_attention_kwargs=self.attention_kwargs,
+                    return_dict=False,
+                )[0]
 
-            noise_pred = noise_pred[:, : latents.size(1) :]
+                noise_pred = noise_pred[:, : latents.size(1) :]
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-            if latents.dtype != latents_dtype and torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-            if callback_on_step_end is not None:
-                callback_kwargs = {}
-                for k in callback_on_step_end_tensor_inputs:
-                    callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                pbar.update()
 
         self._current_timestep = None
 

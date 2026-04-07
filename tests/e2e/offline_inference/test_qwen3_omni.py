@@ -56,7 +56,7 @@ def get_question(prompt_type="video"):
     return prompts.get(prompt_type, prompts["video"])
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)

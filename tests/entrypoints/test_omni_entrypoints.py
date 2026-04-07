@@ -113,6 +113,7 @@ class FakeAsyncOmniEngine:
         sampling_params_list: list[Any] | None = None,
         final_stage_id: int = 0,
         arrival_time: float | None = None,
+        **kwargs: Any,
     ) -> None:
         msg = {
             "request_id": request_id,
@@ -377,6 +378,19 @@ def test_openai_serving_models_can_consume_async_omni_compat_attrs():
     assert serving_models.renderer is renderer
     assert serving_models.io_processor is io_processor
     assert serving_models.input_processor is input_processor
+
+
+def test_get_diffusion_od_config_returns_diffusion_stage_config():
+    diffusion_od_config = object()
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        stage_clients=[
+            SimpleNamespace(stage_type="llm"),
+            SimpleNamespace(stage_type="diffusion", _engine=SimpleNamespace(od_config=diffusion_od_config)),
+        ]
+    )
+
+    assert omni.get_diffusion_od_config() is diffusion_od_config
 
 
 @pytest.mark.asyncio

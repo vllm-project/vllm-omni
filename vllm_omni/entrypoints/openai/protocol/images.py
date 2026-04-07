@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
+
 
 class ResponseFormat(str, Enum):
     """Image response format"""
@@ -43,6 +45,10 @@ class ImageGenerationRequest(BaseModel):
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.B64_JSON, description="Format of the returned image")
     user: str | None = Field(default=None, description="User identifier for tracking")
+    layers: int | None = Field(
+        default=None,
+        description="Number of output layers for layered image models. Supported range: 3-10.",
+    )
 
     @field_validator("size")
     @classmethod
@@ -66,6 +72,12 @@ class ImageGenerationRequest(BaseModel):
         if v is not None and v != ResponseFormat.B64_JSON:
             raise ValueError(f"Only 'b64_json' response format is supported, got: {v}")
         return v
+
+    @field_validator("layers")
+    @classmethod
+    def validate_layers(cls, v):
+        """Validate the layers parameter for layered image models."""
+        return validate_layered_layers(v)
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")

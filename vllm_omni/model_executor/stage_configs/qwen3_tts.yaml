@@ -51,9 +51,10 @@ stage_args:
       gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
       # Must be divisible by num_code_groups and cover (left_context + chunk).
-      max_num_batched_tokens: 8192
-      # async_chunk appends windows per step; max_model_len must cover accumulated stream.
-      max_model_len: 32768
+      # Prefill length is Q * num_frames (e.g. 16 * 2148 = 34368); keep headroom past 32k.
+      max_num_batched_tokens: 65536
+      # async_chunk appends windows per step; max_model_len must cover accumulated flat codec stream.
+      max_model_len: 65536
     engine_input_source: [0]
     final_output: true
     final_output_type: audio
@@ -88,9 +89,9 @@ runtime:
         connector_get_sleep_s: 0.01
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
-        # Align with Omni: small chunks with sufficient context overlap.
+        # Match the decoder sliding attention window to avoid chunk-boundary noise.
         codec_chunk_frames: 25
-        codec_left_context_frames: 25
+        codec_left_context_frames: 72
 
   edges:
     - from: 0
