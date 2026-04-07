@@ -32,6 +32,9 @@ bash run_benchmark.sh --hf-only
 # Use a different model (e.g. 1.7B)
 MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice bash run_benchmark.sh --async-only
 
+# Use a Voice Clone model
+MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base TASK_TYPE=Base bash run_benchmark.sh --async-only
+
 # Use bs16 config for higher throughput
 STAGE_CONFIG=vllm_omni/configs/qwen3_tts_bs16.yaml bash run_benchmark.sh --async-only
 

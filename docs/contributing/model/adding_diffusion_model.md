@@ -802,7 +802,7 @@ omni = Omni(model="your-model", enable_layerwise_offload=True)
 
 ```python
 class WanTransformer3DModel(nn.Module):
-    _layerwise_offload_blocks_attr = "blocks"  # Attribute name containing transformer blocks
+    _layerwise_offload_blocks_attrs = ["blocks"]  # Attribute name containing transformer blocks
 
     def __init__(self):
         self.blocks = nn.ModuleList([...])  # Transformer blocks

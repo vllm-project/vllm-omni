@@ -73,7 +73,6 @@ vllm_omni/                                    tests/
 │   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
 │
 ├── entrypoints/                        →     ├── entrypoints/
-│   ├── async_omni_diffusion.py                 │   ├── test_async_omni_diffusion_config.py  ✅
 │   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
 │   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
 │   │   └── ...                                  │   │   └── test_*.py                  ⬜

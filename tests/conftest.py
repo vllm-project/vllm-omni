@@ -1146,18 +1146,6 @@ def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
     return text
 
 
-def merge_base64_and_convert_to_text(base64_list):
-    """
-    Merge a list of base64 encoded audio data and convert to text.
-    """
-    merged_audio = _merge_base64_audio_to_segment(base64_list)
-    output_path = f"./test_{uuid.uuid4().hex}.wav"
-    merged_audio.export(output_path, format="wav")
-    print(f"audio data is saved: {output_path}")
-    text = convert_audio_file_to_text(output_path)
-    return text
-
-
 def modify_stage_config(
     yaml_path: str,
     updates: dict[str, Any] = None,
@@ -1742,7 +1730,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         label = str(top.get("label", "")).lower()
         conf = float(top.get("score", 0.0))
 
-        if conf < 0.6:
+        if conf < 0.5:
             gender = "unknown"
         # Some models use non-English labels (e.g., Russian). Normalize to 'male'/'female'.
         elif ("female" in label) or ("жен" in label):
@@ -1769,6 +1757,34 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     except Exception as exc:  # pragma: no cover - best-effort fallback
         print(f"Warning: gender classification failed, returning 'unknown': {exc}")
         return "unknown"
+
+
+_PRESET_VOICE_GENDER_MAP: dict[str, str] = {
+    "serena": "female",
+    "uncle_fu": "male",
+    "chelsie": "female",
+    "clone": "female",
+    "ethan": "male",
+}
+
+
+def _assert_preset_voice_gender_from_audio(
+    audio_bytes: bytes | None,
+    voice_name: str | None,
+) -> None:
+    """If ``voice_name`` matches a known preset, assert classifier gender matches (skip when unknown)."""
+    if not voice_name or not audio_bytes:
+        return
+    key = str(voice_name).lower()
+    expected_gender = _PRESET_VOICE_GENDER_MAP.get(key)
+    if expected_gender is None:
+        return
+    estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
+    print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
+    if estimated_gender != "unknown":
+        assert estimated_gender == expected_gender, (
+            f"{voice_name!r} is expected {expected_gender}, but estimated gender is {estimated_gender!r}"
+        )
 
 
 # Threshold aligned with _compute_pcm_hnr_db docstring (clean clone vs distorted).
@@ -1837,6 +1853,12 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
             print(f"audio content is: {response.audio_content}")
+            speaker = request_config.get("speaker")
+            if speaker:
+                _assert_preset_voice_gender_from_audio(
+                    response.audio_bytes,
+                    speaker,
+                )
 
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
@@ -1849,12 +1871,14 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
             keywords = keywords_dict.get(word_type)
             if "text" in modalities:
                 if keywords:
-                    assert any(keyword in response.text_content.lower() for keyword in keywords), (
+                    text_lower = response.text_content.lower()
+                    assert any(str(kw).lower() in text_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
             else:
                 if keywords:
-                    assert any(keyword in response.audio_content.lower() for keyword in keywords), (
+                    audio_lower = response.audio_content.lower()
+                    assert any(str(kw).lower() in audio_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
 
@@ -1908,24 +1932,12 @@ def assert_audio_speech_response(
                 f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
             )
 
-        # Voice gender consistency check:
+        # Voice gender consistency check (preset names in ``_PRESET_VOICE_GENDER_MAP``).
         # When the estimator returns 'unknown', we treat it as inconclusive and do NOT fail the test.
-        voice = (request_config.get("voice") or "").lower()
-        if voice and response.audio_bytes:
-            estimated_gender = _estimate_voice_gender_from_audio(response.audio_bytes)
-            voice_gender_map = {
-                # adjust this mapping to your actual voice names
-                "serena": "female",
-                "uncle_fu": "male",
-                "clone": "female",
-            }
-            expected_gender = voice_gender_map.get(voice)
-            if expected_gender is not None:
-                print(f"Estimated voice gender from audio: {estimated_gender} (voice='{voice}')")
-                if estimated_gender != "unknown":
-                    assert estimated_gender == expected_gender, (
-                        f"Voice '{voice}' is expected {expected_gender}, but estimated gender is '{estimated_gender}'"
-                    )
+        _assert_preset_voice_gender_from_audio(
+            response.audio_bytes,
+            request_config.get("voice"),
+        )
 
 
 def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
@@ -2041,7 +2053,11 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = merge_base64_and_convert_to_text(audio_data)
+                    merged_seg = _merge_base64_audio_to_segment(audio_data)
+                    wav_buf = BytesIO()
+                    merged_seg.export(wav_buf, format="wav")
+                    result.audio_bytes = wav_buf.getvalue()
+                    audio_content = convert_audio_bytes_to_text(result.audio_bytes)
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
@@ -2096,7 +2112,8 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = convert_audio_to_text(audio_data)
+                    result.audio_bytes = base64.b64decode(audio_data)
+                    audio_content = convert_audio_bytes_to_text(result.audio_bytes)
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
@@ -2265,8 +2282,9 @@ class OpenAIClientHandler:
             request_config: Request configuration dictionary containing parameters like model, messages, stream.
                 Optional ``use_audio_in_video`` (bool): when true, sets
                 ``extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}`` for Qwen-Omni video+audio
-                extraction (merged with any existing ``extra_body`` / ``mm_processor_kwargs``).
-                Optional ``extra_body`` (dict): passed through to ``chat.completions.create`` after merge.
+                extraction.
+                Optional top-level ``speaker`` (str): Qwen3-Omni preset TTS speaker name; sent as
+                ``extra_body["speaker"]`` to ``chat.completions.create``.
             request_num: Number of requests, defaults to 1 (single request)
 
         Returns:
@@ -2278,9 +2296,8 @@ class OpenAIClientHandler:
         modalities = request_config.get("modalities", ["text", "audio"])
 
         extra_body: dict[str, Any] = {}
-        raw_extra = request_config.get("extra_body")
-        if raw_extra:
-            extra_body.update(raw_extra)
+        if "speaker" in request_config:
+            extra_body["speaker"] = request_config["speaker"]
         if request_config.get("use_audio_in_video"):
             mm = dict(extra_body.get("mm_processor_kwargs") or {})
             mm["use_audio_in_video"] = True
@@ -2312,12 +2329,15 @@ class OpenAIClientHandler:
             # Send concurrent requests: run create + process in worker so e2e_latency includes full round-trip.
             def _one_omni_request():
                 start = time.perf_counter()
-                chat_completion = self.client.chat.completions.create(
-                    model=request_config.get("model"),
-                    messages=request_config.get("messages"),
-                    modalities=modalities,
-                    stream=stream,
-                )
+                worker_kwargs: dict[str, Any] = {
+                    "model": request_config.get("model"),
+                    "messages": request_config.get("messages"),
+                    "modalities": modalities,
+                    "stream": stream,
+                }
+                if extra_body_arg is not None:
+                    worker_kwargs["extra_body"] = extra_body_arg
+                chat_completion = self.client.chat.completions.create(**worker_kwargs)
                 if stream:
                     response = self._process_stream_omni_response(chat_completion)
                 else:

@@ -6,16 +6,10 @@ steps:
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - |
-        set +e
-        pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "advanced_model" --run-level "advanced_model"
-        EXIT1=$$?
-        pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "advanced_model" --run-level "advanced_model"
-        EXIT2=$$?
-        pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
-        EXIT3=$$?
-        pytest -s -v tests/e2e/offline_inference/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
-        EXIT4=$$?
-        exit $$((EXIT1 | EXIT2 | EXIT3 | EXIT4))
+        pytest -s -v \
+          tests/examples/ \
+          tests/e2e/online_serving/test_*_expansion.py \
+          -m "advanced_model and H100 and omni" --run-level "advanced_model"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -57,8 +51,7 @@ steps:
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-      - pytest -s -v tests/examples/ -m "advanced_model and L4 and omni" --run-level "advanced_model"
-      - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and L4 and omni" --run-level "advanced_model"
+      - pytest -s -v tests/examples/ tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and L4 and omni" --run-level "advanced_model"
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
@@ -79,7 +72,7 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -k "not test_wan22_expansion" -m "advanced_model and diffusion and H100" --run-level "advanced_model"
+      - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -k "not test_wan22_expansion and not test_wan_2_1_vace_expansion" -m "advanced_model and diffusion and H100" --run-level "advanced_model"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -114,13 +107,13 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Diffusion Model Wan22 completed Test with H100"
+  - label: ":full_moon: Diffusion Model (Wan) Test with H100"
     timeout_in_minutes: 90
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -m "advanced_model" --run-level "advanced_model"
+      - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py tests/e2e/online_serving/test_wan_2_1_vace_expansion.py -m "advanced_model" --run-level "advanced_model"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -155,7 +148,7 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Diffusion Model Test with L4"
+  - label: ":full_moon: Diffusion Model Test"
     timeout_in_minutes: 60
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -177,7 +170,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
 
-  - label: ":full_moon: Documentation Example Code Test with H100"
+  - label: ":full_moon: Doc Example Code Test with H100"
     timeout_in_minutes: 60
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -219,7 +212,7 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Omni Model Perf Test & Test Case Statistics"
+  - label: ":full_moon: Omni Model Perf Test & Testcase Statistics with H100"
     key: nightly-omni-performance
     timeout_in_minutes: 180
     depends_on: upload-nightly-pipeline
@@ -369,7 +362,7 @@ steps:
       - kubernetes:
           podSpec:
             containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:c392ce21e9cf9ea65c52b866447793db10e0261c
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
                 resources:
                   limits:
                     nvidia.com/gpu: 2
@@ -397,9 +390,9 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: Qwen-Image Diffusion Perf Test with H100"
+  - label: ":full_moon: Diffusion Perf Test with H100"
     key: nightly-qwen-image-performance
-    timeout_in_minutes: 300
+    timeout_in_minutes: 180
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     commands:

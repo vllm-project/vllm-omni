@@ -1,4 +1,5 @@
 # Common dependencies for all platforms
+av>=14.0.0
 omegaconf>=2.3.0
 librosa>=0.11.0
 resampy>=0.4.3

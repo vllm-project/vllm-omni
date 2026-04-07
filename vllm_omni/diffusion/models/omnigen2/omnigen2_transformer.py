@@ -19,6 +19,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -411,7 +412,7 @@ class OmniGen2RotaryPosEmbed(nn.Module):
         axes_dim: tuple[int, int, int], axes_lens: tuple[int, int, int], theta: int
     ) -> list[torch.Tensor]:
         freqs_cis = []
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        freqs_dtype = torch.float64 if current_omni_platform.supports_float64() else torch.float32
         for i, (d, e) in enumerate(zip(axes_dim, axes_lens)):
             emb = get_1d_rotary_pos_embed(d, e, theta=theta, freqs_dtype=freqs_dtype)
             freqs_cis.append(emb)

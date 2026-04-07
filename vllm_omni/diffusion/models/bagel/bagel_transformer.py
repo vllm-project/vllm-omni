@@ -25,6 +25,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -157,21 +158,12 @@ class BagelMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
-            intermediate_size,
+            [intermediate_size, intermediate_size],
             bias=False,
-            gather_output=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_proj",
-        )
-        self.up_proj = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.up_proj",
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -186,8 +178,8 @@ class BagelMLP(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
-        gate, _ = self.gate_proj(x)
-        up, _ = self.up_proj(x)
+        gate_up, _ = self.gate_up_proj(x)
+        gate, up = gate_up.chunk(2, dim=-1)
         x = self.act_fn(gate) * up
         x, _ = self.down_proj(x)
         return x
@@ -929,27 +921,38 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
+            # MLP gate/up projections — fused into MergedColumnParallelLinear.
+            # HF checkpoints store separate gate_proj / up_proj weights;
+            # these entries remap them to the fused gate_up_proj parameter.
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
+        self.stacked_params_mapping = stacked_params_mapping
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            loaded = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict.get(name)
+                stacked_name = name.replace(weight_name, param_name)
+                param = params_dict.get(stacked_name)
                 if param is None:
                     break
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                name = stacked_name
+                loaded = True
                 break
-            else:
+
+            if not loaded:
                 param = params_dict.get(name)
                 if param is None:
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
 
         return loaded_params

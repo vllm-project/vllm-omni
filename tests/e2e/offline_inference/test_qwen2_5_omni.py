@@ -57,7 +57,7 @@ def get_question(prompt_type="mix"):
     return prompts.get(prompt_type, prompts["mix"])
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
@@ -88,7 +88,7 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)

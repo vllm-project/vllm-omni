@@ -52,6 +52,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
+from vllm.entrypoints.openai.realtime.connection import RealtimeConnection
+from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.openai.speech_to_text.serving import (
@@ -351,6 +353,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     try:
         await shutdown_task
     finally:
+        app.state.openai_serving_speech.shutdown()
         sock.close()
 
 
@@ -508,6 +511,13 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
 
+        state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=engine_client,
+            model_name=model_name,
+            stage_configs=diffusion_stage_configs,
+        )
+        state.openai_streaming_speech = None
+
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
@@ -630,6 +640,7 @@ async def omni_init_app_state(
         OpenAIServingResponses(
             engine_client,
             state.openai_serving_models,
+            openai_serving_render=state.openai_serving_render,
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -690,7 +701,8 @@ async def omni_init_app_state(
         OpenAIServingPooling(
             engine_client,
             state.openai_serving_models,
-            supported_tasks=supported_tasks,
+            state.openai_serving_render,
+            supported_tasks=tuple(supported_tasks),
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -737,6 +749,7 @@ async def omni_init_app_state(
     state.openai_serving_tokenization = OpenAIServingTokenization(
         engine_client,
         state.openai_serving_models,
+        state.openai_serving_render,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
@@ -778,6 +791,7 @@ async def omni_init_app_state(
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
         )
         if "generate" in supported_tasks
         else None
@@ -786,6 +800,7 @@ async def omni_init_app_state(
         ServingTokens(
             engine_client,
             state.openai_serving_models,
+            state.openai_serving_render,
             request_logger=request_logger,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -802,6 +817,11 @@ async def omni_init_app_state(
 
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
         speech_service=state.openai_serving_speech,
+    )
+    state.openai_serving_realtime = OpenAIServingRealtime(
+        engine_client=engine_client,
+        models=state.openai_serving_models,
+        request_logger=request_logger,
     )
 
     state.openai_serving_video = OmniOpenAIServingVideo(
@@ -1017,17 +1037,20 @@ async def list_voices(raw_request: Request):
     uploaded_speakers = []
     if hasattr(handler, "uploaded_speakers"):
         for voice_name, info in handler.uploaded_speakers.items():
-            uploaded_speakers.append(
-                {
-                    "name": info.get("name", voice_name),
-                    "consent": info.get("consent", ""),
-                    "created_at": info.get("created_at", 0),
-                    "file_size": info.get("file_size", 0),
-                    "mime_type": info.get("mime_type", ""),
-                    "embedding_source": info.get("embedding_source", "audio"),
-                    "embedding_dim": info.get("embedding_dim"),
-                }
-            )
+            voice_entry = {
+                "name": info.get("name", voice_name),
+                "consent": info.get("consent", ""),
+                "created_at": info.get("created_at", 0),
+                "file_size": info.get("file_size", 0),
+                "mime_type": info.get("mime_type", ""),
+                "embedding_source": info.get("embedding_source", "audio"),
+                "embedding_dim": info.get("embedding_dim"),
+            }
+            if info.get("ref_text"):
+                voice_entry["ref_text"] = info["ref_text"]
+            if info.get("speaker_description"):
+                voice_entry["speaker_description"] = info["speaker_description"]
+            uploaded_speakers.append(voice_entry)
 
     return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
 
@@ -1046,7 +1069,8 @@ async def upload_voice(
     speaker_embedding: str | None = Form(None),
     consent: str = Form(...),
     name: str = Form(...),
-    ref_text: str = Form(None),
+    ref_text: str | None = Form(None),
+    speaker_description: str | None = Form(None),
 ):
     """Upload a new voice for voice cloning.
 
@@ -1065,6 +1089,11 @@ async def upload_voice(
         speaker_embedding: JSON-encoded float list. Mutually exclusive with audio_sample.
         consent: Consent recording ID
         name: Name for the new voice
+        ref_text: Optional transcript of the audio for ICL (in-context
+            learning) mode. When provided, voice clone requests using this
+            voice will produce higher quality results.
+        speaker_description: Optional free-form description of the voice
+            (e.g. "warm speaker", "energetic narrator").
         raw_request: Raw FastAPI request
 
     Returns:
@@ -1082,7 +1111,13 @@ async def upload_voice(
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
-            result = await handler.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+            result = await handler.upload_voice(
+                audio_sample,
+                consent,
+                name,
+                ref_text=ref_text,
+                speaker_description=speaker_description,
+            )
         else:
             return base(raw_request).create_error_response(
                 message="Either 'audio_sample' or 'speaker_embedding' must be provided"
@@ -1159,6 +1194,19 @@ async def streaming_speech(websocket: WebSocket):
         await websocket.close()
         return
     await handler.handle_session(websocket)
+
+
+@router.websocket("/v1/realtime")
+async def realtime_websocket(websocket: WebSocket):
+    """WebSocket endpoint for OpenAI-style realtime interactions."""
+    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = RealtimeConnection(websocket, serving)
+    await connection.handle_connection()
 
 
 # Health and Model endpoints for diffusion mode
@@ -1264,7 +1312,13 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-
+        extra_args = {}
+        if request.use_system_prompt is not None:
+            extra_args["use_system_prompt"] = request.use_system_prompt
+        if request.system_prompt is not None:
+            extra_args["system_prompt"] = request.system_prompt
+        if extra_args:
+            gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora)
         _update_if_not_none(gen_params, "lora_request", lora_request)
