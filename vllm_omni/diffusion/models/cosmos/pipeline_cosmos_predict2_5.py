@@ -84,7 +84,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
+def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True, revision: str | None = None) -> dict:
     """Load transformer config from model directory or HF Hub."""
     if local_files_only:
         config_path = os.path.join(model_path, subfolder, "config.json")
@@ -99,6 +99,7 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
             config_path = hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/config.json",
+                revision=revision,
             )
             with open(config_path) as f:
                 return json.load(f)
@@ -188,7 +189,7 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=None,
+                revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
             )
@@ -198,12 +199,14 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             model,
             subfolder="tokenizer",
             local_files_only=local_files_only,
+            revision=od_config.revision,
             use_fast=False,
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model,
             subfolder="text_encoder",
             torch_dtype=dtype,
+            revision=od_config.revision,
             local_files_only=local_files_only,
         ).to(self.device)
 
@@ -211,6 +214,7 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             model,
             subfolder="vae",
             torch_dtype=dtype,
+            revision=od_config.revision,
             local_files_only=local_files_only,
         ).to(self.device)
 
@@ -239,13 +243,14 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             model,
             subfolder="transformer",
             local_files_only=local_files_only,
+            revision=od_config.revision,
         )
 
         self.transformer = CosmosTransformer3DModel(
             od_config=od_config,
             **transformer_config,
         )
-        
+
         #self.transformer = create_transformer_from_config(transformer_config)
 
         # Store the active transformer config
@@ -255,6 +260,7 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             model,
             subfolder="scheduler",
             local_files_only=local_files_only,
+            revision=od_config.revision,
         )
 
         if hasattr(self.scheduler, 'alphas_cumprod') and isinstance(self.scheduler.alphas_cumprod, torch.Tensor):

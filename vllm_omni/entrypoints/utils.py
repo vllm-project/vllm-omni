@@ -132,16 +132,17 @@ def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: 
         logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
-def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
+def _try_get_class_name_from_diffusers_config(model: str, revision: str | None = None) -> str | None:
     """Try to get class name from diffusers model configuration files.
 
     Args:
         model: Model name or path
+        revision: Model revision (branch, tag, or commit hash)
 
     Returns:
         Model type string if found, None otherwise
     """
-    model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+    model_index = get_hf_file_to_dict("model_index.json", model, revision=revision)
     if model_index and isinstance(model_index, dict) and "_class_name" in model_index:
         logger.debug(f"Found model_type '{model_index['_class_name']}' in model_index.json")
         return model_index["_class_name"]
@@ -283,7 +284,7 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
     return best_match
 
 
-def resolve_model_config_path(model: str) -> str:
+def resolve_model_config_path(model: str, revision: str | None = None) -> str:
     """Resolve the stage config file path from the model name.
 
     Resolves stage configuration path based on the model type and device type.
@@ -292,6 +293,7 @@ def resolve_model_config_path(model: str) -> str:
 
     Args:
         model: Model name or path (used to determine model_type)
+        revision: Model revision (branch, tag, or commit hash)
 
     Returns:
         String path to the stage configuration file
@@ -306,18 +308,18 @@ def resolve_model_config_path(model: str) -> str:
         model_type = hf_config.model_type
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
-        if file_or_path_exists(model, "model_index.json", revision=None):
-            model_type = _try_get_class_name_from_diffusers_config(model)
+        if file_or_path_exists(model, "model_index.json", revision=revision):
+            model_type = _try_get_class_name_from_diffusers_config(model, revision=revision)
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for diffusers model: {model}. "
                     f"Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
                 )
-        elif file_or_path_exists(model, "config.json", revision=None):
+        elif file_or_path_exists(model, "config.json", revision=revision):
             # Try to read config.json manually for custom models like Bagel that fail get_config
             # but have a valid config.json with model_type
             try:
-                config_dict = get_hf_file_to_dict("config.json", model, revision=None)
+                config_dict = get_hf_file_to_dict("config.json", model, revision=revision)
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
@@ -390,6 +392,8 @@ def load_stage_configs_from_model(
     if base_engine_args is None:
         base_engine_args = {}
 
+    revision = base_engine_args.get("revision", None) if isinstance(base_engine_args, dict) else None
+
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
     if stage_overrides:
         for stage_id_str, overrides in stage_overrides.items():
@@ -406,7 +410,7 @@ def load_stage_configs_from_model(
         return [stage.to_omegaconf() for stage in stages]
 
     # Legacy fallback: load from YAML
-    stage_config_path = resolve_model_config_path(model)
+    stage_config_path = resolve_model_config_path(model, revision=revision)
     if stage_config_path is None:
         return []
     stage_configs = load_stage_configs_from_yaml(
@@ -621,7 +625,8 @@ def load_and_resolve_stage_configs(
             else:
                 stage_configs = []
     elif stage_configs_path is None:
-        config_path = resolve_model_config_path(model)
+        revision = kwargs.get("revision", None) if kwargs and isinstance(kwargs, dict) else None
+        config_path = resolve_model_config_path(model, revision=revision)
         stage_configs = load_stage_configs_from_model(
             model,
             base_engine_args=kwargs,

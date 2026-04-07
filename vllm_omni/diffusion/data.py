@@ -838,7 +838,7 @@ class OmniDiffusionConfig:
             self.model_class_name = "DiffusersAdapterPipeline"
 
         try:
-            config_dict = get_hf_file_to_dict("model_index.json", self.model)
+            config_dict = get_hf_file_to_dict("model_index.json", self.model, revision=self.revision)
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
@@ -858,7 +858,7 @@ class OmniDiffusionConfig:
                             exc,
                         )
                 else:
-                    tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+                    tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model, revision=self.revision)
                     self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
             else:
                 raise FileNotFoundError("model_index.json not found")
@@ -875,7 +875,7 @@ class OmniDiffusionConfig:
                     "that require additional inputs."
                 )
             else:
-                cfg = get_hf_file_to_dict("config.json", self.model)
+                cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
                     raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
 
