@@ -93,7 +93,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
         _, _, latent_h, latent_w = z.shape
         scale = int(2 ** (len(self.config.block_out_channels) - 1))
-        max_parallel_size = self.distributed_decoder.parallel_size
+        max_parallel_size = self.distributed_executor.parallel_size
 
         root = int(math.sqrt(max_parallel_size))
         for rows in range(root, 0, -1):
@@ -187,7 +187,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         if split is not None:
             strategy = "tile" if split == self.tile_split else "patch"
             logger.info(f"Decode run with distributed executor, split strategy is {strategy}")
-            result = self.distributed_decoder.execute(
+            result = self.distributed_executor.execute(
                 z, DistributedOperator(split=split, exec=exec, merge=merge), broadcast_result=False
             )
             if not return_dict:

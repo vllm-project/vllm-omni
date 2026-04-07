@@ -2,6 +2,10 @@ import argparse
 import os
 
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.model_executor.stage_input_processors.bagel import (
+    GEN_THINK_SYSTEM_PROMPT,
+    VLM_THINK_SYSTEM_PROMPT,
+)
 
 
 def parse_args():
@@ -66,6 +70,17 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
     parser.add_argument(
+        "--cfg-interval",
+        type=float,
+        nargs=2,
+        default=None,
+        help="CFG interval [start, end] (default: pipeline default)",
+    )
+    parser.add_argument(
+        "--cfg-renorm-type", type=str, default=None, help="CFG renorm type: global, text_channel, channel"
+    )
+    parser.add_argument("--cfg-renorm-min", type=float, default=None, help="CFG renorm min")
+    parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
@@ -75,6 +90,12 @@ def parse_args():
         type=str,
         default=None,
         help="Quantization method (e.g. 'fp8').",
+    )
+    parser.add_argument(
+        "--think",
+        action="store_true",
+        default=False,
+        help="Enable thinking mode: AR stage decodes <think>...</think> planning tokens before image generation.",
     )
 
     args = parser.parse_args()
@@ -110,8 +131,12 @@ def main():
     from vllm_omni.entrypoints.omni import Omni
 
     omni_kwargs = {}
-    if args.stage_configs_path:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    stage_configs_path = args.stage_configs_path
+    if args.think and stage_configs_path is None:
+        stage_configs_path = "vllm_omni/model_executor/stage_configs/bagel_think.yaml"
+        print(f"[Info] Think mode enabled, using stage config: {stage_configs_path}")
+    if stage_configs_path:
+        omni_kwargs["stage_configs_path"] = stage_configs_path
 
     omni_kwargs.update(
         {
@@ -136,7 +161,8 @@ def main():
             if not args.image_path or not os.path.exists(args.image_path):
                 raise ValueError(f"img2img requires --image-path pointing to an existing file, got: {args.image_path}")
             loaded_image = Image.open(args.image_path).convert("RGB")
-            final_prompt_text = f"<|fim_middle|><|im_start|>{p}<|im_end|>"
+            think_prefix = f"<|im_start|>{GEN_THINK_SYSTEM_PROMPT}<|im_end|>" if args.think else ""
+            final_prompt_text = f"{think_prefix}<|fim_middle|><|im_start|>{p}<|im_end|>"
             prompt_dict = {
                 "prompt": final_prompt_text,
                 "multi_modal_data": {"img2img": loaded_image},
@@ -148,7 +174,10 @@ def main():
         elif args.modality == "img2text":
             if args.image_path:
                 loaded_image = Image.open(args.image_path).convert("RGB")
-                final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                think_prefix = f"<|im_start|>system\n{VLM_THINK_SYSTEM_PROMPT}<|im_end|>\n" if args.think else ""
+                final_prompt_text = (
+                    f"{think_prefix}<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                )
                 prompt_dict = {
                     "prompt": final_prompt_text,
                     "multi_modal_data": {"image": loaded_image},
@@ -156,11 +185,13 @@ def main():
                 }
                 formatted_prompts.append(prompt_dict)
         elif args.modality == "text2text":
-            final_prompt_text = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            think_prefix = f"<|im_start|>{VLM_THINK_SYSTEM_PROMPT}<|im_end|>" if args.think else ""
+            final_prompt_text = f"{think_prefix}<|im_start|>{p}<|im_end|><|im_start|>"
             prompt_dict = {"prompt": final_prompt_text, "modalities": ["text"]}
             formatted_prompts.append(prompt_dict)
         else:
-            final_prompt_text = f"<|im_start|>{p}<|im_end|>"
+            think_prefix = f"<|im_start|>{GEN_THINK_SYSTEM_PROMPT}<|im_end|>" if args.think else ""
+            final_prompt_text = f"{think_prefix}<|im_start|>{p}<|im_end|>"
             prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
             if args.negative_prompt is not None:
                 prompt_dict["negative_prompt"] = args.negative_prompt
@@ -178,6 +209,12 @@ def main():
                 "cfg_text_scale": args.cfg_text_scale,
                 "cfg_img_scale": args.cfg_img_scale,
             }
+            if args.cfg_interval is not None:
+                extra["cfg_interval"] = tuple(args.cfg_interval)
+            if args.cfg_renorm_type is not None:
+                extra["cfg_renorm_type"] = args.cfg_renorm_type
+            if args.cfg_renorm_min is not None:
+                extra["cfg_renorm_min"] = args.cfg_renorm_min
             if args.negative_prompt is not None:
                 extra["negative_prompt"] = args.negative_prompt
             diffusion_params.extra_args = extra  # type: ignore
@@ -186,6 +223,13 @@ def main():
 
     img_idx = 0
     for req_output in omni_outputs:
+        if args.think:
+            ro = getattr(req_output, "request_output", None)
+            if ro and getattr(ro, "outputs", None):
+                txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
+                if txt:
+                    print(txt)
+
         images = getattr(req_output, "images", None)
 
         if not images:
@@ -194,6 +238,7 @@ def main():
         for j, img in enumerate(images):
             save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
             img.save(save_path)
+            print(f"[Output] Saved image to {save_path}")
         img_idx += 1
 
     print(omni_outputs)

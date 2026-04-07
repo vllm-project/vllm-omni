@@ -241,7 +241,7 @@ class Orchestrator:
                 # the output format in the future to simplify the processing logic in Orchestrator.
                 stage_client = self.stage_clients[stage_id]
                 if stage_client.stage_type == "diffusion":
-                    output = stage_client.get_diffusion_output_async()
+                    output = stage_client.get_diffusion_output_nowait()
                     if output is not None:
                         idle = False
                         req_state = self.request_states.get(output.request_id)

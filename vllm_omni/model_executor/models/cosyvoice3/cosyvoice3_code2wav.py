@@ -11,11 +11,12 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
-from torch.nn import functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiT
@@ -29,7 +30,6 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
-from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 
 logger = init_logger(__name__)
 
@@ -151,6 +151,140 @@ class CosyVoice3Code2Wav(nn.Module):
         return self.flow_model.spk_embed_affine_layer
 
     @torch.inference_mode()
+    def _forward_mel(
+        self,
+        token: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        embedding: torch.Tensor,
+        n_timesteps: int = 10,
+        token_offset_tokens: int = 0,
+        streaming: bool = True,
+        finalize: bool = False,
+    ) -> torch.Tensor:
+        """Generate mel features via the upstream flow-model inference path."""
+        flow_weight = next(self.flow_model.parameters())
+        device = flow_weight.device
+        dtype = flow_weight.dtype
+
+        token = token.to(device=device, dtype=torch.int32)
+        prompt_token = prompt_token.to(device=device, dtype=torch.int32)
+        prompt_feat = prompt_feat.to(device=device, dtype=dtype)
+        embedding = embedding.to(device=device, dtype=dtype)
+        token_len = torch.tensor([token.shape[1]], device=device, dtype=torch.int32)
+        prompt_token_len = torch.tensor([prompt_token.shape[1]], device=device, dtype=torch.int32)
+        prompt_feat_len = torch.tensor([prompt_feat.shape[1]], device=device, dtype=torch.int32)
+
+        with nullcontext():
+            feat, _ = self.flow_model.inference(
+                token=token,
+                token_len=token_len,
+                prompt_token=prompt_token,
+                prompt_token_len=prompt_token_len,
+                prompt_feat=prompt_feat,
+                prompt_feat_len=prompt_feat_len,
+                embedding=embedding,
+                streaming=streaming,
+                finalize=finalize,
+                n_timesteps=n_timesteps,
+            )
+
+        trim_mel = max(0, int(token_offset_tokens)) * int(self.token_mel_ratio)
+        if trim_mel > 0:
+            feat = feat[:, :, trim_mel:]
+
+        return feat
+
+    @staticmethod
+    def _fade_speech(
+        speech: torch.Tensor,
+        prev_speech: torch.Tensor,
+    ) -> torch.Tensor:
+        """Blend previous speech tail into current speech head."""
+        if speech.numel() == 0 or prev_speech.numel() == 0:
+            return speech
+        overlap = min(int(speech.shape[-1]), int(prev_speech.shape[-1]))
+        if overlap <= 0:
+            return speech
+        window = torch.hamming_window(2 * overlap, periodic=False, dtype=speech.dtype, device=speech.device)
+        fade_in = window[:overlap].view(1, -1)
+        fade_out = window[overlap:].view(1, -1)
+        blended_head = (
+            speech[:, :overlap] * fade_in
+            + prev_speech[:, -overlap:].to(device=speech.device, dtype=speech.dtype) * fade_out
+        )
+        if overlap == int(speech.shape[-1]):
+            return blended_head
+        return torch.cat([blended_head, speech[:, overlap:]], dim=-1)
+
+    @torch.inference_mode()
+    def forward_streaming(
+        self,
+        token: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        embedding: torch.Tensor,
+        *,
+        cache_state: dict[str, torch.Tensor] | None = None,
+        n_timesteps: int = 10,
+        token_offset_tokens: int = 0,
+        finalize: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Decode streaming audio using cumulative mel + emitted-speech offset.
+
+        This mirrors upstream CosyVoice3 streaming semantics more closely than
+        waveform-domain overlap-add: keep a cumulative mel history per request,
+        re-run causal HiFT on the history, and emit only the newly grown speech
+        suffix. That preserves causal look-right handling without double
+        trimming or duplicated overlap at chunk boundaries.
+        """
+        with nullcontext():
+            feat = self._forward_mel(
+                token=token,
+                prompt_token=prompt_token,
+                prompt_feat=prompt_feat,
+                embedding=embedding,
+                n_timesteps=n_timesteps,
+                token_offset_tokens=token_offset_tokens,
+                streaming=True,
+                finalize=finalize,
+            )
+        hift_weight = self.hift.m_source.l_linear.weight
+        chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+
+        cached_mel = None if not cache_state else cache_state.get("mel")
+        speech_offset_obj = None if not cache_state else cache_state.get("speech_offset")
+        try:
+            speech_offset = int(speech_offset_obj) if speech_offset_obj is not None else 0
+        except (TypeError, ValueError):
+            speech_offset = 0
+
+        if isinstance(cached_mel, torch.Tensor) and cached_mel.numel() > 0:
+            cached_mel = cached_mel.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
+            tts_mel = torch.cat([cached_mel, chunk_mel], dim=-1) if chunk_mel.numel() > 0 else cached_mel
+        else:
+            tts_mel = chunk_mel
+
+        if tts_mel.shape[-1] == 0:
+            tts_speech = torch.zeros((chunk_mel.shape[0], 1, 0), device=chunk_mel.device, dtype=chunk_mel.dtype)
+        else:
+            with nullcontext():
+                tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
+
+        tts_speech = tts_speech.reshape(tts_speech.shape[0], -1)
+        speech_offset = max(0, min(speech_offset, int(tts_speech.shape[-1])))
+        emitted_speech = tts_speech[:, speech_offset:]
+
+        if finalize:
+            return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), None
+
+        new_state = {
+            "mel": tts_mel.detach().cpu().contiguous(),
+            "speech_offset": int(tts_speech.shape[-1]),
+        }
+        return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
+
+    @torch.inference_mode()
     def forward(
         self,
         token: torch.Tensor,
@@ -159,73 +293,17 @@ class CosyVoice3Code2Wav(nn.Module):
         embedding: torch.Tensor,
         n_timesteps: int = 10,
     ) -> torch.Tensor:
-        """Generate audio waveform from speech tokens.
-
-        Args:
-            token: Speech tokens from talker stage [batch, seq_len]
-            prompt_token: Prompt speech tokens [batch, prompt_len]
-            prompt_feat: Prompt mel features [batch, feat_len, mel_dim]
-            embedding: Speaker embedding [batch, spk_dim]
-            n_timesteps: Number of diffusion steps
-
-        Returns:
-            Audio waveform [batch, 1, audio_len]
-        """
-        device = token.device
-        dtype = next(self.flow_model.parameters()).dtype
-
-        # Normalize and project speaker embedding
-        embedding = embedding.to(device=device, dtype=dtype)
-        embedding = F.normalize(embedding, dim=1)
-        embedding = self.spk_embed_affine_layer(embedding)
-
-        # Prepare tokens
-        prompt_token = prompt_token.to(device=device)
-        token_len1, token_len2 = prompt_token.shape[1], token.shape[1]
-        prompt_token_len = torch.tensor([token_len1], device=device, dtype=torch.int32)
-        token_len = torch.tensor([token_len2], device=device, dtype=torch.int32)
-
-        # Concatenate prompt and target tokens
-        full_token = torch.cat([prompt_token, token], dim=1)
-        full_token_len = prompt_token_len + token_len
-
-        # Create mask
-        mask = (~make_pad_mask(full_token_len)).unsqueeze(-1).to(embedding)
-
-        # Token embedding
-        token_emb = self.input_embedding(torch.clamp(full_token, min=0)) * mask
-
-        # Pre-lookahead processing
-        h = self.pre_lookahead_layer(token_emb)
-        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
-
-        # Calculate mel lengths
-        mel_len1 = prompt_feat.shape[1]
-        mel_len2 = h.shape[1] - mel_len1
-
-        # Build conditioning
-        conds = torch.zeros(
-            [1, mel_len1 + mel_len2, self.output_size],
-            device=device,
-            dtype=h.dtype,
-        )
-        conds[:, :mel_len1] = prompt_feat
-        conds = conds.transpose(1, 2)
-
-        # Create mel mask
-        mel_mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
-
-        # Run flow matching decoder
-        feat, _ = self.decoder(
-            mu=h.transpose(1, 2).contiguous(),
-            mask=mel_mask.unsqueeze(1),
-            spks=embedding,
-            cond=conds,
+        """Generate audio waveform from speech tokens."""
+        feat = self._forward_mel(
+            token=token,
+            prompt_token=prompt_token,
+            prompt_feat=prompt_feat,
+            embedding=embedding,
             n_timesteps=n_timesteps,
+            token_offset_tokens=0,
+            streaming=False,
+            finalize=True,
         )
-
-        # Extract generated portion (after prompt)
-        feat = feat[:, :, mel_len1:]
 
         # Run vocoder
         hift_weight = self.hift.m_source.l_linear.weight
@@ -238,7 +316,7 @@ class CosyVoice3Code2Wav(nn.Module):
                 dtype=tts_mel.dtype,
             )
         else:
-            tts_speech, _ = self.hift.inference(speech_feat=tts_mel)
+            tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=True)
 
         return tts_speech
 
