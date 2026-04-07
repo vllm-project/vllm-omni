@@ -21,7 +21,6 @@ import json
 import logging
 import os
 from collections.abc import Iterable
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -39,10 +38,9 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.cosmos.cosmos_transformer import CosmosTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
-
-from vllm_omni.diffusion.models.cosmos.cosmos_transformer import CosmosTransformer3DModel
 
 if is_cosmos_guardrail_available():
     from cosmos_guardrail import CosmosSafetyChecker
@@ -50,9 +48,11 @@ else:
 
     class CosmosSafetyChecker:
         def __init__(self, *args, **kwargs):
-            raise ImportError(
-                "`cosmos_guardrail` is not installed. Please install it to use the safety checker for Cosmos: `pip install cosmos_guardrail`."
+            message = (
+                "`cosmos_guardrail` is not installed. Please install it to use "
+                "the safety checker for Cosmos: `pip install cosmos_guardrail`."
             )
+            raise ImportError(message)
 
 
 DEFAULT_NEGATIVE_PROMPT = (
@@ -65,7 +65,6 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 
 logger = logging.getLogger(__name__)
-
 
 
 def retrieve_latents(
@@ -84,7 +83,9 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True, revision: str | None = None) -> dict:
+def load_transformer_config(
+    model_path: str, subfolder: str = "transformer", local_files_only: bool = True, revision: str | None = None
+) -> dict:
     """Load transformer config from model directory or HF Hub."""
     if local_files_only:
         config_path = os.path.join(model_path, subfolder, "config.json")
@@ -107,43 +108,6 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
             pass
     return {}
 
-
-def create_transformer_from_config(config: dict) -> CosmosTransformer3DModel:
-    """Create WanTransformer3DModel from config dict."""
-    kwargs = {}
-
-    if "patch_size" in config:
-        kwargs["patch_size"] = tuple(config["patch_size"])
-    if "num_attention_heads" in config:
-        kwargs["num_attention_heads"] = config["num_attention_heads"]
-    if "attention_head_dim" in config:
-        kwargs["attention_head_dim"] = config["attention_head_dim"]
-    if "in_channels" in config:
-        kwargs["in_channels"] = config["in_channels"]
-    if "out_channels" in config:
-        kwargs["out_channels"] = config["out_channels"]
-    if "text_dim" in config:
-        kwargs["text_dim"] = config["text_dim"]
-    if "freq_dim" in config:
-        kwargs["freq_dim"] = config["freq_dim"]
-    if "ffn_dim" in config:
-        kwargs["ffn_dim"] = config["ffn_dim"]
-    if "num_layers" in config:
-        kwargs["num_layers"] = config["num_layers"]
-    if "cross_attn_norm" in config:
-        kwargs["cross_attn_norm"] = config["cross_attn_norm"]
-    if "eps" in config:
-        kwargs["eps"] = config["eps"]
-    if "image_dim" in config:
-        kwargs["image_dim"] = config["image_dim"]
-    if "added_kv_proj_dim" in config:
-        kwargs["added_kv_proj_dim"] = config["added_kv_proj_dim"]
-    if "rope_max_seq_len" in config:
-        kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
-    if "pos_embed_seq_len" in config:
-        kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
-
-    return CosmosTransformer3DModel(**kwargs)
 
 def get_cosmos_predict25_post_process_func(
     od_config: OmniDiffusionConfig,
@@ -176,7 +140,7 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         self.safety_checker = CosmosSafetyChecker()
 
         self.od_config = od_config
-        
+
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
 
@@ -251,10 +215,10 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             **transformer_config,
         )
 
-        #self.transformer = create_transformer_from_config(transformer_config)
+        # self.transformer = create_transformer_from_config(transformer_config)
 
         # Store the active transformer config
-        #self.transformer_config = self.transformer.config
+        # self.transformer_config = self.transformer.config
 
         self.scheduler = UniPCMultistepScheduler.from_pretrained(
             model,
@@ -263,10 +227,10 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             revision=od_config.revision,
         )
 
-        if hasattr(self.scheduler, 'alphas_cumprod') and isinstance(self.scheduler.alphas_cumprod, torch.Tensor):
+        if hasattr(self.scheduler, "alphas_cumprod") and isinstance(self.scheduler.alphas_cumprod, torch.Tensor):
             if self.scheduler.alphas_cumprod.is_cuda:
                 self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.cpu()
-        if hasattr(self.scheduler, 'betas') and isinstance(self.scheduler.betas, torch.Tensor):
+        if hasattr(self.scheduler, "betas") and isinstance(self.scheduler.betas, torch.Tensor):
             if self.scheduler.betas.is_cuda:
                 self.scheduler.betas = self.scheduler.betas.cpu()
 
@@ -435,7 +399,6 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
 
         return latents, cond_latents, cond_mask, cond_indicator
 
-
     def check_inputs(
         self,
         prompt,
@@ -470,7 +433,6 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             not isinstance(negative_prompt, str) and not isinstance(negative_prompt, list)
         ):
             raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
-     
 
     def predict_noise(
         self,
@@ -515,36 +477,39 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         conditional_frame_timestep: float = 0.1,
         **kwargs,
     ) -> DiffusionOutput:
-        
         # Enforce safety checker requirement (NVIDIA Open Model License Agreement)
         if self.safety_checker is None:
-            raise ValueError(
+            message = (
                 f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
-                "[NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
+                "[NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/"
+                "enterprise-software/nvidia-open-model-license). "
                 f"Please ensure that you are compliant with the license agreement."
             )
+            raise ValueError(message)
 
         # Get parameters from request or arguments
         if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
             prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
             negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
         if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
+            raise ValueError("Prompt or prompt_embeds is required for Cosmos Predict 2.5 generation.")
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
         num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
 
         # Ensure dimensions are compatible with VAE and patch size
-        #patch_size = self.transformer_config.patch_size
-        mod_value = 32#self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
+        # patch_size = self.transformer_config.patch_size
+        mod_value = 32  # self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
 
-        #num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        guidance_scale = req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else guidance_scale
-        num_videos_per_prompt=1#req.sampling_params.num_outputs_per_prompt or 1,
+        # num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else guidance_scale
+        )
+        num_videos_per_prompt = 1  # req.sampling_params.num_outputs_per_prompt or 1,
 
         self._guidance_scale = guidance_scale
         self._current_timestep = None
