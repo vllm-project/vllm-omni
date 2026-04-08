@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.backends.utils.fa import is_mate_available
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -51,6 +52,10 @@ class PackagesEnvChecker:
     def _check_flash_attn(self, packages_info) -> bool:
         """Check if flash attention is available and compatible."""
         platform = current_omni_platform
+
+        # MUSA uses MATE for flash attention
+        if platform.is_musa():
+            return is_mate_available()
 
         # Flash attention requires CUDA-like platforms (CUDA or ROCm)
         if not platform.is_cuda_alike():
