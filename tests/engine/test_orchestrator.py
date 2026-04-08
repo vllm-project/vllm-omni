@@ -52,7 +52,7 @@ class FakeStageClient:
         self._diffusion_outputs = queue.Queue()
 
     # Orchestrator-facing interface.
-    async def add_request_async(self, *args) -> None:
+    async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
 
     async def get_output_async(self):
