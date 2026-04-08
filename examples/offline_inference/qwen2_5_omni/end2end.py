@@ -6,8 +6,12 @@ with the correct prompt format on Qwen2.5-Omni
 """
 
 import os
+import sys
 import time
+from pathlib import Path
 from typing import NamedTuple
+
+import vllm_omni
 
 import librosa
 import numpy as np
@@ -320,7 +324,25 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-    omni = Omni(
+
+    stage_configs_path: str | None = getattr(args, "stage_configs_path", None)
+    omni_connector = getattr(args, "omni_connector", None)
+    if stage_configs_path and omni_connector:
+        print("Error: use only one of --stage-configs-path or --omni-connector.", file=sys.stderr)
+        sys.exit(2)
+    if omni_connector:
+        pkg_root = Path(vllm_omni.__file__).resolve().parent
+        bundled = {
+            "shm": pkg_root / "model_executor" / "stage_configs" / "qwen2_5_omni_shm.yaml",
+            "priskv": pkg_root / "model_executor" / "stage_configs" / "qwen2_5_omni_priskv.yaml",
+        }
+        p = bundled[omni_connector]
+        if not p.is_file():
+            print(f"Error: bundled stage config not found: {p}", file=sys.stderr)
+            sys.exit(2)
+        stage_configs_path = str(p)
+
+    omni_kwargs: dict = dict(
         model=model_name,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
@@ -328,6 +350,9 @@ def main(args):
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
     )
+    if stage_configs_path:
+        omni_kwargs["stage_configs_path"] = stage_configs_path
+    omni = Omni(**omni_kwargs)
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
         top_p=1.0,  # Disable nucleus sampling
@@ -448,8 +473,9 @@ def parse_args():
     parser.add_argument(
         "--stage-init-timeout",
         type=int,
-        default=300,
-        help="Timeout for initializing a single stage in seconds (default: 300)",
+        default=600,
+        help="Timeout for initializing a single stage in seconds (default: 600). "
+        "Large models on one GPU may need more.",
     )
     parser.add_argument(
         "--batch-timeout",
@@ -460,8 +486,12 @@ def parse_args():
     parser.add_argument(
         "--init-timeout",
         type=int,
-        default=300,
-        help="Timeout for initializing stages in seconds (default: 300)",
+        default=1200,
+        help=(
+            "Seconds to wait for the whole orchestrator / all stages to become ready "
+            "(default: 1200). Single-GPU 3-stage Qwen2.5-Omni often exceeds 5–10 minutes; "
+            "raise this if you see TimeoutError on Omni startup."
+        ),
     )
     parser.add_argument(
         "--shm-threshold-bytes",
@@ -518,6 +548,28 @@ def parse_args():
         type=int,
         default=16000,
         help="Sampling rate for audio loading (default: 16000).",
+    )
+    parser.add_argument(
+        "--omni-connector",
+        type=str,
+        default=None,
+        choices=["shm", "priskv"],
+        help=(
+            "Bundled single-GPU Qwen2.5-Omni stage YAML: "
+            "'shm' uses auto SharedMemoryConnector on stage edges; "
+            "'priskv' uses PrisKVConnector (PrisKV server on 127.0.0.1:6379 required). "
+            "Mutually exclusive with --stage-configs-path."
+        ),
+    )
+    parser.add_argument(
+        "--stage-configs-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to a custom stage configuration YAML. "
+            "If omitted, model default configs are used. "
+            "Mutually exclusive with --omni-connector."
+        ),
     )
     parser.add_argument(
         "--worker-backend", type=str, default="multi_process", choices=["multi_process", "ray"], help="backend"
