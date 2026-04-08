@@ -36,6 +36,8 @@ th {
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano` | ✅︎ | | | |
 | `WanSpeechToVideoPipeline` | Wan2.2-S2V | `Wan-AI/Wan2.2-S2V-14B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22VACEPipeline` | Wan2.1-VACE | `Wan-AI/Wan2.1-VACE-1.3B-diffusers`, `Wan-AI/Wan2.1-VACE-14B-diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
+| `AniSoraI2VCogVideoXPipeline` | AniSora-I2V (5B) | `Disty0/Index-anisora-5B-diffusers` | ✅︎ | ✅︎ | | |
+| `AniSoraV2I2VPipeline` | AniSora-I2V (14B) | `aardsoul-music/Wan2.1-Anisora-14B` | ✅︎ | ✅︎ | | |
 | `LTX2Pipeline` | LTX-2-T2V | `Lightricks/LTX-2` | ✅︎ | ✅︎ | | |
 | `LTX2ImageToVideoPipeline` | LTX-2-I2V | `Lightricks/LTX-2` | ✅︎ | ✅︎ | | |
 | `LTX2TwoStagesPipeline` | LTX-2-T2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |

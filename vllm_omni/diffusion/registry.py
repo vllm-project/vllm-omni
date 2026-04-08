@@ -66,6 +66,18 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_vace",
         "Wan22VACEPipeline",
     ),
+    # Index-AniSora V2/V3 (14B) - Wan2.1 architecture with hybrid loading
+    "AniSoraV2I2VPipeline": (
+        "anisora",
+        "pipeline_anisora_v2_i2v",
+        "AniSoraV2I2VPipeline",
+    ),
+    # Index-AniSora V1 (5B) - CogVideoX-based I2V
+    "AniSoraI2VCogVideoXPipeline": (
+        "anisora",
+        "pipeline_anisora_i2v_cogvideox",
+        "AniSoraI2VCogVideoXPipeline",
+    ),
     "LTX2Pipeline": (
         "ltx2",
         "pipeline_ltx2",
@@ -510,6 +522,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
+    "AniSoraI2VCogVideoXPipeline": "get_anisora_i2v_post_process_func",
+    "AniSoraV2I2VPipeline": "get_anisora_v2_i2v_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -534,6 +548,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
+    "AniSoraI2VCogVideoXPipeline": "get_anisora_i2v_pre_process_func",
+    "AniSoraV2I2VPipeline": "get_anisora_v2_i2v_pre_process_func",
 }
 
 
