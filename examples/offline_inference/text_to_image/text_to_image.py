@@ -376,7 +376,7 @@ def main():
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
         f"enable_expert_parallel={args.enable_expert_parallel}."
     )
-    print(f"  CPU offload: {args.enable_cpu_offload}")
+    print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
