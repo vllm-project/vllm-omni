@@ -13,6 +13,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
+
 @pytest.mark.skip(reason="issue #2588")
 def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
     async def run_test():
