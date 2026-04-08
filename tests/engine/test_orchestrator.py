@@ -61,7 +61,7 @@ class FakeStageClient:
         except queue.Empty:
             return SimpleNamespace(outputs=[])
 
-    def get_diffusion_output_async(self):
+    def get_diffusion_output_nowait(self):
         try:
             return self._diffusion_outputs.get_nowait()
         except queue.Empty:
