@@ -3,7 +3,7 @@
 # from test-nightly.yml (step key: nightly-diffusion-model-test). Top-level groups are
 # foldable in the Buildkite UI (Other / Wan / Qwen-Image).
 steps:
-  - group: "Other Model Test"
+  - group: ":card_index_dividers: Other Model Test"
     key: nightly-other-model-test-group
     steps:
       - label: ":full_moon: Diffusion · Other · Function Test with H100"
@@ -107,7 +107,7 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-  - group: "Wan Model Test"
+  - group: ":card_index_dividers: Wan Series Model Test"
     key: nightly-wan-model-test-group
     steps:
       - label: ":full_moon: Diffusion · Wan · Function Test"
@@ -191,7 +191,7 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-  - group: "Qwen-Image Model Test"
+  - group: ":card_index_dividers: Qwen-Image Series Model Test"
     key: nightly-qwen-image-edit-group
     steps:
       - label: ":full_moon: Diffusion · Qwen-Image · Function Test with H100"

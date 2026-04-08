@@ -1,6 +1,6 @@
 steps:
   # Group: collapses under one heading in the Buildkite UI; child steps still run in parallel.
-  - group: "Omni Model Test"
+  - group: ":card_index_dividers: Omni Model Test"
     key: nightly-omni-test-group
     steps:
       - label: ":full_moon: Omni · Function Test with H100"
@@ -156,7 +156,7 @@ steps:
   # Dynamically appends steps from test-nightly-diffusion.yml into this build (same mechanism as
   # pipeline.yml → test-ready.yml / test-merge.yml / test-nightly.yml). Foldable groups stay in the
   # uploaded YAML (Other / Wan / Qwen-Image).
-  - label: ":arrow_branch: Diffusion Model Test"
+  - label: ":card_index_dividers: Diffusion Model Test"
     key: nightly-diffusion-model-test
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -165,7 +165,7 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  - label: ":full_moon: Testcase Statistics"
+  - label: ":bar_chart: Testcase Statistics"
     key: nightly-testcase-statistics
     timeout_in_minutes: 120
     depends_on: upload-nightly-pipeline
