@@ -385,3 +385,18 @@ class TestStreamingSpeechWebSocket:
 
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2
+
+
+class TestGeneratePcmChunksContract:
+    """Guard: _generate_pcm_chunks must exist on OmniOpenAIServingSpeech.
+
+    The WebSocket handler calls speech_service._generate_pcm_chunks()
+    at runtime. If the method is removed, all WS TTS streaming breaks
+    with an AttributeError. This test catches that at CI time.
+    """
+
+    def test_generate_pcm_chunks_defined(self):
+        assert hasattr(OmniOpenAIServingSpeech, "_generate_pcm_chunks")
+        assert asyncio.iscoroutinefunction(OmniOpenAIServingSpeech._generate_pcm_chunks) or callable(
+            OmniOpenAIServingSpeech._generate_pcm_chunks
+        )
