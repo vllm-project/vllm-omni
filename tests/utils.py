@@ -12,7 +12,6 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
-from pathlib import Path
 from typing import Any, Literal
 
 import cloudpickle
@@ -81,8 +80,6 @@ def wait_for_gpu_memory_to_clear(
     threshold_ratio: float | None = None,
     timeout_s: float = 120,
 ) -> None:
-    import gc
-
     assert threshold_bytes is not None or threshold_ratio is not None
     # Use nvml instead of pytorch to reduce measurement error from torch cuda
     # context.
@@ -621,55 +618,3 @@ class DeviceMemoryMonitor:
 
     def __del__(self):
         self.stop()
-
-
-# --- Whisper (picklable entry for ProcessPoolExecutor / spawn in conftest) -----------------
-# ``whisper.load_model`` and transcribe only; keep heavy logic out of conftest's import path.
-
-
-@contextmanager
-def _serialize_whisper_small_model_download():
-    """Serialize Whisper ``small`` cache writes across processes (Linux CI; ``fcntl``)."""
-    import fcntl
-
-    lock_path = Path.home() / ".cache" / "whisper" / ".small_model_download.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    f = open(lock_path, "a+b")
-    try:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        f.close()
-
-
-def whisper_transcribe_in_subprocess(output_path: str) -> str:
-    """Transcribe audio with openai-whisper (picklable entry for ProcessPoolExecutor)."""
-    import whisper
-
-    if torch.cuda.is_available():
-        n = torch.cuda.device_count()
-        idx = 0 if n == 1 else (n - 1)
-        device = f"cuda:{idx}"
-        use_cuda = True
-    else:
-        device = "cpu"
-        use_cuda = False
-
-    with _serialize_whisper_small_model_download():
-        model = whisper.load_model("small", device=device)
-    try:
-        text = model.transcribe(
-            output_path,
-            temperature=0.0,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-        )["text"]
-    finally:
-        del model
-        gc.collect()
-        if use_cuda:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-    return text or ""
