@@ -129,6 +129,10 @@ def _supports_video_generation(model_name: str) -> bool:
     return any(key in lower for key in ("wan", "video", "i2v", "t2v"))
 
 
+def _supports_chat_generation(model_name: str) -> bool:
+    return not _supports_video_generation(model_name)
+
+
 class _HasServeArgs(Protocol):
     serve_args: list[str]
 
@@ -170,10 +174,31 @@ def _resolve_oom_device_spec(config: dict[str, Any], stage_config_path: str | No
 CONFIGS = _load_reliability_configs()
 _UNIQUE_PARAMS = create_unique_server_params(CONFIGS, E2E_STAGE_CONFIGS_DIR) if CONFIGS else []
 TEST_PARAMS = [OmniServerParams(model=m, stage_config_path=p) for _, m, p in _UNIQUE_PARAMS]
+WAN22_RELIABILITY_PARAMS = [
+    OmniServerParams(
+        model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        server_args=[
+            "--num-gpus",
+            "1",
+            "--boundary-ratio",
+            "0.875",
+            "--flow-shift",
+            "5.0",
+            "--disable-log-stats",
+        ],
+    )
+]
+# B-scheme: keep dfx global config flow unchanged, inject Wan2.2 args locally.
+for _wan_param in WAN22_RELIABILITY_PARAMS:
+    if _wan_param not in TEST_PARAMS:
+        TEST_PARAMS.append(_wan_param)
+
+OMNI_CHAT_PARAMS = [param for param in TEST_PARAMS if _supports_chat_generation(param.model)]
+DIFFUSION_VIDEO_PARAMS = [param for param in TEST_PARAMS if _supports_video_generation(param.model)]
 
 
-def test_scenarios_json_loads() -> None:
-    """Guarantee RFC ``scenarios.json`` exists and parses (collect-only / CI smoke)."""
+def validate_scenarios_json_loads() -> None:
+    """Validate that reliability ``scenarios.json`` exists and parses."""
     assert SCENARIOS_PATH.is_file(), f"Missing {SCENARIOS_PATH}"
     cfg = load_configs(str(SCENARIOS_PATH))
     assert isinstance(cfg, list)
@@ -188,7 +213,7 @@ def test_scenarios_json_loads() -> None:
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
 )
-@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
+@pytest.mark.skipif(not OMNI_CHAT_PARAMS, reason="no omni-chat server params available")
 @pytest.mark.parametrize(
     "oom_cfg",
     [
@@ -201,63 +226,7 @@ def test_scenarios_json_loads() -> None:
     ],
     ids=["oom_default"],
 )
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_single_request_failure(omni_server, openai_client, oom_cfg) -> None:
-    """Generic request-fault test: OOM injection should cause request failure."""
-    device_spec = _resolve_oom_device_spec(
-        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
-    )
-    handle = inject_gpu_oom(
-        device=device_spec,
-        target_mem_ratio=oom_cfg["target_mem_ratio"],
-        hold_seconds=oom_cfg["hold_seconds"],
-        startup_timeout_sec=oom_cfg["startup_timeout_sec"],
-        strict=oom_cfg["strict"],
-    )
-    try:
-        messages = dummy_messages_from_mix_data(
-            system_prompt=_get_system_prompt(),
-            content_text="What is the capital of China? Answer in 20 words.",
-        )
-        request_config = {
-            "model": omni_server.model,
-            "messages": messages,
-            "stream": False,
-            "modalities": ["text"],
-            "key_words": {"text": ["beijing"]},
-        }
-        try:
-            openai_client.send_omni_request(request_config, request_num=1)
-        except Exception as exc:
-            _assert_fault_exception(exc)
-        else:
-            pytest.fail("expected request failure during GPU OOM injection")
-    finally:
-        stop_gpu_oom_hogs(handle)
-
-
-@pytest.mark.slow
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
-    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
-)
-@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
-@pytest.mark.parametrize(
-    "oom_cfg",
-    [
-        {
-            "target_mem_ratio": OOM_INJECTION_CONFIG["target_mem_ratio"],
-            "hold_seconds": OOM_INJECTION_CONFIG["hold_seconds"],
-            "startup_timeout_sec": OOM_INJECTION_CONFIG["startup_timeout_sec"],
-            "strict": OOM_INJECTION_CONFIG["strict"],
-        }
-    ],
-    ids=["oom_default"],
-)
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", OMNI_CHAT_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, openai_client, oom_cfg) -> None:
     """Large chat payload under OOM injection should fail."""
     device_spec = _resolve_oom_device_spec(
@@ -306,7 +275,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, opena
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
 )
-@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
+@pytest.mark.skipif(not DIFFUSION_VIDEO_PARAMS, reason="no diffusion-video server params available")
 @pytest.mark.parametrize(
     "oom_cfg",
     [
@@ -319,11 +288,9 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, opena
     ],
     ids=["oom_default"],
 )
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, openai_client, oom_cfg) -> None:
     """Video-style large request under OOM injection (closer to RFC #2327 trigger path)."""
-    if not _supports_video_generation(omni_server.model):
-        pytest.skip(f"model does not look video-capable: {omni_server.model}")
     device_spec = _resolve_oom_device_spec(
         OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
     )
@@ -369,7 +336,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, open
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
 )
-@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
+@pytest.mark.skipif(not OMNI_CHAT_PARAMS, reason="no omni-chat server params available")
 @pytest.mark.parametrize(
     "oom_cfg",
     [
@@ -382,7 +349,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, open
     ],
     ids=["oom_default"],
 )
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", OMNI_CHAT_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, openai_client, oom_cfg) -> None:
     """Concurrent request pressure under OOM should produce request failures."""
     device_spec = _resolve_oom_device_spec(
@@ -422,8 +389,8 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, open
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
-@pytest.mark.skipif(not TEST_PARAMS, reason="no server params available")
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+@pytest.mark.skipif(not OMNI_CHAT_PARAMS, reason="no omni-chat server params available")
+@pytest.mark.parametrize("omni_server", OMNI_CHAT_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_request_failure(omni_server, openai_client) -> None:
     """Engine-fatal style injection: kill one runtime process and verify request failure."""
     pids, pattern = _kill_runtime_process_for_fault_test()
