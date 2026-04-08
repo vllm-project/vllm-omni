@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import datetime
 import io
 import json
@@ -1087,6 +1088,22 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
     return merged
 
 
+@contextlib.contextmanager
+def _serialize_whisper_small_model_download():
+    """Serialize Whisper ``small`` cache writes across processes (Linux CI; uses ``fcntl``)."""
+    import fcntl
+
+    lock_path = Path.home() / ".cache" / "whisper" / ".small_model_download.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "a+b")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
+
+
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
@@ -1107,7 +1124,8 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
     else:
         use_accelerator = False
         device = "cpu"
-    model = whisper.load_model("small", device=device)
+    with _serialize_whisper_small_model_download():
+        model = whisper.load_model("small", device=device)
     try:
         text = model.transcribe(
             output_path,
