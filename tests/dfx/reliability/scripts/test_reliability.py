@@ -167,31 +167,28 @@ def _resolve_oom_device_spec(config: dict[str, Any], stage_config_path: str | No
     if explicit is not None:
         return str(explicit)
     if not stage_config_path:
-        raise ValueError("OOM device is not configured and stage_config_path is empty.")
+        # Scenarios may omit stage yaml path; reliability OOM cases here are single-card tests.
+        return "0"
     return _parse_stage_devices(stage_config_path)
 
 
+def _extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str, list[str] | None]:
+    mapping: dict[str, list[str] | None] = {}
+    for cfg in configs:
+        test_name = str(cfg.get("test_name"))
+        server_params = cfg.get("server_params") or {}
+        raw_args = server_params.get("server_args")
+        mapping[test_name] = [str(item) for item in raw_args] if isinstance(raw_args, list) else None
+    return mapping
+
+
 CONFIGS = _load_reliability_configs()
+_SERVER_ARGS_BY_TEST_NAME = _extract_server_args_by_test_name(CONFIGS)
 _UNIQUE_PARAMS = create_unique_server_params(CONFIGS, E2E_STAGE_CONFIGS_DIR) if CONFIGS else []
-TEST_PARAMS = [OmniServerParams(model=m, stage_config_path=p) for _, m, p in _UNIQUE_PARAMS]
-WAN22_RELIABILITY_PARAMS = [
-    OmniServerParams(
-        model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        server_args=[
-            "--num-gpus",
-            "1",
-            "--boundary-ratio",
-            "0.875",
-            "--flow-shift",
-            "5.0",
-            "--disable-log-stats",
-        ],
-    )
+TEST_PARAMS = [
+    OmniServerParams(model=model, stage_config_path=stage_config_path, server_args=_SERVER_ARGS_BY_TEST_NAME.get(test_name))
+    for test_name, model, stage_config_path in _UNIQUE_PARAMS
 ]
-# B-scheme: keep dfx global config flow unchanged, inject Wan2.2 args locally.
-for _wan_param in WAN22_RELIABILITY_PARAMS:
-    if _wan_param not in TEST_PARAMS:
-        TEST_PARAMS.append(_wan_param)
 
 OMNI_CHAT_PARAMS = [param for param in TEST_PARAMS if _supports_chat_generation(param.model)]
 DIFFUSION_VIDEO_PARAMS = [param for param in TEST_PARAMS if _supports_video_generation(param.model)]

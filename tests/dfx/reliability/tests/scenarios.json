@@ -28,5 +28,20 @@
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
       "stage_config_name": "qwen3_omni_ci.yaml"
     }
+  },
+  {
+    "test_name": "wan22_t2v_reliability_default",
+    "server_params": {
+      "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+      "server_args": [
+        "--num-gpus",
+        "1",
+        "--boundary-ratio",
+        "0.875",
+        "--flow-shift",
+        "5.0",
+        "--disable-log-stats"
+      ]
+    }
   }
 ]
