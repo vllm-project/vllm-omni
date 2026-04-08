@@ -231,6 +231,8 @@ count, use `size` and `n` rather than `height`, `width`, or
 | `seed`                   | int   | None    | Random seed (reproducible)     |
 | `negative_prompt`        | str   | None    | Negative prompt                |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
+| `use_system_prompt` | str | None | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text string. Only for HunyuanImage-3.0. |
+| `system_prompt` | str | None | Custom system prompt text. Only used when `use_system_prompt` is set to `custom`. Only for HunyuanImage-3.0. |
 
 ## Response Format
 

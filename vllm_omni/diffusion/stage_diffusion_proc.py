@@ -14,8 +14,10 @@ from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import torch
 import zmq
 import zmq.asyncio
+from PIL import Image
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
@@ -128,6 +130,7 @@ class StageDiffusionProc:
         request_id: str,
         prompt: Any,
         sampling_params_dict: dict,
+        kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and run DiffusionEngine.step()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -136,6 +139,8 @@ class StageDiffusionProc:
             prompts=[prompt],
             sampling_params=sampling_params,
             request_ids=[request_id],
+            request_id=request_id,
+            kv_sender_info=kv_sender_info,
         )
 
         loop = asyncio.get_running_loop()
@@ -150,6 +155,7 @@ class StageDiffusionProc:
         request_id: str,
         prompts: list[Any],
         sampling_params_dict: dict,
+        kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a batched diffusion request and run DiffusionEngine.step().
 
@@ -163,7 +169,9 @@ class StageDiffusionProc:
         request = OmniDiffusionRequest(
             prompts=prompts,
             sampling_params=sampling_params,
-            request_ids=[request_id] * len(prompts),
+            request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
+            request_id=request_id,
+            kv_sender_info=kv_sender_info,
         )
 
         loop = asyncio.get_running_loop()
@@ -174,8 +182,13 @@ class StageDiffusionProc:
         merged_mm: dict[str, Any] = {}
         merged_metrics: dict[str, Any] = {}
         merged_durations: dict[str, float] = {}
+        merged_custom: dict[str, Any] = {}
         peak_mem = 0.0
         latents = None
+        trajectory_latents: list[torch.Tensor] | None = None
+        trajectory_timesteps: list[torch.Tensor] | None = None
+        trajectory_log_probs: torch.Tensor | None = None
+        trajectory_decoded: list[Image.Image] | None = None
         final_output_type = "image"
 
         for r in results:
@@ -183,9 +196,18 @@ class StageDiffusionProc:
             merged_mm.update(r._multimodal_output)
             merged_metrics.update(r.metrics)
             merged_durations.update(r.stage_durations)
+            merged_custom.update(r._custom_output)
             peak_mem = max(peak_mem, r.peak_memory_mb)
             if latents is None and r.latents is not None:
                 latents = r.latents
+            if trajectory_latents is None:
+                trajectory_latents = r.trajectory_latents
+            if trajectory_timesteps is None:
+                trajectory_timesteps = r.trajectory_timesteps
+            if trajectory_log_probs is None:
+                trajectory_log_probs = r.trajectory_log_probs
+            if trajectory_decoded is None:
+                trajectory_decoded = r.trajectory_decoded
             if r.final_output_type != "image":
                 final_output_type = r.final_output_type
 
@@ -195,6 +217,11 @@ class StageDiffusionProc:
             prompt=prompts[0] if len(prompts) == 1 else None,
             metrics=merged_metrics,
             latents=latents,
+            trajectory_latents=trajectory_latents,
+            trajectory_timesteps=trajectory_timesteps,
+            trajectory_log_probs=trajectory_log_probs,
+            trajectory_decoded=trajectory_decoded,
+            custom_output=merged_custom or None,
             multimodal_output=merged_mm or None,
             final_output_type=final_output_type,
             stage_durations=merged_durations,
@@ -325,10 +352,20 @@ class StageDiffusionProc:
 
         tasks: dict[str, asyncio.Task] = {}
 
-        async def _dispatch_request(request_id: str, prompt: Any, sampling_params_dict: dict) -> None:
+        async def _dispatch_request(
+            request_id: str,
+            prompt: Any,
+            sampling_params_dict: dict,
+            kv_sender_info: dict[str, Any] | None = None,
+        ) -> None:
             """Process a single diffusion request and send the response."""
             try:
-                result = await self._process_request(request_id, prompt, sampling_params_dict)
+                result = await self._process_request(
+                    request_id,
+                    prompt,
+                    sampling_params_dict,
+                    kv_sender_info=kv_sender_info,
+                )
                 await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
                 logger.info(
@@ -363,6 +400,7 @@ class StageDiffusionProc:
                             request_id,
                             msg["prompt"],
                             msg["sampling_params"],
+                            msg.get("kv_sender_info"),
                         )
                     )
                     tasks[request_id] = task
@@ -370,9 +408,19 @@ class StageDiffusionProc:
                 elif msg_type == "add_batch_request":
                     request_id = msg["request_id"]
 
-                    async def _dispatch_batch(rid: str, prompts: list, sp_dict: dict) -> None:
+                    async def _dispatch_batch(
+                        rid: str,
+                        prompts: list,
+                        sp_dict: dict,
+                        kv_sender_info: dict[str, Any] | None = None,
+                    ) -> None:
                         try:
-                            result = await self._process_batch_request(rid, prompts, sp_dict)
+                            result = await self._process_batch_request(
+                                rid,
+                                prompts,
+                                sp_dict,
+                                kv_sender_info=kv_sender_info,
+                            )
                             await response_socket.send(encoder.encode({"type": "result", "output": result}))
                         except DiffusionRequestAbortedError as e:
                             logger.info(
@@ -399,6 +447,7 @@ class StageDiffusionProc:
                             request_id,
                             msg["prompts"],
                             msg["sampling_params"],
+                            msg.get("kv_sender_info"),
                         )
                     )
                     tasks[request_id] = task

@@ -209,3 +209,13 @@ class FlashAttentionImpl(AttentionImpl):
             layout="BNSD",
         )
         return output
+
+    def forward_musa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
+        # XXX (MUSA): MUSA uses the same implementation as XPU (mate only provides flash_attn_varlen_func)
+        return self.forward_xpu(query, key, value, attn_metadata)

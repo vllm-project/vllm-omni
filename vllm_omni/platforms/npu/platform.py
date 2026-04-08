@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -105,6 +106,24 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory
+
+    @classmethod
+    def create_autocast_context(cls, *, device_type, dtype, enabled=True):
+        if device_type != "npu":
+            return super().create_autocast_context(
+                device_type=device_type,
+                dtype=dtype,
+                enabled=enabled,
+            )
+        if not enabled:
+            return nullcontext()
+
+        # NPU-specific fallback
+        try:
+            return torch.npu.amp.autocast(dtype=dtype)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("autocast unavailable for device_type=%s dtype=%s: %s", device_type, dtype, exc)
+        return nullcontext()
 
     @classmethod
     def get_profiler_cls(cls) -> str:
