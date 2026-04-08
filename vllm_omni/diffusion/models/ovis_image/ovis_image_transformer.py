@@ -366,6 +366,7 @@ class OvisImageTransformer2DModel(nn.Module):
     """
 
     _repeated_blocks = ["OvisImageTransformerBlock", "OvisImageSingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     def __init__(
         self,

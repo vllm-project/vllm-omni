@@ -159,6 +159,9 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.od_config = od_config
         self.device = get_local_device()
 
+        self._scheduler: object | None = None
+        self._scheduler_kwargs: dict = {}
+
         model = od_config.model
         local_files_only = os.path.exists(model)
         if local_files_only:
@@ -630,7 +633,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             enabled=self.device.type != "cpu",
             dtype=self.od_config.dtype,
         ):
-            latents = self.bagel.generate_image(
+            latents, trajectory_latents, trajectory_timesteps, trajectory_log_probs = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"],
                 cfg_img_past_key_values=cfg_img_context["past_key_values"],
@@ -650,11 +653,36 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 cfg_img_packed_query_indexes=generation_input_cfg_img["cfg_packed_query_indexes"],
                 cfg_img_key_values_lens=generation_input_cfg_img["cfg_key_values_lens"],
                 cfg_img_packed_key_value_indexes=generation_input_cfg_img["cfg_packed_key_value_indexes"],
+                return_trajectory_latents=req.sampling_params.return_trajectory_latents,
+                scheduler=self._scheduler,
+                scheduler_kwargs=self._scheduler_kwargs,
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
+
+        # Build trajectory output when requested
+        trajectory_latents_stacked: torch.Tensor | None = None
+        trajectory_timesteps_stacked: torch.Tensor | None = None
+        trajectory_decoded: list[Image.Image] | None = None
+        if trajectory_latents:
+            trajectory_latents_stacked = torch.stack(trajectory_latents)
+            trajectory_timesteps_stacked = torch.stack(trajectory_timesteps)
+            if req.sampling_params.return_trajectory_decoded:
+                trajectory_decoded = [
+                    self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in trajectory_latents
+                ]
+
+        trajectory_log_probs_stacked: torch.Tensor | None = None
+        if trajectory_log_probs:
+            trajectory_log_probs_stacked = torch.stack(trajectory_log_probs)
+
         return DiffusionOutput(
-            output=img, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            output=img,
+            trajectory_latents=trajectory_latents_stacked,
+            trajectory_timesteps=trajectory_timesteps_stacked,
+            trajectory_log_probs=trajectory_log_probs_stacked,
+            trajectory_decoded=trajectory_decoded,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -675,6 +703,8 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
             (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
             (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
+            (".gate_up_proj", ".gate_proj"),
+            (".gate_up_proj", ".up_proj"),
         ]
         stacked_source_names: set[str] = set()
         for name in list(allowed):
