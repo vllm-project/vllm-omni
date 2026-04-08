@@ -16,6 +16,7 @@ if "VLLM_TARGET_DEVICE" not in os.environ:
     os.environ["VLLM_TARGET_DEVICE"] = "cpu"
 
 import concurrent.futures
+import contextlib
 import gc
 import multiprocessing
 import socket
@@ -45,12 +46,60 @@ from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
 
-from tests.utils import whisper_transcribe_in_subprocess
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def _serialize_whisper_small_model_download():
+    """Serialize Whisper ``small`` cache writes across processes (Linux; ``fcntl``)."""
+    import fcntl
+
+    lock_path = Path.home() / ".cache" / "whisper" / ".small_model_download.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "a+b")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
+
+
+def whisper_transcribe_in_subprocess(output_path: str) -> str:
+    """Transcribe audio with openai-whisper (picklable entry for ProcessPoolExecutor)."""
+    import whisper
+
+    if torch.cuda.is_available():
+        n = torch.cuda.device_count()
+        idx = 0 if n == 1 else (n - 1)
+        device = f"cuda:{idx}"
+        use_cuda = True
+    else:
+        device = "cpu"
+        use_cuda = False
+
+    with _serialize_whisper_small_model_download():
+        model = whisper.load_model("small", device=device)
+    try:
+        text = model.transcribe(
+            output_path,
+            temperature=0.0,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+        )["text"]
+    finally:
+        del model
+        gc.collect()
+        if use_cuda:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+    return text or ""
+
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -1088,7 +1137,7 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
 
 
 def convert_audio_file_to_text(output_path: str) -> str:
-    """Convert an audio file to text in an isolated subprocess (spawn; worker in tests.utils)."""
+    """Convert an audio file to text in an isolated subprocess (spawn; worker: ``whisper_transcribe_in_subprocess``)."""
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
         future = executor.submit(whisper_transcribe_in_subprocess, output_path)
