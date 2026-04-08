@@ -45,7 +45,15 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
 
 ```bash
 sgl-omni serve --model-path fishaudio/s2-pro \
-    --config benchmarks/fish-speech/config/sglang_omni/s2pro_tts.yaml \
+    --config benchmarks/fish-speech/config/sglang_omni/s2pro_tts_upstream.yaml \
+    --port 8000
+```
+
+For high-VRAM GPUs, an additional benchmark variant is provided:
+
+```bash
+sgl-omni serve --model-path fishaudio/s2-pro \
+    --config benchmarks/fish-speech/config/sglang_omni/s2pro_tts_gpu_vocoder.yaml \
     --port 8000
 ```
 
@@ -118,12 +126,17 @@ python benchmarks/fish-speech/plot_results.py \
 This benchmark vendors both serving configs under `benchmarks/fish-speech/config/`:
 
 - `benchmarks/fish-speech/config/vllm_omni/fish_speech_s2_pro.yaml`
-- `benchmarks/fish-speech/config/sglang_omni/s2pro_tts.yaml`
-- `benchmarks/fish-speech/config/sglang_omni/test_s2pro.yaml`
+- `benchmarks/fish-speech/config/sglang_omni/s2pro_tts_upstream.yaml`
+- `benchmarks/fish-speech/config/sglang_omni/s2pro_tts_gpu_vocoder.yaml`
 
 The default vllm-omni config is a 2-stage pipeline (Slow AR -> DAC Decoder) with `async_chunk` streaming enabled, `max_num_seqs: 4` for the AR stage and `max_num_seqs: 1` for the DAC decoder. The `SharedMemoryConnector` streams codec frames (25-frame chunks with 25-frame context overlap, ~21.5 Hz codec rate).
 
-For sglang-omni, `test_s2pro.yaml` mirrors the upstream minimal config at `examples/configs/s2pro_tts.yaml`. The benchmark config `s2pro_tts.yaml` expands that minimal config into an explicit stage layout. In upstream `sglang-omni`, `stream_vocoder_device` is not set in the minimal YAML, but `create_sglang_tts_engine_executor(...)` defaults it to `cpu` when omitted, so the explicit CPU setting in the benchmark config reflects the upstream default behavior rather than introducing a benchmark-only override.
+For sglang-omni, two config variants are provided:
+
+- `s2pro_tts_upstream.yaml` mirrors the upstream minimal config at `examples/configs/s2pro_tts.yaml` and therefore uses the upstream default behavior. In upstream `sglang-omni`, `stream_vocoder_device` is not set in the minimal YAML, but `create_sglang_tts_engine_executor(...)` defaults it to `cpu` when omitted, so this config represents the memory-conservative default path. In benchmark runs, this default path may still show partial request failures under load even without moving the streaming vocoder onto GPU.
+- `s2pro_tts_gpu_vocoder.yaml` expands the pipeline explicitly and changes the streaming vocoder path to `stream_vocoder_device: cuda:0`. This variant is intended for high-VRAM GPUs to show the performance of a full-GPU streaming path.
+
+In practice, the two sglang-omni configs illustrate a memory/performance tradeoff: the upstream default is more conservative on GPU memory, while the GPU-vocoder variant can deliver much better latency/RTF when it fits, but may OOM on smaller-memory GPUs. This memory sensitivity is itself an important comparison point in this benchmark. On H20-3e hardware, serving-time VRAM usage was approximately 127.5 GB for sglang-omni versus 87.3 GB for vllm-omni on the same Fish Speech workload. That lower memory footprint is a practical vllm-omni advantage because it enables a full-GPU pipeline on a wider range of hardware.
 
 To use a custom vllm-omni config, start the server with:
 ```bash

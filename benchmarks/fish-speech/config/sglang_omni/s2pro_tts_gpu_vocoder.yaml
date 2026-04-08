@@ -22,7 +22,7 @@ stages:
       args:
         device: cuda:0
         max_new_tokens: 2048
-        stream_vocoder_device: cpu
+        stream_vocoder_device: cuda:0
     get_next: sglang_omni.models.fishaudio_s2_pro.pipeline.next_stage.tts_engine_next
     relay:
       slot_size_mb: 512
