@@ -40,6 +40,7 @@ from vllm.config import CacheConfig, MultiModalConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.distributed import utils as dist_utils
+from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
@@ -73,7 +74,6 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.models.vision import get_vit_attn_backend
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
     MultiModalKwargsItems,

@@ -91,10 +91,17 @@ Models must define the blocks attribute name for layerwise offloading:
 
 ```python
 class WanTransformer3DModel(nn.Module):
-    _layerwise_offload_blocks_attr = "blocks"  # Attribute name containing transformer blocks
+    _layerwise_offload_blocks_attrs = ["blocks"]  # Attribute names containing transformer blocks
 
     def __init__(self):
         self.blocks = nn.ModuleList([...])  # Transformer blocks
+```
+
+For models with multiple block types:
+
+```python
+class Flux2Transformer2DModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 ```
 
 ### Limitations
@@ -132,12 +139,16 @@ Factory function `get_offload_backend()` selects the appropriate backend based o
 
 ## Supported Models
 
-| Architecture | Example Models | DiT Class | Model-Level Offload | Layerwise Offload | Blocks Attr (Layerwise specific) |
-|--------------|----------------|-----------|---------------------|-------------------|-------------|
-| Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
-| Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
+| Architecture | Example Models | DiT Class | Model-Level Offload | Layerwise Offload | Blocks Attrs (Layerwise specific) |
+|--------------|----------------|-----------|---------------------|-------------------|-----------------------------------|
+| LongCatImagePipeline | `meituan-longcat/LongCat-Image` | `LongCatImageTransformer2DModel` | - | ✓ | `"transformer_blocks"`, `"single_transformer_blocks"` |
+| NextStep11Pipeline | `stepfun-ai/NextStep-1.1` | `NextStepModel` | - | ✓ | `"layers"` |
+| OvisImagePipeline | `AIDC-AI/Ovis-Image-7B` | `OvisImageTransformer2DModel` | - | ✓ | `"transformer"` |
 | QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | ✓ | ✓ | `"transformer_blocks"` |
+| StableDiffusion3Pipeline | `stabilityai/stable-diffusion-3.5-medium` | `SD3Transformer2DModel` | - | ✓ | `"transformer_blocks"` |
+| Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
+| Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
 
 **Notes:**
 - Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally
-- Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attr` pointing to transformer blocks
+- Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attrs` pointing to transformer blocks

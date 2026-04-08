@@ -115,7 +115,7 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise Exception(f"{output.error}")
+            raise RuntimeError(f"{output.error}")
         logger.info("Generation completed successfully.")
 
         if output.output is None:
@@ -209,6 +209,10 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        trajectory_latents=output.trajectory_latents,
+                        trajectory_timesteps=output.trajectory_timesteps,
+                        trajectory_log_probs=output.trajectory_log_probs,
+                        trajectory_decoded=output.trajectory_decoded,
                         custom_output=output.custom_output or {},
                         multimodal_output=mm_output,
                         stage_durations=output.stage_durations,
@@ -267,6 +271,10 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
+                            trajectory_latents=output.trajectory_latents,
+                            trajectory_timesteps=output.trajectory_timesteps,
+                            trajectory_log_probs=output.trajectory_log_probs,
+                            trajectory_decoded=output.trajectory_decoded,
                             custom_output=output.custom_output or {},
                             multimodal_output=mm_output,
                             stage_durations=output.stage_durations,
@@ -361,8 +369,8 @@ class DiffusionEngine:
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         num_inference_steps = 1
-        height = 1024
-        width = 1024
+        height = 512
+        width = 512
         if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
