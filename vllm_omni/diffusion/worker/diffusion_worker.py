@@ -168,13 +168,15 @@ class DiffusionWorker:
         return None
 
     def _profiler_context(self, name: str) -> AbstractContextManager:
-        if self.profiler is None:
+        profiler = getattr(self, "profiler", None)
+        if profiler is None:
             return nullcontext()
-        return self.profiler.annotate_context_manager(name)
+        return profiler.annotate_context_manager(name)
 
     def _step_profiler(self) -> None:
-        if self.profiler is not None:
-            self.profiler.step()
+        profiler = getattr(self, "profiler", None)
+        if profiler is not None:
+            profiler.step()
 
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
