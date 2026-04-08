@@ -1,5 +1,4 @@
 import base64
-import contextlib
 import datetime
 import io
 import json
@@ -46,10 +45,10 @@ from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
 
+from tests.utils import whisper_transcribe_in_subprocess
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -1088,67 +1087,11 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
     return merged
 
 
-@contextlib.contextmanager
-def _serialize_whisper_small_model_download():
-    """Serialize Whisper ``small`` cache writes across processes (Linux CI; uses ``fcntl``)."""
-    import fcntl
-
-    lock_path = Path.home() / ".cache" / "whisper" / ".small_model_download.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    f = open(lock_path, "a+b")
-    try:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        f.close()
-
-
-def _whisper_transcribe_in_current_process(output_path: str) -> str:
-    import whisper
-
-    # Multi-GPU: use last visible device to avoid colliding with default device 0; single device uses 0.
-    device_index = None
-    if current_omni_platform.is_available():
-        n = current_omni_platform.get_device_count()
-        if n == 1:
-            device_index = 0
-        elif n > 1:
-            device_index = n - 1
-
-    if device_index is not None:
-        torch_device = current_omni_platform.get_torch_device(device_index)
-        current_omni_platform.set_device(torch_device)
-        device = str(torch_device)
-        use_accelerator = True
-    else:
-        use_accelerator = False
-        device = "cpu"
-    with _serialize_whisper_small_model_download():
-        model = whisper.load_model("small", device=device)
-    try:
-        text = model.transcribe(
-            output_path,
-            temperature=0.0,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-        )["text"]
-    finally:
-        del model
-        gc.collect()
-        if use_accelerator:
-            current_omni_platform.synchronize()
-            current_omni_platform.empty_cache()
-
-    return text or ""
-
-
 def convert_audio_file_to_text(output_path: str) -> str:
-    """Convert an audio file to text in an isolated subprocess."""
-    # Import locally to avoid impacting test module import time.
+    """Convert an audio file to text in an isolated subprocess (spawn; worker in tests.utils)."""
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        future = executor.submit(_whisper_transcribe_in_current_process, output_path)
+        future = executor.submit(whisper_transcribe_in_subprocess, output_path)
         return future.result()
 
 
