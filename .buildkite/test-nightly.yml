@@ -3,7 +3,7 @@ steps:
   - group: "Omni Model Test"
     key: nightly-omni-test-group
     steps:
-      - label: ":full_moon: Function Test with H100"
+      - label: ":full_moon: Omni · Function Test with H100"
         timeout_in_minutes: 90
         depends_on: upload-nightly-pipeline
         if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -44,7 +44,7 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: ":full_moon: Function Test with L4"
+      - label: ":full_moon: Omni · Function Test with L4"
         timeout_in_minutes: 90
         depends_on: upload-nightly-pipeline
         if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -66,7 +66,7 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
-      - label: ":full_moon: Doc Test"
+      - label: ":full_moon: Omni · Doc Test"
         timeout_in_minutes: 90
         depends_on: upload-nightly-pipeline
         if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
@@ -107,7 +107,7 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: ":full_moon: Perf Test"
+      - label: ":full_moon: Omni · Perf Test"
         key: nightly-omni-performance
         timeout_in_minutes: 180
         depends_on: upload-nightly-pipeline
@@ -153,18 +153,17 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-  # Triggers a separate Buildkite pipeline (vllm-omni-nightly-diffusion) so diffusion jobs run in
-  # their own build with foldable groups (Other / Wan / Qwen-Image) — see .buildkite/test-nightly-diffusion.yml.
-  - trigger: "vllm-omni-nightly-diffusion"
-    key: nightly-diffusion-model-test-trigger
-    label: ":arrow_branch: Diffusion Model Test (sub-pipeline)"
-    async: false
+  # Dynamically appends steps from test-nightly-diffusion.yml into this build (same mechanism as
+  # pipeline.yml → test-ready.yml / test-merge.yml / test-nightly.yml). Foldable groups stay in the
+  # uploaded YAML (Other / Wan / Qwen-Image).
+  - label: ":arrow_branch: Diffusion Model Test"
+    key: nightly-diffusion-model-test
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    build:
-      commit: "${BUILDKITE_COMMIT}"
-      branch: "${BUILDKITE_BRANCH}"
-      message: "${BUILDKITE_MESSAGE}"
+    commands:
+      - buildkite-agent pipeline upload .buildkite/test-nightly-diffusion.yml
+    agents:
+      queue: "cpu_queue_premerge"
 
   - label: ":full_moon: Testcase Statistics"
     key: nightly-testcase-statistics
@@ -214,7 +213,7 @@ steps:
     key: nightly-perf-distribution
     depends_on:
       - nightly-omni-performance
-      - nightly-diffusion-model-test-trigger
+      - nightly-qwen-image-performance
       - nightly-testcase-statistics
     if: build.env("NIGHTLY") == "1"
     commands:
@@ -222,8 +221,7 @@ steps:
       - export DEFAULT_INPUT_DIR=tests/dfx/perf/results
       - export DEFAULT_OUTPUT_DIR=tests/dfx/perf/results
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance
-      - export NIGHTLY_DIFFUSION_BUILD_ID=$(curl -fsS -H "Authorization: Bearer ${BUILDKITE_AGENT_ACCESS_TOKEN}" "https://api.buildkite.com/v2/organizations/${BUILDKITE_ORGANIZATION_SLUG}/pipelines/vllm-omni-nightly-diffusion/builds?commit=${BUILDKITE_COMMIT}&per_page=1" | python -c "import json,sys; a=json.load(sys.stdin); print(a[0]['id'] if a else '')") && test -n "$NIGHTLY_DIFFUSION_BUILD_ID"
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-qwen-image-performance --build "$NIGHTLY_DIFFUSION_BUILD_ID"
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-qwen-image-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-omni-performance
       - python tools/nightly/generate_nightly_perf_excel.py
       - python tools/nightly/generate_nightly_perf_html.py

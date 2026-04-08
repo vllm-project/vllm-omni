@@ -337,10 +337,10 @@ def log_test_name_before_test(request):
 
 def _run_pre_test_cleanup(enable_force=False):
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print("GPU cleanup disabled")
+        print("\nPre-test GPU cleanup skipped(Default off is typical when one worker/instance runs many tests.)\n")
         return
 
-    print("Pre-test GPU status:")
+    print("\nPre-test GPU status:")
 
     num_gpus = torch.cuda.device_count()
     if num_gpus > 0:
