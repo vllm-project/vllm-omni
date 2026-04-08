@@ -429,7 +429,7 @@ def _resolve_existing_path(path_like: Any, source_name: str) -> str | None:
         return None
 
     path = Path(text).expanduser()
-    if path.exists():
+    if path.is_file():
         return str(path.resolve())
 
     logger.warning(
