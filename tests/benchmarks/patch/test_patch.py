@@ -574,5 +574,59 @@ class TestTextLatencyAttribute:
         )
 
 
+# ============================================================================
+# prompt_len Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_prompt_len_assigned_from_usage(mocker: MockerFixture):
+    # Arrange: request claims prompt_len=100, but server reports 4992 (multimodal).
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=100,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "Hello"}}],
+                "modality": "text",
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": " world"}}],
+                "modality": "text",
+            }
+        ),
+        # Final usage chunk emitted because stream_options.include_usage=True.
+        create_sse_chunk(
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 4992, "completion_tokens": 2, "total_tokens": 4994},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    # Act
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    # Assert
+    assert output.success is True
+    assert output.prompt_len == 4992, (
+        "prompt_len should be overridden by usage.prompt_tokens to reflect the true multimodal input token count"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
