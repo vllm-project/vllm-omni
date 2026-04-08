@@ -337,12 +337,11 @@ class OmniMRotaryEmbedding(MRotaryEmbedding):
         """
 
         thinker_config = hf_config.thinker_config
-        try:
+        if hasattr(thinker_config, "audio_token_index"):
             audio_token_id = thinker_config.audio_token_index
             image_token_id = thinker_config.image_token_index
             video_token_id = thinker_config.video_token_index
-        except Exception:
-            logger.info("Multimodal token idx changed!")
+        else:
             audio_token_id = thinker_config.audio_token_id
             image_token_id = thinker_config.image_token_id
             video_token_id = thinker_config.video_token_id

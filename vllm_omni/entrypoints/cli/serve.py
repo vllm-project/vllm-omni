@@ -42,6 +42,37 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 """
 
 
+def _ensure_vllm_platform():
+    """Ensure vLLM's current_platform is valid before arg parsing.
+
+    Upstream vLLM's argument parser now instantiates DeviceConfig during
+    ``make_arg_parser``, which requires a resolved platform with a non-empty
+    ``device_type``.  In some environments (e.g. editable installs with
+    broken package metadata), vLLM's own platform auto-detection may fail
+    and fall back to ``UnspecifiedPlatform``.  When that happens, use the
+    Omni platform (which has its own detection logic) as a drop-in
+    replacement so that argument parsing succeeds.
+    """
+    from vllm import platforms as vllm_platforms
+
+    if vllm_platforms.current_platform.is_unspecified():
+        from vllm_omni.platforms import current_omni_platform
+
+        if not current_omni_platform.is_unspecified():
+            vllm_platforms.current_platform = current_omni_platform
+            logger.debug(
+                "Replaced vLLM UnspecifiedPlatform with omni platform %s",
+                type(current_omni_platform).__name__,
+            )
+        else:
+            from vllm.platforms.cpu import CpuPlatform
+
+            vllm_platforms.current_platform = CpuPlatform()
+            logger.debug(
+                "Both vLLM and omni platforms are unspecified, falling back to CpuPlatform for arg parsing",
+            )
+
+
 class OmniServeCommand(CLISubcommand):
     """The `serve` subcommand for the vLLM CLI."""
 
@@ -82,6 +113,7 @@ class OmniServeCommand(CLISubcommand):
             usage="vllm serve [model_tag] --omni [options]",
         )
 
+        _ensure_vllm_platform()
         serve_parser = make_arg_parser(serve_parser)
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
 
@@ -266,6 +298,11 @@ class OmniServeCommand(CLISubcommand):
             "--enable-cache-dit-summary",
             action="store_true",
             help="Enable cache-dit summary logging after diffusion forward passes.",
+        )
+        omni_config_group.add_argument(
+            "--step-execution",
+            action="store_true",
+            help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
 
         # VAE memory optimization parameters

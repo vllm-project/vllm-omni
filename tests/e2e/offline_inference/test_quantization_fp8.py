@@ -120,7 +120,6 @@ def _generate_bagel_image(
         torch.cuda.reset_peak_memory_stats()
 
         params_list = omni.default_sampling_params_list
-        params_list[0].max_tokens = 1  # type: ignore
         if len(params_list) > 1:
             params_list[1].num_inference_steps = num_inference_steps  # type: ignore
             params_list[1].extra_args = {  # type: ignore

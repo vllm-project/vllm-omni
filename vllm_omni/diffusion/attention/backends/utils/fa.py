@@ -32,9 +32,14 @@ if current_omni_platform.is_rocm():
         pass
 elif current_omni_platform.is_xpu():
     try:
-        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func  # noqa: F401
+        from vllm._xpu_ops import xpu_ops  # noqa: F401
+
+        flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func
     except (ImportError, ModuleNotFoundError):
         pass
+elif current_omni_platform.is_musa():
+    # XXX (MUSA): Add MUSA-specific Flash Attention when available
+    pass
 else:
     # CUDA: try FA3 -> FA2 fallback chain
     # Try FA3 from fa3-fwd PyPI package

@@ -387,6 +387,7 @@ class SD3Transformer2DModel(nn.Module):
     """
 
     _repeated_blocks = ["SD3TransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
     def __init__(
         self,

@@ -242,6 +242,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable logging of diffusion pipeline stats.",
     )
+    parser.add_argument(
+        "--use-system-prompt",
+        type=str,
+        default=None,
+        choices=["None", "dynamic", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "custom"],
+        help="System prompt preset for generation. Recommended: en_unified.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=("Custom system prompt. Used when --use-system-prompt is custom. "),
+    )
     return parser.parse_args()
 
 
@@ -363,7 +376,7 @@ def main():
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
         f"enable_expert_parallel={args.enable_expert_parallel}."
     )
-    print(f"  CPU offload: {args.enable_cpu_offload}")
+    print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
@@ -382,13 +395,13 @@ def main():
         )
 
     generation_start = time.perf_counter()
-
     extra_args = {
         "timesteps_shift": args.timesteps_shift,
         "cfg_schedule": args.cfg_schedule,
         "use_norm": args.use_norm,
+        "use_system_prompt": args.use_system_prompt,
+        "system_prompt": args.system_prompt,
     }
-
     if lora_request:
         extra_args["lora_request"] = lora_request
         extra_args["lora_scale"] = args.lora_scale

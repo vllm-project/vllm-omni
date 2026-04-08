@@ -10,7 +10,7 @@ steps:
           DOCKER_BUILDKIT: "1"
           # Buildkite will automatically replace this with the actual commit hash
           VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
-          VLLM_VERSION: "v0.18.0"
+          VLLM_VERSION: "v0.19.0"
         priority: 100
         timeout_in_minutes: 60
         soft_fail: true

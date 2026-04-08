@@ -7,7 +7,7 @@ and are supported by Qwen-Image-Layered model.
 Kept cases (maximum feature coverage, no cpu-offload):
   sp_001              : cache_dit + Ulysses-SP 2          (2×H100)
   cfg_parallel_002    : cache_dit + CFG-Parallel 2        (2×H100)
-  layers_guard_001    : layerwise offload + layers=2      (1×H100, issue #1969 guard)
+  layers_guard_001    : layerwise offload + layers=3      (1×H100, issue #1969 guard)
 
 Total distinct features covered: cache_dit, Ulysses-SP, CFG-Parallel, layerwise-offload.
 """
@@ -62,6 +62,18 @@ FEATURE_CASES = [
         id="cfg_parallel_001",
         marks=PARALLEL_FEATURE_MARKS,
     ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            server_args=[
+                "--use-hsdp",
+                "--hsdp-shard-size",
+                "2",
+            ],
+        ),
+        id="parallel_hsdp",
+        marks=PARALLEL_FEATURE_MARKS,
+    ),
 ]
 
 
@@ -102,8 +114,8 @@ LAYERS_GUARD_CASES = [
             model=MODEL,
             server_args=["--enable-layerwise-offload"],
         ),
-        2,
-        id="layers_guard_001_layers2",
+        3,
+        id="layers_guard_001_layers3",
         marks=SINGLE_CARD_FEATURE_MARKS,
     ),
 ]
