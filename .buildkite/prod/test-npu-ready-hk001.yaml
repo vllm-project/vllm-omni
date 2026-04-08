@@ -1,0 +1,28 @@
+steps:
+  - label: "🧪 NPU Unit Test (HK-001 a2b3)"
+    agents:
+      queue: "linux-aarch64-a2b3-1"
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    plugins:
+      - kubernetes:
+          podSpecPatch:
+            imagePullSecrets:
+            - name: swr-secret
+    command: |
+      set -ex
+
+      echo "--- Container information"
+      uname -a
+      python3 --version
+
+      echo "--- Verifying npu-smi"
+      ls -l /usr/local/bin/npu-smi
+      npu-smi info
+
+      echo "--- Running pytest"
+      timeout 20m pytest -v -s -m 'core_model and npu' \
+        --cov=vllm_omni \
+        --cov-branch \
+        --cov-report=term-missing \
+        --cov-report=html \
+        --cov-report=xml
