@@ -35,6 +35,25 @@ For larger models or multi-GPU environments, you can enable Tensor Parallelism (
 
 1. **Modify Stage Config**: Create or modify a stage configuration yaml (e.g., [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/model_executor/stage_configs/bagel.yaml)). Set `tensor_parallel_size` to `2` (or more) and update `devices` to include multiple GPU IDs (e.g., `"0,1"`).
 
+In multi-stage omni models, LLM stages and diffusion stages use different TP config fields:
+
+1. **LLM stage**: set top-level `engine_args.tensor_parallel_size`.
+2. **Diffusion stage**: set `engine_args.parallel_config.tensor_parallel_size`.
+3. **Set `devices`**: Specify the comma-separated GPU IDs to be used for the target stage (e.g., `"0,1"`).
+
+Example configuration for the diffusion stage with TP=2 on GPUs 0 and 1:
+
+```yaml
+    engine_args:
+      parallel_config:
+        tensor_parallel_size: 2
+      ...
+    runtime:
+      devices: "0,1"
+```
+
+Example configuration for the LLM stage with TP=2 on GPUs 0 and 1:
+
 ```yaml
     engine_args:
       tensor_parallel_size: 2

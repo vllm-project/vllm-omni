@@ -52,8 +52,8 @@ stage_args:
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
-      tensor_parallel_size: 1
       parallel_config:
+        tensor_parallel_size: 1
         ulysses_degree: 2
         # ring_degree: 2
       omni_kv_config:
