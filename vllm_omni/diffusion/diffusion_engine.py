@@ -332,16 +332,12 @@ class DiffusionEngine:
                         missing_result_error="Diffusion execution finished without a final output.",
                     )
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> list[Any] | None:
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling on all diffusion workers.
 
         Args:
             is_start: True to start profiling, False to stop.
-            profile_prefix: Optional prefix for trace filename (vLLM compat).
-
-        Note:
-            Matches vLLM's worker.profile() signature for consistency.
-            Traces are saved automatically via on_trace_ready callback.
+            profile_prefix: Optional prefix for trace filename.
         """
         if is_start:
             if profile_prefix is None:
@@ -351,13 +347,12 @@ class DiffusionEngine:
             logger.info("Stopping diffusion profiling...")
 
         try:
-            return self.collective_rpc(method="profile", args=(is_start, profile_prefix))
+            self.collective_rpc(method="profile", args=(is_start, profile_prefix))
         except Exception as e:
             action = "start" if is_start else "stop"
             logger.error(f"Failed to {action} profiling on workers", exc_info=True)
             if is_start:
                 raise RuntimeError(f"Could not {action} profiler: {e}") from e
-            return None
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
