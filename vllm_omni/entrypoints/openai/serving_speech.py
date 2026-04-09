@@ -6,7 +6,6 @@ import math
 import os
 import re
 import struct
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1301,17 +1300,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_samples, sr = ref_audio_data
         normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(request.input, request.ref_text)
         ph_len = self._estimate_fish_prompt_len(normalized_text, normalized_ref_text, ref_audio_data)
-        with tempfile.NamedTemporaryFile(prefix="fish_ref_", suffix=".npy", delete=False) as f:
-            np.save(f, np.asarray(wav_samples, dtype=np.float32))
-            ref_audio_path = f.name
 
-        # Structured clone metadata is consumed directly by
-        # FishSpeechSlowARForConditionalGeneration.preprocess(), so keep these
-        # values as scalars instead of the list-wrapped prompt-dict convention.
+        # Structured clone: scalars (not list-wrapped) because model-side
+        # preprocess() consumes per-request fields directly.
         additional_information = {
             "text": normalized_text,
             "ref_text": normalized_ref_text,
-            "ref_audio_path": ref_audio_path,
+            "ref_audio_wav": torch.from_numpy(np.asarray(wav_samples, dtype=np.float32)),
             "ref_audio_sr": int(sr),
             "fish_structured_voice_clone": True,
         }
