@@ -1624,7 +1624,12 @@ def get_magi_human_post_process_func(*args, **kwargs):
     def post_process(output):
         if isinstance(output, tuple) and len(output) == 2:
             video, audio = output
-            return {"video": video, "audio": audio}
+            return {
+                "video": video,
+                "audio": audio,
+                "audio_sample_rate": 44100,
+                "fps": 25,
+            }
         return output
 
     return post_process

@@ -353,7 +353,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     try:
         await shutdown_task
     finally:
-        app.state.openai_serving_speech.shutdown()
+        serving_speech = getattr(getattr(app, "state", None), "openai_serving_speech", None)
+        if serving_speech is not None:
+            serving_speech.shutdown()
         sock.close()
 
 
@@ -1280,7 +1282,8 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
-async def generate_images(request: ImageGenerationRequest, raw_request: Request) -> ImageGenerationResponse:
+@with_cancellation
+async def generate_images(request: ImageGenerationRequest, raw_request: Request):
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.

@@ -16,6 +16,7 @@ if "VLLM_TARGET_DEVICE" not in os.environ:
     os.environ["VLLM_TARGET_DEVICE"] = "cpu"
 
 import concurrent.futures
+import contextlib
 import gc
 import multiprocessing
 import socket
@@ -51,6 +52,7 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -337,10 +339,10 @@ def log_test_name_before_test(request):
 
 def _run_pre_test_cleanup(enable_force=False):
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print("GPU cleanup disabled")
+        print("\nPre-test GPU cleanup skipped(Default off is typical when one worker/instance runs many tests.)\n")
         return
 
-    print("Pre-test GPU status:")
+    print("\nPre-test GPU status:")
 
     num_gpus = torch.cuda.device_count()
     if num_gpus > 0:
@@ -1087,6 +1089,22 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
     return merged
 
 
+@contextlib.contextmanager
+def _serialize_whisper_small_model_download():
+    """Serialize Whisper ``small`` cache writes across processes (Linux; ``fcntl``)."""
+    import fcntl
+
+    lock_path = Path.home() / ".cache" / "whisper" / ".small_model_download.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "a+b")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
+
+
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
@@ -1107,7 +1125,8 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
     else:
         use_accelerator = False
         device = "cpu"
-    model = whisper.load_model("small", device=device)
+    with _serialize_whisper_small_model_download():
+        model = whisper.load_model("small", device=device)
     try:
         text = model.transcribe(
             output_path,
@@ -1126,8 +1145,7 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
 
 
 def convert_audio_file_to_text(output_path: str) -> str:
-    """Convert an audio file to text in an isolated subprocess."""
-    # Import locally to avoid impacting test module import time.
+    """Convert an audio file to text in an isolated subprocess (spawn)."""
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
         future = executor.submit(_whisper_transcribe_in_current_process, output_path)
