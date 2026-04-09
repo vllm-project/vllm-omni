@@ -79,7 +79,7 @@ def build_engine_core_request_from_tokens(
         sampling_params=sampling_params,
         pooling_params=pooling_params,
         arrival_time=arrival_time,
-        lora_request=None,
+        lora_request=getattr(params, "lora_request", None),
         cache_salt=None,
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
