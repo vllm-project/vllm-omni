@@ -190,6 +190,10 @@ async def async_request_openai_chat_omni_completions(
                                 if metrics := data.get("metrics"):
                                     output.output_tokens = metrics.get("num_tokens_out", 0)
 
+                                if usage := data.get("usage"):
+                                    if (pt := usage.get("prompt_tokens")) is not None:
+                                        output.prompt_len = pt
+
                     output.latency = timestamp - st
                     output.generated_text = generated_text
                     if generated_audio is not None:

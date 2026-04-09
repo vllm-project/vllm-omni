@@ -10,6 +10,7 @@ reducing kernel launch overhead during inference.
 import torch
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -129,7 +130,7 @@ class CUDAGraphDecoderWrapper:
 
         graph = CUDAGraph()
         with torch.no_grad():
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self.decoder(static_input)
 
         self.graphs[size] = graph
