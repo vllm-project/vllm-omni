@@ -113,7 +113,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -137,7 +137,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
@@ -159,7 +159,7 @@ def test_text_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -184,7 +184,7 @@ def test_image_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -208,7 +208,7 @@ def test_image_to_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -232,7 +232,7 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -256,7 +256,7 @@ def test_video_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -280,7 +280,7 @@ def test_video_to_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -304,7 +304,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
@@ -329,7 +329,7 @@ def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
@@ -355,7 +355,7 @@ def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
@@ -383,7 +383,7 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
 
 
 @pytest.mark.skip(reason="There is a known issue with shape mismatch error.")
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
@@ -414,7 +414,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -442,7 +442,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -471,7 +471,7 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -507,7 +507,7 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
             print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -534,7 +534,7 @@ def test_speaker_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -571,7 +571,7 @@ def test_speaker_002(omni_server, openai_client) -> None:
             print(f"Gender assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -598,7 +598,7 @@ def test_speaker_003(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)

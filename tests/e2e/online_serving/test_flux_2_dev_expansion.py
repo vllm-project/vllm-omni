@@ -50,7 +50,7 @@ def _get_flux_2_dev_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",

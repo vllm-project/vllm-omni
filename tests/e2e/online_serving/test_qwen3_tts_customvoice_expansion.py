@@ -62,7 +62,7 @@ tts_server_params = [
 ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
@@ -95,7 +95,7 @@ def test_voice_001(omni_server, openai_client) -> None:
             raise
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
@@ -120,7 +120,7 @@ def test_voice_002(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
@@ -145,7 +145,7 @@ def test_voice_003(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)

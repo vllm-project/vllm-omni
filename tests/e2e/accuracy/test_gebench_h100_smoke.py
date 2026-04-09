@@ -10,7 +10,7 @@ from tests.e2e.accuracy.conftest import infer_model_label, reset_artifact_dir
 from tests.utils import hardware_test
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

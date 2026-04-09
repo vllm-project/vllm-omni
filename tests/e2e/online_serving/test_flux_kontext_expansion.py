@@ -34,7 +34,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -59,7 +59,7 @@ def test_flux_kontext_text_to_image(omni_server: OmniServer, openai_client: Open
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -88,7 +88,7 @@ def test_flux_kontext_image_edit(omni_server: OmniServer, openai_client: OpenAIC
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -115,7 +115,7 @@ def test_flux_kontext_image_edit_no_negative(omni_server: OmniServer, openai_cli
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -140,7 +140,7 @@ def test_flux_kontext_high_resolution(omni_server: OmniServer, openai_client: Op
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",

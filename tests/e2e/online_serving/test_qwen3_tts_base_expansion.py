@@ -64,7 +64,7 @@ tts_server_params = [
 ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -92,7 +92,7 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

@@ -534,8 +534,9 @@ def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # Test entry point
 # ---------------------------------------------------------------------------
-
-
+@pytest.mark.full_model
+@pytest.mark.benchmark
+@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "diffusion_server",
     server_params,

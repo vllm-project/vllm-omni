@@ -54,6 +54,11 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _is_deep_run_level(run_level: str | None) -> bool:
+    """True for merge/nightly deep validation (--run-level advanced_model or full_model)."""
+    return run_level in ("advanced_model", "full_model")
+
+
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
@@ -105,7 +110,7 @@ def assert_image_diffusion_response(
             f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
         )
 
-    if run_level == "advanced_model":
+    if _is_deep_run_level(run_level):
         width = extra_body.get("width")
         height = extra_body.get("height")
 
@@ -359,7 +364,7 @@ def _run_pre_test_cleanup(enable_force=False):
 
 def _run_post_test_cleanup(enable_force=False):
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print("GPU cleanup disabled")
+        print("\nPost-test GPU cleanup skipped(Default off is typical when one worker/instance runs many tests.)\n")
         return
 
     if torch.cuda.is_available():
@@ -1551,8 +1556,8 @@ def pytest_addoption(parser):
         "--run-level",
         action="store",
         default="core_model",
-        choices=["core_model", "advanced_model"],
-        help="Test level to run: L2, L3",
+        choices=["core_model", "advanced_model", "full_model"],
+        help="Test level to run: L2, L3 (merge), L4 nightly (full_model)",
     )
 
 
@@ -1577,7 +1582,7 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         model = model_prefix + params.model
         port = params.port
         stage_config_path = params.stage_config_path
-        if run_level == "advanced_model" and stage_config_path is not None:
+        if _is_deep_run_level(run_level) and stage_config_path is not None:
             with open(stage_config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
@@ -1867,7 +1872,7 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
-    if run_level == "advanced_model":
+    if _is_deep_run_level(run_level):
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
             print(f"audio content is: {response.audio_content}")
@@ -1915,7 +1920,7 @@ def assert_audio_speech_response(
 ) -> None:
     """
     Validate /v1/audio/speech response: success, optional format check, transcription similarity
-    and gender (non-PCM only for advanced_model), and int16 PCM HNR when response_format is pcm.
+    and gender (non-PCM only for advanced/full run level), and int16 PCM HNR when response_format is pcm.
     """
     assert response.success, "The request failed."
 
@@ -1937,7 +1942,7 @@ def assert_audio_speech_response(
     if e2e_latency is not None:
         print(f"the avg e2e latency is: {e2e_latency}")
 
-    if run_level == "advanced_model" and req_fmt != "pcm":
+    if _is_deep_run_level(run_level) and req_fmt != "pcm":
         # Text–audio semantic similarity check (skipped for raw PCM: no Whisper transcript).
         expected_text = request_config.get("input")
         if expected_text:
@@ -1967,7 +1972,7 @@ def assert_diffusion_response(response: DiffusionResponse, request_config: dict[
     Args:
         response: DiffusionResponse object.
         request_config: Request configuration dictionary.
-        run_level: Test run level (e.g. "core_model", "advanced_model")
+        run_level: Test run level (e.g. "core_model", "advanced_model", "full_model")
 
     Raises:
         AssertionError: When the response does not meet validation criteria

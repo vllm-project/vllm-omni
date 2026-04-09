@@ -537,7 +537,7 @@ def _generate_offline_video(*, image_source: str) -> tuple[Path, Path]:
     return offline_path, offline_metadata_path
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -563,7 +563,7 @@ def test_wan22_i2v_diffusers_offline_generates_video(
     assert offline_metadata["frame_count"] == NUM_FRAMES
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
@@ -594,7 +594,7 @@ def test_wan22_i2v_online_serving_generates_video(
     assert online_metadata["frame_count"] == NUM_FRAMES
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=2)

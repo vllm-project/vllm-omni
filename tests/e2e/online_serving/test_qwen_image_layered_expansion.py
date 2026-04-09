@@ -77,7 +77,7 @@ FEATURE_CASES = [
 ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", FEATURE_CASES, indirect=True)
 def test_feature(omni_server: OmniServer, openai_client: OpenAIClientHandler):
@@ -155,7 +155,7 @@ def _collect_image_url_items(openai_client: OpenAIClientHandler, request_config:
     return image_items
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server, expected_layers",
@@ -230,7 +230,7 @@ PROMPT_CASES = [
 ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", PROMPT_CASES, indirect=True)
 def test_empty_prompt(omni_server: OmniServer, openai_client: OpenAIClientHandler):
