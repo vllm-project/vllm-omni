@@ -34,15 +34,6 @@ Video example (text-to-video):
         --height 720 --width 1280 \
         --num-frames 81 --num-inference-steps 40 --seed 42
 
-Multiple quantization methods:
-    python benchmarks/diffusion/quantization_quality.py \
-        --model Tongyi-MAI/Z-Image-Turbo \
-        --task t2i \
-        --quantization fp8 int8 bitsandbytes \
-        --prompts "a cup of coffee on the table" \
-        --height 1024 --width 1024 \
-        --num-inference-steps 50 --seed 42
-
 Output directory structure (--output-dir, default: ./quant_bench_output):
     quant_bench_output/
         baseline/           # BF16 outputs
@@ -52,6 +43,9 @@ Output directory structure (--output-dir, default: ./quant_bench_output):
 
 import argparse
 import gc
+import hashlib
+import json
+import re
 import time
 from pathlib import Path
 
@@ -145,13 +139,83 @@ def _build_omni_kwargs(args, quantization=None):
     return kwargs
 
 
+def _sanitize_label(text: str) -> str:
+    """Convert a display label into a filesystem-safe slug."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_")
+    return slug or "quantized"
+
+
+def _short_ignored_layer_name(layer_name: str) -> str:
+    """Build a readable short name for ignored_layers labels."""
+    short = layer_name
+    replacements = {
+        "single_transformer_blocks": "single_blocks",
+        "transformer_blocks": "blocks",
+        "context_embedder": "context",
+        "x_embedder": "x",
+    }
+    for src, dst in replacements.items():
+        short = short.replace(src, dst)
+    short = short.replace(".", "_")
+    return _sanitize_label(short)
+
+
+def _build_quantization_label(spec) -> str:
+    """Build a short human-readable label for a quantization config."""
+    if isinstance(spec, str):
+        return spec
+
+    if isinstance(spec, dict):
+        method = str(spec.get("method", "quant"))
+        ignored_layers = spec.get("ignored_layers") or spec.get("modules_to_not_convert") or []
+        if ignored_layers:
+            ignored_suffix = "_".join(_short_ignored_layer_name(layer) for layer in ignored_layers)
+            label = f"{method}_skip_{ignored_suffix}"
+        else:
+            label = method
+
+        extra_keys = sorted(k for k in spec.keys() if k not in {"method", "ignored_layers", "modules_to_not_convert"})
+        if extra_keys:
+            canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"))
+            label = f"{label}_{hashlib.sha1(canonical.encode('utf-8')).hexdigest()[:8]}"
+
+        return label
+
+    raise TypeError(f"Unsupported quantization spec type: {type(spec)!r}")
+
+
+def _parse_quantization_spec(raw_spec: str):
+    """Parse a CLI quantization spec into (display_label, slug, config)."""
+    raw_spec = raw_spec.strip()
+    if raw_spec.startswith("{"):
+        spec = json.loads(raw_spec)
+    else:
+        spec = raw_spec
+
+    label = _build_quantization_label(spec)
+    slug = _sanitize_label(label)
+    return label, slug, spec
+
+
+def _get_gpu_memory_gib(device_index: int = 0) -> float:
+    """Return current GPU memory used (GiB) across all processes on the device."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return info.used / (1024**3)
+    except Exception:
+        return torch.cuda.memory_allocated(device_index) / (1024**3)
+
+
 def _generate_image(omni, args, prompt, seed):
     """Generate a single image and return (PIL.Image, time_seconds, memory_gib)."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt},
@@ -163,12 +227,49 @@ def _generate_image(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = _get_gpu_memory_gib()
 
     first = outputs[0]
-    req_out = first.request_output[0] if hasattr(first, "request_output") else first
+    req_out = first.request_output if hasattr(first, "request_output") else first
+    if isinstance(req_out, (list, tuple)):
+        req_out = req_out[0]
     img = req_out.images[0]
     return img, elapsed, peak_mem
+
+
+def _generate_image_edit(omni, args, prompt, seed):
+    """Generate an edited image and return (PIL.Image, time_seconds, memory_gib)."""
+    import PIL.Image
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.platforms import current_omni_platform
+
+    if args.image:
+        image = PIL.Image.open(args.image).convert("RGB")
+    else:
+        from vllm.assets.image import ImageAsset
+        image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
+    start = time.perf_counter()
+    outputs = omni.generate(
+        {
+            "prompt": prompt,
+            "multi_modal_data": {"image": image},
+        },
+        OmniDiffusionSamplingParams(
+            height=args.height,
+            width=args.width,
+            generator=generator,
+            num_inference_steps=args.num_inference_steps,
+        ),
+    )
+    elapsed = time.perf_counter() - start
+    peak_mem = _get_gpu_memory_gib()
+
+    first = outputs[0]
+    req_out = first.request_output if hasattr(first, "request_output") else first
+    if isinstance(req_out, (list, tuple)):
+        req_out = req_out[0]
+    return req_out.images[0], elapsed, peak_mem
 
 
 def _generate_video(omni, args, prompt, seed):
@@ -178,7 +279,6 @@ def _generate_video(omni, args, prompt, seed):
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt, "negative_prompt": ""},
@@ -192,7 +292,7 @@ def _generate_video(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = _get_gpu_memory_gib()
 
     first = outputs[0]
     if hasattr(first, "request_output") and isinstance(first.request_output, list):
@@ -225,6 +325,8 @@ def _generate_video(omni, args, prompt, seed):
 
 def _unload_omni(omni):
     """Delete Omni instance and free GPU memory."""
+    if hasattr(omni, "close"):
+        omni.close()
     del omni
     gc.collect()
     if torch.cuda.is_available():
@@ -239,13 +341,13 @@ def run_benchmark(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     is_video = args.task == "t2v"
+    is_edit = args.task == "image_edit"
+
     prompts = args.prompts
     seed = args.seed
 
-    # Determine configs to benchmark
-    configs = []  # list of (label, quantization_method)
-    for method in args.quantization:
-        configs.append((method, method))
+    # Determine config to benchmark
+    config_label, config_slug, quant_spec = _parse_quantization_spec(args.quantization)
 
     # --- Baseline run ---
     print("\n" + "=" * 60)
@@ -259,6 +361,8 @@ def run_benchmark(args):
         print(f"  Generating: {prompt[:60]}...")
         if is_video:
             out, t, mem = _generate_video(omni_bl, args, prompt, seed)
+        elif is_edit:
+            out, t, mem = _generate_image_edit(omni_bl, args, prompt, seed)
         else:
             out, t, mem = _generate_image(omni_bl, args, prompt, seed)
         baseline_outputs[prompt] = (out, t, mem)
@@ -283,68 +387,65 @@ def run_benchmark(args):
         else:
             out.save(bl_dir / f"prompt_{i}.png")
 
-    # --- Quantized runs ---
-    all_results = []  # list of dicts
+    # --- Quantized run ---
+    print(f"\n{'=' * 60}")
+    print(f"Running: {config_label}...")
+    print("=" * 60)
 
-    for config_label, quant_method in configs:
-        print(f"\n{'=' * 60}")
-        print(f"Running: {config_label}...")
-        print("=" * 60)
+    qt_kwargs = _build_omni_kwargs(args, quantization=quant_spec)
+    omni_qt = Omni(**qt_kwargs)
 
-        qt_kwargs = _build_omni_kwargs(args, quantization=quant_method)
-        omni_qt = Omni(**qt_kwargs)
+    qt_outputs = {}
+    for prompt in prompts:
+        print(f"  Generating: {prompt[:60]}...")
+        if is_video:
+            out, t, mem = _generate_video(omni_qt, args, prompt, seed)
+        elif is_edit:
+            out, t, mem = _generate_image_edit(omni_qt, args, prompt, seed)
+        else:
+            out, t, mem = _generate_image(omni_qt, args, prompt, seed)
+        qt_outputs[prompt] = (out, t, mem)
 
-        qt_outputs = {}
-        for prompt in prompts:
-            print(f"  Generating: {prompt[:60]}...")
-            if is_video:
-                out, t, mem = _generate_video(omni_qt, args, prompt, seed)
-            else:
-                out, t, mem = _generate_image(omni_qt, args, prompt, seed)
-            qt_outputs[prompt] = (out, t, mem)
+    qt_avg_time = np.mean([v[1] for v in qt_outputs.values()])
+    qt_mem = qt_outputs[prompts[0]][2]
+    _unload_omni(omni_qt)
 
-        qt_avg_time = np.mean([v[1] for v in qt_outputs.values()])
-        qt_mem = qt_outputs[prompts[0]][2]
-        _unload_omni(omni_qt)
+    # Save quantized outputs
+    qt_dir = output_dir / config_slug
+    qt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save quantized outputs
-        qt_dir = output_dir / config_label.replace(" ", "_")
-        qt_dir.mkdir(parents=True, exist_ok=True)
+    # Compute LPIPS per prompt
+    per_prompt = []
+    for i, prompt in enumerate(prompts):
+        bl_out = baseline_outputs[prompt][0]
+        qt_out = qt_outputs[prompt][0]
+        if is_video:
+            lpips_score = compute_lpips_video(bl_out, qt_out, net=args.lpips_net)
+            try:
+                from diffusers.utils import export_to_video
 
-        # Compute LPIPS per prompt
-        per_prompt = []
-        for i, prompt in enumerate(prompts):
-            bl_out = baseline_outputs[prompt][0]
-            qt_out = qt_outputs[prompt][0]
-            if is_video:
-                lpips_score = compute_lpips_video(bl_out, qt_out, net=args.lpips_net)
-                try:
-                    from diffusers.utils import export_to_video
+                frames_list = list(qt_out) if isinstance(qt_out, np.ndarray) and qt_out.ndim == 4 else qt_out
+                export_to_video(frames_list, str(qt_dir / f"prompt_{i}.mp4"), fps=args.fps)
+            except ImportError:
+                np.save(qt_dir / f"prompt_{i}.npy", qt_out)
+        else:
+            lpips_score = compute_lpips_images([bl_out], [qt_out], net=args.lpips_net)[0]
+            qt_out.save(qt_dir / f"prompt_{i}.png")
+        per_prompt.append({"prompt": prompt, "lpips": lpips_score})
 
-                    frames_list = list(qt_out) if isinstance(qt_out, np.ndarray) and qt_out.ndim == 4 else qt_out
-                    export_to_video(frames_list, str(qt_dir / f"prompt_{i}.mp4"), fps=args.fps)
-                except ImportError:
-                    np.save(qt_dir / f"prompt_{i}.npy", qt_out)
-            else:
-                lpips_score = compute_lpips_images([bl_out], [qt_out], net=args.lpips_net)[0]
-                qt_out.save(qt_dir / f"prompt_{i}.png")
-            per_prompt.append({"prompt": prompt, "lpips": lpips_score})
+    mean_lpips = np.mean([p["lpips"] for p in per_prompt])
+    speedup = bl_avg_time / qt_avg_time if qt_avg_time > 0 else float("inf")
+    mem_reduction = (bl_mem - qt_mem) / bl_mem * 100
 
-        mean_lpips = np.mean([p["lpips"] for p in per_prompt])
-        speedup = bl_avg_time / qt_avg_time if qt_avg_time > 0 else float("inf")
-        mem_reduction = (bl_mem - qt_mem) / bl_mem * 100
-
-        all_results.append(
-            {
-                "config": config_label,
-                "avg_time": qt_avg_time,
-                "speedup": speedup,
-                "memory_gib": qt_mem,
-                "mem_reduction_pct": mem_reduction,
-                "mean_lpips": mean_lpips,
-                "per_prompt": per_prompt,
-            }
-        )
+    result = {
+        "config": config_label,
+        "avg_time": qt_avg_time,
+        "speedup": speedup,
+        "memory_gib": qt_mem,
+        "mem_reduction_pct": mem_reduction,
+        "mean_lpips": mean_lpips,
+        "per_prompt": per_prompt,
+    }
 
     # --- Print results ---
     print("\n\n")
@@ -367,12 +468,11 @@ def run_benchmark(args):
     lines.append("| Config | Avg Time | Speedup | Memory (GiB) | Mem Reduction | Mean LPIPS |")
     lines.append("|--------|----------|---------|--------------|---------------|------------|")
     lines.append(f"| BF16 baseline | {bl_avg_time:.2f}s | 1.00x | {bl_mem:.2f} | — | (ref) |")
-    for r in all_results:
-        lines.append(
-            f"| {r['config']} | {r['avg_time']:.2f}s | {r['speedup']:.2f}x "
-            f"| {r['memory_gib']:.2f} | {r['mem_reduction_pct']:.0f}% "
-            f"| {r['mean_lpips']:.4f} |"
-        )
+    lines.append(
+        f"| {result['config']} | {result['avg_time']:.2f}s | {result['speedup']:.2f}x "
+        f"| {result['memory_gib']:.2f} | {result['mem_reduction_pct']:.0f}% "
+        f"| {result['mean_lpips']:.4f} |"
+    )
     lines.append("")
     lines.append("> LPIPS < 0.01 = imperceptible, > 0.1 = clearly noticeable.")
     lines.append("")
@@ -381,19 +481,11 @@ def run_benchmark(args):
     if len(prompts) > 1:
         lines.append("### Per-Prompt LPIPS")
         lines.append("")
-        header = "| Prompt |"
-        sep = "|--------|"
-        for r in all_results:
-            header += f" {r['config']} |"
-            sep += "--------|"
-        lines.append(header)
-        lines.append(sep)
+        lines.append(f"| Prompt | {result['config']} |")
+        lines.append("|--------|--------|")
         for i, prompt in enumerate(prompts):
             short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-            row = f"| {short} |"
-            for r in all_results:
-                row += f" {r['per_prompt'][i]['lpips']:.4f} |"
-            lines.append(row)
+            lines.append(f"| {short} | {result['per_prompt'][i]['lpips']:.4f} |")
         lines.append("")
 
     md = "\n".join(lines)
@@ -404,9 +496,7 @@ def run_benchmark(args):
     results_path.write_text(md, encoding="utf-8")
     print(f"\nResults saved to {results_path}")
     print(f"Baseline outputs in {bl_dir}")
-    for r in all_results:
-        qt_dir = output_dir / r["config"].replace(" ", "_")
-        print(f"Quantized outputs in {qt_dir}")
+    print(f"Quantized outputs in {qt_dir}")
 
 
 def parse_args():
@@ -418,20 +508,29 @@ def parse_args():
     parser.add_argument(
         "--task",
         default="t2i",
-        choices=["t2i", "t2v"],
-        help="Task type: t2i (text-to-image) or t2v (text-to-video).",
+        choices=["t2i", "t2v", "image_edit"],
+        help="Task type: t2i (text-to-image), t2v (text-to-video), or image_edit (image editing).",
     )
     parser.add_argument(
         "--quantization",
-        nargs="+",
         required=True,
-        help="One or more quantization methods to benchmark (e.g. fp8 int8 bitsandbytes).",
+        help=(
+            "Quantization spec to benchmark. "
+            "Can be a method name (e.g. fp8) or a JSON object string "
+            '(e.g. \'{"method":"fp8","ignored_layers":["proj_out"]}\').'
+        ),
     )
     parser.add_argument(
         "--prompts",
         nargs="+",
         default=["a cup of coffee on the table"],
         help="One or more prompts to generate.",
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=None,
+        help="Path to input image for image_edit task. Defaults to a standard vllm test image.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=1024)

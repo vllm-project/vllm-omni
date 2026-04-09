@@ -46,7 +46,7 @@ class QualityTestConfig:
     id: str  # pytest ID, e.g. "fp8_z_image"
     model: str  # HF model name
     quantization: str  # quantization method, e.g. "fp8"
-    task: str  # "t2i" or "t2v"
+    task: str  # "t2i", "t2v", or "image_edit"
     prompt: str  # generation prompt
     max_lpips: float  # fail threshold — higher = more lenient
     height: int = 1024
@@ -55,6 +55,7 @@ class QualityTestConfig:
     num_frames: int = 5  # only for t2v
     seed: int = 42
     gpu: str = "H100"  # minimum GPU requirement
+    image: str | None = None  # vllm ImageAsset name for image_edit task
 
 
 # Add new quantization methods / models here.
@@ -88,6 +89,27 @@ QUALITY_CONFIGS = [
         seed=142,
         num_inference_steps=20,
     ),
+    QualityTestConfig(
+        id="fp8_longcat_image",
+        model="meituan-longcat/LongCat-Image",
+        quantization="fp8",
+        task="t2i",
+        prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.15,
+        seed=42,
+        num_inference_steps=20,
+    ),
+    QualityTestConfig(
+        id="fp8_longcat_image_edit",
+        model="meituan-longcat/LongCat-Image-Edit",
+        quantization="fp8",
+        task="image_edit",
+        prompt="Transform this modern image into a cinematic animation style with vibrant colors.",
+        image="2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+        max_lpips=0.20,
+        seed=42,
+        num_inference_steps=20,
+    ),
 ]
 
 
@@ -118,7 +140,42 @@ def _generate_image(omni, config: QualityTestConfig):
 
     peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
     first = outputs[0]
-    req_out = first.request_output[0] if hasattr(first, "request_output") else first
+    req_out = first.request_output if hasattr(first, "request_output") else first
+    if isinstance(req_out, (list, tuple)):
+        req_out = req_out[0]
+    return req_out.images[0], peak_mem
+
+
+def _generate_image_edit(omni, config: QualityTestConfig):
+    """Generate an edited image, return (PIL.Image, peak_mem_gib)."""
+    from vllm.assets.image import ImageAsset
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.platforms import current_omni_platform
+
+    image = ImageAsset(config.image).pil_image.convert("RGB")
+    generator = torch.Generator(
+        device=current_omni_platform.device_type,
+    ).manual_seed(config.seed)
+    torch.cuda.reset_peak_memory_stats()
+
+    outputs = omni.generate(
+        {
+            "prompt": config.prompt,
+            "multi_modal_data": {"image": image},
+        },
+        OmniDiffusionSamplingParams(
+            height=config.height,
+            width=config.width,
+            generator=generator,
+            num_inference_steps=config.num_inference_steps,
+        ),
+    )
+
+    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    first = outputs[0]
+    req_out = first.request_output if hasattr(first, "request_output") else first
+    if isinstance(req_out, (list, tuple)):
+        req_out = req_out[0]
     return req_out.images[0], peak_mem
 
 
@@ -177,12 +234,14 @@ def _compute_lpips(baseline, quantized, task: str) -> float:
         compute_lpips_video,
     )
 
-    if task == "t2i":
+    if task in ("t2i", "image_edit"):
         return compute_lpips_images([baseline], [quantized])[0]
     return compute_lpips_video(baseline, quantized)
 
 
 def _unload(omni):
+    if hasattr(omni, "close"):
+        omni.close()
     del omni
     gc.collect()
     if torch.cuda.is_available():
@@ -207,7 +266,12 @@ def test_quantization_quality(config: QualityTestConfig):
     """Validate that quantized output stays within LPIPS threshold of BF16."""
     from vllm_omni.entrypoints.omni import Omni
 
-    generate_fn = _generate_video if config.task == "t2v" else _generate_image
+    if config.task == "t2v":
+        generate_fn = _generate_video
+    elif config.task == "image_edit":
+        generate_fn = _generate_image_edit
+    else:
+        generate_fn = _generate_image
 
     # --- BF16 baseline ---
     omni_bl = Omni(model=config.model)
