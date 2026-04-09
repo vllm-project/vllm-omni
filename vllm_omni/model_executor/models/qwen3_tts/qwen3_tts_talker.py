@@ -27,6 +27,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, 
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
@@ -405,6 +406,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Tokenizer for prompt building.
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
+
+        # In-memory LRU cache for voice extraction artifacts (Base voice clone).
+        self._voice_cache = VoiceEmbeddingCache()
 
     # -------------------- vLLM required hooks --------------------
 
@@ -1120,14 +1124,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             speech_tokenizer_dir,
             torch_dtype=torch.bfloat16,
         )
-        # Prefer GPU for encoder if available; otherwise keep CPU.
+        # Only move encoder to GPU; the decoder is unused by Talker (which
+        # only calls tok.encode()) and would otherwise waste bf16 VRAM.
+        # NOTE: after this point the tokenizer instance is encode-only;
+        # calling tok.decode() will fail because tok.model.decoder is None.
         dev = next(self.parameters()).device
-        if getattr(dev, "type", None) == "cuda":
+        if dev.type != "cpu":
             try:
-                tok.model.to(dev)
+                del tok.model.decoder
+                tok.model.decoder = None
+                tok.model.encoder.to(dev)
                 tok.device = dev
             except Exception as e:
-                raise RuntimeError(f"Failed to move speech tokenizer to {dev}: {e}") from e
+                raise RuntimeError(f"Failed to move speech tokenizer encoder to {dev}: {e}") from e
         else:
             tok.device = dev
         self._speech_tokenizer = tok
@@ -1326,6 +1335,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
+
+            # Voice cache: only for uploaded voices (created_at > 0)
+            _voice_cache_key = None
+            if voice_clone_prompt is None:
+                _speaker_list = info_dict.get("speaker")
+                if isinstance(_speaker_list, list) and _speaker_list:
+                    _voice_name = str(_speaker_list[0]).lower()
+                    _voice_created_at = float((info_dict.get("voice_created_at") or [0])[0])
+                    if _voice_created_at > 0:
+                        _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only, _voice_created_at)
+                    _cached = self._voice_cache.get(_voice_cache_key) if _voice_cache_key is not None else None
+                    if _cached is not None:
+                        voice_clone_prompt = {
+                            "ref_code": _cached.get("ref_code"),
+                            "ref_spk_embedding": _cached.get("ref_spk_embedding"),
+                            "icl_mode": _cached.get("icl_mode"),
+                        }
+                        _voice_cache_key = None  # hit -> don't store again
+
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
                 icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
@@ -1374,6 +1402,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     raise ValueError("Base requires `ref_audio`.")
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+
+            # Cache miss: store extraction result
+            if _voice_cache_key is not None and speaker_embed is not None:
+                self._voice_cache.put(
+                    _voice_cache_key,
+                    {
+                        "ref_code": ref_code_prompt.detach().cpu()
+                        if isinstance(ref_code_prompt, torch.Tensor)
+                        else None,
+                        "ref_spk_embedding": speaker_embed.detach().cpu().reshape(-1),
+                        "icl_mode": in_context_mode,
+                    },
+                )
 
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
@@ -1450,10 +1491,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
             if not speaker:
                 raise ValueError("CustomVoice requires additional_information.speaker.")
-            spk_id_map = getattr(self.talker_config, "spk_id", None) or {}
+            spk_id_map = {k.lower(): v for k, v in (getattr(self.talker_config, "spk_id", None) or {}).items()}
             if speaker not in spk_id_map:
                 raise ValueError(f"Unsupported speaker: {speaker}")
-            spk_id = spk_id_map[speaker.lower()]
+            spk_id = spk_id_map[speaker]
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
             spk_embed = self.embed_input_ids(spk_tensor)

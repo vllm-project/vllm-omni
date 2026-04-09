@@ -146,7 +146,7 @@ def parse_args() -> argparse.Namespace:
         "--audio-sample-rate",
         type=int,
         default=24000,
-        help="Sample rate for audio output when saved (default: 24000 for LTX2).",
+        help="Sample rate for audio output when saved (default: 24000).",
     )
     parser.add_argument(
         "--cache-backend",
@@ -471,15 +471,9 @@ def main():
 
     video_array = _ensure_frame_list(video_array)
 
-    use_ltx2_export = is_ltx2
-    encode_video = None
-    if use_ltx2_export:
-        try:
-            from diffusers.pipelines.ltx2.export_utils import encode_video
-        except ImportError:
-            encode_video = None
+    if audio is not None:
+        from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
-    if use_ltx2_export and encode_video is not None:
         if isinstance(video_array, list):
             frames_np = np.stack(video_array, axis=0)
         elif isinstance(video_array, np.ndarray):
@@ -490,29 +484,24 @@ def main():
         if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
             frames_np = frames_np[..., :3]
 
-        frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
-        video_tensor = torch.from_numpy(frames_u8)
+        frames_u8 = (np.clip(frames_np, 0.0, 1.0) * 255).round().clip(0, 255).astype("uint8")
 
-        audio_out = None
-        if audio is not None:
-            if isinstance(audio, list):
-                audio = audio[0] if audio else None
-            if isinstance(audio, np.ndarray):
-                audio = torch.from_numpy(audio)
-            if isinstance(audio, torch.Tensor):
-                audio_out = audio
-                if audio_out.dim() > 1:
-                    audio_out = audio_out[0]
-                audio_out = audio_out.float().cpu()
+        audio_np = audio
+        if isinstance(audio_np, list):
+            audio_np = audio_np[0] if audio_np else None
+        if isinstance(audio_np, torch.Tensor):
+            audio_np = audio_np.detach().cpu().float().numpy()
+        if isinstance(audio_np, np.ndarray):
+            audio_np = np.squeeze(audio_np).astype(np.float32)
 
-        encode_video(
-            video_tensor,
-            fps=fps,
-            audio=audio_out,
-            audio_sample_rate=args.audio_sample_rate if audio_out is not None else None,
-            output_path=str(output_path),
+        video_bytes = mux_video_audio_bytes(
+            frames_u8,
+            audio_np,
+            fps=float(fps),
+            audio_sample_rate=args.audio_sample_rate,
         )
+        with open(str(output_path), "wb") as f:
+            f.write(video_bytes)
     else:
         export_to_video(video_array, str(output_path), fps=fps)
     print(f"Saved generated video to {output_path}")

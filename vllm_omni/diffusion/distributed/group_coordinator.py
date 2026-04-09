@@ -213,7 +213,7 @@ class GroupCoordinator:
         input_size[0] *= world_size
         output_tensor = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
         # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        torch.distributed.all_gather_into_tensor(output_tensor, input_.contiguous(), group=self.device_group)
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(

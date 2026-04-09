@@ -30,6 +30,26 @@ class ExpandedPrompt:
     prompt: dict[str, Any] | str
     role: str
     request_id_suffix: str
+    sampling_params_override: dict[str, Any] | None = None
+
+    def apply_overrides(
+        self,
+        base_params: Any,
+        base_spl: list[Any],
+    ) -> tuple[Any, list[Any]]:
+        """Return ``(params, sampling_params_list)`` with overrides applied.
+
+        If this prompt has no overrides the originals are returned as-is.
+        """
+        if not self.sampling_params_override:
+            return base_params, base_spl
+        patched = base_params.clone()
+        for k, v in self.sampling_params_override.items():
+            setattr(patched, k, v)
+        spl = list(base_spl)
+        if spl:
+            spl[0] = patched
+        return patched, spl
 
 
 def expand_cfg_prompts(
@@ -102,6 +122,102 @@ def expand_cfg_prompts(
                 prompt=cfg_img_dict,
                 role="cfg_img",
                 request_id_suffix=CFG_IMG_SUFFIX,
+            ),
+        ]
+
+    return []
+
+
+GEN_THINK_SYSTEM_PROMPT = (
+    "You should first think about the planning process in the mind "
+    "and then generate the image. \n"
+    "The planning process is enclosed within <think> </think> tags, "
+    "i.e. <think> planning process here </think> image here"
+)
+
+VLM_THINK_SYSTEM_PROMPT = (
+    "You should first think about the reasoning process in the mind "
+    "and then provide the user with the answer. \n"
+    "The reasoning process is enclosed within <think> </think> tags, "
+    "i.e. <think> reasoning process here </think> answer here"
+)
+
+
+def expand_cfg_prompts_think(
+    prompt: dict[str, Any] | str,
+    sampling_params: Any,
+) -> list[ExpandedPrompt]:
+    """Expand prompts for Bagel CFG in thinking mode.
+
+    Same as expand_cfg_prompts but companion requests get max_tokens=1
+    so they stop immediately after prefill (no thinking decode).
+
+    In thinking mode the gen (main) request decodes thinking tokens until
+    EOS; companions should only contribute their prefill KV cache.
+    """
+    if not isinstance(prompt, dict):
+        return []
+
+    modalities = prompt.get("modalities", [])
+    if "image" not in modalities and "img2img" not in modalities:
+        return []
+
+    neg_prompt = _get_negative_prompt(prompt, sampling_params)
+    companion_params = {"max_tokens": 1}
+
+    if "image" in modalities:
+        neg_prompt_dict = {
+            "prompt": neg_prompt,
+            "modalities": prompt.get("modalities", []),
+        }
+        return [
+            ExpandedPrompt(
+                prompt=neg_prompt_dict,
+                role="cfg_text",
+                request_id_suffix=CFG_TEXT_SUFFIX,
+                sampling_params_override=companion_params,
+            ),
+        ]
+
+    if "img2img" in modalities:
+        IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
+
+        original_text = prompt.get("prompt", "")
+        # Extract system prompt prefix (everything before <|fim_middle|>)
+        # so cfg_text gets system_prompt + image (no user text), matching
+        # the original BAGEL code where cfg_text = deepcopy(gen after image).
+        parts = original_text.split(IMG2IMG_PLACEHOLDER, 1)
+        system_prefix = parts[0] if len(parts) > 1 else ""
+
+        cfg_text_prompt = f"{system_prefix}{IMG2IMG_PLACEHOLDER}{neg_prompt}"
+        cfg_text_dict: dict[str, Any] = {
+            "prompt": cfg_text_prompt,
+            "modalities": ["img2img"],
+        }
+        mm_data = prompt.get("multi_modal_data")
+        if mm_data:
+            cfg_text_dict["multi_modal_data"] = mm_data
+
+        cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "")
+        cfg_img_dict: dict[str, Any] = {
+            "prompt": cfg_img_text,
+            "modalities": ["img2img"],
+        }
+        if mm_data:
+            cfg_img_dict["multi_modal_data"] = mm_data
+
+        return [
+            ExpandedPrompt(
+                prompt=cfg_text_dict,
+                role="cfg_text",
+                request_id_suffix=CFG_TEXT_SUFFIX,
+                sampling_params_override=companion_params,
+            ),
+            ExpandedPrompt(
+                prompt=cfg_img_dict,
+                role="cfg_img",
+                request_id_suffix=CFG_IMG_SUFFIX,
+                sampling_params_override=companion_params,
             ),
         ]
 

@@ -33,6 +33,7 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `black-forest-labs/FLUX.2-klein-4B` | 1024 x 1024 | 72.7 | 14.9 |
 | `black-forest-labs/FLUX.2-klein-9B` | 1024 x 1024 | 37.1 | 32.3 |
 | `black-forest-labs/FLUX.2-dev` | 1024 x 1024 | 65.7 | >80 (CPU offload required) |
+| `HunyuanImage-3.0` | 1024 x 1024 | 80.0 (TP≥3)  | 160 |
 
 !!! info
 *Peak VRAM:  based on basic single-card usage, batch size =1, without any acceleration/optimization features. FLUX.2-dev requires `--enable-cpu-offload` on a single 80 GiB GPU.
@@ -90,6 +91,8 @@ python text_to_image.py \
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
 | `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
 | `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
+| `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
 
 **NextStep-1.1 specific arguments:**
 

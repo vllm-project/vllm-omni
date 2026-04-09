@@ -20,7 +20,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationResponse,
 )
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
-from vllm_omni.entrypoints.openai.video_api_utils import encode_video_base64
+from vllm_omni.entrypoints.openai.video_api_utils import _encode_video_bytes, encode_video_base64
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -71,13 +71,18 @@ class OmniOpenAIServingVideo:
             stage_configs=stage_configs,
         )
 
-    async def generate_videos(
+    async def _run_and_extract(
         self,
         request: VideoGenerationRequest,
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
-    ) -> VideoGenerationResponse:
+    ) -> tuple[list[Any], list[Any | None], int, int]:
+        """Run the generation pipeline and extract video/audio outputs.
+
+        Returns:
+            Tuple of (videos, audios, audio_sample_rate, output_fps).
+        """
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
@@ -144,12 +149,23 @@ class OmniOpenAIServingVideo:
         )
 
         result = await self._run_generation(prompt, gen_params, reference_id)
-        _t_encode_start = time.perf_counter()
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
-        output_fps = vp.fps or 24
+        output_fps = vp.fps or self._resolve_fps(result) or 24
+        return videos, audios, audio_sample_rate, output_fps
 
+    async def generate_videos(
+        self,
+        request: VideoGenerationRequest,
+        reference_id: str,
+        *,
+        reference_image: ReferenceImage | None = None,
+    ) -> VideoGenerationResponse:
+        videos, audios, audio_sample_rate, output_fps = await self._run_and_extract(
+            request, reference_id, reference_image=reference_image
+        )
+        _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
                 b64_json=(
@@ -168,6 +184,32 @@ class OmniOpenAIServingVideo:
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
         return VideoGenerationResponse(created=int(time.time()), data=video_data)
+
+    async def generate_video_bytes(
+        self,
+        request: VideoGenerationRequest,
+        reference_id: str,
+        *,
+        reference_image: ReferenceImage | None = None,
+    ) -> bytes:
+        """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
+        videos, audios, audio_sample_rate, output_fps = await self._run_and_extract(
+            request, reference_id, reference_image=reference_image
+        )
+        if len(videos) > 1:
+            logger.warning(
+                "Video request %s generated %d outputs; returning only the first.", reference_id, len(videos)
+            )
+        audio = audios[0]
+        _t_encode_start = time.perf_counter()
+        video_bytes = _encode_video_bytes(
+            videos[0],
+            fps=output_fps,
+            **({"audio": audio, "audio_sample_rate": audio_sample_rate} if audio is not None else {}),
+        )
+        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+        logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
+        return video_bytes
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
@@ -322,6 +364,46 @@ class OmniOpenAIServingVideo:
             return config_sample_rate
 
         return 24000
+
+    @staticmethod
+    def _resolve_fps(result: Any) -> int | None:
+        """Extract fps from multimodal_output if the model reported it."""
+        multimodal_output = getattr(result, "multimodal_output", None)
+        if isinstance(multimodal_output, dict):
+            fps = multimodal_output.get("fps")
+            if fps is not None:
+                try:
+                    fps_val = fps.item() if hasattr(fps, "item") else int(fps)
+                    if fps_val > 0:
+                        return fps_val
+                except (TypeError, ValueError):
+                    pass
+
+        request_output = getattr(result, "request_output", None)
+        if isinstance(request_output, dict):
+            mm = request_output.get("multimodal_output") or {}
+            if isinstance(mm, dict):
+                fps = mm.get("fps")
+                if fps is not None:
+                    try:
+                        fps_val = fps.item() if hasattr(fps, "item") else int(fps)
+                        if fps_val > 0:
+                            return fps_val
+                    except (TypeError, ValueError):
+                        pass
+        elif hasattr(request_output, "multimodal_output"):
+            mm = getattr(request_output, "multimodal_output", None)
+            if isinstance(mm, dict):
+                fps = mm.get("fps")
+                if fps is not None:
+                    try:
+                        fps_val = fps.item() if hasattr(fps, "item") else int(fps)
+                        if fps_val > 0:
+                            return fps_val
+                    except (TypeError, ValueError):
+                        pass
+
+        return None
 
     @classmethod
     def _extract_audio_sample_rate_from_result(cls, result: Any) -> int | None:

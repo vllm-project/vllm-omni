@@ -78,16 +78,22 @@ BENCHMARK_COLUMNS: tuple[str, ...] = (
     "output_throughput",
     "total_token_throughput",
     "mean_ttft_ms",
+    "median_ttft_ms",
     "p99_ttft_ms",
     "mean_tpot_ms",
+    "median_tpot_ms",
     "p99_tpot_ms",
     "mean_itl_ms",
+    "median_itl_ms",
     "p99_itl_ms",
     "mean_e2el_ms",
+    "median_e2el_ms",
     "p99_e2el_ms",
     "mean_audio_rtf",
+    "median_audio_rtf",
     "p99_audio_rtf",
     "mean_audio_duration_s",
+    "median_audio_duration_s",
     "p99_audio_duration_s",
 )
 # Columns that get float coercion and number format in Excel. Excludes request_rate ("inf" str)
@@ -143,16 +149,22 @@ def _load_summary_columns(script_dir: str) -> list[str]:
         "output_throughput",
         "total_token_throughput",
         "mean_ttft_ms",
+        "median_ttft_ms",
         "p99_ttft_ms",
         "mean_tpot_ms",
+        "median_tpot_ms",
         "p99_tpot_ms",
         "mean_itl_ms",
+        "median_itl_ms",
         "p99_itl_ms",
         "mean_e2el_ms",
+        "median_e2el_ms",
         "p99_e2el_ms",
         "mean_audio_rtf",
+        "median_audio_rtf",
         "p99_audio_rtf",
         "mean_audio_duration_s",
+        "median_audio_duration_s",
         "p99_audio_duration_s",
         "commit_sha",
         "build_id",
@@ -447,14 +459,29 @@ def _apply_build_metadata_to_latest_only(
     build_id: str | None,
     build_url: str | None,
 ) -> None:
-    """Set commit_sha, build_id, build_url only on rows with the latest date.
-    Other rows get None so that build info is not duplicated for older benchmark data.
+    """Set commit_sha, build_id, build_url on rows from the latest calendar day.
+
+    Dates are expected like YYYYMMDD-HHMMSS (filename / benchmark convention). All rows
+    whose date starts with the same YYYYMMDD as the lexicographic max date receive
+    build metadata; older calendar days get None.
+    When max date is shorter than 8 chars, falls back to exact match.
     """
     if not records:
         return
     max_date = max((r.get("date") or "") for r in records)
+    use_day_prefix = len(max_date) >= 8
+    day_prefix = max_date[:8] if use_day_prefix else ""
+
     for r in records:
-        if (r.get("date") or "") == max_date:
+        d = r.get("date") or ""
+        if use_day_prefix and d.startswith(day_prefix):
+            in_latest_day = True
+        elif not use_day_prefix and d == max_date:
+            in_latest_day = True
+        else:
+            in_latest_day = False
+
+        if in_latest_day:
             r["commit_sha"] = commit_sha
             r["build_id"] = build_id
             r["build_url"] = build_url
