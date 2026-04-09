@@ -16,13 +16,28 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Voxtral TTS CUDA Unit Test"
-    timeout_in_minutes: 10
+  - label: "CUDA Unit Test with single card"
     depends_on: upload-ready-pipeline
     commands:
-      - "timeout 10m pytest -s -v tests/model_executor/models/voxtral_tts/test_cuda_graph_acoustic_transformer.py"
+      - timeout 10m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' --ignore=tests/e2e --ignore=tests/engine/test_async_omni_engine_abort.py --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
     agents:
       queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "CUDA Unit Test with multi cards"
+    depends_on: upload-ready-pipeline
+    commands:
+      - timeout 10m pytest -v -s -m 'core_model and cuda and L4 and distributed_cuda' --ignore=tests/e2e --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml
+    agents:
+      queue: "gpu_4_queue"
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -138,24 +153,6 @@ steps:
     depends_on: upload-ready-pipeline
     commands:
       - timeout 20m pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py -m core_model
-    agents:
-      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          shm-size: "8gb"
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-            - "HF_TOKEN"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
-
-  - label: "Diffusion GPU Worker Test"
-    depends_on: upload-ready-pipeline
-    commands:
-      - timeout 20m pytest -s -v tests/diffusion/test_diffusion_worker.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:

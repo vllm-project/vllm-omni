@@ -336,7 +336,13 @@ def acquire_device_locks(
             num_devices = current_omni_platform.get_device_count()
             physical_devices = list(range(num_devices))
 
-        num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
+        if len(physical_devices) < num_devices_per_stage:
+            raise RuntimeError(
+                f"Stage {stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+                f"but only {len(physical_devices)} device(s) are available: {physical_devices}"
+            )
+
+        num_devices_to_lock = num_devices_per_stage
         devices_to_lock = sorted(physical_devices[:num_devices_to_lock])
 
         logger.debug(
@@ -462,6 +468,21 @@ def initialize_diffusion_stage(
         model=model,
         **_to_dict(stage_cfg.engine_args),
     )
+    num_devices_per_stage = od_config.parallel_config.world_size
+    device_control_env = current_omni_platform.device_control_env_var
+    visible_devices_str = os.environ.get(device_control_env)
+    if visible_devices_str:
+        physical_devices = [device.strip() for device in visible_devices_str.split(",") if device.strip()]
+    else:
+        physical_devices = list(range(current_omni_platform.get_device_count()))
+
+    if len(physical_devices) < num_devices_per_stage:
+        raise ValueError(
+            f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+            f"but {len(physical_devices)} device(s) are available: {physical_devices}"
+        )
+
+    od_config.num_gpus = num_devices_per_stage
     if metadata.cfg_kv_collect_func is not None:
         od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
     return StageDiffusionClient(model, od_config, metadata, batch_size=batch_size)

@@ -272,7 +272,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
