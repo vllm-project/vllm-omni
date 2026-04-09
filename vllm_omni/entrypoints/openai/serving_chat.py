@@ -733,7 +733,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 sampling_params_list.append(params)
             else:
                 # For other stages, clone default params
-                sampling_params_list.append(default_params.clone())
+                # except ignore_eos which applies to all stages.
+                params = default_params.clone()
+                if request.ignore_eos is not None:
+                    params.ignore_eos = request.ignore_eos
+                sampling_params_list.append(params)
 
         return sampling_params_list
 
