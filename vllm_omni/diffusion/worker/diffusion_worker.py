@@ -156,6 +156,9 @@ class DiffusionWorker:
             logger.warning("Unknown profiler backend %r on diffusion worker %s", profiler_type, self.rank)
         return None
 
+    def _get_profiler(self) -> WorkerProfiler | None:
+        return getattr(self, "profiler", None)
+
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
         with (
@@ -203,18 +206,19 @@ class DiffusionWorker:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename.
         """
-        if self.profiler is None:
+        profiler = self._get_profiler()
+        if profiler is None:
             return
 
         if is_start:
-            if isinstance(self.profiler, OmniTorchProfilerWrapper):
+            if isinstance(profiler, OmniTorchProfilerWrapper):
                 import time
 
                 filename = profile_prefix or f"diffusion_rank{self.rank}_{int(time.time())}"
-                self.profiler.set_trace_filename(filename)
-            self.profiler.start()
+                profiler.set_trace_filename(filename)
+            profiler.start()
         else:
-            self.profiler.stop()
+            profiler.stop()
 
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
@@ -226,11 +230,12 @@ class DiffusionWorker:
                 if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
-        ctx = self.profiler.annotate_context_manager("diffusion_forward") if self.profiler else nullcontext()
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
             output = self.model_runner.execute_model(req)
-        if self.profiler:
-            self.profiler.step()
+        if profiler:
+            profiler.step()
         return output
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
@@ -243,11 +248,12 @@ class DiffusionWorker:
 
         if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
             raise ValueError("Step mode does not support LoRA yet.")
-        ctx = self.profiler.annotate_context_manager("diffusion_step") if self.profiler else nullcontext()
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         with ctx:
             output = self.model_runner.execute_stepwise(scheduler_output)
-        if self.profiler:
-            self.profiler.step()
+        if profiler:
+            profiler.step()
         return output
 
     def load_weights(self, weights) -> set[str]:
