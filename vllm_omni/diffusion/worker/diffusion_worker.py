@@ -209,7 +209,7 @@ class DiffusionWorker:
         if is_start:
             if isinstance(self.profiler, OmniTorchProfilerWrapper):
                 import time
-                
+
                 filename = profile_prefix or f"diffusion_rank{self.rank}_{int(time.time())}"
                 self.profiler.set_trace_filename(filename)
             self.profiler.start()
