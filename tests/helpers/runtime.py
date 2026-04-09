@@ -108,6 +108,7 @@ class OmniServer:
             cmd.append("--omni")
         cmd += self.serve_args
 
+        print(f"Launching OmniServer with: {' '.join(cmd)}")
         self.proc = subprocess.Popen(
             cmd,
             env=env,
@@ -123,6 +124,7 @@ class OmniServer:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
                 if sock.connect_ex((self.host, self.port)) == 0:
+                    print(f"Server ready on {self.host}:{self.port}")
                     return
             time.sleep(2)
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
@@ -131,17 +133,22 @@ class OmniServer:
         try:
             parent = psutil.Process(pid)
             children = parent.children(recursive=True)
+            all_pids = [pid] + [child.pid for child in children]
+
             for child in children:
                 try:
                     child.terminate()
                 except psutil.NoSuchProcess:
                     pass
+
             _, still_alive = psutil.wait_procs(children, timeout=10)
+
             for child in still_alive:
                 try:
                     child.kill()
                 except psutil.NoSuchProcess:
                     pass
+
             try:
                 parent.terminate()
                 parent.wait(timeout=10)
@@ -150,6 +157,21 @@ class OmniServer:
                     parent.kill()
                 except psutil.NoSuchProcess:
                     pass
+
+            time.sleep(1)
+            alive_processes = []
+            for check_pid in all_pids:
+                if psutil.pid_exists(check_pid):
+                    alive_processes.append(check_pid)
+
+            if alive_processes:
+                print(f"Warning: Processes still alive: {alive_processes}")
+                for alive_pid in alive_processes:
+                    try:
+                        subprocess.run(["kill", "-9", str(alive_pid)], timeout=2)
+                    except Exception as e:
+                        print(f"Cleanup failed: {e}")
+
         except psutil.NoSuchProcess:
             pass
 
@@ -229,6 +251,7 @@ class OpenAIClientHandler:
             result.success = True
         except Exception as e:
             result.error_message = f"Stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
         return result
 
     def _process_non_stream_omni_response(self, chat_completion) -> OmniResponse:
@@ -256,6 +279,7 @@ class OpenAIClientHandler:
             result.success = True
         except Exception as e:
             result.error_message = f"Non-stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
         return result
 
     def _process_diffusion_response(self, chat_completion) -> DiffusionResponse:
@@ -281,6 +305,7 @@ class OpenAIClientHandler:
             result.success = True
         except Exception as e:
             result.error_message = f"Diffusion response processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
         return result
 
     def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
@@ -869,6 +894,7 @@ class OmniRunner:
                     cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
                     name = proc.name().lower()
                     if any(k in cmdline for k in keywords) or any(k in name for k in keywords):
+                        print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
                         matched.append(proc)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
@@ -883,6 +909,14 @@ class OmniRunner:
                     proc.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+            if still_alive:
+                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
+                if stubborn:
+                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
+                else:
+                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
+            elif matched:
+                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
         except Exception as e:
             print(f"Error in psutil vllm cleanup: {e}")
 
@@ -918,6 +952,7 @@ class OmniRunnerHandler:
         except Exception as e:
             result.error_message = f"Output processing error: {str(e)}"
             result.success = False
+            print(f"Error: {result.error_message}")
         return result
 
     def send_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:

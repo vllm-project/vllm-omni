@@ -192,6 +192,9 @@ def assert_video_valid(
             "fps": actual_fps,
             "num_frames": actual_frames,
         }
+    except Exception as e:
+        print(f"ERROR: {type(e).__name__}: {e}", flush=True)
+        raise
     finally:
         if cap is not None:
             cap.release()
@@ -280,6 +283,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         median_f0 = _median_pitch_hz_from_autocorr(mono, sr)
         clf = _load_gender_pipeline()
         if clf is None:
+            print("gender model not available, returning 'unknown'")
             return "unknown"
         with _GENDER_PIPELINE_LOCK:
             outputs = clf(mono, sampling_rate=sr)
@@ -298,21 +302,30 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
             gender = "unknown"
 
         if gender == "female" and median_f0 is not None and median_f0 < 165.0 and conf < 0.88:
+            print(f"gender pitch assist: reclassifying female->male (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
             gender = "male"
         elif gender == "male" and median_f0 is not None and median_f0 > 230.0 and conf < 0.88:
+            print(f"gender pitch assist: reclassifying male->female (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
             gender = "female"
+        print(
+            f"gender classifier: label={label}, conf={conf:.3f}, gender={gender}"
+            + (f", median_f0={median_f0:.1f}Hz" if median_f0 is not None else "")
+        )
         return gender
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover
+        print(f"Warning: gender classification failed, returning 'unknown': {exc}")
         return "unknown"
 
 
 def _assert_preset_voice_gender_from_audio(audio_bytes: bytes | None, voice_name: str | None) -> None:
     if not voice_name or not audio_bytes:
         return
-    expected_gender = _PRESET_VOICE_GENDER_MAP.get(str(voice_name).lower())
+    key = str(voice_name).lower()
+    expected_gender = _PRESET_VOICE_GENDER_MAP.get(key)
     if expected_gender is None:
         return
     estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
+    print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
     if estimated_gender != "unknown":
         assert estimated_gender == expected_gender
 
@@ -343,20 +356,27 @@ def _assert_pcm_int16_speech_hnr(audio_bytes: bytes) -> None:
     assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     hnr = _compute_pcm_hnr_db(pcm_samples)
+    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {_MIN_PCM_SPEECH_HNR_DB} dB)")
     assert hnr >= _MIN_PCM_SPEECH_HNR_DB
 
 
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
     assert response.success, "The request failed."
+    e2e_latency = getattr(response, "e2e_latency", None)
+    if e2e_latency is not None:
+        print(f"the e2e latency is: {e2e_latency}")
+
     modalities = request_config.get("modalities", ["text", "audio"])
     if run_level == "advanced_model":
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
+            print(f"audio content is: {response.audio_content}")
             speaker = request_config.get("speaker")
             if speaker:
                 _assert_preset_voice_gender_from_audio(response.audio_bytes, speaker)
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
+            print(f"text content is: {response.text_content}")
         keywords_dict = request_config.get("key_words", {})
         for word_type in ["text", "image", "audio", "video"]:
             keywords = keywords_dict.get(word_type)
@@ -370,13 +390,22 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                 assert any(str(kw).lower() in audio_lower for kw in keywords)
         if "text" in modalities and "audio" in modalities:
             assert response.similarity is not None and response.similarity > 0.9
+            print(f"similarity is: {response.similarity}")
 
 
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
     assert response.success, "The request failed."
+    e2e_latency = getattr(response, "e2e_latency", None)
+    if e2e_latency is not None:
+        print(f"the avg e2e latency is: {e2e_latency}")
+
     req_fmt = request_config.get("response_format")
     if req_fmt == "pcm" and response.audio_bytes:
         _assert_pcm_int16_speech_hnr(response.audio_bytes)
+        if response.audio_format:
+            assert "pcm" in response.audio_format.lower(), (
+                f"Expected audio/pcm content-type, got {response.audio_format!r}"
+            )
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
 
@@ -384,13 +413,21 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
         expected_text = request_config.get("input")
         if expected_text:
             transcript = (response.audio_content or "").strip()
+            print(f"audio content is: {transcript}")
+            print(f"input text is: {expected_text}")
             similarity = cosine_similarity_text(transcript.lower(), expected_text.lower())
-            assert similarity > 0.9
+            print(f"Cosine similarity: {similarity:.3f}")
+            assert similarity > 0.9, (
+                f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
+            )
         _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
 
 
 def assert_diffusion_response(response: Any, request_config: dict[str, Any], run_level: str = None):
     assert response.success, "The request failed."
+    e2e_latency = getattr(response, "e2e_latency", None)
+    if e2e_latency is not None:
+        print(f"the avg e2e is: {e2e_latency}")
     has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
     assert has_any_content, "Response contains no images, videos, or audios"
     if response.images is not None:

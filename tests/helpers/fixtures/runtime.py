@@ -52,7 +52,11 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
             env_dict=params.env_dict,
             use_omni=params.use_omni,
         ) as server:
+            print("OmniServer started successfully")
             yield server
+            print("OmniServer stopping...")
+
+        print("OmniServer stopped")
 
 
 @pytest.fixture
@@ -70,7 +74,11 @@ def omni_runner(request: pytest.FixtureRequest, model_prefix: str):
         model, stage_config_path = request.param
         model = model_prefix + model
         with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
+            print("OmniRunner started successfully")
             yield runner
+            print("OmniRunner stopping...")
+
+        print("OmniRunner stopped")
 
 
 @pytest.fixture

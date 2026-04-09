@@ -31,6 +31,7 @@ def model_prefix() -> str:
 
 @pytest.fixture(autouse=True)
 def clean_gpu_memory_between_tests():
+    print("\n=== PRE-TEST GPU CLEANUP ===")
     _run_pre_test_cleanup()
     yield
     _run_post_test_cleanup()

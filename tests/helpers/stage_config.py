@@ -135,6 +135,8 @@ def modify_stage_config(
             del current[index]
         elif isinstance(current, dict) and last_key in current:
             del current[last_key]
+        else:
+            print(f"Path {path} does not exist")
 
     if deletes:
         for key, value in deletes.items():

@@ -209,6 +209,7 @@ def generate_synthetic_audio(
         output_path = f"audio_{num_channels}ch_{timestamp}.wav"
         try:
             sf.write(output_path, audio_data, sample_rate, format="WAV", subtype="PCM_16")
+            print(f"Audio saved: {output_path}")
             with open(output_path, "rb") as f:
                 audio_bytes = f.read()
         except Exception as e:
@@ -353,11 +354,15 @@ def generate_synthetic_video(
         "macro_block_size": 16,
         "ffmpeg_params": ["-preset", "medium", "-crf", "23", "-movflags", "+faststart", "-pix_fmt", "yuv420p"],
     }
-    with imageio.get_writer(buffer, **writer_kwargs) as writer:
-        for frame in video_frames:
-            writer.append_data(frame)
-    buffer.seek(0)
-    video_only_bytes = buffer.read()
+    try:
+        with imageio.get_writer(buffer, **writer_kwargs) as writer:
+            for frame in video_frames:
+                writer.append_data(frame)
+        buffer.seek(0)
+        video_only_bytes = buffer.read()
+    except Exception as e:
+        print(f"Warning: Failed to encode synthetic video: {e}")
+        raise
     video_bytes = (
         _mux_mp4_bytes_with_synthetic_audio(video_only_bytes, num_frames=num_frames, fps=float(fps))
         if embed_audio
@@ -371,9 +376,13 @@ def generate_synthetic_video(
     if save_to_file:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = f"video_{width}x{height}_{timestamp}.mp4"
-        with open(output_path, "wb") as f:
-            f.write(video_bytes)
-        result["file_path"] = output_path
+        try:
+            with open(output_path, "wb") as f:
+                f.write(video_bytes)
+            print(f"Video saved to: {output_path}")
+            result["file_path"] = output_path
+        except Exception as e:
+            print(f"Warning: Failed to save video to file {output_path}: {e}")
     return result
 
 
@@ -397,10 +406,16 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
     if save_to_file:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = f"image_{width}x{height}_{timestamp}.jpg"
-        image.save(output_path, format="JPEG", quality=85, optimize=True)
-        saved_file_path = output_path
-        with open(output_path, "rb") as f:
-            image_bytes = f.read()
+        try:
+            image.save(output_path, format="JPEG", quality=85, optimize=True)
+            saved_file_path = output_path
+            print(f"Image saved to: {saved_file_path}")
+            with open(output_path, "rb") as f:
+                image_bytes = f.read()
+        except Exception as e:
+            print(f"Warning: Failed to save image to file {output_path}: {e}")
+            saved_file_path = None
+            image_bytes = None
     if not save_to_file or image_bytes is None:
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=85, optimize=True)
@@ -455,6 +470,7 @@ def cosine_similarity_text(text1, text2, n: int = 3):
 
     text1 = preprocess_text(text1)
     text2 = preprocess_text(text2)
+    print(f"cosine similarity text1 is: {text1}, text2 is: {text2}")
 
     ngrams1 = [text1[i : i + n] for i in range(len(text1) - n + 1)]
     ngrams2 = [text2[i : i + n] for i in range(len(text2) - n + 1)]
@@ -534,6 +550,7 @@ def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
     output_path = f"./test_{uuid.uuid4().hex}.wav"
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
+    print(f"audio data is saved: {output_path}")
     return convert_audio_file_to_text(output_path)
 
 
