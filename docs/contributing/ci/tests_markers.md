@@ -53,7 +53,7 @@ def test_video_to_audio()
 
 ### Decorator: `@hardware_test`
 
-This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/utils.py` performs the following actions:
+This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/helpers/mark.py` performs the following actions:
 
 1. **Applies platform and resource markers**  
    Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `MI325`, `B60`, `A2`, `A3`).
@@ -133,9 +133,9 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
        "distributed_tpu: Tests that require multiple TPU devices",
    ]
    ```
-2. **Implement a marker construction function for your platform** in `vllm-omni/tests/utils.py`:
+2. **Implement a marker construction function for your platform** in `vllm-omni/tests/helpers/mark.py`:
    ```python
-   # In vllm-omni/tests/utils.py
+   # In vllm-omni/tests/helpers/mark.py
 
    def tpu_marks(*, res: str, num_cards: int):
        test_platform = pytest.mark.tpu
@@ -175,4 +175,4 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
 - Plug into `hardware_marks`  
 - You're done: tests using `@hardware_test` or `hardware_marks` with your platform now automatically get the correct markers, distribution, and isolation!
 
-See code in `vllm-omni/tests/utils.py` for existing examples (`cuda_marks`, `rocm_marks`, `npu_marks`).
+See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`cuda_marks`, `rocm_marks`, `npu_marks`).

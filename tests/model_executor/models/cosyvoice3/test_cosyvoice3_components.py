@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 
 
 class TestPreLookaheadLayer:

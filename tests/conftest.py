@@ -3,7 +3,7 @@ Root pytest entrypoint for the vLLM-Omni test suite.
 
 - `tests/conftest.py` stays thin: plugin registration + compatibility re-exports.
 - Importable utilities live under `tests/helpers/`.
-- Fixtures live under `tests/fixtures/` and are loaded via `pytest_plugins`.
+- Fixtures live under `tests/helpers/fixtures/` and are loaded via `pytest_plugins`.
 """
 
 from __future__ import annotations

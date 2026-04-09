@@ -489,7 +489,7 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["london"]},
     }
 
-    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/conftest.py).
+    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).
     _similarity_assert_msg = "The audio content is not same as the text"
     _max_retries = 3
     for attempt in range(_max_retries):
@@ -553,7 +553,7 @@ def test_speaker_002(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    # Retry only when assert_omni_response fails on preset voice gender (see tests/conftest.py).
+    # Retry only when assert_omni_response fails on preset voice gender (see tests/helpers/assertions.py).
     _gender_assert_substr = "estimated gender"
     _max_retries = 3
     for attempt in range(_max_retries):

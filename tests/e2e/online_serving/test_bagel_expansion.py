@@ -134,7 +134,7 @@ def test_bagel(
     - Ulysses-SP (degree=2)
     - Ring-Attention (degree=2)
 
-    Validation is delegated to assert_diffusion_response in tests.conftest,
+    Validation is delegated to assert_diffusion_response in tests/helpers/assertions.py,
     which checks output dimensions and basic correctness.
     """
 
