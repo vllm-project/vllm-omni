@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import os
 import select
 import signal
@@ -24,6 +25,7 @@ from typing import Any
 import pytest
 
 FaultVariant = str
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -412,6 +414,12 @@ def make_process_kill_fault_injector(
 
     def _inject(_server: Any) -> None:
         for pattern in patterns:
+            logger.info(
+                "[reliability][process-kill] trying pattern=%s signal=%s limit=%s",
+                pattern,
+                signal_name,
+                limit,
+            )
             pids = inject_process_kill(
                 grep_pattern=pattern,
                 signal_name=signal_name,
@@ -419,7 +427,19 @@ def make_process_kill_fault_injector(
                 allow_zero_match=True,
             )
             if pids:
+                logger.info(
+                    "[reliability][process-kill] matched pattern=%s killed_pids=%s killed_count=%d",
+                    pattern,
+                    pids,
+                    len(pids),
+                )
                 return
+        logger.warning(
+            "[reliability][process-kill] no process matched patterns=%s signal=%s limit=%s",
+            patterns,
+            signal_name,
+            limit,
+        )
         pytest.skip("no matching runtime process found for kill injection")
 
     return _inject
