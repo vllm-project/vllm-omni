@@ -428,7 +428,7 @@ from pathlib import Path
 import pytest
 from vllm.assets.video import VideoAsset
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from ..multi_stages.conftest import OmniRunner
 
 # Optional: set process start method for workers

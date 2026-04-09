@@ -22,8 +22,8 @@ import torch
 from PIL import Image
 from safetensors.torch import save_file
 
-from tests.conftest import OmniServer
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 

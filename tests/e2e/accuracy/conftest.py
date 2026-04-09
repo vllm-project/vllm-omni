@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,7 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.conftest import OmniServer, OmniServerParams
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 
 def pytest_addoption(parser):
@@ -181,18 +180,6 @@ def accuracy_artifact_root() -> Path:
     root = Path(__file__).resolve().parent / "artifacts"
     root.mkdir(parents=True, exist_ok=True)
     return root
-
-
-def reset_artifact_dir(path: Path) -> Path:
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def infer_model_label(model: str) -> str:
-    label = Path(model.rstrip("/\\")).name or "model"
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in label)
 
 
 def _build_accuracy_server_config(

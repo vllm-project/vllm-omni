@@ -8,14 +8,14 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServer
-from tests.dfx.conftest import (
+from tests.dfx.helpers import (
     create_benchmark_indices,
     create_test_parameter_mapping,
     create_unique_server_params,
     get_benchmark_params_for_server,
     load_configs,
 )
+from tests.helpers.runtime import OmniServer
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"

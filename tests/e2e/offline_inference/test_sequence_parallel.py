@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams

@@ -7,15 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import dummy_messages_from_mix_data, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"

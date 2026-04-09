@@ -1,0 +1,414 @@
+"""Assertion and response validation helpers for tests."""
+
+import io
+import tempfile
+import threading
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import soundfile as sf
+from PIL import Image
+from transformers import pipeline
+
+from tests.helpers.media import cosine_similarity_text
+
+_GENDER_PIPELINE = None
+_GENDER_PIPELINE_LOCK = threading.Lock()
+_PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
+_MIN_PCM_SPEECH_HNR_DB = 1.0
+_PRESET_VOICE_GENDER_MAP: dict[str, str] = {
+    "serena": "female",
+    "uncle_fu": "male",
+    "chelsie": "female",
+    "clone": "female",
+    "ethan": "male",
+}
+
+
+def assert_image_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate image diffusion response.
+
+    Expected request_config schema:
+        {
+            "request_type": "image",
+            "extra_body": {
+                "num_outputs_per_prompt": 1,
+                "width": ...,
+                "height": ...,
+                ...
+            }
+        }
+    """
+    assert response.images is not None, "Image response is None"
+    assert len(response.images) > 0, "No images in response"
+
+    extra_body = request_config.get("extra_body") or {}
+
+    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt")
+    if num_outputs_per_prompt is not None:
+        assert len(response.images) == num_outputs_per_prompt, (
+            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
+        )
+
+    if run_level == "advanced_model":
+        width = extra_body.get("width")
+        height = extra_body.get("height")
+
+        if width is not None or height is not None:
+            for img in response.images:
+                assert_image_valid(img, width=width, height=height)
+
+
+def assert_video_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate video diffusion response.
+
+    Expected request_config schema:
+        {
+            "request_type": "video",
+            "form_data": {
+                "prompt": "...",
+                "num_frames": ...,
+                "width": ...,
+                "height": ...,
+                "fps": ...,
+                ...
+            }
+        }
+    """
+    form_data = request_config.get("form_data", {})
+
+    assert response.videos is not None, "Video response is None"
+    assert len(response.videos) > 0, "No videos in response"
+
+    expected_frames = _maybe_int(form_data.get("num_frames"))
+    expected_width = _maybe_int(form_data.get("width"))
+    expected_height = _maybe_int(form_data.get("height"))
+    expected_fps = _maybe_int(form_data.get("fps"))
+
+    for vid_bytes in response.videos:
+        assert_video_valid(
+            vid_bytes,
+            num_frames=expected_frames,
+            width=expected_width,
+            height=expected_height,
+            fps=expected_fps,
+        )
+
+
+def assert_audio_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate audio diffusion response.
+    """
+    raise NotImplementedError("Audio validation is not implemented yet")
+
+
+def _maybe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
+    """Assert the file is a loadable image with optional exact dimensions."""
+    if isinstance(image, Path):
+        assert image.exists(), f"Image not found: {image}"
+        image = Image.open(image)
+        image.load()
+    assert image.width > 0 and image.height > 0
+    if width is not None:
+        assert image.width == width, f"Expected width={width}, got {image.width}"
+    if height is not None:
+        assert image.height == height, f"Expected height={height}, got {image.height}"
+    return image
+
+
+def assert_video_valid(
+    video: Path | bytes | BytesIO,
+    *,
+    num_frames: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: float | None = None,
+) -> dict[str, int | float]:
+    """Assert the MP4 has the expected resolution and exact frame count."""
+    temp_path = None
+    cap = None
+    try:
+        import cv2
+
+        if isinstance(video, Path):
+            if not video.exists():
+                raise AssertionError(f"Video file not found: {video}")
+            video_path = str(video)
+        else:
+            suffix = ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="wb") as tmp:
+                if isinstance(video, bytes):
+                    tmp.write(video)
+                elif isinstance(video, BytesIO):
+                    tmp.write(video.getvalue())
+                else:
+                    raise TypeError(f"Unsupported video type: {type(video)}")
+                temp_path = Path(tmp.name)
+                video_path = str(temp_path)
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise AssertionError("Failed to open video capture")
+
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        actual_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if width is not None:
+            assert actual_width == width, f"Expected width={width}, got {actual_width}"
+        if height is not None:
+            assert actual_height == height, f"Expected height={height}, got {actual_height}"
+        if fps is not None and actual_fps:
+            assert abs(actual_fps - float(fps)) < 1.0, f"Expected fps~={fps}, got {actual_fps}"
+        if num_frames is not None:
+            assert actual_frames == num_frames, f"Expected frames={num_frames}, got {actual_frames}"
+
+        return {
+            "width": actual_width,
+            "height": actual_height,
+            "fps": actual_fps,
+            "num_frames": actual_frames,
+        }
+    finally:
+        if cap is not None:
+            cap.release()
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
+    """Assert the WAV has the expected sample rate, channel count, and duration."""
+    assert path.exists(), f"Audio not found: {path}"
+    info = sf.info(str(path))
+    assert info.samplerate == sample_rate, f"Expected sample_rate={sample_rate}, got {info.samplerate}"
+    assert info.channels == channels, f"Expected {channels} channel(s), got {info.channels}"
+    expected_frames = int(duration_s * sample_rate)
+    assert info.frames == expected_frames, (
+        f"Expected {expected_frames} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
+    )
+
+
+def _load_gender_pipeline():
+    global _GENDER_PIPELINE
+    if _GENDER_PIPELINE is not None:
+        return _GENDER_PIPELINE
+    model_name = "7wolf/wav2vec2-base-gender-classification"
+    try:
+        _GENDER_PIPELINE = pipeline(task="audio-classification", model=model_name, device=-1)
+        return _GENDER_PIPELINE
+    except Exception as exc:  # pragma: no cover
+        print(f"Warning: failed to create gender pipeline '{model_name}': {exc}")
+        _GENDER_PIPELINE = None
+        return None
+
+
+def _median_pitch_hz_from_autocorr(mono: np.ndarray, sr: int) -> float | None:
+    x = np.asarray(mono, dtype=np.float64)
+    x = x - np.mean(x)
+    if x.size < int(0.15 * sr):
+        return None
+    frame_len = int(0.04 * sr)
+    hop = max(frame_len // 2, 1)
+    f0_min_hz, f0_max_hz = 70.0, 400.0
+    lag_min = max(1, int(sr / f0_max_hz))
+    lag_max = min(frame_len - 2, int(sr / f0_min_hz))
+    if lag_max <= lag_min:
+        return None
+    win = np.hamming(frame_len)
+    pitches: list[float] = []
+    for start in range(0, int(x.shape[0]) - frame_len, hop):
+        frame = x[start : start + frame_len] * win
+        frame = frame - np.mean(frame)
+        if float(np.sqrt(np.mean(frame**2))) < 1e-4:
+            continue
+        ac = np.correlate(frame, frame, mode="full")[frame_len - 1 :]
+        ac = ac / (float(ac[0]) + 1e-12)
+        region = ac[lag_min : lag_max + 1]
+        peak_rel = int(np.argmax(region))
+        peak_lag = peak_rel + lag_min
+        if peak_lag <= 0:
+            continue
+        f0 = float(sr) / float(peak_lag)
+        if f0_min_hz <= f0 <= f0_max_hz:
+            pitches.append(f0)
+    if len(pitches) < 4:
+        return None
+    return float(np.median(np.asarray(pitches, dtype=np.float64)))
+
+
+def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
+    data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+    if data.size == 0:
+        raise ValueError("Empty audio")
+    mono = np.mean(data, axis=1)
+    try:
+        target_sr = 16000
+        if int(sr) != target_sr and mono.size > 1:
+            src_len = int(mono.shape[0])
+            dst_len = max(1, int(round(src_len * float(target_sr) / float(sr))))
+            src_idx = np.arange(src_len, dtype=np.float32)
+            dst_idx = np.linspace(0, src_len - 1, dst_len, dtype=np.float32)
+            mono = np.interp(dst_idx, src_idx, mono.astype(np.float32, copy=False)).astype(np.float32)
+            sr = target_sr
+
+        median_f0 = _median_pitch_hz_from_autocorr(mono, sr)
+        clf = _load_gender_pipeline()
+        if clf is None:
+            return "unknown"
+        with _GENDER_PIPELINE_LOCK:
+            outputs = clf(mono, sampling_rate=sr)
+        if not outputs:
+            return "unknown"
+        top = outputs[0]
+        label = str(top.get("label", "")).lower()
+        conf = float(top.get("score", 0.0))
+        if conf < 0.5:
+            gender = "unknown"
+        elif ("female" in label) or ("жен" in label):
+            gender = "female"
+        elif ("male" in label) or ("муж" in label):
+            gender = "male"
+        else:
+            gender = "unknown"
+
+        if gender == "female" and median_f0 is not None and median_f0 < 165.0 and conf < 0.88:
+            gender = "male"
+        elif gender == "male" and median_f0 is not None and median_f0 > 230.0 and conf < 0.88:
+            gender = "female"
+        return gender
+    except Exception:  # pragma: no cover
+        return "unknown"
+
+
+def _assert_preset_voice_gender_from_audio(audio_bytes: bytes | None, voice_name: str | None) -> None:
+    if not voice_name or not audio_bytes:
+        return
+    expected_gender = _PRESET_VOICE_GENDER_MAP.get(str(voice_name).lower())
+    if expected_gender is None:
+        return
+    estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
+    if estimated_gender != "unknown":
+        assert estimated_gender == expected_gender
+
+
+def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
+    frame_len = int(0.03 * sr)
+    hop = frame_len // 2
+    hnr_values: list[float] = []
+    for start in range(0, len(pcm_samples) - frame_len, hop):
+        frame = pcm_samples[start : start + frame_len].astype(np.float32, copy=False)
+        frame = frame - np.mean(frame)
+        if np.max(np.abs(frame)) < 0.01:
+            continue
+        ac = np.correlate(frame, frame, mode="full")[len(frame) - 1 :]
+        ac = ac / (ac[0] + 1e-10)
+        min_lag = int(sr / 400)
+        max_lag = min(int(sr / 80), len(ac))
+        if min_lag >= max_lag:
+            continue
+        peak = float(np.max(ac[min_lag:max_lag]))
+        if 0 < peak < 1:
+            hnr_values.append(10 * np.log10(peak / (1 - peak + 1e-10)))
+    return float(np.mean(hnr_values)) if hnr_values else 0.0
+
+
+def _assert_pcm_int16_speech_hnr(audio_bytes: bytes) -> None:
+    assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
+    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    hnr = _compute_pcm_hnr_db(pcm_samples)
+    assert hnr >= _MIN_PCM_SPEECH_HNR_DB
+
+
+def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
+    assert response.success, "The request failed."
+    modalities = request_config.get("modalities", ["text", "audio"])
+    if run_level == "advanced_model":
+        if "audio" in modalities:
+            assert response.audio_content is not None, "No audio output is generated"
+            speaker = request_config.get("speaker")
+            if speaker:
+                _assert_preset_voice_gender_from_audio(response.audio_bytes, speaker)
+        if "text" in modalities:
+            assert response.text_content is not None, "No text output is generated"
+        keywords_dict = request_config.get("key_words", {})
+        for word_type in ["text", "image", "audio", "video"]:
+            keywords = keywords_dict.get(word_type)
+            if not keywords:
+                continue
+            if "text" in modalities:
+                text_lower = (response.text_content or "").lower()
+                assert any(str(kw).lower() in text_lower for kw in keywords)
+            else:
+                audio_lower = (response.audio_content or "").lower()
+                assert any(str(kw).lower() in audio_lower for kw in keywords)
+        if "text" in modalities and "audio" in modalities:
+            assert response.similarity is not None and response.similarity > 0.9
+
+
+def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
+    assert response.success, "The request failed."
+    req_fmt = request_config.get("response_format")
+    if req_fmt == "pcm" and response.audio_bytes:
+        _assert_pcm_int16_speech_hnr(response.audio_bytes)
+    elif req_fmt == "wav" and response.audio_format:
+        assert req_fmt in response.audio_format
+
+    if run_level == "advanced_model" and req_fmt != "pcm":
+        expected_text = request_config.get("input")
+        if expected_text:
+            transcript = (response.audio_content or "").strip()
+            similarity = cosine_similarity_text(transcript.lower(), expected_text.lower())
+            assert similarity > 0.9
+        _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
+
+
+def assert_diffusion_response(response: Any, request_config: dict[str, Any], run_level: str = None):
+    assert response.success, "The request failed."
+    has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
+    assert has_any_content, "Response contains no images, videos, or audios"
+    if response.images is not None:
+        assert_image_diffusion_response(response=response, request_config=request_config, run_level=run_level)
+    if response.videos is not None:
+        assert_video_diffusion_response(response=response, request_config=request_config, run_level=run_level)
+    if response.audios is not None:
+        assert_audio_diffusion_response(response=response, request_config=request_config, run_level=run_level)
+
+
+__all__ = [
+    "assert_audio_diffusion_response",
+    "assert_audio_speech_response",
+    "assert_diffusion_response",
+    "assert_image_diffusion_response",
+    "assert_image_valid",
+    "assert_omni_response",
+    "assert_video_diffusion_response",
+    "assert_video_valid",
+    "assert_audio_valid",
+]

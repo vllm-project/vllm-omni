@@ -23,7 +23,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 

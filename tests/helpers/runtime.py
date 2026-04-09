@@ -1,0 +1,1024 @@
+"""Server/client/runner runtime primitives for tests."""
+
+import base64
+import concurrent.futures
+import io
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from io import BytesIO
+from typing import Any, NamedTuple
+
+import psutil
+import requests
+import soundfile as sf
+import torch
+from openai import OpenAI, omit
+from PIL import Image
+from vllm import TextPrompt
+from vllm.logger import init_logger
+
+from tests.helpers.assertions import (
+    assert_audio_speech_response,
+    assert_diffusion_response,
+    assert_omni_response,
+)
+from tests.helpers.env import _run_post_test_cleanup, _run_pre_test_cleanup
+from tests.helpers.media import (
+    _merge_base64_audio_to_segment,
+    convert_audio_bytes_to_text,
+    cosine_similarity_text,
+    decode_b64_image,
+)
+
+logger = init_logger(__name__)
+
+PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
+PromptImageInput = list[Any] | Any | None
+PromptVideoInput = list[Any] | Any | None
+
+try:
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory  # type: ignore
+except Exception:  # pragma: no cover
+
+    def cleanup_dist_env_and_memory() -> None:
+        return None
+
+
+def get_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+class OmniServerParams(NamedTuple):
+    model: str
+    port: int | None = None
+    stage_config_path: str | None = None
+    server_args: list[str] | None = None
+    env_dict: dict[str, str] | None = None
+    use_omni: bool = True
+
+
+class OmniServer:
+    """Omniserver for vLLM-Omni tests."""
+
+    def __init__(
+        self,
+        model: str,
+        serve_args: list[str],
+        *,
+        port: int | None = None,
+        env_dict: dict[str, str] | None = None,
+        use_omni: bool = True,
+    ) -> None:
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
+        cleanup_dist_env_and_memory()
+        self.model = model
+        self.serve_args = serve_args
+        self.env_dict = env_dict
+        self.use_omni = use_omni
+        self.proc: subprocess.Popen | None = None
+        self.host = "127.0.0.1"
+        self.port = get_open_port() if port is None else port
+
+    def _start_server(self) -> None:
+        env = os.environ.copy()
+        env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        if self.env_dict is not None:
+            env.update(self.env_dict)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "vllm_omni.entrypoints.cli.main",
+            "serve",
+            self.model,
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+        ]
+        if self.use_omni:
+            cmd.append("--omni")
+        cmd += self.serve_args
+
+        self.proc = subprocess.Popen(
+            cmd,
+            env=env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+
+        max_wait = 1200
+        start_time = time.time()
+        while time.time() - start_time < max_wait:
+            ret = self.proc.poll()
+            if ret is not None:
+                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                if sock.connect_ex((self.host, self.port)) == 0:
+                    return
+            time.sleep(2)
+        raise RuntimeError(f"Server failed to start within {max_wait} seconds")
+
+    def _kill_process_tree(self, pid):
+        try:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            _, still_alive = psutil.wait_procs(children, timeout=10)
+            for child in still_alive:
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            try:
+                parent.terminate()
+                parent.wait(timeout=10)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                try:
+                    parent.kill()
+                except psutil.NoSuchProcess:
+                    pass
+        except psutil.NoSuchProcess:
+            pass
+
+    def __enter__(self):
+        self._start_server()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.proc:
+            self._kill_process_tree(self.proc.pid)
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
+        cleanup_dist_env_and_memory()
+
+
+@dataclass
+class OmniResponse:
+    text_content: str | None = None
+    audio_data: list[str] | None = None
+    audio_content: str | None = None
+    audio_format: str | None = None
+    audio_bytes: bytes | None = None
+    similarity: float | None = None
+    e2e_latency: float | None = None
+    success: bool = False
+    error_message: str | None = None
+
+
+@dataclass
+class DiffusionResponse:
+    text_content: str | None = None
+    images: list[Image.Image] | None = None
+    audios: list[Any] | None = None
+    videos: list[Any] | None = None
+    e2e_latency: float | None = None
+    success: bool = False
+    error_message: str | None = None
+
+
+class OpenAIClientHandler:
+    def __init__(self, host: str = "127.0.0.1", port: int = None, api_key: str = "EMPTY", run_level: str = None):
+        if port is None:
+            port = get_open_port()
+        self.base_url = f"http://{host}:{port}"
+        self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
+        self.run_level = run_level
+
+    def _process_stream_omni_response(self, chat_completion) -> OmniResponse:
+        result = OmniResponse()
+        start_time = time.perf_counter()
+        try:
+            text_content = ""
+            audio_data = []
+            for chunk in chat_completion:
+                for choice in chunk.choices:
+                    content = getattr(getattr(choice, "delta", None), "content", None)
+                    modality = getattr(chunk, "modality", None)
+                    if modality == "audio" and content:
+                        audio_data.append(content)
+                    elif modality == "text" and content:
+                        text_content += content
+            result.e2e_latency = time.perf_counter() - start_time
+            audio_content = None
+            similarity = None
+            if audio_data:
+                merged_seg = _merge_base64_audio_to_segment(audio_data)
+                wav_buf = BytesIO()
+                merged_seg.export(wav_buf, format="wav")
+                result.audio_bytes = wav_buf.getvalue()
+                audio_content = convert_audio_bytes_to_text(result.audio_bytes)
+            if audio_content and text_content:
+                similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
+            result.text_content = text_content
+            result.audio_data = audio_data
+            result.audio_content = audio_content
+            result.similarity = similarity
+            result.success = True
+        except Exception as e:
+            result.error_message = f"Stream processing error: {str(e)}"
+        return result
+
+    def _process_non_stream_omni_response(self, chat_completion) -> OmniResponse:
+        result = OmniResponse()
+        start_time = time.perf_counter()
+        try:
+            audio_data = None
+            text_content = None
+            for choice in chat_completion.choices:
+                if hasattr(choice.message, "audio") and choice.message.audio is not None:
+                    audio_data = choice.message.audio.data
+                if hasattr(choice.message, "content") and choice.message.content is not None:
+                    text_content = choice.message.content
+            result.e2e_latency = time.perf_counter() - start_time
+            audio_content = None
+            similarity = None
+            if audio_data:
+                result.audio_bytes = base64.b64decode(audio_data)
+                audio_content = convert_audio_bytes_to_text(result.audio_bytes)
+            if audio_content and text_content:
+                similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
+            result.text_content = text_content
+            result.audio_content = audio_content
+            result.similarity = similarity
+            result.success = True
+        except Exception as e:
+            result.error_message = f"Non-stream processing error: {str(e)}"
+        return result
+
+    def _process_diffusion_response(self, chat_completion) -> DiffusionResponse:
+        result = DiffusionResponse()
+        start_time = time.perf_counter()
+        try:
+            images = []
+            for choice in chat_completion.choices:
+                content = getattr(choice.message, "content", None)
+                if isinstance(content, list):
+                    for item in content:
+                        image_url = None
+                        if isinstance(item, dict):
+                            image_url = item.get("image_url", {}).get("url")
+                        else:
+                            image_url_obj = getattr(item, "image_url", None)
+                            image_url = getattr(image_url_obj, "url", None) if image_url_obj else None
+                        if image_url and image_url.startswith("data:image"):
+                            b64_data = image_url.split(",", 1)[1]
+                            images.append(decode_b64_image(b64_data))
+            result.e2e_latency = time.perf_counter() - start_time
+            result.images = images if images else None
+            result.success = True
+        except Exception as e:
+            result.error_message = f"Diffusion response processing error: {str(e)}"
+        return result
+
+    def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        responses: list[OmniResponse] = []
+        stream = request_config.get("stream", False)
+        modalities = request_config.get("modalities", ["text", "audio"])
+        extra_body: dict[str, Any] = {}
+        if "speaker" in request_config:
+            extra_body["speaker"] = request_config["speaker"]
+        if request_config.get("use_audio_in_video"):
+            mm = dict(extra_body.get("mm_processor_kwargs") or {})
+            mm["use_audio_in_video"] = True
+            extra_body["mm_processor_kwargs"] = mm
+        create_kwargs: dict[str, Any] = {
+            "model": request_config.get("model"),
+            "messages": request_config.get("messages"),
+            "stream": stream,
+            "modalities": modalities,
+        }
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
+
+        if request_num == 1:
+            chat_completion = self.client.chat.completions.create(**create_kwargs)
+            resp = (
+                self._process_stream_omni_response(chat_completion)
+                if stream
+                else self._process_non_stream_omni_response(chat_completion)
+            )
+            assert_omni_response(resp, request_config, run_level=self.run_level)
+            responses.append(resp)
+            return responses
+
+        def _one():
+            chat_completion = self.client.chat.completions.create(**create_kwargs)
+            return (
+                self._process_stream_omni_response(chat_completion)
+                if stream
+                else self._process_non_stream_omni_response(chat_completion)
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+            futures = [executor.submit(_one) for _ in range(request_num)]
+            for future in concurrent.futures.as_completed(futures):
+                resp = future.result()
+                assert_omni_response(resp, request_config, run_level=self.run_level)
+                responses.append(resp)
+        return responses
+
+    def _process_stream_audio_speech_response(self, response, *, response_format: str | None = None) -> OmniResponse:
+        """
+        Process streaming /v1/audio/speech responses into an OmniResponse.
+
+        This mirrors _process_stream_omni_response but operates on low-level
+        audio bytes and produces an OmniResponse with audio_content filled
+        from Whisper transcription.
+        """
+        result = OmniResponse()
+        start_time = time.perf_counter()
+
+        try:
+            # Aggregate all audio bytes from the streaming response.
+            data = bytearray()
+
+            # Preferred OpenAI helper.
+            if hasattr(response, "iter_bytes") and callable(getattr(response, "iter_bytes")):
+                for chunk in response.iter_bytes():
+                    if chunk:
+                        data.extend(chunk)
+            else:
+                # Generic iterable-of-bytes fallback (e.g., generator or list of chunks).
+                try:
+                    iterator = iter(response)
+                except TypeError:
+                    iterator = None
+
+                if iterator is not None:
+                    for chunk in iterator:
+                        if not chunk:
+                            continue
+                        if isinstance(chunk, (bytes, bytearray)):
+                            data.extend(chunk)
+                        elif hasattr(chunk, "data"):
+                            data.extend(chunk.data)  # type: ignore[arg-type]
+                        elif hasattr(chunk, "content"):
+                            data.extend(chunk.content)  # type: ignore[arg-type]
+                        else:
+                            raise TypeError(f"Unsupported stream chunk type: {type(chunk)}")
+                else:
+                    raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
+
+            raw_bytes = bytes(data)
+            if response_format == "pcm":
+                transcript = None
+            else:
+                transcript = convert_audio_bytes_to_text(raw_bytes)
+
+            # Populate OmniResponse.
+            result.audio_bytes = raw_bytes
+            result.audio_content = transcript
+            result.e2e_latency = time.perf_counter() - start_time
+            result.success = True
+            result.audio_format = getattr(response, "response", None)
+            if result.audio_format is not None:
+                result.audio_format = result.audio_format.headers.get("content-type", "")
+
+        except Exception as e:
+            result.error_message = f"Audio speech stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def _process_non_stream_audio_speech_response(
+        self, response, *, response_format: str | None = None
+    ) -> OmniResponse:
+        """
+        Process non-streaming /v1/audio/speech responses into an OmniResponse.
+
+        This mirrors _process_non_stream_omni_response but for the binary
+        audio payload returned by audio.speech.create.
+        """
+        result = OmniResponse()
+        start_time = time.perf_counter()
+
+        try:
+            # OpenAI non-streaming audio.speech.create returns HttpxBinaryResponseContent (.read() or .content)
+            if hasattr(response, "read") and callable(getattr(response, "read")):
+                raw_bytes = response.read()
+            elif hasattr(response, "content"):
+                raw_bytes = response.content  # type: ignore[assignment]
+            else:
+                raise TypeError(f"Unsupported audio speech response type: {type(response)}")
+
+            if response_format == "pcm":
+                transcript = None
+            else:
+                transcript = convert_audio_bytes_to_text(raw_bytes)
+
+            result.audio_bytes = raw_bytes
+            result.audio_content = transcript
+            result.e2e_latency = time.perf_counter() - start_time
+            result.success = True
+            result.audio_format = getattr(response, "response", None)
+            if result.audio_format is not None:
+                result.audio_format = result.audio_format.headers.get("content-type", "")
+
+        except Exception as e:
+            result.error_message = f"Audio speech non-stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """
+        Call the /v1/audio/speech endpoint using the same configuration-dict
+        style as send_omni_request, but via the OpenAI Python client's
+        audio.speech APIs.
+
+        Expected keys in request_config:
+          - model: model name/path (required)
+          - input: text to synthesize (required)
+          - response_format: audio format such as "wav" or "pcm" (optional)
+          - task_type, ref_text, ref_audio: TTS-specific extras (optional, passed via extra_body)
+          - timeout: request timeout in seconds (float, optional, default 120.0)
+          - stream: whether to use streaming API (bool, optional, default False)
+        """
+        timeout = float(request_config.get("timeout", 120.0))
+
+        model = request_config["model"]
+        text_input = request_config["input"]
+        stream = bool(request_config.get("stream", False))
+        voice = request_config.get("voice", None)
+
+        # Standard OpenAI param: use omit when not provided to keep default behavior.
+        response_format = request_config.get("response_format", omit)
+
+        # Qwen3-TTS custom fields, forwarded via extra_body.
+        extra_body: dict[str, Any] = {}
+        # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
+        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens"):
+            if key in request_config:
+                extra_body[key] = request_config[key]
+
+        responses: list[OmniResponse] = []
+
+        speech_fmt: str | None = None if response_format is omit else str(response_format).lower()
+
+        if request_num == 1:
+            if stream:
+                # Use streaming response helper.
+                with self.client.audio.speech.with_streaming_response.create(
+                    model=model,
+                    input=text_input,
+                    response_format=response_format,
+                    extra_body=extra_body or None,
+                    timeout=timeout,
+                    voice=voice,
+                ) as resp:
+                    omni_resp = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+            else:
+                # Non-streaming response.
+                resp = self.client.audio.speech.create(
+                    model=model,
+                    input=text_input,
+                    response_format=response_format,
+                    extra_body=extra_body or None,
+                    timeout=timeout,
+                    voice=voice,
+                )
+                omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
+
+            assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+            responses.append(omni_resp)
+            return responses
+        else:
+            # request_num > 1: concurrent requests (use same params as single-request path)
+
+            if stream:
+
+                def _stream_task():
+                    with self.client.audio.speech.with_streaming_response.create(
+                        model=model,
+                        input=text_input,
+                        response_format=response_format,
+                        extra_body=extra_body or None,
+                        timeout=timeout,
+                        voice=voice,
+                    ) as resp:
+                        return self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                    futures = [executor.submit(_stream_task) for _ in range(request_num)]
+                    for future in concurrent.futures.as_completed(futures):
+                        omni_resp = future.result()
+                        assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+                        responses.append(omni_resp)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                    futures = []
+                    for _ in range(request_num):
+                        future = executor.submit(
+                            self.client.audio.speech.create,
+                            model=model,
+                            input=text_input,
+                            response_format=response_format,
+                            extra_body=extra_body or None,
+                            timeout=timeout,
+                            voice=voice,
+                        )
+                        futures.append(future)
+
+                    for future in concurrent.futures.as_completed(futures):
+                        resp = future.result()
+                        omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
+                        assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+                        responses.append(omni_resp)
+
+        return responses
+
+    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        if request_num != 1:
+            raise NotImplementedError("Concurrent diffusion requests not supported here")
+        chat_completion = self.client.chat.completions.create(
+            model=request_config.get("model"),
+            messages=request_config.get("messages"),
+            extra_body=request_config.get("extra_body", None),
+            modalities=request_config.get("modalities", omit),
+        )
+        resp = self._process_diffusion_response(chat_completion)
+        assert_diffusion_response(resp, request_config, run_level=self.run_level)
+        return [resp]
+
+    def send_video_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        if request_num != 1:
+            raise NotImplementedError("Concurrent video diffusion requests are not currently implemented")
+        form_data = request_config.get("form_data")
+        if not isinstance(form_data, dict):
+            raise ValueError("Video request_config must contain 'form_data'")
+        normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
+        files: dict[str, tuple[str, BytesIO, str]] = {}
+        image_reference = request_config.get("image_reference")
+        if image_reference:
+            if image_reference.startswith("data:image"):
+                header, encoded = image_reference.split(",", 1)
+                content_type = header.split(";")[0].removeprefix("data:")
+                extension = content_type.split("/")[-1]
+                file_data = base64.b64decode(encoded)
+                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+            else:
+                normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
+
+        result = DiffusionResponse()
+        start_time = time.perf_counter()
+        create_url = self._build_url("/v1/videos")
+        response = requests.post(
+            create_url,
+            data=normalized_form_data,
+            files=files,
+            headers={"Accept": "application/json"},
+            timeout=60,
+        )
+        response.raise_for_status()
+        job_data = response.json()
+        video_id = job_data["id"]
+        self._wait_until_video_completed(video_id)
+        video_content = self._download_video_content(video_id)
+        result.success = True
+        result.videos = [video_content]
+        result.e2e_latency = time.perf_counter() - start_time
+        assert_diffusion_response(result, request_config, run_level=self.run_level)
+        return [result]
+
+    def _wait_until_video_completed(
+        self, video_id: str, poll_interval_seconds: int = 2, timeout_seconds: int = 300
+    ) -> None:
+        status_url = self._build_url(f"/v1/videos/{video_id}")
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            status_resp = requests.get(status_url, headers={"Accept": "application/json"}, timeout=30)
+            status_resp.raise_for_status()
+            status_data = status_resp.json()
+            current_status = status_data["status"]
+            if current_status == "completed":
+                return
+            if current_status == "failed":
+                error_msg = status_data.get("last_error", "Unknown error")
+                raise RuntimeError(f"Job failed: {error_msg}")
+            time.sleep(poll_interval_seconds)
+        raise TimeoutError(f"Video job {video_id} did not complete within {timeout_seconds}s")
+
+    def _download_video_content(self, video_id: str) -> bytes:
+        download_url = self._build_url(f"/v1/videos/{video_id}/content")
+        video_resp = requests.get(download_url, stream=True, timeout=60)
+        video_resp.raise_for_status()
+        video_bytes = BytesIO()
+        for chunk in video_resp.iter_content(chunk_size=8192):
+            if chunk:
+                video_bytes.write(chunk)
+        return video_bytes.getvalue()
+
+    def _build_url(self, path: str) -> str:
+        return f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+class OmniRunner:
+    def __init__(
+        self,
+        model_name: str,
+        seed: int = 42,
+        stage_init_timeout: int = 300,
+        batch_timeout: int = 10,
+        init_timeout: int = 300,
+        shm_threshold_bytes: int = 65536,
+        log_stats: bool = False,
+        stage_configs_path: str | None = None,
+        **kwargs,
+    ) -> None:
+        cleanup_dist_env_and_memory()
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
+        self.model_name = model_name
+        self.seed = seed
+        self._prompt_len_estimate_cache: dict[str, Any] = {}
+        from vllm_omni.entrypoints.omni import Omni
+
+        self.omni = Omni(
+            model=model_name,
+            log_stats=log_stats,
+            stage_init_timeout=stage_init_timeout,
+            batch_timeout=batch_timeout,
+            init_timeout=init_timeout,
+            shm_threshold_bytes=shm_threshold_bytes,
+            stage_configs_path=stage_configs_path,
+            **kwargs,
+        )
+
+    def get_default_sampling_params_list(self) -> list[Any]:
+        if not hasattr(self.omni, "default_sampling_params_list"):
+            raise AttributeError("Omni.default_sampling_params_list is not available")
+        return list(self.omni.default_sampling_params_list)
+
+    def _estimate_prompt_len(
+        self,
+        additional_information: dict[str, Any],
+        model_name: str,
+    ) -> int:
+        """Estimate prompt_token_ids placeholder length for the Talker stage.
+
+        The AR Talker replaces all input embeddings via ``preprocess``, so the
+        placeholder values are irrelevant but the **length** must match the
+        embeddings that ``preprocess`` will produce.
+        """
+        _cache = self._prompt_len_estimate_cache
+        try:
+            from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
+            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+                Qwen3TTSTalkerForConditionalGeneration,
+            )
+
+            if model_name not in _cache:
+                from transformers import AutoTokenizer
+
+                tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
+                cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
+                _cache[model_name] = (tok, getattr(cfg, "talker_config", None))
+
+            tok, tcfg = _cache[model_name]
+            task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
+            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+                additional_information=additional_information,
+                task_type=task_type,
+                tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
+                codec_language_id=getattr(tcfg, "codec_language_id", None),
+                spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
+            )
+        except Exception as exc:
+            logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
+            return 2048
+
+    def get_omni_inputs(
+        self,
+        prompts: list[str] | str,
+        system_prompt: str | None = None,
+        audios: PromptAudioInput = None,
+        images: PromptImageInput = None,
+        videos: PromptVideoInput = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+        modalities: list[str] | None = None,
+    ) -> list[TextPrompt]:
+        if system_prompt is None:
+            system_prompt = (
+                "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
+                "Group, capable of perceiving auditory and visual inputs, as well as "
+                "generating text and speech."
+            )
+        video_padding_token = "<|VIDEO|>"
+        image_padding_token = "<|IMAGE|>"
+        audio_padding_token = "<|AUDIO|>"
+        if "Qwen3-Omni-30B-A3B-Instruct" in self.model_name:
+            video_padding_token = "<|video_pad|>"
+            image_padding_token = "<|image_pad|>"
+            audio_padding_token = "<|audio_pad|>"
+        if isinstance(prompts, str):
+            prompts = [prompts]
+
+        # Qwen-TTS: follow examples/offline_inference/qwen3_tts/end2end.py style.
+        # Stage 0 expects token placeholders + additional_information (text/speaker/task_type/...),
+        # and Talker replaces embeddings in preprocess based on additional_information only.
+        is_tts_model = "Qwen3-TTS" in self.model_name or "qwen3_tts" in self.model_name.lower()
+        if is_tts_model and modalities == ["audio"]:
+            tts_kw = mm_processor_kwargs or {}
+            task_type = tts_kw.get("task_type", "CustomVoice")
+            speaker = tts_kw.get("speaker", "Vivian")
+            language = tts_kw.get("language", "Auto")
+            max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
+            ref_audio = tts_kw.get("ref_audio", None)
+            ref_text = tts_kw.get("ref_text", None)
+
+            omni_inputs: list[TextPrompt] = []
+            for prompt_text in prompts:
+                text_str = str(prompt_text).strip() or " "
+                additional_information: dict[str, Any] = {
+                    "task_type": [task_type],
+                    "text": [text_str],
+                    "language": [language],
+                    "speaker": [speaker],
+                    "max_new_tokens": [max_new_tokens],
+                }
+                if ref_audio is not None:
+                    additional_information["ref_audio"] = [ref_audio]
+                if ref_text is not None:
+                    additional_information["ref_text"] = [ref_text]
+                plen = self._estimate_prompt_len(additional_information, self.model_name)
+                input_dict: TextPrompt = {
+                    "prompt_token_ids": [0] * plen,
+                    "additional_information": additional_information,
+                }
+                omni_inputs.append(input_dict)
+            return omni_inputs
+
+        def _normalize(mm_input, num_prompts):
+            if mm_input is None:
+                return [None] * num_prompts
+            if isinstance(mm_input, list):
+                if len(mm_input) != num_prompts:
+                    raise ValueError("Multimodal input list length must match prompts length")
+                return mm_input
+            return [mm_input] * num_prompts
+
+        num_prompts = len(prompts)
+        audios_list = _normalize(audios, num_prompts)
+        images_list = _normalize(images, num_prompts)
+        videos_list = _normalize(videos, num_prompts)
+
+        omni_inputs = []
+        for i, prompt_text in enumerate(prompts):
+            user_content = ""
+            multi_modal_data = {}
+            audio = audios_list[i]
+            if audio is not None:
+                if isinstance(audio, list):
+                    for _ in audio:
+                        user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                    multi_modal_data["audio"] = audio
+                else:
+                    user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                    multi_modal_data["audio"] = audio
+            image = images_list[i]
+            if image is not None:
+                if isinstance(image, list):
+                    for _ in image:
+                        user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                    multi_modal_data["image"] = image
+                else:
+                    user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                    multi_modal_data["image"] = image
+            video = videos_list[i]
+            if video is not None:
+                if isinstance(video, list):
+                    for _ in video:
+                        user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                    multi_modal_data["video"] = video
+                else:
+                    user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                    multi_modal_data["video"] = video
+            user_content += prompt_text
+
+            full_prompt = (
+                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+            input_dict: dict[str, Any] = {"prompt": full_prompt}
+            if multi_modal_data:
+                input_dict["multi_modal_data"] = multi_modal_data
+            if modalities:
+                input_dict["modalities"] = modalities
+            if mm_processor_kwargs:
+                input_dict["mm_processor_kwargs"] = mm_processor_kwargs
+            omni_inputs.append(input_dict)
+        return omni_inputs
+
+    def generate(
+        self,
+        prompts: list[Any],
+        sampling_params_list: list[Any] | None = None,
+    ) -> list[Any]:
+        if sampling_params_list is None:
+            sampling_params_list = self.get_default_sampling_params_list()
+        return self.omni.generate(prompts, sampling_params_list)
+
+    def generate_multimodal(
+        self,
+        prompts: list[str] | str,
+        sampling_params_list: list[Any] | None = None,
+        system_prompt: str | None = None,
+        audios: PromptAudioInput = None,
+        images: PromptImageInput = None,
+        videos: PromptVideoInput = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+        modalities: list[str] | None = None,
+    ) -> list[Any]:
+        omni_inputs = self.get_omni_inputs(
+            prompts=prompts,
+            system_prompt=system_prompt,
+            audios=audios,
+            images=images,
+            videos=videos,
+            mm_processor_kwargs=mm_processor_kwargs,
+            modalities=modalities,
+        )
+        return self.generate(omni_inputs, sampling_params_list)
+
+    def start_profile(self, profile_prefix: str | None = None, stages: list[int] | None = None) -> list[Any]:
+        return self.omni.start_profile(profile_prefix=profile_prefix, stages=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        return self.omni.stop_profile(stages=stages)
+
+    def _cleanup_process(self):
+        try:
+            keywords = ["enginecore"]
+            matched = []
+            for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
+                try:
+                    cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
+                    name = proc.name().lower()
+                    if any(k in cmdline for k in keywords) or any(k in name for k in keywords):
+                        matched.append(proc)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            for proc in matched:
+                try:
+                    proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            _, still_alive = psutil.wait_procs(matched, timeout=5)
+            for proc in still_alive:
+                try:
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception as e:
+            print(f"Error in psutil vllm cleanup: {e}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self.omni, "close"):
+            self.omni.close()
+        self._cleanup_process()
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
+        cleanup_dist_env_and_memory()
+
+
+class OmniRunnerHandler:
+    def __init__(self, omni_runner):
+        self.runner = omni_runner
+
+    def _process_output(self, outputs: list[Any]) -> OmniResponse:
+        result = OmniResponse()
+        try:
+            text_content = None
+            audio_content = None
+            for stage_output in outputs:
+                if getattr(stage_output, "final_output_type", None) == "text":
+                    text_content = stage_output.request_output.outputs[0].text
+                if getattr(stage_output, "final_output_type", None) == "audio":
+                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
+            result.audio_content = audio_content
+            result.text_content = text_content
+            result.success = True
+        except Exception as e:
+            result.error_message = f"Output processing error: {str(e)}"
+            result.success = False
+        return result
+
+    def send_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:
+        if request_config is None:
+            request_config = {}
+        prompts = request_config.get("prompts")
+        videos = request_config.get("videos")
+        images = request_config.get("images")
+        audios = request_config.get("audios")
+        modalities = request_config.get("modalities", ["text", "audio"])
+        outputs = self.runner.generate_multimodal(
+            prompts=prompts, videos=videos, images=images, audios=audios, modalities=modalities
+        )
+        response = self._process_output(outputs)
+        assert_omni_response(response, request_config, run_level="core_model")
+        return response
+
+    def send_audio_speech_request(self, request_config: dict[str, Any]) -> OmniResponse:
+        """
+        Offline TTS: text -> audio via generate_multimodal, then validate with assert_audio_speech_response.
+
+        request_config must contain:
+          - 'input' or 'prompts': text to synthesize.
+        Optional keys:
+          - 'voice'       -> speaker (CustomVoice)
+          - 'task_type'   -> task_type in additional_information (default: "CustomVoice")
+          - 'language'    -> language in additional_information (default: "Auto")
+          - 'max_new_tokens' -> max_new_tokens in additional_information (default: 2048)
+          - 'response_format' -> desired audio format (used only for assertion)
+        """
+        input_text = request_config.get("input") or request_config.get("prompts")
+        if input_text is None:
+            raise ValueError("request_config must contain 'input' or 'prompts' for TTS")
+        if isinstance(input_text, list):
+            input_text = input_text[0] if input_text else ""
+
+        mm_processor_kwargs: dict[str, Any] = {}
+        if "voice" in request_config:
+            mm_processor_kwargs["speaker"] = request_config["voice"]
+        if "task_type" in request_config:
+            mm_processor_kwargs["task_type"] = request_config["task_type"]
+        if "ref_audio" in request_config:
+            mm_processor_kwargs["ref_audio"] = request_config["ref_audio"]
+        if "ref_text" in request_config:
+            mm_processor_kwargs["ref_text"] = request_config["ref_text"]
+        if "language" in request_config:
+            mm_processor_kwargs["language"] = request_config["language"]
+        if "max_new_tokens" in request_config:
+            mm_processor_kwargs["max_new_tokens"] = request_config["max_new_tokens"]
+
+        outputs = self.runner.generate_multimodal(
+            prompts=input_text,
+            modalities=["audio"],
+            mm_processor_kwargs=mm_processor_kwargs or None,
+        )
+        mm_out: dict[str, Any] | None = None
+        for stage_out in outputs:
+            if getattr(stage_out, "final_output_type", None) == "audio":
+                mm_out = stage_out.request_output.outputs[0].multimodal_output
+                break
+        if mm_out is None:
+            result = OmniResponse(success=False, error_message="No audio output from pipeline")
+            assert result.success, result.error_message
+            return result
+
+        audio_data = mm_out.get("audio")
+        if audio_data is None:
+            result = OmniResponse(success=False, error_message="No audio tensor in multimodal output")
+            assert result.success, result.error_message
+            return result
+
+        sr_raw = mm_out.get("sr")
+        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+        sr = int(sr_val.item() if hasattr(sr_val, "item") else sr_val)
+        wav_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+        wav_buf = io.BytesIO()
+        sf.write(
+            wav_buf,
+            wav_tensor.float().cpu().numpy().reshape(-1),
+            samplerate=sr,
+            format="WAV",
+            subtype="PCM_16",
+        )
+        result = OmniResponse(success=True, audio_bytes=wav_buf.getvalue(), audio_format="audio/wav")
+        assert_audio_speech_response(result, request_config, run_level="core_model")
+        return result
+
+    def start_profile(self, profile_prefix: str | None = None, stages: list[int] | None = None) -> list[Any]:
+        return self.runner.start_profile(profile_prefix=profile_prefix, stages=stages)
+
+    def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+        return self.runner.stop_profile(stages=stages)
+
+
+__all__ = [
+    "DiffusionResponse",
+    "OmniResponse",
+    "OmniRunner",
+    "OmniRunnerHandler",
+    "OmniServer",
+    "OmniServerParams",
+    "OpenAIClientHandler",
+    "get_open_port",
+]

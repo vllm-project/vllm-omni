@@ -13,14 +13,10 @@ This validates:
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-    generate_synthetic_image,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.media import generate_synthetic_image
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.stage_config import dummy_messages_from_mix_data
 
 EDIT_PROMPT = "Transform this modern image into a cinematic animation style with vibrant colors and soft lighting."
 NEGATIVE_PROMPT = "blurry, low quality, distorted, oversaturated"

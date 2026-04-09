@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 

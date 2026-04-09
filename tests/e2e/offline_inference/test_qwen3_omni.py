@@ -11,11 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_video
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]

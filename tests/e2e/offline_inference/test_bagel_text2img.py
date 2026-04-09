@@ -28,8 +28,8 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from tests.conftest import modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.platforms import current_omni_platform
 

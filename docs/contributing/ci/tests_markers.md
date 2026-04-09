@@ -38,7 +38,7 @@ Defined in `pyproject.toml`:
 ### Example usage for markers
 
 ```python
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 
 @pytest.mark.core_model
 @pytest.mark.omni
@@ -105,7 +105,7 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
 `hardware_marks` returns a list of pytest mark objects with the same signature as `@hardware_test`. Use it when you need more flexibility, such as attaching hardware marks to individual `pytest.param` entries rather than an entire test function.
 
 ```python
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
 
 MULTI_CARD_MARKS = hardware_marks(
     res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2

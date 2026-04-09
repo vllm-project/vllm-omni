@@ -6,13 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen2.5-Omni-7B"]

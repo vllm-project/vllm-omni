@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import modify_stage_config
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 

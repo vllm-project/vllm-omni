@@ -22,12 +22,9 @@ import httpx
 import pytest
 import yaml
 
-from tests.conftest import (
-    OmniServer,
-    convert_audio_file_to_text,
-    cosine_similarity_text,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_text
+from tests.helpers.runtime import OmniServer
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 

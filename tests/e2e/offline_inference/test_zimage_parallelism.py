@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.utils import DeviceMemoryMonitor, hardware_test
+from tests.helpers.mark import DeviceMemoryMonitor, hardware_test
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
