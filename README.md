@@ -59,6 +59,76 @@ vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, in
 - Omni-modality models (e.g. Qwen-Omni)
 - Multi-modality generation models (e.g. Qwen-Image)
 
+## Installation
+
+### Prerequisites
+
+- Python 3.10 or higher
+- CUDA 11.8+ (for GPU support) or ROCm (for AMD GPUs)
+
+### Quick Install
+
+#### 1. Clone the Repository
+
+```bash
+git clone https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
+```
+
+#### 2. Install Dependencies (Platform-Specific)
+
+vLLM-Omni automatically detects your hardware platform and installs the correct dependencies.
+
+**CUDA (NVIDIA GPUs) - Recommended:**
+```bash
+pip install -e .
+```
+The setup script will automatically detect CUDA and install the appropriate dependencies from `requirements/cuda.txt`.
+
+**ROCm (AMD GPUs):**
+```bash
+export VLLM_OMNI_TARGET_DEVICE=rocm
+pip install -e .
+```
+
+**CPU Only:**
+```bash
+export VLLM_OMNI_TARGET_DEVICE=cpu
+pip install -e .
+```
+
+**NPU (Ascend HiSilicon):**
+```bash
+export VLLM_OMNI_TARGET_DEVICE=npu
+pip install -e .
+```
+
+**XPU (Intel GPUs):**
+```bash
+export VLLM_OMNI_TARGET_DEVICE=xpu
+pip install -e .
+```
+
+#### 3. Verify Installation
+
+```bash
+python -c "import vllm_omni; print('Installation successful!')"
+```
+
+### Platform-Specific Notes
+
+- **Memory Requirements**: Ensure at least 16GB VRAM for basic models; 24GB+ recommended for larger models
+- **CUDA Compatibility**: Install CUDA Toolkit 11.8 or higher alongside PyTorch before installing vLLM-Omni
+- **ROCm Setup**: Ensure ROCm is properly installed and `LD_LIBRARY_PATH` is set correctly
+- **Dependency Details**: See [requirements/](./requirements/) directory for platform-specific dependency lists
+
+### Alternative: PyPI Installation (Editable Mode)
+
+For development or running from source:
+```bash
+pip install -e ".[dev]"  # Install with development dependencies
+```
+
 ## Getting Started
 
 Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn more.

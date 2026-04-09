@@ -1,5 +1,51 @@
 # Qwen3-Omni
 
+## Prerequisites and Dependencies
+
+Before running the Qwen3-Omni examples, ensure you have the required dependencies installed.
+
+### System Requirements
+
+- Python 3.10 or higher
+- At least 16GB VRAM for basic inference (24GB+ recommended)
+- CUDA 11.8+ or compatible GPU drivers
+
+### Required Python Packages
+
+Install the core vLLM-Omni with development dependencies:
+
+```bash
+# From the repository root
+pip install -e ".[dev]"
+```
+
+This automatically installs all required packages including:
+- `librosa` - Audio processing
+- `soundfile` - Audio I/O
+- `resampy` - Audio resampling
+- `imageio[ffmpeg]` - Video/image handling
+- `opencv-python` - Computer vision utilities
+- `PIL (Pillow)` - Image processing
+
+### System-Level Dependencies
+
+**Linux (Ubuntu/Debian):**
+```bash
+sudo apt update
+sudo apt install ffmpeg
+```
+
+**macOS:**
+```bash
+brew install ffmpeg
+```
+
+**Windows:**
+Download ffmpeg from [ffmpeg.org](https://ffmpeg.org/download.html) or use:
+```bash
+choco install ffmpeg
+```
+
 ## Setup
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
 
@@ -111,8 +157,30 @@ python end2end_async_chunk.py \
 
 ### FAQ
 
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
+**Q: I get a `ModuleNotFoundError` when running examples**
+
+A: Ensure you installed vLLM-Omni with development dependencies:
+```bash
+pip install -e ".[dev]"
 ```
+
+**Q: Error about backend of librosa or ffmpeg not found**
+
+A: Install ffmpeg (see [System-Level Dependencies](#system-level-dependencies) section) or ensure it's in your PATH.
+
+**Linux:**
+```bash
 sudo apt update
 sudo apt install ffmpeg
 ```
+
+**Q: The script fails with audio processing errors**
+
+A: This typically indicates missing audio dependencies. Install them with:
+```bash
+pip install librosa soundfile resampy
+```
+
+**Q: How do I use my own media files?**
+
+A: Use the `--*-path` arguments to specify local files (see [Using Local Media Files](#using-local-media-files) section).
