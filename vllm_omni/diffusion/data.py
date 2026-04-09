@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any
 
 import torch
+from PIL import Image
 from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
@@ -701,10 +702,12 @@ class DiffusionOutput:
     Final output (after pipeline completion)
     """
 
-    output: torch.Tensor | None = None
-    trajectory_timesteps: list[torch.Tensor] | None = None
-    trajectory_latents: torch.Tensor | None = None
-    trajectory_decoded: list[torch.Tensor] | None = None
+    # Fields may be replaced with SHM handle dicts by ipc.pack_diffusion_output_shm
+    output: torch.Tensor | dict | None = None
+    trajectory_timesteps: torch.Tensor | dict | None = None
+    trajectory_latents: torch.Tensor | dict | None = None
+    trajectory_log_probs: torch.Tensor | dict | None = None
+    trajectory_decoded: list[Image.Image] | None = None
     error: str | None = None
     aborted: bool = False
     abort_message: str | None = None

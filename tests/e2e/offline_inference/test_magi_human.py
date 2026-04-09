@@ -47,7 +47,7 @@ def test_magi_human_e2e(run_level):
     if run_level != "advanced_model":
         pytest.skip("MagiHuman e2e test requires advanced_model run level with real weights.")
 
-    model_path = "princepride/daVinci-MagiHuman"
+    model_path = "SII-GAIR/daVinci-MagiHuman-Base-1080p"
 
     omni = Omni(
         model=model_path,
