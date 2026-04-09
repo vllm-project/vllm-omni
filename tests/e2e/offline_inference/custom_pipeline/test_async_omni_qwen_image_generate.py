@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""E2E tests for AsyncOmni Qwen-Image generation flow (no Ray, no HTTP server)."""
+"""E2E tests for AsyncOmni Qwen-Image generation with trajectory_* fields.
+
+Validates that the custom Qwen-Image pipeline returns structured trajectory
+outputs (latents, timesteps, log_probs) via OmniRequestOutput's trajectory_*
+fields instead of the legacy custom_output dict.
+"""
 
 from __future__ import annotations
 
@@ -191,10 +196,17 @@ async def test_async_omni_generate_with_logprobs():
 
         _assert_valid_image_output(output)
 
-        all_log_probs = output.custom_output.get("all_log_probs")
-        assert all_log_probs is not None, "all_log_probs should be present when logprobs=True"
-        assert hasattr(all_log_probs, "shape")
-        assert all_log_probs.numel() > 0
+        assert output.trajectory_latents is not None, "trajectory_latents should be present"
+        assert hasattr(output.trajectory_latents, "shape")
+        assert output.trajectory_latents.numel() > 0
+
+        assert output.trajectory_timesteps is not None, "trajectory_timesteps should be present"
+        assert hasattr(output.trajectory_timesteps, "shape")
+        assert output.trajectory_timesteps.numel() > 0
+
+        assert output.trajectory_log_probs is not None, "trajectory_log_probs should be present when logprobs=True"
+        assert hasattr(output.trajectory_log_probs, "shape")
+        assert output.trajectory_log_probs.numel() > 0
 
 
 @pytest.mark.core_model
