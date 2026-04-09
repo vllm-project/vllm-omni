@@ -90,6 +90,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
     validate_layered_layers,
+    validate_qwen_image_min_size,
 )
 from vllm_omni.entrypoints.openai.protocol.audio import BatchSpeechRequest, OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
@@ -1328,6 +1329,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         width, height = None, None
         if request.size:
             width, height = parse_size(request.size)
+            _validate_qwen_image_request_size(raw_request, engine_client, model_name, width, height)
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
@@ -1526,6 +1528,8 @@ async def edit_images(
             # else: let pipeline calculate dimensions based on resolution
         else:
             width, height = parse_size(size)
+        if width is not None and height is not None:
+            _validate_qwen_image_request_size(raw_request, engine_client, model_name, width, height)
 
         # Check max_generated_image_size
         if max_generated_image_size is not None:
@@ -1649,17 +1653,36 @@ def _get_engine_and_model(raw_request: Request):
 
 
 def _supports_multimodal_image_inputs(raw_request: Request, engine_client: Any) -> bool:
-    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None) or engine_client
-    get_diffusion_od_config = getattr(diffusion_engine, "get_diffusion_od_config", None)
-    od_config = (
-        get_diffusion_od_config() if callable(get_diffusion_od_config) else getattr(diffusion_engine, "od_config", None)
-    )
-
+    od_config = _get_diffusion_od_config(raw_request, engine_client)
     if od_config is None:
         # Preserve the existing compatibility behavior when the diffusion
         # config is not exposed on the serving surface.
         return True
     return bool(getattr(od_config, "supports_multimodal_inputs", False))
+
+
+def _get_diffusion_od_config(raw_request: Request, engine_client: Any) -> Any | None:
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None) or engine_client
+    get_diffusion_od_config = getattr(diffusion_engine, "get_diffusion_od_config", None)
+    return (
+        get_diffusion_od_config() if callable(get_diffusion_od_config) else getattr(diffusion_engine, "od_config", None)
+    )
+
+
+def _validate_qwen_image_request_size(
+    raw_request: Request,
+    engine_client: Any,
+    model_name: str | None,
+    width: int,
+    height: int,
+) -> None:
+    od_config = _get_diffusion_od_config(raw_request, engine_client)
+    validate_qwen_image_min_size(
+        width,
+        height,
+        model_name=model_name,
+        model_class_name=getattr(od_config, "model_class_name", None),
+    )
 
 
 def _get_lora_from_json_str(lora_body):

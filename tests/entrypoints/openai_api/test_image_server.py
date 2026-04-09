@@ -21,6 +21,8 @@ from vllm import SamplingParams
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
+    requires_qwen_image_min_size,
+    validate_qwen_image_min_size,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -81,6 +83,21 @@ def test_parse_size_edge_cases():
     # Missing separator (user might forget 'x')
     with pytest.raises(ValueError, match="separator"):
         parse_size("1024 1024")
+
+
+def test_qwen_image_min_size_validation():
+    """Test the Qwen-Image family minimum size guard."""
+    assert requires_qwen_image_min_size(model_name="Qwen/Qwen-Image")
+    assert requires_qwen_image_min_size(model_class_name="QwenImageEditPipeline")
+    assert not requires_qwen_image_min_size(model_name="Tongyi-MAI/Z-Image-Turbo")
+
+    validate_qwen_image_min_size(16, 16, model_name="Qwen/Qwen-Image")
+
+    with pytest.raises(ValueError, match="at least 16 pixels"):
+        validate_qwen_image_min_size(15, 16, model_name="Qwen/Qwen-Image")
+
+    with pytest.raises(ValueError, match="at least 16 pixels"):
+        validate_qwen_image_min_size(16, 15, model_class_name="QwenImageLayeredPipeline")
 
 
 def test_encode_image_base64():
@@ -504,6 +521,20 @@ def test_invalid_size_parse_error(test_client):
     assert response.status_code == 400
     detail = str(response.json()["detail"])
     assert "size" in detail.lower() or "invalid" in detail.lower()
+
+
+def test_qwen_image_too_small_size_returns_400(test_client, mock_async_diffusion):
+    """Qwen-Image requests smaller than 16x16 should fail before reaching the backend."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "size": "15x15",
+        },
+    )
+    assert response.status_code == 400
+    assert "at least 16 pixels" in response.json()["detail"]
+    assert mock_async_diffusion.generate_calls == 0
 
 
 def test_missing_prompt(test_client):
@@ -991,6 +1022,23 @@ def test_image_edit_parameter_default_single_stage(test_client):
         },
     )
     assert response.status_code == 400
+
+
+def test_qwen_image_edit_too_small_size_returns_400(test_client, mock_async_diffusion):
+    """Qwen-Image edit requests smaller than 16x16 should fail before backend dispatch."""
+    img_bytes = make_test_image_bytes((24, 24))
+
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "hello world.",
+            "size": "15x15",
+        },
+    )
+    assert response.status_code == 400
+    assert "at least 16 pixels" in response.json()["detail"]
+    assert mock_async_diffusion.generate_calls == 0
 
 
 def test_image_edit_compression_jpeg(test_client):
