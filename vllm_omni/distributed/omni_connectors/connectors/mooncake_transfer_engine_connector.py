@@ -277,13 +277,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         }
 
         self.config = config
-        host_config = config.get("host", "127.0.0.1")
-        # Support "auto" to auto-detect local IP address
-        if host_config.lower() == "auto":
+        host_config = config.get("host")
+        host_value = "auto" if host_config is None else str(host_config)
+        # Default sender/receiver bootstrap to a routable local IP so the
+        # advertised endpoint matches the interface Mooncake binds.
+        if host_value.lower() == "auto" or host_value in {"", "*", "0.0.0.0", "::"}:
             self.host = self._get_local_ip()
             logger.info(f"Auto-detected local IP for RDMA: {self.host}")
         else:
-            self.host = host_config
+            self.host = host_value
         self.zmq_port = config.get("zmq_port", 50051)
         self.protocol = config.get("protocol", "rdma")
 
