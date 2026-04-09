@@ -78,8 +78,6 @@ class CfgCompanionTracker:
             return parent_id
         return None
 
-    # -- Deferred parent management --
-
     def defer_parent(self, parent_id: str, engine_outputs: Any, stage_id: int) -> None:
         """Hold parent result while waiting for companions to finish."""
         self._pending_parents[parent_id] = {
@@ -90,8 +88,6 @@ class CfgCompanionTracker:
 
     def pop_pending_parent(self, parent_id: str) -> dict[str, Any] | None:
         return self._pending_parents.pop(parent_id, None)
-
-    # -- Cleanup / abort --
 
     def cleanup_parent(self, parent_id: str) -> list[str]:
         companion_ids = list(self._companion_map.pop(parent_id, {}).values())

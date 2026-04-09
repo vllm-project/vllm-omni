@@ -1,6 +1,6 @@
 import pytest
 
-from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
