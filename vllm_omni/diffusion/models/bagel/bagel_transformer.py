@@ -1734,7 +1734,7 @@ class Bagel(nn.Module):
                     packed_seqlens=packed_seqlens,
                 )
 
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     **common,
                     packed_indexes=packed_indexes,
                     packed_position_ids=packed_position_ids,
@@ -1744,7 +1744,7 @@ class Bagel(nn.Module):
                 )
 
                 if cfg_text_scale_ > 1.0:
-                    cfg_text_v_t = self._forward_flow_single_branch(
+                    cfg_text_v_t = self.forward_single_branch(
                         **common,
                         packed_indexes=cfg_text_packed_query_indexes,
                         packed_position_ids=cfg_text_packed_position_ids,
@@ -1754,7 +1754,7 @@ class Bagel(nn.Module):
                     )
                     cfg_img_v_t = None
                     if cfg_img_scale_ > 1.0:
-                        cfg_img_v_t = self._forward_flow_single_branch(
+                        cfg_img_v_t = self.forward_single_branch(
                             **common,
                             packed_indexes=cfg_img_packed_query_indexes,
                             packed_position_ids=cfg_img_packed_position_ids,
@@ -1790,7 +1790,7 @@ class Bagel(nn.Module):
         if use_sp:
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1883,7 +1883,7 @@ class Bagel(nn.Module):
             else:
                 cfg_text_scale_ = 1.0
                 cfg_img_scale_ = 1.0
-            v_t = self._forward_flow(
+            v_t = self.forward(
                 x_t=x_t,
                 timestep=timestep,
                 packed_vae_token_indexes=packed_vae_token_indexes,
@@ -2019,7 +2019,7 @@ class Bagel(nn.Module):
 
             if use_cfg_this_step:
                 # CFG interval: each rank computes its own branch
-                local_v_t = self._forward_flow_single_branch(
+                local_v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -2046,7 +2046,7 @@ class Bagel(nn.Module):
                 )
             else:
                 # Outside CFG interval: all ranks compute with gen inputs, no comm
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -2128,7 +2128,7 @@ class Bagel(nn.Module):
 
         return v_t
 
-    def _forward_flow_single_branch(
+    def forward_single_branch(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,
@@ -2258,7 +2258,7 @@ class Bagel(nn.Module):
         v_t = v_t[packed_vae_token_indexes]
         return v_t
 
-    def _forward_flow(
+    def forward(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,
