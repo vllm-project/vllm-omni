@@ -1331,6 +1331,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
+
+        app_state_args = getattr(raw_request.app.state, "args", None)
+        _check_max_generated_image_size(app_state_args, width, height)
+
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
@@ -1517,7 +1521,6 @@ async def edit_images(
             )
 
         # 3.3 Parse and add size if provided
-        max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
         width, height = None, None
         if size.lower() == "auto":
             if resolution is None:
@@ -1527,23 +1530,7 @@ async def edit_images(
         else:
             width, height = parse_size(size)
 
-        # Check max_generated_image_size
-        if max_generated_image_size is not None:
-            if width is not None and height is not None:
-                if width * height > max_generated_image_size:
-                    raise HTTPException(
-                        status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                        f"size of {max_generated_image_size} pixels.",
-                    )
-            elif resolution is not None:
-                # When resolution is set, the output size is resolution * resolution
-                if resolution * resolution > max_generated_image_size:
-                    raise HTTPException(
-                        status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
-                        f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
-                    )
+        _check_max_generated_image_size(app_state_args, width, height, resolution)
 
         size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
         _update_if_not_none(gen_params, "width", width)
@@ -1741,6 +1728,34 @@ async def _generate_with_async_omni(
             detail="No output generated from multi-stage pipeline.",
         )
     return result
+
+
+def _check_max_generated_image_size(
+    app_state_args: Any,
+    width: int | None,
+    height: int | None,
+    resolution: int | None = None,
+) -> None:
+    """Raise 400 if the requested image size exceeds --max-generated-image-size."""
+    max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
+    # Check max_generated_image_size
+    if max_generated_image_size is None:
+        return
+    if width is not None and height is not None:
+        if width * height > max_generated_image_size:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
+                f"size of {max_generated_image_size} pixels.",
+            )
+    elif resolution is not None:
+        # When resolution is set, the output size is resolution * resolution
+        if resolution * resolution > max_generated_image_size:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
+                f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+            )
 
 
 def _update_if_not_none(object: Any, key: str, val: Any) -> None:
