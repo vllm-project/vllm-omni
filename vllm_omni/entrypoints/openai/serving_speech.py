@@ -1459,6 +1459,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return request_id, generator, tts_params
 
+    async def _generate_pcm_chunks(self, generator, request_id: str):
+        """Yield raw PCM byte chunks from the engine generator.
+
+        Delegates to ``_generate_audio_chunks`` with ``response_format="pcm"``.
+        Used by the WebSocket streaming handler and ``_iter_pcm_audio_bytes``.
+        """
+        async for chunk in self._generate_audio_chunks(generator, request_id, response_format="pcm"):
+            yield chunk
+
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
