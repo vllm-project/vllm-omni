@@ -29,6 +29,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni import AsyncOmni, Omni
 from vllm_omni.model_executor.models.fish_speech.dac_utils import DAC_HOP_LENGTH, DAC_SAMPLE_RATE
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
@@ -149,6 +150,7 @@ def main(args):
 
     omni = Omni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
@@ -185,6 +187,7 @@ async def main_streaming(args):
 
     omni = AsyncOmni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
@@ -273,7 +276,7 @@ def parse_args():
         default=False,
         help="Stream audio chunks as they arrive via AsyncOmni.",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 if __name__ == "__main__":

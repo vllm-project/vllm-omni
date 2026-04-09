@@ -21,6 +21,7 @@ from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -296,6 +297,7 @@ def main(args):
 
     omni = Omni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         dtype=args.dtype,
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
@@ -557,7 +559,7 @@ def parse_args():
         help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 if __name__ == "__main__":

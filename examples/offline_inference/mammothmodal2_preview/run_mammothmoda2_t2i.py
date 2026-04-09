@@ -29,6 +29,7 @@ from PIL import Image
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni import Omni
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -117,7 +118,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out", type=str, default="output.png", help="Path to save the generated image.")
     p.add_argument("--trust-remote-code", action="store_true", help="Trust remote code when loading the model.")
-    args = p.parse_args()
+    args = parse_args_with_explicit_overrides(p)
     if not args.prompt:
         args.prompt = ["A stylish woman with sunglasses riding a motorcycle in NYC."]
     return args
@@ -194,7 +195,12 @@ def main() -> None:
     expected_grid_tokens = ar_height * (ar_width + 1)
 
     logger.info("Initializing Omni pipeline...")
-    omni = Omni(model=args.model, stage_configs_path=args.stage_config, trust_remote_code=args.trust_remote_code)
+    omni = Omni(
+        model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
+        stage_configs_path=args.stage_config,
+        trust_remote_code=args.trust_remote_code,
+    )
     try:
         ar_sampling = SamplingParams(
             temperature=1.0,

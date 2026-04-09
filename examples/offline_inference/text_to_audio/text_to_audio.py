@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -95,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 44100):
@@ -140,6 +141,7 @@ def main():
     # Initialize Omni with Stable Audio model
     omni = Omni(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 

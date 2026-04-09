@@ -1,6 +1,7 @@
 import argparse
 
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -24,7 +25,7 @@ def parse_args():
     parser.add_argument("--width", type=int, default=448, help="Video width.")
     parser.add_argument("--num-inference-steps", type=int, default=8, help="Number of denoising steps.")
     parser.add_argument("--seed", type=int, default=52, help="Random seed for generation.")
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def main():
@@ -33,6 +34,7 @@ def main():
     print(f"Initializing MagiHuman pipeline with TP={args.tensor_parallel_size}...")
     omni = Omni(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         init_timeout=1200,
         tensor_parallel_size=args.tensor_parallel_size,
         devices=list(range(args.tensor_parallel_size)),

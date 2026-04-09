@@ -20,6 +20,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -322,6 +323,7 @@ def main(args):
         query_result = query_func()
     omni = Omni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
@@ -540,7 +542,7 @@ def parse_args():
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 if __name__ == "__main__":

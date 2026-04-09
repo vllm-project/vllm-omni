@@ -10,6 +10,7 @@ import soundfile as sf
 from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
@@ -55,7 +56,7 @@ def run_e2e():
         required=True,
         help="Path to tokenizer directory (e.g., <model_path>/CosyVoice-BlankEN).",
     )
-    args = parser.parse_args()
+    args = parse_args_with_explicit_overrides(parser)
     _ensure_mel_filters_asset()
     # Ensure tokenizer directory exists
     if not os.path.exists(args.tokenizer):
@@ -72,6 +73,7 @@ def run_e2e():
     # We pass trust_remote_code=True same as Qwen examples
     omni = Omni(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=args.stage_config,
         trust_remote_code=True,
         tokenizer=args.tokenizer,

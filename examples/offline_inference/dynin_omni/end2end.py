@@ -18,6 +18,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
+
 TASK_CHOICES = ("t2t", "t2i", "t2s", "i2i", "i2t", "s2t", "v2t")
 
 TASK_DEFAULT_RUNTIME = {
@@ -970,7 +972,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument("--vq-model-audio-local-files-only", action=argparse.BooleanOptionalAction, default=None)
 
     parser.add_argument("--disable-hf-xet", action=argparse.BooleanOptionalAction, default=True)
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def main() -> None:
@@ -1395,7 +1397,12 @@ def main() -> None:
     from vllm_omni.entrypoints.omni import Omni
 
     stage_config_path = str(Path(args.stage_config_path).expanduser())
-    omni = Omni(model=model_source, stage_configs_path=stage_config_path, dtype=args.dtype)
+    omni = Omni(
+        model=model_source,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
+        stage_configs_path=stage_config_path,
+        dtype=args.dtype,
+    )
     sampling_params_list = [
         SamplingParams(max_tokens=int(args.max_tokens_per_stage), temperature=0.0, top_p=1.0, detokenize=False)
         for _ in range(omni.num_stages)

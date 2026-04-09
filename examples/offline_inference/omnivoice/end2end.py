@@ -21,6 +21,7 @@ import os
 import numpy as np
 import soundfile as sf
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -79,7 +80,7 @@ def run_e2e():
         default=600,
         help="Stage initialization timeout in seconds",
     )
-    args = parser.parse_args()
+    args = parse_args_with_explicit_overrides(parser)
 
     if not os.path.exists(args.stage_config):
         raise FileNotFoundError(f"Stage config not found: {args.stage_config}")
@@ -88,6 +89,7 @@ def run_e2e():
 
     omni = Omni(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=args.stage_config,
         trust_remote_code=True,
         log_stats=True,

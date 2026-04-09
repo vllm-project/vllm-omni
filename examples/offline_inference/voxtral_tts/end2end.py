@@ -29,6 +29,7 @@ except ImportError:
 from vllm import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni import AsyncOmni
 from vllm_omni.entrypoints.omni import Omni
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 async def run_streaming(inputs, sampling_params_list, model_name, args, output_dir):
     async_omni = AsyncOmni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
     )
@@ -191,6 +193,7 @@ async def run_streaming(inputs, sampling_params_list, model_name, args, output_d
 def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir):
     llm = Omni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         log_stats=args.log_stats,
         stage_configs_path=args.stage_configs_path,
     )
@@ -297,7 +300,7 @@ def parse_args() -> Namespace:
         default=None,
         help="Voice to use instead of audio file.",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def compose_request(

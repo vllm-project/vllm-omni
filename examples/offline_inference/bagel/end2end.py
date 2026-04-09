@@ -1,6 +1,7 @@
 import argparse
 import os
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.inputs.data import OmniPromptType
 from vllm_omni.model_executor.stage_input_processors.bagel import (
     GEN_THINK_SYSTEM_PROMPT,
@@ -98,7 +99,7 @@ def parse_args():
         help="Enable thinking mode: AR stage decodes <think>...</think> planning tokens before image generation.",
     )
 
-    args = parser.parse_args()
+    args = parse_args_with_explicit_overrides(parser)
     return args
 
 
@@ -152,6 +153,7 @@ def main():
     )
     if args.quantization:
         omni_kwargs["quantization_config"] = args.quantization
+    omni_kwargs["explicit_overrides"] = getattr(args, "_explicit_overrides", None)
 
     omni = Omni(model=model_name, **omni_kwargs)
 

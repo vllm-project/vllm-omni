@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -185,7 +186,7 @@ def parse_args() -> argparse.Namespace:
         choices=["fp8", "gguf"],
         help="Quantization method for the transformer (fp8 for online FP8 quantization).",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def main():
@@ -229,6 +230,7 @@ def main():
 
     omni_kwargs = dict(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,

@@ -1,8 +1,11 @@
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
+import argparse
 import os
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
+from textwrap import dedent
 
 import pytest
 import torch
@@ -16,6 +19,7 @@ from vllm_omni.entrypoints.utils import (
     _filter_dict_like_object,
     filter_dataclass_kwargs,
     load_and_resolve_stage_configs,
+    parse_args_with_explicit_overrides,
     resolve_model_config_path,
 )
 
@@ -309,6 +313,28 @@ class TestResolveModelConfigPath:
         assert "glm_image.yaml" in result
 
 
+class TestParseArgsWithExplicitStageOverrides:
+    def test_only_explicit_cli_values_are_captured(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--foo", default="default-foo")
+        parser.add_argument("--bar", type=int, default=3)
+
+        args = parse_args_with_explicit_overrides(parser, ["--foo", "cli-foo"])
+
+        assert args.foo == "cli-foo"
+        assert args.bar == 3
+        assert args._explicit_overrides == {"foo": "cli-foo"}
+
+    def test_equals_style_option_is_supported(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--tensor-parallel-size", dest="tensor_parallel_size", type=int, default=1)
+
+        args = parse_args_with_explicit_overrides(parser, ["--tensor-parallel-size=4"])
+
+        assert args.tensor_parallel_size == 4
+        assert args._explicit_overrides == {"tensor_parallel_size": 4}
+
+
 class TestLoadAndResolveStageConfigs:
     def test_load_and_resolve_with_kwargs(self):
         """Ensure that dtype survives default stage creation."""
@@ -322,3 +348,134 @@ class TestLoadAndResolveStageConfigs:
         assert config_path is None
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
+
+    def test_explicit_yaml_overrides_explicit_overrides(self, tmp_path: Path):
+        config_path = tmp_path / "stage.yaml"
+        config_path.write_text(
+            dedent(
+                """
+                stage_args:
+                  - stage_id: 0
+                    stage_type: diffusion
+                    runtime:
+                      process: true
+                      devices: "0"
+                    engine_args:
+                      tensor_parallel_size: 1
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+        _, stage_configs = load_and_resolve_stage_configs(
+            model="dummy-model",
+            stage_configs_path=str(config_path),
+            kwargs={
+                "tensor_parallel_size": 4,
+                "explicit_overrides": {"tensor_parallel_size": 4},
+            },
+        )
+
+        assert stage_configs[0].engine_args.tensor_parallel_size == 1
+
+    def test_default_yaml_uses_explicit_overrides_instead_of_full_kwargs(self, mocker: MockerFixture):
+        config_path = "/tmp/default-stage.yaml"
+        stage_cfg = [
+            {
+                "stage_id": 0,
+                "stage_type": "diffusion",
+                "runtime": {"process": True, "devices": "0"},
+                "engine_args": {
+                    "tensor_parallel_size": 1,
+                    "distributed_executor_backend": "mp",
+                },
+            }
+        ]
+
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.resolve_model_config_path",
+            return_value=config_path,
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            side_effect=lambda path: __import__(
+                "vllm_omni.config.yaml_util", fromlist=["create_config"]
+            ).create_config({"stage_args": stage_cfg}),
+        )
+
+        _, stage_configs = load_and_resolve_stage_configs(
+            model="dummy-model",
+            stage_configs_path=None,
+            kwargs={
+                "distributed_executor_backend": None,
+                "tensor_parallel_size": 8,
+                "explicit_overrides": {"tensor_parallel_size": 8},
+            },
+        )
+
+        assert stage_configs[0].engine_args.tensor_parallel_size == 8
+        assert stage_configs[0].engine_args.distributed_executor_backend == "mp"
+
+    def test_default_yaml_plain_kwargs_do_not_override_defaults(self, mocker: MockerFixture):
+        config_path = "/tmp/default-stage.yaml"
+        stage_cfg = [
+            {
+                "stage_id": 0,
+                "stage_type": "diffusion",
+                "runtime": {"process": True, "devices": "0"},
+                "engine_args": {"tensor_parallel_size": 1},
+            }
+        ]
+
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.resolve_model_config_path",
+            return_value=config_path,
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            side_effect=lambda path: __import__(
+                "vllm_omni.config.yaml_util", fromlist=["create_config"]
+            ).create_config({"stage_args": stage_cfg}),
+        )
+
+        _, stage_configs = load_and_resolve_stage_configs(
+            model="dummy-model",
+            stage_configs_path=None,
+            kwargs={"tensor_parallel_size": 8},
+        )
+
+        assert stage_configs[0].engine_args.tensor_parallel_size == 1
+
+    def test_parser_defaults_still_fill_missing_keys_under_default_yaml(self, mocker: MockerFixture):
+        config_path = "/tmp/default-stage.yaml"
+        stage_cfg = [
+            {
+                "stage_id": 0,
+                "stage_type": "diffusion",
+                "runtime": {"process": True, "devices": "0"},
+                "engine_args": {"tensor_parallel_size": 1},
+            }
+        ]
+
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.resolve_model_config_path",
+            return_value=config_path,
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            side_effect=lambda path: __import__(
+                "vllm_omni.config.yaml_util", fromlist=["create_config"]
+            ).create_config({"stage_args": stage_cfg}),
+        )
+
+        _, stage_configs = load_and_resolve_stage_configs(
+            model="dummy-model",
+            stage_configs_path=None,
+            kwargs={
+                "pipeline_parallel_size": 2,
+                "explicit_overrides": {},
+            },
+        )
+
+        assert stage_configs[0].engine_args.tensor_parallel_size == 1
+        assert stage_configs[0].engine_args.pipeline_parallel_size == 2

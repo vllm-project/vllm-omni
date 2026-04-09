@@ -9,6 +9,7 @@ import librosa
 from PIL import Image
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -56,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable CPU offloading for diffusion models.",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def load_image_and_audio(image_paths, audio_paths):
@@ -121,6 +122,7 @@ def main() -> None:
 
     omni = Omni(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         parallel_config=parallel_config,
         model_type=args.model_type,
         enable_cpu_offload=args.enable_cpu_offload,

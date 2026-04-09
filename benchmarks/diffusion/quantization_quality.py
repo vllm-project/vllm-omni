@@ -58,6 +58,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
+
 
 def compute_lpips_images(
     baseline_images: list,
@@ -137,6 +139,7 @@ def _build_omni_kwargs(args, quantization=None):
     )
     kwargs = {
         "model": args.model,
+        "explicit_overrides": getattr(args, "_explicit_overrides", None),
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
     }
@@ -452,7 +455,7 @@ def parse_args():
     parser.add_argument("--ring-degree", type=int, default=1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 if __name__ == "__main__":

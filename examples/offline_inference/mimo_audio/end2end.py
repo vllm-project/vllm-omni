@@ -23,6 +23,7 @@ from message_convert import (
 from vllm import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -182,6 +183,7 @@ def main(args):
 
     omni = Omni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=args.stage_configs_path,
         log_stats=args.enable_stats,
         log_file=("omni_pipeline.log" if args.enable_stats else None),
@@ -434,7 +436,7 @@ def parse_args():
         help="Path to a stage configs file.",
     )
 
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 if __name__ == "__main__":

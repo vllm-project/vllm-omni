@@ -430,8 +430,9 @@ async def build_async_omni_from_stage_config(
     async_omni: EngineClient | None = None
 
     try:
-        kwargs = vars(args).copy()
+        kwargs = {k: v for k, v in vars(args).items() if not k.startswith("_")}
         kwargs.pop("model", None)
+        kwargs["explicit_overrides"] = getattr(args, "_explicit_overrides", None)
         async_omni = AsyncOmni(model=args.model, **kwargs)
 
         # # Don't keep the dummy data in memory

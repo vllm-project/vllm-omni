@@ -44,6 +44,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -260,6 +261,7 @@ def main(args: argparse.Namespace) -> None:
 
     omni = Omni(
         model=args.model_path,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=config_path,
         log_stats=args.enable_stats,
         stage_init_timeout=args.stage_init_timeout,
@@ -503,7 +505,7 @@ def parse_args() -> argparse.Namespace:
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
 
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
+import argparse
 import os
+import sys
 import types
 from collections import Counter
 from dataclasses import fields, is_dataclass
@@ -21,6 +23,53 @@ logger = init_logger(__name__)
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
     "GlmImagePipeline": "glm_image",
 }
+
+
+def parse_args_with_explicit_overrides(
+    parser: argparse.ArgumentParser,
+    argv: list[str] | None = None,
+) -> argparse.Namespace:
+    """Parse CLI args and attach explicit override kwargs onto the namespace."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    option_to_dest: dict[str, str] = {}
+    for action in parser._actions:
+        for option_string in action.option_strings:
+            option_to_dest[option_string] = action.dest
+
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict):
+            for choice in choices.values():
+                if not isinstance(choice, argparse.ArgumentParser):
+                    continue
+                for sub_action in choice._actions:
+                    for option_string in sub_action.option_strings:
+                        option_to_dest[option_string] = sub_action.dest
+
+    explicit_dests: set[str] = set()
+    for arg in argv:
+        if arg == "--":
+            break
+        if not arg.startswith("-") or arg == "-":
+            continue
+        option = arg.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest is not None:
+            explicit_dests.add(dest)
+
+    args = parser.parse_args(argv)
+    explicit_overrides: dict[str, Any] = {}
+    for dest in explicit_dests:
+        if dest.startswith("_") or not hasattr(args, dest):
+            continue
+        value = getattr(args, dest)
+        if callable(value):
+            continue
+        explicit_overrides[dest] = value
+
+    setattr(args, "_explicit_overrides", explicit_overrides)
+    return args
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
@@ -320,28 +369,38 @@ def load_stage_configs_from_yaml(
     Args:
         config_path: Path to the YAML configuration file
         base_engine_args: Engine args supplied by the caller.
-        prefer_stage_engine_args: When True, YAML stage args override caller
-            engine args. When False, caller engine args override YAML defaults.
+        prefer_stage_engine_args: Controls precedence between YAML stage args
+            and explicit_overrides. Plain caller kwargs only fill keys missing
+            from the YAML and never override YAML defaults.
 
     Returns:
         List of stage configuration dictionaries from the file's stage_args
     """
     if base_engine_args is None:
         base_engine_args = {}
+    base_engine_args = dict(base_engine_args)
+    explicit_overrides = base_engine_args.pop("explicit_overrides", None)
     config_data = load_yaml_config(config_path)
     stage_args = config_data.stage_args
     global_async_chunk = config_data.get("async_chunk", False)
-    # Convert any nested dataclass objects to dicts before creating DictConfig
-    base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
-    base_engine_args = create_config(base_engine_args)
+    # Convert nested dataclass objects before creating DictConfigs.
+    base_engine_args = create_config(_convert_dataclasses_to_dict(base_engine_args))
+    explicit_engine_args = (
+        create_config(_convert_dataclasses_to_dict(explicit_overrides)) if explicit_overrides else None
+    )
     for stage_arg in stage_args:
         base_engine_args_tmp = base_engine_args.copy()
-        # Update base_engine_args with stage-specific engine_args if they exist
+        # Plain caller kwargs only provide fallback values; stage YAML always
+        # wins over them. Only explicit_overrides participate in conflict
+        # resolution against the YAML defaults below.
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
+            base_engine_args_tmp = create_config(merge_configs(base_engine_args_tmp, stage_arg.engine_args))
+        if explicit_engine_args is not None:
+            explicit_engine_args_tmp = explicit_engine_args.copy()
             if prefer_stage_engine_args:
-                merged_engine_args = merge_configs(base_engine_args_tmp, stage_arg.engine_args)
+                merged_engine_args = merge_configs(explicit_engine_args_tmp, base_engine_args_tmp)
             else:
-                merged_engine_args = merge_configs(stage_arg.engine_args, base_engine_args_tmp)
+                merged_engine_args = merge_configs(base_engine_args_tmp, explicit_engine_args_tmp)
             base_engine_args_tmp = create_config(merged_engine_args)
         stage_type = getattr(stage_arg, "stage_type", "llm")
         if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
@@ -462,6 +521,8 @@ def load_and_resolve_stage_configs(
     Returns:
         Tuple of (config_path, stage_configs)
     """
+    kwargs = kwargs or {}
+
     if stage_configs_path is None:
         config_path = resolve_model_config_path(model)
         stage_configs = load_stage_configs_from_model(model, base_engine_args=kwargs)

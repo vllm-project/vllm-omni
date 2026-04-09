@@ -19,6 +19,7 @@ from vllm import SamplingParams
 from vllm.multimodal.image import convert_image_mode
 
 from vllm_omni import Omni
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 
 DEFAULT_SYSTEM = "You are a helpful assistant."
 DEFAULT_QUESTION = "Please summarize the content of this image."
@@ -48,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def build_prompt(system: str, question: str) -> str:
@@ -73,6 +74,7 @@ def main() -> None:
 
     omni = Omni(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=args.stage_config,
         trust_remote_code=args.trust_remote_code,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,

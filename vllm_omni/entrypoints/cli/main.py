@@ -20,6 +20,7 @@ def main():
 
         import vllm_omni.entrypoints.cli.benchmark.main
         import vllm_omni.entrypoints.cli.serve
+        from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,
@@ -49,7 +50,7 @@ def main():
             for cmd in new_cmds:
                 cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
                 cmds[cmd.name] = cmd
-        args = parser.parse_args()
+        args = parse_args_with_explicit_overrides(parser)
         if args.subparser in cmds:
             cmds[args.subparser].validate(args)
 

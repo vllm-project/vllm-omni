@@ -17,6 +17,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni import AsyncOmni, Omni
 
 logger = logging.getLogger(__name__)
@@ -368,6 +369,7 @@ def main(args):
 
     omni = Omni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
@@ -389,6 +391,7 @@ async def main_streaming(args):
 
     omni = AsyncOmni(
         model=model_name,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
@@ -534,7 +537,7 @@ def parse_args():
         help="Number of prompts per batch (default: 1, sequential).",
     )
 
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 if __name__ == "__main__":

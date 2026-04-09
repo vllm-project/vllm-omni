@@ -6,6 +6,7 @@ import os
 
 from PIL import Image
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 
 """
@@ -46,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def load_image(image_path: str) -> Image.Image:
@@ -59,6 +60,7 @@ def load_image(image_path: str) -> Image.Image:
 def main(args: argparse.Namespace) -> None:
     omni = Omni(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         mode="image-to-text",
     )

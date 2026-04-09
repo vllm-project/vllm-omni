@@ -34,6 +34,7 @@ import PIL.Image
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -71,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ulysses-degree", type=int, default=1, help="Ulysses SP degree.")
     parser.add_argument("--ring-degree", type=int, default=1, help="Ring attention degree.")
     parser.add_argument("--cfg-parallel-size", type=int, default=1, choices=[1, 2], help="CFG parallel size.")
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 def build_prompts(args):
@@ -155,6 +156,7 @@ def main():
 
     omni = Omni(
         model=args.model,
+        explicit_overrides=getattr(args, "_explicit_overrides", None),
         vae_use_tiling=args.vae_use_tiling,
         flow_shift=args.flow_shift,
         enforce_eager=args.enforce_eager,

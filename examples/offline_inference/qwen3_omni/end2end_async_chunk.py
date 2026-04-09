@@ -41,6 +41,7 @@ from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.utils import parse_args_with_explicit_overrides
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 logger = logging.getLogger(__name__)
@@ -379,6 +380,7 @@ async def run_all(args):
     try:
         async_omni = AsyncOmni(
             model=args.model,
+            explicit_overrides=getattr(args, "_explicit_overrides", None),
             stage_configs_path=args.stage_configs_path,
             log_stats=args.log_stats,
             stage_init_timeout=args.stage_init_timeout,
@@ -584,7 +586,7 @@ def parse_args():
         default=16000,
         help="Sampling rate for audio loading.",
     )
-    return parser.parse_args()
+    return parse_args_with_explicit_overrides(parser)
 
 
 if __name__ == "__main__":
