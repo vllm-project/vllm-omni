@@ -123,8 +123,12 @@ class OmniRequestOutput:
             prompt: The prompt used
             metrics: Generation metrics
             latents: Optional latent tensors
+            trajectory_latents: Optional stacked trajectory latent tensors
+            trajectory_timesteps: Optional stacked trajectory timestep tensors
+            trajectory_log_probs: Optional stacked trajectory log-probability tensors
+            trajectory_decoded: Optional list of decoded trajectory images
             multimodal_output: Optional multimodal output dict
-            custom_output: Optional custom output dict (e.g. latent trajectories, prompt embeds)
+            custom_output: Optional custom output dict (e.g. prompt embeds)
             stage_durations: Optional stage durations (execution time of each stage) dict
             peak_memory_mb: Peak memory usage in MB
 
