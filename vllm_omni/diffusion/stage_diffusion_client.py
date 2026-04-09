@@ -142,8 +142,10 @@ class StageDiffusionClient:
         recreate an equivalent generator via ``diffusion_model_runner``.
         """
         if is_dataclass(sampling_params) and not isinstance(sampling_params, type):
+            from vllm_omni.inputs.data import UNSET
+
             result = {
-                f.name: getattr(sampling_params, f.name)
+                f.name: (None if (v := getattr(sampling_params, f.name)) is UNSET else v)
                 for f in fields(sampling_params)
                 if f.name not in StageDiffusionClient._NON_SERIALIZABLE_FIELDS
             }

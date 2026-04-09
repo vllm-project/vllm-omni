@@ -3,7 +3,6 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -59,7 +58,7 @@ def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
             result = await proc._process_batch_request(
                 request_id="req-parent",
                 prompts=["hello", "world"],
-                sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+                sampling_params_dict=OmniDiffusionSamplingParams().to_dict(),
                 kv_sender_info={0: {"host": "10.0.0.2", "zmq_port": 50151}},
             )
         finally:

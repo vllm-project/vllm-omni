@@ -990,6 +990,7 @@ class LTX2Pipeline(VllmDiffusionPipeline, CFGParallelMixin, ProgressBarMixin):
             latents=audio_latents,
         )
 
+        sigmas = req.sampling_params.sigmas
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
         mu = calculate_shift(
             video_sequence_length,
@@ -1154,7 +1155,7 @@ class LTX2Pipeline(VllmDiffusionPipeline, CFGParallelMixin, ProgressBarMixin):
         return loader.load_weights(weights)
 
 
-class LTX2TwoStagesPipeline(nn.Module):
+class LTX2TwoStagesPipeline(torch.nn.Module):
     """LTX2TwoStagesPipeline is for two stages image to video generation"""
 
     def __init__(

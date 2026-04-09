@@ -151,11 +151,15 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     #    failures when None is explicitly passed for non-Optional typed fields,
     #    e.g. CompilationConfig.cudagraph_capture_sizes: list[int] = None)
     if is_dataclass(obj) and not isinstance(obj, type):
+        from vllm_omni.inputs.data import UNSET
+
         result = {}
         for f in fields(obj):
             if not f.init:
                 continue
             value = getattr(obj, f.name)
+            if value is UNSET:
+                continue
             if value is None and f.default is None:
                 continue
             result[f.name] = _convert_dataclasses_to_dict(value)

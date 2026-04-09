@@ -66,7 +66,9 @@ def to_device(data, device):
         return data
 
 
-class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, VllmDiffusionPipeline, GenerationMixin, DiffusionPipelineProfilerMixin):
+class HunyuanImage3Pipeline(
+    HunyuanImage3PreTrainedModel, VllmDiffusionPipeline, GenerationMixin, DiffusionPipelineProfilerMixin
+):
     _PROFILER_TARGETS = [
         "model.forward",
         "model.layers[0].forward",

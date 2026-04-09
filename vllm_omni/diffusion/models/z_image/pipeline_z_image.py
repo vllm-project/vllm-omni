@@ -23,7 +23,6 @@ from typing import Any
 
 import PIL.Image
 import torch
-import torch.nn as nn
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging

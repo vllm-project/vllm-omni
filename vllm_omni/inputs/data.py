@@ -1,6 +1,6 @@
 import copy
 import pprint
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from typing import Any, TypeAlias, TypedDict
 
 from vllm.inputs import PromptType
@@ -17,6 +17,32 @@ except ImportError:
 
 import torch
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensInput, TokensPrompt
+
+
+class _Unset:
+    """Sentinel for distinguishing 'user did not set this' from explicit None/0/False."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "UNSET"
+
+    def __bool__(self):
+        return False
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+UNSET = _Unset()
 
 
 class OmniTextPrompt(TextPrompt):
@@ -181,7 +207,9 @@ class OmniDiffusionSamplingParams:
     """
 
     # Additional text-related parameters
-    max_sequence_length: int | None = None
+    # UNSET sentinel: distinguishes "caller didn't pass this" from an explicit None/0.
+    # Always resolved to a real value by _finalize_sampling_params before pipeline forward().
+    max_sequence_length: int | None = UNSET  # type: ignore[assignment]
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
     output_type: str | None = None
@@ -234,9 +262,9 @@ class OmniDiffusionSamplingParams:
     step_index: int | None = None
     boundary_ratio: float | None = None
 
-    # Scheduler parameters – ``None`` means "not explicitly set by the caller";
+    # Scheduler parameters – UNSET means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.
-    num_inference_steps: int | None = None
+    num_inference_steps: int | None = UNSET  # type: ignore[assignment]
     guidance_scale: float = 0.0
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
@@ -247,7 +275,7 @@ class OmniDiffusionSamplingParams:
     eta: float = 0.0
     sigmas: list[float] | None = None
 
-    true_cfg_scale: float | None = None  # qwen-image specific now
+    true_cfg_scale: float | None = UNSET  # type: ignore[assignment]
 
     n_tokens: int | None = None
     extra_step_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -327,20 +355,31 @@ class OmniDiffusionSamplingParams:
         return float(fps)
 
     def __str__(self):
-        return pprint.pformat(asdict(self), indent=2, width=120)
+        d = {f.name: getattr(self, f.name) for f in fields(self)}
+        return pprint.pformat(d, indent=2, width=120)
 
     def clone(self) -> "OmniDiffusionSamplingParams":
         return copy.deepcopy(self)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict, replacing any UNSET sentinels with None."""
+        return {f.name: (None if (v := getattr(self, f.name)) is UNSET else v) for f in fields(self)}
+
+    def _resolve_unset(self):
+        """Replace any remaining UNSET sentinel values with None."""
+        for f in fields(self):
+            if getattr(self, f.name) is UNSET:
+                setattr(self, f.name, None)
+
     def merge_with_def_params(self, def_params: "DiffusionParamOverrides"):
-        """Merges an instance of this class with a pipeline's defaults."""
+        """Merges an instance of this class with a pipeline's defaults.
+
+        Only fills in fields that the caller left at the UNSET sentinel
+        (i.e. never explicitly provided). Explicitly-set falsy values
+        such as 0 or None are preserved.
+        """
         for attr_name, attr_val in def_params.validated_overrides.items():
-            # For now, check if the field is falsy and override it.
-            # TODO: We should handle this better, because this does
-            # not distinguish between the user passing a Falsy value
-            # vs initializing with the default, but it matches the
-            # current pipeline behavior.
-            if not getattr(self, attr_name):
+            if getattr(self, attr_name) is UNSET:
                 setattr(self, attr_name, attr_val)
 
 

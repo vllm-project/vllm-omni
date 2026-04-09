@@ -234,6 +234,9 @@ class DiffusionModelRunner:
         if isinstance(self.pipeline, VllmDiffusionPipeline):
             logger.debug("Merging default sampling params into user request")
             sampling_params.merge_with_def_params(self.pipeline.sampling_param_defaults)
+
+        # Guarantee no UNSET sentinels leak past this point.
+        sampling_params._resolve_unset()
         return sampling_params
 
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
