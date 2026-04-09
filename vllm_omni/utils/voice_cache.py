@@ -13,6 +13,7 @@ Usage::
         cache.put(key, {"artifact": result})
 """
 
+import asyncio
 import os
 import tempfile
 import threading
@@ -116,6 +117,14 @@ class VoiceCacheManager:
     def __init__(self, cache_dir: str | Path):
         self._cache_dir = Path(cache_dir)
         self._speaker_prompt_cache: dict[str, dict[str, Any]] = {}
+        self._speaker_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_speaker_lock(self, speaker_key: str) -> asyncio.Lock:
+        lock = self._speaker_locks.get(speaker_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._speaker_locks[speaker_key] = lock
+        return lock
 
     @staticmethod
     def cache_file_path_for_speaker(speaker_info: dict[str, Any]) -> Path | None:
@@ -237,64 +246,65 @@ class VoiceCacheManager:
         force: bool = False,
     ) -> dict[str, Any]:
         speaker_key = speaker_name.lower()
-        current_status = speaker_info.get("cache_status")
+        async with self._get_speaker_lock(speaker_key):
+            current_status = speaker_info.get("cache_status")
 
-        if current_status == "processing" and not force:
-            started_at = speaker_info.get("cache_generated_at")
+            if current_status == "processing" and not force:
+                started_at = speaker_info.get("cache_generated_at")
+                try:
+                    started_at = float(started_at) if started_at is not None else None
+                except (TypeError, ValueError):
+                    started_at = None
+                    logger.warning("Invalid cache_generated_at for speaker %s, treating as stale", speaker_name)
+                if started_at is not None and (time.time() - started_at) < _PROCESSING_TIMEOUT_S:
+                    return {
+                        "cache_status": "processing",
+                        "message": "Cache generation in progress",
+                    }
+                logger.warning("Processing state for speaker %s timed out or stale, allowing rebuild", speaker_name)
+
+            if current_status == "ready" and not force:
+                cached = self.load_cached_speaker_prompt(speaker_name, speaker_info)
+                if cached is not None:
+                    return {
+                        "cache_status": "ready",
+                        "message": "Cache already exists and is valid",
+                    }
+                logger.warning("Cache for speaker %s is invalid, rebuilding", speaker_name)
+
+            previous_status = current_status or "pending"
+            previous_cache_generated_at = speaker_info.get("cache_generated_at")
+            self.invalidate_speaker_prompt_cache(speaker_key)
+            speaker_info["cache_status"] = "processing"
+            speaker_info["cache_generated_at"] = time.time()
+
+            save_attempted = False
             try:
-                started_at = float(started_at) if started_at is not None else None
-            except (TypeError, ValueError):
-                started_at = None
-                logger.warning("Invalid cache_generated_at for speaker %s, treating as stale", speaker_name)
-            if started_at is not None and (time.time() - started_at) < _PROCESSING_TIMEOUT_S:
-                return {
-                    "cache_status": "processing",
-                    "message": "Cache generation in progress",
-                }
-            logger.warning("Processing state for speaker %s timed out or stale, allowing rebuild", speaker_name)
+                file_path_str = speaker_info.get("file_path")
+                if not file_path_str:
+                    raise ValueError(
+                        f"Metadata for voice '{speaker_name}' has no file_path. "
+                        f"Delete this voice via DELETE /v1/audio/voices/{speaker_name} and re-upload."
+                    )
+                audio_file_path = Path(file_path_str)
+                if not audio_file_path.is_file():
+                    raise ValueError(
+                        f"Audio file for voice '{speaker_name}' is missing from disk. "
+                        f"Delete this voice via DELETE /v1/audio/voices/{speaker_name} "
+                        "then re-upload via POST /v1/audio/voices before generating cache."
+                    )
 
-        if current_status == "ready" and not force:
-            cached = self.load_cached_speaker_prompt(speaker_name, speaker_info)
-            if cached is not None:
-                return {
-                    "cache_status": "ready",
-                    "message": "Cache already exists and is valid",
-                }
-            logger.warning("Cache for speaker %s is invalid, rebuilding", speaker_name)
+                payload = await build_speaker_prompt(audio_file_path, speaker_info)
 
-        previous_status = current_status or "pending"
-        previous_cache_generated_at = speaker_info.get("cache_generated_at")
-        self.invalidate_speaker_prompt_cache(speaker_key)
-        speaker_info["cache_status"] = "processing"
-        speaker_info["cache_generated_at"] = time.time()
+                save_attempted = True
+                if not self.save_speaker_cache(speaker_key, speaker_info, audio_file_path, payload):
+                    raise ValueError(f"Failed to save voice cache for '{speaker_name}'")
+            except Exception:
+                if save_attempted:
+                    speaker_info["cache_status"] = "failed"
+                else:
+                    speaker_info["cache_status"] = previous_status
+                    speaker_info["cache_generated_at"] = previous_cache_generated_at
+                raise
 
-        save_attempted = False
-        try:
-            file_path_str = speaker_info.get("file_path")
-            if not file_path_str:
-                raise ValueError(
-                    f"Metadata for voice '{speaker_name}' has no file_path. "
-                    f"Delete this voice via DELETE /v1/audio/voices/{speaker_name} and re-upload."
-                )
-            audio_file_path = Path(file_path_str)
-            if not audio_file_path.is_file():
-                raise ValueError(
-                    f"Audio file for voice '{speaker_name}' is missing from disk. "
-                    f"Delete this voice via DELETE /v1/audio/voices/{speaker_name} "
-                    "then re-upload via POST /v1/audio/voices before generating cache."
-                )
-
-            payload = await build_speaker_prompt(audio_file_path, speaker_info)
-
-            save_attempted = True
-            if not self.save_speaker_cache(speaker_key, speaker_info, audio_file_path, payload):
-                raise ValueError(f"Failed to save voice cache for '{speaker_name}'")
-        except Exception:
-            if save_attempted:
-                speaker_info["cache_status"] = "failed"
-            else:
-                speaker_info["cache_status"] = previous_status
-                speaker_info["cache_generated_at"] = previous_cache_generated_at
-            raise
-
-        return {"cache_status": "ready"}
+            return {"cache_status": "ready"}

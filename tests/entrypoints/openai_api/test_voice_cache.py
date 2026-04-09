@@ -13,8 +13,8 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
-    VoiceCacheUnsupportedError,
-    VoiceNotFoundError,
+    SpeakerCacheUnsupportedError,
+    SpeakerNotFoundError,
 )
 from vllm_omni.utils.voice_cache import VoiceCacheManager
 
@@ -115,33 +115,33 @@ class TestCreateVoiceCache:
 
     @pytest.mark.asyncio
     async def test_create_cache_not_found(self, server):
-        """Voice entry does not exist -> VoiceNotFoundError."""
+        """Voice entry does not exist -> SpeakerNotFoundError."""
         server.uploaded_speakers = {}
-        with pytest.raises(VoiceNotFoundError, match="not found"):
+        with pytest.raises(SpeakerNotFoundError, match="not found"):
             await server.create_voice_cache("nonexistent")
 
     @pytest.mark.asyncio
     async def test_create_cache_direct_rejected(self, server):
-        """Direct embedding voice -> VoiceCacheUnsupportedError."""
+        """Direct embedding voice -> SpeakerCacheUnsupportedError."""
         server.uploaded_speakers = {"emb_voice": _direct_speaker_info()}
-        with pytest.raises(VoiceCacheUnsupportedError, match="pre-computed embedding"):
+        with pytest.raises(SpeakerCacheUnsupportedError, match="pre-computed embedding"):
             await server.create_voice_cache("emb_voice")
 
     @pytest.mark.asyncio
     async def test_create_cache_non_qwen3_rejected(self, mocker: MockerFixture):
-        """Non Qwen3-TTS model -> VoiceCacheUnsupportedError."""
+        """Non Qwen3-TTS model -> SpeakerCacheUnsupportedError."""
         server = _make_server(mocker, model_stage="audio_generation")
         server.uploaded_speakers = {"v": _audio_speaker_info()}
-        with pytest.raises(VoiceCacheUnsupportedError, match="Qwen3-TTS"):
+        with pytest.raises(SpeakerCacheUnsupportedError, match="Qwen3-TTS"):
             await server.create_voice_cache("v")
 
     @pytest.mark.asyncio
     async def test_create_cache_no_collective_rpc(self, mocker: MockerFixture):
-        """Engine without collective_rpc -> VoiceCacheUnsupportedError."""
+        """Engine without collective_rpc -> SpeakerCacheUnsupportedError."""
         server = _make_server(mocker)
         del server.engine_client.collective_rpc
         server.uploaded_speakers = {"v": _audio_speaker_info()}
-        with pytest.raises(VoiceCacheUnsupportedError, match="multi-stage"):
+        with pytest.raises(SpeakerCacheUnsupportedError, match="multi-stage"):
             await server.create_voice_cache("v")
 
     @pytest.mark.asyncio
@@ -761,11 +761,11 @@ class TestVoiceCacheHandlerContract:
             try:
                 result = await server.create_voice_cache(name, force=force)
                 return result
-            except VoiceNotFoundError as e:
+            except SpeakerNotFoundError as e:
                 from fastapi.responses import JSONResponse
 
                 return JSONResponse(content={"success": False, "error": str(e)}, status_code=404)
-            except VoiceCacheUnsupportedError as e:
+            except SpeakerCacheUnsupportedError as e:
                 from fastapi.responses import JSONResponse
 
                 return JSONResponse(content={"success": False, "error": str(e)}, status_code=400)

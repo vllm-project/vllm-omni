@@ -110,8 +110,8 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
-    VoiceCacheUnsupportedError,
-    VoiceNotFoundError,
+    SpeakerCacheUnsupportedError,
+    SpeakerNotFoundError,
 )
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
@@ -1171,12 +1171,12 @@ async def create_voice_cache(
     try:
         result = await handler.create_voice_cache(name, force=force)
         return JSONResponse(content=result)
-    except VoiceNotFoundError as e:
+    except SpeakerNotFoundError as e:
         return JSONResponse(
             content={"success": False, "error": str(e)},
             status_code=HTTPStatus.NOT_FOUND.value,
         )
-    except VoiceCacheUnsupportedError as e:
+    except SpeakerCacheUnsupportedError as e:
         return JSONResponse(
             content={"success": False, "error": str(e)},
             status_code=HTTPStatus.BAD_REQUEST.value,

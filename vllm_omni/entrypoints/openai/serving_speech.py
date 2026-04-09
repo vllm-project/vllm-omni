@@ -54,11 +54,6 @@ class SpeakerCacheUnsupportedError(ValueError):
     """Raised when speaker cache generation is not supported (wrong model/source)."""
 
 
-# Keep voice naming at the HTTP API boundary for compatibility.
-VoiceNotFoundError = SpeakerNotFoundError
-VoiceCacheUnsupportedError = SpeakerCacheUnsupportedError
-
-
 # TTS Configuration
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
