@@ -4,6 +4,7 @@ This module keeps fault injection callable from tests directly:
 - abnormal input (raw HTTP malformed requests)
 - GPU OOM (CUDA sidecar memory hog)
 - process kill by pattern and signal
+- post-ready hooks via ``fault_injector`` / ``omni_server_after_fault`` fixtures
 """
 
 from __future__ import annotations
@@ -16,8 +17,11 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+import pytest
 
 FaultVariant = str
 
@@ -46,7 +50,7 @@ class RecoveryResult:
 class OomHandle:
     """Handle for a started CUDA memory hog subprocess."""
 
-    proc: subprocess.Popen
+    proc: subprocess.Popen | None
     device: int
     target_mem_ratio: float
     start_ts: float
@@ -235,8 +239,18 @@ def start_gpu_oom_hog(
     """
     if os.name == "nt":
         raise RuntimeError("CUDA OOM sidecar is intended for Linux CI/runtime.")
-    if not (0.1 <= target_mem_ratio < 1.0):
-        raise ValueError("target_mem_ratio should be in [0.1, 1.0).")
+    if not (0.0 <= target_mem_ratio < 1.0):
+        raise ValueError("target_mem_ratio should be in [0.0, 1.0).")
+
+    # Explicit opt-out for debugging: keep API shape stable while disabling injection.
+    if target_mem_ratio == 0.0:
+        print(f"[oom-sidecar][gpu={device}] DISABLED: target_mem_ratio=0.0 (no OOM injection)", flush=True)
+        return OomHandle(
+            proc=None,
+            device=device,
+            target_mem_ratio=target_mem_ratio,
+            start_ts=time.time(),
+        )
 
     cmd = _build_sidecar_cmd(device, target_mem_ratio, hold_seconds, strict)
     proc = subprocess.Popen(
@@ -279,6 +293,8 @@ def start_gpu_oom_hog(
 def stop_gpu_oom_hog(handle: OomHandle, *, timeout_sec: int = 5) -> None:
     """Stop and cleanup CUDA OOM sidecar."""
     proc = handle.proc
+    if proc is None:
+        return
     if proc.poll() is not None:
         return
     proc.terminate()
@@ -369,3 +385,54 @@ def inject_process_kill(
     for pid in pids:
         os.kill(pid, sig)
     return pids
+
+
+FaultInjector = Callable[[Any], None]
+"""Callable invoked with the live ``OmniServer`` after it is ready (see ``omni_server_after_fault``)."""
+
+
+def make_process_kill_fault_injector(
+    *,
+    grep_patterns: str | Sequence[str],
+    signal_name: str = "SIGKILL",
+    limit: int = 1,
+) -> FaultInjector:
+    """Build a post-ready injector that kills processes matched by ``pgrep -f``.
+
+    Tries each pattern in order until at least one PID is killed. If none match,
+    the returned callable issues ``pytest.skip`` (same behavior as the previous
+    inline reliability test).
+
+    Args:
+        grep_patterns: One pattern or an ordered list of patterns.
+        signal_name: Passed to :func:`inject_process_kill` (e.g. ``SIGKILL``).
+        limit: Maximum PIDs to kill per pattern (default ``1``).
+    """
+    patterns: tuple[str, ...] = (grep_patterns,) if isinstance(grep_patterns, str) else tuple(grep_patterns)
+
+    def _inject(_server: Any) -> None:
+        for pattern in patterns:
+            pids = inject_process_kill(
+                grep_pattern=pattern,
+                signal_name=signal_name,
+                limit=limit,
+                allow_zero_match=True,
+            )
+            if pids:
+                return
+        pytest.skip("no matching runtime process found for kill injection")
+
+    return _inject
+
+
+@pytest.fixture
+def fault_injector(request: pytest.FixtureRequest) -> FaultInjector:
+    """Indirect only: ``request.param`` must be a ``FaultInjector`` callable."""
+    return request.param
+
+
+@pytest.fixture
+def omni_server_after_fault(omni_server: Any, fault_injector: FaultInjector):
+    """After ``omni_server`` is up, run ``fault_injector(omni_server)``, then yield the server."""
+    fault_injector(omni_server)
+    yield omni_server

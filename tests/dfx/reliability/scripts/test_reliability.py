@@ -25,7 +25,7 @@ from tests.conftest import (
 from tests.dfx.conftest import create_unique_server_params, load_configs
 from tests.dfx.reliability.conftest import (
     inject_gpu_oom,
-    inject_process_kill,
+    make_process_kill_fault_injector,
     stop_gpu_oom_hogs,
 )
 from tests.utils import hardware_test
@@ -105,23 +105,15 @@ def _assert_fault_exception(exc: Exception) -> None:
     assert any(key in text for key in FAULT_ERROR_KEYWORDS), f"unexpected error under fault injection: {exc}"
 
 
-def _kill_runtime_process_for_fault_test() -> tuple[list[int], str]:
-    """Kill one runtime process to trigger engine-fatal style failure."""
-    patterns = (
-        "VLLM::EngineCore",
-        "vllm_omni.engine.orchestrator",
-        "EngineCore",
-    )
-    for pattern in patterns:
-        pids = inject_process_kill(
-            grep_pattern=pattern,
-            signal_name="SIGKILL",
-            limit=1,
-            allow_zero_match=True,
-        )
-        if pids:
-            return pids, pattern
-    return [], ""
+# Qwen3-Omni staged stack uses StageEngineCoreProc_* / Worker in argv (see ps -f on serve).
+# Older or non-staged builds may still show EngineCore / orchestrator in cmdline.
+_RUNTIME_PROCESS_KILL_PATTERNS = (
+    "VLLM::StageEngineCoreProc",
+    "VLLM::Worker",
+    "VLLM::EngineCore",
+    "vllm_omni.engine.orchestrator",
+    "EngineCore",
+)
 
 
 def _supports_video_generation(model_name: str) -> bool:
@@ -186,7 +178,9 @@ CONFIGS = _load_reliability_configs()
 _SERVER_ARGS_BY_TEST_NAME = _extract_server_args_by_test_name(CONFIGS)
 _UNIQUE_PARAMS = create_unique_server_params(CONFIGS, E2E_STAGE_CONFIGS_DIR) if CONFIGS else []
 TEST_PARAMS = [
-    OmniServerParams(model=model, stage_config_path=stage_config_path, server_args=_SERVER_ARGS_BY_TEST_NAME.get(test_name))
+    OmniServerParams(
+        model=model, stage_config_path=stage_config_path, server_args=_SERVER_ARGS_BY_TEST_NAME.get(test_name)
+    )
     for test_name, model, stage_config_path in _UNIQUE_PARAMS
 ]
 
@@ -226,9 +220,7 @@ def validate_scenarios_json_loads() -> None:
 @pytest.mark.parametrize("omni_server", OMNI_CHAT_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, openai_client, oom_cfg) -> None:
     """Large chat payload under OOM injection should fail."""
-    device_spec = _resolve_oom_device_spec(
-        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
-    )
+    device_spec = _resolve_oom_device_spec(OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server))
     handle = inject_gpu_oom(
         device=device_spec,
         target_mem_ratio=oom_cfg["target_mem_ratio"],
@@ -288,9 +280,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, opena
 @pytest.mark.parametrize("omni_server", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, openai_client, oom_cfg) -> None:
     """Video-style large request under OOM injection (closer to RFC #2327 trigger path)."""
-    device_spec = _resolve_oom_device_spec(
-        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
-    )
+    device_spec = _resolve_oom_device_spec(OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server))
     handle = inject_gpu_oom(
         device=device_spec,
         target_mem_ratio=oom_cfg["target_mem_ratio"],
@@ -349,9 +339,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, open
 @pytest.mark.parametrize("omni_server", OMNI_CHAT_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, openai_client, oom_cfg) -> None:
     """Concurrent request pressure under OOM should produce request failures."""
-    device_spec = _resolve_oom_device_spec(
-        OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server)
-    )
+    device_spec = _resolve_oom_device_spec(OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server))
     handle = inject_gpu_oom(
         device=device_spec,
         target_mem_ratio=oom_cfg["target_mem_ratio"],
@@ -387,18 +375,29 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, open
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.skipif(not OMNI_CHAT_PARAMS, reason="no omni-chat server params available")
+@pytest.mark.parametrize(
+    "fault_injector",
+    [
+        pytest.param(
+            make_process_kill_fault_injector(
+                grep_patterns="VLLM::Worker",
+                signal_name="SIGKILL",
+                limit=1,
+            ),
+            id="runtime_process_chain",
+        ),
+    ],
+    indirect=True,
+)
 @pytest.mark.parametrize("omni_server", OMNI_CHAT_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_request_failure(omni_server, openai_client) -> None:
+def test_reliability_fault_process_kill_request_failure(omni_server_after_fault, openai_client) -> None:
     """Engine-fatal style injection: kill one runtime process and verify request failure."""
-    pids, pattern = _kill_runtime_process_for_fault_test()
-    if not pids:
-        pytest.skip("no matching runtime process found for kill injection")
     messages = dummy_messages_from_mix_data(
         system_prompt=_get_system_prompt(),
         content_text="What is the capital of China? Answer in 20 words.",
     )
     request_config = {
-        "model": omni_server.model,
+        "model": omni_server_after_fault.model,
         "messages": messages,
         "stream": False,
         "modalities": ["text"],
@@ -409,4 +408,4 @@ def test_reliability_fault_process_kill_request_failure(omni_server, openai_clie
     except Exception as exc:
         _assert_fault_exception(exc)
     else:
-        pytest.fail(f"expected request failure after process-kill injection (pattern={pattern}, pids={pids})")
+        pytest.fail("expected request failure after process-kill injection")
