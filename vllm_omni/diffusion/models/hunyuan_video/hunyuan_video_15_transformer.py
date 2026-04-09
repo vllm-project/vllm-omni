@@ -752,10 +752,9 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         encoder_attention_mask = torch.stack(new_encoder_attention_mask)
 
         # Create explicit attn_mask for image tokens when SP auto_pad is active.
-        # Cache the mask since it is identical across denoising steps.
         ctx = get_forward_context()
-        hidden_states_mask = getattr(self, "_cached_sp_mask", None)
-        if hidden_states_mask is None and ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        hidden_states_mask = None
+        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
             padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
             hidden_states_mask = torch.ones(
                 batch_size,
@@ -764,7 +763,6 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 device=hidden_states.device,
             )
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-            self._cached_sp_mask = hidden_states_mask
 
         for block in self.transformer_blocks:
             hidden_states, encoder_hidden_states = block(
