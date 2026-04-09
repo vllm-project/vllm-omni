@@ -24,9 +24,25 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 from vllm_omni.transformers_utils import configs as _configs  # noqa: F401, E402
 
 from .config import OmniModelConfig
-from .entrypoints import AsyncOmni, Omni
 
 from .version import __version__, __version_tuple__  # isort:skip
+
+
+def __getattr__(name: str):
+    # Lazy import for AsyncOmni and Omni to avoid pulling in heavy
+    # dependencies (vllm model_loader → fused_moe → pynvml) at package
+    # import time.  This prevents crashes in lightweight subprocesses
+    # (e.g. model-architecture inspection) that lack a CUDA context.
+    # See: https://github.com/vllm-project/vllm-omni/issues/1793
+    if name == "AsyncOmni":
+        from .entrypoints.async_omni import AsyncOmni
+
+        return AsyncOmni
+    if name == "Omni":
+        from .entrypoints.omni import Omni
+
+        return Omni
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

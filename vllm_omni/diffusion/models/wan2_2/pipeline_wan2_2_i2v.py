@@ -217,7 +217,7 @@ class Wan22I2VPipeline(
 
         # VAE
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
 
         # Transformers (weights loaded via load_weights)

@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm_musa.platform import MUSAPlatformBase
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.attention.backends.utils.fa import is_mate_available
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
@@ -54,9 +55,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
     ) -> str:
         """Get the diffusion attention backend class path for MUSA platform.
 
-        MUSA currently supports SDPA (Scaled Dot Product Attention) as the
-        primary backend. Flash Attention support may be added in future
-        when MUSA-specific implementations are available.
+        MUSA supports FLASH_ATTN via the mate package, and SDPA as fallback.
 
         Args:
             selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
@@ -66,13 +65,24 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         Returns:
             Fully qualified class path of the selected backend.
         """
+
+        flash_attn_available = is_mate_available()
+
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper == "FLASH_ATTN" and not flash_attn_available:
+                logger.warning("Flash Attention (mate package) not available. Falling back to TORCH_SDPA backend.")
+                logger.info("Defaulting to diffusion attention backend SDPA")
+                return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.info("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
-        # Default to SDPA for MUSA as it's the most compatible backend
+        # Default to FLASH_ATTN if mate is available, otherwise SDPA
+        if flash_attn_available:
+            logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
+            return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
+
         logger.info("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
