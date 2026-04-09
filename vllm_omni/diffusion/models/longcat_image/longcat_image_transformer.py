@@ -40,14 +40,26 @@ logger = init_logger(__name__)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, dim_out: int | None = None, mult: int = 4, bias: bool = True, quant_config: "QuantizationConfig | None" = None, prefix: str = ""):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int | None = None,
+        mult: int = 4,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
 
-        self.w_in = ColumnParallelLinear(dim, inner_dim, bias=bias, return_bias=False, quant_config=quant_config, prefix=f"{prefix}.w_in")
+        self.w_in = ColumnParallelLinear(
+            dim, inner_dim, bias=bias, return_bias=False, quant_config=quant_config, prefix=f"{prefix}.w_in"
+        )
         self.act = get_act_fn("gelu_pytorch_tanh")
-        self.w_out = RowParallelLinear(inner_dim, dim_out, bias=bias, return_bias=False, quant_config=quant_config, prefix=f"{prefix}.w_out")
+        self.w_out = RowParallelLinear(
+            inner_dim, dim_out, bias=bias, return_bias=False, quant_config=quant_config, prefix=f"{prefix}.w_out"
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w_in(hidden_states)
@@ -101,7 +113,9 @@ class LongCatImageAttention(nn.Module):
         )
 
         if not self.pre_only:
-            self.to_out = RowParallelLinear(self.inner_dim, self.out_dim, bias=out_bias, quant_config=quant_config, prefix="to_out")
+            self.to_out = RowParallelLinear(
+                self.inner_dim, self.out_dim, bias=out_bias, quant_config=quant_config, prefix="to_out"
+            )
 
         if self.added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
@@ -116,7 +130,9 @@ class LongCatImageAttention(nn.Module):
                 prefix="add_kv_proj",
             )
 
-            self.to_add_out = RowParallelLinear(self.inner_dim, query_dim, bias=out_bias, quant_config=quant_config, prefix="to_add_out")
+            self.to_add_out = RowParallelLinear(
+                self.inner_dim, query_dim, bias=out_bias, quant_config=quant_config, prefix="to_add_out"
+            )
 
         self.attn = Attention(
             num_heads=heads,

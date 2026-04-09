@@ -236,7 +236,9 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = LongCatImageTransformer2DModel(od_config=od_config, quant_config=od_config.quantization_config)
+        self.transformer = LongCatImageTransformer2DModel(
+            od_config=od_config, quant_config=od_config.quantization_config
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
