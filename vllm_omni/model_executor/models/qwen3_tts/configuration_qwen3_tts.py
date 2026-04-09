@@ -482,8 +482,6 @@ class Qwen3TTSConfig(PretrainedConfig):
         tts_eos_token_id=151673,
         **kwargs,
     ):
-        super().__init__(**kwargs)
-
         if talker_config is None:
             talker_config = {}
             logger.info("talker_config is None. Initializing talker model with default values")
@@ -493,6 +491,8 @@ class Qwen3TTSConfig(PretrainedConfig):
 
         self.talker_config = Qwen3TTSTalkerConfig(**talker_config)
         self.speaker_encoder_config = Qwen3TTSSpeakerEncoderConfig(**speaker_encoder_config)
+
+        super().__init__(**kwargs)
 
         self.tokenizer_type = tokenizer_type
         self.tts_model_size = tts_model_size

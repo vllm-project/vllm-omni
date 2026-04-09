@@ -37,6 +37,9 @@ PROMPTS = [
     "Could you please turn down the music a little bit, I'm trying to concentrate on my work.",
     "It was a dark and stormy night when the old lighthouse keeper heard a knock at the door.",
 ]
+REF_AUDIO = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+INSTRUCT = "Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
 
 
 @dataclass
@@ -93,22 +96,39 @@ def pcm_bytes_to_duration(num_bytes: int, sample_rate: int = 24000, sample_width
     return num_samples / sample_rate
 
 
+def create_payload(
+    prompt: str, task_type: str = "CustomVoice", voice: str = "vivian", language: str = "English"
+) -> dict:
+    payload = {
+        "input": prompt,
+        "language": language,
+        "stream": True,
+        "response_format": "pcm",
+        "task_type": task_type,
+    }
+
+    if task_type == "Base":
+        payload["ref_audio"] = REF_AUDIO
+        payload["ref_text"] = REF_TEXT
+    elif task_type == "CustomVoice":
+        payload["voice"] = voice
+    elif task_type == "VoiceDesign":
+        payload["instructions"] = INSTRUCT
+
+    return payload
+
+
 async def send_tts_request(
     session: aiohttp.ClientSession,
     api_url: str,
     prompt: str,
+    task_type: str = "CustomVoice",
     voice: str = "vivian",
     language: str = "English",
     pbar: tqdm | None = None,
 ) -> RequestResult:
     """Send a streaming TTS request and measure latency metrics."""
-    payload = {
-        "input": prompt,
-        "voice": voice,
-        "language": language,
-        "stream": True,
-        "response_format": "pcm",
-    }
+    payload = create_payload(prompt, task_type, voice, language)
 
     result = RequestResult(prompt=prompt)
     st = time.perf_counter()
@@ -153,6 +173,7 @@ async def run_benchmark(
     num_prompts: int,
     max_concurrency: int,
     num_warmups: int = 3,
+    task_type: str = "CustomVoice",
     voice: str = "vivian",
     language: str = "English",
 ) -> BenchmarkResult:
@@ -175,7 +196,7 @@ async def run_benchmark(
         warmup_tasks = []
         for i in range(num_warmups):
             prompt = PROMPTS[i % len(PROMPTS)]
-            warmup_tasks.append(send_tts_request(session, api_url, prompt, voice, language))
+            warmup_tasks.append(send_tts_request(session, api_url, prompt, task_type, voice, language))
         await asyncio.gather(*warmup_tasks)
         print("  Warmup done.")
 
@@ -189,7 +210,7 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, voice, language, pbar)
+            return await send_tts_request(session, api_url, prompt, task_type, voice, language, pbar)
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -306,6 +327,7 @@ async def main(args):
             num_prompts=args.num_prompts,
             max_concurrency=concurrency,
             num_warmups=args.num_warmups,
+            task_type=args.task_type,
             voice=args.voice,
             language=args.language,
         )
@@ -334,6 +356,7 @@ def parse_args():
         "--max-concurrency", type=int, nargs="+", default=[1, 4, 10], help="Concurrency levels to test"
     )
     parser.add_argument("--num-warmups", type=int, default=3)
+    parser.add_argument("--task-type", type=str, default="CustomVoice", choices=["CustomVoice", "VoiceDesign", "Base"])
     parser.add_argument("--voice", type=str, default="vivian")
     parser.add_argument("--language", type=str, default="English")
     parser.add_argument(

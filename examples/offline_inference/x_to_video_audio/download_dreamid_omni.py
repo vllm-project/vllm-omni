@@ -82,13 +82,18 @@ def main(output_dir: str):
 
     data = {
         "_class_name": "DreamIDOmniPipeline",
-        "fusion": "DreamID-Omni/dreamid_omni.safetensors",
     }
 
     with open(os.path.join(output_dir, "model_index.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
     print(f"model_index.json created at {os.path.join(output_dir, 'model_index.json')}")
+
+    transformer_dir = os.path.join(output_dir, "transformer")
+    os.makedirs(transformer_dir, exist_ok=True)
+    with open(os.path.join(transformer_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({"fusion": "DreamID-Omni/dreamid_omni.safetensors"}, f)
+    print(f"transformer/config.json created at {os.path.join(transformer_dir, 'config.json')}")
 
     # now we download the dependency code
     download_dependency()

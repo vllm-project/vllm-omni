@@ -38,6 +38,10 @@ PROMPTS = [
     "It was a dark and stormy night when the old lighthouse keeper heard a knock at the door.",
 ]
 
+REF_AUDIO = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+INSTRUCT = "Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
+
 
 @dataclass
 class BenchmarkResult:
@@ -75,6 +79,29 @@ class BenchmarkResult:
     per_request: list = field(default_factory=list)
 
 
+def generate_audio(model, prompt: str, args):
+    if args.task_type == "Base":
+        return model.generate_voice_clone(
+            text=prompt,
+            language=args.language,
+            ref_audio=REF_AUDIO,
+            ref_text=REF_TEXT,
+        )
+
+    if args.task_type == "VoiceDesign":
+        return model.generate_voice_design(
+            text=prompt,
+            language=args.language,
+            instruct=INSTRUCT,
+        )
+
+    return model.generate_custom_voice(
+        text=prompt,
+        language=args.language,
+        speaker=args.voice,
+    )
+
+
 def run_benchmark(args):
     from qwen_tts import Qwen3TTSModel
 
@@ -95,11 +122,7 @@ def run_benchmark(args):
         print(f"Warming up with {args.num_warmups} requests...")
         for i in range(args.num_warmups):
             p = PROMPTS[i % len(PROMPTS)]
-            wavs, sr = model.generate_custom_voice(
-                text=p,
-                language=args.language,
-                speaker=args.voice,
-            )
+            wavs, sr = generate_audio(model, p, args)
         # Sync GPU
         torch.cuda.synchronize(device)
         print("Warmup done.")
@@ -124,11 +147,7 @@ def run_benchmark(args):
             torch.cuda.synchronize(device)
             st = time.perf_counter()
 
-            wavs, sr = model.generate_custom_voice(
-                text=prompt,
-                language=args.language,
-                speaker=args.voice,
-            )
+            wavs, sr = generate_audio(model, prompt, args)
 
             torch.cuda.synchronize(device)
             elapsed = time.perf_counter() - st
@@ -268,6 +287,7 @@ def parse_args():
     parser.add_argument("--gpu-device", type=int, default=0)
     parser.add_argument("--voice", type=str, default="Vivian")
     parser.add_argument("--language", type=str, default="English")
+    parser.add_argument("--task-type", type=str, default="CustomVoice", choices=["CustomVoice", "VoiceDesign", "Base"])
     parser.add_argument(
         "--config-name", type=str, default="hf_transformers", help="Label for this config (used in filenames)"
     )

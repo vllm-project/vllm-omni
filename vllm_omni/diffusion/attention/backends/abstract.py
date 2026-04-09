@@ -99,6 +99,8 @@ class AttentionImpl(ABC, Generic[T]):
             return self.forward_npu(query, key, value, attn_metadata)
         elif current_omni_platform.is_xpu():
             return self.forward_xpu(query, key, value, attn_metadata)
+        elif current_omni_platform.is_musa():
+            return self.forward_musa(query, key, value, attn_metadata)
         else:
             raise NotImplementedError(f"No forward implementation for platform: {current_omni_platform}")
 
@@ -137,4 +139,14 @@ class AttentionImpl(ABC, Generic[T]):
         attn_metadata: T | None = None,
     ) -> torch.Tensor:
         # By default, HIP ops are compatible with CUDA ops.
+        return self.forward_cuda(query, key, value, attn_metadata)
+
+    def forward_musa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: T | None = None,
+    ) -> torch.Tensor:
+        # By default, MUSA ops are compatible with CUDA ops.
         return self.forward_cuda(query, key, value, attn_metadata)

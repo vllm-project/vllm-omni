@@ -75,6 +75,14 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     return model
 
 
+def terminate_alive_proc(proc, timeout=5):
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=timeout)
+        if proc.is_alive():
+            proc.kill()
+
+
 def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     """Resolve worker_cls from worker_type for non-diffusion stages."""
     worker_type = engine_args.get("worker_type", None)
@@ -121,8 +129,7 @@ class StartedLlmStage:
     metadata: Any
     vllm_config: Any
     executor_class: type
-    engine_manager: Any
-    coordinator: Any
+    proc: Any
     addresses: Any
 
 
@@ -329,7 +336,13 @@ def acquire_device_locks(
             num_devices = current_omni_platform.get_device_count()
             physical_devices = list(range(num_devices))
 
-        num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
+        if len(physical_devices) < num_devices_per_stage:
+            raise RuntimeError(
+                f"Stage {stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+                f"but only {len(physical_devices)} device(s) are available: {physical_devices}"
+            )
+
+        num_devices_to_lock = num_devices_per_stage
         devices_to_lock = sorted(physical_devices[:num_devices_to_lock])
 
         logger.debug(
@@ -446,7 +459,7 @@ def initialize_diffusion_stage(
         metadata: Extracted stage metadata.
         batch_size: Maximum number of requests to batch together in the
             diffusion engine.  Passed through to ``StageDiffusionClient``
-            and ultimately to ``AsyncOmniDiffusion``.
+            and ultimately to ``AsyncOmni``.
     """
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
@@ -455,29 +468,67 @@ def initialize_diffusion_stage(
         model=model,
         **_to_dict(stage_cfg.engine_args),
     )
+    num_devices_per_stage = od_config.parallel_config.world_size
+    device_control_env = current_omni_platform.device_control_env_var
+    visible_devices_str = os.environ.get(device_control_env)
+    if visible_devices_str:
+        physical_devices = [device.strip() for device in visible_devices_str.split(",") if device.strip()]
+    else:
+        physical_devices = list(range(current_omni_platform.get_device_count()))
+
+    if len(physical_devices) < num_devices_per_stage:
+        raise ValueError(
+            f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+            f"but {len(physical_devices)} device(s) are available: {physical_devices}"
+        )
+
+    od_config.num_gpus = num_devices_per_stage
     if metadata.cfg_kv_collect_func is not None:
         od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
     return StageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
 
 
-def close_started_llm_stage(started: StartedLlmStage) -> None:
-    """Close managers owned by a launched stage that never attached."""
-    resources = (
-        ("engine manager", started.engine_manager),
-        ("coordinator", started.coordinator),
-    )
-    for resource_name, resource in resources:
-        if resource is None:
-            continue
+def _shutdown_or_close_resource(resource: Any, resource_name: str, stage_id: int) -> None:
+    """vLLM CoreEngineProcManager / coordinators use ``shutdown()``, not ``close()``."""
+    if resource is None:
+        return
+    shutdown = getattr(resource, "shutdown", None)
+    if callable(shutdown):
         try:
-            resource.close()
+            shutdown()
+        except Exception as cleanup_error:
+            logger.warning(
+                "[stage_init] Failed to shutdown launched %s for stage %s: %s",
+                resource_name,
+                stage_id,
+                cleanup_error,
+            )
+        return
+    close = getattr(resource, "close", None)
+    if callable(close):
+        try:
+            close()
         except Exception as cleanup_error:
             logger.warning(
                 "[stage_init] Failed to close launched %s for stage %s: %s",
                 resource_name,
-                started.stage_id,
+                stage_id,
                 cleanup_error,
             )
+
+
+def close_started_llm_stage(started: StartedLlmStage) -> None:
+    """Terminate the subprocess owned by a launched stage that never attached."""
+    if started.proc is None:
+        return
+    try:
+        terminate_alive_proc(started.proc)
+    except Exception as cleanup_error:
+        logger.warning(
+            "[stage_init] Failed to terminate process for stage %s: %s",
+            started.stage_id,
+            cleanup_error,
+        )
 
 
 def finalize_initialized_stages(

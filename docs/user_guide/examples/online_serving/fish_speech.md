@@ -11,6 +11,15 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serv
 
 ## Gradio Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
 An interactive Gradio demo is available with text-to-speech synthesis, voice cloning, and streaming support.
 
 ```bash

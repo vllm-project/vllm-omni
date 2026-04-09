@@ -105,6 +105,15 @@ python openai_chat_client.py --prompt "A beautiful landscape painting" --output 
 
 ### Method 4: Using Gradio Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
 ```bash
 python gradio_demo.py
 # Visit http://localhost:7860

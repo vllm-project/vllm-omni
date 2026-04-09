@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, Iterable, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from vllm.engine.protocol import EngineClient
+from vllm import TokensPrompt
+from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
+from vllm.renderers.inputs.preprocess import extract_prompt_components
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -85,7 +88,12 @@ class AsyncOmni(EngineClient, OmniBase):
         else:
             vllm_config = self.engine.stage_vllm_configs[stage_index]
             io_processor_plugin = vllm_config.model_config.io_processor_plugin
-            self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+            renderer = self.renderer
+            if renderer is None:
+                from vllm.renderers import renderer_from_config
+
+                renderer = renderer_from_config(vllm_config)
+            self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
 
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
@@ -118,6 +126,23 @@ class AsyncOmni(EngineClient, OmniBase):
         """Compatibility helper for call sites expecting async vllm config access."""
         return self.vllm_config
 
+    def get_diffusion_od_config(self) -> Any | None:
+        """Return the diffusion-stage config when the pipeline has one."""
+        for stage_client in self.engine.stage_clients:
+            if getattr(stage_client, "stage_type", None) != "diffusion":
+                continue
+
+            od_config = getattr(stage_client, "od_config", None)
+            if od_config is not None:
+                return od_config
+
+            inner_engine = getattr(stage_client, "_engine", None)
+            od_config = getattr(inner_engine, "od_config", None)
+            if od_config is not None:
+                return od_config
+
+        return None
+
     @property
     def model_config(self):
         """Return the model config for the comprehension stage when present."""
@@ -130,7 +155,8 @@ class AsyncOmni(EngineClient, OmniBase):
 
     async def generate(
         self,
-        prompt: OmniPromptType | list[OmniPromptType],
+        prompt: OmniPromptType | AsyncGenerator[StreamingInput, None] | list[OmniPromptType],
+        sampling_params: Any = None,
         request_id: str = "",
         *,
         prompt_text: str | None = None,
@@ -138,6 +164,10 @@ class AsyncOmni(EngineClient, OmniBase):
         tokenization_kwargs: dict[str, Any] | None = None,
         sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         output_modalities: list[str] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -174,6 +204,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
         logger.debug(f"[AsyncOmni] generate() called for request {request_id}")
 
+        input_stream_task: asyncio.Task | None = None
         try:
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
@@ -197,13 +228,22 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
 
-            # Add request to stage 0 (Orchestrator handles all stage transitions)
-            await self.engine.add_request_async(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params_list=sampling_params_list,
-                final_stage_id=final_stage_id_for_e2e,
-            )
+            # Add request(s) to stage 0. For streaming inputs, submit
+            # chunks incrementally through streaming_update.
+            if isinstance(prompt, AsyncGenerator):
+                input_stream_task = await self._add_streaming_input_request(
+                    request_id=request_id,
+                    input_stream=prompt,
+                    sampling_params_list=sampling_params_list,
+                    final_stage_id=final_stage_id_for_e2e,
+                )
+            else:
+                await self.engine.add_request_async(
+                    request_id=request_id,
+                    prompt=prompt,
+                    sampling_params_list=sampling_params_list,
+                    final_stage_id=final_stage_id_for_e2e,
+                )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
@@ -226,9 +266,118 @@ class AsyncOmni(EngineClient, OmniBase):
             self._log_summary_and_cleanup(request_id)
 
         except (asyncio.CancelledError, GeneratorExit):
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
             await self.abort(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
+        except Exception as e:
+            await self.abort(request_id)
+            logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
+            raise
+
+    async def _add_streaming_input_request(
+        self,
+        *,
+        request_id: str,
+        input_stream: AsyncGenerator[StreamingInput, None],
+        sampling_params_list: Sequence[OmniSamplingParams],
+        final_stage_id: int,
+    ) -> asyncio.Task:
+        """Submit a streaming input generator as incremental stage-0 updates."""
+        if not sampling_params_list:
+            raise ValueError("sampling_params_list cannot be empty for streaming input")
+        # only check thinker's sampling params now
+        stage0_params = sampling_params_list[0]
+        self._validate_streaming_input_sampling_params(stage0_params)
+
+        req_state = self.request_states[request_id]
+
+        if not stage0_params.skip_clone:
+            stage0_params = stage0_params.clone()
+            stage0_params.skip_clone = True
+        stage0_params.output_kind = RequestOutputKind.DELTA
+
+        has_submitted_first_chunk = False
+
+        async def handle_inputs() -> None:
+            nonlocal has_submitted_first_chunk
+            cancelled = False
+            try:
+                async for chunk in input_stream:
+                    chunk_params = getattr(chunk, "sampling_params", None) or stage0_params
+                    self._validate_streaming_input_sampling_params(chunk_params)
+                    chunk_sampling_params_list = list(sampling_params_list)
+                    chunk_sampling_params_list[0] = chunk_params
+                    chunk_prompt = chunk.prompt
+                    prompt_text, _, _ = extract_prompt_components(self.model_config, chunk_prompt)
+
+                    if not has_submitted_first_chunk:
+                        await self.engine.add_request_async(
+                            request_id=request_id,
+                            prompt=chunk_prompt,
+                            prompt_text=prompt_text,
+                            sampling_params_list=chunk_sampling_params_list,
+                            final_stage_id=final_stage_id,
+                            resumable=True,
+                        )
+                        has_submitted_first_chunk = True
+                    else:
+                        await self.engine.add_streaming_update_async(
+                            request_id=request_id,
+                            prompt=chunk_prompt,
+                            prompt_text=prompt_text,
+                            sampling_params_list=chunk_sampling_params_list,
+                            final_stage_id=final_stage_id,
+                            resumable=True,
+                        )
+            except (asyncio.CancelledError, GeneratorExit):
+                cancelled = True
+            except Exception as error:
+                await req_state.queue.put({"request_id": request_id, "error": error})
+            finally:
+                if not cancelled:
+                    # Send empty final request to indicate that inputs have
+                    # finished. Don't send if canceled (session was aborted).
+                    final_sampling_params_list = list(sampling_params_list)
+                    final_sampling_params_list[0] = stage0_params
+                    final_prompt = TokensPrompt(prompt_token_ids=[0])
+
+                    if has_submitted_first_chunk:
+                        await self.engine.add_streaming_update_async(
+                            request_id=request_id,
+                            prompt=final_prompt,
+                            prompt_text=None,
+                            sampling_params_list=final_sampling_params_list,
+                            final_stage_id=final_stage_id,
+                            resumable=False,
+                        )
+                    else:
+                        await self.engine.add_request_async(
+                            request_id=request_id,
+                            prompt=final_prompt,
+                            prompt_text=None,
+                            sampling_params_list=final_sampling_params_list,
+                            final_stage_id=final_stage_id,
+                            resumable=False,
+                        )
+
+        input_stream_task = asyncio.create_task(handle_inputs())
+        req_state.input_stream_task = input_stream_task
+        return input_stream_task
+
+    @staticmethod
+    def _validate_streaming_input_sampling_params(params: OmniSamplingParams) -> None:
+        if (
+            not isinstance(params, SamplingParams)
+            or params.n > 1
+            or params.output_kind == RequestOutputKind.FINAL_ONLY
+            or params.stop
+        ):
+            raise ValueError(
+                "Input streaming is currently supported only for SamplingParams "
+                "with n == 1, output_kind != FINAL_ONLY, and without stop strings."
+            )
 
     async def encode(
         self,

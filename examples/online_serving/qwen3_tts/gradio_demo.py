@@ -24,7 +24,10 @@ import io
 import json
 import logging
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    raise ImportError("gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'") from None
 import httpx
 import numpy as np
 import soundfile as sf
@@ -122,7 +125,7 @@ PLAYER_HTML = """
 def _build_player_js(sample_rate: int) -> str:
     """Build the JavaScript that powers the AudioWorklet player."""
     return f"""
-() => {{
+    <script>
     const SR = {sample_rate};
     const WC = {json.dumps(WORKLET_JS)};
     let ctx = null, node = null, abort = null, gen = false, st = {{}};
@@ -281,7 +284,7 @@ def _build_player_js(sample_rate: int) -> str:
             }}
         }}
     }};
-}}
+    </script>
 """
 
 
@@ -432,10 +435,7 @@ def create_app(api_base: str):
     )
 
     with gr.Blocks(
-        css=css,
         title="Qwen3-TTS Demo",
-        js=_build_player_js(PCM_SAMPLE_RATE),
-        theme=theme,
     ) as demo:
         gr.HTML(f"""
         <div style="display:flex; align-items:center; gap:16px; margin-bottom:8px;">
@@ -770,7 +770,14 @@ def create_app(api_base: str):
 
         demo.queue()
 
-    return gr.mount_gradio_app(fastapi_app, demo, path="/")
+    return gr.mount_gradio_app(
+        fastapi_app,
+        demo,
+        path="/",
+        css=css,
+        theme=theme,
+        head=_build_player_js(PCM_SAMPLE_RATE),
+    )
 
 
 def parse_args():

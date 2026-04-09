@@ -79,7 +79,7 @@ def build_engine_core_request_from_tokens(
         sampling_params=sampling_params,
         pooling_params=pooling_params,
         arrival_time=arrival_time,
-        lora_request=None,
+        lora_request=getattr(params, "lora_request", None),
         cache_salt=None,
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
@@ -200,6 +200,8 @@ class Orchestrator:
 
             if msg_type == "add_request":
                 await self._handle_add_request(msg)
+            elif msg_type == "streaming_update":
+                await self._handle_streaming_update(msg)
             elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
             elif msg_type == "abort":
@@ -239,7 +241,7 @@ class Orchestrator:
                 # the output format in the future to simplify the processing logic in Orchestrator.
                 stage_client = self.stage_clients[stage_id]
                 if stage_client.stage_type == "diffusion":
-                    output = stage_client.get_diffusion_output_async()
+                    output = stage_client.get_diffusion_output_nowait()
                     if output is not None:
                         idle = False
                         req_state = self.request_states.get(output.request_id)
@@ -267,6 +269,9 @@ class Orchestrator:
                 if raw_outputs is None:
                     continue
                 idle = False
+
+                # Handle prefill-finished KV-ready signals before finished outputs.
+                await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
 
                 # 2) Process raw outputs through the output processor
                 request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
@@ -313,25 +318,7 @@ class Orchestrator:
         # CFG companion handling: companions don't produce user-visible output
         # and don't forward to the next stage directly.
         if finished and req_id in self._companion_ids:
-            parent_id = self._companion_to_parent.get(req_id)
-            if parent_id is not None:
-                self._companion_done.setdefault(parent_id, set()).add(req_id)
-                logger.debug(
-                    "[Orchestrator] CFG companion %s done (parent=%s)",
-                    req_id,
-                    parent_id,
-                )
-                # Check if parent is waiting and all companions are done
-                if parent_id in self._deferred_parents and self._all_companions_done(parent_id):
-                    deferred = self._deferred_parents.pop(parent_id)
-                    parent_state = self.request_states.get(parent_id)
-                    if parent_state is not None:
-                        await self._forward_to_next_stage(
-                            parent_id,
-                            deferred["stage_id"],
-                            deferred["output"],
-                            parent_state,
-                        )
+            await self._handle_cfg_companion_ready(req_id)
             self.request_states.pop(req_id, None)
             return
 
@@ -358,17 +345,17 @@ class Orchestrator:
                 }
             )
 
-        if finished and stage_id < req_state.final_stage_id and not self.async_chunk:
-            # If this parent has CFG companions, defer forwarding until all done
+        if (
+            finished
+            and stage_id < req_state.final_stage_id
+            and not self.async_chunk
+            and not self._next_stage_already_submitted(stage_id, req_state)
+        ):
             if req_id in self._companion_map and not self._all_companions_done(req_id):
                 self._deferred_parents[req_id] = {
                     "stage_id": stage_id,
                     "output": output,
                 }
-                logger.debug(
-                    "[Orchestrator] Parent %s deferred, waiting for CFG companions",
-                    req_id,
-                )
             else:
                 await self._forward_to_next_stage(req_id, stage_id, output, req_state)
 
@@ -392,6 +379,56 @@ class Orchestrator:
             return True
         done_set = self._companion_done.get(parent_id, set())
         return all(cid in done_set for cid in role_map.values())
+
+    def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
+        return (stage_id + 1) in req_state.stage_submit_ts
+
+    async def _handle_cfg_companion_ready(self, req_id: str) -> None:
+        """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
+        parent_id = self._companion_to_parent.get(req_id)
+        if parent_id is None:
+            return
+        done_set = self._companion_done.setdefault(parent_id, set())
+        if req_id in done_set:
+            return
+        done_set.add(req_id)
+        if parent_id in self._deferred_parents and self._all_companions_done(parent_id):
+            deferred = self._deferred_parents.pop(parent_id)
+            parent_state = self.request_states.get(parent_id)
+            if parent_state is not None and not self._next_stage_already_submitted(deferred["stage_id"], parent_state):
+                await self._forward_to_next_stage(
+                    parent_id,
+                    deferred["stage_id"],
+                    deferred["output"],
+                    parent_state,
+                )
+
+    async def _handle_kv_ready_raw_outputs(self, stage_id: int, raw_outputs: EngineCoreOutputs) -> None:
+        """Forward split requests once stage-0 KV is ready, not only when decode fully finishes."""
+        if self.async_chunk:
+            return
+        for raw_output in raw_outputs.outputs:
+            kv_params = getattr(raw_output, "kv_transfer_params", None)
+            if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
+                continue
+            req_id = raw_output.request_id
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                continue
+            if req_id in self._companion_ids:
+                await self._handle_cfg_companion_ready(req_id)
+                continue
+            if stage_id >= req_state.final_stage_id:
+                continue
+            if self._next_stage_already_submitted(stage_id, req_state):
+                continue
+            if req_id in self._companion_map and not self._all_companions_done(req_id):
+                self._deferred_parents[req_id] = {
+                    "stage_id": stage_id,
+                    "output": raw_output,
+                }
+            else:
+                await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
 
     def _build_stage_metrics(
         self,
@@ -440,6 +477,30 @@ class Orchestrator:
             ),
         )
 
+    def _build_kv_sender_info(self, sender_stage_ids: list[int]) -> dict[int, dict[str, Any]] | None:
+        """Build per-request sender info for diffusion KV-transfer receivers."""
+        sender_infos: dict[int, dict[str, Any]] = {}
+        for sender_stage_id in dict.fromkeys(sender_stage_ids):
+            if sender_stage_id < 0 or sender_stage_id >= self.num_stages:
+                continue
+
+            sender_stage = self.stage_clients[sender_stage_id]
+            get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
+            if not callable(get_sender_info):
+                continue
+
+            sender_info = get_sender_info()
+            if not sender_info:
+                logger.warning(
+                    "[Orchestrator] Stage-%s has no KV sender info available",
+                    sender_stage_id,
+                )
+                continue
+
+            sender_infos[sender_stage_id] = sender_info
+
+        return sender_infos or None
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -485,14 +546,22 @@ class Orchestrator:
                         req_id,
                     )
 
+            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [stage_id])
+            kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
             if isinstance(diffusion_prompt, list):
                 await next_client.add_batch_request_async(
                     req_id,
                     diffusion_prompt,
                     params,
+                    kv_sender_info=kv_sender_info,
                 )
             else:
-                await next_client.add_request_async(req_id, diffusion_prompt, params)
+                await next_client.add_request_async(
+                    req_id,
+                    diffusion_prompt,
+                    params,
+                    kv_sender_info=kv_sender_info,
+                )
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 
@@ -624,6 +693,34 @@ class Orchestrator:
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
+    async def _handle_streaming_update(self, msg: dict[str, Any]) -> None:
+        """Handle a streaming_update message for an existing request."""
+        stage_id = 0
+        request_id = msg["request_id"]
+        request = msg["prompt"]
+
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            logger.warning(
+                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
+                request_id,
+            )
+            fallback_msg = dict(msg)
+            fallback_msg["type"] = "add_request"
+            await self._handle_add_request(fallback_msg)
+            return
+
+        if "sampling_params_list" in msg and msg["sampling_params_list"]:
+            req_state.sampling_params_list = msg["sampling_params_list"]
+
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        stage_client = self.stage_clients[stage_id]
+        if stage_client.stage_type == "diffusion":
+            params = req_state.sampling_params_list[stage_id]
+            await stage_client.add_request_async(request_id, request, params)
+        else:
+            await stage_client.add_request_async(request)
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -666,7 +763,14 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             if next_client.stage_type == "diffusion":
-                await next_client.add_request_async(request_id, req_state.prompt, params)
+                source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [next_stage_id - 1])
+                kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
+                await next_client.add_request_async(
+                    request_id,
+                    req_state.prompt,
+                    params,
+                    kv_sender_info=kv_sender_info,
+                )
                 req_state.stage_submit_ts[next_stage_id] = _time.time()
                 continue
 

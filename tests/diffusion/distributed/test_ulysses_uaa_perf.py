@@ -17,6 +17,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from tests.utils import hardware_test
 from vllm_omni.diffusion.attention.parallel.ulysses import (
     _all_gather_int,
     _ulysses_all_to_all_any_o,
@@ -69,6 +70,8 @@ PERF_CASES: list[_PerfCase] = [
 
 
 @pytest.mark.parametrize("case", PERF_CASES)
+@pytest.mark.core_model
+@hardware_test(res={"cuda": "L4"}, num_cards=4)
 def test_ulysses_advanced_uaa_comm_overhead(case: _PerfCase) -> None:
     available_gpus = current_omni_platform.get_device_count()
     if available_gpus < case.world_size:

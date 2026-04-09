@@ -118,6 +118,7 @@ Content-Type: application/json
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
+| `stream` | bool | false | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
@@ -143,9 +144,23 @@ Lists available voices for the loaded model.
 
 ```json
 {
-    "voices": ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"]
+    "voices": ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian", "custom_voice_1"],
+    "uploaded_voices": [
+        {
+            "name": "custom_voice_1",
+            "consent": "user_consent_id",
+            "created_at": 1738660000,
+            "file_size": 1024000,
+            "mime_type": "audio/wav",
+            "ref_text": "The exact transcript of the audio sample.",
+            "speaker_description": "warm narrator"
+        }
+    ]
 }
 ```
+
+`uploaded_voices` is always present (empty list when no custom voices have been uploaded). Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
+
 ```
 POST /v1/audio/voices
 Content-Type: multipart/form-data
@@ -161,6 +176,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
 | `ref_text` | string | No | Transcript of the audio. When provided, enables in-context voice cloning (higher quality). Without it, only the speaker embedding is extracted. |
+| `speaker_description` | string | No | Free-form description of the voice (e.g. "warm narrator", "energetic presenter"). Stored as metadata and returned in `GET /v1/audio/voices`. |
 
 **Response Example:**
 
@@ -172,10 +188,14 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
     "consent": "user_consent_id",
     "created_at": 1738660000,
     "mime_type": "audio/wav",
-    "file_size": 1024000
+    "file_size": 1024000,
+    "ref_text": "The exact transcript of the audio sample.",
+    "speaker_description": "warm narrator"
   }
 }
 ```
+
+Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
 
 **Usage Example:**
 
@@ -184,7 +204,8 @@ curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1" \
-  -F "ref_text=The exact transcript of the audio sample."
+  -F "ref_text=The exact transcript of the audio sample." \
+  -F "speaker_description=warm narrator"
 ```
 
 ## Streaming Text Input (WebSocket)

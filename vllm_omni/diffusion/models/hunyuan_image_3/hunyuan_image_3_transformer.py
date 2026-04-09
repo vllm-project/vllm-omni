@@ -61,6 +61,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
     get_pp_group,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -2033,7 +2036,7 @@ class HunyuanImage3Model(nn.Module):
         for name, loaded_weight in weights:
             # print(f"Loading weight name: {name}, tp_rank: {tp_rank}", flush=True)
             if contains_unexpected_keyword(name, unexpected_keywords):
-                print(f"Skipping unexpected weight name: {name}")
+                logger.warning("Skipping unexpected weight name: %s", name)
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -2535,6 +2538,61 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     def set_scheduler(self, new_scheduler):
         self.register_modules(scheduler=new_scheduler)
 
+    @staticmethod
+    def _split_model_kwargs_for_cfg_parallel(model_kwargs: dict[str, Any], batch_size: int, cfg_rank: int) -> None:
+        """Split batch-doubled model_kwargs in-place for CFG parallel.
+
+        The tokenizer produces inputs with cfg_factor=2, so all batch-dim
+        tensors have shape [batch_size*2, ...]. This method slices them
+        so that rank 0 gets the conditioned half and rank 1 gets the
+        unconditioned half.
+        """
+        s = slice(cfg_rank * batch_size, (cfg_rank + 1) * batch_size)
+
+        # Tensor fields with leading batch dimension
+        tensor_keys = [
+            "position_ids",
+            "image_mask",
+            "gen_timestep_scatter_index",
+            "cond_vae_image_mask",
+            "cond_vit_image_mask",
+            "cond_timestep_scatter_index",
+        ]
+        for key in tensor_keys:
+            if key in model_kwargs and model_kwargs[key] is not None:
+                model_kwargs[key] = model_kwargs[key][s]
+
+        # custom_pos_emb: tuple of (cos, sin)
+        if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:
+            cos, sin = model_kwargs["custom_pos_emb"]
+            model_kwargs["custom_pos_emb"] = (cos[s], sin[s])
+
+        # cond_vae_images: tensor or list
+        if model_kwargs.get("cond_vae_images") is not None:
+            v = model_kwargs["cond_vae_images"]
+            if isinstance(v, torch.Tensor):
+                model_kwargs["cond_vae_images"] = v[s]
+            elif isinstance(v, list):
+                model_kwargs["cond_vae_images"] = v[s.start : s.stop]
+
+        # cond_timestep: tensor or list
+        if model_kwargs.get("cond_timestep") is not None:
+            v = model_kwargs["cond_timestep"]
+            if isinstance(v, torch.Tensor):
+                model_kwargs["cond_timestep"] = v[s]
+            elif isinstance(v, list):
+                model_kwargs["cond_timestep"] = v[s.start : s.stop]
+
+        # cond_vit_images: list of tensors
+        if model_kwargs.get("cond_vit_images") is not None:
+            model_kwargs["cond_vit_images"] = model_kwargs["cond_vit_images"][s.start : s.stop]
+
+        # vit_kwargs: dict of lists
+        if model_kwargs.get("vit_kwargs") is not None:
+            model_kwargs["vit_kwargs"] = {
+                k: v[s.start : s.stop] if isinstance(v, list) else v[s] for k, v in model_kwargs["vit_kwargs"].items()
+            }
+
     @torch.no_grad()
     def __call__(
         self,
@@ -2621,7 +2679,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
 
-        cfg_factor = 1 + self.do_classifier_free_guidance
+        # Detect CFG parallel configuration (only 2-branch layout is supported)
+        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() == 2
 
         # Define call parameters
         device = self._execution_device
@@ -2649,13 +2708,33 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # Prepare extra step kwargs.
         _scheduler_step_extra_kwargs = self.prepare_extra_func_kwargs(self.scheduler.step, {"generator": generator})
 
-        # Prepare model kwargs
+        # Prepare model kwargs — attention mask is built from the full
+        # (cfg_factor=2) batch before any splitting so that each rank's
+        # slice is correct.
         input_ids = model_kwargs.pop("input_ids")
         attention_mask = self.model._prepare_attention_mask_for_generation(  # noqa
             input_ids,
             self.model.generation_config,
             model_kwargs=model_kwargs,
         )
+
+        # Split inputs for CFG parallel: each rank processes only its branch.
+        if cfg_parallel_ready:
+            cfg_group = get_cfg_group()
+            cfg_rank = get_classifier_free_guidance_rank()
+
+            # Ensure all ranks start with the same latents
+            latents = latents.contiguous()
+            cfg_group.broadcast(latents, src=0)
+
+            # Split batch-doubled tensors: rank 0 → conditioned, rank 1 → unconditioned
+            s = slice(cfg_rank * batch_size, (cfg_rank + 1) * batch_size)
+            input_ids = input_ids[s]
+            attention_mask = attention_mask[s]
+            self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
+        else:
+            cfg_factor = 1 + self.do_classifier_free_guidance
+
         b, _, q_len1, seq_len = attention_mask.shape
         query_lens = [q_len1] * b
         seq_lens = [seq_len] * b
@@ -2667,35 +2746,75 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # ---- TeaCache initialization ----
+        tea_cache_config = getattr(self.model, "_tea_cache_config", None)
+        if tea_cache_config is not None:
+            tc_rescale = np.poly1d(tea_cache_config.coefficients)
+            tc_acc_dist = 0.0
+            tc_prev_mod = None
+            tc_prev_pred = None
+            tc_cnt = 0
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * cfg_factor)
-                # latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                if cfg_parallel_ready:
+                    # CFG parallel: each rank forwards its own branch (no batch doubling)
+                    latent_model_input = latents
+                else:
+                    # Sequential CFG: double the batch
+                    latent_model_input = torch.cat([latents] * cfg_factor)
 
                 t_expand = t.repeat(latent_model_input.shape[0])
 
-                model_inputs = self.model.prepare_inputs_for_generation(
-                    input_ids,
-                    images=latent_model_input,
-                    timestep=t_expand,
-                    **model_kwargs,
-                )
+                # ---- TeaCache: decide whether to compute or reuse ----
+                should_compute = True
+                if tea_cache_config is not None:
+                    with torch.no_grad():
+                        # Use timestep embedding as the modulated input for cache decision
+                        cur_mod = self.model.time_embed(t.unsqueeze(0))
+                    if tc_cnt > 0 and tc_prev_mod is not None:
+                        rel_dist = (
+                            ((cur_mod - tc_prev_mod).abs().mean() / (tc_prev_mod.abs().mean() + 1e-8)).cpu().item()
+                        )
+                        rescaled = float(tc_rescale(rel_dist))
+                        tc_acc_dist += abs(rescaled)
+                        if tc_acc_dist < tea_cache_config.rel_l1_thresh:
+                            should_compute = False
+                        else:
+                            tc_acc_dist = 0.0
+                    tc_prev_mod = cur_mod.detach()
 
-                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                    model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
-                    pred = model_output["diffusion_prediction"]
-                pred = pred.to(dtype=torch.float32)
+                if should_compute:
+                    model_inputs = self.model.prepare_inputs_for_generation(
+                        input_ids,
+                        images=latent_model_input,
+                        timestep=t_expand,
+                        **model_kwargs,
+                    )
 
-                # perform guidance
-                if self.do_classifier_free_guidance:
+                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+                        model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
+                        pred = model_output["diffusion_prediction"]
+                    pred = pred.to(dtype=torch.float32)
+
+                    if tea_cache_config is not None:
+                        tc_prev_pred = pred.clone()
+                else:
+                    # TeaCache fast path: reuse previous prediction
+                    pred = tc_prev_pred
+
+                # Perform guidance
+                if cfg_parallel_ready:
+                    # CFG parallel: all_gather → all ranks combine locally (no broadcast needed)
+                    gathered = cfg_group.all_gather(pred, separate_tensors=True)
+                    pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
+                elif self.do_classifier_free_guidance:
                     pred_cond, pred_uncond = pred.chunk(2)
                     pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
 
-                # compute the previous noisy sample x_t -> x_t-1
+                # Scheduler step (all ranks compute locally in CFG parallel)
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
-
-                if i != len(timesteps) - 1:
+                if i != len(timesteps) - 1 and should_compute:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
                         model_kwargs,
@@ -2708,6 +2827,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     seq_lens = [seq_len] * b
                     model_kwargs["query_lens"] = query_lens
                     model_kwargs["seq_lens"] = seq_lens
+
+                if tea_cache_config is not None:
+                    tc_cnt += 1
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

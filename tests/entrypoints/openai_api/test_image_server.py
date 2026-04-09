@@ -106,7 +106,7 @@ def test_encode_image_base64():
 
 
 class MockGenerationResult:
-    """Mock result object from AsyncOmniDiffusion.generate()"""
+    """Mock result object from AsyncOmni.generate()"""
 
     def __init__(self, images):
         self.images = images
@@ -115,7 +115,7 @@ class MockGenerationResult:
 class FakeAsyncOmni:
     """Fake AsyncOmni that yields a single diffusion output."""
 
-    def __init__(self):
+    def __init__(self, images=None):
         self.stage_configs = [
             SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion"),
@@ -123,11 +123,12 @@ class FakeAsyncOmni:
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
+        self._images = images or [Image.new("RGB", (64, 64), color="green")]
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_sampling_params_list = sampling_params_list
         self.captured_prompt = prompt
-        images = [Image.new("RGB", (64, 64), color="green")]
+        images = [img.copy() for img in self._images]
         yield MockGenerationResult(images)
 
 
@@ -168,10 +169,16 @@ def test_client(mock_async_diffusion):
     app.state.engine_client = mock_async_diffusion
     app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
     app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
-    app.state.diffusion_model_name = "Qwen/Qwen-Image"  # For models endpoint
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+
+    from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels
+
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
+    )
     app.state.args = Namespace(
         default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5}}',
-        max_generated_image_size=4096,  # 64*64
+        max_generated_image_size=1024 * 1792,
     )
 
     return TestClient(app)
@@ -200,6 +207,28 @@ def async_omni_test_client():
 
 
 @pytest.fixture
+def async_omni_rgba_test_client():
+    """Create test client with mocked AsyncOmni engine returning RGBA output."""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    app.state.engine_client = FakeAsyncOmni(images=[Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))])
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="diffusion"),
+    ]
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        max_generated_image_size=1048576,
+    )
+    return TestClient(app)
+
+
+@pytest.fixture
 def async_omni_stage_configs_only_client():
     """Create test client with refactored AsyncOmni compatibility surface only."""
     from fastapi import FastAPI
@@ -216,7 +245,7 @@ def async_omni_stage_configs_only_client():
     # AsyncOmni exposes stage_configs on the engine instance.
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
-        max_generated_image_size=4096,  # 64*64
+        max_generated_image_size=1024 * 1792,
     )
     return TestClient(app)
 
@@ -361,6 +390,18 @@ def test_image_edits_async_omni_stage_configs_only(async_omni_stage_configs_only
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert len(captured) == 2
+
+
+def test_generate_images_max_size_rejected(async_omni_test_client):
+    """Test that a size exceeding max_generated_image_size returns 400."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "size": "2048x2048",  # 4,194,304 pixels > max_generated_image_size (1,048,576)
+        },
+    )
+    assert response.status_code == 400
 
 
 def test_generate_multiple_images(test_client):
@@ -592,6 +633,13 @@ def test_parameter_validation():
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", guidance_scale=21.0)
 
+    # Invalid layers for layered models (must stay within the backend-supported range)
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", layers=2)
+
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", layers=11)
+
 
 # Pass-Through Tests
 
@@ -711,6 +759,29 @@ def test_image_edit_images_processing(async_omni_test_client):
     assert processed_images[1].size == (24, 24)
 
 
+def test_image_edit_rejects_multiple_images_when_model_does_not_support_them(async_omni_test_client):
+    img_bytes_1 = make_test_image_bytes((16, 16))
+    img_bytes_2 = make_test_image_bytes((32, 32))
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(supports_multimodal_inputs=False)
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", img_bytes_1),
+            ("image", img_bytes_2),
+        ],
+        data={"prompt": "hello world."},
+    )
+
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"] == "Received multiple input images. Only a single image is supported by this model."
+    )
+    assert engine.captured_prompt is None
+
+
 def test_image_edit_parameter_pass(async_omni_test_client):
     img_bytes_1 = make_test_image_bytes((16, 16))
 
@@ -816,35 +887,36 @@ def test_image_edit_invalid_resolution(async_omni_test_client):
 
 
 def test_image_edit_invalid_layers(async_omni_test_client):
-    """Test that invalid layers values (< 1) are rejected with 400."""
+    """Test that layered image edits reject out-of-range layers with 400."""
     img_bytes = make_test_image_bytes((16, 16))
 
-    # Test layers = 0
+    # Test layers below the supported range
     response = async_omni_test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": 0,
+            "layers": 2,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be >= 1" in detail
+    assert "layers must be between 3 and 10 inclusive" in detail
 
-    # Test layers = -1
+    # Test layers above the supported range
     response = async_omni_test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": -1,
+            "layers": 11,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
+    assert "layers must be between 3 and 10 inclusive" in detail
 
 
 def test_image_edit_resolution_and_size_conflict(async_omni_test_client):
@@ -922,12 +994,13 @@ def test_image_edit_parameter_default_single_stage(test_client):
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
 
+    # Size exceeding max_generated_image_size (1024*1792) returns 400
     response = test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes_1)],
         data={
             "prompt": "hello world.",
-            "size": "96x96",
+            "size": "2048x2048",
         },
     )
     assert response.status_code == 400
@@ -975,6 +1048,27 @@ def test_image_edit_compression_jpeg(test_client):
 
     assert len(img_bytes_10) < len(img_bytes_50)
     assert len(img_bytes_50) < len(img_bytes_100)
+
+
+def test_image_edit_rgba_output_converts_to_jpeg(async_omni_rgba_test_client):
+    img_bytes_1 = make_test_image_bytes((16, 16))
+
+    response = async_omni_rgba_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "output_format": "jpeg",
+        },
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    img_bytes = base64.b64decode(data["data"][0]["b64_json"])
+    img = Image.open(io.BytesIO(img_bytes))
+    assert img.format.lower() == "jpeg"
+    assert img.mode == "RGB"
+    assert data["output_format"] == "jpeg"
 
 
 def test_image_edit_compression_png(async_omni_test_client):
