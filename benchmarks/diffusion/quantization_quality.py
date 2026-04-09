@@ -240,6 +240,7 @@ def _generate_image(omni, args, prompt, seed):
 def _generate_image_edit(omni, args, prompt, seed):
     """Generate an edited image and return (PIL.Image, time_seconds, memory_gib)."""
     import PIL.Image
+
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.platforms import current_omni_platform
 
@@ -247,6 +248,7 @@ def _generate_image_edit(omni, args, prompt, seed):
         image = PIL.Image.open(args.image).convert("RGB")
     else:
         from vllm.assets.image import ImageAsset
+
         image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
     start = time.perf_counter()

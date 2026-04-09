@@ -148,6 +148,42 @@ def _generate_image(omni, config: QualityTestConfig):
     raise ValueError("Could not extract image from output.")
 
 
+def _generate_image_edit(omni, config: QualityTestConfig):
+    """Generate an edited image, return (PIL.Image, peak_mem_gib)."""
+    from vllm.assets.image import ImageAsset
+
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.platforms import current_omni_platform
+
+    image = ImageAsset(config.image).pil_image.convert("RGB")
+    generator = torch.Generator(
+        device=current_omni_platform.device_type,
+    ).manual_seed(config.seed)
+    torch.cuda.reset_peak_memory_stats()
+
+    outputs = omni.generate(
+        {
+            "prompt": config.prompt,
+            "multi_modal_data": {"image": image},
+        },
+        OmniDiffusionSamplingParams(
+            height=config.height,
+            width=config.width,
+            generator=generator,
+            num_inference_steps=config.num_inference_steps,
+        ),
+    )
+
+    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    first = outputs[0]
+    if hasattr(first, "images") and first.images:
+        return first.images[0], peak_mem
+    inner = first.request_output
+    if inner is not None and hasattr(inner, "images") and inner.images:
+        return inner.images[0], peak_mem
+    raise ValueError("Could not extract image from output.")
+
+
 def _generate_video(omni, config: QualityTestConfig):
     """Generate a video, return (np.ndarray [F,H,W,C], peak_mem_gib)."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
