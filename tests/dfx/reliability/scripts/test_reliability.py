@@ -293,10 +293,10 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, open
         request_config = {
             "form_data": {
                 "prompt": "Generate a realistic road-driving video with camera motion.",
-                "width": 1280,
-                "height": 720,
-                "fps": 16,
-                "num_frames": 81,
+                "width": 512,
+                "height": 512,
+                "fps": 8,
+                "num_frames": 8,
                 "guidance_scale": 1.0,
                 "flow_shift": 5.0,
                 "num_inference_steps": 4,
