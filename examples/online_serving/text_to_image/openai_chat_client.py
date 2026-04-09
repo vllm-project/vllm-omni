@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+Qwen-Image OpenAI-compatible image generation client.
+
+Usage:
+    python openai_chat_client.py --prompt "A beautiful landscape" --output output.png
+    python openai_chat_client.py --prompt "A sunset" --height 1024 --width 1024 --steps 50 --seed 42
+"""
+
+import argparse
+import base64
+from pathlib import Path
+
+import requests
+
+
+def generate_image(
+    prompt: str,
+    server_url: str = "http://localhost:8091",
+    height: int | None = None,
+    width: int | None = None,
+    steps: int | None = None,
+    true_cfg_scale: float | None = None,
+    seed: int | None = None,
+    negative_prompt: str | None = None,
+    num_outputs_per_prompt: int = 1,
+    lora_path: str | None = None,
+    lora_name: str | None = None,
+    lora_scale: float | None = None,
+    lora_int_id: int | None = None,
+    use_system_prompt: str | None = None,
+    system_prompt: str | None = None,
+) -> bytes | None:
+    """Generate an image using the images generation API.
+
+    Args:
+        prompt: Text description of the image
+        server_url: Server URL
+        height: Image height in pixels
+        width: Image width in pixels
+        steps: Number of diffusion steps
+        true_cfg_scale: Qwen-Image CFG scale
+        seed: Random seed
+        negative_prompt: Negative prompt
+        num_outputs_per_prompt: Number of images to generate
+        lora_path: Server-local LoRA adapter folder path (PEFT format)
+        lora_name: LoRA name (optional, defaults to path stem)
+        lora_scale: LoRA scale factor (default: 1.0)
+        lora_int_id: LoRA integer ID (optional, derived from path if not provided)
+        use_system_prompt: System prompt for generation.
+        system_prompt: Custom system prompt.
+
+    Returns:
+        Image bytes or None if failed
+    """
+    payload: dict[str, object] = {
+        "prompt": prompt,
+        "response_format": "b64_json",
+        "n": num_outputs_per_prompt,
+    }
+
+    if width is not None and height is not None:
+        payload["size"] = f"{width}x{height}"
+    elif width is not None:
+        payload["size"] = f"{width}x{width}"
+    elif height is not None:
+        payload["size"] = f"{height}x{height}"
+
+    if steps is not None:
+        payload["num_inference_steps"] = steps
+    if true_cfg_scale is not None:
+        payload["true_cfg_scale"] = true_cfg_scale
+    if negative_prompt:
+        payload["negative_prompt"] = negative_prompt
+    if seed is not None:
+        payload["seed"] = seed
+    if use_system_prompt is not None:
+        payload["use_system_prompt"] = use_system_prompt
+    if system_prompt is not None:
+        payload["system_prompt"] = system_prompt
+    # Add LoRA if provided
+    if lora_path:
+        lora_body: dict = {
+            "local_path": lora_path,
+            "name": lora_name or Path(lora_path).stem,
+        }
+        if lora_scale is not None:
+            lora_body["scale"] = float(lora_scale)
+        if lora_int_id is not None:
+            lora_body["int_id"] = int(lora_int_id)
+        payload["lora"] = lora_body
+
+    try:
+        response = requests.post(
+            f"{server_url}/v1/images/generations",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=300,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        items = data.get("data")
+        if isinstance(items, list) and items:
+            first = items[0].get("b64_json") if isinstance(items[0], dict) else None
+            if isinstance(first, str):
+                return base64.b64decode(first)
+
+        print(f"Unexpected response format: {data}")
+        return None
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Qwen-Image chat client")
+    parser.add_argument("--prompt", "-p", default="a cup of coffee on the table", help="Text prompt")
+    parser.add_argument("--output", "-o", default="qwen_image_output.png", help="Output file")
+    parser.add_argument("--server", "-s", default="http://localhost:8091", help="Server URL")
+    parser.add_argument("--height", type=int, default=1024, help="Image height")
+    parser.add_argument("--width", type=int, default=1024, help="Image width")
+    parser.add_argument("--steps", type=int, default=50, help="Inference steps")
+    parser.add_argument("--cfg-scale", type=float, default=4.0, help="True CFG scale")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--negative", help="Negative prompt")
+
+    parser.add_argument("--lora-path", default=None, help="Server-local LoRA adapter folder (PEFT format)")
+    parser.add_argument("--lora-name", default=None, help="LoRA name (optional)")
+    parser.add_argument("--lora-scale", type=float, default=1.0, help="LoRA scale")
+    parser.add_argument(
+        "--lora-int-id",
+        type=int,
+        default=None,
+        help="LoRA integer id (cache key). If omitted, the server derives a stable id from lora_path.",
+    )
+    parser.add_argument(
+        "--use-system-prompt",
+        type=str,
+        default=None,
+        help=(
+            "System prompt for generation. Use predefined types: 'en_unified', 'en_vanilla', 'en_recaption', 'en_think_recaption', 'dynamic', or 'None'; Or provide custom text string directly. Recommended en_unified. "
+        ),
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=("Custom system prompt. Used when --use-system-prompt is custom. "),
+    )
+    args = parser.parse_args()
+    print(f"Generating image for: {args.prompt}")
+
+    image_bytes = generate_image(
+        prompt=args.prompt,
+        server_url=args.server,
+        height=args.height,
+        width=args.width,
+        steps=args.steps,
+        true_cfg_scale=args.cfg_scale,
+        seed=args.seed,
+        negative_prompt=args.negative,
+        lora_path=args.lora_path,
+        lora_name=args.lora_name,
+        lora_scale=args.lora_scale if args.lora_path else None,
+        lora_int_id=args.lora_int_id if args.lora_path else None,
+        use_system_prompt=args.use_system_prompt,
+        system_prompt=args.system_prompt,
+    )
+
+    if image_bytes:
+        output_path = Path(args.output)
+        output_path.write_bytes(image_bytes)
+        print(f"Image saved to: {output_path}")
+        print(f"Size: {len(image_bytes) / 1024:.1f} KB")
+    else:
+        print("Failed to generate image")
+        exit(1)
+
+
+if __name__ == "__main__":
+    main()

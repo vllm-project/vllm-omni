@@ -1,0 +1,17 @@
+# CODEOWNERS is used to automatically assign PR reviewers
+# Format: path pattern @username or @team
+# More info: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners (fallback reviewers for all files)
+# later, we can add more reviewers here
+* @hsliuustc0106
+
+# Assign reviewers by directory
+/.github/ @owner1
+/tests/ @owner1
+/docs/ @owner1
+
+# Example: reviewers for specific directories
+# /examples/offline_inference/ @offline-inference-team
+# /vllm_omni/core/ @core-team
+# /vllm_omni/model_executor/ @model-team

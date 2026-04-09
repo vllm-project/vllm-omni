@@ -1,0 +1,3 @@
+-r common.txt
+onnxruntime-cann>=1.23.2
+torchaudio==2.9.0

@@ -1,0 +1,12 @@
+{{- if gt (int .Values.replicaCount) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: "{{ .Release.Name }}-pdb"
+  namespace: {{ .Release.Namespace }}
+spec:
+  maxUnavailable: {{ default 1 .Values.maxUnavailablePodDisruptionBudget }}
+  selector:
+    matchLabels:
+    {{- include "chart.labels" . | nindent 6 }}
+{{- end }}

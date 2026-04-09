@@ -1,0 +1,226 @@
+[build-system]
+requires = [
+    "setuptools>=77.0.3,<81.0.0",
+    "wheel",
+    "setuptools-scm>=8.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-omni"
+dynamic = ["version", "dependencies"]
+description = "A framework for efficient model inference with omni-modality models"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "Apache-2.0"
+authors = [
+    {name = "vLLM-Omni Team"}
+]
+keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# Dependencies are now managed dynamically via setup.py based on detected hardware platform.
+# This allows automatic installation of the correct platform-specific dependencies (CUDA/ROCm/CPU/XPU/NPU)
+# without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
+# Note: vllm is intentionally excluded due to entrypoints overwrite issue.
+
+[project.optional-dependencies]
+
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+    "datasets>=2.14.0",
+    "mypy==1.11.1",
+    "pre-commit==4.0.1",
+    "openai-whisper>=20250625",
+    "psutil>=7.2.0",
+    "soundfile>=0.13.1",
+    "imageio[ffmpeg]>=0.6.0",
+    "opencv-python>=4.12.0.88",
+    "mooncake-transfer-engine==0.3.8.post1",
+    "av", # for ComfyUI tests
+    "openpyxl>=3.0.0", # for nightly CI
+    "pyttsx3>=2.99",
+    "opencc>=1.2.0",
+    "mistune>=3.2.0", # for example tests
+]
+
+demo = [
+    "gradio>=6.7.0",
+]
+
+docs = [
+    "mkdocs>=1.5.0",
+    "mkdocs-api-autonav",
+    "mkdocs-material",
+    "mkdocstrings-python",
+    "mkdocs-gen-files",
+    "mkdocs-awesome-nav",
+    "mkdocs-glightbox",
+    "mkdocs-git-revision-date-localized-plugin",
+    "mkdocs-minify-plugin",
+    "regex",
+    "ruff",
+    "pydantic",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/vllm-project/vllm-omni"
+Repository = "https://github.com/vllm-project/vllm-omni"
+Documentation = "https://vllm-omni.readthedocs.io"
+"Bug Tracker" = "https://github.com/vllm-project/vllm-omni/issues"
+
+[project.scripts]
+vllm = "vllm_omni.entrypoints.cli.main:main"
+vllm-omni = "vllm_omni.entrypoints.cli.main:main"
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_omni*"]
+
+[tool.setuptools.package-data]
+"vllm_omni" = ["_version.py", "py.typed"]
+"vllm_omni.model_executor.stage_configs" = ["*.yaml"]
+
+[tool.setuptools_scm]
+# no extra settings needed, presence enables setuptools-scm
+
+[tool.ruff]
+line-length = 120
+exclude = [
+    ".eggs",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "build",
+    "dist",
+    "vllm_omni.egg-info",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort (handled separately, but included for compatibility)
+    "N",  # pep8-naming
+    "UP", # pyupgrade
+]
+ignore = [
+    "E203",  # whitespace before ':' (conflicts with black)
+    # W503 is not needed in ruff as it's compatible with black by default
+    "N801",  # class names should use CapWords convention
+    "N802",  # function name should follow snake_case
+    "N806",  # variable in function should follow snake_case
+    "N812",  # lowercase imported as non-lowercase: functional as F
+]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**" = ["E501"]  # Allow long lines in examples
+"tests/**" = ["E501"]  # Allow long lines in tests
+
+[tool.mypy]
+python_version = "3.12, 3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--strict-config"
+]
+markers = [
+    # ci/cd required
+    "core_model: L1&L2 tests (run in each PR)",
+    "advanced_model: L3&L4 level tests (run in each merge or nightly)",
+    # function module markers
+    "diffusion: Diffusion model tests",
+    "omni: Omni model tests",
+    "cache: Cache backend tests",
+    "parallel: Parallelism/distributed tests",
+    "example: Doc example code tests",
+    # platform markers
+    "cpu: Tests that run on CPU",
+    "gpu: Tests that run on GPU (auto-added)",
+    "cuda: Tests that run on CUDA (auto-added)",
+    "rocm: Tests that run on AMD/ROCm (auto-added)",
+    "xpu: Tests that run on XPU (auto-added)",
+    "npu: Tests that run on NPU/Ascend (auto-added)",
+    "musa: Tests that run on MUSA/Moore Threads (auto-added)",
+    # specified computation resources marks (auto-added)
+    "H100: Tests that require H100 GPU",
+    "L4: Tests that require L4 GPU",
+    "MI325: Tests that require MI325 GPU (AMD/ROCm)",
+    "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",
+    "A2: Tests that require A2 NPU",
+    "A3: Tests that require A3 NPU",
+    "distributed_cuda: Tests that require multi cards on CUDA platform",
+    "distributed_rocm: Tests that require multi cards on ROCm platform",
+    "distributed_xpu: Tests that require multi cards on XPU platform",
+    "distributed_npu: Tests that require multi cards on NPU platform",
+    "distributed_musa: Tests that require multi cards on MUSA platform",
+    "skipif_cuda: Skip if the num of CUDA cards is less than the required",
+    "skipif_rocm: Skip if the num of ROCm cards is less than the required",
+    "skipif_xpu: Skip if the num of XPU cards is less than the required",
+    "skipif_npu: Skip if the num of NPU cards is less than the required",
+    "skipif_musa: Skip if the num of MUSA cards is less than the required",
+    # more detailed markers
+    "slow: Slow tests (may skip in quick CI)",
+    "benchmark: Benchmark tests",
+]
+filterwarnings = [
+    "ignore:.*does not have '__test__' attribute.*:UserWarning",
+    "ignore:.*does not have '__bases__' attribute.*:UserWarning",
+]
+
+[tool.typos.default]
+extend-ignore-identifiers-re = [
+    ".*_thw",
+    ".*thw",
+    "ein",
+    ".*arange",
+    ".*MoBA",
+    ".*temperal_downsample",
+    ".*_nd",
+    ".*nothink.*",
+    ".*NOTHINK.*",
+    ".*nin.*",
+    ".*[Oo]no_[Aa]nna.*",
+    ".*cann.*",
+]
+[tool.typos.default.extend-words]
+ue = "ue"
+semantics = "semantics"
+fullset = "fullset"
+Vai = "Vai"
