@@ -140,12 +140,15 @@ steps:
       echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
       echo "buildkitd address: $${BUILDKITD_ADDR}"
 
+      # 配置 GitHub 代理（国内集群）
+      git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
+
       # Ensure buildctl is available
       if ! command -v buildctl &> /dev/null; then
         echo "Installing buildctl..."
         mkdir -p /tmp/buildkit
         BUILDKIT_VERSION="v0.29.0"
-        wget -q "https://github.com/moby/buildkit/releases/download/$${BUILDKIT_VERSION}/buildkit-$${BUILDKIT_VERSION}.linux-arm64.tar.gz" -O /tmp/buildkit.tar.gz
+        wget -q "https://gh-proxy.test.osinfra.cn/https://github.com/moby/buildkit/releases/download/$${BUILDKIT_VERSION}/buildkit-$${BUILDKIT_VERSION}.linux-arm64.tar.gz" -O /tmp/buildkit.tar.gz
         tar -xzf /tmp/buildkit.tar.gz -C /tmp/buildkit
         cp /tmp/buildkit/bin/buildctl /usr/local/bin/
       fi
