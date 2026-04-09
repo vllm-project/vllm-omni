@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -13,8 +13,18 @@ from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
@@ -30,14 +40,14 @@ logger = init_logger(__name__)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, dim_out: int | None = None, mult: int = 4, bias: bool = True):
+    def __init__(self, dim: int, dim_out: int | None = None, mult: int = 4, bias: bool = True, quant_config: "QuantizationConfig | None" = None, prefix: str = ""):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
 
-        self.w_in = ColumnParallelLinear(dim, inner_dim, bias=bias, return_bias=False)
+        self.w_in = ColumnParallelLinear(dim, inner_dim, bias=bias, return_bias=False, quant_config=quant_config, prefix=f"{prefix}.w_in")
         self.act = get_act_fn("gelu_pytorch_tanh")
-        self.w_out = RowParallelLinear(inner_dim, dim_out, bias=bias, return_bias=False)
+        self.w_out = RowParallelLinear(inner_dim, dim_out, bias=bias, return_bias=False, quant_config=quant_config, prefix=f"{prefix}.w_out")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w_in(hidden_states)
@@ -62,6 +72,7 @@ class LongCatImageAttention(nn.Module):
         out_dim: int = None,
         context_pre_only: bool | None = None,
         pre_only: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.parallel_config = parallel_config
@@ -85,10 +96,12 @@ class LongCatImageAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.heads,
             bias=bias,
+            quant_config=quant_config,
+            prefix="to_qkv",
         )
 
         if not self.pre_only:
-            self.to_out = RowParallelLinear(self.inner_dim, self.out_dim, bias=out_bias)
+            self.to_out = RowParallelLinear(self.inner_dim, self.out_dim, bias=out_bias, quant_config=quant_config, prefix="to_out")
 
         if self.added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
@@ -99,9 +112,11 @@ class LongCatImageAttention(nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
+                quant_config=quant_config,
+                prefix="add_kv_proj",
             )
 
-            self.to_add_out = RowParallelLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(self.inner_dim, query_dim, bias=out_bias, quant_config=quant_config, prefix="to_add_out")
 
         self.attn = Attention(
             num_heads=heads,
@@ -182,6 +197,8 @@ class LongCatImageAttention(nn.Module):
             - Standard concatenation of text + image Q/K/V
             - Regular attention over the full sequence
         """
+        # Ensure contiguous for FP8 quantized linear layers
+        hidden_states = hidden_states.contiguous()
         qkv, _ = self.to_qkv(hidden_states)
 
         q_size = self.to_qkv.num_heads * self.head_dim
@@ -196,6 +213,7 @@ class LongCatImageAttention(nn.Module):
         key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
+            encoder_hidden_states = encoder_hidden_states.contiguous()
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             q_size = self.add_kv_proj.num_heads * self.head_dim
             kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
@@ -293,8 +311,9 @@ class LongCatImageAttention(nn.Module):
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
-            hidden_states, _ = self.to_out(hidden_states)
-            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
+            # Contiguous for FP8 quantization in RowParallelLinear
+            hidden_states, _ = self.to_out(hidden_states.contiguous())
+            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states.contiguous())
 
             return hidden_states, encoder_hidden_states
         else:
@@ -313,6 +332,7 @@ class LongCatImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
 
@@ -330,13 +350,14 @@ class LongCatImageTransformerBlock(nn.Module):
             context_pre_only=False,
             bias=True,
             eps=eps,
+            quant_config=quant_config,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim)
+        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="ff")
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim)
+        self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="ff_context")
 
     def forward(
         self,
@@ -508,14 +529,29 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
+        self.proj_mlp = ReplicatedLinear(
+            dim,
+            self.mlp_hidden_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="proj_mlp",
+        )
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
+        self.proj_out = ReplicatedLinear(
+            dim + self.mlp_hidden_dim,
+            dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="proj_out",
+        )
 
         # SP handling is delegated to LongCatImageAttention via text_seq_len kwarg
         self.attn = LongCatImageAttention(
@@ -526,6 +562,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             out_dim=dim,
             bias=True,
             eps=1e-6,
+            quant_config=quant_config,
             pre_only=True,
         )
 
@@ -603,6 +640,7 @@ class LongCatImageTransformer2DModel(nn.Module):
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         model_config = od_config.tf_model_config
@@ -627,8 +665,22 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         self.time_embed = LongCatImageTimestepEmbeddings(embedding_dim=self.inner_dim)
 
-        self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim)
-        self.x_embedder = torch.nn.Linear(in_channels, self.inner_dim)
+        self.context_embedder = ReplicatedLinear(
+            joint_attention_dim,
+            self.inner_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="context_embedder",
+        )
+        self.x_embedder = ReplicatedLinear(
+            in_channels,
+            self.inner_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="x_embedder",
+        )
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -637,6 +689,7 @@ class LongCatImageTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    quant_config=quant_config,
                 )
                 for i in range(num_layers)
             ]
@@ -649,13 +702,21 @@ class LongCatImageTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    quant_config=quant_config,
                 )
                 for i in range(num_single_layers)
             ]
         )
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+        self.proj_out = ReplicatedLinear(
+            self.inner_dim,
+            patch_size * patch_size * self.out_channels,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix="proj_out",
+        )
 
         self.gradient_checkpointing = False
 

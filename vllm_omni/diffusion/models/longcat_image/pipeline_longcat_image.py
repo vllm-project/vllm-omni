@@ -236,7 +236,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = LongCatImageTransformer2DModel(od_config=od_config)
+        self.transformer = LongCatImageTransformer2DModel(od_config=od_config, quant_config=od_config.quantization_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
@@ -681,4 +681,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(weights)
+        loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
+        loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
+        return loaded_weights
