@@ -16,7 +16,7 @@ except ImportError:
 
 
 import torch
-from vllm.inputs.data import EmbedsPrompt, TextPrompt, TokenInputs, TokensPrompt
+from vllm.inputs import EmbedsPrompt, TextPrompt, TokensInput, TokensPrompt
 
 
 class OmniTextPrompt(TextPrompt):
@@ -59,10 +59,10 @@ class OmniTokensPrompt(TokensPrompt):
     additional_information: NotRequired[dict[str, Any]]
 
 
-class OmniTokenInputs(TokenInputs):
+class OmniTokenInputs(TokensInput):
     """Token inputs with optional embeddings and additional information.
 
-    Extends TokenInputs to support prompt embeddings and additional
+    Extends TokensInput to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:
@@ -241,6 +241,7 @@ class OmniDiffusionSamplingParams:
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
+    strength: float | None = None  # I2I: Z-Image specific now, uses to control denoising start timestep
     decode_timestep: float | list[float] | None = None
     decode_noise_scale: float | list[float] | None = None
     eta: float = 0.0

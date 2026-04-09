@@ -179,6 +179,7 @@ class StageDiffusionClient:
         request_id: str,
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         self._request_socket.send(
             self._encoder.encode(
@@ -187,6 +188,7 @@ class StageDiffusionClient:
                     "request_id": request_id,
                     "prompt": prompt,
                     "sampling_params": self._sampling_params_to_dict(sampling_params),
+                    "kv_sender_info": kv_sender_info,
                 }
             )
         )
@@ -198,6 +200,7 @@ class StageDiffusionClient:
         request_id: str,
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         """Submit a list of prompts as a single batched engine call.
 
@@ -206,7 +209,12 @@ class StageDiffusionClient:
         *request_id*.
         """
         task = asyncio.create_task(
-            self._run_batch(request_id, prompts, sampling_params),
+            self._run_batch(
+                request_id,
+                prompts,
+                sampling_params,
+                kv_sender_info,
+            ),
             name=f"diffusion-batch-{request_id}",
         )
         self._tasks[request_id] = task
@@ -216,6 +224,7 @@ class StageDiffusionClient:
         request_id: str,
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         try:
             self._request_socket.send(
@@ -225,6 +234,7 @@ class StageDiffusionClient:
                         "request_id": request_id,
                         "prompts": prompts,
                         "sampling_params": self._sampling_params_to_dict(sampling_params),
+                        "kv_sender_info": kv_sender_info,
                     }
                 )
             )
@@ -244,7 +254,20 @@ class StageDiffusionClient:
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
             if not self._shutting_down and self._proc is not None and not self._proc.is_alive():
-                raise RuntimeError(f"StageDiffusionProc died unexpectedly (exit code {self._proc.exitcode})")
+                exitcode = self._proc.exitcode
+                # One final drain – the last ZMQ frame may have arrived
+                # between the first drain and the is_alive() check.
+                self._drain_responses()
+                try:
+                    return self._output_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                if exitcode is not None and exitcode > 128:
+                    sig = exitcode - 128
+                    logger.warning("StageDiffusionProc was killed by signal %d; treating as external shutdown.", sig)
+                    self._shutting_down = True
+                    return None
+                raise RuntimeError(f"StageDiffusionProc died unexpectedly (exit code {exitcode})")
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:

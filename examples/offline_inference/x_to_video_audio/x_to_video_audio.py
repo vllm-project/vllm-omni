@@ -132,8 +132,8 @@ def main() -> None:
     if not outputs:
         raise RuntimeError("No output returned from DreamID-Omni.")
     output = outputs[0].request_output
-    generated_video = output[0].images[0][0]
-    generated_audio = output[0].images[0][1]
+    generated_video = output.images[0][0]
+    generated_audio = output.images[0][1]
     try:
         from dreamid_omni.utils.io_utils import save_video
     except Exception as e:

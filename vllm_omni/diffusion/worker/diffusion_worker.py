@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 import zmq
-from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
+from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -113,8 +113,12 @@ class DiffusionWorker:
         self.device = current_omni_platform.get_torch_device(rank)
         current_omni_platform.set_device(self.device)
 
-        # Create vllm_config for parallel configuration
-        vllm_config = VllmConfig(compilation_config=CompilationConfig())
+        # Create vllm_config for parallel configuration. Pass explicit device_config
+        # so DeviceConfig does not rely on current_platform in worker subprocesses.
+        vllm_config = VllmConfig(
+            compilation_config=CompilationConfig(),
+            device_config=DeviceConfig(device=self.device),
+        )
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel

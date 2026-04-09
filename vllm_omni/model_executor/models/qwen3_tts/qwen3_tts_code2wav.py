@@ -41,6 +41,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._num_quantizers: int | None = None
         self._output_sample_rate: int | None = None
         self._total_upsample: int | None = None
+        self._decoder_sliding_window: int | None = None
         self._logged_codec_stats = False
 
     @staticmethod
@@ -106,6 +107,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._num_quantizers = num_q
         self._output_sample_rate = out_sr
         self._total_upsample = int(decoder.total_upsample)
+        self._decoder_sliding_window = int(getattr(dec_cfg, "sliding_window", 0) or 0)
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(decoder, "precompute_snake_caches"):
@@ -128,6 +130,20 @@ class Qwen3TTSCode2Wav(nn.Module):
                     if isinstance(extra_cfg, dict):
                         chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
                         left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+                        if (
+                            chunk_frames > 0
+                            and left_frames > 0
+                            and self._decoder_sliding_window
+                            and left_frames < self._decoder_sliding_window
+                        ):
+                            logger.warning(
+                                "Qwen3-TTS streaming codec_left_context_frames=%d is smaller than "
+                                "decoder sliding_window=%d; chunk-boundary distortion may occur. "
+                                "Increase codec_left_context_frames to at least %d for streaming.",
+                                left_frames,
+                                self._decoder_sliding_window,
+                                self._decoder_sliding_window,
+                            )
 
                     decoder.enable_cudagraph(
                         device=device,
@@ -289,21 +305,17 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
-            # Drop the ref_code prefix from the decoded waveform, keeping only newly generated audio.
-            if ctx_frames <= 0:
-                expected_len = actual_frames * upsample
-                if wav.shape[0] > expected_len:
-                    wav = wav[:expected_len]
-            else:
-                cut = int(ctx_frames / max(actual_frames, 1) * wav.shape[0])
-                if cut >= wav.shape[0]:
-                    logger.warning(
-                        "Context trim %d >= decoded length %d; returning empty audio.",
-                        cut,
-                        wav.shape[0],
-                    )
-                    continue
-                wav = wav[cut:]
+            # Slice on exact codec-frame boundaries instead of proportionally.
+            start = max(0, ctx_frames * upsample)
+            end = max(start, actual_frames * upsample)
+            if start >= wav.shape[0]:
+                logger.warning(
+                    "Context trim start %d >= decoded length %d; returning empty audio.",
+                    start,
+                    wav.shape[0],
+                )
+                continue
+            wav = wav[start : min(end, wav.shape[0])]
             if wav.shape[0] > 0:
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 

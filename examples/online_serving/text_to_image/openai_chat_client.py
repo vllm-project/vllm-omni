@@ -28,6 +28,8 @@ def generate_image(
     lora_name: str | None = None,
     lora_scale: float | None = None,
     lora_int_id: int | None = None,
+    use_system_prompt: str | None = None,
+    system_prompt: str | None = None,
 ) -> bytes | None:
     """Generate an image using the images generation API.
 
@@ -45,6 +47,8 @@ def generate_image(
         lora_name: LoRA name (optional, defaults to path stem)
         lora_scale: LoRA scale factor (default: 1.0)
         lora_int_id: LoRA integer ID (optional, derived from path if not provided)
+        use_system_prompt: System prompt for generation.
+        system_prompt: Custom system prompt.
 
     Returns:
         Image bytes or None if failed
@@ -70,7 +74,10 @@ def generate_image(
         payload["negative_prompt"] = negative_prompt
     if seed is not None:
         payload["seed"] = seed
-
+    if use_system_prompt is not None:
+        payload["use_system_prompt"] = use_system_prompt
+    if system_prompt is not None:
+        payload["system_prompt"] = system_prompt
     # Add LoRA if provided
     if lora_path:
         lora_body: dict = {
@@ -128,9 +135,21 @@ def main():
         default=None,
         help="LoRA integer id (cache key). If omitted, the server derives a stable id from lora_path.",
     )
-
+    parser.add_argument(
+        "--use-system-prompt",
+        type=str,
+        default=None,
+        help=(
+            "System prompt for generation. Use predefined types: 'en_unified', 'en_vanilla', 'en_recaption', 'en_think_recaption', 'dynamic', or 'None'; Or provide custom text string directly. Recommended en_unified. "
+        ),
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=("Custom system prompt. Used when --use-system-prompt is custom. "),
+    )
     args = parser.parse_args()
-
     print(f"Generating image for: {args.prompt}")
 
     image_bytes = generate_image(
@@ -146,6 +165,8 @@ def main():
         lora_name=args.lora_name,
         lora_scale=args.lora_scale if args.lora_path else None,
         lora_int_id=args.lora_int_id if args.lora_path else None,
+        use_system_prompt=args.use_system_prompt,
+        system_prompt=args.system_prompt,
     )
 
     if image_bytes:

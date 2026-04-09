@@ -99,6 +99,7 @@ nav:
       - design/feature/ray_based_execution.md
       - design/feature/omni_connectors/
       - design/feature/cfg_parallel.md
+      - design/feature/expert_parallel.md
       - design/feature/sequence_parallel.md
       - design/feature/tensor_parallel.md
       - design/feature/vae_parallel.md
