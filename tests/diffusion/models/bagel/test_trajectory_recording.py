@@ -24,15 +24,15 @@ EXPECTED_STEPS = NUM_TIMESTEPS - 1
 
 
 def _make_mock_bagel():
-    """Create a mock Bagel with _forward_flow returning constant velocity."""
+    """Create a mock Bagel with forward returning constant velocity."""
     mock = MagicMock(spec=Bagel)
     mock._sp_size = 1
 
-    # _forward_flow returns a small constant velocity so x_t changes each step
-    def fake_forward_flow(self, x_t, **kwargs):
+    # forward returns a small constant velocity so x_t changes each step
+    def fake_forward(self, x_t, **kwargs):
         return torch.ones_like(x_t) * 0.1
 
-    mock._forward_flow = types.MethodType(fake_forward_flow, mock)
+    mock.forward = types.MethodType(fake_forward, mock)
     # _merge_naive_caches is called in the batched CFG path
     mock._merge_naive_caches = types.MethodType(lambda self, caches: NaiveCache(1), mock)
 
