@@ -26,6 +26,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.magi_integration import apply_magi_to_qwen_decoder_layers
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerDummyInputsBuilder,
@@ -80,6 +81,11 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             architectures=["Qwen2ForCausalLM_old"],
         )
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+
+        apply_magi_to_qwen_decoder_layers(
+            self.language_model,
+            model_tag_prefix="qwen2_5_omni_talker",
+        )
 
         # suppress start id
         self.suppress_start_id = None
