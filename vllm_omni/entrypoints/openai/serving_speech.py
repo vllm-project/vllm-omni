@@ -945,9 +945,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return None
 
     def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Validate Fish Speech request parameters. Returns error message or None."""
+        """Validate Fish Speech request parameters. Returns error message or None.
+
+        Side effect: if request.voice references an uploaded speaker, resolves
+        it to request.ref_audio and request.ref_text for voice cloning.
+        """
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
+
+        # Support uploaded voices: auto-resolve voice → ref_audio + ref_text.
+        if request.voice is not None and request.ref_audio is None:
+            voice_lower = request.voice.lower()
+            if voice_lower in self.uploaded_speakers:
+                speaker_info = self.uploaded_speakers[voice_lower]
+                file_path = Path(speaker_info["file_path"])
+                if not file_path.exists():
+                    return f"Audio file for uploaded voice '{request.voice}' not found on disk"
+                audio_data_url = self._get_uploaded_audio_data(voice_lower)
+                if audio_data_url is None:
+                    return f"Could not load audio for uploaded voice '{request.voice}'"
+                request.ref_audio = audio_data_url
+                # Use ref_text from upload metadata if not provided in request.
+                if not request.ref_text or not request.ref_text.strip():
+                    upload_ref_text = speaker_info.get("ref_text")
+                    if upload_ref_text and upload_ref_text.strip():
+                        request.ref_text = upload_ref_text
 
         if request.ref_audio is not None:
             fmt_err = self._validate_ref_audio_format(request.ref_audio)
@@ -1303,13 +1325,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Structured clone: scalars (not list-wrapped) because model-side
         # preprocess() consumes per-request fields directly.
-        additional_information = {
+        additional_information: dict[str, Any] = {
             "text": normalized_text,
             "ref_text": normalized_ref_text,
             "ref_audio_wav": torch.from_numpy(np.asarray(wav_samples, dtype=np.float32)),
             "ref_audio_sr": int(sr),
             "fish_structured_voice_clone": True,
         }
+        # Pass voice identity for model-side DAC code caching.
+        if request.voice is not None:
+            voice_lower = request.voice.lower()
+            if voice_lower in self.uploaded_speakers:
+                additional_information["voice_name"] = voice_lower
+                additional_information["voice_created_at"] = self.uploaded_speakers[voice_lower].get("created_at", 0)
         if request.max_new_tokens is not None:
             additional_information["max_new_tokens"] = request.max_new_tokens
         return {
