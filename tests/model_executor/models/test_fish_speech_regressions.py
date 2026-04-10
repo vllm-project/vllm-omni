@@ -13,11 +13,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeCodec:
-    def decode(self, codes_bqf: torch.Tensor, feature_lengths: torch.Tensor):
-        del codes_bqf, feature_lengths
-        wav = torch.arange(100, dtype=torch.float32).view(1, 1, 100)
-        audio_lengths = torch.tensor([100], dtype=torch.long)
-        return wav, audio_lengths
+    def from_indices(self, codes_bqf: torch.Tensor):
+        del codes_bqf
+        return torch.arange(100, dtype=torch.float32).view(1, 1, 100)
 
 
 class _FakeTokenizer:
