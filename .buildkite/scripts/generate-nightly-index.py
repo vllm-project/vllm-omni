@@ -4,14 +4,13 @@
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
-
-import regex as re
 
 
 def normalize_package_name(name: str) -> str:

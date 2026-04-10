@@ -67,13 +67,17 @@ if current_omni_platform.is_xpu():
 
 # Create parameter combinations for model and stage config
 test_params = [
-    pytest.param(OmniServerParams(model=model, stage_config_path=default_path), id="default"),
-    pytest.param(OmniServerParams(model=model, stage_config_path=get_chunk_config(default_path)), id="async_chunk"),
+    pytest.param(OmniServerParams(model=model, stage_config_path=default_path, use_stage_cli=True), id="default"),
+    pytest.param(
+        OmniServerParams(model=model, stage_config_path=get_chunk_config(default_path), use_stage_cli=True),
+        id="async_chunk",
+    ),
 ]
 
 test_token_params = [
     pytest.param(
-        OmniServerParams(model=model, stage_config_path=get_batch_token_config(default_path)), id="batch_token_64"
+        OmniServerParams(model=model, stage_config_path=get_batch_token_config(default_path), use_stage_cli=True),
+        id="batch_token_64",
     )
 ]
 

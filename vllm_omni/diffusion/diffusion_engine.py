@@ -166,7 +166,6 @@ class DiffusionEngine:
             exec_total_time=exec_total_time,
             diffusion_engine_start_time=diffusion_engine_start_time,
         )
-
     @staticmethod
     def make_engine(
         config: OmniDiffusionConfig,
@@ -549,7 +548,7 @@ class DiffusionEngine:
         metrics: dict[str, float | int],
         diffusion_output: DiffusionOutput,
         model_outputs_audio: bool,
-        request_mm_audio: Any = None,
+        request_multimodal_output: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build one public response object from per-request payloads.
 
@@ -564,8 +563,8 @@ class DiffusionEngine:
                 latents and auxiliary metadata.
             model_outputs_audio: Whether the primary model output modality is
                 audio instead of images.
-            request_mm_audio: Optional secondary audio payload attached under
-                ``multimodal_output`` for image-producing models.
+            request_multimodal_output: Optional per-request multimodal payload
+                attached under ``multimodal_output``.
 
         Returns:
             The final ``OmniRequestOutput`` for one logical request.
@@ -577,25 +576,29 @@ class DiffusionEngine:
             the historical diffusion response contract for callers that already
             expect those fields to be available on each logical result.
         """
+        request_multimodal_output = request_multimodal_output or {}
+
         if model_outputs_audio:
             request_audio_payload = request_outputs
             if isinstance(request_outputs, (list, tuple)) and len(request_outputs) == 1:
                 request_audio_payload = request_outputs[0]
+            multimodal_output = {"audio": request_audio_payload}
+            multimodal_output.update(request_multimodal_output)
             return OmniRequestOutput.from_diffusion(
                 request_id=request_id,
                 images=[],
                 prompt=prompt,
                 metrics=metrics,
                 latents=diffusion_output.trajectory_latents,
-                multimodal_output={"audio": request_audio_payload},
+                trajectory_latents=diffusion_output.trajectory_latents,
+                trajectory_timesteps=diffusion_output.trajectory_timesteps,
+                trajectory_log_probs=diffusion_output.trajectory_log_probs,
+                trajectory_decoded=diffusion_output.trajectory_decoded,
+                multimodal_output=multimodal_output,
                 final_output_type="audio",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
             )
-
-        multimodal_output = {}
-        if request_mm_audio is not None:
-            multimodal_output["audio"] = request_mm_audio
 
         return OmniRequestOutput.from_diffusion(
             request_id=request_id,
@@ -603,8 +606,12 @@ class DiffusionEngine:
             prompt=prompt,
             metrics=metrics,
             latents=diffusion_output.trajectory_latents,
+            trajectory_latents=diffusion_output.trajectory_latents,
+            trajectory_timesteps=diffusion_output.trajectory_timesteps,
+            trajectory_log_probs=diffusion_output.trajectory_log_probs,
+            trajectory_decoded=diffusion_output.trajectory_decoded,
             custom_output=diffusion_output.custom_output or {},
-            multimodal_output=multimodal_output,
+            multimodal_output=request_multimodal_output,
             stage_durations=diffusion_output.stage_durations,
             peak_memory_mb=diffusion_output.peak_memory_mb,
         )
@@ -654,8 +661,12 @@ class DiffusionEngine:
         postprocess_start_time = time.perf_counter()
         outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
         audio_payload = None
+        model_audio_sample_rate = None
+        model_fps = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
+            model_audio_sample_rate = outputs.get("audio_sample_rate")
+            model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
@@ -711,9 +722,9 @@ class DiffusionEngine:
                     request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
                 output_idx = end_idx
 
-            request_mm_audio = None
+            request_multimodal_output: dict[str, Any] = {}
             if not model_outputs_audio and audio_payload is not None:
-                request_mm_audio = (
+                request_multimodal_output["audio"] = (
                     audio_payload
                     if single_request
                     else self._extract_audio_slice(
@@ -723,6 +734,10 @@ class DiffusionEngine:
                         num_outputs=num_outputs,
                     )
                 )
+            if model_audio_sample_rate is not None:
+                request_multimodal_output["audio_sample_rate"] = model_audio_sample_rate
+            if model_fps is not None:
+                request_multimodal_output["fps"] = model_fps
 
             results.append(
                 self._build_request_output(
@@ -732,7 +747,7 @@ class DiffusionEngine:
                     metrics=metrics,
                     diffusion_output=output,
                     model_outputs_audio=model_outputs_audio,
-                    request_mm_audio=request_mm_audio,
+                    request_multimodal_output=request_multimodal_output,
                 )
             )
 

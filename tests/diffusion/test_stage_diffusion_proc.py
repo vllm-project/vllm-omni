@@ -219,3 +219,47 @@ async def test_handle_collective_rpc_uses_submit_rpc_and_merges_lora_ids() -> No
         )
     finally:
         proc.close()
+
+
+@pytest.mark.asyncio
+async def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info() -> None:
+    """Preserve parent request metadata when building batched engine requests."""
+    engine = SimpleNamespace(close=Mock())
+    proc = _make_proc(engine)
+    proc._reconstruct_sampling_params = Mock(return_value=OmniDiffusionSamplingParams())
+    captured: dict[str, object] = {}
+
+    async def execute_step_request_async(request):
+        """Capture the built engine request and return two prompt results."""
+        captured["request"] = request
+        return [
+            OmniRequestOutput.from_diffusion(
+                request_id="req-parent-0",
+                images=["img-1"],
+                prompt="hello",
+            ),
+            OmniRequestOutput.from_diffusion(
+                request_id="req-parent-1",
+                images=["img-2"],
+                prompt="world",
+            ),
+        ]
+
+    proc._execute_step_request_async = AsyncMock(side_effect=execute_step_request_async)
+
+    try:
+        result = await proc._process_batch_request(
+            request_id="req-parent",
+            prompts=["hello", "world"],
+            sampling_params_dict={},
+            kv_sender_info={0: {"host": "10.0.0.2", "zmq_port": 50151}},
+        )
+
+        request = captured["request"]
+        assert request.request_id == "req-parent"
+        assert request.request_ids == ["req-parent-0", "req-parent-1"]
+        assert request.kv_sender_info == {0: {"host": "10.0.0.2", "zmq_port": 50151}}
+        assert result.request_id == "req-parent"
+        assert result.images == ["img-1", "img-2"]
+    finally:
+        proc.close()
