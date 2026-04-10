@@ -18,7 +18,6 @@ import asyncio
 import logging
 import math
 import os
-import tempfile
 import time
 
 import numpy as np
@@ -88,17 +87,10 @@ def build_prompt(
         semantic_len,
     )
 
-    # The model-side structured clone prefill consumes a temporary .npy file and
-    # removes it after loading. Abnormal termination can still leave the file
-    # behind, which is acceptable for this offline example.
-    with tempfile.NamedTemporaryFile(prefix="fish_ref_", suffix=".npy", delete=False) as f:
-        np.save(f, np.asarray(ref_audio_wav, dtype=np.float32))
-        ref_audio_npy_path = f.name
-
     additional_information = {
         "text": normalized_text,
         "ref_text": normalized_ref_text,
-        "ref_audio_path": ref_audio_npy_path,
+        "ref_audio_wav": torch.from_numpy(np.asarray(ref_audio_wav, dtype=np.float32)),
         "ref_audio_sr": int(ref_audio_sr),
         "fish_structured_voice_clone": True,
     }
