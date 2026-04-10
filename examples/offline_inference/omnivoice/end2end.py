@@ -103,9 +103,9 @@ def run_e2e():
         if not os.path.exists(args.ref_audio):
             raise FileNotFoundError(f"Reference audio not found: {args.ref_audio}")
 
-        import librosa
+        from vllm.multimodal.media.audio import load_audio
 
-        audio_signal, sr = librosa.load(args.ref_audio, sr=None)
+        audio_signal, sr = load_audio(args.ref_audio, sr=None)
         multi_modal_data["audio"] = (audio_signal.astype(np.float32), sr)
         mm_processor_kwargs["ref_text"] = args.ref_text or ""
         mm_processor_kwargs["sample_rate"] = sr

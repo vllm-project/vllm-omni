@@ -13,7 +13,6 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from librosa.filters import mel as librosa_mel_fn
 from transformers import AutoTokenizer
 from transformers.activations import ACT2FN
 from transformers.utils.hub import cached_file
@@ -27,6 +26,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, 
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
@@ -258,14 +258,19 @@ def mel_spectrogram(
     fmax: int | None = None,
     center: bool = False,
 ) -> torch.Tensor:
-    """Calculate mel spectrogram of an input signal using librosa mel filterbank and torch STFT."""
+    """Calculate mel spectrogram of an input signal using torchaudio mel filterbank and torch STFT."""
     if torch.min(y) < -1.0:
         logger.warning("Min value of input waveform signal is %s", torch.min(y))
     if torch.max(y) > 1.0:
         logger.warning("Max value of input waveform signal is %s", torch.max(y))
     device = y.device
-    mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
-    mel_basis = torch.from_numpy(mel).float().to(device)
+    mel_basis = mel_filter_bank(
+        sr=sampling_rate,
+        n_fft=n_fft,
+        n_mels=num_mels,
+        fmin=fmin,
+        fmax=fmax,
+    ).to(device)
     hann_window = torch.hann_window(win_size).to(device)
     padding = (n_fft - hop_size) // 2
     y = torch.nn.functional.pad(y.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
@@ -871,7 +876,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         Uses upstream vLLM's MediaConnector for http(s) URLs and ``file:``
         URIs, with unrestricted local access (offline inference is trusted).
         """
-        import librosa
+        from vllm.multimodal.media.audio import load_audio
 
         if self._is_url(x):
             from vllm.multimodal.media import MediaConnector
@@ -883,7 +888,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)
         else:
-            audio, sr = librosa.load(x, sr=None, mono=True)
+            audio, sr = load_audio(x, sr=None, mono=True)
 
         if isinstance(audio, np.ndarray) and audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
@@ -1089,9 +1094,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Resample to 24kHz for speaker encoder.
         target_sr = int(getattr(self.config.speaker_encoder_config, "sample_rate", 24000))
         if sr != target_sr:
-            import librosa
+            from vllm.multimodal.audio import resample_audio_resampy
 
-            wav = librosa.resample(y=wav.astype(np.float32), orig_sr=int(sr), target_sr=target_sr)
+            wav = resample_audio_resampy(wav.astype(np.float32), orig_sr=int(sr), target_sr=target_sr)
             sr = target_sr
 
         # Follow official implementation: mel_spectrogram expects 24kHz.
