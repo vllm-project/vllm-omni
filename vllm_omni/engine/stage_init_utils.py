@@ -101,6 +101,34 @@ def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
         raise ValueError(f"Unknown worker_type: {worker_type}")
 
 
+def inject_kv_stage_info(stage_cfg: Any, stage_id: int) -> None:
+    """Inject stage metadata into omni_kv_config when present."""
+    try:
+        engine_args = stage_cfg.engine_args
+        if hasattr(engine_args, "get"):
+            omni_kv = engine_args.get("omni_kv_config", None)
+        else:
+            omni_kv = getattr(engine_args, "omni_kv_config", None)
+
+        if omni_kv is None:
+            return
+
+        if hasattr(omni_kv, "setdefault"):
+            omni_kv.setdefault("stage_id", stage_id)
+        elif hasattr(omni_kv, "__setitem__"):
+            if "stage_id" not in omni_kv:
+                omni_kv["stage_id"] = stage_id
+
+        engine_input_source = getattr(stage_cfg, "engine_input_source", None)
+        if engine_input_source is not None:
+            if hasattr(omni_kv, "setdefault"):
+                omni_kv.setdefault("engine_input_source", list(engine_input_source))
+            elif hasattr(omni_kv, "__setitem__") and "engine_input_source" not in omni_kv:
+                omni_kv["engine_input_source"] = list(engine_input_source)
+    except Exception as e:
+        logger.debug("Failed to inject stage info into omni_kv_config: %s", e)
+
+
 @dataclass
 class StageMetadata:
     """Lightweight stage attributes extracted from stage_config."""
@@ -129,8 +157,10 @@ class StartedLlmStage:
     metadata: Any
     vllm_config: Any
     executor_class: type
-    proc: Any
     addresses: Any
+    proc: Any = None
+    engine_manager: Any = None
+    coordinator: Any = None
 
 
 def extract_stage_metadata(stage_config: Any) -> StageMetadata:
@@ -263,6 +293,7 @@ def build_vllm_config(
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
     engine_args_dict: dict[str, Any] | None = None,
+    headless: bool = False,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
 
@@ -278,7 +309,10 @@ def build_vllm_config(
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
-    vllm_config = omni_engine_args.create_engine_config(usage_context=UsageContext.LLM_CLASS)
+    vllm_config = omni_engine_args.create_engine_config(
+        usage_context=UsageContext.LLM_CLASS,
+        headless=headless,
+    )
     executor_class = Executor.get_class(vllm_config)
 
     return vllm_config, executor_class
@@ -445,6 +479,37 @@ def get_stage_connector_spec(
     return {}
 
 
+def build_diffusion_config(
+    model: str,
+    stage_cfg: Any,
+    metadata: StageMetadata,
+) -> Any:
+    """Build diffusion config for a stage."""
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    engine_args_dict = build_engine_args_dict(stage_cfg, model)
+    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
+
+    num_devices_per_stage = od_config.parallel_config.world_size
+    device_control_env = current_omni_platform.device_control_env_var
+    visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
+    if visible_devices_str:
+        physical_devices = [device.strip() for device in visible_devices_str.split(",") if device.strip()]
+    else:
+        physical_devices = list(range(current_omni_platform.get_device_count()))
+
+    if len(physical_devices) < num_devices_per_stage:
+        raise ValueError(
+            f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+            f"but {len(physical_devices)} device(s) are available: {physical_devices}"
+        )
+
+    od_config.num_gpus = num_devices_per_stage
+    if metadata.cfg_kv_collect_func is not None:
+        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
+    return od_config
+
+
 def initialize_diffusion_stage(
     model: str,
     stage_cfg: Any,
@@ -461,30 +526,9 @@ def initialize_diffusion_stage(
             diffusion engine.  Passed through to ``StageDiffusionClient``
             and ultimately to ``AsyncOmni``.
     """
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
-    od_config = OmniDiffusionConfig.from_kwargs(
-        model=model,
-        **_to_dict(stage_cfg.engine_args),
-    )
-    num_devices_per_stage = od_config.parallel_config.world_size
-    device_control_env = current_omni_platform.device_control_env_var
-    visible_devices_str = os.environ.get(device_control_env)
-    if visible_devices_str:
-        physical_devices = [device.strip() for device in visible_devices_str.split(",") if device.strip()]
-    else:
-        physical_devices = list(range(current_omni_platform.get_device_count()))
-
-    if len(physical_devices) < num_devices_per_stage:
-        raise ValueError(
-            f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
-            f"but {len(physical_devices)} device(s) are available: {physical_devices}"
-        )
-
-    od_config.num_gpus = num_devices_per_stage
-    if metadata.cfg_kv_collect_func is not None:
-        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
+    od_config = build_diffusion_config(model, stage_cfg, metadata)
     return StageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
 
 
@@ -518,17 +562,18 @@ def _shutdown_or_close_resource(resource: Any, resource_name: str, stage_id: int
 
 
 def close_started_llm_stage(started: StartedLlmStage) -> None:
-    """Terminate the subprocess owned by a launched stage that never attached."""
-    if started.proc is None:
-        return
-    try:
-        terminate_alive_proc(started.proc)
-    except Exception as cleanup_error:
-        logger.warning(
-            "[stage_init] Failed to terminate process for stage %s: %s",
-            started.stage_id,
-            cleanup_error,
-        )
+    """Release resources owned by a launched stage that never attached."""
+    if started.proc is not None:
+        try:
+            terminate_alive_proc(started.proc)
+        except Exception as cleanup_error:
+            logger.warning(
+                "[stage_init] Failed to terminate process for stage %s: %s",
+                started.stage_id,
+                cleanup_error,
+            )
+    _shutdown_or_close_resource(started.engine_manager, "engine manager", started.stage_id)
+    _shutdown_or_close_resource(started.coordinator, "coordinator", started.stage_id)
 
 
 def finalize_initialized_stages(

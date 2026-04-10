@@ -73,6 +73,8 @@ class OmniServerParams(NamedTuple):
     server_args: list[str] | None = None
     env_dict: dict[str, str] | None = None
     use_omni: bool = True
+    use_stage_cli: bool = False
+    init_timeout: int | None = None
 
 
 def assert_image_diffusion_response(
@@ -1546,6 +1548,183 @@ class OmniServer:
         cleanup_dist_env_and_memory()
 
 
+class OmniServerStageCli(OmniServer):
+    """Omni server harness that exercises the stage CLI flow."""
+
+    def __init__(
+        self,
+        model: str,
+        stage_config_path: str,
+        serve_args: list[str] | None = None,
+        *,
+        stage_ids: list[int] | None = None,
+        port: int | None = None,
+        env_dict: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(model, serve_args or [], port=port, env_dict=env_dict, use_omni=True)
+        self.stage_config_path = stage_config_path
+        self.master_port = get_open_port()
+        self.visible_device_list = self._load_visible_device_list(env_dict)
+        self.stage_runtime_devices = self._load_stage_runtime_devices(stage_config_path)
+        self.stage_ids = stage_ids or self._load_stage_ids(stage_config_path)
+        if 0 not in self.stage_ids:
+            raise ValueError(f"Stage CLI test requires stage_id=0 in config: {stage_config_path}")
+        self.stage_procs: dict[int, subprocess.Popen] = {}
+        self.proc = None
+
+    @staticmethod
+    def _load_stage_ids(stage_config_path: str) -> list[int]:
+        with open(stage_config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
+        if not stage_ids:
+            raise ValueError(f"No stage IDs found in config: {stage_config_path}")
+        return stage_ids
+
+    @staticmethod
+    def _load_stage_runtime_devices(stage_config_path: str) -> dict[int, str]:
+        with open(stage_config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        runtime_devices: dict[int, str] = {}
+        for stage in cfg.get("stage_args", []):
+            stage_id = stage.get("stage_id")
+            devices = stage.get("runtime", {}).get("devices")
+            if stage_id is not None and devices:
+                runtime_devices[int(stage_id)] = str(devices)
+        return runtime_devices
+
+    @classmethod
+    def _parse_device_list(cls, devices: str | int) -> list[str]:
+        if isinstance(devices, int):
+            if devices < 0:
+                raise ValueError("Device IDs must be non-negative integers")
+            return [str(devices)]
+        return [token.strip() for token in str(devices).split(",") if token.strip()]
+
+    @classmethod
+    def _load_visible_device_list(cls, env_dict: dict[str, str] | None) -> list[str] | None:
+        env = os.environ.copy()
+        if env_dict is not None:
+            env.update(env_dict)
+
+        env_var = getattr(current_omni_platform, "device_control_env_var", None)
+        if env_var and env_var in env:
+            return [token.strip() for token in env[env_var].split(",") if token.strip()]
+        return None
+
+    @classmethod
+    def _map_stage_devices(cls, stage_id: int, visible_device_list: list[str] | None, devices: str) -> str:
+        device_list = cls._parse_device_list(devices)
+
+        if visible_device_list is None:
+            return ",".join(device_list)
+
+        if not all(device.isdigit() for device in device_list):
+            raise ValueError("Logical devices must be non-negative integers")
+
+        logical_ids = [int(device) for device in device_list]
+        if logical_ids and max(logical_ids) >= len(visible_device_list):
+            raise ValueError(
+                f"Stage {stage_id} has logical IDs {device_list}, one or more of which exceed the number of visible devices"
+            )
+
+        return ",".join(visible_device_list[idx] for idx in logical_ids)
+
+    def _set_stage_device_env(self, stage_id: int, env: dict[str, str], devices: str) -> None:
+        mapped_devices = self._map_stage_devices(stage_id, self.visible_device_list, devices)
+        env_var = getattr(current_omni_platform, "device_control_env_var", None)
+        if env_var:
+            env[env_var] = mapped_devices
+
+    def _build_stage_cmd(self, stage_id: int, *, headless: bool) -> list[str]:
+        cmd = [
+            sys.executable,
+            "-m",
+            "vllm_omni.entrypoints.cli.main",
+            "serve",
+            self.model,
+            "--omni",
+            "--stage-configs-path",
+            self.stage_config_path,
+            "--stage-id",
+            str(stage_id),
+            "--omni-master-address",
+            self.host,
+            "--omni-master-port",
+            str(self.master_port),
+        ]
+
+        if headless:
+            cmd.append("--headless")
+        else:
+            cmd += ["--host", self.host, "--port", str(self.port)]
+
+        cmd += self.serve_args
+        return cmd
+
+    def _launch_stage(self, stage_id: int, *, headless: bool) -> None:
+        env = os.environ.copy()
+        env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        if self.env_dict is not None:
+            env.update(self.env_dict)
+
+        devices = self.stage_runtime_devices.get(stage_id)
+        if devices:
+            self._set_stage_device_env(stage_id, env, devices)
+
+        cmd = self._build_stage_cmd(stage_id, headless=headless)
+        print(f"Launching OmniServerStageCli stage {stage_id}: {' '.join(cmd)}")
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        self.stage_procs[stage_id] = proc
+        if stage_id == 0:
+            self.proc = proc
+
+    def _ensure_stage_processes_alive(self) -> None:
+        for stage_id, proc in self.stage_procs.items():
+            ret = proc.poll()
+            if ret is not None:
+                raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.")
+
+    def _start_server(self) -> None:
+        ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
+
+        self._launch_stage(0, headless=False)
+        time.sleep(2)
+        self._ensure_stage_processes_alive()
+
+        for stage_id in ordered_stage_ids[1:]:
+            self._launch_stage(stage_id, headless=True)
+
+        max_wait = 1200
+        start_time = time.time()
+        while time.time() - start_time < max_wait:
+            self._ensure_stage_processes_alive()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                result = sock.connect_ex((self.host, self.port))
+                if result == 0:
+                    print(f"OmniServerStageCli ready on {self.host}:{self.port}")
+                    return
+            time.sleep(2)
+
+        raise RuntimeError(f"OmniServerStageCli failed to start within {max_wait} seconds")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for stage_id in sorted(self.stage_procs, reverse=True):
+            proc = self.stage_procs[stage_id]
+            if proc.poll() is None:
+                self._kill_process_tree(proc.pid)
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
+        cleanup_dist_env_and_memory()
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--run-level",
@@ -1568,9 +1747,11 @@ _omni_server_lock = threading.Lock()
 
 @pytest.fixture(scope="module")
 def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: str) -> Generator[OmniServer, Any, None]:
-    """Start vLLM-Omni server as a subprocess with actual model weights.
-    Uses session scope so the server starts only once for the entire test session.
-    Multi-stage initialization can take 10-20+ minutes.
+    """Start vLLM-Omni through the standard or stage-CLI launcher.
+
+    The fixture stays module-scoped because multi-stage initialization is costly.
+    The ``use_stage_cli`` flag on ``OmniServerParams`` routes the setup through the
+    stage-CLI harness while still reusing the same fixture grouping semantics.
     """
     with _omni_server_lock:
         params: OmniServerParams = request.param
@@ -1589,28 +1770,47 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         server_args = params.server_args or []
         if params.use_omni:
             server_args = ["--stage-init-timeout", "120", *server_args]
-        if stage_config_path is not None:
-            server_args += ["--stage-configs-path", stage_config_path]
+        if params.init_timeout is not None:
+            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+        if params.use_stage_cli:
+            if not params.use_omni:
+                raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
+            if stage_config_path is None:
+                raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
 
-        with (
-            OmniServer(
+            with OmniServerStageCli(
                 model,
+                stage_config_path,
                 server_args,
                 port=port,
                 env_dict=params.env_dict,
-                use_omni=params.use_omni,
-            )
-            if port
-            else OmniServer(
-                model,
-                server_args,
-                env_dict=params.env_dict,
-                use_omni=params.use_omni,
-            )
-        ) as server:
-            print("OmniServer started successfully")
-            yield server
-            print("OmniServer stopping...")
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+        else:
+            if stage_config_path is not None:
+                server_args += ["--stage-configs-path", stage_config_path]
+
+            with (
+                OmniServer(
+                    model,
+                    server_args,
+                    port=port,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+                if port
+                else OmniServer(
+                    model,
+                    server_args,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
 
         print("OmniServer stopped")
 
@@ -2653,10 +2853,11 @@ class OpenAIClientHandler:
 
 
 @pytest.fixture
-def openai_client(omni_server: OmniServer, run_level: str):
+def openai_client(request: pytest.FixtureRequest, run_level: str):
     """Create OpenAIClientHandler fixture to facilitate communication with OmniServer
     with encapsulated request sending, concurrent requests, response handling, and validation."""
-    return OpenAIClientHandler(host=omni_server.host, port=omni_server.port, api_key="EMPTY", run_level=run_level)
+    server = request.getfixturevalue("omni_server")
+    return OpenAIClientHandler(host=server.host, port=server.port, api_key="EMPTY", run_level=run_level)
 
 
 class OmniRunner:

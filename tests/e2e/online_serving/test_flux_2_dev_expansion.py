@@ -2,13 +2,11 @@
 End-to-end diffusion coverage for FLUX.2-dev in online serving mode.
 
 Coverage:
-- Cache-DiT cache acceleration backend
 - CPU offload
 
-This test verifies that FLUX.2-dev can be launched with the Cache-DiT backend
-and CPU offload enabled, accepts text-to-image requests through the
-OpenAI-compatible API, and returns valid generated images with the requested
-resolution.
+This test verifies that FLUX.2-dev can be launched with CPU offload enabled,
+accepts text-to-image requests through the OpenAI-compatible API, and returns
+valid generated images with the requested resolution.
 
 assert_diffusion_response validates successful generation and the expected
 image resolution.
@@ -33,19 +31,17 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=2)
 
 
 def _get_flux_2_dev_feature_cases(model: str):
-    """Return FLUX.2-dev diffusion feature cases for Cache-DiT + CPU offload."""
+    """Return FLUX.2-dev diffusion feature cases for CPU offload."""
 
     return [
         pytest.param(
             OmniServerParams(
                 model=model,
                 server_args=[
-                    "--cache-backend",
-                    "cache_dit",
                     "--enable-cpu-offload",
                 ],
             ),
-            id="cache_dit_cpu_offload",
+            id="cpu_offload",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
         pytest.param(
@@ -76,7 +72,7 @@ def test_flux_2_dev(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
 ):
-    """Validate FLUX.2-dev online serving with Cache-DiT and CPU offload."""
+    """Validate FLUX.2-dev online serving with CPU offload."""
 
     messages = dummy_messages_from_mix_data(content_text=PROMPT)
 

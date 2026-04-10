@@ -353,7 +353,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     try:
         await shutdown_task
     finally:
-        serving_speech = getattr(getattr(app, "state", None), "openai_serving_speech", None)
+        state = getattr(app, "state", None)
+        serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
         if serving_speech is not None:
             serving_speech.shutdown()
         sock.close()
