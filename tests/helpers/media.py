@@ -2,7 +2,6 @@
 
 import base64
 import concurrent.futures
-import datetime
 import gc
 import io
 import logging
@@ -15,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,15 +24,71 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def _resolve_synthetic_media_cache_dir(cache_dir: Path | str | None) -> Path:
+    if cache_dir is not None:
+        return Path(cache_dir).expanduser().resolve()
+    return Path(tempfile.gettempdir()) / "vllm_omni_test_synthetic_media"
+
+
+def _np_array_from_mp4_bytes(video_bytes: bytes) -> np.ndarray:
+    """Decode MP4 bytes to a (T, H, W, 3) uint8 RGB stack (matches in-memory synthetic frames)."""
+    import cv2
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(video_bytes)
+        path = tmp.name
+    cap = None
+    try:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open cached synthetic video for decode")
+        frames: list[np.ndarray] = []
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        if not frames:
+            raise RuntimeError("Cached synthetic video has no decodable frames")
+        return np.stack(frames, axis=0)
+    finally:
+        if cap is not None:
+            cap.release()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def generate_synthetic_audio(
     duration: int,
     num_channels: int,
     sample_rate: int = 48000,
-    save_to_file: bool = False,
+    *,
+    force_regenerate: bool = False,
+    cache_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """
     Generate TTS speech with pyttsx3 and return base64 string.
+
+    Caches the WAV under ``cache_dir`` when given, else under the default temp
+    subdirectory. Reuses the file when the same
+    ``duration`` / ``num_channels`` / ``sample_rate`` are requested unless
+    ``force_regenerate`` is true.
     """
+    root = _resolve_synthetic_media_cache_dir(cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    cache_path = root / f"synth_audio_d{duration}_ch{num_channels}_sr{sample_rate}.wav"
+
+    if not force_regenerate and cache_path.is_file():
+        data, _sr = sf.read(str(cache_path), dtype="float32", always_2d=True)
+        audio_bytes = cache_path.read_bytes()
+        return {
+            "np_array": np.asarray(data, dtype=np.float32),
+            "base64": base64.b64encode(audio_bytes).decode("utf-8"),
+            "file_path": str(cache_path.resolve()),
+        }
+
     import pyttsx3
 
     def _pick_voice(engine: pyttsx3.Engine) -> str | None:
@@ -200,31 +256,14 @@ def generate_synthetic_audio(
     if max_amp > 0:
         audio_data = audio_data / max_amp * 0.95
 
-    audio_bytes: bytes | None = None
-    output_path: str | None = None
-    result: dict[str, Any] = {"np_array": audio_data.copy()}
+    sf.write(str(cache_path), audio_data, sample_rate, format="WAV", subtype="PCM_16")
+    audio_bytes = cache_path.read_bytes()
 
-    if save_to_file:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"audio_{num_channels}ch_{timestamp}.wav"
-        try:
-            sf.write(output_path, audio_data, sample_rate, format="WAV", subtype="PCM_16")
-            print(f"Audio saved: {output_path}")
-            with open(output_path, "rb") as f:
-                audio_bytes = f.read()
-        except Exception as e:
-            print(f"Save failed: {e}")
-            save_to_file = False
-
-    if not save_to_file or audio_bytes is None:
-        buffer = io.BytesIO()
-        sf.write(buffer, audio_data, sample_rate, format="WAV", subtype="PCM_16")
-        buffer.seek(0)
-        audio_bytes = buffer.read()
-
-    result["base64"] = base64.b64encode(audio_bytes).decode("utf-8")
-    result["file_path"] = output_path if save_to_file and output_path else None
-    return result
+    return {
+        "np_array": audio_data.copy(),
+        "base64": base64.b64encode(audio_bytes).decode("utf-8"),
+        "file_path": str(cache_path.resolve()),
+    }
 
 
 def _mux_mp4_bytes_with_synthetic_audio(
@@ -242,7 +281,6 @@ def _mux_mp4_bytes_with_synthetic_audio(
             duration=duration_int,
             num_channels=1,
             sample_rate=sample_rate,
-            save_to_file=False,
         )
         audio_pcm = audio_result["np_array"]
     except Exception as e:
@@ -303,10 +341,29 @@ def generate_synthetic_video(
     width: int,
     height: int,
     num_frames: int,
-    save_to_file: bool = False,
     *,
     embed_audio: bool = False,
+    force_regenerate: bool = False,
+    cache_dir: Path | str | None = None,
 ) -> dict[str, Any]:
+    """
+    Generate synthetic MP4 (optional AAC audio). Caches final bytes by
+    ``width`` / ``height`` / ``num_frames`` / ``embed_audio`` unless
+    ``force_regenerate`` is true. Cache root: ``cache_dir`` if given, else the
+    default temp subdirectory.
+    """
+    root = _resolve_synthetic_media_cache_dir(cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    cache_path = root / f"synth_video_w{width}_h{height}_nf{num_frames}_ea{int(embed_audio)}.mp4"
+
+    if not force_regenerate and cache_path.is_file():
+        video_bytes = cache_path.read_bytes()
+        return {
+            "np_array": _np_array_from_mp4_bytes(video_bytes),
+            "base64": base64.b64encode(video_bytes).decode("utf-8"),
+            "file_path": str(cache_path.resolve()),
+        }
+
     import cv2
     import imageio
 
@@ -369,24 +426,43 @@ def generate_synthetic_video(
         else video_only_bytes
     )
 
-    result: dict[str, Any] = {
+    cache_path.write_bytes(video_bytes)
+
+    return {
         "np_array": np.array(video_frames),
         "base64": base64.b64encode(video_bytes).decode("utf-8"),
+        "file_path": str(cache_path.resolve()),
     }
-    if save_to_file:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"video_{width}x{height}_{timestamp}.mp4"
-        try:
-            with open(output_path, "wb") as f:
-                f.write(video_bytes)
-            print(f"Video saved to: {output_path}")
-            result["file_path"] = output_path
-        except Exception as e:
-            print(f"Warning: Failed to save video to file {output_path}: {e}")
-    return result
 
 
-def generate_synthetic_image(width: int, height: int, save_to_file: bool = False) -> dict[str, Any]:
+def generate_synthetic_image(
+    width: int,
+    height: int,
+    *,
+    force_regenerate: bool = False,
+    cache_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """
+    Random colored squares on white background. Caches JPEG by ``width`` /
+    ``height`` unless ``force_regenerate`` is true. Cache root: ``cache_dir``
+    if given, else the default temp subdirectory.
+    """
+    root = _resolve_synthetic_media_cache_dir(cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    cache_path = root / f"synth_image_w{width}_h{height}.jpg"
+
+    if not force_regenerate and cache_path.is_file():
+        from PIL import Image as PILImage
+
+        image = PILImage.open(cache_path)
+        image.load()
+        image_bytes = cache_path.read_bytes()
+        return {
+            "np_array": np.array(image).copy(),
+            "base64": base64.b64encode(image_bytes).decode("utf-8"),
+            "file_path": str(cache_path.resolve()),
+        }
+
     from PIL import ImageDraw
 
     image = Image.new("RGB", (width, height), (255, 255, 255))
@@ -400,32 +476,14 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
         border_width = random.randint(1, 5)
         draw.rectangle([x, y, x + square_size, y + square_size], fill=color, outline=(0, 0, 0), width=border_width)
 
-    result: dict[str, Any] = {"np_array": np.array(image).copy()}
-    image_bytes: bytes | None = None
-    saved_file_path: str | None = None
-    if save_to_file:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"image_{width}x{height}_{timestamp}.jpg"
-        try:
-            image.save(output_path, format="JPEG", quality=85, optimize=True)
-            saved_file_path = output_path
-            print(f"Image saved to: {saved_file_path}")
-            with open(output_path, "rb") as f:
-                image_bytes = f.read()
-        except Exception as e:
-            print(f"Warning: Failed to save image to file {output_path}: {e}")
-            saved_file_path = None
-            image_bytes = None
-    if not save_to_file or image_bytes is None:
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=85, optimize=True)
-        buffer.seek(0)
-        image_bytes = buffer.read()
+    image.save(str(cache_path), format="JPEG", quality=85, optimize=True)
+    image_bytes = cache_path.read_bytes()
 
-    result["base64"] = base64.b64encode(image_bytes).decode("utf-8")
-    if save_to_file and saved_file_path:
-        result["file_path"] = saved_file_path
-    return result
+    return {
+        "np_array": np.array(image).copy(),
+        "base64": base64.b64encode(image_bytes).decode("utf-8"),
+        "file_path": str(cache_path.resolve()),
+    }
 
 
 def decode_b64_image(b64: str):
