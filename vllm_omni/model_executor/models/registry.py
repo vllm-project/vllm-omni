@@ -157,6 +157,11 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    "DyninOmniForConditionalGeneration": (
+        "dynin_omni",
+        "dynin_omni",
+        "DyninOmniForConditionalGeneration",
+    ),
 }
 
 

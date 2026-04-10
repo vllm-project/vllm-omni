@@ -92,9 +92,10 @@ def test_set_stage_devices_handles_not_enough_devices(mocker: MockerFixture, mon
         mock_platform,
     )
 
-    # Raise since we need 4 GPUs, but we only have 2 visible
-    with pytest.raises(ValueError):
-        set_stage_devices(stage_id=0, devices="0,1,2,3")
+    # Keep the logical mapping and resolve to the visible subset.
+    set_stage_devices(stage_id=0, devices="0,1,2,3")
+
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "6,7"
 
 
 @pytest.mark.usefixtures("clean_gpu_memory_between_tests")

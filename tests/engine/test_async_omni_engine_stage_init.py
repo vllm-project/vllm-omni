@@ -1,3 +1,4 @@
+import importlib
 import os
 import types
 
@@ -6,6 +7,17 @@ import pytest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
+    """Regression test for forward references in make_async_mp_client."""
+    import vllm_omni.engine.stage_engine_core_client as client_mod
+
+    importlib.reload(client_mod)
+
+    assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
+        "StageEngineCoreClient | DPLBStageEngineCoreClient"
+    )
 
 
 def test_initialize_stages_restores_device_visibility_after_diffusion_init(monkeypatch):
@@ -23,6 +35,9 @@ def test_initialize_stages_restores_device_visibility_after_diffusion_init(monke
     engine.num_stages = 1
     engine.async_chunk = False
     engine.diffusion_batch_size = 1
+    engine.single_stage_mode = False
+    engine._single_stage_id_filter = None
+    engine._omni_master_server = None
     engine.stage_configs = [types.SimpleNamespace(stage_id=0, stage_type="diffusion")]
 
     env_var = current_omni_platform.device_control_env_var
@@ -49,7 +64,7 @@ def test_initialize_stages_restores_device_visibility_after_diffusion_init(monke
         current_omni_platform.set_device_control_env_var("1")
 
     monkeypatch.setattr(engine_mod, "setup_stage_devices", _fake_setup_stage_devices)
-    monkeypatch.setattr(engine_mod, "_inject_kv_stage_info", lambda *_: None)
+    monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
     monkeypatch.setattr(engine_mod, "initialize_diffusion_stage", lambda *_, **__: diffusion_client)
     monkeypatch.setattr(
         engine_mod,
@@ -101,7 +116,11 @@ def test_attach_llm_stage_uses_omni_input_preprocessor(monkeypatch):
             self.vllm_config = vllm_config
             self.renderer = renderer
 
-    monkeypatch.setattr(engine_mod, "StageEngineCoreClient", DummyStageEngineCoreClient)
+    monkeypatch.setattr(
+        engine_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **kwargs: DummyStageEngineCoreClient(**kwargs)),
+    )
     monkeypatch.setattr(engine_mod, "MultimodalOutputProcessor", DummyOutputProcessor)
     monkeypatch.setattr(engine_mod, "InputProcessor", DummyInputProcessor)
     monkeypatch.setattr(engine_mod, "OmniInputPreprocessor", DummyOmniInputPreprocessor)

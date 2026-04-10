@@ -52,19 +52,50 @@ class StageDiffusionClient:
         metadata: StageMetadata,
         batch_size: int = 1,
     ) -> None:
+        # Spawn StageDiffusionProc subprocess and wait for READY.
+        proc, handshake_address, request_address, response_address = spawn_diffusion_proc(model, od_config)
+        complete_diffusion_handshake(proc, handshake_address)
+        self._initialize_client(metadata, request_address, response_address, proc=proc, batch_size=batch_size)
+
+    @classmethod
+    def from_addresses(
+        cls,
+        metadata: StageMetadata,
+        request_address: str,
+        response_address: str,
+        *,
+        proc: Any = None,
+        batch_size: int = 1,
+    ) -> StageDiffusionClient:
+        """Create a client for an already-running diffusion subprocess."""
+        client = cls.__new__(cls)
+        client._initialize_client(
+            metadata,
+            request_address,
+            response_address,
+            proc=proc,
+            batch_size=batch_size,
+        )
+        return client
+
+    def _initialize_client(
+        self,
+        metadata: StageMetadata,
+        request_address: str,
+        response_address: str,
+        *,
+        proc: Any,
+        batch_size: int,
+    ) -> None:
         self.stage_id = metadata.stage_id
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
         self.default_sampling_params = metadata.default_sampling_params
         self.custom_process_input_func = metadata.custom_process_input_func
         self.engine_input_source = metadata.engine_input_source
-
-        # Spawn StageDiffusionProc subprocess and wait for READY.
-        proc, handshake_address, request_address, response_address = spawn_diffusion_proc(model, od_config)
-        complete_diffusion_handshake(proc, handshake_address)
         self._proc = proc
+        self._owns_process = proc is not None
 
-        # ZMQ sockets (sync) for communicating with the subprocess.
         self._zmq_ctx = zmq.Context()
         self._request_socket = self._zmq_ctx.socket(zmq.PUSH)
         self._request_socket.connect(request_address)
@@ -74,14 +105,18 @@ class StageDiffusionClient:
         self._encoder = OmniMsgpackEncoder()
         self._decoder = OmniMsgpackDecoder()
 
-        # Buffers for demultiplexing response messages.
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._rpc_results: dict[str, Any] = {}
         self._pending_rpcs: set[str] = set()
         self._tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = False
 
-        logger.info("[StageDiffusionClient] Stage-%s initialized (batch_size=%d)", self.stage_id, batch_size)
+        logger.info(
+            "[StageDiffusionClient] Stage-%s initialized (owns_process=%s, batch_size=%d)",
+            self.stage_id,
+            self._owns_process,
+            batch_size,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -253,7 +288,7 @@ class StageDiffusionClient:
         try:
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
-            if not self._shutting_down and self._proc is not None and not self._proc.is_alive():
+            if not self._shutting_down and self._owns_process and self._proc is not None and not self._proc.is_alive():
                 exitcode = self._proc.exitcode
                 # One final drain – the last ZMQ frame may have arrived
                 # between the first drain and the is_alive() check.
@@ -325,7 +360,7 @@ class StageDiffusionClient:
                 self._drain_responses()
                 if rpc_id in self._rpc_results:
                     return self._rpc_results.pop(rpc_id)
-                if self._proc is not None and not self._proc.is_alive():
+                if self._owns_process and self._proc is not None and not self._proc.is_alive():
                     raise RuntimeError(
                         f"StageDiffusionProc died while waiting for "
                         f"collective_rpc '{method}' (exit code {self._proc.exitcode})"
@@ -343,7 +378,7 @@ class StageDiffusionClient:
         except Exception:
             pass
 
-        if self._proc is not None and self._proc.is_alive():
+        if self._owns_process and self._proc is not None and self._proc.is_alive():
             self._proc.join(timeout=10)
             terminate_alive_proc(self._proc)
 

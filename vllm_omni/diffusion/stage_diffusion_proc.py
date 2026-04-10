@@ -580,14 +580,17 @@ class StageDiffusionProc:
 def spawn_diffusion_proc(
     model: str,
     od_config: OmniDiffusionConfig,
+    handshake_address: str | None = None,
+    request_address: str | None = None,
+    response_address: str | None = None,
 ) -> tuple[BaseProcess, str, str, str]:
     """Spawn a StageDiffusionProc subprocess.
 
     Returns ``(proc, handshake_address, request_address, response_address)``.
     """
-    handshake_address = get_open_zmq_ipc_path()
-    request_address = get_open_zmq_ipc_path()
-    response_address = get_open_zmq_ipc_path()
+    handshake_address = handshake_address or get_open_zmq_ipc_path()
+    request_address = request_address or get_open_zmq_ipc_path()
+    response_address = response_address or get_open_zmq_ipc_path()
 
     ctx = get_mp_context()
     proc = ctx.Process(
