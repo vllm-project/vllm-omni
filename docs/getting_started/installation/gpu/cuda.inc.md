@@ -124,7 +124,7 @@ If you want to specify the base vLLM version:
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile.cuda \
-  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.18.0 \
+  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.19.0 \
   -t vllm-omni-cuda .
 ```
 
