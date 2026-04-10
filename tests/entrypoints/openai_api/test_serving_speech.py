@@ -1861,8 +1861,8 @@ class TestFishSpeechServing:
         assert info["text"] == "<|speaker:1|>你好，欢迎回来。"
         assert info["ref_text"] == "<|speaker:0|>参考音频的原始文本。"
         assert info["fish_structured_voice_clone"] is True
-        assert os.path.exists(info["ref_audio_path"])
-        os.remove(info["ref_audio_path"])
+        assert isinstance(info["ref_audio_wav"], torch.Tensor)
+        assert info["ref_audio_wav"].dtype == torch.float32
         fish_speech_server._estimate_fish_prompt_len.assert_called_once_with(
             "<|speaker:1|>你好，欢迎回来。",
             "<|speaker:0|>参考音频的原始文本。",

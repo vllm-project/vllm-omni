@@ -80,8 +80,6 @@ def test_structured_voice_clone_prefill_adds_full_codebooks_with_decode_scale(mo
     model.codebook_embeddings = codebook_embed
     model._get_tokenizer = lambda: _FakeTokenizer({"<|audio_start|>": 10, "<|audio_end|>": 11})
 
-    monkeypatch.setattr(slow_ar_module.np, "load", lambda path: [0.0])
-    monkeypatch.setattr(slow_ar_module.os, "remove", lambda path: None)
     monkeypatch.setattr(
         slow_ar_module,
         "encode_reference_audio_codes",
@@ -97,7 +95,7 @@ def test_structured_voice_clone_prefill_adds_full_codebooks_with_decode_scale(mo
         {
             "ref_text": "ref",
             "text": "target",
-            "ref_audio_path": "unused.npy",
+            "ref_audio_wav": torch.tensor([0.0]),
             "ref_audio_sr": 16000,
         }
     )
