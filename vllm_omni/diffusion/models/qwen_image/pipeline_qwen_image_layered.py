@@ -36,6 +36,9 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.size_utils import (
+    normalize_min_aligned_size,
+)
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -109,9 +112,7 @@ def get_qwen_image_layered_pre_process_func(
             height = calculated_height
             width = calculated_width
 
-            multiple_of = vae_scale_factor * 2
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
+            height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
 
             # Store calculated dimensions in request
             prompt["additional_information"]["calculated_height"] = calculated_height
@@ -665,9 +666,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             height = calculated_height
             width = calculated_width
 
-            multiple_of = self.vae_scale_factor * 2
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
+            height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
 
             if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
                 image = self.image_processor.resize(image, calculated_height, calculated_width)
