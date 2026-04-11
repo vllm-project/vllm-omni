@@ -166,6 +166,7 @@ class DiffusionEngine:
             exec_total_time=exec_total_time,
             diffusion_engine_start_time=diffusion_engine_start_time,
         )
+
     @staticmethod
     def make_engine(
         config: OmniDiffusionConfig,
