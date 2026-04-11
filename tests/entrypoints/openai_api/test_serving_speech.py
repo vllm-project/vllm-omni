@@ -752,6 +752,26 @@ class TestTTSMethods:
         )
         assert speech_server._validate_tts_request(req) is None
 
+    @pytest.mark.parametrize(
+        "ref_text",
+        [None, "", "   "],
+        ids=["none", "empty", "whitespace"],
+    )
+    def test_validate_base_task_missing_ref_text_returns_400(self, speech_server, ref_text):
+        """Regression: Base task without ref_text must return 400, not crash EngineCore.
+
+        See https://github.com/vllm-project/vllm-omni/pull/2203
+        """
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text=ref_text,
+        )
+        result = speech_server._validate_tts_request(req)
+        assert result is not None, f"ref_text={ref_text!r} should be rejected"
+        assert "ref_text" in result
+
     def test_validate_tts_request_customvoice_no_speakers(self, speech_server):
         """CustomVoice on a model with no speakers returns 400 instead of crashing engine."""
         req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")

@@ -1439,11 +1439,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     )
                 if ref_ids is None:
                     ref_text = _as_singleton(info_dict.get("ref_text"))
-                    if not isinstance(ref_text, str) or not ref_text.strip():
-                        raise ValueError("Base in-context voice cloning requires `ref_text` or tokenized `ref_ids`.")
-                    ref_ids = tok(self._build_ref_text(ref_text), return_tensors="pt", padding=False)["input_ids"].to(
-                        device=input_ids.device
-                    )
+                    if isinstance(ref_text, str) and ref_text.strip():
+                        ref_ids = tok(
+                            self._build_ref_text(ref_text),
+                            return_tensors="pt",
+                            padding=False,
+                        )["input_ids"].to(device=input_ids.device)
+                    else:
+                        logger.warning("Base ICL: ref_text/ref_ids missing, falling back to x-vector-only mode.")
+                        in_context_mode = False
+            if in_context_mode:
                 icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
                     text_id=input_ids[:, 3:-5],
                     ref_id=ref_ids[:, 3:-2],
