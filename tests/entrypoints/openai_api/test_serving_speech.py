@@ -63,14 +63,11 @@ class TestAudioMixin:
         adjusted_tensor = mock_speed.call_args[0][0]
         assert len(adjusted_tensor) == 24000
 
-    def test_speed_adjustment(self, audio_mixin, mocker: MockerFixture):
-        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
-        mock_time_stretch.return_value = np.zeros(12000)
+    def test_speed_adjustment(self, audio_mixin):
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
         adjusted_audio, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=2.0, sample_rate=24000)
 
-        mock_time_stretch.assert_called_with(y=audio_tensor, rate=2.0)
         assert adjusted_audio.shape == (12000,)
 
     def test_unsupported_format_fallback(self, audio_mixin, caplog, mocker: MockerFixture):
@@ -117,30 +114,22 @@ class TestAudioMixin:
         assert np.array_equal(output_tensor, stereo_tensor)
 
     def test_speed_adjustment_bypass(self, audio_mixin, mocker: MockerFixture):
-        """Test that speed=1.0 bypasses the expensive librosa time stretching."""
+        """Test that speed=1.0 bypasses the expensive torchaudio time stretching."""
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
-        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
-        # speed=1.0 should return immediately without calling librosa
+        mock_time_stretch = mocker.patch("torchaudio.transforms.TimeStretch")
+        # speed=1.0 should return immediately without calling torchaudio
         result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
 
         mock_time_stretch.assert_not_called()
         assert np.array_equal(result, audio_tensor)
 
-    def test_speed_adjustment_stereo_handling(self, audio_mixin, mocker: MockerFixture):
-        """Test that speed adjustment is attempted on stereo inputs."""
-        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
+    def test_speed_adjustment_stereo_handling(self, audio_mixin):
+        """Test that speed adjustment handles stereo (channels-last) input."""
         stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
-        # Mock return value representing a sped-up version (half length)
-        mock_time_stretch.return_value = np.zeros((12000, 2), dtype=np.float32)
 
         result, _ = audio_mixin._apply_speed_adjustment(stereo_tensor, speed=2.0, sample_rate=24000)
 
-        mock_time_stretch.assert_called_once()
-        # Ensure the stereo tensor was passed to librosa
-        call_args = mock_time_stretch.call_args
-        assert np.array_equal(call_args.kwargs["y"], stereo_tensor)
-        assert call_args.kwargs["rate"] == 2.0
         assert result.shape == (12000, 2)
 
 
@@ -762,6 +751,26 @@ class TestTTSMethods:
             input="Hello", task_type="Base", ref_audio="data:audio/wav;base64,abc", ref_text="", x_vector_only_mode=True
         )
         assert speech_server._validate_tts_request(req) is None
+
+    @pytest.mark.parametrize(
+        "ref_text",
+        [None, "", "   "],
+        ids=["none", "empty", "whitespace"],
+    )
+    def test_validate_base_task_missing_ref_text_returns_400(self, speech_server, ref_text):
+        """Regression: Base task without ref_text must return 400, not crash EngineCore.
+
+        See https://github.com/vllm-project/vllm-omni/pull/2203
+        """
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text=ref_text,
+        )
+        result = speech_server._validate_tts_request(req)
+        assert result is not None, f"ref_text={ref_text!r} should be rejected"
+        assert "ref_text" in result
 
     def test_validate_tts_request_customvoice_no_speakers(self, speech_server):
         """CustomVoice on a model with no speakers returns 400 instead of crashing engine."""

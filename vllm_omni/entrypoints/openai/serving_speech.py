@@ -919,6 +919,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     fmt_err = self._validate_ref_audio_format(request.ref_audio)
                     if fmt_err:
                         return fmt_err
+                    if not getattr(request, "x_vector_only_mode", False) and (
+                        not request.ref_text or not request.ref_text.strip()
+                    ):
+                        return (
+                            "Base task requires non-empty 'ref_text' (transcript of "
+                            "the reference audio) unless 'x_vector_only_mode' is enabled"
+                        )
 
         # Validate cross-parameter dependencies
         if task_type != "Base":

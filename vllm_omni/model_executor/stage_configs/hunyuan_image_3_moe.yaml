@@ -50,12 +50,8 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: diffusion
-      gpu_memory_utilization: 0.9
       enforce_eager: true
-      engine_output_type: image
       distributed_executor_backend: "mp"
-      enable_prefix_caching: false
-      max_num_batched_tokens: 32768
       vae_use_slicing: false
       vae_use_tiling: false
       cache_backend: null

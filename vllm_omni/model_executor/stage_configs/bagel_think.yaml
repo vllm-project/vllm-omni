@@ -49,14 +49,9 @@ stage_args:
     engine_args:
       model_stage: dit
       max_num_seqs: 1
-      gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
-      engine_output_type: image
       distributed_executor_backend: "mp"
-      enable_prefix_caching: false
-      max_num_batched_tokens: 32768
-      tensor_parallel_size: 1
       omni_kv_config:
         need_recv_cache: true
     engine_input_source: [0]
