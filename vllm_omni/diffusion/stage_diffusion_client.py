@@ -50,11 +50,12 @@ class StageDiffusionClient:
         model: str,
         od_config: OmniDiffusionConfig,
         metadata: StageMetadata,
+        stage_init_timeout: int,
         batch_size: int = 1,
     ) -> None:
         # Spawn StageDiffusionProc subprocess and wait for READY.
         proc, handshake_address, request_address, response_address = spawn_diffusion_proc(model, od_config)
-        complete_diffusion_handshake(proc, handshake_address)
+        complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
         self._initialize_client(metadata, request_address, response_address, proc=proc, batch_size=batch_size)
 
     @classmethod

@@ -75,6 +75,7 @@ class OmniServerParams(NamedTuple):
     use_omni: bool = True
     use_stage_cli: bool = False
     init_timeout: int | None = None
+    stage_init_timeout: int | None = None  # None defers to the server's own default (300 s)
 
 
 def assert_image_diffusion_response(
@@ -1768,8 +1769,8 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
             )
 
         server_args = params.server_args or []
-        if params.use_omni:
-            server_args = ["--stage-init-timeout", "120", *server_args]
+        if params.use_omni and params.stage_init_timeout is not None:
+            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
         if params.init_timeout is not None:
             server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
         if params.use_stage_cli:
@@ -3257,7 +3258,7 @@ def omni_runner(request, model_prefix):
     with _omni_server_lock:
         model, stage_config_path = request.param
         model = model_prefix + model
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
+        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path) as runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")

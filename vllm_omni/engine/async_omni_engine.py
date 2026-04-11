@@ -430,7 +430,9 @@ class AsyncOmniEngine:
                         else:
                             assert proc is not None
                             assert handshake_address is not None
-                            complete_stage_handshake(proc, handshake_address, addresses, vllm_config)
+                            complete_stage_handshake(
+                                proc, handshake_address, addresses, vllm_config, stage_init_timeout
+                            )
                         logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
                     finally:
                         if previous_visible_devices is None:
@@ -759,6 +761,7 @@ class AsyncOmniEngine:
                                         self.model,
                                         stage_cfg,
                                         metadata,
+                                        stage_init_timeout=stage_init_timeout,
                                         batch_size=self.diffusion_batch_size,
                                     )
                                 logger.info(

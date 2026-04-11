@@ -39,8 +39,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_HANDSHAKE_POLL_TIMEOUT_S = 600
-
 
 class StageDiffusionProc:
     """Subprocess entry point for diffusion inference.
@@ -619,13 +617,14 @@ def spawn_diffusion_proc(
 def complete_diffusion_handshake(
     proc: BaseProcess,
     handshake_address: str,
+    handshake_timeout: int,
 ) -> None:
     """Wait for the diffusion subprocess to signal READY.
 
     On failure the process is terminated before re-raising.
     """
     try:
-        _perform_diffusion_handshake(proc, handshake_address)
+        _perform_diffusion_handshake(proc, handshake_address, handshake_timeout)
     except Exception:
         shutdown([proc])
         raise
@@ -634,6 +633,7 @@ def complete_diffusion_handshake(
 def _perform_diffusion_handshake(
     proc: BaseProcess,
     handshake_address: str,
+    handshake_timeout: int,
 ) -> None:
     """Run the handshake with the diffusion subprocess."""
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
@@ -641,11 +641,15 @@ def _perform_diffusion_handshake(
         poller.register(handshake_socket, zmq.POLLIN)
         poller.register(proc.sentinel, zmq.POLLIN)
 
-        timeout_ms = _HANDSHAKE_POLL_TIMEOUT_S * 1000
+        timeout_ms = handshake_timeout * 1000
         while True:
             events = dict(poller.poll(timeout=timeout_ms))
             if not events:
-                raise TimeoutError("Timed out waiting for READY from StageDiffusionProc")
+                raise TimeoutError(
+                    f"Timed out waiting for READY from StageDiffusionProc after {handshake_timeout}s. "
+                    f"This typically indicates model loading or warmup is taking too long. "
+                    f"Consider increasing `stage_init_timeout` for large models."
+                )
             if handshake_socket in events:
                 identity, raw = handshake_socket.recv_multipart()
                 msg = msgspec.msgpack.decode(raw)
