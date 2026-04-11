@@ -35,7 +35,11 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.size_utils import (
+    normalize_min_aligned_size,
+)
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -96,9 +100,7 @@ def get_qwen_image_edit_pre_process_func(
             width = request.sampling_params.width or calculated_width
 
             # Ensure dimensions are multiples of vae_scale_factor * 2
-            multiple_of = vae_scale_factor * 2
-            height = height // multiple_of * multiple_of
-            width = width // multiple_of * multiple_of
+            height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
 
             # Store calculated dimensions in request
             prompt["additional_information"]["calculated_height"] = calculated_height
@@ -215,7 +217,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin):
+class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,
@@ -244,7 +246,7 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self.device)
 
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
@@ -266,6 +268,9 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
         self.prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"  # noqa: E501
         self.prompt_template_encode_start_idx = 64
         self.default_sample_size = 128
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def check_inputs(
         self,
@@ -657,9 +662,7 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
             height = height or calculated_height
             width = width or calculated_width
 
-            multiple_of = self.vae_scale_factor * 2
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
+            height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
 
             if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
                 image = self.image_processor.resize(image, calculated_height, calculated_width)
@@ -814,7 +817,9 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

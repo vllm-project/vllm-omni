@@ -29,6 +29,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -52,10 +53,14 @@ def apply_rotary_emb_wan(
     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos = freqs_cos[..., 0::2]
     sin = freqs_sin[..., 1::2]
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
-    return out.type_as(hidden_states)
+    rotated = torch.stack(
+        (
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos,
+        ),
+        dim=-1,
+    )
+    return rotated.flatten(-2, -1).to(hidden_states.dtype)
 
 
 class DistributedRMSNorm(nn.Module):
@@ -167,7 +172,7 @@ class WanRotaryPosEmbed(nn.Module):
         # Split dimensions for temporal, height, width
         h_dim = w_dim = 2 * (attention_head_dim // 6)
         t_dim = attention_head_dim - h_dim - w_dim
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        freqs_dtype = torch.float64 if current_omni_platform.supports_float64() else torch.float32
 
         freqs_cos = []
         freqs_sin = []
@@ -221,7 +226,7 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
         freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
 
-        return freqs_cos, freqs_sin
+        return freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
 
 
 class WanImageEmbedding(nn.Module):
@@ -535,6 +540,7 @@ class WanCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            skip_sequence_parallel=True,
         )
 
     def forward(
@@ -720,7 +726,7 @@ class WanTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["WanTransformerBlock"]
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }

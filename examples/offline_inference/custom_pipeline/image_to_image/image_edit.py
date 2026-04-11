@@ -209,7 +209,7 @@ async def main():
     if not outputs:
         raise ValueError("No output produced from omni.generate()")
 
-    first_out = outputs[0].request_output[0]
+    first_out = outputs[0].request_output
     req_out: OmniRequestOutput = first_out
 
     # Verify trajectory data (from custom pipeline)

@@ -2,34 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import os
-from pathlib import Path
 
-import librosa
 import numpy as np
 import soundfile as sf
 from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
+from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
-
-
-def _ensure_mel_filters_asset() -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    filters_path = repo_root / "vllm_omni" / "model_executor" / "models" / "cosyvoice3" / "assets" / "mel_filters.npz"
-    if filters_path.exists():
-        return
-
-    source_url = "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
-    raise FileNotFoundError(
-        "Missing CosyVoice3 mel filter asset:\n"
-        f"  {filters_path}\n"
-        "Download it with:\n"
-        f"  mkdir -p {filters_path.parent} && "
-        f"curl -L {source_url} -o {filters_path}"
-    )
 
 
 def run_e2e():
@@ -56,7 +39,6 @@ def run_e2e():
         help="Path to tokenizer directory (e.g., <model_path>/CosyVoice-BlankEN).",
     )
     args = parser.parse_args()
-    _ensure_mel_filters_asset()
     # Ensure tokenizer directory exists
     if not os.path.exists(args.tokenizer):
         raise FileNotFoundError(f"{args.tokenizer} does not exist!")
@@ -85,7 +67,7 @@ def run_e2e():
         if not os.path.exists(args.audio_path):
             raise FileNotFoundError(f"Audio file not found: {args.audio_path}")
         # Load at native sample rate
-        audio_signal, sr = librosa.load(args.audio_path, sr=None)
+        audio_signal, sr = load_audio(args.audio_path, sr=None)
 
         # Validate sample rate before processing (similar to original CosyVoice)
         min_sr = 16000
@@ -167,27 +149,26 @@ def run_e2e():
     print(f"Received {len(outputs)} outputs.")
     for i, output in enumerate(outputs):
         try:
-            ro_list = output.request_output or []
-            if not ro_list:
+            ro = output.request_output
+            if ro is None:
                 print("No request_output found.")
                 continue
 
-            for ro in ro_list:
-                # Multimodal output may be attached to RequestOutput or CompletionOutput.
-                mm = getattr(ro, "multimodal_output", None)
-                if not mm and ro.outputs:
-                    mm = getattr(ro.outputs[0], "multimodal_output", None)
+            # Multimodal output may be attached to RequestOutput or CompletionOutput.
+            mm = getattr(ro, "multimodal_output", None)
+            if not mm and ro.outputs:
+                mm = getattr(ro.outputs[0], "multimodal_output", None)
 
-                if mm:
-                    print(f"Multimodal output keys: {mm.keys()}")
-                    if "audio" in mm:
-                        audio_out = mm["audio"]
-                        print(f"Generated Audio Shape: {audio_out.shape}")
-                        out_path = f"output_{i}.wav"
-                        sf.write(out_path, audio_out.cpu().numpy().squeeze(), 22050)
-                        print(f"Saved audio to {out_path}")
-                else:
-                    print("No multimodal output found.")
+            if mm:
+                print(f"Multimodal output keys: {mm.keys()}")
+                if "audio" in mm:
+                    audio_out = mm["audio"]
+                    print(f"Generated Audio Shape: {audio_out.shape}")
+                    out_path = f"output_{i}.wav"
+                    sf.write(out_path, audio_out.cpu().numpy().squeeze(), 22050)
+                    print(f"Saved audio to {out_path}")
+            else:
+                print("No multimodal output found.")
         except Exception as e:
             print(f"Error inspecting output: {e}")
     omni.close()

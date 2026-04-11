@@ -11,6 +11,12 @@ from vllm.platforms import current_platform
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_language_from_prompt,
+    extract_language_from_request,
+    extract_speaker_from_prompt,
+    extract_speaker_from_request,
+)
 
 
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
@@ -115,6 +121,12 @@ def thinker2talker_async_chunk(
             "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
+        speaker = extract_speaker_from_request(request)
+        if speaker is not None:
+            talker_additional_info["speaker"] = speaker
+        language = extract_language_from_request(request)
+        if language is not None:
+            talker_additional_info["language"] = language
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
                 transfer_manager.request_payload[request_id] = talker_additional_info
@@ -140,6 +152,13 @@ def thinker2talker_async_chunk(
         talker_additional_info = {
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
+        speaker = extract_speaker_from_request(request)
+        if speaker is not None:
+            talker_additional_info["speaker"] = speaker
+        language = extract_language_from_request(request)
+        if language is not None:
+            talker_additional_info["language"] = language
+
         if output_token_ids:
             talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
             talker_additional_info["thinker_decode_embeddings"] = pooling_output.get("0").detach().cpu()
@@ -148,6 +167,7 @@ def thinker2talker_async_chunk(
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
             talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
             talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
+
     return talker_additional_info
 
 
@@ -180,7 +200,7 @@ def thinker2talker(
     device = torch.device(current_platform.device_type)
 
     # Process each thinker output
-    for thinker_output in thinker_outputs:
+    for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
 
         info = {
@@ -195,6 +215,12 @@ def thinker2talker(
             "tts_eos_embed": output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
             "tts_pad_embed": output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
         }
+        speaker = extract_speaker_from_prompt(prompt, index=i)
+        if speaker is not None:
+            info["speaker"] = speaker
+        language = extract_language_from_prompt(prompt, index=i)
+        if language is not None:
+            info["language"] = language
 
         prompt_len = _compute_talker_prompt_ids_length(info, device=device)
 

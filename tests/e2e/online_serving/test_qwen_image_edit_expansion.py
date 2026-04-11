@@ -98,6 +98,18 @@ def _get_diffusion_feature_cases(model: str):
             id="parallel_004",
             marks=PARALLEL_FEATURE_MARKS,
         ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "2",
+                ],
+            ),
+            id="parallel_005",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
     ]
 
 

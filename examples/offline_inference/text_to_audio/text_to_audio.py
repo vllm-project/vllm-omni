@@ -90,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         default=44100,
         help="Sample rate for output audio (Stable Audio uses 44100 Hz).",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -133,7 +138,10 @@ def main():
     print(f"{'=' * 60}\n")
 
     # Initialize Omni with Stable Audio model
-    omni = Omni(model=args.model)
+    omni = Omni(
+        model=args.model,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+    )
 
     # Calculate audio end time
     audio_end_in_s = args.audio_start + args.audio_length
@@ -177,7 +185,7 @@ def main():
     output = outputs[0]
     if not hasattr(output, "request_output") or not output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
-    request_output = output.request_output[0]
+    request_output = output.request_output
     if not hasattr(request_output, "multimodal_output"):
         raise ValueError("No multimodal_output found in request_output")
 

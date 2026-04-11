@@ -11,6 +11,8 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class E2EOperator:
     """tiles with (2, 3) -- (H,W)"""
@@ -59,9 +61,9 @@ class E2EOperator:
 class DummyMixin(DistributedVaeMixin):
     def __init__(self):
         self.use_tiling = True
-        self.distributed_decoder = MagicMock()
-        self.distributed_decoder.parallel_size = 2
-        self.distributed_decoder.group = None
+        self.distributed_executor = MagicMock()
+        self.distributed_executor.parallel_size = 2
+        self.distributed_executor.group = None
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +72,7 @@ def mock_dist():
         patch.object(dist, "get_world_size", return_value=2),
         patch.object(dist, "get_rank", return_value=0),
         patch.object(dist, "is_initialized", return_value=True),
+        patch.object(dist, "all_reduce", return_value=None),
         patch.object(dist, "gather", return_value=None),
         patch.object(dist, "broadcast", return_value=None),
     ):

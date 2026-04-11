@@ -3,6 +3,7 @@
 
 import torch
 from torch import nn
+from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
@@ -29,14 +30,22 @@ class SequentialOffloadHook(ModelHook):
         offload_targets: list[nn.Module],
         device: torch.device,
         pin_memory: bool = True,
+        use_hsdp: bool = False,
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
         self.device = device
         self.pin_memory = pin_memory
+        self.use_hsdp = use_hsdp
 
     @staticmethod
-    def _move_params(module: nn.Module, device: torch.device) -> None:
+    def _move_params(
+        module: nn.Module,
+        target_device: torch.device,
+        *,
+        non_blocking: bool = False,
+        pin_memory: bool = False,
+    ) -> None:
         """Move module parameters and buffers to device.
 
         This cls method specifically prevents recursion device movement,
@@ -46,41 +55,43 @@ class SequentialOffloadHook(ModelHook):
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
         for p in module.parameters():
-            if p.data.device != device:
-                p.data = p.data.to(device, non_blocking=True)
+            if p.data.device != target_device:
+                data = p.data.to(target_device, non_blocking=non_blocking)
+                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                    data = data.pin_memory()
+                p.data = data
         for b in module.buffers():
-            if b.device != device:
-                b.data = b.data.to(device, non_blocking=True)
+            if b.device != target_device:
+                data = b.data.to(target_device, non_blocking=non_blocking)
+                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                    data = data.pin_memory()
+                b.data = data
 
     def _to_cpu(self, module: nn.Module) -> None:
-        """Move module to CPU."""
         try:
             param = next(module.parameters())
         except StopIteration:
             return
 
-        # Skip if already on CPU
         if param.device.type == "cpu":
             return
 
-        self._move_params(module, torch.device("cpu"))
+        self._move_params(
+            module,
+            torch.device("cpu"),
+            non_blocking=not self.use_hsdp,
+            pin_memory=self.pin_memory,
+        )
         current_omni_platform.empty_cache()
 
-        if self.pin_memory:
-            for p in module.parameters():
-                if p.data.device.type == "cpu" and not p.data.is_pinned():
-                    p.data = p.data.pin_memory()
-
     def _to_gpu(self, module: nn.Module) -> None:
-        """Move module to GPU."""
         try:
-            # Skip if already on target device
             if next(module.parameters()).device == self.device:
                 return
         except StopIteration:
             return
 
-        self._move_params(module, self.device)
+        self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU
@@ -107,6 +118,7 @@ def apply_sequential_offload(
     encoder_modules: list[nn.Module],
     device: torch.device,
     pin_memory: bool = True,
+    use_hsdp: bool = False,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -119,6 +131,7 @@ def apply_sequential_offload(
         encoder_modules: Encoder modules to register hooks on
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
+        use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
 
     Example:
         >>> apply_sequential_offload(
@@ -135,6 +148,7 @@ def apply_sequential_offload(
             offload_targets=encoder_modules,
             device=device,
             pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
         logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
@@ -146,6 +160,7 @@ def apply_sequential_offload(
             offload_targets=dit_modules,
             device=device,
             pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
         logger.debug("Registered offload hook for %s", enc.__class__.__name__)
@@ -208,6 +223,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
             encoder_modules=modules.encoders,
             device=self.device,
             pin_memory=self.config.pin_cpu_memory,
+            use_hsdp=self.config.use_hsdp,
         )
 
         # Track modules for cleanup

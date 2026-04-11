@@ -11,10 +11,10 @@ stage_args:
     runtime:
       process: true
       devices: "0"
-      max_batch_size: 1
       requires_multimodal_data: true # Required for i2i mode to receive source images
     engine_args:
       model_stage: ar
+      max_num_seqs: 1
       model_arch: GlmImageForConditionalGeneration
       model_subdir: vision_language_encoder # AR model config.json is in this subdirectory
       tokenizer_subdir: processor # Use processor's tokenizer (not ByT5 from tokenizer/)
@@ -45,10 +45,10 @@ stage_args:
     runtime:
       process: true
       devices: "1" # Can use different GPU, or same GPU if memory allows
-      max_batch_size: 1
       requires_multimodal_data: true # Required for i2i mode to pass condition images
     engine_args:
       model_stage: dit
+      max_num_seqs: 1
       model_arch: GlmImagePipeline # Required for diffusion model class resolution
       # Diffusion-specific parameters
       num_gpus: 1

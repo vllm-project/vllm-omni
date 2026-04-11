@@ -161,6 +161,12 @@ class VideoGenerationRequest(BaseModel):
         ),
     )
 
+    # Generic model-specific parameters
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description=("Optional model-specific parameters passed directly to the model's extra_args. "),
+    )
+
     def resolve_video_params(self) -> VideoParams:
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
 
@@ -195,6 +201,14 @@ class VideoGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[VideoData] = Field(..., description="Array of generated videos")
+    stage_durations: dict[str, float] = Field(
+        default_factory=dict,
+        description="Profiler stage durations reported by the diffusion pipeline.",
+    )
+    peak_memory_mb: float = Field(
+        default=0.0,
+        description="Peak device memory usage in MB reported by the diffusion pipeline.",
+    )
 
 
 class VideoError(BaseModel):
@@ -244,6 +258,14 @@ class VideoResponse(BaseModel):
         description="Filename of the saved output video files for this job.",
     )
     inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
+    stage_durations: dict[str, float] = Field(
+        default_factory=dict,
+        description="Profiler stage durations reported by the diffusion pipeline.",
+    )
+    peak_memory_mb: float = Field(
+        default=0.0,
+        description="Peak device memory usage in MB reported by the diffusion pipeline.",
+    )
 
     @property
     def file_extension(self) -> str:

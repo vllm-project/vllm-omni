@@ -2,15 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Image-to-Video generation example using Wan2.2 I2V/TI2V models or LTX2.
+Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2, or HunyuanVideo-1.5.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
+- HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
 
 Usage:
-    # I2V-A14B (MoE)
+    # Wan I2V-A14B (MoE)
     python image_to_video.py --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
         --image input.jpg --prompt "A cat playing with yarn"
 
@@ -24,6 +25,11 @@ Usage:
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
         --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
+
+    # HunyuanVideo-1.5 I2V (480p)
+    python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
+        --image input.jpg --prompt "A cat playing with yarn" \
+        --flow-shift 5.0 --guidance-scale 6.0
 """
 
 import argparse
@@ -43,11 +49,11 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video from an image with Wan2.2 or LTX2.")
+    parser = argparse.ArgumentParser(description="Generate a video from an image (Wan2.2, LTX2, HunyuanVideo-1.5).")
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers Wan2.2 I2V model ID or local path.",
+        help="Diffusers I2V model ID or local path (Wan2.2 or HunyuanVideo-1.5).",
     )
     parser.add_argument(
         "--model-class-name",
@@ -140,7 +146,7 @@ def parse_args() -> argparse.Namespace:
         "--audio-sample-rate",
         type=int,
         default=24000,
-        help="Sample rate for audio output when saved (default: 24000 for LTX2).",
+        help="Sample rate for audio output when saved (default: 24000).",
     )
     parser.add_argument(
         "--cache-backend",
@@ -175,6 +181,11 @@ def parse_args() -> argparse.Namespace:
             "Number of replica groups for HSDP. Each replica holds a full sharded copy. "
             "Default 1 means pure sharding (no replication). "
         ),
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
     return parser.parse_args()
 
@@ -281,6 +292,7 @@ def main():
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
     if profiler_enabled:
@@ -338,8 +350,6 @@ def main():
             audio = frames.multimodal_output["audio"]
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
-            if isinstance(inner_output, list):
-                inner_output = inner_output[0] if inner_output else None
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
@@ -461,15 +471,9 @@ def main():
 
     video_array = _ensure_frame_list(video_array)
 
-    use_ltx2_export = is_ltx2
-    encode_video = None
-    if use_ltx2_export:
-        try:
-            from diffusers.pipelines.ltx2.export_utils import encode_video
-        except ImportError:
-            encode_video = None
+    if audio is not None:
+        from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
-    if use_ltx2_export and encode_video is not None:
         if isinstance(video_array, list):
             frames_np = np.stack(video_array, axis=0)
         elif isinstance(video_array, np.ndarray):
@@ -480,29 +484,24 @@ def main():
         if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
             frames_np = frames_np[..., :3]
 
-        frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
-        video_tensor = torch.from_numpy(frames_u8)
+        frames_u8 = (np.clip(frames_np, 0.0, 1.0) * 255).round().clip(0, 255).astype("uint8")
 
-        audio_out = None
-        if audio is not None:
-            if isinstance(audio, list):
-                audio = audio[0] if audio else None
-            if isinstance(audio, np.ndarray):
-                audio = torch.from_numpy(audio)
-            if isinstance(audio, torch.Tensor):
-                audio_out = audio
-                if audio_out.dim() > 1:
-                    audio_out = audio_out[0]
-                audio_out = audio_out.float().cpu()
+        audio_np = audio
+        if isinstance(audio_np, list):
+            audio_np = audio_np[0] if audio_np else None
+        if isinstance(audio_np, torch.Tensor):
+            audio_np = audio_np.detach().cpu().float().numpy()
+        if isinstance(audio_np, np.ndarray):
+            audio_np = np.squeeze(audio_np).astype(np.float32)
 
-        encode_video(
-            video_tensor,
-            fps=fps,
-            audio=audio_out,
-            audio_sample_rate=args.audio_sample_rate if audio_out is not None else None,
-            output_path=str(output_path),
+        video_bytes = mux_video_audio_bytes(
+            frames_u8,
+            audio_np,
+            fps=float(fps),
+            audio_sample_rate=args.audio_sample_rate,
         )
+        with open(str(output_path), "wb") as f:
+            f.write(video_bytes)
     else:
         export_to_video(video_array, str(output_path), fps=fps)
     print(f"Saved generated video to {output_path}")

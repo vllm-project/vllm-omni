@@ -68,7 +68,7 @@ def _extract_single_image(outputs) -> Image.Image:
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 

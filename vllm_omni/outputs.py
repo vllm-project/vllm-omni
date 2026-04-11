@@ -58,9 +58,19 @@ class OmniRequestOutput:
     images: list[Image.Image] = field(default_factory=list)
     prompt: OmniPromptType | None = None
     latents: torch.Tensor | None = None
+    trajectory_latents: torch.Tensor | None = None
+    trajectory_timesteps: torch.Tensor | None = None
+    trajectory_log_probs: torch.Tensor | None = None
+    trajectory_decoded: list | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
     _custom_output: dict[str, Any] = field(default_factory=dict)
+
+    # profiling data
+    stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # memory usage info
+    peak_memory_mb: float = 0.0
 
     @classmethod
     def from_pipeline(
@@ -95,9 +105,15 @@ class OmniRequestOutput:
         prompt: OmniPromptType | None = None,
         metrics: dict[str, Any] | None = None,
         latents: torch.Tensor | None = None,
+        trajectory_latents: torch.Tensor | None = None,
+        trajectory_timesteps: torch.Tensor | None = None,
+        trajectory_log_probs: torch.Tensor | None = None,
+        trajectory_decoded: list | None = None,
         multimodal_output: dict[str, Any] | None = None,
         custom_output: dict[str, Any] | None = None,
         final_output_type: str = "image",
+        stage_durations: dict[str, float] | None = None,
+        peak_memory_mb: float = 0.0,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -107,8 +123,14 @@ class OmniRequestOutput:
             prompt: The prompt used
             metrics: Generation metrics
             latents: Optional latent tensors
+            trajectory_latents: Optional stacked trajectory latent tensors
+            trajectory_timesteps: Optional stacked trajectory timestep tensors
+            trajectory_log_probs: Optional stacked trajectory log-probability tensors
+            trajectory_decoded: Optional list of decoded trajectory images
             multimodal_output: Optional multimodal output dict
-            custom_output: Optional custom output dict (e.g. latent trajectories, prompt embeds)
+            custom_output: Optional custom output dict (e.g. prompt embeds)
+            stage_durations: Optional stage durations (execution time of each stage) dict
+            peak_memory_mb: Peak memory usage in MB
 
         Returns:
             OmniRequestOutput configured for diffusion mode
@@ -119,9 +141,15 @@ class OmniRequestOutput:
             images=images,
             prompt=prompt,
             latents=latents,
+            trajectory_latents=trajectory_latents,
+            trajectory_timesteps=trajectory_timesteps,
+            trajectory_log_probs=trajectory_log_probs,
+            trajectory_decoded=trajectory_decoded,
             metrics=metrics or {},
             _multimodal_output=multimodal_output or {},
             _custom_output=custom_output or {},
+            stage_durations=stage_durations or {},
+            peak_memory_mb=peak_memory_mb,
             finished=True,
         )
 
@@ -135,14 +163,12 @@ class OmniRequestOutput:
         if self.request_output is None:
             return self._multimodal_output
 
-        request_outputs = self.request_output if isinstance(self.request_output, list) else [self.request_output]
-        for req_out in request_outputs:
-            # Check completion outputs first (where multimodal_output is attached)
-            for output in getattr(req_out, "outputs", []):
-                if mm := getattr(output, "multimodal_output", None):
-                    return mm
-            if mm := getattr(req_out, "multimodal_output", None):
+        # Check completion outputs first (where multimodal_output is attached)
+        for output in getattr(self.request_output, "outputs", []):
+            if mm := getattr(output, "multimodal_output", None):
                 return mm
+        if mm := getattr(self.request_output, "multimodal_output", None):
+            return mm
         return self._multimodal_output
 
     @property
@@ -273,6 +299,8 @@ class OmniRequestOutput:
             f"metrics={self.metrics}",
             f"multimodal_output={self._multimodal_output}",
             f"custom_output={self._custom_output}",
+            f"stage_durations={self.stage_durations}",
+            f"peak_memory_mb={self.peak_memory_mb}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"

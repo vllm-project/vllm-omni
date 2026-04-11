@@ -24,6 +24,7 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 # This test is specific to Z-Image LoRA behavior. Keep it focused on a single
 # model to reduce runtime and avoid extra downloads.
 models = ["Tongyi-MAI/Z-Image-Turbo"]
+DIFFUSION_INIT_TIMEOUT_S = 600
 
 
 @pytest.mark.parametrize("model_name", models)
@@ -36,7 +37,7 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
         if not hasattr(first_output, "request_output") or not first_output.request_output:
             raise ValueError("No request_output found in OmniRequestOutput")
 
-        req_out = first_output.request_output[0]
+        req_out = first_output.request_output
         if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
             raise ValueError("Invalid request_output structure or missing 'images' key")
         return req_out.images
@@ -76,7 +77,11 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
         )
         return str(adapter_dir)
 
-    m = Omni(model=model_name)
+    m = Omni(
+        model=model_name,
+        stage_init_timeout=DIFFUSION_INIT_TIMEOUT_S,
+        init_timeout=DIFFUSION_INIT_TIMEOUT_S,
+    )
     try:
         # high resolution may cause OOM on L4
         height = 256

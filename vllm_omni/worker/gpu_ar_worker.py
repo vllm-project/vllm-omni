@@ -48,17 +48,17 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
-                assert self.local_rank < torch.cuda.device_count(), (
+                assert self.local_rank < torch.accelerator.device_count(), (
                     f"DP adjusted local rank {self.local_rank} is out of bounds. "
                 )
-                visible_device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                visible_device_count = torch.accelerator.device_count() if torch.cuda.is_available() else 0
                 assert self.parallel_config.local_world_size <= visible_device_count, (
                     f"local_world_size ({self.parallel_config.local_world_size}) must "
                     f"be less than or equal to the number of visible devices "
                     f"({visible_device_count})."
                 )
             self.device = torch.device(f"cuda:{self.local_rank}")
-            current_platform.set_device(self.device)
+            torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
@@ -79,7 +79,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # Now take memory snapshot after NCCL is initialized
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)

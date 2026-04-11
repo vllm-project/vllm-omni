@@ -1,5 +1,8 @@
 # X-To-Video-Audio
 
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/x_to_video_audio>.
+
+
 The `DreamID-Omni` pipeline generates short videos from text, image and video.
 
 ## Local CLI Usage
@@ -56,3 +59,14 @@ Key arguments:
 - `--video-negative-prompt`: negative prompt for video generation.
 - `--audio-negative-prompt`: negative prompt for audio generation.
 - `--enable-cpu-offload`: enable CPU offload (defaults False).
+
+## Example materials
+
+??? abstract "download_dreamid_omni.py"
+    ``````py
+    --8<-- "examples/offline_inference/x_to_video_audio/download_dreamid_omni.py"
+    ``````
+??? abstract "x_to_video_audio.py"
+    ``````py
+    --8<-- "examples/offline_inference/x_to_video_audio/x_to_video_audio.py"
+    ``````

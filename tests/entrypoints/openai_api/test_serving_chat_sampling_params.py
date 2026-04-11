@@ -63,9 +63,9 @@ def mock_engine_client(
     default_other_params,
     mocker: MockerFixture,
 ):
-    """Create mock engine client with stage_list and default_sampling_params_list."""
+    """Create mock engine client with stage_configs and default_sampling_params_list."""
     engine_client = mocker.MagicMock()
-    engine_client.stage_list = [mock_comprehension_stage, mock_other_stage]
+    engine_client.stage_configs = [mock_comprehension_stage, mock_other_stage]
     engine_client.default_sampling_params_list = [
         default_comprehension_params,
         default_other_params,
@@ -311,7 +311,7 @@ def test_get_comprehension_stage_index_finds_second_stage(mocker: MockerFixture)
     comprehension.is_comprehension = True
 
     instance.engine_client = mocker.MagicMock()
-    instance.engine_client.stage_list = [other, comprehension]
+    instance.engine_client.stage_configs = [other, comprehension]
 
     assert instance._get_comprehension_stage_index() == 1
 
@@ -328,7 +328,7 @@ def test_get_comprehension_stage_index_raises_when_not_found(mocker: MockerFixtu
     stage2.is_comprehension = False
 
     instance.engine_client = mocker.MagicMock()
-    instance.engine_client.stage_list = [stage1, stage2]
+    instance.engine_client.stage_configs = [stage1, stage2]
 
     with pytest.raises(ValueError, match="No comprehension stage"):
         instance._get_comprehension_stage_index()

@@ -369,7 +369,7 @@ images = omni.generate(
 2. **Compare performance** - Measure speedup vs baseline (expect 1.5x-2.0x)
 3. **Verify output quality** - Visually compare cached vs uncached outputs (should be nearly identical)
 
-See more detailed examples in [user guide for teacache](../../user_guide/diffusion/teacache.md).
+See more detailed examples in [user guide for teacache](../../user_guide/diffusion/cache_acceleration/teacache.md).
 
 ---
 

@@ -1,4 +1,4 @@
-# adapted from sglang and fastvideo
+# adapted from fastvideo
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -9,6 +9,7 @@ If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 Supports multiple backends:
     - vllm-omni: Uses /v1/chat/completions endpoint (default)
     - openai: Uses /v1/images/generations endpoint
+    - v1/videos: Use /v1/videos endpoint
 
 Usage:
     # Video (vllm-omni backend)
@@ -28,6 +29,16 @@ Usage:
         --backend vllm-omni --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024
 
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --backend vllm-omni --dataset random --task t2i --num-prompts 1 \
+        --max-concurrency 1 --enable-negative-prompt \
+        --random-request-config '[
+            {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
+            {"width":768,"height":768,"num_inference_steps":20,"weight":0.25},
+            {"width":1024,"height":1024,"num_inference_steps":25,"weight":0.45},
+            {"width":1536,"height":1536,"num_inference_steps":35,"weight":0.15}
+        ]'
+
     i2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --backend vllm-omni --dataset vbench --task i2i --num-prompts 10
@@ -38,6 +49,16 @@ Usage:
         --backend openai --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
+    # Video (v1/vedeos)
+    t2v:
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --backend v1/videos --dataset random --task t2v --num-prompts 1 \
+        --max-concurrency 1 --enable-negative-prompt \
+        --random-request-config '[
+            {"width":854,"height":480,"num_inference_steps":18,"num_frames":120,"fps":24,"weight":1}
+        ]'
+
+
 """
 
 import argparse
@@ -45,7 +66,10 @@ import ast
 import asyncio
 import glob
 import json
+import logging
 import os
+import random
+import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -57,7 +81,10 @@ import aiohttp
 import numpy as np
 import requests
 from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
+from PIL import Image
 from tqdm.asyncio import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 class BaseDataset(ABC):
@@ -262,6 +289,9 @@ class VBenchDataset(BaseDataset):
 
     def _resize_data(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Resize data to match num_prompts."""
+        if not data:
+            raise ValueError("No benchmark data available. Install Pillow or provide --dataset-path.")
+
         if not self.args.num_prompts:
             return data
 
@@ -485,6 +515,14 @@ class TraceDataset(BaseDataset):
         timestamp = self._coerce_float(row.get("timestamp"))
         slo_ms = self._coerce_float(row.get("slo_ms"))
         image_paths = row.get("image_paths")
+        if not image_paths:
+            single = row.get("image_path")
+            image_paths = [single] if single else None
+
+        if not image_paths and self.args.task in ["i2v", "i2i", "ti2v", "ti2i"]:
+            raise ValueError(
+                f"Task {self.args.task} requires image input, but no image_path or image_paths found in trace row."
+            )
 
         override_w = self.args.width
         override_h = self.args.height
@@ -516,26 +554,66 @@ class TraceDataset(BaseDataset):
 
 
 class RandomDataset(BaseDataset):
-    def __init__(self, args, api_url: str, model: str):
-        self.args = args
-        self.api_url = api_url
-        self.model = model
+    def __init__(self, args, api_url: str, model: str, enable_negative_prompt: bool = False):
+        super().__init__(args, api_url, model)
         self.num_prompts = args.num_prompts
+        self.enable_negative_prompt = enable_negative_prompt
+        self.random_request_config = getattr(args, "random_request_config", None)
+        if self.random_request_config:
+            self.random_request_config = json.loads(self.random_request_config)
+            self._weights = [p["weight"] for p in self.random_request_config]
+
+            self.random_request_config = [
+                {k: v for k, v in p.items() if k != "weight"} for p in self.random_request_config
+            ]
+
+            seed = getattr(args, "random_request_seed", 42)
+            self._rng = random.Random(seed)
+
+            self._sampled_requests = self._rng.choices(
+                self.random_request_config,
+                weights=self._weights,
+                k=self.num_prompts,
+            )
+        else:
+            self._sampled_requests = None
+
+        # Random image generate
+        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+            img = Image.new("RGB", (512, 512), (255, 255, 255))
+
+            image_path = os.path.join(tempfile.gettempdir(), "diffusion_benchmark_random_image.png")
+            self._random_image_path = [image_path]
+            img.save(image_path)
+        else:
+            self._random_image_path = None
 
     def __len__(self) -> int:
         return self.num_prompts
 
     def __getitem__(self, idx: int) -> RequestFuncInput:
+        extra_body = {}
+        if self.enable_negative_prompt:
+            extra_body["negative_prompt"] = f"Negative prompt {idx} for benchmarking diffusion models"
+
+        params = {
+            "width": self.args.width,
+            "height": self.args.height,
+            "num_frames": self.args.num_frames,
+            "num_inference_steps": self.args.num_inference_steps,
+            "fps": self.args.fps,
+        }
+        if self._sampled_requests:
+            profile = self._sampled_requests[idx]
+            params.update(profile)
         return RequestFuncInput(
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
             model=self.model,
-            width=self.args.width,
-            height=self.args.height,
-            num_frames=self.args.num_frames,
-            num_inference_steps=self.args.num_inference_steps,
             seed=self.args.seed,
-            fps=self.args.fps,
+            extra_body=extra_body,
+            image_paths=self._random_image_path,
+            **params,
         )
 
     def get_requests(self) -> list[RequestFuncInput]:
@@ -647,19 +725,19 @@ async def iter_requests(
     requests_list: list[RequestFuncInput],
     request_rate: float,
 ) -> AsyncGenerator[RequestFuncInput, None]:
-    """Yield requests using a fixed interval if request_rate is set.
+    """Yield requests using a Poisson process if request_rate is set.
 
     - If request_rate is inf, all requests are yielded immediately (no sleep).
-    - Otherwise, requests are emitted at a fixed cadence of 1 / request_rate seconds.
+    - Otherwise, inter-arrival times follow an exponential distribution.
     """
 
     if request_rate != float("inf"):
         if request_rate <= 0:
             raise ValueError(f"request_rate must be positive or inf, got {request_rate}.")
-        interval_s = 1.0 / float(request_rate)
 
     for i, req in enumerate(requests_list):
         if request_rate != float("inf") and i > 0:
+            interval_s = random.expovariate(request_rate)
             await asyncio.sleep(interval_s)
         yield req
 
@@ -678,6 +756,15 @@ def calculate_metrics(
     latencies = [o.latency for o in success_outputs]
     peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
 
+    # Aggregate per-stage durations across all successful requests that reported them.
+    stage_duration_lists: dict[str, list[float]] = {}
+    for o in success_outputs:
+        for stage, duration in (o.stage_durations or {}).items():
+            stage_duration_lists.setdefault(stage, []).append(duration)
+    stage_durations_mean = {s: float(np.mean(v)) for s, v in stage_duration_lists.items()}
+    stage_durations_p50 = {s: float(np.percentile(v, 50)) for s, v in stage_duration_lists.items()}
+    stage_durations_p99 = {s: float(np.percentile(v, 99)) for s, v in stage_duration_lists.items()}
+
     metrics = {
         "duration": total_duration,
         "completed_requests": num_success,
@@ -686,10 +773,14 @@ def calculate_metrics(
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,
         "latency_p99": np.percentile(latencies, 99) if latencies else 0,
+        "latency_p95": np.percentile(latencies, 95) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
         "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
         "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
+        "stage_durations_mean": stage_durations_mean,
+        "stage_durations_p50": stage_durations_p50,
+        "stage_durations_p99": stage_durations_p99,
     }
 
     if slo_enabled:
@@ -742,8 +833,32 @@ async def benchmark(args):
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
 
+    VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
+    IMAGE_TASKS = {"t2i", "i2i", "ti2i"}
+
+    if args.task in VIDEO_TASKS:
+        task_type = "2v"
+    elif args.task in IMAGE_TASKS:
+        task_type = "2i"
+    else:
+        raise ValueError(
+            f"Unsupported task: '{args.task}'. "
+            f"Valid video tasks: {sorted(VIDEO_TASKS)}, "
+            f"Valid image tasks: {sorted(IMAGE_TASKS)}"
+        )
+
+    valid_backends = sorted(backends_function_mapping[task_type].keys())
+
+    if args.backend not in valid_backends:
+        logger.error(
+            f"Invalid backend '{args.backend}' for task '{args.task}' (task type: '{task_type}').\n"
+            f"Valid backends for this task type: {valid_backends}\n"
+            f"Example usage: --task {args.task} --backend {valid_backends[0]}"
+        )
+        raise ValueError("Backend validation failed. See log above for valid options.")
+
     # Setup API URL and request function based on backend
-    request_func, api_url = backends_function_mapping[args.backend]
+    request_func, api_url = backends_function_mapping[task_type][args.backend]
     api_url = f"{args.base_url}{api_url}"
 
     if args.dataset == "vbench":
@@ -751,7 +866,7 @@ async def benchmark(args):
     elif args.dataset == "trace":
         dataset = TraceDataset(args, api_url, args.model)
     elif args.dataset == "random":
-        dataset = RandomDataset(args, api_url, args.model)
+        dataset = RandomDataset(args, api_url, args.model, args.enable_negative_prompt)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -789,6 +904,8 @@ async def benchmark(args):
                         warm_req,
                         num_inference_steps=args.warmup_num_inference_steps,
                     )
+                if args.task == "t2v":
+                    warm_req = replace(warm_req, num_frames=1)
                 warm_out = await limited_request_func(warm_req, session, None)
                 warmup_pairs.append((warm_req, warm_out))
 
@@ -847,6 +964,7 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
+    print("{:<40} {:<15.4f}".format("Latency P95 (s):", metrics["latency_p95"]))
 
     if args.slo:
         print(f"{'-' * 50}")
@@ -859,6 +977,12 @@ async def benchmark(args):
         print("{:<40} {:<15.2f}".format("Peak Memory Max (MB):", metrics["peak_memory_mb_max"]))
         print("{:<40} {:<15.2f}".format("Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]))
         print("{:<40} {:<15.2f}".format("Peak Memory Median (MB):", metrics["peak_memory_mb_median"]))
+
+    if metrics["stage_durations_mean"]:
+        print(f"{'-' * 50}")
+        print("Stage Durations Mean (s):")
+        for stage, val in metrics["stage_durations_mean"].items():
+            print("{:<40} {:<15.4f}".format(f"  {stage}:", val))
 
     print("\n" + "=" * 60)
 
@@ -883,7 +1007,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="vllm-omni",
-        choices=["vllm-omni", "openai"],
+        choices=["vllm-omni", "openai", "v1/videos"],
         help="Backend to target the benchmark to.",
     )
     parser.add_argument(
@@ -972,6 +1096,25 @@ if __name__ == "__main__":
         help="SLO target multiplier: slo_ms = estimated_exec_time_ms * slo_scale (default: 3).",
     )
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
+    parser.add_argument(
+        "--enable-negative-prompt",
+        action="store_true",
+        default=False,
+        help="Generate negative prompts when using the random dataset.",
+    )
+    parser.add_argument(
+        "--random-request-config",
+        type=str,
+        default=None,
+        help=(
+            "JSON string defining random request profiles. "
+            "Each profile may contain: width, height, num_inference_steps, etc. "
+            "The 'weight' field controls sampling probability (relative weight). "
+            "Example: "
+            '[{"width":512,"height":512,"num_inference_steps":20,"weight":0.15},'
+            '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
+        ),
+    )
 
     args = parser.parse_args()
 

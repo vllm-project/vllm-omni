@@ -130,7 +130,7 @@ def _run_inference(
         elapsed_ms = (time.time() - start) * 1000
 
         return InferenceResult(
-            images=outputs[0].request_output[0].images,
+            images=outputs[0].request_output.images,
             elapsed_ms=elapsed_ms,
         )
     finally:

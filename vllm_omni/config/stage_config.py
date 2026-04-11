@@ -11,6 +11,7 @@ Runtime parameters (gpu_memory_utilization, tp_size, etc.) come from CLI.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -49,10 +50,11 @@ class StageType(str, Enum):
 
 @dataclass
 class StageConfig:
-    """Per-stage configuration — pipeline-structure fields only.
+    """Per-stage configuration from pipeline YAML.
 
-    Engine params (gpu_memory_utilization, tp_size, etc.) come from CLI,
-    NOT from this class.
+    Topology fields (stage_id, input_sources, etc.) define the DAG.
+    Engine and runtime defaults come from the YAML; CLI overrides take
+    precedence via ``runtime_overrides``.
     """
 
     # Identity
@@ -71,6 +73,14 @@ class StageConfig:
     hf_config_name: str | None = None
     is_comprehension: bool = False
 
+    # Per-stage engine args from pipeline YAML (defaults)
+    yaml_engine_args: dict[str, Any] = field(default_factory=dict)
+    # Per-stage runtime config from pipeline YAML (devices, etc.)
+    yaml_runtime: dict[str, Any] = field(default_factory=dict)
+    # Pass-through fields from pipeline YAML (default_sampling_params,
+    # output_connectors, input_connectors, tts_args, etc.)
+    yaml_extras: dict[str, Any] = field(default_factory=dict)
+
     # Runtime overrides (populated from CLI, not from pipeline YAML)
     runtime_overrides: dict[str, Any] = field(default_factory=dict)
 
@@ -80,11 +90,11 @@ class StageConfig:
         Returns:
             OmegaConf DictConfig with stage configuration in legacy format.
         """
-        # Build engine_args dict with required fields
-        engine_args: dict[str, Any] = {
-            "model_stage": self.model_stage,
-        }
+        # Start with YAML engine_args defaults
+        engine_args: dict[str, Any] = dict(self.yaml_engine_args)
 
+        # Overlay topology-level fields
+        engine_args["model_stage"] = self.model_stage
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:
@@ -92,18 +102,31 @@ class StageConfig:
         if self.hf_config_name:
             engine_args["hf_config_name"] = self.hf_config_name
 
-        # Apply runtime overrides (CLI args)
+        # CLI overrides take precedence over YAML defaults
         for key, value in self.runtime_overrides.items():
             if key not in ("devices", "max_batch_size"):
                 engine_args[key] = value
 
-        # Build runtime config
-        runtime: dict[str, Any] = {
-            "process": True,
-            "max_batch_size": self.runtime_overrides.get("max_batch_size", 1),
-        }
+        # Build runtime config from YAML defaults + CLI overrides
+        runtime: dict[str, Any] = dict(self.yaml_runtime)
+        runtime.setdefault("process", True)
         if "devices" in self.runtime_overrides:
             runtime["devices"] = self.runtime_overrides["devices"]
+
+        # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
+        legacy_mbs = runtime.pop("max_batch_size", None)
+        cli_mbs = self.runtime_overrides.get("max_batch_size")
+        if legacy_mbs is not None or cli_mbs is not None:
+            warnings.warn(
+                "runtime.max_batch_size is deprecated and will be removed in a "
+                "future release. Use engine_args.max_num_seqs instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            effective_mbs = int(cli_mbs or legacy_mbs or 1)
+            engine_args.setdefault("max_num_seqs", effective_mbs)
+
+        engine_args.setdefault("max_num_seqs", 1)
 
         # Build full config dict
         config_dict: dict[str, Any] = {
@@ -119,6 +142,10 @@ class StageConfig:
 
         if self.custom_process_input_func:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
+
+        # Pass through extra YAML fields (default_sampling_params,
+        # output_connectors, input_connectors, tts_args, etc.)
+        config_dict.update(self.yaml_extras)
 
         return create_config(config_dict)
 
@@ -206,6 +233,7 @@ class StageConfigFactory:
         "qwen2_5_omni": "qwen2_5_omni",
         "bagel": "bagel",
         "qwen3_tts": "qwen3_tts",
+        "voxtral_tts": "voxtral_tts",
         "mimo_audio": "mimo_audio",
         "glm-image": "glm_image",
         "cosyvoice3": "cosyvoice3",
@@ -248,6 +276,15 @@ class StageConfigFactory:
         errors = pipeline.validate_pipeline()
         if errors:
             logger.warning(f"Pipeline validation warnings for {model}: {errors}")
+
+        # Inject pipeline-wide async_chunk into ALL stages' engine_args.
+        # The legacy loader (load_stage_configs_from_yaml) sets async_chunk
+        # on every stage so that build_engine_args_dict() can inject the
+        # stage_connector_spec.  AsyncOmniEngine.__init__ also reads it
+        # from stage_configs[0].engine_args.async_chunk.
+        if pipeline.async_chunk:
+            for stage in pipeline.stages:
+                stage.yaml_engine_args.setdefault("async_chunk", True)
 
         # Apply CLI overrides
         result: list[StageConfig] = []
@@ -296,13 +333,14 @@ class StageConfigFactory:
         if "dtype" in engine_args:
             engine_args["dtype"] = str(engine_args["dtype"])
 
+        engine_args.setdefault("max_num_seqs", 1)
+
         config_dict: dict[str, Any] = {
             "stage_id": 0,
             "stage_type": StageType.DIFFUSION.value,
             "runtime": {
                 "process": True,
                 "devices": devices,
-                "max_batch_size": 1,
             },
             "engine_args": create_config(engine_args),
             "final_output": True,
@@ -348,6 +386,25 @@ class StageConfigFactory:
 
         return cls._parse_pipeline_yaml(pipeline_path, model_type)
 
+    # Keys consumed as explicit StageConfig fields — everything else is
+    # passed through via yaml_extras.
+    _KNOWN_STAGE_KEYS: set[str] = {
+        "stage_id",
+        "model_stage",
+        "stage_type",
+        "input_sources",
+        "engine_input_source",
+        "custom_process_input_func",
+        "final_output",
+        "final_output_type",
+        "worker_type",
+        "scheduler_cls",
+        "hf_config_name",
+        "is_comprehension",
+        "engine_args",
+        "runtime",
+    }
+
     @classmethod
     def _parse_pipeline_yaml(cls, path: Path, model_type: str) -> ModelPipeline:
         """Parse a pipeline YAML file.
@@ -375,27 +432,75 @@ class StageConfigFactory:
                 input_sources = []
             input_sources = list(input_sources)
 
+            # Extract per-stage engine_args and runtime dicts
+            raw_ea = stage_data.get("engine_args", None)
+            yaml_engine_args = to_dict(raw_ea) if raw_ea is not None else {}
+            raw_rt = stage_data.get("runtime", None)
+            yaml_runtime = to_dict(raw_rt) if raw_rt is not None else {}
+
+            # Migrate legacy runtime.max_batch_size → engine_args.max_num_seqs
+            if "max_batch_size" in yaml_runtime:
+                mbs = yaml_runtime.pop("max_batch_size")
+                yaml_engine_args.setdefault("max_num_seqs", int(mbs))
+                logger.debug(
+                    "Stage %s: migrated runtime.max_batch_size=%s to engine_args.max_num_seqs",
+                    stage_data.get("stage_id", "?"),
+                    mbs,
+                )
+
+            # Topology-level fields that also live inside engine_args in legacy
+            # YAMLs (worker_type, scheduler_cls, etc.) — read from both places.
+            worker_type = stage_data.get("worker_type", None) or yaml_engine_args.pop("worker_type", None)
+            scheduler_cls = stage_data.get("scheduler_cls", None) or yaml_engine_args.pop("scheduler_cls", None)
+            hf_config_name = stage_data.get("hf_config_name", None) or yaml_engine_args.pop("hf_config_name", None)
+            model_stage = getattr(stage_data, "model_stage", None) or yaml_engine_args.pop("model_stage", None)
+
+            # Collect pass-through fields (default_sampling_params,
+            # output_connectors, input_connectors, tts_args, etc.)
+            yaml_extras: dict[str, Any] = {}
+            for key in stage_data:
+                if key not in cls._KNOWN_STAGE_KEYS:
+                    val = stage_data[key]
+                    try:
+                        yaml_extras[key] = to_dict(val)
+                    except ValueError:
+                        yaml_extras[key] = val
+
             stage = StageConfig(
                 stage_id=stage_data.stage_id,
-                model_stage=stage_data.model_stage,
+                model_stage=model_stage or "",
                 stage_type=stage_type,
                 input_sources=input_sources,
                 custom_process_input_func=stage_data.get("custom_process_input_func", None),
                 final_output=stage_data.get("final_output", False),
                 final_output_type=stage_data.get("final_output_type", None),
-                worker_type=stage_data.get("worker_type", None),
-                scheduler_cls=stage_data.get("scheduler_cls", None),
-                hf_config_name=stage_data.get("hf_config_name", None),
+                worker_type=worker_type,
+                scheduler_cls=scheduler_cls,
+                hf_config_name=hf_config_name,
                 is_comprehension=stage_data.get("is_comprehension", False),
+                yaml_engine_args=yaml_engine_args,
+                yaml_runtime=yaml_runtime,
+                yaml_extras=yaml_extras,
             )
             stages.append(stage)
 
         # Get pipeline-wide flags
         async_chunk = config_data.get("async_chunk", False)
 
-        # Get optional connector config
-        connectors = to_dict(config_data.connectors) if hasattr(config_data, "connectors") else None
-        edges = to_dict(config_data.edges) if hasattr(config_data, "edges") else None
+        # Get optional connector config — check both top-level and nested
+        # under ``runtime`` (legacy stage_configs format).
+        connectors = None
+        edges = None
+        if hasattr(config_data, "connectors"):
+            connectors = to_dict(config_data.connectors)
+        if hasattr(config_data, "edges"):
+            edges = to_dict(config_data.edges)
+        if hasattr(config_data, "runtime") and config_data.runtime is not None:
+            top_runtime = config_data.runtime
+            if connectors is None and hasattr(top_runtime, "connectors"):
+                connectors = to_dict(top_runtime.connectors)
+            if edges is None and hasattr(top_runtime, "edges"):
+                edges = to_dict(top_runtime.edges)
 
         return ModelPipeline(
             model_type=getattr(config_data, "model_type", model_type),
@@ -421,9 +526,21 @@ class StageConfigFactory:
 
             hf_config = get_config(model, trust_remote_code=trust_remote_code)
             return hf_config.model_type, hf_config
+        except Exception:
+            pass
+
+        # Fallback: read config.json directly for custom model types that
+        # are not registered with transformers (e.g. qwen3_tts).
+        try:
+            from vllm.transformers_utils.config import get_hf_file_to_dict
+
+            config_dict = get_hf_file_to_dict("config.json", model, revision=None)
+            if config_dict and "model_type" in config_dict:
+                return config_dict["model_type"], None
         except Exception as e:
             logger.debug(f"Failed to auto-detect model type for {model}: {e}")
-            return None, None
+
+        return None, None
 
     # Keys that should never be forwarded as engine overrides (internal /
     # orchestrator-only knobs, complex objects, etc.).

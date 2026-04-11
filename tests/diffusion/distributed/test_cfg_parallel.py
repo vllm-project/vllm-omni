@@ -209,12 +209,9 @@ def _test_cfg_parallel_worker(
             cfg_normalize=test_config["cfg_normalize"],
         )
 
-    # Only rank 0 has valid output in CFG parallel mode
-    if cfg_rank == 0:
-        assert noise_pred is not None
-        result_queue.put(noise_pred.cpu())
-    else:
-        assert noise_pred is None
+    # CFG parallel returns the combined prediction on every rank.
+    assert noise_pred is not None
+    result_queue.put((cfg_rank, noise_pred.cpu()))
 
     destroy_distributed_env()
 
@@ -348,7 +345,18 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
 
     # Get results from queues
     baseline_output = baseline_queue.get()
-    cfg_parallel_output = cfg_parallel_queue.get()
+    cfg_parallel_outputs = [cfg_parallel_queue.get() for _ in range(cfg_parallel_size)]
+    cfg_parallel_outputs.sort(key=lambda item: item[0])
+    cfg_parallel_output = cfg_parallel_outputs[0][1]
+
+    for cfg_rank, rank_output in cfg_parallel_outputs[1:]:
+        torch.testing.assert_close(
+            rank_output,
+            cfg_parallel_output,
+            rtol=0,
+            atol=0,
+            msg=f"CFG parallel ranks produced different outputs (rank 0 vs rank {cfg_rank})",
+        )
 
     # Verify shapes match
     assert baseline_output.shape == cfg_parallel_output.shape, (

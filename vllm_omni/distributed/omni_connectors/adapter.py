@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# temporary for compatibility with vllm_omni.entrypoints.omni_stage.py
-# and vllm_omni.entrypoints.omni_llm.py
-
 import time
 from collections.abc import Callable
 from typing import Any
 
-from vllm_omni.entrypoints.stage_utils import OmniStageTaskType
 from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
@@ -66,7 +62,7 @@ def try_send_via_connector(
         if success:
             # Send lightweight notification via queue
             notify_payload = {
-                "type": OmniStageTaskType.GENERATE,
+                "type": "generate",
                 "request_id": req_id,
                 "sampling_params": sampling_params,
                 "from_connector": True,

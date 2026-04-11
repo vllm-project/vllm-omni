@@ -26,6 +26,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -147,7 +148,7 @@ class SiglipNaViTWrapper(nn.Module):
         return outputs.last_hidden_state.squeeze(0)
 
 
-class BagelPipeline(nn.Module):
+class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     """Bagel generation pipeline (MoT) packaged for vllm-omni diffusion engine.
 
     This pipeline is self-contained and uses the ported Bagel core files.
@@ -157,6 +158,9 @@ class BagelPipeline(nn.Module):
         super().__init__()
         self.od_config = od_config
         self.device = get_local_device()
+
+        self.scheduler: object | None = None
+        self.scheduler_kwargs: dict = {}
 
         model = od_config.model
         local_files_only = os.path.exists(model)
@@ -223,13 +227,24 @@ class BagelPipeline(nn.Module):
             int(required_max_id + 1),
         )
 
-        self.language_model = Qwen2MoTForCausalLM(llm_config)
+        parallel_config = od_config.parallel_config if od_config else None
+        quant_config = od_config.quantization_config
+        # Bagel uses explicit prefixes ("bagel.language_model", "bagel") because
+        # its model structure nests components under a top-level "bagel" module,
+        # unlike other pipelines where the transformer is the root module.
+        # This ensures ComponentQuantizationConfig prefix matching works correctly.
+        self.language_model = Qwen2MoTForCausalLM(
+            llm_config, parallel_config=parallel_config, quant_config=quant_config, prefix="bagel.language_model"
+        )
         ae_params: AutoEncoderParams = default_ae_params()
         self.vae = AutoEncoder(ae_params)
 
         self.bagel = Bagel(
             language_model=self.language_model,
             vit_model=self.vit_model,
+            parallel_config=parallel_config,
+            quant_config=quant_config,
+            prefix="bagel",
             config=BagelConfig(
                 llm_config=llm_config,
                 vae_config=vae_cfg,
@@ -254,7 +269,15 @@ class BagelPipeline(nn.Module):
             )
         ]
 
-        self.to(self.device)
+        # When quantization is enabled, vLLM linear layers live on meta
+        # device until the weight loader materializes them. Calling
+        # .to(device) would fail on those meta tensors, so we skip it
+        # entirely and let the weight loader handle device placement.
+        if quant_config is None:
+            self.to(self.device)
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @staticmethod
     def _decode_image_from_latent(
@@ -306,11 +329,18 @@ class BagelPipeline(nn.Module):
         cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
         cfg_img_scale = extra_args.get("cfg_img_scale", 1.5)
 
+        cfg_interval = extra_args.get("cfg_interval", (0.4, 1.0))
+        cfg_renorm_type = extra_args.get("cfg_renorm_type", "global")
+        cfg_renorm_min = extra_args.get("cfg_renorm_min", 0.0)
+
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
             cfg_text_scale=cfg_text_scale,
             cfg_img_scale=cfg_img_scale,
+            cfg_interval=cfg_interval,
+            cfg_renorm_type=cfg_renorm_type,
+            cfg_renorm_min=cfg_renorm_min,
         )
 
         gen_context = {
@@ -367,7 +397,12 @@ class BagelPipeline(nn.Module):
 
         else:
             image_input = (
-                None if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {}).get("image")
+                None
+                if isinstance(first_prompt, str)
+                else (
+                    (first_prompt.get("multi_modal_data") or {}).get("image")
+                    or (first_prompt.get("multi_modal_data") or {}).get("img2img")
+                )
             )
             if image_input and not isinstance(image_input, list):
                 image_input = [image_input]
@@ -598,7 +633,7 @@ class BagelPipeline(nn.Module):
             enabled=self.device.type != "cpu",
             dtype=self.od_config.dtype,
         ):
-            latents = self.bagel.generate_image(
+            latents, trajectory_latents, trajectory_timesteps, trajectory_log_probs = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"],
                 cfg_img_past_key_values=cfg_img_context["past_key_values"],
@@ -618,10 +653,37 @@ class BagelPipeline(nn.Module):
                 cfg_img_packed_query_indexes=generation_input_cfg_img["cfg_packed_query_indexes"],
                 cfg_img_key_values_lens=generation_input_cfg_img["cfg_key_values_lens"],
                 cfg_img_packed_key_value_indexes=generation_input_cfg_img["cfg_packed_key_value_indexes"],
+                return_trajectory_latents=req.sampling_params.return_trajectory_latents,
+                scheduler=self.scheduler,
+                scheduler_kwargs=self.scheduler_kwargs,
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
-        return DiffusionOutput(output=img)
+
+        # Build trajectory output when requested
+        trajectory_latents_stacked: torch.Tensor | None = None
+        trajectory_timesteps_stacked: torch.Tensor | None = None
+        trajectory_decoded: list[Image.Image] | None = None
+        if trajectory_latents:
+            trajectory_latents_stacked = torch.stack(trajectory_latents)
+            trajectory_timesteps_stacked = torch.stack(trajectory_timesteps)
+            if req.sampling_params.return_trajectory_decoded:
+                trajectory_decoded = [
+                    self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in trajectory_latents
+                ]
+
+        trajectory_log_probs_stacked: torch.Tensor | None = None
+        if trajectory_log_probs:
+            trajectory_log_probs_stacked = torch.stack(trajectory_log_probs)
+
+        return DiffusionOutput(
+            output=img,
+            trajectory_latents=trajectory_latents_stacked,
+            trajectory_timesteps=trajectory_timesteps_stacked,
+            trajectory_log_probs=trajectory_log_probs_stacked,
+            trajectory_decoded=trajectory_decoded,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         state = self.state_dict()
@@ -641,6 +703,8 @@ class BagelPipeline(nn.Module):
             (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
             (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
             (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
+            (".gate_up_proj", ".gate_proj"),
+            (".gate_up_proj", ".up_proj"),
         ]
         stacked_source_names: set[str] = set()
         for name in list(allowed):

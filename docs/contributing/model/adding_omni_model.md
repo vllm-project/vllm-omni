@@ -330,54 +330,46 @@ Stage transitions are the mechanism by which outputs from one stage are converte
 
 ### Where Stage Transitions Are Called
 
-Stage transitions happen automatically in the orchestrator (`OmniLLM` class) during the generation loop. Here's the detailed flow:
+Stage transitions happen automatically in the runtime orchestrator. Here's the detailed flow:
 
-1. **Location**: `vllm_omni/entrypoints/omni_llm.py` in the `_run_generation()` method
+1. **Location**: `vllm_omni/engine/orchestrator.py` in `_forward_to_next_stage()`
 2. **Trigger**: When a stage completes processing and produces outputs
 3. **Execution Flow**:
    ```python
-   # In omni_llm.py, _run_generation() method (around line 345-460)
+   # In orchestrator.py
+   next_stage_id = stage_id + 1
+   next_client = self.stage_clients[next_stage_id]
+   params = req_state.sampling_params_list[next_stage_id]
 
-   # Main orchestrator loop polls each stage for completed requests
-   for stage_id, stage in enumerate(self.stage_list):
-       result = stage.try_collect()  # Get completed request
-       if result is None:
-           continue
+   # Save current stage outputs so stage_input_processors can consume them.
+   self.stage_clients[stage_id].set_engine_outputs([output])
 
-       # Store outputs from this stage
-       engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-       stage.set_engine_outputs(engine_outputs)
+   # THIS IS WHERE STAGE TRANSITION HAPPENS
+   next_inputs = next_client.process_engine_inputs(
+       stage_list=self.stage_clients,
+       prompt=req_state.prompt,
+   )
 
-       # Check if there's a next stage to forward to
-       next_stage_id = stage_id + 1
-       if next_stage_id < len(self.stage_list):
-           next_stage: OmniStage = self.stage_list[next_stage_id]
-
-           # THIS IS WHERE STAGE TRANSITION HAPPENS
-           next_inputs = next_stage.process_engine_inputs(
-               self.stage_list,
-               [request_id_to_prompt[req_id]]
-           )
-
-           # Submit to next stage
-           task = {
-               "type": OmniStageTaskType.GENERATE,
-               "request_id": req_id,
-               "engine_inputs": next_inputs[0],
-               "sampling_params": sampling_params_list[next_stage_id],
-           }
-           next_stage.submit(task)
+   # Build and submit request(s) to the next stage.
+   for next_input in next_inputs:
+       request = build_engine_core_request_from_tokens(
+           request_id=req_id,
+           prompt=next_input,
+           params=params,
+           model_config=self.stage_vllm_configs[next_stage_id].model_config,
+       )
+       await next_client.add_request_async(request)
    ```
 
 ### How Stage Transitions Work
 
 The stage transition process follows these steps:
 
-1. **Stage Completion**: When a stage finishes processing a request, it stores outputs via `stage.set_engine_outputs(engine_outputs)`
+1. **Stage Completion**: When a stage finishes processing a request, the orchestrator stores outputs via `stage_client.set_engine_outputs(...)`
 
 2. **Transition Detection**: The orchestrator checks if there's a next stage and calls `process_engine_inputs()` on it
 
-3. **Input Processing**: The `process_engine_inputs()` method in `OmniStage` (`omni_stage.py`) handles the transition:
+3. **Input Processing**: The stage input processor configured in stage YAML (under `vllm_omni/model_executor/stage_input_processors/`) handles the transition:
    ```python
    def process_engine_inputs(
        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None

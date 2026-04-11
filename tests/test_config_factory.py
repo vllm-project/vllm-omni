@@ -83,6 +83,8 @@ class TestStageConfig:
 
     def test_to_omegaconf_with_runtime_overrides(self):
         """Test that runtime overrides are applied to OmegaConf output."""
+        import warnings
+
         config = StageConfig(
             stage_id=0,
             model_stage="thinker",
@@ -93,12 +95,41 @@ class TestStageConfig:
                 "max_batch_size": 64,
             },
         )
-        omega_config = config.to_omegaconf()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            omega_config = config.to_omegaconf()
 
         assert omega_config.engine_args.gpu_memory_utilization == 0.9
         assert omega_config.engine_args.tensor_parallel_size == 2
         assert omega_config.runtime.devices == "0,1"
-        assert omega_config.runtime.max_batch_size == 64
+        # max_batch_size is migrated to engine_args.max_num_seqs
+        assert omega_config.engine_args.max_num_seqs == 64
+
+    def test_to_omegaconf_max_batch_size_deprecation(self):
+        """Test that runtime.max_batch_size emits a FutureWarning."""
+        import warnings
+
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            runtime_overrides={"max_batch_size": 8},
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            config.to_omegaconf()
+            deprecation_warnings = [x for x in w if issubclass(x.category, FutureWarning)]
+            assert len(deprecation_warnings) == 1
+            assert "max_batch_size" in str(deprecation_warnings[0].message)
+
+    def test_to_omegaconf_max_num_seqs_in_engine_args(self):
+        """Test that max_num_seqs in yaml_engine_args takes precedence."""
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            yaml_engine_args={"max_num_seqs": 32},
+        )
+        omega_config = config.to_omegaconf()
+        assert omega_config.engine_args.max_num_seqs == 32
 
 
 class TestModelPipeline:
@@ -424,6 +455,29 @@ stages:
         pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "valid_model")
         errors = pipeline.validate_pipeline()
         assert errors == [], f"Unexpected validation errors: {errors}"
+
+    def test_parse_yaml_migrates_runtime_max_batch_size(self, tmp_path):
+        """Test that runtime.max_batch_size is migrated to engine_args.max_num_seqs."""
+        yaml_content = """\
+model_type: legacy_batch
+stages:
+  - stage_id: 0
+    model_stage: entry
+    stage_type: llm
+    input_sources: []
+    runtime:
+      devices: "0"
+      max_batch_size: 16
+    engine_args:
+      model_arch: SomeModel
+"""
+        yaml_file = tmp_path / "legacy_batch.yaml"
+        yaml_file.write_text(yaml_content)
+
+        pipeline = StageConfigFactory._parse_pipeline_yaml(yaml_file, "legacy_batch")
+        s0 = pipeline.stages[0]
+        assert "max_batch_size" not in s0.yaml_runtime
+        assert s0.yaml_engine_args.get("max_num_seqs") == 16
 
     def test_parse_diffusion_stage_type(self, tmp_path):
         """Test parsing a diffusion stage type from YAML."""

@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 try:
     import flash_attn
@@ -99,9 +100,16 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
-        talker_config.text_config.rope_parameters = talker_config.text_config.rope_scaling
-        talker_config.text_config.rope_parameters["rope_theta"] = talker_config.text_config.rope_theta
-        self.quant_config = vllm_config.quant_config
+        rope_params = talker_config.text_config.rope_scaling
+        if rope_params is None:
+            # Newer transformers use rope_parameters instead of rope_scaling
+            rope_params = getattr(talker_config.text_config, "rope_parameters", None) or {}
+        rope_params["rope_theta"] = talker_config.text_config.rope_theta
+        talker_config.text_config.rope_parameters = rope_params
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            quant_config = quant_config.resolve("talker")
+        self.quant_config = quant_config
         self.prefix = prefix
         self.vllm_config = vllm_config
         self.config = talker_config
@@ -341,7 +349,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         )
 
         # The result multimodal_embeddings is tuple of tensors, with each
-        # tensor correspoending to a multimodal data item (image or video).
+        # tensor corresponding to a multimodal data item (image or video).
         dummy_multimodal_embeddings: tuple[torch.Tensor, ...] = ()
 
         # NOTE: It is important to iterate over the keys in this dictionary

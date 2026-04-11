@@ -3,10 +3,26 @@
 
 from typing import Any
 
+import vllm.forward_context as _vllm_fc
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.platforms import current_omni_platform
+
+
+def _set_forward_context_num_tokens(num_tokens: int) -> None:
+    """Set num_tokens on the vLLM ForwardContext for MoE routing.
+
+    After the rebase to vLLM 0.18.0, SharedFusedMoE expects
+    ForwardContext.num_tokens to be set. Without it, MoE expert
+    routing may produce incorrect results (silent correctness bug).
+    """
+    if not _vllm_fc.is_forward_context_available():
+        return
+    forward_context = _vllm_fc.get_forward_context()
+    forward_context.num_tokens = num_tokens
+    if not hasattr(forward_context, "in_profile_run"):
+        forward_context.in_profile_run = False
 
 
 class HunyuanFusedMoEDefault(SharedFusedMoE):
@@ -21,6 +37,7 @@ class HunyuanFusedMoEDefault(SharedFusedMoE):
         self._init_hook_handle.remove()
 
     def forward(self, hidden_states: Any, router_logits: Any) -> Any:
+        _set_forward_context_num_tokens(hidden_states.shape[0])
         return super().forward(hidden_states, router_logits)
 
 

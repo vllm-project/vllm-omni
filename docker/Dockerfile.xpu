@@ -15,9 +15,7 @@ RUN apt clean && apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
     curl \
     espeak-ng \
-    ffmpeg \
     git \
-    libsndfile1 \
     libsm6 \
     libxext6 \
     libgl1 \
@@ -76,7 +74,7 @@ ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE="copy"
 
-ARG VLLM_VERSION=v0.17.0
+ARG VLLM_VERSION=v0.19.0
 RUN git clone -b ${VLLM_VERSION} https://github.com/vllm-project/vllm
 WORKDIR /workspace/vllm
 

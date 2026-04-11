@@ -15,56 +15,97 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
+_MODEL_PRESETS = {
+    "wan": {
+        "height": 720,
+        "width": 1280,
+        "num_frames": 81,
+        "num_inference_steps": 40,
+        "guidance_scale": 4.0,
+        "fps": 24,
+        "output": "wan22_output.mp4",
+    },
+    "hunyuan": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 121,
+        "num_inference_steps": 50,
+        "guidance_scale": 6.0,
+        "fps": 24,
+        "output": "hunyuan_video_15_output.mp4",
+    },
+}
+
+
+def _detect_preset(model: str) -> dict:
+    model_lower = model.lower()
+    if "hunyuan" in model_lower:
+        return _MODEL_PRESETS["hunyuan"]
+    return _MODEL_PRESETS["wan"]
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video with Wan2.2 T2V.")
+    parser = argparse.ArgumentParser(
+        description="Generate a video from a text prompt. "
+        "Supports Wan2.2, HunyuanVideo-1.5, and other text-to-video models."
+    )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        help="Diffusers Wan2.2 model ID or local path.",
+        help="Diffusers model ID or local path. "
+        "Examples: Wan-AI/Wan2.2-T2V-A14B-Diffusers, "
+        "hunyuanvideo-community/HunyuanVideo-1.5-480p_t2v",
+    )
+    parser.add_argument(
+        "--model-class-name",
+        default=None,
+        help="Override model class name (e.g., LTX2TwoStagesVideoPipeline).",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--guidance-scale", type=float, default=4.0, help="CFG scale (applied to low/high).")
-    parser.add_argument("--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise.")
-    parser.add_argument("--height", type=int, default=720, help="Video height.")
-    parser.add_argument("--width", type=int, default=1280, help="Video width.")
-    parser.add_argument("--num-frames", type=int, default=81, help="Number of frames (Wan default is 81).")
+    parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
+    parser.add_argument(
+        "--guidance-scale-high", type=float, default=None, help="Separate CFG for high-noise stage (Wan2.2 only)."
+    )
+    parser.add_argument("--height", type=int, default=None, help="Video height. Default: model-specific.")
+    parser.add_argument("--width", type=int, default=None, help="Video width. Default: model-specific.")
+    parser.add_argument("--num-frames", type=int, default=None, help="Number of frames. Default: model-specific.")
     parser.add_argument(
         "--frame-rate",
         type=float,
         default=None,
         help="Optional generation frame rate (used by models like LTX2). Defaults to --fps.",
     )
-    parser.add_argument("--num-inference-steps", type=int, default=40, help="Sampling steps.")
+    parser.add_argument(
+        "--num-inference-steps", type=int, default=None, help="Sampling steps. Default: model-specific."
+    )
     parser.add_argument(
         "--boundary-ratio",
         type=float,
-        default=0.875,
-        help="Boundary split ratio for low/high DiT. Default 0.875 uses both transformers for best quality. Set to 1.0 to load only the low-noise transformer (saves noticeable memory with good quality, recommended if memory is limited).",
+        default=None,
+        help="(Wan2.2) Boundary split ratio for low/high DiT. Default 0.875.",
     )
     parser.add_argument(
-        "--flow-shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
+        "--flow-shift",
+        type=float,
+        default=None,
+        help="Scheduler flow_shift. Wan2.2: 5.0(720p)/12.0(480p). HunyuanVideo-1.5: 5.0(480p)/9.0(720p).",
     )
     parser.add_argument(
         "--cache-backend",
         type=str,
         default=None,
         choices=["cache_dit"],
-        help=(
-            "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer). "
-            "Default: None (no cache acceleration)."
-        ),
+        help="Cache backend for acceleration (Wan2.2). Default: None.",
     )
     parser.add_argument(
         "--enable-cache-dit-summary",
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
-    parser.add_argument("--output", type=str, default="wan22_output.mp4", help="Path to save the video (mp4).")
-    parser.add_argument("--fps", type=int, default=24, help="Frames per second for the output video.")
+    parser.add_argument("--output", type=str, default=None, help="Output path (mp4). Default: model-specific.")
+    parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
     parser.add_argument(
         "--vae-use-slicing",
         action="store_true",
@@ -119,7 +160,7 @@ def parse_args() -> argparse.Namespace:
         "--audio-sample-rate",
         type=int,
         default=24000,
-        help="Sample rate for audio output when saved (default: 24000 for LTX2).",
+        help="Sample rate for audio output when saved (default: 24000).",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -132,32 +173,47 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable expert parallelism for MoE layers.",
     )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "gguf"],
+        help="Quantization method for the transformer (fp8 for online FP8 quantization).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    frame_rate = args.frame_rate if args.frame_rate is not None else float(args.fps)
+    model_class_name = args.model_class_name
 
-    # Wan2.2 cache-dit tuning (from cache-dit examples and cache_alignment).
+    preset = _detect_preset(args.model)
+    for key, default_val in preset.items():
+        if getattr(args, key.replace("-", "_"), None) is None:
+            setattr(args, key.replace("-", "_"), default_val)
+
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    # Cache-dit config (Wan2.2 only)
     cache_config = None
     if args.cache_backend == "cache_dit":
         cache_config = {
-            # DBCache parameters [cache-dit only]
-            "Fn_compute_blocks": 1,  # Optimized for single-transformer models
-            "Bn_compute_blocks": 0,  # Number of backward compute blocks
-            "max_warmup_steps": 4,  # Maximum warmup steps (works for few-step models)
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 4,
             "max_cached_steps": 20,
-            "residual_diff_threshold": 0.24,  # Higher threshold for more aggressive caching
-            "max_continuous_cached_steps": 3,  # Limit to prevent precision degradation
-            # TaylorSeer parameters [cache-dit only]
-            "enable_taylorseer": False,  # Disabled by default (not suitable for few-step models)
-            "taylorseer_order": 1,  # TaylorSeer polynomial order
-            # SCM (Step Computation Masking) parameters [cache-dit only]
-            "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
-            "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
+            "residual_diff_threshold": 0.24,
+            "max_continuous_cached_steps": 3,
+            "enable_taylorseer": False,
+            "taylorseer_order": 1,
+            "scm_steps_mask_policy": None,
+            "scm_steps_policy": "dynamic",
         }
+
     # Configure parallel settings
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
@@ -171,20 +227,31 @@ def main():
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
-    omni = Omni(
+    omni_kwargs = dict(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
-        boundary_ratio=args.boundary_ratio,
-        flow_shift=args.flow_shift,
-        enable_cache_dit_summary=args.enable_cache_dit_summary,
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
+    if args.boundary_ratio is not None:
+        omni_kwargs["boundary_ratio"] = args.boundary_ratio
+    if args.flow_shift is not None:
+        omni_kwargs["flow_shift"] = args.flow_shift
+    if args.quantization is not None:
+        omni_kwargs["quantization"] = args.quantization
+    if args.cache_backend is not None:
+        omni_kwargs["cache_backend"] = args.cache_backend
+        omni_kwargs["cache_config"] = cache_config
+        omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
+
+    omni = Omni(**omni_kwargs)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -204,22 +271,25 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
+    prompt_dict = {"prompt": args.prompt}
+    if args.negative_prompt:
+        prompt_dict["negative_prompt"] = args.negative_prompt
+
+    sampling_kwargs = dict(
+        height=args.height,
+        width=args.width,
+        generator=generator,
+        guidance_scale=args.guidance_scale,
+        num_inference_steps=args.num_inference_steps,
+        num_frames=args.num_frames,
+    )
+    if args.guidance_scale_high is not None:
+        sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+
     generation_start = time.perf_counter()
     frames = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-        },
-        OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            generator=generator,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_high,
-            num_inference_steps=args.num_inference_steps,
-            num_frames=args.num_frames,
-            frame_rate=frame_rate,
-        ),
+        prompt_dict,
+        OmniDiffusionSamplingParams(**sampling_kwargs),
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -240,8 +310,6 @@ def main():
             audio = frames.multimodal_output["audio"]
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
-            if isinstance(inner_output, list):
-                inner_output = inner_output[0] if inner_output else None
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
@@ -362,17 +430,8 @@ def main():
 
     video_array = _ensure_frame_list(video_array)
 
-    use_ltx2_export = False
-    if args.model and "ltx" in str(args.model).lower():
-        use_ltx2_export = True
     if audio is not None:
-        use_ltx2_export = True
-
-    if use_ltx2_export:
-        try:
-            from diffusers.pipelines.ltx2.export_utils import encode_video
-        except ImportError:
-            raise ImportError("diffusers is required for LTX2 encode_video.")
+        from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
         if isinstance(video_array, list):
             frames_np = np.stack(video_array, axis=0)
@@ -381,28 +440,24 @@ def main():
         else:
             frames_np = np.asarray(video_array)
 
-        frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
-        video_tensor = torch.from_numpy(frames_u8)
+        frames_u8 = (np.clip(frames_np, 0.0, 1.0) * 255).round().clip(0, 255).astype("uint8")
 
-        audio_out = None
-        if audio is not None:
-            if isinstance(audio, list):
-                audio = audio[0] if audio else None
-            if isinstance(audio, np.ndarray):
-                audio = torch.from_numpy(audio)
-            if isinstance(audio, torch.Tensor):
-                audio_out = audio
-                if audio_out.dim() > 1:
-                    audio_out = audio_out[0]
-                audio_out = audio_out.float().cpu()
+        audio_np = audio
+        if isinstance(audio_np, list):
+            audio_np = audio_np[0] if audio_np else None
+        if isinstance(audio_np, torch.Tensor):
+            audio_np = audio_np.detach().cpu().float().numpy()
+        if isinstance(audio_np, np.ndarray):
+            audio_np = np.squeeze(audio_np).astype(np.float32)
 
-        encode_video(
-            video_tensor,
-            fps=args.fps,
-            audio=audio_out,
-            audio_sample_rate=args.audio_sample_rate if audio_out is not None else None,
-            output_path=str(output_path),
+        video_bytes = mux_video_audio_bytes(
+            frames_u8,
+            audio_np,
+            fps=float(args.fps),
+            audio_sample_rate=args.audio_sample_rate,
         )
+        with open(str(output_path), "wb") as f:
+            f.write(video_bytes)
     else:
         export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")

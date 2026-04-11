@@ -7,8 +7,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_NUM_CODEBOOKS = 10  # 1 semantic + 9 residual
-
 
 def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
     """Extract the last frame of audio codes from the pooling output."""
@@ -76,8 +74,7 @@ def slow_ar_to_dac_decoder_async_chunk(
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(device="cpu", dtype=torch.long))
     elif not finished:
         return None
 
@@ -114,7 +111,7 @@ def slow_ar_to_dac_decoder_async_chunk(
         if finished:
             return {
                 "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "finished": True,
             }
         return None
 
@@ -142,10 +139,11 @@ def slow_ar_to_dac_decoder_async_chunk(
         window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack into codebook-major flat codes.
-    code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    stacked_frames = torch.stack(window_frames, dim=0)
+    code_predictor_codes = stacked_frames.transpose(0, 1).reshape(-1).tolist()
 
     return {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,
-        "finished": torch.tensor(finished, dtype=torch.bool),
+        "finished": finished,
     }

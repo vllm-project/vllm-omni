@@ -8,6 +8,7 @@ so the decode side references the correct KV entry.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import sys
 from dataclasses import dataclass
@@ -30,30 +31,23 @@ class PatchedRecvReqMeta:
 
 def _import_mooncake_module():
     """Import MooncakeConnector module, supporting both vLLM >=0.16 and older."""
-    try:
-        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import mooncake_connector
-
-        return mooncake_connector
-    except ImportError:
-        pass
-    try:
-        from vllm.distributed.kv_transfer.kv_connector.v1 import mooncake_connector
-
-        return mooncake_connector
-    except ImportError:
-        return None
+    for mod_path in (
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake_connector",
+    ):
+        try:
+            return importlib.import_module(mod_path)
+        except (ImportError, ModuleNotFoundError):
+            continue
+    return None
 
 
 def _create_patched_mooncake_connector():
     """Return a subclass of MooncakeConnector with remote_request_id support."""
-    try:
-        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
-            MooncakeConnector as _OriginalMooncakeConnector,
-        )
-    except (ImportError, AttributeError):
-        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_connector import (
-            MooncakeConnector as _OriginalMooncakeConnector,
-        )
+    _mc_mod = _import_mooncake_module()
+    if _mc_mod is None:
+        raise ImportError("Cannot import MooncakeConnector from upstream vLLM")
+    _OriginalMooncakeConnector = _mc_mod.MooncakeConnector
 
     class PatchedMooncakeConnector(_OriginalMooncakeConnector):
         """Fixes request-ID mismatch in PD disaggregation by injecting

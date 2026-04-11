@@ -16,9 +16,11 @@ Usage:
 
 import asyncio
 import logging
+import math
 import os
 import time
 
+import numpy as np
 import soundfile as sf
 import torch
 
@@ -27,6 +29,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import AsyncOmni, Omni
+from vllm_omni.model_executor.models.fish_speech.dac_utils import DAC_HOP_LENGTH, DAC_SAMPLE_RATE
+from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
+    build_fish_text_only_prompt_ids,
+    estimate_fish_voice_clone_prompt_len_from_normalized,
+    normalize_fish_voice_clone_texts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,44 +59,55 @@ def build_prompt(
 ) -> dict:
     """Build a prompt for Fish Speech S2 Pro.
 
-    Uses Qwen3 chat template format with <|voice|> modality marker:
-      <|im_start|>user\n<|speaker:0|>text<|im_end|>\n<|im_start|>assistant\n<|voice|>
-
-    The model then generates semantic tokens autoregressively.
+    Uses the same text-only / structured-clone protocol as serving.
     """
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if ref_audio_path is None and ref_text is None:
+        prompt_ids, normalized_text = build_fish_text_only_prompt_ids(tokenizer, text)
+        additional_information = {
+            "text": [normalized_text],
+        }
+        return {
+            "prompt_token_ids": prompt_ids,
+            "additional_information": additional_information,
+        }
 
-    # Build user message with speaker tag prefix.
-    user_text = f"<|speaker:0|>{text}"
+    if not ref_audio_path or not ref_text:
+        raise ValueError("Fish Speech voice cloning requires both --ref-audio and --ref-text")
 
-    # Use chat template for user turn + assistant generation prompt.
-    messages = [{"role": "user", "content": user_text}]
-    prompt_ids = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
+    normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(text, ref_text)
+    ref_audio_wav, ref_audio_sr = sf.read(ref_audio_path, dtype="float32", always_2d=False)
+    semantic_len = _estimate_fish_ref_code_len(ref_audio_wav, ref_audio_sr)
+    ph_len = estimate_fish_voice_clone_prompt_len_from_normalized(
+        tokenizer,
+        normalized_text,
+        normalized_ref_text,
+        semantic_len,
     )
 
-    # Append <|voice|> token (151673) to signal voice generation mode.
-    voice_token_id = tokenizer.encode("<|voice|>", add_special_tokens=False)
-    prompt_ids = prompt_ids + voice_token_id
-
     additional_information = {
-        "text": [text],
-        "max_new_tokens": [4096],
+        "text": normalized_text,
+        "ref_text": normalized_ref_text,
+        "ref_audio_wav": torch.from_numpy(np.asarray(ref_audio_wav, dtype=np.float32)),
+        "ref_audio_sr": int(ref_audio_sr),
+        "fish_structured_voice_clone": True,
     }
-
-    if ref_audio_path:
-        additional_information["ref_audio"] = [ref_audio_path]
-    if ref_text:
-        additional_information["ref_text"] = [ref_text]
 
     return {
-        "prompt_token_ids": prompt_ids,
+        "prompt_token_ids": [1] * ph_len,
         "additional_information": additional_information,
     }
+
+
+def _estimate_fish_ref_code_len(wav: np.ndarray, sample_rate: int) -> int:
+    """Estimate Fish semantic token length from local reference audio."""
+    n_samples = int(np.asarray(wav).shape[0]) if np.asarray(wav).ndim > 0 else 0
+    if sample_rate <= 0 or n_samples <= 0:
+        raise ValueError("Reference audio must contain samples and a positive sample rate")
+    resampled_len = max(1, math.ceil(n_samples * DAC_SAMPLE_RATE / int(sample_rate)))
+    return max(1, math.ceil(resampled_len / DAC_HOP_LENGTH))
 
 
 def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
@@ -129,8 +148,14 @@ def main(args):
 
     t_start = time.perf_counter()
     for stage_outputs in omni.generate(inputs):
-        for output in stage_outputs.request_output:
-            _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+        request_output = stage_outputs.request_output
+        if request_output is None or not request_output.outputs:
+            continue
+        _save_wav(
+            output_dir,
+            request_output.request_id,
+            request_output.outputs[0].multimodal_output,
+        )
     t_end = time.perf_counter()
     logger.info("Total inference time: %.1f ms", (t_end - t_start) * 1000)
 

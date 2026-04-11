@@ -34,7 +34,11 @@ from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.size_utils import (
+    normalize_min_aligned_size,
+)
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -94,6 +98,9 @@ def get_qwen_image_layered_pre_process_func(
             else:
                 image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
 
+            if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
+                image = image.convert("RGBA")
+
             # 1. calculate dimensions
             image_size = image.size
             assert request.sampling_params.resolution in [640, 1024], (
@@ -105,9 +112,7 @@ def get_qwen_image_layered_pre_process_func(
             height = calculated_height
             width = calculated_width
 
-            multiple_of = vae_scale_factor * 2
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
+            height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
 
             # Store calculated dimensions in request
             prompt["additional_information"]["calculated_height"] = calculated_height
@@ -193,7 +198,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin):
+class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
     color_format = "RGBA"
 
     def __init__(
@@ -215,7 +220,7 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self.device)
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
@@ -283,6 +288,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         self.default_sample_size = 128
 
         self.stage = None
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def check_inputs(
         self,
@@ -648,6 +656,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             width = req.sampling_params.width
         else:
             # fallback to run pre-processing in pipeline (debug only)
+            if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
+                image = image.convert("RGBA")
             image_size = image[0].size if isinstance(image, list) else image.size
             assert resolution in [640, 1024], f"resolution must be either 640 or 1024, but got {resolution}"
             calculated_width, calculated_height = calculate_dimensions(
@@ -656,9 +666,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             height = calculated_height
             width = calculated_width
 
-            multiple_of = self.vae_scale_factor * 2
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
+            height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
 
             if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
                 image = self.image_processor.resize(image, calculated_height, calculated_width)
@@ -843,7 +851,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             for bidx in range(b):
                 images.append(image[bidx * f : (bidx + 1) * f])
 
-        return DiffusionOutput(output=images)
+        return DiffusionOutput(
+            output=images, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

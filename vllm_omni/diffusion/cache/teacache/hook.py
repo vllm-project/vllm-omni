@@ -157,20 +157,26 @@ class TeaCacheHook(ModelHook):
                 ctx.encoder_hidden_states.clone() if ctx.encoder_hidden_states is not None else None
             )
 
-            # Run transformer blocks using model-specific callable
-            outputs = ctx.run_transformer_blocks()
+            # Handle models with additional blocks (e.g., Flux2 single_transformer_blocks)
+            if getattr(ctx, "extra_states", None) and "run_flux2_full_transformer_with_single" in ctx.extra_states:
+                run_full = ctx.extra_states["run_flux2_full_transformer_with_single"]
+                ctx.hidden_states, ctx.encoder_hidden_states = run_full(ori_hidden_states, ori_encoder_hidden_states)
+                output = ctx.hidden_states
+                state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
+            else:
+                # Run transformer blocks using model-specific callable
+                outputs = ctx.run_transformer_blocks()
+                # Update context with outputs
+                ctx.hidden_states = outputs[0]
+                if len(outputs) > 1 and ctx.encoder_hidden_states is not None:
+                    ctx.encoder_hidden_states = outputs[1]
 
-            # Update context with outputs
-            ctx.hidden_states = outputs[0]
-            if len(outputs) > 1 and ctx.encoder_hidden_states is not None:
-                ctx.encoder_hidden_states = outputs[1]
+                output = ctx.hidden_states
 
-            # Cache residuals for next timestep
-            state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
-            if ori_encoder_hidden_states is not None:
-                state.previous_residual_encoder = (ctx.encoder_hidden_states - ori_encoder_hidden_states).detach()
-
-            output = ctx.hidden_states
+                # Cache residuals for next timestep
+                state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
+                if ori_encoder_hidden_states is not None:
+                    state.previous_residual_encoder = (ctx.encoder_hidden_states - ori_encoder_hidden_states).detach()
 
         # Update state
         state.previous_modulated_input = ctx.modulated_input.detach()

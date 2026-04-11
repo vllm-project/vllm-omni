@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
@@ -58,6 +59,31 @@ class LayerwiseOffloadHook(ModelHook):
         self.dtype_cpu_flattened_weights: dict[torch.dtype, torch.Tensor] = {}
         self.dtype_metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
 
+    @staticmethod
+    def _is_dtensor(t: torch.Tensor) -> bool:
+        return isinstance(t, DTensor)
+
+    @staticmethod
+    def _set_tensor_storage(target: torch.Tensor, value: torch.Tensor) -> None:
+        if LayerwiseOffloadHook._is_dtensor(target):
+            target._local_tensor = value
+        else:
+            target.data = value
+
+    @staticmethod
+    def _make_offload_placeholder(tensor: torch.Tensor) -> torch.Tensor:
+        if LayerwiseOffloadHook._is_dtensor(tensor):
+            local_shape = tuple(tensor.to_local().shape)
+            return torch.empty(local_shape, device="meta", dtype=tensor.dtype)
+        return torch.empty((0,), device=tensor.device, dtype=tensor.dtype)
+
+    @staticmethod
+    def _is_materialized_tensor(t: torch.Tensor) -> bool:
+        if LayerwiseOffloadHook._is_dtensor(t):
+            local_t = t.to_local()
+            return not local_t.is_meta
+        return not t.is_meta and t.data.numel() > 0
+
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         # This all happen during the hook instance being registered to hook registry;
         # the input module is kept intact
@@ -71,7 +97,10 @@ class LayerwiseOffloadHook(ModelHook):
 
         # Pre-allocate gpu tensors in a flattened way
         self.dtype_cpu_flattened_weights, self.dtype_metadata = LayerwiseOffloadHook._to_cpu(
-            self.next_block_parameters, self.next_block_buffers, self.device, self.pin_memory
+            self.next_block_parameters,
+            self.next_block_buffers,
+            self.device,
+            self.pin_memory,
         )
 
         return module
@@ -106,13 +135,17 @@ class LayerwiseOffloadHook(ModelHook):
 
         for dtype, name2weights in dtype_grouped_weights.items():
             # total # of parameters + buffers
-            total_numel = sum(t.numel() for _, t in name2weights.items())
+            weights_with_local = []
+            for name, t in name2weights.items():
+                local_t = t.to_local() if hasattr(t, "to_local") else t
+                weights_with_local.append((name, t, local_t))
+            total_numel = sum(local.numel() for _, _, local in weights_with_local)
             cpu_tensor = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=pin_memory)
 
             current_offset = 0
-            for name, param_or_buf in name2weights.items():
-                numel = param_or_buf.numel()
-                cpu_tensor[current_offset : current_offset + numel].copy_(param_or_buf.flatten())
+            for name, original_tensor, local_tensor in weights_with_local:
+                numel = local_tensor.numel()
+                cpu_tensor[current_offset : current_offset + numel].copy_(local_tensor.flatten())
                 if dtype not in dtype_metadata:
                     dtype_metadata[dtype] = []
                 dtype_metadata[dtype].append(
@@ -120,11 +153,13 @@ class LayerwiseOffloadHook(ModelHook):
                         "name": name,
                         "offset": current_offset,
                         "numel": numel,
-                        "shape": param_or_buf.shape,
+                        "shape": local_tensor.shape,
                     }
                 )
 
-                param_or_buf.data = torch.empty((), device=device, dtype=dtype)
+                LayerwiseOffloadHook._set_tensor_storage(
+                    original_tensor, LayerwiseOffloadHook._make_offload_placeholder(original_tensor)
+                )
                 current_offset += numel
 
             dtype_cpu_flattened_weights[dtype] = cpu_tensor
@@ -135,7 +170,7 @@ class LayerwiseOffloadHook(ModelHook):
     def is_materialized(self) -> bool:
         """Check whether this block's parameters hold real data on device."""
         for param in self.block_parameters.values():
-            return param.data.dim() > 0
+            return LayerwiseOffloadHook._is_materialized_tensor(param)
 
         return True
 
@@ -172,8 +207,9 @@ class LayerwiseOffloadHook(ModelHook):
                     layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
                 )
 
-                target_param_or_buf.data = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
-                    metadata["shape"]
+                LayerwiseOffloadHook._set_tensor_storage(
+                    target_param_or_buf,
+                    gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(metadata["shape"]),
                 )
 
         self._prefetch_done = evt
@@ -191,9 +227,9 @@ class LayerwiseOffloadHook(ModelHook):
 
         # free GPU residency
         for _, param in self.block_parameters.items():
-            param.data = torch.empty((), device=self.device, dtype=param.dtype)
+            LayerwiseOffloadHook._set_tensor_storage(param, LayerwiseOffloadHook._make_offload_placeholder(param))
         for _, buf in self.block_buffers.items():
-            buf.data = torch.empty((), device=self.device, dtype=buf.dtype)
+            LayerwiseOffloadHook._set_tensor_storage(buf, LayerwiseOffloadHook._make_offload_placeholder(buf))
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         # if the previous hook was skipped and the weights are not on device,
@@ -276,10 +312,9 @@ class LayerWiseOffloadBackend(OffloadBackend):
             dit_name = modules.dit_names[i]
             logger.info(f"Applying hooks on {dit_name} ({dit_module.__class__.__name__})")
 
-            blocks_attr_name = LayerWiseOffloadBackend.get_blocks_attr_name(dit_module)
-            blocks = LayerWiseOffloadBackend.get_blocks_from_dit(dit_module)
+            blocks_attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(dit_module)
 
-            if not blocks_attr_name or not blocks:
+            if not blocks:
                 logger.warning(
                     "Target layers (blocks) not found. Skipping offloading on %s (%s)",
                     dit_name,
@@ -300,18 +335,31 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
             # Move non-block modules to GPU (they stay resident)
             for name, m in dit_module.named_children():
-                if name == blocks_attr_name:
+                if name not in blocks_attr_names:
+                    m.to(self.device)
+                    logger.debug(f"Moved {name} to device {self.device}")
+                else:
                     logger.debug(f"Skipped blocks module {name}")
-                    continue
-                m.to(self.device)
-                logger.debug(f"Moved {name} to device {self.device}")
+
+            # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
+            for param in dit_module._parameters.values():
+                if param is not None:
+                    param.data = param.data.to(self.device, non_blocking=True)
+
+            for buffer in dit_module._buffers.values():
+                if buffer is not None:
+                    buffer.data = buffer.data.to(self.device, non_blocking=True)
 
             # Pre-fetch the first layer by manually calling the hook function on the last layer;
             # For subsequent requests, the first layer/block will be pre-fetched
             # during the last layer compute of the previous request.
             last_block, first_block = blocks[-1], blocks[0]
             last_hook = apply_block_hook(
-                last_block, first_block, self.device, self.copy_stream, self.config.pin_cpu_memory
+                last_block,
+                first_block,
+                self.device,
+                self.copy_stream,
+                self.config.pin_cpu_memory,
             )
             last_hook.prefetch_layer(non_blocking=False)
 
@@ -319,7 +367,13 @@ class LayerWiseOffloadBackend(OffloadBackend):
             # Register hook for each of blocks
             for i, block in enumerate(blocks[:-1]):
                 next_block = blocks[(i + 1) % num_blocks]
-                hook = apply_block_hook(block, next_block, self.device, self.copy_stream, self.config.pin_cpu_memory)
+                hook = apply_block_hook(
+                    block,
+                    next_block,
+                    self.device,
+                    self.copy_stream,
+                    self.config.pin_cpu_memory,
+                )
                 block_hooks.append(hook)
 
             # NOTE(yuanheng-zhao): We make each hook gets a backward reference to the hook
@@ -349,40 +403,84 @@ class LayerWiseOffloadBackend(OffloadBackend):
         logger.info("Layer-wise offloading disabled")
 
     @staticmethod
-    def get_blocks_attr_name(model: nn.Module) -> str | None:
-        """Retrieve blocks attribute name from provided DiT model"""
-        return getattr(model.__class__, "_layerwise_offload_blocks_attr", None)
+    def get_blocks_attr_names(model: nn.Module) -> list[str]:
+        """Get block attribute names from model class."""
+        attrs: list[str] = getattr(model.__class__, "_layerwise_offload_blocks_attrs", [])
+
+        if not attrs:
+            old_attr = getattr(model.__class__, "_layerwise_offload_blocks_attr", None)
+            if old_attr is not None:
+                logger.warning(
+                    "'_layerwise_offload_blocks_attr' is deprecated, "
+                    "please use '_layerwise_offload_blocks_attrs' instead. "
+                    "Example: _layerwise_offload_blocks_attrs = ['blocks']"
+                )
+                attrs = [old_attr] if isinstance(old_attr, str) else list(old_attr)
+
+        return attrs
 
     @staticmethod
-    def set_blocks_attr_name(model: nn.Module, name: str) -> None:
-        if not hasattr(model.__class__, "_layerwise_offload_blocks_attr"):
-            setattr(model.__class__, "_layerwise_offload_blocks_attr", name)
+    def set_blocks_attr_names(model: nn.Module, names: list[str]) -> None:
+        if not hasattr(model.__class__, "_layerwise_offload_blocks_attrs"):
+            setattr(model.__class__, "_layerwise_offload_blocks_attrs", names)
 
     @staticmethod
-    def get_blocks_from_dit(model: nn.Module) -> list[nn.Module]:
+    def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
         """
-        Retrieve a list of blocks from provided DiT model. Blocks attribute name
-        are found by `_layerwise_offload_blocks_attr` set to DiT models. For example,
+        Retrieve blocks and attribute names from provided DiT model. Blocks attribute names
+        are found by `_layerwise_offload_blocks_attrs` set to DiT models. For example,
 
         ```
         class WanTransformer3DModel(nn.Module):
-            _layerwise_offload_blocks_attr = "blocks"
+            _layerwise_offload_blocks_attrs = ["blocks"]
         ```
+
+        Returns:
+            Tuple of (blocks_attr_names, blocks)
         """
-        blocks_attr_name = LayerWiseOffloadBackend.get_blocks_attr_name(model)
-        if blocks_attr_name is None:
+        blocks_attr_names = LayerWiseOffloadBackend.get_blocks_attr_names(model)
+        if not blocks_attr_names:
             logger.warning(
-                f"No _layerwise_offload_blocks_attr defined for {model.__class__.__name__}, "
+                f"No _layerwise_offload_blocks_attrs defined for {model.__class__.__name__}, "
                 "skipping layerwise offloading"
             )
-            return []
+            return [], []
 
-        _blocks = getattr(model, blocks_attr_name, None)
-        if _blocks is None:
+        blocks = []
+        for name in blocks_attr_names:
+            attr = getattr(model, name, None)
+            if attr is None:
+                raise AttributeError(
+                    f"Attribute '{name}' declared in _layerwise_offload_blocks_attrs "
+                    f"does not exist on model {model.__class__.__name__}"
+                )
+            try:
+                attr_iter = iter(attr)
+            except TypeError:
+                if isinstance(attr, nn.Module):
+                    logger.warning(
+                        "Attribute '%s' on %s is not iterable; treating it as one block.",
+                        name,
+                        model.__class__.__name__,
+                    )
+                    blocks.append(attr)
+                    continue
+
+                logger.warning(
+                    "Attribute '%s' on %s is not iterable (got %s); skipping it.",
+                    name,
+                    model.__class__.__name__,
+                    type(attr).__name__,
+                )
+            else:
+                blocks.extend(attr_iter)
+
+        if not blocks:
             logger.warning(
-                f"Blocks (layers) '{blocks_attr_name}' not found on {model.__class__.__name__}, "
-                "skipping layerwise offloading"
+                "No blocks found in %s for %s, skipping layerwise offloading",
+                blocks_attr_names,
+                model.__class__.__name__,
             )
-            return []
+            return [], []
 
-        return list(_blocks)
+        return blocks_attr_names, blocks

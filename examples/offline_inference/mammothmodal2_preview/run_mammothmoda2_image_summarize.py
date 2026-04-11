@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
     return parser.parse_args()
 
 
@@ -70,6 +75,7 @@ def main() -> None:
         model=args.model,
         stage_configs_path=args.stage_config,
         trust_remote_code=args.trust_remote_code,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
     try:
         sp = SamplingParams(
@@ -99,14 +105,12 @@ def main() -> None:
 
     lines: list[str] = []
     for stage_outputs in outputs:
-        req_outputs = getattr(stage_outputs, "request_output", stage_outputs)
-        req_outputs = req_outputs if isinstance(req_outputs, list) else [req_outputs]
-        for ro in req_outputs:
-            text = ro.outputs[0].text if getattr(ro, "outputs", None) else str(ro)
-            lines.append(f"request_id: {getattr(ro, 'request_id', 'unknown')}\n")
-            lines.append("answer:\n")
-            lines.append(text.strip() + "\n")
-            lines.append("\n")
+        ro = getattr(stage_outputs, "request_output", stage_outputs)
+        text = ro.outputs[0].text if getattr(ro, "outputs", None) else str(ro)
+        lines.append(f"request_id: {getattr(ro, 'request_id', 'unknown')}\n")
+        lines.append("answer:\n")
+        lines.append(text.strip() + "\n")
+        lines.append("\n")
 
     print("\n".join(lines))
 

@@ -38,7 +38,11 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.size_utils import (
+    normalize_min_aligned_size,
+)
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -98,9 +102,7 @@ def get_qwen_image_edit_plus_pre_process_func(
             width = request.sampling_params.width or calculated_width
 
             # Ensure dimensions are multiples of vae_scale_factor * 2
-            multiple_of = vae_scale_factor * 2
-            height = height // multiple_of * multiple_of
-            width = width // multiple_of * multiple_of
+            height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
 
             # Store calculated dimensions in request
             prompt["additional_information"]["calculated_height"] = calculated_height
@@ -166,7 +168,9 @@ def get_qwen_image_edit_plus_post_process_func(
     return post_process_func
 
 
-class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin):
+class QwenImageEditPlusPipeline(
+    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin
+):
     def __init__(
         self,
         *,
@@ -195,7 +199,7 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParall
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self.device)
 
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
@@ -224,6 +228,9 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParall
         )
         self.prompt_template_encode_start_idx = 64
         self.default_sample_size = 128
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def check_inputs(
         self,
@@ -598,9 +605,7 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParall
             height = height or calculated_height
             width = width or calculated_width
 
-            multiple_of = self.vae_scale_factor * 2
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
+            height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
 
             condition_images = []
             vae_images = []
@@ -769,7 +774,9 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParall
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

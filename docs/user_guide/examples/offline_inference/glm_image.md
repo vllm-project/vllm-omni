@@ -43,8 +43,7 @@ GLM-Image uses a 2-stage pipeline:
 
 ```bash
 python end2end.py \
-    --model-path /path/to/glm-image \
-    --config-path ../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
+    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
     --prompt "A beautiful sunset over the ocean with sailing boats" \
     --height 1024 \
     --width 1024 \
@@ -55,8 +54,7 @@ python end2end.py \
 
 ```bash
 python end2end.py \
-    --model-path /path/to/glm-image \
-    --config-path ../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
+    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
     --prompt "Transform this scene into a winter wonderland" \
     --image input.png \
     --output output_i2i.png
@@ -67,7 +65,7 @@ python end2end.py \
 ```bash
 python end2end.py \
     --model-path /path/to/glm-image \
-    --config-path ../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
+    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
     --prompt "A photorealistic cat sitting on a window sill" \
     --height 1024 \
     --width 1024 \
