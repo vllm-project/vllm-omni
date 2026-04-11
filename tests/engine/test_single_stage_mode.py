@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 from vllm.v1.engine.utils import EngineZmqAddresses
@@ -41,31 +42,33 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # ---------------------------------------------------------------------------
 
 
-def _make_stage_cfg(stage_id: int, stage_type: str = "llm") -> Mock:
+def _make_stage_cfg(stage_id: int, stage_type: str = "llm"):
     """Return a lightweight stage config mock."""
-    cfg = Mock()
-    cfg.stage_id = stage_id
-    cfg.stage_type = stage_type
-    cfg.engine_args = MagicMock()
-    cfg.engine_args.async_chunk = False
-    cfg.engine_args.model_stage = None
-    cfg.engine_args.engine_output_type = None
-    return cfg
+    return SimpleNamespace(
+        stage_id=stage_id,
+        stage_type=stage_type,
+        engine_args=SimpleNamespace(
+            async_chunk=False,
+            model_stage=None,
+            engine_output_type=None,
+        ),
+    )
 
 
 def _make_started_llm_stage(stage_id: int) -> StartedLlmStage:
     """Return a minimal StartedLlmStage for mocking."""
-    addresses = Mock()
-    addresses.inputs = ["tcp://127.0.0.1:5000"]
-    addresses.outputs = ["tcp://127.0.0.1:5001"]
-    addresses.frontend_stats_publish_address = None
+    addresses = SimpleNamespace(
+        inputs=["tcp://127.0.0.1:5000"],
+        outputs=["tcp://127.0.0.1:5001"],
+        frontend_stats_publish_address=None,
+    )
     return StartedLlmStage(
         stage_id=stage_id,
-        metadata=Mock(stage_id=stage_id),
-        vllm_config=Mock(),
-        executor_class=Mock(),
-        engine_manager=Mock(),
-        coordinator=Mock(),
+        metadata=SimpleNamespace(stage_id=stage_id),
+        vllm_config=SimpleNamespace(),
+        executor_class=SimpleNamespace(),
+        engine_manager=SimpleNamespace(),
+        coordinator=SimpleNamespace(),
         addresses=addresses,
     )
 

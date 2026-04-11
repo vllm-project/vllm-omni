@@ -5,7 +5,7 @@ explicitly patch values that differ from vLLM.
 """
 
 import inspect
-from unittest.mock import Mock
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -100,7 +100,7 @@ def test_qwen3_tts_codec_frame_rate_patching():
     vllm_config = EngineArgs().create_model_config()
 
     # Create a mock talking config with a dummy value for position_id_per_seconds
-    mock_talker_config = Mock()
+    mock_talker_config = SimpleNamespace()
     mock_talker_config.position_id_per_seconds = 12.3
     vllm_config.hf_config.talker_config = mock_talker_config
 
@@ -124,13 +124,12 @@ def test_stage_specific_text_config_override():
     # Switch the created hf text config with a mock whose
     # values we want to pull through the text config helper
     stage_text_config = vllm_config.hf_text_config
-    vllm_config.hf_text_config = Mock()
+    vllm_config.hf_text_config = SimpleNamespace()
     stage_text_config.sliding_window = 4096
     stage_text_config.attention_chunk_size = 2048
 
     # Move the stage config's text config getter & thinker config
-    mock_stage_config = Mock()
-    mock_stage_config.get_text_config.return_value = stage_text_config
+    mock_stage_config = SimpleNamespace(get_text_config=lambda: stage_text_config)
     vllm_config.hf_config.thinker_config = mock_stage_config
 
     # Ensure that create from a vLLM config correctly pulls the
