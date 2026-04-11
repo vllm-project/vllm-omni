@@ -5,8 +5,8 @@ import argparse
 import re
 import time
 
-import librosa
 from PIL import Image
+from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
@@ -69,7 +69,7 @@ def load_image_and_audio(image_paths, audio_paths):
             image.append(img)
 
     for path in audio_paths:
-        audio_array, sr = librosa.load(path, sr=16000)
+        audio_array, sr = load_audio(path, sr=16000)
         audio_array = audio_array[int(sr * 1) : int(sr * 3)]
         audio.append(audio_array)
     return image, audio

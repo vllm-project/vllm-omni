@@ -26,17 +26,12 @@ models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 # TODO: When NPU support is ready, remove this branch.
 if current_omni_platform.is_npu():
     models = ["Tongyi-MAI/Z-Image-Turbo", "Qwen/Qwen-Image"]
-elif current_omni_platform.is_rocm():
-    # TODO: When ROCm support is ready, remove this branch.
-    # Current upstream vLLM has issues running riverclouds/qwen_image_random
-    # on ROCm
-    models = ["Tongyi-MAI/Z-Image-Turbo"]
 
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 1, "rocm": 2, "xpu": 2})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 1, "rocm": 1, "xpu": 2})
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str, run_level):
     if run_level == "core_model" and model_name != "riverclouds/qwen_image_random":

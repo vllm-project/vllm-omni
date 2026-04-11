@@ -34,12 +34,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class MockVideoResult:
-    def __init__(self, videos, audios=None, sample_rate=None):
+    def __init__(self, videos, audios=None, sample_rate=None, stage_durations=None, peak_memory_mb=0.0):
         self.multimodal_output = {"video": videos}
         if audios is not None:
             self.multimodal_output["audio"] = audios
         if sample_rate is not None:
             self.multimodal_output["audio_sample_rate"] = sample_rate
+        self.stage_durations = stage_durations or {}
+        self.peak_memory_mb = peak_memory_mb
 
 
 class FakeAsyncOmni:
@@ -369,6 +371,33 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
     video_id = response.json()["id"]
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     assert audio_sample_rates == [16000]
+
+
+def test_video_job_persists_profiler_metadata(test_client, mocker: MockerFixture):
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        yield MockVideoResult(
+            [object()],
+            stage_durations={"diffuse": 2.5, "vae.decode": 0.3},
+            peak_memory_mb=4096.5,
+        )
+
+    engine.generate = _generate
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
+    )
+
+    response = test_client.post("/v1/videos", data={"prompt": "profile me"})
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    completed = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    assert completed["stage_durations"] == {"diffuse": 2.5, "vae.decode": 0.3}
+    assert completed["peak_memory_mb"] == 4096.5
 
 
 def test_missing_handler_returns_503():
@@ -770,6 +799,31 @@ def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
     assert response.headers["x-request-id"].startswith("video_sync-")
     assert response.headers["x-model"] == "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
     assert float(response.headers["x-inference-time-s"]) >= 0
+    assert json.loads(response.headers["x-stage-durations"]) == {}
+    assert float(response.headers["x-peak-memory-mb"]) == 0.0
+
+
+def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        yield MockVideoResult(
+            [object()],
+            stage_durations={"diffuse": 1.75},
+            peak_memory_mb=1234.25,
+        )
+
+    engine.generate = _generate
+    _mock_encode_video_bytes(mocker, b"profiled-video")
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "sync profile"})
+
+    assert response.status_code == 200
+    assert response.content == b"profiled-video"
+    assert json.loads(response.headers["x-stage-durations"]) == {"diffuse": 1.75}
+    assert float(response.headers["x-peak-memory-mb"]) == pytest.approx(1234.25, rel=0, abs=1e-3)
 
 
 def test_sync_i2v_returns_video_bytes(test_client, mocker: MockerFixture):

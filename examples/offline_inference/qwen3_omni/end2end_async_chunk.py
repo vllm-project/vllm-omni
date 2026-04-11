@@ -32,13 +32,13 @@ import torch
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-import librosa
 from PIL import Image
 from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
+from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -89,7 +89,7 @@ def get_audio_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
