@@ -16,6 +16,7 @@ import os
 from collections.abc import Iterable
 from typing import ClassVar
 
+import numpy as np
 import torch
 from tokenizers import Tokenizer as HFTokenizer
 from torch import nn
@@ -29,6 +30,13 @@ from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
 from vllm_omni.model_executor.models.omnivoice.duration import RuleDurationEstimator
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import OmniVoiceDecoder
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import OmniVoiceGenerator
+
+try:
+    from transformers import HiggsAudioV2TokenizerModel
+except ImportError:
+    HiggsAudioV2TokenizerModel = None
+
+import torchaudio
 
 logger = init_logger(__name__)
 
@@ -79,6 +87,17 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         tokenizer_path = os.path.join(self.model_path, "tokenizer.json")
         self.tokenizer = HFTokenizer.from_file(tokenizer_path)
 
+        # Audio tokenizer for voice cloning (requires transformers>=5.3)
+        if HiggsAudioV2TokenizerModel is not None:
+            audio_tokenizer_path = os.path.join(self.model_path, "audio_tokenizer")
+            self.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
+                audio_tokenizer_path, device_map=self.device
+            ).eval()
+            logger.info("HiggsAudioV2 tokenizer loaded for voice cloning on %s", self.device)
+        else:
+            self.audio_tokenizer = None
+            logger.warning("Voice cloning disabled (requires transformers>=5.3.0).")
+
         # Duration estimator
         self.duration_estimator = RuleDurationEstimator()
 
@@ -91,20 +110,46 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         self.class_temperature = self.config.class_temperature
         self.sample_rate = self.config.sample_rate
 
+    def _encode_ref_audio(self, audio_signal: torch.Tensor, sr: int) -> torch.Tensor:
+        """Encode reference audio to 8-codebook tokens for voice cloning."""
+        if self.audio_tokenizer is None:
+            raise RuntimeError("Audio tokenizer not available for voice cloning")
+        if audio_signal.dim() == 1:
+            audio_signal = audio_signal.unsqueeze(0)
+        # Resample to tokenizer's expected sample rate
+        target_sr = self.audio_tokenizer.config.sample_rate
+        if sr != target_sr:
+            audio_signal = torchaudio.functional.resample(audio_signal, sr, target_sr)
+        # Ensure mono [B, 1, samples]
+        if audio_signal.dim() == 2:
+            audio_signal = audio_signal.unsqueeze(1)
+        with torch.inference_mode():
+            tokens = self.audio_tokenizer.encode(
+                audio_signal.to(self.audio_tokenizer.device), return_dict=False
+            )  # [B, 8, T_ref]
+            tokens = tokens.squeeze(0)  # [8, T_ref]
+        return tokens
+
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        """Generate speech audio from text.
+        """Generate speech audio from text, optionally with voice cloning.
 
-        Args:
-            req: Diffusion request containing text prompt(s).
-
-        Returns:
-            DiffusionOutput with audio tensor in .output
+        Accepts either a plain text prompt or a structured dict:
+          {"text": "...", "ref_audio": (samples, sr), "ref_text": "...",
+           "lang": "...", "instruct": "..."}
         """
-        # Extract text from request
         prompt = req.prompts[0] if req.prompts else ""
+        ref_audio = None
+        ref_text = None
+        lang = "None"
+        instruct = "None"
+
         if isinstance(prompt, dict):
             text = prompt.get("input", prompt.get("text", str(prompt)))
+            ref_audio = prompt.get("ref_audio")
+            ref_text = prompt.get("ref_text")
+            lang = prompt.get("lang") or "None"
+            instruct = prompt.get("instruct") or "None"
         else:
             text = str(prompt)
 
@@ -119,17 +164,37 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         target_len = self.duration_estimator.estimate_duration(text, "Nice to meet you.", 25)
         target_len = max(1, int(target_len))
 
-        # Tokenize with control tokens
-        style = "<|denoise|><|lang_start|>None<|lang_end|><|instruct_start|>None<|instruct_end|>"
-        full_prompt = f"{style}<|text_start|>{text}<|text_end|>"
+        # Build text prompt with control tokens
+        style = f"<|denoise|><|lang_start|>{lang}<|lang_end|><|instruct_start|>{instruct}<|instruct_end|>"
+        if ref_text:
+            full_text = f"{ref_text} {text}"
+        else:
+            full_text = text
+        full_prompt = f"{style}<|text_start|>{full_text}<|text_end|>"
         encoding = self.tokenizer.encode(full_prompt)
         text_tokens = torch.tensor(encoding.ids, dtype=torch.long, device=device)
         text_len = text_tokens.shape[0]
 
+        # Encode reference audio tokens if provided
+        ref_audio_tokens = None
+        if ref_audio is not None:
+            if self.audio_tokenizer is None:
+                raise RuntimeError(
+                    "Voice cloning requires transformers>=5.3.0. Try: uv pip install 'transformers>=5.3.0'"
+                )
+            audio_signal, sr = ref_audio
+            if isinstance(audio_signal, np.ndarray):
+                audio_signal = torch.from_numpy(audio_signal).float()
+            ref_audio_tokens = self._encode_ref_audio(audio_signal, int(sr)).to(device)
+
         # Build conditional + unconditional batches [2, 8, max_len]
         text_ids = text_tokens.unsqueeze(0).repeat(num_cb, 1)
         target_ids = torch.full((num_cb, target_len), mask_id, dtype=torch.long, device=device)
-        cond_ids = torch.cat([text_ids, target_ids], dim=1)
+
+        if ref_audio_tokens is not None:
+            cond_ids = torch.cat([text_ids, ref_audio_tokens, target_ids], dim=1)
+        else:
+            cond_ids = torch.cat([text_ids, target_ids], dim=1)
         cond_len = cond_ids.shape[1]
 
         uncond_ids = target_ids.clone()
