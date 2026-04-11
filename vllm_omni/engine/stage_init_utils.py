@@ -168,6 +168,20 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     stage_id: int = stage_config.stage_id
     stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
+
+    if current_omni_platform.is_rocm():
+        if engine_args.get("attention_backend") is None:
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            if rocm_aiter_ops.is_enabled():
+                engine_args["attention_backend"] = "ROCM_AITER_FA"
+            # Before vLLM v0.19.0, the default attention backend is TRITON_ATTN for ROCm.
+            # Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
+            # However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
+            # Therefore, we still use TRITON_ATTN as the default attention backend,
+            # when the selected_backend is not specified.
+            engine_args["attention_backend"] = "TRITON_ATTN"
+
     runtime_cfg = getattr(stage_config, "runtime", {})
     engine_input_source: list[int] = getattr(stage_config, "engine_input_source", [])
     final_output: bool = getattr(stage_config, "final_output", False)
