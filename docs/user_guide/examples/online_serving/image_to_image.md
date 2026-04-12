@@ -3,7 +3,9 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/image_to_image>.
 
 
-This example demonstrates how to deploy Qwen-Image-Edit model for online image editing service using vLLM-Omni.
+This example demonstrates how to deploy image editing models for online service using vLLM-Omni.
+
+Supported models include **Qwen-Image-Edit**, **FLUX.2-klein** (4B/9B), **OmniGen2**, **LongCat-Image-Edit**, and **GLM-Image**.
 
 For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
 
@@ -13,6 +15,12 @@ For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPl
 
 ```bash
 vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
+```
+
+### FLUX.2-klein
+
+```bash
+vllm serve black-forest-labs/FLUX.2-klein-4B --omni --port 8092
 ```
 
 !!! note

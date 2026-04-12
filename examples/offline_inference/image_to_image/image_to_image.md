@@ -1,6 +1,8 @@
 # Image-To-Image
 
-This example edits an input image with `Qwen/Qwen-Image-Edit` using the `image_edit.py` CLI.
+This example edits an input image using the `image_edit.py` CLI. Supported models include
+`Qwen/Qwen-Image-Edit`, `black-forest-labs/FLUX.2-klein-4B`, `black-forest-labs/FLUX.2-klein-9B`,
+`OmniGen2/OmniGen2`, `meituan-longcat/LongCat-Image-Edit`, `zai-org/GLM-Image`, and more.
 
 ## Local CLI Usage
 
@@ -22,6 +24,21 @@ python image_edit.py \
   --num-inference-steps 50 \
   --cfg-scale 4.0
 ```
+
+### Image Editing with FLUX.2-klein
+
+```bash
+python image_edit.py \
+  --model black-forest-labs/FLUX.2-klein-4B \
+  --image input.png \
+  --prompt "Change the background to a beach" \
+  --output output_image_edit.png \
+  --num-inference-steps 50 \
+  --cfg-scale 4.0 \
+  --guidance-scale 1.0
+```
+
+A larger 9B variant is also available: `black-forest-labs/FLUX.2-klein-9B`.
 
 ### Multiple Image Editing (Qwen-Image-Edit-2509)
 
