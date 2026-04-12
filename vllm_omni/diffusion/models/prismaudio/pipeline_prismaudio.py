@@ -217,7 +217,6 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
     support_audio_output = True
     supports_step_execution = True
-    skip_default_dummy_run = True
     required_feature_names = ("video_features", "text_features", "sync_features")
     default_num_inference_steps = 24
     default_cfg_scale = 5.0
@@ -581,6 +580,28 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 expected_feature_dims.get(feature_name),
             )
 
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, torch.Tensor]]:
+        expected_feature_dims = self._get_expected_feature_dims()
+        feature_names = self._get_required_feature_names()
+        dummy_payloads: list[dict[str, torch.Tensor]] = []
+        for _ in range(num_reqs):
+            payload: dict[str, torch.Tensor] = {}
+            for feature_name in feature_names:
+                feature_width = expected_feature_dims.get(feature_name, 1)
+                payload[feature_name] = torch.zeros((1, int(feature_width)), dtype=torch.float32)
+            dummy_payloads.append(payload)
+        return dummy_payloads
+
+    def _is_engine_dummy_warmup_prompt(self, prompt: Any) -> bool:
+        if not isinstance(prompt, Mapping):
+            return False
+        if prompt.get("prompt") != "dummy run":
+            return False
+        additional_information = prompt.get("additional_information")
+        if additional_information not in (None, {}):
+            return False
+        return "multi_modal_data" in prompt
+
     def _has_required_features(self, additional_information: Mapping[str, Any]) -> bool:
         return all(
             additional_information.get(feature_name) is not None for feature_name in self._get_required_feature_names()
@@ -820,6 +841,15 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             raise ValueError("PrismAudioPipeline requires at least one prompt.")
 
         conditioning_batch = [self._get_additional_information(prompt) for prompt in prompts]
+        if (
+            all(not additional_information for additional_information in conditioning_batch)
+            and all(self._is_engine_dummy_warmup_prompt(prompt) for prompt in prompts)
+        ):
+            dummy_batch = self.get_dummy_runtime_additional_information(len(prompts))
+            for additional_information in dummy_batch:
+                self._validate_required_features(additional_information)
+            logger.info("PrismAudioPipeline synthesized dummy conditioning for engine warmup.")
+            return dummy_batch
         if all(self._has_required_features(item) for item in conditioning_batch):
             for additional_information in conditioning_batch:
                 self._validate_required_features(additional_information)
@@ -1121,6 +1151,11 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                     "PrismAudioPipeline runtime transformer checkpoint is missing required weights: "
                     f"{transformer_missing_keys!r}."
                 )
+            logger.info(
+                "PrismAudioPipeline loaded %d transformer tensors from %s.",
+                len(report.loaded_keys),
+                runtime_config.transformer_checkpoint_path,
+            )
             loaded_keys.update(f"transformer.{key}" for key in report.loaded_keys)
 
         if self.vae is not None and runtime_config.vae_checkpoint_path:
@@ -1138,6 +1173,11 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 raise ValueError(
                     f"PrismAudioPipeline runtime VAE checkpoint is missing required weights: {report.missing_keys!r}."
                 )
+            logger.info(
+                "PrismAudioPipeline loaded %d VAE tensors from %s.",
+                len(report.loaded_keys),
+                runtime_config.vae_checkpoint_path,
+            )
             loaded_keys.update(f"vae.{key}" for key in report.loaded_keys)
 
         return loaded_keys
@@ -1146,6 +1186,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         loader = AutoWeightsLoader(self)
         loaded_keys = loader.load_weights(weights)
         loaded_keys.update(self._load_runtime_checkpoint_weights())
+        logger.info("PrismAudioPipeline finished weight loading with %d loaded tensor names.", len(loaded_keys))
         return loaded_keys
 
     def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:

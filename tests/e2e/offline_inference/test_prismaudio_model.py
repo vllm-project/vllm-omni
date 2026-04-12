@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from tests.utils import hardware_test
 from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import (
@@ -211,6 +212,100 @@ def test_prismaudio_e2e_config_path_is_env_driven(monkeypatch) -> None:
 
     with pytest.raises(pytest.skip.Exception, match=_ENV_CONFIG):
         _resolve_prismaudio_config_path()
+
+
+def test_prismaudio_dummy_runtime_additional_information_uses_declared_feature_dims() -> None:
+    pipeline = PrismAudioPipeline()
+    pipeline.runtime_config = PrismAudioRuntimeConfig(
+        sample_rate=44100,
+        audio_channels=2,
+        latent_channels=64,
+        raw_model_config={
+            "model": {
+                "conditioning": {
+                    "configs": [
+                        {"id": "video_features", "config": {"dim": 1024}},
+                        {"id": "text_features", "config": {"dim": 1024}},
+                        {"id": "sync_features", "config": {"dim": 768}},
+                    ]
+                }
+            }
+        },
+    )
+
+    payloads = pipeline.get_dummy_runtime_additional_information(2)
+
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert tuple(payload["video_features"].shape) == (1, 1024)
+        assert tuple(payload["text_features"].shape) == (1, 1024)
+        assert tuple(payload["sync_features"].shape) == (1, 768)
+
+
+def test_prismaudio_engine_dummy_warmup_uses_synthesized_conditioning() -> None:
+    pipeline = PrismAudioPipeline()
+    pipeline.runtime_config = PrismAudioRuntimeConfig(
+        sample_rate=44100,
+        audio_channels=2,
+        latent_channels=64,
+        raw_model_config={
+            "model": {
+                "conditioning": {
+                    "configs": [
+                        {"id": "video_features", "config": {"dim": 1024}},
+                        {"id": "text_features", "config": {"dim": 1024}},
+                        {"id": "sync_features", "config": {"dim": 768}},
+                    ]
+                }
+            }
+        },
+    )
+
+    conditioning = pipeline._collect_prompt_conditioning(
+        [
+            {
+                "prompt": "dummy run",
+                "multi_modal_data": {
+                    "image": None,
+                    "audio": None,
+                },
+            }
+        ]
+    )
+
+    assert len(conditioning) == 1
+    assert tuple(conditioning[0]["video_features"].shape) == (1, 1024)
+    assert tuple(conditioning[0]["text_features"].shape) == (1, 1024)
+    assert tuple(conditioning[0]["sync_features"].shape) == (1, 768)
+
+
+def test_prismaudio_load_weights_loads_runtime_checkpoints_from_empty_weight_iterator(tmp_path: Path) -> None:
+    transformer = nn.Linear(2, 2, bias=False)
+    vae = nn.Linear(2, 2, bias=False)
+    transformer.weight.data.zero_()
+    vae.weight.data.zero_()
+
+    transformer_ckpt = tmp_path / "transformer.ckpt"
+    vae_ckpt = tmp_path / "vae.ckpt"
+    torch.save({"weight": torch.full_like(transformer.weight, 3.0)}, transformer_ckpt)
+    torch.save({"autoencoder.weight": torch.full_like(vae.weight, 5.0)}, vae_ckpt)
+
+    pipeline = PrismAudioPipeline(transformer=transformer, vae=vae)
+    pipeline.runtime_config = PrismAudioRuntimeConfig(
+        sample_rate=44100,
+        audio_channels=2,
+        latent_channels=64,
+        transformer_checkpoint_path=str(transformer_ckpt),
+        vae_checkpoint_path=str(vae_ckpt),
+        raw_model_config=None,
+    )
+
+    loaded = pipeline.load_weights([])
+
+    assert "transformer.weight" in loaded
+    assert "vae.weight" in loaded
+    assert torch.equal(transformer.weight, torch.full_like(transformer.weight, 3.0))
+    assert torch.equal(vae.weight, torch.full_like(vae.weight, 5.0))
 
 
 def test_prismaudio_e2e_prompt_uses_conditioning_path_contract(tmp_path: Path) -> None:
