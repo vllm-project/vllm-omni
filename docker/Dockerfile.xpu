@@ -15,9 +15,7 @@ RUN apt clean && apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
     curl \
     espeak-ng \
-    ffmpeg \
     git \
-    libsndfile1 \
     libsm6 \
     libxext6 \
     libgl1 \

@@ -63,14 +63,11 @@ class TestAudioMixin:
         adjusted_tensor = mock_speed.call_args[0][0]
         assert len(adjusted_tensor) == 24000
 
-    def test_speed_adjustment(self, audio_mixin, mocker: MockerFixture):
-        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
-        mock_time_stretch.return_value = np.zeros(12000)
+    def test_speed_adjustment(self, audio_mixin):
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
         adjusted_audio, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=2.0, sample_rate=24000)
 
-        mock_time_stretch.assert_called_with(y=audio_tensor, rate=2.0)
         assert adjusted_audio.shape == (12000,)
 
     def test_unsupported_format_fallback(self, audio_mixin, caplog, mocker: MockerFixture):
@@ -117,30 +114,22 @@ class TestAudioMixin:
         assert np.array_equal(output_tensor, stereo_tensor)
 
     def test_speed_adjustment_bypass(self, audio_mixin, mocker: MockerFixture):
-        """Test that speed=1.0 bypasses the expensive librosa time stretching."""
+        """Test that speed=1.0 bypasses the expensive torchaudio time stretching."""
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
-        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
-        # speed=1.0 should return immediately without calling librosa
+        mock_time_stretch = mocker.patch("torchaudio.transforms.TimeStretch")
+        # speed=1.0 should return immediately without calling torchaudio
         result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
 
         mock_time_stretch.assert_not_called()
         assert np.array_equal(result, audio_tensor)
 
-    def test_speed_adjustment_stereo_handling(self, audio_mixin, mocker: MockerFixture):
-        """Test that speed adjustment is attempted on stereo inputs."""
-        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
+    def test_speed_adjustment_stereo_handling(self, audio_mixin):
+        """Test that speed adjustment handles stereo (channels-last) input."""
         stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
-        # Mock return value representing a sped-up version (half length)
-        mock_time_stretch.return_value = np.zeros((12000, 2), dtype=np.float32)
 
         result, _ = audio_mixin._apply_speed_adjustment(stereo_tensor, speed=2.0, sample_rate=24000)
 
-        mock_time_stretch.assert_called_once()
-        # Ensure the stereo tensor was passed to librosa
-        call_args = mock_time_stretch.call_args
-        assert np.array_equal(call_args.kwargs["y"], stereo_tensor)
-        assert call_args.kwargs["rate"] == 2.0
         assert result.shape == (12000, 2)
 
 
@@ -791,6 +780,26 @@ class TestTTSMethods:
         )
         assert speech_server._validate_tts_request(req) is None
 
+    @pytest.mark.parametrize(
+        "ref_text",
+        [None, "", "   "],
+        ids=["none", "empty", "whitespace"],
+    )
+    def test_validate_base_task_missing_ref_text_returns_400(self, speech_server, ref_text):
+        """Regression: Base task without ref_text must return 400, not crash EngineCore.
+
+        See https://github.com/vllm-project/vllm-omni/pull/2203
+        """
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text=ref_text,
+        )
+        result = speech_server._validate_tts_request(req)
+        assert result is not None, f"ref_text={ref_text!r} should be rejected"
+        assert "ref_text" in result
+
     def test_validate_tts_request_customvoice_no_speakers(self, speech_server):
         """CustomVoice on a model with no speakers returns 400 instead of crashing engine."""
         req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
@@ -1087,6 +1096,181 @@ class TestTTSMethods:
         result = speech_server._get_uploaded_audio_data("nonexistent")
 
         assert result is None
+
+    # ── speaker field alias ──
+
+    def test_speaker_alias_accepted_as_voice(self):
+        """The 'speaker' JSON key should be accepted as an alias for 'voice'."""
+        req = OpenAICreateSpeechRequest.model_validate({"input": "Hello", "speaker": "custom_voice"})
+        assert req.voice == "custom_voice"
+
+    def test_voice_field_still_accepted(self):
+        """The canonical 'voice' JSON key should still work."""
+        req = OpenAICreateSpeechRequest.model_validate({"input": "Hello", "voice": "custom_voice"})
+        assert req.voice == "custom_voice"
+
+    def test_speaker_alias_in_base_task_with_uploaded_voice(self, speech_server):
+        """Using 'speaker' key with an uploaded voice should work for Base task."""
+        speech_server.uploaded_speakers = {
+            "utesf": {
+                "name": "UTESF",
+                "file_path": "/tmp/voice_samples/utesf.wav",
+                "mime_type": "audio/wav",
+                "ref_text": None,
+            }
+        }
+        req = OpenAICreateSpeechRequest.model_validate({"input": "Hello", "speaker": "UTESF", "task_type": "Base"})
+        assert req.voice == "UTESF"
+        with patch("pathlib.Path.exists", return_value=True):
+            result = speech_server._validate_qwen_tts_request(req)
+        assert result is None
+
+    # ── uploaded voice with embedding ──
+
+    def test_build_tts_params_with_uploaded_voice_embedding(self, speech_server):
+        """Test _build_tts_params loads embedding for embedding-uploaded voices."""
+        speech_server.uploaded_speakers = {
+            "emb_voice": {
+                "name": "emb_voice",
+                "file_path": "/tmp/voice_samples/emb_voice.safetensors",
+                "mime_type": "application/x-safetensors",
+                "embedding_source": "direct",
+                "embedding_dim": 1024,
+                "cache_status": "ready",
+                "cache_file": "/tmp/voice_samples/emb_voice.safetensors",
+            }
+        }
+        speech_server.supported_speakers = {"ryan", "vivian", "emb_voice"}
+
+        fake_embedding = [0.1] * 1024
+        with patch.object(speech_server, "_get_uploaded_speaker_embedding") as mock_get_emb:
+            mock_get_emb.return_value = fake_embedding
+            req = OpenAICreateSpeechRequest(input="Hello", voice="emb_voice")
+            params = speech_server._build_tts_params(req)
+
+            assert "voice_clone_prompt" in params
+            assert params["voice_clone_prompt"][0]["ref_spk_embedding"] == fake_embedding
+            assert params["task_type"] == ["Base"]
+            assert params["x_vector_only_mode"] == [True]
+            assert "ref_audio" not in params
+
+    # ── regression: full flow from issue #1603 ──
+
+    def test_regression_1603_speaker_key_with_uploaded_audio_voice(self, speech_server):
+        """Regression test for #1603: upload audio voice, then invoke TTS with 'speaker' key.
+
+        Verifies the full validate → build_params pipeline works end-to-end.
+        """
+        speech_server.uploaded_speakers = {
+            "utesf": {
+                "name": "UTESF",
+                "file_path": "/tmp/voice_samples/utesf.wav",
+                "mime_type": "audio/wav",
+                "ref_text": "Hola, esta es una prueba.",
+            }
+        }
+        # Parse with 'speaker' alias (the key users actually send)
+        req = OpenAICreateSpeechRequest.model_validate(
+            {"input": "Hello world", "speaker": "UTESF", "task_type": "Base"}
+        )
+        assert req.voice == "UTESF"
+
+        # Validation should pass (file exists)
+        with patch("pathlib.Path.exists", return_value=True):
+            err = speech_server._validate_qwen_tts_request(req)
+        assert err is None, f"Validation failed: {err}"
+
+        # Build params should auto-set ref_audio from stored file
+        with patch.object(speech_server, "_get_uploaded_audio_data") as mock_audio:
+            mock_audio.return_value = "data:audio/wav;base64,ZmFrZQ=="
+            params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["Base"]
+        assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZQ=="]
+        assert params["ref_text"] == ["Hola, esta es una prueba."]
+        assert params["x_vector_only_mode"] == [False]
+        assert params["speaker"] == ["utesf"]
+
+    def test_regression_1603_speaker_key_with_uploaded_embedding_voice(self, speech_server):
+        """Regression test for #1603: upload embedding voice, then invoke TTS with 'speaker' key.
+
+        Verifies embedding-uploaded voices are loaded as voice_clone_prompt, not as audio.
+        """
+        speech_server.uploaded_speakers = {
+            "myvoice": {
+                "name": "myvoice",
+                "file_path": "/tmp/voice_samples/myvoice.safetensors",
+                "mime_type": "application/x-safetensors",
+                "embedding_source": "direct",
+                "embedding_dim": 1024,
+                "cache_status": "ready",
+                "cache_file": "/tmp/voice_samples/myvoice.safetensors",
+            }
+        }
+        # Parse with 'speaker' alias
+        req = OpenAICreateSpeechRequest.model_validate(
+            {"input": "Hello world", "speaker": "myvoice", "task_type": "Base"}
+        )
+        assert req.voice == "myvoice"
+
+        # Validation should pass
+        with patch("pathlib.Path.exists", return_value=True):
+            err = speech_server._validate_qwen_tts_request(req)
+        assert err is None, f"Validation failed: {err}"
+
+        # Build params should use embedding, NOT audio
+        fake_emb = [0.1] * 1024
+        with patch.object(speech_server, "_get_uploaded_speaker_embedding") as mock_emb:
+            mock_emb.return_value = fake_emb
+            params = speech_server._build_tts_params(req)
+
+        assert params["task_type"] == ["Base"]
+        assert params["x_vector_only_mode"] == [True]
+        assert "voice_clone_prompt" in params
+        assert params["voice_clone_prompt"][0]["ref_spk_embedding"] == fake_emb
+        # Must NOT have ref_audio — that would fail for safetensors files
+        assert "ref_audio" not in params
+
+    def test_validate_rejects_embedding_voice_with_pending_cache(self, speech_server):
+        """Validation should reject embedding voices whose cache is not yet ready."""
+        speech_server.uploaded_speakers = {
+            "myvoice": {
+                "name": "myvoice",
+                "file_path": "/tmp/myvoice.safetensors",
+                "mime_type": "application/x-safetensors",
+                "embedding_source": "direct",
+                "cache_status": "pending",
+                "cache_file": None,
+            }
+        }
+        req = OpenAICreateSpeechRequest.model_validate({"input": "Hello", "speaker": "myvoice", "task_type": "Base"})
+        with patch("pathlib.Path.exists", return_value=True):
+            err = speech_server._validate_qwen_tts_request(req)
+        assert err is not None
+        assert "not yet ready" in err
+
+    def test_x_vector_only_mode_not_overwritten_for_uploaded_embedding(self, speech_server):
+        """x_vector_only_mode set by uploaded embedding must not be overwritten by request field."""
+        speech_server.uploaded_speakers = {
+            "emb_voice": {
+                "name": "emb_voice",
+                "file_path": "/tmp/emb_voice.safetensors",
+                "mime_type": "application/x-safetensors",
+                "embedding_source": "direct",
+                "embedding_dim": 1024,
+                "cache_status": "ready",
+                "cache_file": "/tmp/emb_voice.safetensors",
+            }
+        }
+        fake_emb = [0.1] * 1024
+        with patch.object(speech_server, "_get_uploaded_speaker_embedding") as mock_emb:
+            mock_emb.return_value = fake_emb
+            # Client explicitly sends x_vector_only_mode=False, but embedding requires True
+            req = OpenAICreateSpeechRequest(input="Hello", voice="emb_voice", x_vector_only_mode=False)
+            params = speech_server._build_tts_params(req)
+
+        assert params["x_vector_only_mode"] == [True]
+        assert "voice_clone_prompt" in params
 
     def test_max_instructions_length_default(self, speech_server):
         """Test default max instructions length (500) when no config provided."""
@@ -1746,8 +1930,8 @@ class TestFishSpeechServing:
         assert info["text"] == "<|speaker:1|>你好，欢迎回来。"
         assert info["ref_text"] == "<|speaker:0|>参考音频的原始文本。"
         assert info["fish_structured_voice_clone"] is True
-        assert os.path.exists(info["ref_audio_path"])
-        os.remove(info["ref_audio_path"])
+        assert isinstance(info["ref_audio_wav"], torch.Tensor)
+        assert info["ref_audio_wav"].dtype == torch.float32
         fish_speech_server._estimate_fish_prompt_len.assert_called_once_with(
             "<|speaker:1|>你好，欢迎回来。",
             "<|speaker:0|>参考音频的原始文本。",

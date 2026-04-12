@@ -1655,6 +1655,9 @@ class Bagel(nn.Module):
         cfg_img_past_key_values: NaiveCache | None = None,
         cfg_img_key_values_lens: torch.IntTensor | None = None,
         cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
+        return_trajectory_latents: bool = False,
+        scheduler: object | None = None,
+        scheduler_kwargs: dict | None = None,
     ):
         x_t = packed_init_noises
 
@@ -1662,6 +1665,14 @@ class Bagel(nn.Module):
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
+
+        # Optional trajectory recording for RL rollout data collection
+        trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_log_probs: list[torch.Tensor] | None = (
+            [] if (return_trajectory_latents and scheduler is not None) else None
+        )
+        _sched_kw = scheduler_kwargs or {}
 
         use_cfg_text = cfg_text_scale > 1.0
         use_cfg_img = cfg_img_scale > 1.0
@@ -1699,6 +1710,9 @@ class Bagel(nn.Module):
                 cfg_img_past_key_values=cfg_img_past_key_values,
                 cfg_img_key_values_lens=cfg_img_key_values_lens,
                 cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
+                return_trajectory_latents=return_trajectory_latents,
+                scheduler=scheduler,
+                scheduler_kwargs=scheduler_kwargs,
             )
 
         # ── SP + CFG: sequential single-branch forwards ──
@@ -1720,7 +1734,7 @@ class Bagel(nn.Module):
                     packed_seqlens=packed_seqlens,
                 )
 
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     **common,
                     packed_indexes=packed_indexes,
                     packed_position_ids=packed_position_ids,
@@ -1730,7 +1744,7 @@ class Bagel(nn.Module):
                 )
 
                 if cfg_text_scale_ > 1.0:
-                    cfg_text_v_t = self._forward_flow_single_branch(
+                    cfg_text_v_t = self.forward_single_branch(
                         **common,
                         packed_indexes=cfg_text_packed_query_indexes,
                         packed_position_ids=cfg_text_packed_position_ids,
@@ -1740,7 +1754,7 @@ class Bagel(nn.Module):
                     )
                     cfg_img_v_t = None
                     if cfg_img_scale_ > 1.0:
-                        cfg_img_v_t = self._forward_flow_single_branch(
+                        cfg_img_v_t = self.forward_single_branch(
                             **common,
                             packed_indexes=cfg_img_packed_query_indexes,
                             packed_position_ids=cfg_img_packed_position_ids,
@@ -1758,16 +1772,25 @@ class Bagel(nn.Module):
                         cfg_renorm_min,
                     )
 
-                x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if scheduler is not None:
+                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                    x_t = out.prev_sample
+                    if trajectory_log_probs is not None and out.log_prob is not None:
+                        trajectory_log_probs.append(out.log_prob)
+                else:
+                    x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if return_trajectory_latents:
+                    trajectory_latents.append(x_t.clone())
+                    trajectory_timesteps.append(timesteps[i] - dts[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-            return unpacked_latent
+            return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── SP without CFG: direct single-branch loop ──
         if use_sp:
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1781,10 +1804,20 @@ class Bagel(nn.Module):
                     past_key_values=past_key_values,
                     packed_key_value_indexes=packed_key_value_indexes,
                 )
-                x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if scheduler is not None:
+                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                    x_t = out.prev_sample
+                    out_log_prob = getattr(out, "log_prob", None)
+                    if trajectory_log_probs is not None and out_log_prob is not None:
+                        trajectory_log_probs.append(out_log_prob)
+                else:
+                    x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if return_trajectory_latents:
+                    trajectory_latents.append(x_t.clone())
+                    trajectory_timesteps.append(timesteps[i] - dts[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-            return unpacked_latent
+            return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── Batched CFG mode (cfg_parallel_size=1, no SP) ──
         cfg_batched = None
@@ -1850,7 +1883,7 @@ class Bagel(nn.Module):
             else:
                 cfg_text_scale_ = 1.0
                 cfg_img_scale_ = 1.0
-            v_t = self._forward_flow(
+            v_t = self.forward(
                 x_t=x_t,
                 timestep=timestep,
                 packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1870,10 +1903,19 @@ class Bagel(nn.Module):
                 cfg_batched=cfg_batched,
             )
 
-            x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+            if scheduler is not None:
+                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                x_t = out.prev_sample
+                if trajectory_log_probs is not None and out.log_prob is not None:
+                    trajectory_log_probs.append(out.log_prob)
+            else:
+                x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+            if return_trajectory_latents:
+                trajectory_latents.append(x_t.clone())
+                trajectory_timesteps.append(timesteps[i] - dts[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent
+        return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
     def _generate_image_parallel(
         self,
@@ -1905,6 +1947,9 @@ class Bagel(nn.Module):
         cfg_img_past_key_values: NaiveCache | None,
         cfg_img_key_values_lens: torch.IntTensor | None,
         cfg_img_packed_key_value_indexes: torch.LongTensor | None,
+        return_trajectory_latents: bool = False,
+        scheduler: object | None = None,
+        scheduler_kwargs: dict | None = None,
     ):
         """CFG parallel denoising loop: each rank computes one CFG branch.
 
@@ -1961,13 +2006,20 @@ class Bagel(nn.Module):
         else:
             raise RuntimeError(f"Unexpected cfg_rank={cfg_rank} for Bagel 3-branch CFG parallel")
 
+        trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_log_probs: list[torch.Tensor] | None = (
+            [] if (return_trajectory_latents and scheduler is not None) else None
+        )
+        _sched_kw = scheduler_kwargs or {}
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
 
             if use_cfg_this_step:
                 # CFG interval: each rank computes its own branch
-                local_v_t = self._forward_flow_single_branch(
+                local_v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1994,7 +2046,7 @@ class Bagel(nn.Module):
                 )
             else:
                 # Outside CFG interval: all ranks compute with gen inputs, no comm
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -2009,10 +2061,19 @@ class Bagel(nn.Module):
                     packed_key_value_indexes=packed_key_value_indexes,
                 )
 
-            x_t = x_t - v_t.to(x_t.device) * dts[i]
+            if scheduler is not None:
+                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                x_t = out.prev_sample
+                if trajectory_log_probs is not None and out.log_prob is not None:
+                    trajectory_log_probs.append(out.log_prob)
+            else:
+                x_t = x_t - v_t.to(x_t.device) * dts[i]
+            if return_trajectory_latents:
+                trajectory_latents.append(x_t.clone())
+                trajectory_timesteps.append(timesteps[i] - dts[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent
+        return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
     @staticmethod
     def _combine_cfg(
@@ -2067,7 +2128,7 @@ class Bagel(nn.Module):
 
         return v_t
 
-    def _forward_flow_single_branch(
+    def forward_single_branch(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,
@@ -2197,7 +2258,7 @@ class Bagel(nn.Module):
         v_t = v_t[packed_vae_token_indexes]
         return v_t
 
-    def _forward_flow(
+    def forward(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,

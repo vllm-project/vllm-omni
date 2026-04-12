@@ -8,6 +8,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
+from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -16,6 +17,7 @@ from vllm_omni.entrypoints.utils import (
     _filter_dict_like_object,
     filter_dataclass_kwargs,
     load_and_resolve_stage_configs,
+    load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
 
@@ -322,3 +324,70 @@ class TestLoadAndResolveStageConfigs:
         assert config_path is None
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
+
+
+class TestLoadStageConfigsFromYaml:
+    """Regression tests for stage-config loading and merging."""
+
+    def test_deep_merges_stage_engine_args(self, mocker: MockerFixture):
+        yaml_config = create_config(
+            {
+                "async_chunk": True,
+                "stage_args": [
+                    {
+                        "stage_id": 0,
+                        "runtime": {"device": 0},
+                        "engine_args": {
+                            "parallel_config": {"tensor_parallel_size": 4},
+                        },
+                    }
+                ],
+            }
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            return_value=yaml_config,
+        )
+
+        stages = load_stage_configs_from_yaml(
+            "fake.yaml",
+            base_engine_args={
+                "parallel_config": {
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 2,
+                },
+                "model": "base-model",
+            },
+        )
+
+        merged_engine_args = stages[0]["engine_args"]
+        assert merged_engine_args["parallel_config"]["tensor_parallel_size"] == 4
+        assert merged_engine_args["parallel_config"]["pipeline_parallel_size"] == 2
+        assert merged_engine_args["model"] == "base-model"
+        assert merged_engine_args["async_chunk"] is True
+
+    def test_merges_nested_stage_engine_args(self, mocker: MockerFixture):
+        yaml_config = create_config(
+            {
+                "stage_args": [
+                    {
+                        "stage_id": 0,
+                        "engine_args": {
+                            "nested": {"override": 2},
+                        },
+                    }
+                ],
+            }
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            return_value=yaml_config,
+        )
+
+        stages = load_stage_configs_from_yaml(
+            "fake.yaml",
+            base_engine_args={"nested": {"base": 1}},
+        )
+
+        assert stages[0]["engine_args"]["nested"]["base"] == 1
+        assert stages[0]["engine_args"]["nested"]["override"] == 2

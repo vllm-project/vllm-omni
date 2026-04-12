@@ -1,9 +1,8 @@
-import sys
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
-from vllm.compilation.cuda_graph import CUDAGraphWrapper as _OriginalCUDAGraphWrapper
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
@@ -36,22 +35,6 @@ else:
     )
 
 logger = init_logger(__name__)
-
-
-class CUDAGraphWrapper(_OriginalCUDAGraphWrapper):
-    def __getattr__(self, key: str) -> Any:
-        # allow accessing the attributes of the runnable.
-        if hasattr(self.runnable, key):
-            return getattr(self.runnable, key)
-        raise AttributeError(f"Attribute {key} not exists in the runnable of cudagraph wrapper")
-
-
-# Patch vLLM's CUDAGraphWrapper with our optimized version
-for _module_name, _module in sys.modules.items():
-    if "vllm" not in _module_name:
-        continue
-    if hasattr(_module, "CUDAGraphWrapper") and _module.CUDAGraphWrapper is _OriginalCUDAGraphWrapper:
-        _module.CUDAGraphWrapper = CUDAGraphWrapper
 
 
 class OmniGPUModelRunner(GPUModelRunner):

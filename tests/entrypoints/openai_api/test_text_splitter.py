@@ -4,7 +4,7 @@ import pytest
 
 from vllm_omni.entrypoints.openai.text_splitter import SentenceSplitter
 
-pytestmark = [pytest.mark.openai, pytest.mark.speech]
+pytestmark = [pytest.mark.openai, pytest.mark.speech, pytest.mark.core_model, pytest.mark.cpu]
 
 
 class TestSentenceSplitterEnglish:

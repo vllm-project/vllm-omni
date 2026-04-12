@@ -24,6 +24,18 @@ def test_sync_config_is_omni():
     assert isinstance(cfg, OmniModelConfig)
 
 
+def test_default_stage_id_is_concrete_int():
+    """Ensure `stage_id` stays safe for downstream arithmetic/indexing."""
+    engine_args = OmniEngineArgs()
+
+    assert engine_args.stage_id == 0
+    assert isinstance(engine_args.stage_id, int)
+    assert engine_args.log_stats is False
+
+    cfg = engine_args.create_model_config()
+    assert cfg.stage_id == 0
+
+
 def test_multimodal_kwarg_overrides():
     """Ensure that overrides in the multimodal config are preserved."""
     # Get a different value than the default for a multimodal field

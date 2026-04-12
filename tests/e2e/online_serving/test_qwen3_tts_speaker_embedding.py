@@ -23,6 +23,7 @@ from tests.utils import hardware_test
 
 MODEL_BASE = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 MODEL_BASE_1_7B = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+STAGE_INIT_TIMEOUT_S = 120
 
 # A synthetic 1024-dim speaker embedding (all 0.1 — not a real voice, but
 # exercises the full code path through the talker's _build_prompt_embeds).
@@ -47,7 +48,7 @@ def _server_args():
         "--stage-configs-path",
         get_stage_config(),
         "--stage-init-timeout",
-        "120",
+        str(STAGE_INIT_TIMEOUT_S),
         "--trust-remote-code",
         "--enforce-eager",
         "--disable-log-stats",
