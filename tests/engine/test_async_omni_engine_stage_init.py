@@ -98,6 +98,7 @@ def test_initialize_stages_passes_stage_init_timeout_to_diffusion_handshake(monk
     from vllm_omni.platforms import current_omni_platform
 
     engine = object.__new__(AsyncOmniEngine)
+    engine.log_stats = False
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.num_stages = 1
@@ -178,6 +179,7 @@ def test_launch_llm_stage_passes_stage_init_timeout_to_complete_stage_handshake(
     from vllm_omni.platforms import current_omni_platform
 
     engine = object.__new__(AsyncOmniEngine)
+    engine.log_stats = False
     engine.model = "dummy-model"
     engine.single_stage_mode = False
     engine._omni_master_server = None
