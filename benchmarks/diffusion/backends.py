@@ -306,6 +306,8 @@ async def async_request_v1_videos(
             video_bytes = await content_response.read()
             output.response_body = video_bytes
             output.success = True
+            if "stage_durations" in poll_json:
+                output.stage_durations = poll_json["stage_durations"] or {}
             if "peak_memory_mb" in poll_json:
                 output.peak_memory_mb = poll_json["peak_memory_mb"]
             elif "peak_memory_mb" in resp_json:
