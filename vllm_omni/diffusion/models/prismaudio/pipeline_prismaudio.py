@@ -841,9 +841,8 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             raise ValueError("PrismAudioPipeline requires at least one prompt.")
 
         conditioning_batch = [self._get_additional_information(prompt) for prompt in prompts]
-        if (
-            all(not additional_information for additional_information in conditioning_batch)
-            and all(self._is_engine_dummy_warmup_prompt(prompt) for prompt in prompts)
+        if all(not additional_information for additional_information in conditioning_batch) and all(
+            self._is_engine_dummy_warmup_prompt(prompt) for prompt in prompts
         ):
             dummy_batch = self.get_dummy_runtime_additional_information(len(prompts))
             for additional_information in dummy_batch:
