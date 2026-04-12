@@ -7,10 +7,10 @@ import queue
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.utils import hardware_test
@@ -542,11 +542,11 @@ class TestWorker:
 class TestExecutor:
     """MultiprocDiffusionExecutor.execute_step"""
 
-    def test_execute_step_passes_through_runner_output(self):
+    def test_execute_step_passes_through_runner_output(self, mocker: MockerFixture):
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._ensure_open = lambda: None
         expected = RunnerOutput(req_id="req-step", step_index=1, finished=False, result=None)
-        executor.collective_rpc = Mock(return_value=expected)
+        executor.collective_rpc = mocker.Mock(return_value=expected)
 
         request = _make_engine_request("req-step", num_inference_steps=2)
         scheduler_output = _make_scheduler_output(request, sched_req_id="req-step")
@@ -578,9 +578,9 @@ class TestEngine:
             ),
         ],
     )
-    def test_step_engine_returns_error(self, execute_fn, expected_error):
+    def test_step_engine_returns_error(self, execute_fn, expected_error, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(mocker.Mock())
         engine = _make_engine(scheduler, execute_fn=execute_fn)
 
         output = engine.add_req_and_wait_for_response(_make_engine_request("req-error", num_inference_steps=2))
@@ -588,9 +588,9 @@ class TestEngine:
         assert output.output is None
         assert expected_error in output.error
 
-    def test_step_execution_completes(self):
+    def test_step_execution_completes(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(mocker.Mock())
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-step", num_inference_steps=2)
 
@@ -614,9 +614,9 @@ class TestEngine:
         assert output.error is None
         assert torch.equal(output.output, torch.tensor([2.0]))
 
-    def test_step_abort_stops_rescheduling_after_first_step(self):
+    def test_step_abort_stops_rescheduling_after_first_step(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(mocker.Mock())
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-stop", num_inference_steps=4)
 
@@ -639,9 +639,9 @@ class TestEngine:
         assert step["n"] == 1
         _assert_aborted_output(output, "req-stop")
 
-    def test_step_abort_after_reschedule_returns_aborted_output(self):
+    def test_step_abort_after_reschedule_returns_aborted_output(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(mocker.Mock())
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-mid", num_inference_steps=4)
 
@@ -666,9 +666,9 @@ class TestEngine:
         assert step["n"] == 2
         _assert_aborted_output(output, "req-mid")
 
-    def test_finished_step_without_result_returns_error(self):
+    def test_finished_step_without_result_returns_error(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(mocker.Mock())
         engine = _make_engine(
             scheduler,
             execute_fn=lambda _: RunnerOutput(
