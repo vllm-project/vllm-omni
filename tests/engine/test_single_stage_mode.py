@@ -461,6 +461,7 @@ class TestInitializeStagesRouting:
         engine.stage_configs = stage_cfgs
         engine.num_stages = len(stage_cfgs)
         engine.async_chunk = False
+        engine.log_stats = False
         engine.single_stage_mode = single_stage_mode
         engine._single_stage_id_filter = stage_id_filter
         engine._omni_master_address = omni_master_address
@@ -1366,6 +1367,7 @@ class TestLaunchLlmStageSingleStageMode:
     def _build_engine_with_oms(self) -> AsyncOmniEngine:
         engine = object.__new__(AsyncOmniEngine)
         engine.model = "fake-model"
+        engine.log_stats = False
         engine.single_stage_mode = True
         engine._single_stage_id_filter = 0
         engine._llm_stage_launch_lock = threading.Lock()
@@ -1446,6 +1448,7 @@ class TestLaunchLlmStageSingleStageMode:
         """~single_stage_mode → spawn_stage_core + complete_stage_handshake."""
         engine = object.__new__(AsyncOmniEngine)
         engine.model = "fake-model"
+        engine.log_stats = False
         engine.single_stage_mode = False
         engine._omni_master_server = None
         engine._llm_stage_launch_lock = threading.Lock()

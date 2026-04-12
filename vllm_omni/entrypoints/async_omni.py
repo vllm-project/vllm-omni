@@ -743,11 +743,8 @@ class AsyncOmni(EngineClient, OmniBase):
         return False
 
     async def do_log_stats(self) -> None:
-        """Log statistics.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        pass
+        """Log statistics via the engine, mirroring vLLM ``AsyncLLM``."""
+        await self.engine.do_log_stats()
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Return the task set exposed by the orchestrator-backed engine."""
