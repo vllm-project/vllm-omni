@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from unittest.mock import Mock, patch
 
 import pytest
+from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.cli.serve import run_headless
 
@@ -26,45 +26,43 @@ def _make_headless_args() -> argparse.Namespace:
     )
 
 
-def test_run_headless_registers_stage_once_and_launches_all_local_engines() -> None:
+def test_run_headless_registers_stage_once_and_launches_all_local_engines(mocker: MockerFixture) -> None:
     args = _make_headless_args()
-    stage_cfg = Mock(stage_id=3)
+    stage_cfg = mocker.Mock(stage_id=3)
     stage_cfgs = [stage_cfg]
-    parallel_config = Mock(
+    parallel_config = mocker.Mock(
         data_parallel_size_local=2,
         data_parallel_rank=4,
         data_parallel_rank_local=1,
         node_rank_within_dp=0,
     )
-    vllm_config = Mock(parallel_config=parallel_config)
-    executor_class = Mock()
-    engine_manager = Mock()
+    vllm_config = mocker.Mock(parallel_config=parallel_config)
+    executor_class = mocker.Mock()
+    engine_manager = mocker.Mock()
 
-    with (
-        patch(
-            "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-            return_value=("/fake/stages.yaml", stage_cfgs),
-        ),
-        patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment"),
-        patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=Mock()),
-        patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={}),
-        patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={}),
-        patch(
-            "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
-            return_value=(None, None, None),
-        ),
-        patch(
-            "vllm_omni.engine.stage_init_utils.build_vllm_config",
-            return_value=(vllm_config, executor_class),
-        ) as mock_build_vllm_config,
-        patch(
-            "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value="tcp://127.0.0.1:26001",
-        ) as mock_register,
-        patch("vllm.v1.engine.utils.CoreEngineProcManager", return_value=engine_manager) as mock_manager_cls,
-        patch("signal.signal"),
-    ):
-        run_headless(args)
+    mocker.patch(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        return_value=("/fake/stages.yaml", stage_cfgs),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=mocker.Mock())
+    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mock_build_vllm_config = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_vllm_config",
+        return_value=(vllm_config, executor_class),
+    )
+    mock_register = mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
+        return_value="tcp://127.0.0.1:26001",
+    )
+    mock_manager_cls = mocker.patch("vllm.v1.engine.utils.CoreEngineProcManager", return_value=engine_manager)
+    mocker.patch("signal.signal")
+    run_headless(args)
 
     mock_build_vllm_config.assert_called_once_with(
         stage_cfg,
@@ -92,89 +90,85 @@ def test_run_headless_registers_stage_once_and_launches_all_local_engines() -> N
     engine_manager.shutdown.assert_called_once_with()
 
 
-def test_run_headless_honors_explicit_log_stats_flag() -> None:
+def test_run_headless_honors_explicit_log_stats_flag(mocker: MockerFixture) -> None:
     args = _make_headless_args()
     args.log_stats = True
-    stage_cfg = Mock(stage_id=3)
+    stage_cfg = mocker.Mock(stage_id=3)
     stage_cfgs = [stage_cfg]
-    parallel_config = Mock(
+    parallel_config = mocker.Mock(
         data_parallel_size_local=2,
         data_parallel_rank=4,
         data_parallel_rank_local=1,
         node_rank_within_dp=0,
     )
-    vllm_config = Mock(parallel_config=parallel_config)
-    executor_class = Mock()
-    engine_manager = Mock()
+    vllm_config = mocker.Mock(parallel_config=parallel_config)
+    executor_class = mocker.Mock()
+    engine_manager = mocker.Mock()
 
-    with (
-        patch(
-            "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-            return_value=("/fake/stages.yaml", stage_cfgs),
-        ),
-        patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment"),
-        patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=Mock()),
-        patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={}),
-        patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={}),
-        patch(
-            "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
-            return_value=(None, None, None),
-        ),
-        patch(
-            "vllm_omni.engine.stage_init_utils.build_vllm_config",
-            return_value=(vllm_config, executor_class),
-        ),
-        patch(
-            "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value="tcp://127.0.0.1:26001",
-        ),
-        patch("vllm.v1.engine.utils.CoreEngineProcManager", return_value=engine_manager) as mock_manager_cls,
-        patch("signal.signal"),
-    ):
-        run_headless(args)
+    mocker.patch(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        return_value=("/fake/stages.yaml", stage_cfgs),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=mocker.Mock())
+    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_vllm_config",
+        return_value=(vllm_config, executor_class),
+    )
+    mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
+        return_value="tcp://127.0.0.1:26001",
+    )
+    mock_manager_cls = mocker.patch("vllm.v1.engine.utils.CoreEngineProcManager", return_value=engine_manager)
+    mocker.patch("signal.signal")
+    run_headless(args)
 
     manager_kwargs = mock_manager_cls.call_args.kwargs
     assert manager_kwargs["log_stats"] is True
 
 
-def test_run_headless_launches_diffusion_stage_via_omni_master() -> None:
+def test_run_headless_launches_diffusion_stage_via_omni_master(mocker: MockerFixture) -> None:
     args = _make_headless_args()
-    stage_cfg = Mock(stage_id=3, stage_type="diffusion")
-    stage_cfg.engine_args = Mock()
+    stage_cfg = mocker.Mock(stage_id=3, stage_type="diffusion")
+    stage_cfg.engine_args = mocker.Mock()
     stage_cfg.engine_input_source = []
     stage_cfgs = [stage_cfg]
-    metadata = Mock(stage_id=3)
-    od_config = Mock()
-    proc = Mock()
+    metadata = mocker.Mock(stage_id=3)
+    od_config = mocker.Mock()
+    proc = mocker.Mock()
     proc.exitcode = 0
     proc.is_alive.return_value = False
 
-    with (
-        patch(
-            "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-            return_value=("/fake/stages.yaml", stage_cfgs),
-        ),
-        patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment"),
-        patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=Mock()),
-        patch(
-            "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
-            return_value=(None, None, None),
-        ),
-        patch("vllm_omni.engine.stage_init_utils.extract_stage_metadata", return_value=metadata),
-        patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info") as mock_inject_stage_info,
-        patch("vllm_omni.engine.stage_init_utils.build_diffusion_config", return_value=od_config),
-        patch(
-            "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
-            return_value=("tcp://127.0.0.1:26001", "tcp://127.0.0.1:26002", "tcp://127.0.0.1:26003"),
-        ) as mock_register,
-        patch(
-            "vllm_omni.diffusion.stage_diffusion_proc.spawn_diffusion_proc",
-            return_value=(proc, "tcp://127.0.0.1:26001", "tcp://127.0.0.1:26002", "tcp://127.0.0.1:26003"),
-        ) as mock_spawn,
-        patch("vllm_omni.diffusion.stage_diffusion_proc.complete_diffusion_handshake") as mock_handshake,
-        patch("signal.signal"),
-    ):
-        run_headless(args)
+    mocker.patch(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        return_value=("/fake/stages.yaml", stage_cfgs),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=mocker.Mock())
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.extract_stage_metadata", return_value=metadata)
+    mock_inject_stage_info = mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_config", return_value=od_config)
+    mock_register = mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
+        return_value=("tcp://127.0.0.1:26001", "tcp://127.0.0.1:26002", "tcp://127.0.0.1:26003"),
+    )
+    mock_spawn = mocker.patch(
+        "vllm_omni.diffusion.stage_diffusion_proc.spawn_diffusion_proc",
+        return_value=(proc, "tcp://127.0.0.1:26001", "tcp://127.0.0.1:26002", "tcp://127.0.0.1:26003"),
+    )
+    mock_handshake = mocker.patch("vllm_omni.diffusion.stage_diffusion_proc.complete_diffusion_handshake")
+    mocker.patch("signal.signal")
+    run_headless(args)
 
     mock_inject_stage_info.assert_called_once_with(stage_cfg, 3)
     mock_register.assert_called_once_with(
