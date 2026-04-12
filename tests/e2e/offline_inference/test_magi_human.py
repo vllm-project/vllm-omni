@@ -47,7 +47,7 @@ def test_magi_human_e2e(run_level):
     if run_level != "advanced_model":
         pytest.skip("MagiHuman e2e test requires advanced_model run level with real weights.")
 
-    model_path = "princepride/daVinci-MagiHuman"
+    model_path = "SII-GAIR/daVinci-MagiHuman-Base-1080p"
 
     omni = Omni(
         model=model_path,
@@ -110,16 +110,31 @@ def test_magi_human_e2e(run_level):
         assert isinstance(video_frames, np.ndarray), f"Expected numpy array, got {type(video_frames)}"
         assert video_frames.ndim == 4, f"Expected 4D array (T,H,W,3), got shape {video_frames.shape}"
 
-        audio_waveform = None
-        if hasattr(first, "multimodal_output") and first.multimodal_output:
-            audio_waveform = first.multimodal_output.get("audio")
+        mm = first.multimodal_output
+        assert mm, "multimodal_output is empty or missing"
+
+        audio_waveform = mm.get("audio")
         assert audio_waveform is not None, "No audio waveform in multimodal_output"
+
+        audio_sample_rate = mm.get("audio_sample_rate")
+        assert audio_sample_rate is not None, (
+            "audio_sample_rate not found in multimodal_output; model post-process must propagate it"
+        )
+        assert isinstance(audio_sample_rate, (int, float)), (
+            f"audio_sample_rate should be numeric, got {type(audio_sample_rate)}"
+        )
+        assert int(audio_sample_rate) > 0, f"audio_sample_rate must be positive, got {audio_sample_rate}"
+
+        fps = mm.get("fps")
+        assert fps is not None, "fps not found in multimodal_output; model post-process must propagate it"
+        assert isinstance(fps, (int, float)), f"fps should be numeric, got {type(fps)}"
+        assert int(fps) > 0, f"fps must be positive, got {fps}"
 
         video_bytes = mux_video_audio_bytes(
             video_frames,
             audio_waveform,
-            fps=25.0,
-            audio_sample_rate=44100,
+            fps=float(fps),
+            audio_sample_rate=int(audio_sample_rate),
         )
         assert isinstance(video_bytes, bytes), f"Expected MP4 bytes, got {type(video_bytes)}"
         assert len(video_bytes) > 1000, f"MP4 too small ({len(video_bytes)} bytes)"

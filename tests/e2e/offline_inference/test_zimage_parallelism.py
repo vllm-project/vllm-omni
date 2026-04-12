@@ -159,8 +159,8 @@ def _run_zimage_generate(
 @pytest.mark.parallel
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
-    if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
-        pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
+    if current_omni_platform.is_npu():
+        pytest.skip("Z-Image TP e2e test is only supported on CUDA and ROCm for now.")
     if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 devices.")
 
@@ -211,7 +211,9 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     )
 
     print(f"Z-Image TP perf (lower is better): tp1_time_s={tp1_time_s:.6f}, tp2_time_s={tp2_time_s:.6f}")
-    assert tp2_time_s < tp1_time_s, f"Expected TP=2 to be faster than TP=1 (tp1={tp1_time_s}, tp2={tp2_time_s})"
+    # ROCm is not optimized TP2 can be slower than TP1
+    if not current_omni_platform.is_rocm():
+        assert tp2_time_s < tp1_time_s, f"Expected TP=2 to be faster than TP=1 (tp1={tp1_time_s}, tp2={tp2_time_s})"
 
     print(f"Z-Image TP peak memory (MB): tp1_peak_mem={tp1_peak_mem:.2f}, tp2_peak_mem={tp2_peak_mem:.2f}")
     assert tp2_peak_mem < tp1_peak_mem, (
@@ -221,8 +223,8 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 
 @pytest.mark.integration
 def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
-    if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
-        pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
+    if current_omni_platform.is_npu():
+        pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA and ROCm for now.")
     if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
         pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 devices.")
 

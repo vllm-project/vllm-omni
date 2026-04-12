@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import types
 from typing import Any
 
 import numpy as np
@@ -74,15 +73,8 @@ class BagelAdapter:
 
     @staticmethod
     def install_hook(transformer: Any, hook: DataCollectionHook) -> None:
-        original_forward_flow = transformer._forward_flow
-
-        def forward_alias(self, *args, **kwargs):
-            return original_forward_flow(*args, **kwargs)
-
-        transformer.forward = types.MethodType(forward_alias, transformer)
         registry = HookRegistry.get_or_create(transformer)
         registry.register_hook(hook._HOOK_NAME, hook)
-        transformer._forward_flow = transformer.forward
 
 
 class StableAudioAdapter:

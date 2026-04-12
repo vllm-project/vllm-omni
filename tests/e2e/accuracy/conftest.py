@@ -114,8 +114,8 @@ class AccuracyServerConfig:
         params = self.generate_params
         model = self.model_prefix + params.model
         server_args = params.server_args or []
-        if params.use_omni:
-            server_args = ["--stage-init-timeout", "120", *server_args]
+        if params.use_omni and params.stage_init_timeout is not None:
+            server_args = ["--stage-init-timeout", str(params.stage_init_timeout), *server_args]
         with OmniServer(
             model,
             server_args,
@@ -226,6 +226,7 @@ def _build_accuracy_server_config(
             server_args=generate_server_args,
             env_dict={"CUDA_VISIBLE_DEVICES": shared_gpu},
             use_omni=True,
+            stage_init_timeout=300,
         ),
         judge_params=OmniServerParams(
             model=judge_model,
