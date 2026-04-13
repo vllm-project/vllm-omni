@@ -489,6 +489,7 @@ def start_runtime_teardown_container_server(
 
     container_name = f"omni_rt_teardown_{uuid4().hex[:8]}"
     host = os.getenv("RUNTIME_TEARDOWN_SERVER_HOST", "127.0.0.1")
+    bind_host = os.getenv("RUNTIME_TEARDOWN_BIND_HOST", "0.0.0.0")
     port = _allocate_open_port()
     local_repo_root = Path(__file__).resolve().parents[3]
     remote_workdir = os.getenv("RUNTIME_TEARDOWN_REMOTE_WORKDIR", str(local_repo_root))
@@ -539,7 +540,7 @@ def start_runtime_teardown_container_server(
         "serve",
         model,
         "--host",
-        host,
+        bind_host,
         "--port",
         str(port),
         "--omni",
@@ -547,6 +548,7 @@ def start_runtime_teardown_container_server(
     ]
     serve_cmd_str = " ".join(shlex.quote(arg) for arg in serve_cmd)
     bootstrap_prefix = f"{resolved_bootstrap} && " if resolved_bootstrap.strip() else ""
+    serve_log_path = "/tmp/vllm_runtime_teardown_serve.log"
     exec_cmd = [
         "docker",
         "exec",
@@ -554,7 +556,11 @@ def start_runtime_teardown_container_server(
         container_name,
         "bash",
         "-lc",
-        f"cd {shlex.quote(remote_workdir)} && {bootstrap_prefix}VLLM_WORKER_MULTIPROC_METHOD=spawn {serve_cmd_str}",
+        (
+            f"cd {shlex.quote(remote_workdir)} && "
+            f"{bootstrap_prefix}VLLM_WORKER_MULTIPROC_METHOD=spawn {serve_cmd_str} "
+            f"> {shlex.quote(serve_log_path)} 2>&1"
+        ),
     ]
     exec_cmd_str = " ".join(shlex.quote(arg) for arg in exec_cmd)
     exec_out = _runtime_teardown_ssh_cmd(exec_cmd_str, step="docker-exec-start-serve")
@@ -564,14 +570,25 @@ def start_runtime_teardown_container_server(
 
     try:
         print(
-            f"[runtime-teardown] waiting server ready container={container_name} host={host} port={port} timeout={startup_timeout_sec}s",
+            f"[runtime-teardown] waiting server ready container={container_name} host={host} bind_host={bind_host} port={port} timeout={startup_timeout_sec}s",
             flush=True,
         )
         _wait_tcp_port_ready(host, port, timeout_sec=startup_timeout_sec)
     except Exception:
-        logs = _runtime_teardown_ssh_cmd(f"docker logs {shlex.quote(container_name)}", step="docker-logs")
+        logs = _runtime_teardown_ssh_cmd(
+            (
+                f"docker exec {shlex.quote(container_name)} bash -lc "
+                f"\"tail -n 200 {shlex.quote(serve_log_path)} 2>/dev/null || "
+                f"echo '[no-serve-log-file] {shlex.quote(serve_log_path)}'\""
+            ),
+            step="docker-exec-tail-serve-log",
+        )
         force_remove_container(container_name)
-        raise RuntimeError(f"runtime teardown container server startup failed: {logs.stdout[-2000:]}") from None
+        raise RuntimeError(
+            "runtime teardown container server startup failed. "
+            f"host={host} bind_host={bind_host} port={port}; "
+            f"serve_log_tail={logs.stdout[-2000:]}"
+        ) from None
 
     return RuntimeTeardownContainerHandle(
         container_name=container_name,
