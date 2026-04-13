@@ -22,8 +22,6 @@ from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
-from vllm.v1.metrics.loggers import StatLoggerManager
-from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import (
@@ -124,7 +122,6 @@ class Orchestrator:
         stage_vllm_configs: list[Any],
         *,
         async_chunk: bool = False,
-        logger_manager: StatLoggerManager | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -136,8 +133,6 @@ class Orchestrator:
         self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
         self.stage_vllm_configs: list[Any] = stage_vllm_configs
-        self.logger_manager: StatLoggerManager | None = logger_manager
-        self.log_stats = self.logger_manager is not None
 
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
@@ -629,13 +624,10 @@ class Orchestrator:
         """
         processor = self.output_processors[stage_id]
 
-        num_outputs = len(raw_outputs.outputs)
-        iteration_stats = IterationStats() if (self.log_stats and num_outputs) else None
-
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            iteration_stats,
+            None,
         )
 
         if processed.reqs_to_abort:
@@ -643,22 +635,6 @@ class Orchestrator:
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
-
-        # Mirror vLLM AsyncLLM output_handler: feed stats to the logger
-        # manager so LoggingStatLogger can periodically print KV cache /
-        # prefix cache hit rate, and PrometheusStatLogger can publish.
-        if self.logger_manager is not None:
-            try:
-                self.logger_manager.record(
-                    engine_idx=stage_id,
-                    scheduler_stats=raw_outputs.scheduler_stats,
-                    iteration_stats=iteration_stats,
-                )
-            except Exception:
-                logger.exception(
-                    "[Orchestrator] stat logger record failed for stage-%s",
-                    stage_id,
-                )
 
         return processed.request_outputs
 
