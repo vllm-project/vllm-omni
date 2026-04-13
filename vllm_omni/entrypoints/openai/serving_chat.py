@@ -2116,7 +2116,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     index=output.index,
                     delta=DeltaMessage(role=role, content=audio_base64),
                     logprobs=None,
-                    finish_reason=output.finish_reason,
+                    finish_reason="stop",
                     stop_reason=output.stop_reason,
                     token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
                 )
@@ -2126,7 +2126,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     message=ChatMessage(role=role, audio=audio_obj),
                     logprobs=None,
                     finish_reason="stop",
-                    stop_reason=output.stop_reason,
+                    stop_reason=None,
                 )
             choices.append(choice_data)
         return choices

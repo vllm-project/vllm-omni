@@ -1,6 +1,7 @@
-# HunyuanImage-3.0-Instruct
+# HunyuanImage-3.0-Instruct DiT Image Generation on 4x GPU
 
-> DiT-only text-to-image serving and benchmark
+> DiT-only text-to-image recipe for HunyuanImage-3.0-Instruct with FP8,
+> tensor parallelism, sequence parallelism, and CFG parallelism.
 
 ## Summary
 

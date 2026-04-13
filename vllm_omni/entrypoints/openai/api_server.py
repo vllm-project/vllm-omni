@@ -115,6 +115,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.realtime.robot.openpi_serving import ServingRealtimeRobotOpenPI
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -629,6 +630,10 @@ async def omni_init_app_state(
         )
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
+        state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI(
+            engine_client=engine_client,
+            model_name=model_name,
+        )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -947,6 +952,8 @@ async def omni_init_app_state(
         stage_configs=state.stage_configs,
     )
 
+    state.openai_serving_realtime_robot = None
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
     state.sleeping_stages = set()
@@ -1164,8 +1171,6 @@ async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_r
                 status_code=result.error.code if result.error else 400,
             )
         return result
-    except (EngineGenerateError, EngineDeadError) as exc:
-        return _create_engine_error_json_response(raw_request, exc)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
@@ -1403,6 +1408,28 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close()
         return
     connection = RealtimeConnection(websocket, serving)
+    await connection.handle_connection()
+
+
+@router.websocket("/v1/realtime/robot/openpi")
+async def realtime_robot_openpi(websocket: WebSocket):
+    """WebSocket endpoint for robot policy inference (OpenPI protocol).
+
+    Binary frames: msgpack observation/action (DreamZero/OpenPI compatible).
+    Text frames: JSON control events (session.update, etc.).
+    See realtime.robot.openpi_connection.py for protocol details.
+    """
+    from vllm_omni.entrypoints.openai.realtime.robot.openpi_connection import (
+        RobotRealtimeConnection,
+    )
+
+    serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = RobotRealtimeConnection(websocket, serving)
     await connection.handle_connection()
 
 

@@ -1,7 +1,5 @@
 # Fish Speech S2 Pro
 
-> Online serving for TTS
-
 ## Summary
 
 - Vendor: FishAudio

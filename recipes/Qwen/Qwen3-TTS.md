@@ -1,6 +1,4 @@
-# Qwen3-TTS
-
-> Text-to-speech serving (CustomVoice / VoiceDesign / Base)
+# Qwen3-TTS for text-to-speech
 
 ## Summary
 

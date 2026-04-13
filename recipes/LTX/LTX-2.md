@@ -1,6 +1,6 @@
-# LTX-2
+# LTX-2 T2V and I2V
 
-> Text-to-video and image-to-video serving
+> LTX-2 for text-to-video & image-to-video on 1x H200 141GB
 
 ## Summary
 

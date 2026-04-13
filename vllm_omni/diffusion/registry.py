@@ -261,6 +261,11 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
+    "DreamZeroPipeline": (
+        "dreamzero",
+        "pipeline_dreamzero",
+        "DreamZeroPipeline",
+    ),
 }
 
 

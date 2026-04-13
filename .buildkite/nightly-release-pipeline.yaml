@@ -1,0 +1,20 @@
+steps:
+  - label: "Build and upload wheel"
+    key: "build-wheel"
+    agents:
+      queue: cpu_queue_release
+    commands:
+      - "curl -LsSf https://astral.sh/uv/install.sh | sh"
+      - 'export PATH="$HOME/.local/bin:$PATH"'
+      - "uv venv --python=3.12 && source .venv/bin/activate"
+      - "uv pip install --upgrade build"
+      - "python3 -m build"
+      - "bash .buildkite/scripts/upload-nightly-wheels.sh"
+
+  - label: "Generate and upload wheel indices"
+    depends_on: "build-wheel"
+    allow_dependency_failure: true
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "bash .buildkite/scripts/generate-and-upload-nightly-index.sh"

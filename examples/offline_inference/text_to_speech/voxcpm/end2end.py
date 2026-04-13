@@ -11,8 +11,11 @@ import soundfile as sf
 import torch
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import AsyncOmni, Omni
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+DEFAULT_SYNC_STAGE_CONFIG = get_deploy_config_path("voxcpm.yaml")
 
 
 def _build_prompt(args) -> dict[str, Any]:
@@ -56,6 +59,10 @@ def _extract_sample_rate(mm: dict[str, Any]) -> int:
     return int(sr_raw)
 
 
+def _is_streaming_stage_config(stage_config_path: str) -> bool:
+    return "async_chunk" in Path(stage_config_path).stem
+
+
 def _save_audio(audio: torch.Tensor, sample_rate: int, output_dir: Path, request_id: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"output_{request_id}.wav"
@@ -80,7 +87,6 @@ async def _run_streaming(args) -> Path:
     omni = AsyncOmni(
         model=args.model,
         stage_configs_path=args.stage_configs_path,
-        deploy_config=args.deploy_config,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
     )
@@ -127,7 +133,6 @@ def _run_sync(args) -> Path:
     omni = Omni(
         model=args.model,
         stage_configs_path=args.stage_configs_path,
-        deploy_config=args.deploy_config,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
     )
@@ -160,26 +165,10 @@ def parse_args():
     parser = FlexibleArgumentParser(description="Minimal offline VoxCPM example for vLLM Omni.")
     parser.add_argument("--model", type=str, required=True, help="Local VoxCPM model directory.")
     parser.add_argument(
-        "--deploy-config",
-        type=str,
-        default=None,
-        help=("Override the deploy config path."),
-    )
-    parser.add_argument(
         "--stage-configs-path",
         type=str,
-        default=None,
-        help=(
-            "Legacy stage_args yaml path. Required for streaming "
-            "(vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml); "
-            "leave unset for non-streaming to use the auto-resolved deploy config."
-        ),
-    )
-    parser.add_argument(
-        "--streaming",
-        action="store_true",
-        default=False,
-        help="Stream audio chunks as they arrive via AsyncOmni.",
+        default=DEFAULT_SYNC_STAGE_CONFIG,
+        help=("Stage config path. Use voxcpm.yaml for non-streaming or voxcpm_async_chunk.yaml for streaming."),
     )
     parser.add_argument("--text", type=str, required=True, help="Input text for synthesis.")
     parser.add_argument("--ref-audio", type=str, default=None, help="Reference audio path for voice cloning.")
@@ -205,10 +194,9 @@ def parse_args():
 
 
 def main(args) -> None:
-    route = "streaming" if args.streaming else "sync"
+    route = "streaming" if _is_streaming_stage_config(args.stage_configs_path) else "sync"
     print(f"Model: {args.model}")
-    print(f"Deploy config: {args.deploy_config or '<auto from HF model_type>'}")
-    print(f"Stage configs path: {args.stage_configs_path or '<unused>'}")
+    print(f"Stage config: {args.stage_configs_path}")
     print(f"Route: {route}")
     if route == "streaming":
         asyncio.run(_run_streaming(args))
