@@ -31,7 +31,6 @@ def test_initialize_stages_restores_device_visibility_after_diffusion_init(monke
     from vllm_omni.platforms import current_omni_platform
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.log_stats = False
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.num_stages = 1
@@ -283,7 +282,6 @@ def test_attach_llm_stage_uses_omni_input_preprocessor(monkeypatch):
     )
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.log_stats = False
 
     _stage_client, _out_proc, _vllm_cfg, input_processor = engine._attach_llm_stage(started)
 
