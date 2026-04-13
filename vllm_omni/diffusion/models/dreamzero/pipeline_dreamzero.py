@@ -573,6 +573,36 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         mu = (mu - mean) * inv_std
         return mu.to(dtype=input_dtype)
 
+    def decode_video_latents(self, video_latents: torch.Tensor) -> torch.Tensor:
+        """Decode DreamZero normalized VAE latents into RGB video tensors.
+
+        `forward()` returns `video` in the same form as upstream
+        `WANPolicyHead.lazy_joint_video_action()` / `GrootSimPolicy`: normalized
+        VAE latents shaped `[B, C, T, H, W]`, not decoded RGB frames. Upstream
+        only decodes those latents when saving the debug video on reset.
+
+        Source correspondence:
+        - `socket_test_optimized_AR.py` `_reset_state()` calls
+          `action_head.vae.decode(video_across_time_cat, ...)`.
+        - `wan_video_vae.py` `WanVideoVAE.decode()` delegates to
+          `VideoVAE_.decode(z, scale)`.
+        - `wan_video_vae.py` `VideoVAE_.decode()` first inverts latent
+          normalization as `z = z / scale[1] + scale[0]`, where `scale[1]` is
+          the precomputed fp32 reciprocal std cast to the runtime dtype.
+
+        The cast-before-division detail is required for bf16 video parity; doing
+        the inverse in fp32 and then casting changes RGB frames even though the
+        action path is unaffected.
+        """
+        vae_dtype = self.vae.dtype
+        vae_device = next(self.vae.parameters()).device
+        latents = video_latents.to(device=vae_device, dtype=vae_dtype)
+        mean = self.vae_latents_mean.to(device=vae_device, dtype=vae_dtype)
+        inv_std = self.vae_latents_inv_std.to(device=vae_device, dtype=vae_dtype)
+        latents = latents / inv_std + mean
+        with torch.no_grad():
+            return self.vae.decode(latents, return_dict=False)[0]
+
     # -----------------------------------------------------------------------
     # KV cache prefill
     # -----------------------------------------------------------------------
@@ -1092,6 +1122,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return DiffusionOutput(
             output={
                 "actions": actions_np,  # L1273
+                # Source `video_pred` is normalized VAE latent output, not RGB.
+                # Use `decode_video_latents()` for DreamZero-equivalent debug
+                # video decoding.
                 "video": video_out.transpose(1, 2).cpu(),
             },
         )
