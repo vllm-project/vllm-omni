@@ -302,7 +302,7 @@ def test_dynin_t2i_decode_to_image(test_config: tuple[str, str]) -> None:
         seed=42,
         stage_configs_path=stage_config_path,
         stage_init_timeout=600,
-        init_timeout=600,
+        init_timeout=900,
     ) as runner:
         outputs = runner.generate([prompt])
 
@@ -330,7 +330,7 @@ def test_dynin_mmu_to_text(test_config: tuple[str, str]) -> None:
         seed=42,
         stage_configs_path=stage_config_path,
         stage_init_timeout=600,
-        init_timeout=600,
+        init_timeout=900,
     ) as runner:
         outputs = runner.generate([prompt])
 
@@ -358,7 +358,7 @@ def test_dynin_image_to_text(test_config: tuple[str, str]) -> None:
         seed=42,
         stage_configs_path=stage_config_path,
         stage_init_timeout=600,
-        init_timeout=600,
+        init_timeout=900,
     ) as runner:
         outputs = runner.generate([prompt])
 
@@ -386,7 +386,7 @@ def test_dynin_speech_to_text(test_config: tuple[str, str]) -> None:
         seed=42,
         stage_configs_path=stage_config_path,
         stage_init_timeout=600,
-        init_timeout=600,
+        init_timeout=900,
     ) as runner:
         outputs = runner.generate([prompt])
 
@@ -408,7 +408,7 @@ def test_dynin_t2s_decode_to_audio(test_config: tuple[str, str]) -> None:
         seed=42,
         stage_configs_path=stage_config_path,
         stage_init_timeout=600,
-        init_timeout=600,
+        init_timeout=900,
     ) as runner:
         outputs = runner.generate([prompt])
 

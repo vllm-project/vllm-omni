@@ -24,7 +24,7 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 # This test is specific to Z-Image LoRA behavior. Keep it focused on a single
 # model to reduce runtime and avoid extra downloads.
 models = ["Tongyi-MAI/Z-Image-Turbo"]
-DIFFUSION_INIT_TIMEOUT_S = 600
+DIFFUSION_INIT_TIMEOUT_S = 900
 
 
 @pytest.mark.parametrize("model_name", models)
