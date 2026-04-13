@@ -49,7 +49,19 @@ def parse_args():
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
     parser.add_argument("--batch-timeout", type=int, default=5)
-    parser.add_argument("--init-timeout", type=int, default=300)
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=1200,
+        help="Seconds to wait for orchestrator / all stages to become ready (default: 1200). "
+        "Bagel loads two heavy stages; raise if you hit TimeoutError on Omni startup.",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=900,
+        help="Timeout for initializing a single stage in seconds (default: 900).",
+    )
     parser.add_argument("--shm-threshold-bytes", type=int, default=65536)
     parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"])
     parser.add_argument("--ray-address", type=str, default=None)
@@ -144,6 +156,7 @@ def main():
             "init_sleep_seconds": args.init_sleep_seconds,
             "batch_timeout": args.batch_timeout,
             "init_timeout": args.init_timeout,
+            "stage_init_timeout": args.stage_init_timeout,
             "shm_threshold_bytes": args.shm_threshold_bytes,
             "worker_backend": args.worker_backend,
             "ray_address": args.ray_address,
