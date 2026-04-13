@@ -738,6 +738,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
 
 class Qwen2MoTModel(Qwen2PreTrainedModel):
+    _layerwise_offload_blocks_attrs = ["layers"]
+
     def __init__(
         self,
         config,
