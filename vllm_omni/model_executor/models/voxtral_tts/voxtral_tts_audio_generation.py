@@ -108,6 +108,7 @@ class AcousticTransformerArgs:
     use_biases: bool = False
     norm_eps: float = 1e-5
     sigma: float = 1e-5  # was 0.01 in beta version
+    n_decoding_steps: int | None = None  # Number of Euler ODE steps for flow matching
 
 
 @dataclass
@@ -436,14 +437,13 @@ class FlowMatchingAudioTransformer(nn.Module):
         self._empty_audio_token_id = AudioSpecialTokens.id(AudioSpecialTokens.empty_audio)
 
         # Flow matching constants
-        # TODO(chenyo): hardcoded, need to fix
-        self._acoustic_decode_iters = 8
+        self._n_steps = args.n_decoding_steps
         # TODO(chenyo): hardcoded, need to fix
         self._cfg_alpha = 1.2
         self._noise_scale = 1.0
         self.register_buffer(
             "_timesteps",
-            torch.linspace(0, 1, self._acoustic_decode_iters),
+            torch.linspace(0, 1, self._n_steps + 1),
             persistent=False,
         )
 
