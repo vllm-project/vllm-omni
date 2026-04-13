@@ -537,6 +537,10 @@ class Qwen3TTSConfig(PretrainedConfig):
         if any("Code2Wav" in str(a) for a in archs):
             if hasattr(config, "rope_parameters"):
                 delattr(config, "rope_parameters")
+            # Code2Wav doesn't use position embeddings, but vLLM validates
+            # max_model_len <= max_position_embeddings. Set a large value
+            # to allow the pipeline.yaml max_model_len (65536) to pass validation.
+            config.max_position_embeddings = 131072
         return config
 
 

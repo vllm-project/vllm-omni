@@ -326,7 +326,7 @@ def _build_inputs(args) -> tuple[str, list]:
     else:
         query_result = query_func()
 
-    model_name = query_result.model_name
+    model_name = args.model if args.model else query_result.model_name
 
     if args.txt_prompts:
         with open(args.txt_prompts) as f:
@@ -343,7 +343,10 @@ def _build_inputs(args) -> tuple[str, list]:
             for t in lines
         ]
     else:
-        inputs = query_result.inputs if isinstance(query_result.inputs, list) else [query_result.inputs]
+        if isinstance(query_result.inputs, list):
+            inputs = query_result.inputs * args.num_prompts
+        else:
+            inputs = [query_result.inputs] * args.num_prompts
 
     return model_name, inputs
 
@@ -422,6 +425,12 @@ async def main_streaming(args):
 
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Override the default model path for the selected query type.",
+    )
     parser.add_argument(
         "--query-type",
         "-q",
