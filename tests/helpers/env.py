@@ -1,4 +1,8 @@
-"""Test environment / lifecycle helpers (GPU cleanup hooks and memory monitoring for tests)."""
+"""Test environment / lifecycle helpers (GPU cleanup hooks and memory monitoring for tests).
+
+``vllm.platforms`` / ``vllm_omni.platforms`` are imported only inside functions that need them
+so importing this module at pytest plugin load does not run before session autouse fixtures
+"""
 
 from __future__ import annotations
 
@@ -10,45 +14,6 @@ import time
 from contextlib import contextmanager
 
 import torch
-from vllm.platforms import current_platform
-
-from vllm_omni.platforms import current_omni_platform
-
-if current_platform.is_rocm():
-    from amdsmi import (
-        amdsmi_get_gpu_vram_usage,
-        amdsmi_get_processor_handles,
-        amdsmi_init,
-        amdsmi_shut_down,
-    )
-
-    @contextmanager
-    def _nvml():
-        try:
-            amdsmi_init()
-            yield
-        finally:
-            amdsmi_shut_down()
-elif current_platform.is_cuda():
-    from vllm.third_party.pynvml import (
-        nvmlDeviceGetHandleByIndex,
-        nvmlDeviceGetMemoryInfo,
-        nvmlInit,
-        nvmlShutdown,
-    )
-
-    @contextmanager
-    def _nvml():
-        try:
-            nvmlInit()
-            yield
-        finally:
-            nvmlShutdown()
-else:
-
-    @contextmanager
-    def _nvml():
-        yield
 
 
 def get_physical_device_indices(devices):
@@ -60,7 +25,6 @@ def get_physical_device_indices(devices):
     return [index_mapping[i] for i in devices if i in index_mapping]
 
 
-@_nvml()
 def wait_for_gpu_memory_to_clear(
     *,
     devices: list[int],
@@ -68,6 +32,8 @@ def wait_for_gpu_memory_to_clear(
     threshold_ratio: float | None = None,
     timeout_s: float = 120,
 ) -> None:
+    from vllm.platforms import current_platform
+
     assert threshold_bytes is not None or threshold_ratio is not None
     devices = get_physical_device_indices(devices)
     start_time = time.time()
@@ -92,46 +58,75 @@ def wait_for_gpu_memory_to_clear(
         def is_free(used, total):
             return used / total <= threshold_ratio
 
-    while True:
-        output: dict[int, str] = {}
-        output_raw: dict[int, tuple[float, float]] = {}
-        for device in devices:
-            if current_platform.is_rocm():
-                dev_handle = amdsmi_get_processor_handles()[device]
-                mem_info = amdsmi_get_gpu_vram_usage(dev_handle)
-                gb_used = mem_info["vram_used"] / 2**10
-                gb_total = mem_info["vram_total"] / 2**10
-            else:
-                dev_handle = nvmlDeviceGetHandleByIndex(device)
-                mem_info = nvmlDeviceGetMemoryInfo(dev_handle)
-                gb_used = mem_info.used / 2**30
-                gb_total = mem_info.total / 2**30
-            output_raw[device] = (gb_used, gb_total)
-            usage_percent = (gb_used / gb_total) * 100 if gb_total > 0 else 0
-            output[device] = f"{gb_used:.1f}GiB/{gb_total:.1f}GiB ({usage_percent:.1f}%)"
+    @contextmanager
+    def nvml_scope():
+        if current_platform.is_rocm():
+            from amdsmi import amdsmi_init, amdsmi_shut_down
 
-        print("[GPU Memory Status] Current usage:")
-        for device_id, mem_info in output.items():
-            print(f"  GPU {device_id}: {mem_info}")
+            amdsmi_init()
+            try:
+                yield
+            finally:
+                amdsmi_shut_down()
+        elif current_platform.is_cuda():
+            from vllm.third_party.pynvml import nvmlInit, nvmlShutdown
 
-        dur_s = time.time() - start_time
-        elapsed_minutes = dur_s / 60
-        if all(is_free(used, total) for used, total in output_raw.values()):
-            print(f"[GPU Memory Freed] Devices {device_list} meet memory condition")
-            print(f"   Condition: {condition_str}")
-            print(f"   Wait time: {dur_s:.1f} seconds ({elapsed_minutes:.1f} minutes)")
-            break
+            nvmlInit()
+            try:
+                yield
+            finally:
+                nvmlShutdown()
+        else:
+            yield
 
-        if dur_s >= timeout_s:
-            raise ValueError(
-                f"[GPU Memory Timeout] Devices {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
-                f"Condition: {condition_str}\n"
-                f"Current status:\n" + "\n".join(f"  GPU {device}: {output[device]}" for device in devices)
-            )
+    is_rocm = current_platform.is_rocm()
 
-        gc.collect()
-        torch.cuda.empty_cache()
-        time.sleep(5)
+    with nvml_scope():
+        if is_rocm:
+            from amdsmi import amdsmi_get_gpu_vram_usage, amdsmi_get_processor_handles
+        elif current_platform.is_cuda():
+            from vllm.third_party.pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
+
+        while True:
+            output: dict[int, str] = {}
+            output_raw: dict[int, tuple[float, float]] = {}
+            for device in devices:
+                if is_rocm:
+                    dev_handle = amdsmi_get_processor_handles()[device]
+                    mem_info = amdsmi_get_gpu_vram_usage(dev_handle)
+                    gb_used = mem_info["vram_used"] / 2**10
+                    gb_total = mem_info["vram_total"] / 2**10
+                else:
+                    dev_handle = nvmlDeviceGetHandleByIndex(device)
+                    mem_info = nvmlDeviceGetMemoryInfo(dev_handle)
+                    gb_used = mem_info.used / 2**30
+                    gb_total = mem_info.total / 2**30
+                output_raw[device] = (gb_used, gb_total)
+                usage_percent = (gb_used / gb_total) * 100 if gb_total > 0 else 0
+                output[device] = f"{gb_used:.1f}GiB/{gb_total:.1f}GiB ({usage_percent:.1f}%)"
+
+            print("[GPU Memory Status] Current usage:")
+            for device_id, mem_info in output.items():
+                print(f"  GPU {device_id}: {mem_info}")
+
+            dur_s = time.time() - start_time
+            elapsed_minutes = dur_s / 60
+            if all(is_free(used, total) for used, total in output_raw.values()):
+                print(f"[GPU Memory Freed] Devices {device_list} meet memory condition")
+                print(f"   Condition: {condition_str}")
+                print(f"   Wait time: {dur_s:.1f} seconds ({elapsed_minutes:.1f} minutes)")
+                break
+
+            if dur_s >= timeout_s:
+                raise ValueError(
+                    f"[GPU Memory Timeout] Devices {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
+                    f"Condition: {condition_str}\n"
+                    f"Current status:\n" + "\n".join(f"  GPU {device}: {output[device]}" for device in devices)
+                )
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            time.sleep(5)
 
 
 def _print_gpu_processes() -> None:
@@ -231,6 +226,8 @@ class DeviceMemoryMonitor:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        from vllm_omni.platforms import current_omni_platform
+
         def monitor_loop() -> None:
             while not self._stop_event.is_set():
                 try:
@@ -253,6 +250,8 @@ class DeviceMemoryMonitor:
 
     @property
     def peak_used_mb(self) -> float:
+        from vllm_omni.platforms import current_omni_platform
+
         fallback_alloc = current_omni_platform.max_memory_allocated(device=self.device_index) / (1024**2)
         fallback_reserved = current_omni_platform.max_memory_reserved(device=self.device_index) / (1024**2)
         return max(self._peak_used_mb, fallback_alloc, fallback_reserved)

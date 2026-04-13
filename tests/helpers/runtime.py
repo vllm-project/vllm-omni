@@ -27,7 +27,6 @@ from tests.helpers.assertions import (
     assert_diffusion_response,
     assert_omni_response,
 )
-from tests.helpers.env import _run_post_test_cleanup, _run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     convert_audio_bytes_to_text,
@@ -47,6 +46,14 @@ except Exception:  # pragma: no cover
 
     def cleanup_dist_env_and_memory() -> None:
         return None
+
+
+def _run_forced_gpu_cleanup_round() -> None:
+    """Defer ``tests.helpers.env`` import until cleanup runs (RFC #2299)."""
+    from tests.helpers.env import _run_post_test_cleanup, _run_pre_test_cleanup
+
+    _run_pre_test_cleanup(enable_force=True)
+    _run_post_test_cleanup(enable_force=True)
 
 
 def get_open_port() -> int:
@@ -76,8 +83,7 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
     ) -> None:
-        _run_pre_test_cleanup(enable_force=True)
-        _run_post_test_cleanup(enable_force=True)
+        _run_forced_gpu_cleanup_round()
         cleanup_dist_env_and_memory()
         self.model = model
         self.serve_args = serve_args
@@ -182,8 +188,7 @@ class OmniServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
             self._kill_process_tree(self.proc.pid)
-        _run_pre_test_cleanup(enable_force=True)
-        _run_post_test_cleanup(enable_force=True)
+        _run_forced_gpu_cleanup_round()
         cleanup_dist_env_and_memory()
 
 
@@ -664,8 +669,7 @@ class OmniRunner:
         **kwargs,
     ) -> None:
         cleanup_dist_env_and_memory()
-        _run_pre_test_cleanup(enable_force=True)
-        _run_post_test_cleanup(enable_force=True)
+        _run_forced_gpu_cleanup_round()
         self.model_name = model_name
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
@@ -927,8 +931,7 @@ class OmniRunner:
         if hasattr(self.omni, "close"):
             self.omni.close()
         self._cleanup_process()
-        _run_pre_test_cleanup(enable_force=True)
-        _run_post_test_cleanup(enable_force=True)
+        _run_forced_gpu_cleanup_round()
         cleanup_dist_env_and_memory()
 
 
