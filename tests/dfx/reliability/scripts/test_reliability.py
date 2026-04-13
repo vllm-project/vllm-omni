@@ -8,8 +8,10 @@ helpers from ``tests.dfx.reliability.conftest``, then validates request behavior
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -24,8 +26,12 @@ from tests.conftest import (
 )
 from tests.dfx.conftest import create_unique_server_params, load_configs
 from tests.dfx.reliability.conftest import (
+    force_remove_container,
     inject_gpu_oom,
+    list_process_pids_by_pattern,
     make_process_kill_fault_injector,
+    post_chat_completions_raw,
+    start_runtime_teardown_container_server,
     stop_gpu_oom_hogs,
 )
 from tests.utils import hardware_test
@@ -40,7 +46,8 @@ OOM_INJECTION_CONFIG = {
     # If omitted, devices are auto-derived from stage yaml runtime.devices.
     # "device": "0,1,2",
     "target_mem_ratio": 0.95,
-    "hold_seconds": 45,
+    # Keep sidecar OOM pressure for the whole test; release in finally via stop_gpu_oom_hogs.
+    "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": True,
 }
@@ -114,6 +121,7 @@ _RUNTIME_PROCESS_KILL_PATTERNS = (
     "vllm_omni.engine.orchestrator",
     "EngineCore",
 )
+_RUNTIME_WORKER_PATTERN = "VLLM::Worker"
 
 
 def _supports_video_generation(model_name: str) -> bool:
@@ -123,6 +131,44 @@ def _supports_video_generation(model_name: str) -> bool:
 
 def _supports_chat_generation(model_name: str) -> bool:
     return not _supports_video_generation(model_name)
+
+
+def _wait_chat_request_ready(host: str, port: int, model: str, timeout_sec: int = 180) -> None:
+    """Poll a minimal chat request until success."""
+    deadline = time.time() + timeout_sec
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+            "stream": False,
+            "modalities": ["text"],
+        }
+    )
+    last_error: str | None = None
+    while time.time() < deadline:
+        try:
+            status, body = post_chat_completions_raw(host, port, payload)
+            if status == 200:
+                return
+            last_error = f"http={status} body={body[:200]!r}"
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+        time.sleep(2)
+    raise TimeoutError(f"runtime-teardown warmup request did not succeed within {timeout_sec}s: {last_error}")
+
+
+def _assert_no_extra_worker_processes(baseline_pids: set[int], timeout_sec: int = 60) -> None:
+    """Ensure no extra worker PIDs remain after teardown."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        current = set(list_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
+        extra = current - baseline_pids
+        if not extra:
+            return
+        time.sleep(2)
+    current = set(list_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
+    extra = sorted(current - baseline_pids)
+    assert not extra, f"orphan worker processes remain after container teardown: {extra}"
 
 
 class _HasServeArgs(Protocol):
@@ -409,3 +455,55 @@ def test_reliability_fault_process_kill_request_failure(omni_server_after_fault,
         _assert_fault_exception(exc)
     else:
         pytest.fail("expected request failure after process-kill injection")
+
+
+@pytest.mark.slow
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(os.name == "nt", reason="runtime-teardown helper is POSIX-only")
+@pytest.mark.skipif(not OMNI_CHAT_PARAMS, reason="no omni-chat server params available")
+@pytest.mark.parametrize("runtime_params", [OMNI_CHAT_PARAMS[0]], ids=["runtime_teardown_container_kill"])
+def test_reliability_fault_runtime_teardown_container_kill_no_orphan_worker(runtime_params, model_prefix) -> None:
+    """Start server in container B, force-remove container B, and assert no extra worker remains."""
+    baseline_worker_pids = set(list_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
+    model = model_prefix + runtime_params.model
+    serve_args = list(runtime_params.server_args or [])
+    if "--stage-init-timeout" not in serve_args:
+        serve_args = ["--stage-init-timeout", "120", *serve_args]
+    if runtime_params.stage_config_path is not None:
+        serve_args += ["--stage-configs-path", runtime_params.stage_config_path]
+
+    handle = None
+    try:
+        handle = start_runtime_teardown_container_server(
+            model=model,
+            serve_args=serve_args,
+        )
+        _wait_chat_request_ready(handle.host, handle.port, model=model)
+
+        force_remove_container(handle.container_name)
+
+        payload = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "What is the capital of China? Answer in one word."}],
+                "stream": False,
+                "modalities": ["text"],
+            }
+        )
+        request_failed = False
+        try:
+            status, body = post_chat_completions_raw(handle.host, handle.port, payload)
+            if status >= 500:
+                request_failed = True
+            else:
+                pytest.fail(f"expected request failure after container teardown, got http={status} body={body[:200]!r}")
+        except Exception:
+            request_failed = True
+        assert request_failed, "expected request failure after container teardown"
+
+        _assert_no_extra_worker_processes(baseline_worker_pids)
+    finally:
+        if handle is not None:
+            force_remove_container(handle.container_name)

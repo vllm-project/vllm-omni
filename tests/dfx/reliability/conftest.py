@@ -14,13 +14,18 @@ import json
 import logging
 import os
 import select
+import shlex
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -56,6 +61,16 @@ class OomHandle:
     device: int
     target_mem_ratio: float
     start_ts: float
+
+
+@dataclass
+class RuntimeTeardownContainerHandle:
+    """Handle for a dockerized vLLM-Omni server used by runtime teardown tests."""
+
+    container_name: str
+    host: str
+    port: int
+    model: str
 
 
 def post_chat_completions_raw(
@@ -209,6 +224,9 @@ print(
     f"allocated={allocated}",
     flush=True,
 )
+if hold_seconds <= 0:
+    while True:
+        time.sleep(3600)
 time.sleep(hold_seconds)
 print("DONE", flush=True)
 """
@@ -238,6 +256,8 @@ def start_gpu_oom_hog(
     Note:
         ``target_mem_ratio`` is evaluated against free memory at injection start
         (not total GPU memory), i.e. success gate is ``allocated / free_before``.
+        ``hold_seconds <= 0`` means keeping OOM pressure until the sidecar is
+        explicitly stopped via ``stop_gpu_oom_hog(s)``.
     """
     if os.name == "nt":
         raise RuntimeError("CUDA OOM sidecar is intended for Linux CI/runtime.")
@@ -320,6 +340,8 @@ def inject_gpu_oom(
     Args:
         device: One device id (``0``), comma-separated string (``"0,1,2"``),
             or a list of device ids (``[0, 1, 2]``).
+        hold_seconds: OOM hold time in seconds; ``<=0`` keeps pressure until
+            ``stop_gpu_oom_hogs`` is called.
     """
     if isinstance(device, int):
         devices = [device]
@@ -352,6 +374,149 @@ def stop_gpu_oom_hogs(handles: OomHandle | list[OomHandle], *, timeout_sec: int 
         return
     for handle in handles:
         stop_gpu_oom_hog(handle, timeout_sec=timeout_sec)
+
+
+def list_process_pids_by_pattern(pattern: str) -> list[int]:
+    """Return matched PIDs from ``pgrep -f <pattern>``."""
+    out = subprocess.run(
+        ["pgrep", "-f", pattern],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode not in (0, 1):
+        raise RuntimeError(f"pgrep failed for pattern={pattern!r}: {out.stderr.strip()}")
+    return [int(item) for item in out.stdout.split() if item.strip().isdigit()]
+
+
+def force_remove_container(container_name: str) -> None:
+    """Force-remove a docker container if it exists."""
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _allocate_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_tcp_port_ready(host: str, port: int, timeout_sec: int) -> None:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            if sock.connect_ex((host, port)) == 0:
+                return
+        time.sleep(2)
+    raise TimeoutError(f"Server in container did not become ready within {timeout_sec}s: {host}:{port}")
+
+
+def start_runtime_teardown_container_server(
+    *,
+    model: str,
+    serve_args: list[str],
+    image: str | None = None,
+    docker_run_args: list[str] | None = None,
+    bootstrap_cmd: str | None = None,
+    startup_timeout_sec: int = 1200,
+) -> RuntimeTeardownContainerHandle:
+    """Start a dedicated container, launch vLLM-Omni inside it, and wait until port is ready."""
+    if os.name == "nt":
+        raise RuntimeError("runtime teardown container helper currently supports POSIX platforms only.")
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI not available for runtime teardown test")
+
+    container_name = f"omni_rt_teardown_{uuid4().hex[:8]}"
+    host = "127.0.0.1"
+    port = _allocate_open_port()
+    repo_root = Path(__file__).resolve().parents[3]
+    resolved_image = image or os.getenv("RUNTIME_TEARDOWN_IMAGE", "nvcr.io/nvidia/pytorch:25.01-py3")
+    resolved_bootstrap = bootstrap_cmd if bootstrap_cmd is not None else os.getenv("RUNTIME_TEARDOWN_BOOTSTRAP_CMD", "")
+    if docker_run_args is not None:
+        extra_run_args = docker_run_args
+    else:
+        extra_run_args = shlex.split(os.getenv("RUNTIME_TEARDOWN_DOCKER_ARGS", ""))
+
+    run_cmd = [
+        "docker",
+        "run",
+        "-d",
+        "--shm-size=128g",
+        "--privileged=true",
+        "--restart=always",
+        "--gpus",
+        "all",
+        "--name",
+        container_name,
+        "--net=host",
+        "-v",
+        "/home:/home",
+        "-v",
+        f"{repo_root}:{repo_root}",
+        "--cap-add=SYS_PTRACE",
+        "--security-opt",
+        "seccomp=unconfined",
+        *extra_run_args,
+        resolved_image,
+        "sleep",
+        "infinity",
+    ]
+    run_out = subprocess.run(run_cmd, check=False, capture_output=True, text=True)
+    if run_out.returncode != 0:
+        raise RuntimeError(f"failed to start runtime teardown container: {run_out.stderr.strip()}")
+
+    serve_cmd = [
+        "python",
+        "-m",
+        "vllm_omni.entrypoints.cli.main",
+        "serve",
+        model,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--omni",
+        *serve_args,
+    ]
+    serve_cmd_str = " ".join(shlex.quote(arg) for arg in serve_cmd)
+    bootstrap_prefix = f"{resolved_bootstrap} && " if resolved_bootstrap.strip() else ""
+    exec_cmd = [
+        "docker",
+        "exec",
+        "-d",
+        container_name,
+        "bash",
+        "-lc",
+        f"cd {shlex.quote(str(repo_root))} && {bootstrap_prefix}VLLM_WORKER_MULTIPROC_METHOD=spawn {serve_cmd_str}",
+    ]
+    exec_out = subprocess.run(exec_cmd, check=False, capture_output=True, text=True)
+    if exec_out.returncode != 0:
+        force_remove_container(container_name)
+        raise RuntimeError(f"failed to start server in runtime teardown container: {exec_out.stderr.strip()}")
+
+    try:
+        _wait_tcp_port_ready(host, port, timeout_sec=startup_timeout_sec)
+    except Exception:
+        logs = subprocess.run(
+            ["docker", "logs", container_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        force_remove_container(container_name)
+        raise RuntimeError(f"runtime teardown container server startup failed: {logs.stdout[-2000:]}") from None
+
+    return RuntimeTeardownContainerHandle(
+        container_name=container_name,
+        host=host,
+        port=port,
+        model=model,
+    )
 
 
 def inject_process_kill(
