@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+import librosa
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -39,6 +40,53 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .voxcpm2_import_utils import import_voxcpm2_core
 
 logger = init_logger(__name__)
+
+
+def _encode_raw_audio(
+    tts: nn.Module,
+    samples: list[float] | torch.Tensor,
+    sr: int,
+    padding_mode: str = "right",
+) -> torch.Tensor:
+    """Encode raw audio samples using the native VoxCPM2 AudioVAE.
+
+    Mirrors ``VoxCPM2Model._encode_wav`` but accepts in-memory samples
+    instead of a file path.  This is needed for the OpenAI speech API
+    where ``_resolve_ref_audio`` returns decoded audio data.
+
+    Args:
+        tts: Native VoxCPM2 tts_model instance.
+        samples: Audio samples (mono, float32).
+        sr: Sample rate of the input audio.
+        padding_mode: "right" (default) or "left" padding.
+
+    Returns:
+        audio_feat: (T, P, D) tensor of latent patches.
+    """
+    if isinstance(samples, list):
+        audio = torch.tensor(samples, dtype=torch.float32)
+    else:
+        audio = samples.float()
+
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+
+    # Resample to the model's expected encoding sample rate
+    encode_sr = tts._encode_sample_rate
+    if sr != encode_sr:
+        audio_np = audio.squeeze(0).numpy()
+        audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=encode_sr)
+        audio = torch.from_numpy(audio_np).unsqueeze(0)
+
+    # Pad to patch boundary
+    patch_len = tts.patch_size * tts.chunk_size
+    if audio.size(1) % patch_len != 0:
+        padding_size = patch_len - audio.size(1) % patch_len
+        pad = (padding_size, 0) if padding_mode == "left" else (0, padding_size)
+        audio = torch.nn.functional.pad(audio, pad)
+
+    feat = tts.audio_vae.encode(audio.to(tts.device), encode_sr).cpu()
+    return feat.view(tts.audio_vae.latent_dim, -1, tts.patch_size).permute(1, 2, 0)
 
 
 class VoxCPM2TalkerForConditionalGeneration(nn.Module):
@@ -82,6 +130,82 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def tts(self) -> nn.Module:
         assert self._tts is not None, "Model not loaded yet"
         return self._tts
+
+    def _build_prompt_cache(
+        self,
+        ref_audio: Any = None,
+        prompt_audio: Any = None,
+        prompt_text: str | None = None,
+    ) -> dict | None:
+        """Build prompt cache, handling both file paths and raw audio data.
+
+        The OpenAI speech API sends decoded audio as [samples_list, sr]
+        via ``_resolve_ref_audio``, while offline usage sends file paths.
+        This method detects the format and routes accordingly.
+        """
+        tts = self.tts
+
+        def _is_raw_audio(v: Any) -> bool:
+            """Check if value is [samples, sr] from serving_speech."""
+            return (
+                isinstance(v, (list, tuple))
+                and len(v) == 2
+                and isinstance(v[1], int)
+                and isinstance(v[0], (list, torch.Tensor))
+            )
+
+        # If all inputs are file paths (or None), use native build_prompt_cache
+        if not _is_raw_audio(ref_audio) and not _is_raw_audio(prompt_audio):
+            return tts.build_prompt_cache(
+                prompt_text=prompt_text,
+                prompt_wav_path=prompt_audio,
+                reference_wav_path=ref_audio,
+            )
+
+        # Raw audio path: encode directly
+        cache: dict[str, Any] = {}
+
+        if ref_audio is not None:
+            if _is_raw_audio(ref_audio):
+                samples, sr = ref_audio
+                cache["ref_audio_feat"] = _encode_raw_audio(
+                    tts,
+                    samples,
+                    sr,
+                    padding_mode="right",
+                )
+            else:
+                cache["ref_audio_feat"] = tts._encode_wav(
+                    ref_audio,
+                    padding_mode="right",
+                )
+
+        if prompt_audio is not None and prompt_text is not None:
+            cache["prompt_text"] = prompt_text
+            if _is_raw_audio(prompt_audio):
+                samples, sr = prompt_audio
+                cache["audio_feat"] = _encode_raw_audio(
+                    tts,
+                    samples,
+                    sr,
+                    padding_mode="left",
+                )
+            else:
+                cache["audio_feat"] = tts._encode_wav(
+                    prompt_audio,
+                    padding_mode="left",
+                )
+
+        has_ref = "ref_audio_feat" in cache
+        has_prompt = "audio_feat" in cache
+        if has_ref and has_prompt:
+            cache["mode"] = "ref_continuation"
+        elif has_ref:
+            cache["mode"] = "reference"
+        else:
+            cache["mode"] = "continuation"
+
+        return cache
 
     # -------------------- vllm hooks --------------------
 
@@ -482,10 +606,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             self._prompt_cache = None
             if ref_audio or (prompt_audio and prompt_text):
                 try:
-                    self._prompt_cache = self.tts.build_prompt_cache(
+                    self._prompt_cache = self._build_prompt_cache(
+                        ref_audio=ref_audio,
+                        prompt_audio=prompt_audio,
                         prompt_text=prompt_text,
-                        prompt_wav_path=prompt_audio,
-                        reference_wav_path=ref_audio,
                     )
                 except Exception as e:
                     logger.warning("build_prompt_cache failed: %s; falling back to zero-shot", e)
