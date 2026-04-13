@@ -353,7 +353,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     try:
         await shutdown_task
     finally:
-        serving_speech = getattr(getattr(app, "state", None), "openai_serving_speech", None)
+        state = getattr(app, "state", None)
+        serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
         if serving_speech is not None:
             serving_speech.shutdown()
         sock.close()
@@ -2008,6 +2009,8 @@ async def _run_video_generation_job(
                 "file_name": file_name,
                 "completed_at": int(time.time()),
                 "inference_time_s": time.perf_counter() - started_at,
+                "stage_durations": response.stage_durations,
+                "peak_memory_mb": response.peak_memory_mb,
             },
         )
     except Exception as exc:
@@ -2181,7 +2184,7 @@ async def create_video_sync(
     request_id = f"video_sync-{random_uuid()}"
     started_at = time.perf_counter()
     try:
-        video_bytes = await asyncio.wait_for(
+        video_bytes, stage_durations, peak_memory_mb = await asyncio.wait_for(
             handler.generate_video_bytes(request, request_id, reference_image=reference_image),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
@@ -2207,6 +2210,8 @@ async def create_video_sync(
             "X-Request-Id": request_id,
             "X-Model": effective_model_name,
             "X-Inference-Time-S": f"{inference_time_s:.3f}",
+            "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
+            "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",
         },
     )
 

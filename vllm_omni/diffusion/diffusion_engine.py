@@ -361,15 +361,11 @@ class DiffusionEngine:
                     )
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
-        """Start or stop torch profiling on all diffusion workers.
+        """Start or stop profiling on all diffusion workers.
 
         Args:
             is_start: True to start profiling, False to stop.
-            profile_prefix: Optional prefix for trace filename (vLLM compat).
-
-        Note:
-            Matches vLLM's worker.profile() signature for consistency.
-            Traces are saved automatically via on_trace_ready callback.
+            profile_prefix: Optional prefix for trace filename.
         """
         if is_start:
             if profile_prefix is None:

@@ -14,7 +14,6 @@
 # limitations under the License.
 import math
 import operator
-import os
 from functools import cache
 from itertools import accumulate
 
@@ -24,6 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN, flash_attn_varlen_func
+from vllm_omni.utils.audio import mel_filter_bank
 
 N_FFT = 400
 HOP_LENGTH = 160
@@ -31,21 +31,8 @@ HOP_LENGTH = 160
 
 @cache
 def mel_filters(device, n_mels: int) -> torch.Tensor:
-    """
-    load the mel filterbank matrix for projecting STFT into a Mel spectrogram.
-    Allows decoupling librosa dependency; saved using:
-
-        np.savez_compressed(
-            "mel_filters.npz",
-            mel_80=librosa.filters.mel(sr=16000, n_fft=400, n_mels=80),
-            mel_128=librosa.filters.mel(sr=16000, n_fft=400, n_mels=128),
-        )
-    """
-    assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
-
-    filters_path = os.path.join(os.path.dirname(__file__), "assets", "mel_filters.npz")
-    with np.load(filters_path, allow_pickle=False) as f:
-        return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
+    """Compute mel filterbank matrix for projecting STFT into a Mel spectrogram."""
+    return mel_filter_bank(sr=16000, n_fft=N_FFT, n_mels=n_mels).to(device)
 
 
 def log_mel_spectrogram(

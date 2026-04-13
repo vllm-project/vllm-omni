@@ -126,7 +126,7 @@ if skip:
 else:
     rep = "'true'"
     ready_rep = "'build.branch != \"main\" && build.pull_request.labels includes \"ready\"'"
-    merge_rep = "'build.branch == \"main\" && build.env(\"NIGHTLY\") != \"1\"'"
+    merge_rep = "'(build.branch == \"main\" && build.env(\"NIGHTLY\") != \"1\") || (build.branch != \"main\" && build.pull_request.labels includes \"merge-test\")'"
 rendered = (
     continuation
     .replace("__IMAGE_BUILD_IF__", rep)

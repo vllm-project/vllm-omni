@@ -10,7 +10,7 @@ model, for example:
 Requirements:
 - vllm with audio support
 - websockets
-- librosa
+- soundfile
 - numpy
 
 The script:
@@ -25,10 +25,10 @@ import asyncio
 import base64
 import json
 
-import librosa
 import numpy as np
 import websockets
 from vllm.assets.audio import AudioAsset
+from vllm.multimodal.media.audio import load_audio
 
 
 def audio_to_pcm16_base64(audio_path: str) -> str:
@@ -36,7 +36,7 @@ def audio_to_pcm16_base64(audio_path: str) -> str:
     Load an audio file and convert it to base64-encoded PCM16 @ 16kHz.
     """
     # Load audio and resample to 16kHz mono
-    audio, _ = librosa.load(audio_path, sr=16000, mono=True)
+    audio, _ = load_audio(audio_path, sr=16000, mono=True)
     # Convert to PCM16
     pcm16 = (audio * 32767).astype(np.int16)
     # Encode as base64
