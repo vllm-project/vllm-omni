@@ -3,6 +3,7 @@
 
 from .pipeline_wan2_2 import (
     Wan22Pipeline,
+    WanT2VDMD2Pipeline,
     create_transformer_from_config,
     get_wan22_post_process_func,
     get_wan22_pre_process_func,
@@ -28,6 +29,7 @@ from .wan2_2_transformer import WanTransformer3DModel
 from .wan2_2_vace_transformer import VaceWanTransformerBlock, WanVACETransformer3DModel
 
 __all__ = [
+    "WanT2VDMD2Pipeline",
     "Wan22Pipeline",
     "get_wan22_post_process_func",
     "get_wan22_pre_process_func",

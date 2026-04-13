@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import PIL.Image
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
@@ -872,3 +873,116 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 
         if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
+
+
+# ---------------------------------------------------------------------------
+# DMD2-distilled variant
+# ---------------------------------------------------------------------------
+
+
+class WanT2VDMD2Pipeline(Wan22Pipeline):
+    """Wan 2.1 T2V pipeline for FastGen DMD2-distilled 4-step models.
+
+    Three changes from Wan22Pipeline:
+    - FlowMatchEulerDiscreteScheduler(shift=1.0): σ=t exactly, matching the
+      RFNoiseSchedule used during student training.
+    - Training timesteps [999, 937, 833, 624] injected via set_timesteps patch.
+      Euler's default 4-step schedule gives a different distribution.
+    - guidance_scale and negative_prompt are sanitized: teacher CFG is baked
+      into student weights so any user-supplied CFG is silently overridden.
+    """
+
+    GUIDANCE_SCALE = 1.0
+    NUM_INFERENCE_STEPS = 4
+    DMD2_TIMESTEPS = [999, 937, 833, 624]
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__(od_config=od_config, prefix=prefix)
+        self.scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=1000,
+            shift=1.0,
+        )
+
+    def _verify_dmd2_request(self, req: OmniDiffusionRequest) -> None:
+        """Sanitize CFG-related fields from the request.
+
+        DMD2 student weights have teacher CFG baked in.  Any CFG-triggering
+        field supplied by the caller would double-guide the model and degrade
+        quality.  We override all of them with a single warning per field.
+        """
+        sp = req.sampling_params
+
+        if sp.guidance_scale_provided and sp.guidance_scale != self.GUIDANCE_SCALE:
+            logger.warning(
+                "DMD2: ignoring guidance_scale=%.2f — CFG is baked into student weights. Forcing guidance_scale=%.2f.",
+                sp.guidance_scale,
+                self.GUIDANCE_SCALE,
+            )
+        sp.guidance_scale = self.GUIDANCE_SCALE
+        sp.guidance_scale_provided = False
+
+        if sp.guidance_scale_2 is not None:
+            logger.warning("DMD2: ignoring guidance_scale_2 — not supported.")
+            sp.guidance_scale_2 = None
+
+        # Classifier free guidance is baked in the student weights, set all related params to None
+        if sp.true_cfg_scale is not None:
+            logger.warning("DMD2: ignoring true_cfg_scale — not supported.")
+            sp.true_cfg_scale = None
+
+        sp.do_classifier_free_guidance = False
+        sp.is_cfg_negative = False
+
+        # negative_prompt comes from req.prompts, not a forward() param.
+        # Strip it so the parent's encode_prompt never encodes an uncond embedding.
+        fixed_prompts = []
+        for p in req.prompts:
+            if isinstance(p, dict) and p.get("negative_prompt"):
+                logger.warning("DMD2: ignoring negative_prompt — not supported for DMD2 models.")
+                p = {k: v for k, v in p.items() if k != "negative_prompt"}
+            fixed_prompts.append(p)
+        req.prompts = fixed_prompts
+
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        prompt: str | None = None,
+        height: int = 480,
+        width: int = 832,
+        num_inference_steps: int = 4,
+        guidance_scale: float | tuple[float, float] = 1.0,
+        frame_num: int = 81,
+        output_type: str | None = "np",
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        attention_kwargs: dict | None = None,
+        **kwargs,
+    ) -> DiffusionOutput:
+        # DMD2: teacher CFG is baked into student weights.
+        # negative_prompt comes from req.prompts — sanitize it there.
+        # guidance_scale is forced to 1.0 regardless of what the caller passed.
+        self._verify_dmd2_request(req)
+
+        _orig = self.scheduler.set_timesteps
+
+        def _dmd2_set_timesteps(num_steps, device=None, **kw):
+            _orig(timesteps=self.DMD2_TIMESTEPS, device=device)
+
+        self.scheduler.set_timesteps = _dmd2_set_timesteps
+        try:
+            return super().forward(
+                req,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=1.0,
+                frame_num=frame_num,
+                output_type=output_type,
+                generator=generator,
+                prompt_embeds=prompt_embeds,
+                attention_kwargs=attention_kwargs,
+                **kwargs,
+            )
+        finally:
+            self.scheduler.set_timesteps = _orig
