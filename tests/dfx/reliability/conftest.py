@@ -396,8 +396,7 @@ def _runtime_teardown_ssh_target() -> str:
 
 def _runtime_teardown_ssh_cmd(remote_cmd: str) -> subprocess.CompletedProcess[str]:
     ssh_target = _runtime_teardown_ssh_target()
-    default_opts = "-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
-    ssh_opts = shlex.split(os.getenv("RUNTIME_TEARDOWN_SSH_OPTS", default_opts))
+    ssh_opts = shlex.split(os.getenv("RUNTIME_TEARDOWN_SSH_OPTS", ""))
     return subprocess.run(
         ["ssh", *ssh_opts, ssh_target, "bash", "-lc", remote_cmd],
         check=False,
