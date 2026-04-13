@@ -1,20 +1,40 @@
 steps:
-  - label: "Simple Unit Test"
-    depends_on: upload-merge-pipeline
-    commands:
-      - "pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
-    agents:
-      queue: "gpu_1_queue"
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-            - "HF_TOKEN"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
+  - group: "Simple Unit Test"
+    key: merge-simple-unit-test-group
+    steps:
+      - label: "Simple UT·diffusion"
+        depends_on: upload-merge-pipeline
+        commands:
+          - "timeout 20m pytest -v -s tests/diffusion/ -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      - label: "Simple UT·other"
+        depends_on: upload-merge-pipeline
+        commands:
+          - "timeout 20m pytest -v -s -m 'core_model and cpu' --ignore=tests/diffusion --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
 
   # Group: images LoRA, offload, worker, FP8, LoRA, cache, seq+TP, VAE, EP; parallel children, each depends_on upload-merge-pipeline.
   - group: "Diffusion Test"
