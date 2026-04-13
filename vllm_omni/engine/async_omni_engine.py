@@ -1221,6 +1221,8 @@ class AsyncOmniEngine:
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enforce_eager": kwargs.get("enforce_eager", False),
+            "boundary_ratio": kwargs.get("boundary_ratio", None),
+            "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
