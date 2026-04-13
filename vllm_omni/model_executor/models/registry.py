@@ -161,6 +161,12 @@ _OMNI_MODELS = {
         "minicpmo_omni_code2wav",
         "MiniCPMOOmniCode2WavForConditionalGeneration",
     ),
+    # MiniCPM-o 4.5 Omni models
+    "MiniCPMOOmniTalkerV45Model": (
+        "minicpmo",
+        "minicpmo_omni_talker_v45",
+        "MiniCPMOOmniTalkerV45ForConditionalGeneration",
+    ),
 }
 
 

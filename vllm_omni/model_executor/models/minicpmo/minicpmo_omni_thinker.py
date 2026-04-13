@@ -389,8 +389,14 @@ class MiniCPMOConfig(Qwen2Config):
         if tts_config is None:
             self.tts_config = ConditionalChatTTSConfig()
         elif isinstance(tts_config, dict):
-            self.tts_config = ConditionalChatTTSConfig(**tts_config)
+            tts_model_type = tts_config.get("model_type", "conditional_chattts")
+            if tts_model_type == "conditional_chattts":
+                self.tts_config = ConditionalChatTTSConfig(**tts_config)
+            else:
+                self.tts_config = PretrainedConfig(**tts_config)
         elif isinstance(tts_config, ConditionalChatTTSConfig):
+            self.tts_config = tts_config
+        else:
             self.tts_config = tts_config
 
         self.patch_size = self.vision_config.patch_size
@@ -2856,7 +2862,7 @@ class MiniCPMOOmniThinkerProcessingInfo(BaseProcessingInfo):
     
 
     def get_default_audio_pool_step(self) -> int:
-        return 2
+        return getattr(self.get_hf_config(), "audio_pool_step", 2)
 
     def get_default_audio_sampling_rate(self) -> int:
         return 16000
@@ -3788,13 +3794,20 @@ class MiniCPMOOmniThinkerForConditionalGeneration(
         else:
             self.vpm = None
 
-        # Initialize language model (Qwen2)
-        text_config = Qwen2Config.from_dict(config.to_dict())
+        config_dict = config.to_dict()
+        use_qwen3 = config_dict.get("attention_bias") is False
+        if use_qwen3:
+            from transformers import Qwen3Config as _Qwen3Config
+            text_config = _Qwen3Config.from_dict(config_dict)
+            llm_arch = "Qwen3ForCausalLM"
+        else:
+            text_config = Qwen2Config.from_dict(config_dict)
+            llm_arch = "Qwen2ForCausalLM"
         self.llm = init_vllm_registered_model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "llm"),
             hf_config=text_config,
-            architectures=["Qwen2ForCausalLM"],
+            architectures=[llm_arch],
         )
         
         embed_dim = self.llm.config.hidden_size
