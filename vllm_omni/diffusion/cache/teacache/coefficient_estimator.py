@@ -13,6 +13,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+from vllm_omni.diffusion.models.flux2.pipeline_flux2 import Flux2Pipeline
 from vllm_omni.diffusion.models.stable_audio.pipeline_stable_audio import StableAudioPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -103,6 +104,31 @@ class StableAudioAdapter:
         registry.register_hook(hook._HOOK_NAME, hook)
 
 
+class Flux2Adapter:
+    """Adapter for Flux2 model coefficient estimation."""
+
+    @staticmethod
+    def load_pipeline(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> Flux2Pipeline:
+        """Load Flux2 pipeline for coefficient estimation."""
+        od_config = OmniDiffusionConfig.from_kwargs(model=model_path, dtype=dtype)
+        od_config.model_class_name = "Flux2Pipeline"
+
+        pipeline = Flux2Pipeline(od_config=od_config)
+        loader = DiffusersPipelineLoader(LoadConfig())
+        loader.load_weights(pipeline)
+        pipeline.to(device)
+        return pipeline
+
+    @staticmethod
+    def get_transformer(pipeline: Any) -> tuple[Any, str]:
+        return pipeline.transformer, pipeline.transformer.__class__.__name__
+
+    @staticmethod
+    def install_hook(transformer: Any, hook: DataCollectionHook) -> None:
+        registry = HookRegistry.get_or_create(transformer)
+        registry.register_hook(hook._HOOK_NAME, hook)
+
+
 class DefaultAdapter:
     """Default adapter for standard diffusers pipelines."""
 
@@ -123,6 +149,7 @@ class DefaultAdapter:
 _MODEL_ADAPTERS: dict[str, type] = {
     "Bagel": BagelAdapter,
     "StableAudio": StableAudioAdapter,
+    "Flux2": Flux2Adapter,
 }
 
 _EPSILON = 1e-6
