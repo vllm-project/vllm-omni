@@ -2,11 +2,12 @@
 
 See [RFC-dfx-l5-reliability.md](../../../docs/contributing/rfc/RFC-dfx-l5-reliability.md).
 
-- Scenarios: `tests/scenarios.json`
 - Fault helpers: `conftest.py`
-- Pytest entry: `scripts/test_reliability.py`
+- Qwen3 tests: `test_reliability_qwen3_omni.py`
+- Wan2.2 tests: `test_reliability_wan22.py`
 
 ```bash
 pytest --collect-only tests/dfx/reliability
-pytest -s -v tests/dfx/reliability/scripts/test_reliability.py -m slow
+pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m slow
+pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m slow
 ```
