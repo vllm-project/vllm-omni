@@ -448,11 +448,26 @@ def _allocate_open_port() -> int:
 
 def _wait_tcp_port_ready(host: str, port: int, timeout_sec: int) -> None:
     deadline = time.time() + timeout_sec
+    start_ts = time.time()
+    next_log_ts = start_ts
     while time.time() < deadline:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(1.0)
             if sock.connect_ex((host, port)) == 0:
+                elapsed = int(time.time() - start_ts)
+                print(
+                    f"[runtime-teardown][wait-port] ready host={host} port={port} elapsed={elapsed}s",
+                    flush=True,
+                )
                 return
+        now = time.time()
+        if now >= next_log_ts:
+            elapsed = int(now - start_ts)
+            print(
+                f"[runtime-teardown][wait-port] waiting host={host} port={port} elapsed={elapsed}s",
+                flush=True,
+            )
+            next_log_ts = now + 15
         time.sleep(2)
     raise TimeoutError(f"Server in container did not become ready within {timeout_sec}s: {host}:{port}")
 
@@ -509,6 +524,10 @@ def start_runtime_teardown_container_server(
         "infinity",
     ]
     run_cmd = " ".join(shlex.quote(arg) for arg in run_cmd_args)
+    print(
+        f"[runtime-teardown] container={container_name} host={host} port={port} image={resolved_image}",
+        flush=True,
+    )
     run_out = _runtime_teardown_ssh_cmd(run_cmd, step="docker-run")
     if run_out.returncode != 0:
         raise RuntimeError(f"failed to start runtime teardown container: {run_out.stderr.strip()}")
@@ -544,6 +563,10 @@ def start_runtime_teardown_container_server(
         raise RuntimeError(f"failed to start server in runtime teardown container: {exec_out.stderr.strip()}")
 
     try:
+        print(
+            f"[runtime-teardown] waiting server ready container={container_name} host={host} port={port} timeout={startup_timeout_sec}s",
+            flush=True,
+        )
         _wait_tcp_port_ready(host, port, timeout_sec=startup_timeout_sec)
     except Exception:
         logs = _runtime_teardown_ssh_cmd(f"docker logs {shlex.quote(container_name)}", step="docker-logs")
