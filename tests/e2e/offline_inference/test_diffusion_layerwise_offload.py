@@ -1,20 +1,11 @@
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
+from tests.conftest import OmniRunner
 from tests.utils import DeviceMemoryMonitor
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
-
-# ruff: noqa: E402
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from vllm_omni import Omni
 
 # Models to test and expected saved memory in MB, correspondingly
 MODELS_SAVED_MEMORY_MB = {
@@ -33,34 +24,33 @@ def run_inference(
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
 
-    m = Omni(
-        model=model_name,
+    with OmniRunner(
+        model_name,
         enable_layerwise_offload=layerwise_offload,
         # TODO: we might want to add overlapped feature e2e tests
         # cache_backend="cache_dit",
         boundary_ratio=0.875,
         flow_shift=5.0,
-    )
+    ) as runner:
+        current_omni_platform.reset_peak_memory_stats()
 
-    current_omni_platform.reset_peak_memory_stats()
+        # Refer to tests/e2e/offline_inference/test_t2v_model.py
+        # Use minimal settings for testing
+        height = 480
+        width = 640
+        num_frames = 5
 
-    # Refer to tests/e2e/offline_inference/test_t2v_model.py
-    # Use minimal settings for testing
-    height = 480
-    width = 640
-    num_frames = 5
-
-    m.generate(
-        "A cat sitting on a table",
-        OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
-            guidance_scale=1.0,
-            num_inference_steps=num_inference_steps,
-            num_frames=num_frames,
-        ),
-    )
+        runner.omni.generate(
+            "A cat sitting on a table",
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
+                guidance_scale=1.0,
+                num_inference_steps=num_inference_steps,
+                num_frames=num_frames,
+            ),
+        )
 
     peak = monitor.peak_used_mb
     monitor.stop()

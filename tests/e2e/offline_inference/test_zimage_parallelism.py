@@ -98,8 +98,6 @@ def _run_zimage_generate(
                 tensor_parallel_size=tp_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
             ),
-            init_timeout=900,
-            stage_init_timeout=600,
             enforce_eager=enforce_eager,
             vae_use_tiling=vae_use_tiling,
         ) as runner:
