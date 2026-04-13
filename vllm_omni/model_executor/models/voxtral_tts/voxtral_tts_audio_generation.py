@@ -864,6 +864,29 @@ class VoxtralTTSMultiModalProcessor(BaseMultiModalProcessor[VoxtralTTSProcessing
             ),
         ]
 
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        """
+        Apply the HF processor on the multi-modal data only.
+
+        Issue: Voxtral TTS use Mistral Tokenizer with custom audio encoder. It doesn't
+        inherit Transformers ProcessorMixin and can't use call_hf_processor_mm_only.
+
+        Solution: Override this method to call _apply_hf_processor_text_mm directly.
+        """
+        mm_counts = mm_items.get_all_counts()
+        _, mm_processed_data, _ = self._apply_hf_processor_text_mm(
+            prompt_text=self.dummy_inputs.get_dummy_text(mm_counts),
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+        )
+        return mm_processed_data
+
     def _cached_apply_hf_processor(
         self,
         inputs: ProcessorInputs,
