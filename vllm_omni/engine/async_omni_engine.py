@@ -32,6 +32,7 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
@@ -1258,31 +1259,13 @@ class AsyncOmniEngine:
         _no_warn = {"model"}
 
         parent_fields: dict[str, dataclasses.Field] = {f.name: f for f in dataclasses.fields(EngineArgs)}
-        overridden: list[str] = []
-        result: dict[str, Any] = {}
-        for k, v in kwargs.items():
-            if k in _strip_omni:
-                continue
-            if k not in parent_fields or k in _keep:
-                result[k] = v
-                continue
-            # Detect explicitly-set values that differ from the default.
-            # Values may have been through asdict() which converts dataclass
-            # defaults to dicts, so normalise before comparing.
-            field = parent_fields[k]
-            if field.default is not dataclasses.MISSING:
-                default = field.default
-            elif field.default_factory is not dataclasses.MISSING:
-                default = field.default_factory()
-            else:
-                default = dataclasses.MISSING
-            if default is dataclasses.MISSING or v is None:
-                continue
-            # Normalise dataclass defaults to dicts for comparison
-            if dataclasses.is_dataclass(default) and not isinstance(default, type):
-                default = dataclasses.asdict(default)
-            if v != default and k not in _no_warn:
-                overridden.append(k)
+        result, overridden = strip_parent_engine_args(
+            kwargs,
+            parent_fields=parent_fields,
+            keep_keys=_keep,
+            strip_keys=_strip_omni,
+            no_warn_keys=_no_warn,
+        )
 
         if overridden:
             logger.warning(

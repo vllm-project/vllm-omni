@@ -4,11 +4,18 @@
 Unit tests for StageConfigFactory and related classes.
 """
 
+from dataclasses import fields
+
+from vllm.engine.arg_utils import EngineArgs
+
 from vllm_omni.config.stage_config import (
+    INTERNAL_STAGE_OVERRIDE_KEYS,
     ModelPipeline,
     StageConfig,
     StageConfigFactory,
     StageType,
+    build_stage_runtime_overrides,
+    strip_parent_engine_args,
 )
 
 
@@ -309,6 +316,49 @@ class TestStageConfigFactory:
         assert overrides["gpu_memory_utilization"] == 0.9
         assert "model" not in overrides
         assert "batch_timeout" not in overrides
+
+
+class TestStageResolutionHelpers:
+    """Tests for shared stage override / filtering helpers."""
+
+    def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self):
+        overrides = build_stage_runtime_overrides(
+            0,
+            {
+                "gpu_memory_utilization": 0.5,
+                "stage_0_gpu_memory_utilization": 0.9,
+                "stage_1_gpu_memory_utilization": 0.1,
+                "stage_0_model": "should_be_ignored",
+                "parallel_config": {"world_size": 2},
+            },
+            internal_keys=INTERNAL_STAGE_OVERRIDE_KEYS,
+        )
+
+        assert overrides["gpu_memory_utilization"] == 0.9
+        assert "model" not in overrides
+        assert "parallel_config" not in overrides
+
+    def test_strip_parent_engine_args_reports_only_surprising_parent_overrides(self):
+        parent_fields = {f.name: f for f in fields(EngineArgs)}
+        filtered, overridden = strip_parent_engine_args(
+            {
+                "model": "some/model",
+                "stage_configs_path": "/tmp/stages.yaml",
+                "tensor_parallel_size": 4,
+                "worker_extension_cls": "some.Extension",
+                "custom_pipeline_args": {"pipeline_class": "demo.Pipeline"},
+            },
+            parent_fields=parent_fields,
+            keep_keys={"worker_extension_cls"},
+            strip_keys={"stage_configs_path"},
+            no_warn_keys={"model"},
+        )
+
+        assert filtered == {
+            "worker_extension_cls": "some.Extension",
+            "custom_pipeline_args": {"pipeline_class": "demo.Pipeline"},
+        }
+        assert overridden == ["tensor_parallel_size"]
 
 
 class TestPipelineYamlParsing:
