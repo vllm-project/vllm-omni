@@ -303,6 +303,11 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 modules.vae.to(self.device, non_blocking=True)
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
+                
+        # Move resident modules to GPU
+        for name, module in zip(modules.resident_names, modules.resident_modules):
+            logger.debug(f"Moving resident module {name} to device {self.device}")
+            module.to(self.device)
 
         logger.info("Applying layer-wise offloading on %s", modules.dit_names)
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from torch import nn
 from vllm.logger import init_logger
@@ -16,7 +16,8 @@ class PipelineModules:
     encoders: list[nn.Module]
     encoder_names: list[str]
     vae: nn.Module | None = None
-
+    resident_modules: list[nn.Module] = field(default_factory=list)
+    resident_names: list[str] = field(default_factory=list)
 
 class ModuleDiscovery:
     """Discovers pipeline components for offloading"""
@@ -35,6 +36,16 @@ class ModuleDiscovery:
         Returns:
             PipelineModules with lists of discovered modules and names
         """
+        # Custom discovery
+        custom_discover = getattr(pipeline, "discover_offload_modules", None)
+        if callable(custom_discover):
+            modules = custom_discover()
+            if not isinstance(modules, PipelineModules):
+                raise TypeError(
+                    f"discover_offload_modules() must return PipelineModules, got {type(modules)!r}"
+                )
+            return modules
+    
         # Collect DiT/transformer modules
         dit_modules: list[nn.Module] = []
         dit_names: list[str] = []

@@ -25,6 +25,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -273,7 +274,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # device until the weight loader materializes them. Calling
         # .to(device) would fail on those meta tensors, so we skip it
         # entirely and let the weight loader handle device placement.
-        if quant_config is None:
+        if quant_config is None and not(od_config.enable_layerwise_offload):
             self.to(self.device)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -813,3 +814,31 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(_filtered_weights())
+    
+    def discover_offload_modules(self) -> PipelineModules:
+        resident_modules: list[nn.Module] = []
+        resident_names: list[str] = []
+        
+        def add_resident(name: str, module: nn.Module | None) -> None:
+            if module is None:
+                return
+            resident_modules.append(module)
+            resident_names.append(name)
+            
+        add_resident("bagel.time_embedder", getattr(self.bagel, "time_embedder", None))
+        add_resident("bagel.vae2llm", getattr(self.bagel, "vae2llm", None))
+        add_resident("bagel.llm2vae", getattr(self.bagel, "llm2vae", None))
+        add_resident("bagel.latent_pos_embed", getattr(self.bagel, "latent_pos_embed", None))
+        add_resident("bagel.vit_model", getattr(self.bagel, "vit_model", None))
+        add_resident("bagel.connector", getattr(self.bagel, "connector", None))
+        add_resident("bagel.vit_pos_embed", getattr(self.bagel, "vit_pos_embed", None))
+        
+        return PipelineModules(
+            dits=[self.language_model.model],
+            dit_names=["bagel.language_model.model"],
+            encoders=[],
+            encoder_names=[],
+            vae=self.vae,
+            resident_modules=resident_modules,
+            resident_names=resident_names,
+    )
