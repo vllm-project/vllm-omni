@@ -394,7 +394,7 @@ def _runtime_teardown_ssh_target() -> str:
     return target or "root@127.0.0.1"
 
 
-def _runtime_teardown_ssh_cmd(remote_cmd: str) -> subprocess.CompletedProcess[str]:
+def _runtime_teardown_ssh_cmd(remote_cmd: str, *, step: str | None = None) -> subprocess.CompletedProcess[str]:
     ssh_target = _runtime_teardown_ssh_target()
     default_reuse_opts = (
         "-o ControlMaster=auto "
@@ -403,18 +403,30 @@ def _runtime_teardown_ssh_cmd(remote_cmd: str) -> subprocess.CompletedProcess[st
     )
     raw_opts = os.getenv("RUNTIME_TEARDOWN_SSH_OPTS", "").strip()
     ssh_opts = shlex.split(raw_opts or default_reuse_opts)
-    return subprocess.run(
-        ["ssh", *ssh_opts, ssh_target, "bash", "-lc", remote_cmd],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    timeout_sec = int(os.getenv("RUNTIME_TEARDOWN_SSH_TIMEOUT_SEC", "600"))
+    step_prefix = f"[runtime-teardown][ssh]{f'[{step}]' if step else ''}"
+    print(f"{step_prefix} target={ssh_target} running remote command...", flush=True)
+    try:
+        out = subprocess.run(
+            ["ssh", *ssh_opts, ssh_target, "bash", "-lc", remote_cmd],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{step_prefix} timed out after {timeout_sec}s. "
+            "Increase RUNTIME_TEARDOWN_SSH_TIMEOUT_SEC if needed."
+        ) from exc
+    print(f"{step_prefix} exit_code={out.returncode}", flush=True)
+    return out
 
 
 def list_remote_process_pids_by_pattern(pattern: str) -> list[int]:
     """Return matched PIDs from remote host ``pgrep -f <pattern>`` via SSH."""
     cmd = f"pgrep -f {shlex.quote(pattern)} || true"
-    out = _runtime_teardown_ssh_cmd(cmd)
+    out = _runtime_teardown_ssh_cmd(cmd, step="pgrep")
     if out.returncode not in (0, 1):
         raise RuntimeError(f"remote pgrep failed for pattern={pattern!r}: {out.stderr.strip()}")
     return [int(item) for item in out.stdout.split() if item.strip().isdigit()]
@@ -422,7 +434,10 @@ def list_remote_process_pids_by_pattern(pattern: str) -> list[int]:
 
 def force_remove_container(container_name: str) -> None:
     """Force-remove a docker container on remote host via SSH."""
-    _runtime_teardown_ssh_cmd(f"docker rm -f {shlex.quote(container_name)} >/dev/null 2>&1 || true")
+    _runtime_teardown_ssh_cmd(
+        f"docker rm -f {shlex.quote(container_name)} >/dev/null 2>&1 || true",
+        step="docker-rm-f",
+    )
 
 
 def _allocate_open_port() -> int:
@@ -494,7 +509,7 @@ def start_runtime_teardown_container_server(
         "infinity",
     ]
     run_cmd = " ".join(shlex.quote(arg) for arg in run_cmd_args)
-    run_out = _runtime_teardown_ssh_cmd(run_cmd)
+    run_out = _runtime_teardown_ssh_cmd(run_cmd, step="docker-run")
     if run_out.returncode != 0:
         raise RuntimeError(f"failed to start runtime teardown container: {run_out.stderr.strip()}")
 
@@ -523,7 +538,7 @@ def start_runtime_teardown_container_server(
         f"cd {shlex.quote(remote_workdir)} && {bootstrap_prefix}VLLM_WORKER_MULTIPROC_METHOD=spawn {serve_cmd_str}",
     ]
     exec_cmd_str = " ".join(shlex.quote(arg) for arg in exec_cmd)
-    exec_out = _runtime_teardown_ssh_cmd(exec_cmd_str)
+    exec_out = _runtime_teardown_ssh_cmd(exec_cmd_str, step="docker-exec-start-serve")
     if exec_out.returncode != 0:
         force_remove_container(container_name)
         raise RuntimeError(f"failed to start server in runtime teardown container: {exec_out.stderr.strip()}")
@@ -531,7 +546,7 @@ def start_runtime_teardown_container_server(
     try:
         _wait_tcp_port_ready(host, port, timeout_sec=startup_timeout_sec)
     except Exception:
-        logs = _runtime_teardown_ssh_cmd(f"docker logs {shlex.quote(container_name)}")
+        logs = _runtime_teardown_ssh_cmd(f"docker logs {shlex.quote(container_name)}", step="docker-logs")
         force_remove_container(container_name)
         raise RuntimeError(f"runtime teardown container server startup failed: {logs.stdout[-2000:]}") from None
 
