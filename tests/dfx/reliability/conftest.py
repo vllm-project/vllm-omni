@@ -543,6 +543,13 @@ def start_runtime_teardown_container_server(
         raise RuntimeError(f"failed to start runtime teardown container: {run_out.stderr.strip()}")
     run_stdout = (run_out.stdout or "").strip()
     run_stderr = (run_out.stderr or "").strip()
+    if "Usage:  docker [OPTIONS] COMMAND" in run_stderr:
+        raise RuntimeError(
+            "docker-run rendered docker CLI help on remote host; command likely malformed. "
+            f"run_cmd={run_cmd!r}, stderr={run_stderr!r}. "
+            "Check RUNTIME_TEARDOWN_DOCKER_ARGS and avoid passing a full 'docker run ...' command there "
+            "(only extra args are allowed)."
+        )
     print(
         f"[runtime-teardown][docker-run] stdout={run_stdout!r} stderr={run_stderr!r}",
         flush=True,
