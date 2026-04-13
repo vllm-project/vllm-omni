@@ -406,18 +406,14 @@ def _runtime_teardown_ssh_cmd(remote_cmd: str, *, step: str | None = None) -> su
     timeout_sec = int(os.getenv("RUNTIME_TEARDOWN_SSH_TIMEOUT_SEC", "600"))
     step_prefix = f"[runtime-teardown][ssh]{f'[{step}]' if step else ''}"
     print(f"{step_prefix} target={ssh_target} running remote command...", flush=True)
+    # IMPORTANT: SSH joins remote argv into one shell command string. If we pass
+    # ["bash", "-c", remote_cmd] as separate argv items, remote shell parsing can
+    # make `-c` consume only the first word (e.g. "docker"), causing docker help.
+    # Wrap the whole command as one quoted string for remote bash -c.
+    remote_invocation = f"bash --noprofile --norc -c {shlex.quote(remote_cmd)}"
     try:
         out = subprocess.run(
-            [
-                "ssh",
-                *ssh_opts,
-                ssh_target,
-                "bash",
-                "--noprofile",
-                "--norc",
-                "-c",
-                remote_cmd,
-            ],
+            ["ssh", *ssh_opts, ssh_target, remote_invocation],
             check=False,
             capture_output=True,
             text=True,
