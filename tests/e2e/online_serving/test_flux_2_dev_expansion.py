@@ -63,7 +63,6 @@ def _get_flux_2_dev_feature_cases(model: str):
 
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.skip(reason="issue #2722")
 @pytest.mark.parametrize(
     "omni_server",
     _get_flux_2_dev_feature_cases(MODEL),
