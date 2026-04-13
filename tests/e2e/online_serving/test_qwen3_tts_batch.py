@@ -27,6 +27,7 @@ from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_te
 from tests.helpers.runtime import OmniServer
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+STAGE_INIT_TIMEOUT_S = 120
 
 
 def get_stage_config(name: str = "qwen3_tts.yaml"):
@@ -44,7 +45,7 @@ def omni_server():
             "--stage-configs-path",
             stage_config_path,
             "--stage-init-timeout",
-            "120",
+            str(STAGE_INIT_TIMEOUT_S),
             "--trust-remote-code",
             "--enforce-eager",
             "--disable-log-stats",
@@ -334,7 +335,7 @@ def omni_server_batch2():
             "--stage-configs-path",
             config_path,
             "--stage-init-timeout",
-            "120",
+            str(STAGE_INIT_TIMEOUT_S),
             "--trust-remote-code",
             "--enforce-eager",
             "--disable-log-stats",

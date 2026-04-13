@@ -13,4 +13,5 @@ def pytest_addoption(parser):
 
 @pytest.fixture(scope="session")
 def run_level(request) -> str:
+    """CLI test level for the session (``--run-level``). See CI level docs."""
     return request.config.getoption("--run-level")

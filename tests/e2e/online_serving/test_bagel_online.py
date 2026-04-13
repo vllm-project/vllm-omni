@@ -47,7 +47,7 @@ test_params = [
     OmniServerParams(
         model=MODEL,
         stage_config_path=STAGE_CONFIGS_PATH,
-        server_args=["--stage-init-timeout", "300"],
+        stage_init_timeout=300,
     ),
 ]
 

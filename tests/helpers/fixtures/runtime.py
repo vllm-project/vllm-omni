@@ -22,7 +22,8 @@ omni_fixture_lock = threading.Lock()
 
 @pytest.fixture(scope="module")
 def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: str) -> Generator[Any, Any, None]:
-    from tests.helpers.runtime import OmniServer, OmniServerParams
+    """Start vLLM-Omni through the standard or stage-CLI launcher (aligned with upstream ``tests/conftest``)."""
+    from tests.helpers.runtime import OmniServer, OmniServerParams, OmniServerStageCli
 
     with omni_fixture_lock:
         params: OmniServerParams = request.param
@@ -40,30 +41,65 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
             )
 
         server_args = params.server_args or []
-        if params.use_omni:
-            server_args = ["--stage-init-timeout", "120", *server_args]
-        if stage_config_path is not None:
-            server_args += ["--stage-configs-path", stage_config_path]
+        if params.use_omni and params.stage_init_timeout is not None:
+            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+        else:
+            server_args = [*server_args, "--stage-init-timeout", "600"]
+        if params.init_timeout is not None:
+            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+        else:
+            server_args = [*server_args, "--init-timeout", "900"]
 
-        with OmniServer(
-            model,
-            server_args,
-            port=port,
-            env_dict=params.env_dict,
-            use_omni=params.use_omni,
-        ) as server:
-            print("OmniServer started successfully")
-            yield server
-            print("OmniServer stopping...")
+        if params.use_stage_cli:
+            if not params.use_omni:
+                raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
+            if stage_config_path is None:
+                raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
+
+            with OmniServerStageCli(
+                model,
+                stage_config_path,
+                server_args,
+                port=port,
+                env_dict=params.env_dict,
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+        else:
+            if stage_config_path is not None:
+                server_args += ["--stage-configs-path", stage_config_path]
+
+            with (
+                OmniServer(
+                    model,
+                    server_args,
+                    port=port,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+                if port
+                else OmniServer(
+                    model,
+                    server_args,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
 
         print("OmniServer stopped")
 
 
 @pytest.fixture
-def openai_client(omni_server: Any, run_level: str):
+def openai_client(request: pytest.FixtureRequest, run_level: str):
+    """Resolve ``omni_server`` lazily so parametrized server fixtures work like upstream."""
     from tests.helpers.runtime import OpenAIClientHandler
 
-    return OpenAIClientHandler(host=omni_server.host, port=omni_server.port, api_key="EMPTY", run_level=run_level)
+    server = request.getfixturevalue("omni_server")
+    return OpenAIClientHandler(host=server.host, port=server.port, api_key="EMPTY", run_level=run_level)
 
 
 @pytest.fixture(scope="module")

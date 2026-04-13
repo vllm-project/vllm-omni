@@ -85,7 +85,11 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
-from vllm_omni.entrypoints.openai.utils import parse_lora_request
+from vllm_omni.entrypoints.openai.utils import (
+    get_supported_speakers_from_hf_config,
+    parse_lora_request,
+    validate_requested_speaker,
+)
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -106,6 +110,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _diffusion_mode: bool = False
     _diffusion_engine: AsyncOmni | None = None
     _diffusion_model_name: str = ""
+    _supported_speakers: set[str] | None = None
 
     @classmethod
     def for_diffusion(
@@ -131,6 +136,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         return instance
+
+    def _get_supported_speakers(self) -> set[str]:
+        """Load supported speakers from model config (cached)."""
+        if self._supported_speakers is not None:
+            return self._supported_speakers
+        try:
+            self._supported_speakers = get_supported_speakers_from_hf_config(self.model_config.hf_config)
+            return self._supported_speakers
+        except Exception as e:
+            logger.warning("Could not load speakers from model config: %s", e)
+        self._supported_speakers = set()
+        return self._supported_speakers
 
     async def create_chat_completion(
         self,
@@ -260,7 +277,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
-            return self.create_error_response(f"{e} {e.__cause__}")
+            message = str(e)
+            if e.__cause__ is not None:
+                message = f"{message} {e.__cause__}"
+            return self.create_error_response(message)
 
         request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
 
@@ -540,10 +560,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["cache_salt"] = request.cache_salt
 
         speaker = getattr(request, "speaker", None)
-        if speaker is not None and isinstance(speaker, str) and speaker.strip():
+        normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
+        if normalized is not None:
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
                 engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["speaker"] = [speaker.lower().strip()]
+            engine_prompt["additional_information"]["speaker"] = [normalized]
 
         language = getattr(request, "language", None)
         if language is not None and isinstance(language, str) and language.strip():

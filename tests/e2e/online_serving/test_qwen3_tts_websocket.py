@@ -19,6 +19,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+STAGE_INIT_TIMEOUT_S = 120
 
 
 def get_stage_config() -> str:
@@ -37,7 +38,7 @@ def omni_server():
             "--stage-configs-path",
             stage_config_path,
             "--stage-init-timeout",
-            "120",
+            str(STAGE_INIT_TIMEOUT_S),
             "--trust-remote-code",
             "--enforce-eager",
             "--disable-log-stats",

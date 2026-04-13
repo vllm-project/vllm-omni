@@ -49,6 +49,7 @@ _RUNTIME_EXPORT_NAMES = (
     "OmniRunnerHandler",
     "OmniServer",
     "OmniServerParams",
+    "OmniServerStageCli",
     "OpenAIClientHandler",
 )
 

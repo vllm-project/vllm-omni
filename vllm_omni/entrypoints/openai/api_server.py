@@ -353,7 +353,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     try:
         await shutdown_task
     finally:
-        app.state.openai_serving_speech.shutdown()
+        state = getattr(app, "state", None)
+        serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
+        if serving_speech is not None:
+            serving_speech.shutdown()
         sock.close()
 
 
@@ -1280,7 +1283,8 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
-async def generate_images(request: ImageGenerationRequest, raw_request: Request) -> ImageGenerationResponse:
+@with_cancellation
+async def generate_images(request: ImageGenerationRequest, raw_request: Request):
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
@@ -1331,6 +1335,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
+
+        app_state_args = getattr(raw_request.app.state, "args", None)
+        _check_max_generated_image_size(app_state_args, width, height)
+
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
@@ -1517,7 +1525,6 @@ async def edit_images(
             )
 
         # 3.3 Parse and add size if provided
-        max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
         width, height = None, None
         if size.lower() == "auto":
             if resolution is None:
@@ -1527,23 +1534,7 @@ async def edit_images(
         else:
             width, height = parse_size(size)
 
-        # Check max_generated_image_size
-        if max_generated_image_size is not None:
-            if width is not None and height is not None:
-                if width * height > max_generated_image_size:
-                    raise HTTPException(
-                        status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                        f"size of {max_generated_image_size} pixels.",
-                    )
-            elif resolution is not None:
-                # When resolution is set, the output size is resolution * resolution
-                if resolution * resolution > max_generated_image_size:
-                    raise HTTPException(
-                        status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
-                        f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
-                    )
+        _check_max_generated_image_size(app_state_args, width, height, resolution)
 
         size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
         _update_if_not_none(gen_params, "width", width)
@@ -1741,6 +1732,34 @@ async def _generate_with_async_omni(
             detail="No output generated from multi-stage pipeline.",
         )
     return result
+
+
+def _check_max_generated_image_size(
+    app_state_args: Any,
+    width: int | None,
+    height: int | None,
+    resolution: int | None = None,
+) -> None:
+    """Raise 400 if the requested image size exceeds --max-generated-image-size."""
+    max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
+    # Check max_generated_image_size
+    if max_generated_image_size is None:
+        return
+    if width is not None and height is not None:
+        if width * height > max_generated_image_size:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
+                f"size of {max_generated_image_size} pixels.",
+            )
+    elif resolution is not None:
+        # When resolution is set, the output size is resolution * resolution
+        if resolution * resolution > max_generated_image_size:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
+                f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+            )
 
 
 def _update_if_not_none(object: Any, key: str, val: Any) -> None:
@@ -1990,6 +2009,8 @@ async def _run_video_generation_job(
                 "file_name": file_name,
                 "completed_at": int(time.time()),
                 "inference_time_s": time.perf_counter() - started_at,
+                "stage_durations": response.stage_durations,
+                "peak_memory_mb": response.peak_memory_mb,
             },
         )
     except Exception as exc:
@@ -2163,7 +2184,7 @@ async def create_video_sync(
     request_id = f"video_sync-{random_uuid()}"
     started_at = time.perf_counter()
     try:
-        video_bytes = await asyncio.wait_for(
+        video_bytes, stage_durations, peak_memory_mb = await asyncio.wait_for(
             handler.generate_video_bytes(request, request_id, reference_image=reference_image),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
@@ -2189,6 +2210,8 @@ async def create_video_sync(
             "X-Request-Id": request_id,
             "X-Model": effective_model_name,
             "X-Inference-Time-S": f"{inference_time_s:.3f}",
+            "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
+            "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",
         },
     )
 

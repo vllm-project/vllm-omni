@@ -16,7 +16,6 @@ Equivalent to running:
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 import signal
 import socket
 import subprocess
@@ -29,6 +28,7 @@ import pytest
 from PIL import Image
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.platforms import current_omni_platform
@@ -199,14 +199,13 @@ def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
     config_path = _resolve_stage_config(config_path, run_level)
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
-
-    try:
-        generated_image = _generate_bagel_image(omni)
+    with OmniRunner(
+        "ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_bagel_image(runner.omni)
         if run_level == "advanced_model":
             _validate_pixels(generated_image)
-    finally:
-        omni.close()
 
 
 def _wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
@@ -319,7 +318,6 @@ def test_bagel_text2img_mooncake_connector(run_level):
 
     mooncake_master_proc = None
     temp_config_file = None
-    omni = None
 
     try:
         _cleanup_mooncake_processes()
@@ -349,15 +347,16 @@ def test_bagel_text2img_mooncake_connector(run_level):
         )
 
         temp_config_file = _resolve_stage_config(temp_config_file, run_level)
-        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file, stage_init_timeout=300)
-
-        generated_image = _generate_bagel_image(omni)
-        if run_level == "advanced_model":
-            _validate_pixels(generated_image)
+        with OmniRunner(
+            "ByteDance-Seed/BAGEL-7B-MoT",
+            stage_configs_path=temp_config_file,
+            stage_init_timeout=300,
+        ) as runner:
+            generated_image = _generate_bagel_image(runner.omni)
+            if run_level == "advanced_model":
+                _validate_pixels(generated_image)
 
     finally:
-        if omni:
-            omni.close()
         if temp_config_file:
             try:
                 os.unlink(temp_config_file)

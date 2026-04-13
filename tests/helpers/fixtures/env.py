@@ -31,12 +31,12 @@ def model_prefix() -> str:
 def clean_gpu_memory_between_tests():
     # Import here so ``tests.helpers.env`` (and vLLM platform modules) load only
     # after session autouse fixtures like ``default_env`` have run (RFC #2299).
-    from tests.helpers.env import _run_post_test_cleanup, _run_pre_test_cleanup
+    from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 
     print("\n=== PRE-TEST GPU CLEANUP ===")
-    _run_pre_test_cleanup()
+    run_pre_test_cleanup()
     yield
-    _run_post_test_cleanup()
+    run_post_test_cleanup()
 
 
 @pytest.fixture(scope="session", autouse=True)

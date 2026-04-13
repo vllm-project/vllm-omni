@@ -184,7 +184,7 @@ def _print_gpu_processes() -> None:
     print("=" * 80)
 
 
-def _run_pre_test_cleanup(enable_force: bool = False) -> None:
+def run_pre_test_cleanup(enable_force: bool = False) -> None:
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
         print("GPU cleanup disabled")
         return
@@ -202,7 +202,7 @@ def _run_pre_test_cleanup(enable_force: bool = False) -> None:
             print(f"Pre-test cleanup note: {e}")
 
 
-def _run_post_test_cleanup(enable_force: bool = False) -> None:
+def run_post_test_cleanup(enable_force: bool = False) -> None:
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
         print("GPU cleanup disabled")
         return
@@ -262,8 +262,8 @@ class DeviceMemoryMonitor:
 
 __all__ = [
     "DeviceMemoryMonitor",
-    "_run_post_test_cleanup",
-    "_run_pre_test_cleanup",
     "get_physical_device_indices",
+    "run_post_test_cleanup",
+    "run_pre_test_cleanup",
     "wait_for_gpu_memory_to_clear",
 ]
