@@ -1,0 +1,113 @@
+# 3-stage config for MiniCPM-o-2.6 TTS: thinker → talker → code2wav
+# Adapted for 8x RTX 4090 (24GB each)
+#
+# GPU layout:
+#   Stage 0 (thinker): GPU 0,1,2,3 (4-way TP, ~35% mem each ≈ 8.5GB/card)
+#   Stage 1 (talker):  GPU 4 (80% mem ≈ 19GB)
+#   Stage 2 (code2wav): GPU 4 (20% mem ≈ 5GB, shared with talker)
+#
+stage_args:
+  - stage_id: 0
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: MiniCPMOOmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.35
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 16384
+      max_num_seqs: 1
+      tensor_parallel_size: 4
+      limit_mm_per_prompt:
+        video: 1
+
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    runtime:
+      process: true
+      devices: "4"
+      max_batch_size: 1
+    engine_args:
+      model_stage: talker
+      model_arch: MiniCPMOOmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      max_num_seqs: 16
+      engine_output_type: latent
+      hf_config_name: tts_config
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.minicpmo_omni.thinker2talker
+    final_output: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: False
+
+  - stage_id: 2
+    runtime:
+      process: true
+      devices: "4"
+      max_batch_size: 1
+    engine_args:
+      model_stage: code2wav
+      model_arch: MiniCPMOOmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.2
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      hf_config_name: tts_config
+      engine_output_type: audio
+    engine_input_source: [1]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.minicpmo_omni.talker2code2wav
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: False
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+    - from: 1
+      to: 2
+      window_size: -1

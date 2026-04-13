@@ -406,6 +406,13 @@ async def build_async_omni_from_stage_config(
 
     async_omni: EngineClient | None = None
 
+    if getattr(args, "trust_remote_code", False) and hasattr(args, "model"):
+        try:
+            from transformers import AutoConfig
+            AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        except Exception:
+            pass
+
     try:
         # Convert args Namespace to kwargs dict for AsyncOmni to use
         kwargs = vars(args).copy()
@@ -693,7 +700,7 @@ async def omni_init_app_state(
         if "generate" in supported_tasks
         else None
     )
-      if state.openai_serving_chat is not None:
+    if state.openai_serving_chat is not None:
         state.openai_serving_chat.warmup()
 
     state.openai_serving_completion = (

@@ -573,6 +573,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     try:
                         if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
                             mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
+                        elif isinstance(v, torch.Tensor):
+                            mm_payload[k] = v.detach().to("cpu").contiguous()
                         elif isinstance(v, dict):
                             sub_dict: dict[str, torch.Tensor] = {}
                             for sk, sv in v.items():

@@ -130,6 +130,11 @@ def talker2code2wav(
         mel_spec = None
         if hasattr(output, "multimodal_output") and isinstance(output.multimodal_output, dict):
             mel_spec = output.multimodal_output.get("mel_spec")
+            if mel_spec is None:
+                import torch as _torch
+                latent = output.multimodal_output.get("latent")
+                if isinstance(latent, _torch.Tensor) and latent.dim() >= 2 and 100 in latent.shape:
+                    mel_spec = latent
 
         if mel_spec is None:
             import logging

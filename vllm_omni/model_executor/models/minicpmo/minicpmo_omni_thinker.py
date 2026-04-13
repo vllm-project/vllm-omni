@@ -3274,10 +3274,9 @@ class MiniCPMOOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MiniCPMOOmn
         without corresponding image data (e.g. during profiling/cache-miss path).
         """
         use_tts = hf_processor_mm_kwargs.get("use_tts", False)
-        if use_tts:
-            hf_processor_mm_kwargs = {
-                k: v for k, v in hf_processor_mm_kwargs.items() if k != "use_tts"
-            }
+        hf_processor_mm_kwargs = {
+            k: v for k, v in hf_processor_mm_kwargs.items() if k != "use_tts"
+        }
         if isinstance(prompt, str):
             if use_tts:
                 prompt = prompt + self._TTS_SUFFIX
@@ -3319,9 +3318,9 @@ class MiniCPMOOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MiniCPMOOmn
         tokenizer = self.info.get_tokenizer()
 
         use_tts = mm_kwargs.get("use_tts", False)
+        mm_kwargs = {k: v for k, v in mm_kwargs.items() if k != "use_tts"}
         if use_tts:
             prompt = prompt + self._TTS_SUFFIX
-            mm_kwargs = {k: v for k, v in mm_kwargs.items() if k != "use_tts"}
 
         input_ids = torch.tensor([tokenizer.encode(prompt, **tok_kwargs)])
         mm_inputs = self.process_mm_inputs(mm_data, mm_kwargs, tok_kwargs)
@@ -3494,6 +3493,7 @@ class MiniCPMOOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MiniCPMOOmn
         *,
         out_keys: set[str],
     ) -> dict[str, NestedTensors]:
+        mm_kwargs = {k: v for k, v in mm_kwargs.items() if k != "use_tts"}
         # This processor supports zipping prompt and mm_data together
         if self.info.get_model_version() in {(2, 6), (4, 0), (4, 5)}:
             inputs = super()._call_hf_processor(
