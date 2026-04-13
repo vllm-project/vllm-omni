@@ -37,16 +37,25 @@ def test_attach_cfg_request_ids_clones_diffusion_params():
     assert updated.cfg_kv_request_ids == {"cfg_text": "req1__cfg_text"}
 
 
-def test_abort_parents_with_parent_or_companion_ids():
+def test_abort_parent_expands_to_companions_and_cleans_up_deferred_parent():
     tracker = CfgCompanionTracker()
     tracker.register_companion("req1", "cfg_text", "req1__cfg_text")
     tracker.defer_parent("req1", {"out": 1}, stage_id=0)
 
-    aborted = tracker.abort_parents(["req1__cfg_text"])
+    aborted = tracker.abort_parents(["req1"])
 
     assert sorted(aborted) == ["req1", "req1__cfg_text"]
     assert not tracker.is_companion("req1__cfg_text")
     assert tracker.pop_pending_parent("req1") is None
+
+
+def test_abort_companion_does_not_expand_to_parent():
+    tracker = CfgCompanionTracker()
+    tracker.register_companion("req1", "cfg_text", "req1__cfg_text")
+
+    aborted = tracker.abort_parents(["req1__cfg_text"])
+
+    assert aborted == ["req1__cfg_text"]
 
 
 def test_companion_completion_flushes_deferred_parent():

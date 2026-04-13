@@ -104,14 +104,7 @@ class CfgCompanionTracker:
         parents_to_cleanup: set[str] = set()
 
         for req_id in request_ids:
-            if req_id in self._companion_ids:
-                parent_id = self._companion_to_parent.get(req_id)
-                if parent_id is not None:
-                    parents_to_cleanup.add(parent_id)
-                    if parent_id not in seen:
-                        seen.add(parent_id)
-                        all_request_ids.append(parent_id)
-            else:
+            if req_id not in self._companion_ids:
                 parents_to_cleanup.add(req_id)
 
         for parent_id in parents_to_cleanup:
