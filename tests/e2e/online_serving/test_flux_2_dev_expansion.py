@@ -27,7 +27,7 @@ PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-deta
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=2)
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_flux_2_dev_feature_cases(model: str):
@@ -48,8 +48,6 @@ def _get_flux_2_dev_feature_cases(model: str):
             OmniServerParams(
                 model=model,
                 server_args=[
-                    "--cache-backend",
-                    "cache_dit",
                     "--enable-cpu-offload",
                     "--cfg-parallel-size",
                     "2",
