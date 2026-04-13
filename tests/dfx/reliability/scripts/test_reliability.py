@@ -28,7 +28,7 @@ from tests.dfx.conftest import create_unique_server_params, load_configs
 from tests.dfx.reliability.conftest import (
     force_remove_container,
     inject_gpu_oom,
-    list_process_pids_by_pattern,
+    list_remote_process_pids_by_pattern,
     make_process_kill_fault_injector,
     post_chat_completions_raw,
     start_runtime_teardown_container_server,
@@ -161,12 +161,12 @@ def _assert_no_extra_worker_processes(baseline_pids: set[int], timeout_sec: int 
     """Ensure no extra worker PIDs remain after teardown."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
-        current = set(list_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
+        current = set(list_remote_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
         extra = current - baseline_pids
         if not extra:
             return
         time.sleep(2)
-    current = set(list_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
+    current = set(list_remote_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
     extra = sorted(current - baseline_pids)
     assert not extra, f"orphan worker processes remain after container teardown: {extra}"
 
@@ -466,7 +466,7 @@ def test_reliability_fault_process_kill_request_failure(omni_server_after_fault,
 @pytest.mark.parametrize("runtime_params", [OMNI_CHAT_PARAMS[0]], ids=["runtime_teardown_container_kill"])
 def test_reliability_fault_runtime_teardown_container_kill_no_orphan_worker(runtime_params, model_prefix) -> None:
     """Start server in container B, force-remove container B, and assert no extra worker remains."""
-    baseline_worker_pids = set(list_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
+    baseline_worker_pids = set(list_remote_process_pids_by_pattern(_RUNTIME_WORKER_PATTERN))
     model = model_prefix + runtime_params.model
     serve_args = list(runtime_params.server_args or [])
     if "--stage-init-timeout" not in serve_args:

@@ -15,7 +15,6 @@ import logging
 import os
 import select
 import shlex
-import shutil
 import signal
 import socket
 import subprocess
@@ -389,14 +388,35 @@ def list_process_pids_by_pattern(pattern: str) -> list[int]:
     return [int(item) for item in out.stdout.split() if item.strip().isdigit()]
 
 
-def force_remove_container(container_name: str) -> None:
-    """Force-remove a docker container if it exists."""
-    subprocess.run(
-        ["docker", "rm", "-f", container_name],
+def _runtime_teardown_ssh_target() -> str:
+    target = os.getenv("RUNTIME_TEARDOWN_SSH_TARGET", "").strip()
+    # Default to localhost when not provided, so same-host SSH setups work out-of-the-box.
+    return target or "localhost"
+
+
+def _runtime_teardown_ssh_cmd(remote_cmd: str) -> subprocess.CompletedProcess[str]:
+    ssh_target = _runtime_teardown_ssh_target()
+    ssh_opts = shlex.split(os.getenv("RUNTIME_TEARDOWN_SSH_OPTS", ""))
+    return subprocess.run(
+        ["ssh", *ssh_opts, ssh_target, "bash", "-lc", remote_cmd],
         check=False,
         capture_output=True,
         text=True,
     )
+
+
+def list_remote_process_pids_by_pattern(pattern: str) -> list[int]:
+    """Return matched PIDs from remote host ``pgrep -f <pattern>`` via SSH."""
+    cmd = f"pgrep -f {shlex.quote(pattern)} || true"
+    out = _runtime_teardown_ssh_cmd(cmd)
+    if out.returncode not in (0, 1):
+        raise RuntimeError(f"remote pgrep failed for pattern={pattern!r}: {out.stderr.strip()}")
+    return [int(item) for item in out.stdout.split() if item.strip().isdigit()]
+
+
+def force_remove_container(container_name: str) -> None:
+    """Force-remove a docker container on remote host via SSH."""
+    _runtime_teardown_ssh_cmd(f"docker rm -f {shlex.quote(container_name)} >/dev/null 2>&1 || true")
 
 
 def _allocate_open_port() -> int:
@@ -425,16 +445,17 @@ def start_runtime_teardown_container_server(
     bootstrap_cmd: str | None = None,
     startup_timeout_sec: int = 1200,
 ) -> RuntimeTeardownContainerHandle:
-    """Start a dedicated container, launch vLLM-Omni inside it, and wait until port is ready."""
+    """Start a dedicated container on remote host via SSH and wait until port is ready."""
     if os.name == "nt":
         raise RuntimeError("runtime teardown container helper currently supports POSIX platforms only.")
-    if shutil.which("docker") is None:
-        pytest.skip("docker CLI not available for runtime teardown test")
+    if subprocess.run(["ssh", "-V"], check=False, capture_output=True, text=True).returncode != 0:
+        pytest.skip("ssh client not available for runtime teardown test")
 
     container_name = f"omni_rt_teardown_{uuid4().hex[:8]}"
-    host = "127.0.0.1"
+    host = os.getenv("RUNTIME_TEARDOWN_SERVER_HOST", "127.0.0.1")
     port = _allocate_open_port()
-    repo_root = Path(__file__).resolve().parents[3]
+    local_repo_root = Path(__file__).resolve().parents[3]
+    remote_workdir = os.getenv("RUNTIME_TEARDOWN_REMOTE_WORKDIR", str(local_repo_root))
     resolved_image = image or os.getenv("RUNTIME_TEARDOWN_IMAGE", "nvcr.io/nvidia/pytorch:25.01-py3")
     resolved_bootstrap = bootstrap_cmd if bootstrap_cmd is not None else os.getenv("RUNTIME_TEARDOWN_BOOTSTRAP_CMD", "")
     if docker_run_args is not None:
@@ -442,7 +463,7 @@ def start_runtime_teardown_container_server(
     else:
         extra_run_args = shlex.split(os.getenv("RUNTIME_TEARDOWN_DOCKER_ARGS", ""))
 
-    run_cmd = [
+    run_cmd_args = [
         "docker",
         "run",
         "-d",
@@ -457,7 +478,7 @@ def start_runtime_teardown_container_server(
         "-v",
         "/home:/home",
         "-v",
-        f"{repo_root}:{repo_root}",
+        f"{remote_workdir}:{remote_workdir}",
         "--cap-add=SYS_PTRACE",
         "--security-opt",
         "seccomp=unconfined",
@@ -466,7 +487,8 @@ def start_runtime_teardown_container_server(
         "sleep",
         "infinity",
     ]
-    run_out = subprocess.run(run_cmd, check=False, capture_output=True, text=True)
+    run_cmd = " ".join(shlex.quote(arg) for arg in run_cmd_args)
+    run_out = _runtime_teardown_ssh_cmd(run_cmd)
     if run_out.returncode != 0:
         raise RuntimeError(f"failed to start runtime teardown container: {run_out.stderr.strip()}")
 
@@ -492,9 +514,10 @@ def start_runtime_teardown_container_server(
         container_name,
         "bash",
         "-lc",
-        f"cd {shlex.quote(str(repo_root))} && {bootstrap_prefix}VLLM_WORKER_MULTIPROC_METHOD=spawn {serve_cmd_str}",
+        f"cd {shlex.quote(remote_workdir)} && {bootstrap_prefix}VLLM_WORKER_MULTIPROC_METHOD=spawn {serve_cmd_str}",
     ]
-    exec_out = subprocess.run(exec_cmd, check=False, capture_output=True, text=True)
+    exec_cmd_str = " ".join(shlex.quote(arg) for arg in exec_cmd)
+    exec_out = _runtime_teardown_ssh_cmd(exec_cmd_str)
     if exec_out.returncode != 0:
         force_remove_container(container_name)
         raise RuntimeError(f"failed to start server in runtime teardown container: {exec_out.stderr.strip()}")
@@ -502,12 +525,7 @@ def start_runtime_teardown_container_server(
     try:
         _wait_tcp_port_ready(host, port, timeout_sec=startup_timeout_sec)
     except Exception:
-        logs = subprocess.run(
-            ["docker", "logs", container_name],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        logs = _runtime_teardown_ssh_cmd(f"docker logs {shlex.quote(container_name)}")
         force_remove_container(container_name)
         raise RuntimeError(f"runtime teardown container server startup failed: {logs.stdout[-2000:]}") from None
 
