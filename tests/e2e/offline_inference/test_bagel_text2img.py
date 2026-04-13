@@ -16,7 +16,6 @@ Equivalent to running:
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 import signal
 import socket
 import subprocess

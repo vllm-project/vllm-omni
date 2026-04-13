@@ -19,7 +19,6 @@ import os
 import uuid
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 from pathlib import Path
 

@@ -8,8 +8,6 @@ This test verifies that cache-dit acceleration works correctly with diffusion mo
 It uses minimal settings to keep test time short for CI.
 """
 
-import os
-
 import pytest
 import torch
 
@@ -18,8 +16,6 @@ from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 # Use random weights model for testing
 models = ["riverclouds/qwen_image_random"]

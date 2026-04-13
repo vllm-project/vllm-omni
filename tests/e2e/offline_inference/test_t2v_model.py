@@ -8,7 +8,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
-# os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Wan-AI/Wan2.2-T2V-A14B-Diffusers"]

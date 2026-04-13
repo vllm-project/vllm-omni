@@ -1,5 +1,3 @@
-import os
-
 import numpy as np
 import pytest
 import torch
@@ -8,8 +6,6 @@ from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 # Use random weights model for CI testing (small, no authentication required)
 models = ["linyueqian/stable_audio_random"]

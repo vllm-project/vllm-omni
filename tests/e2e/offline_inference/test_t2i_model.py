@@ -1,5 +1,3 @@
-import os
-
 import pytest
 import torch
 
@@ -7,8 +5,6 @@ from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 # Match unprefixed HF id even when MODEL_PREFIX is set (omni_runner resolves full path).
 _QWEN_IMAGE_RANDOM_ID = "riverclouds/qwen_image_random"

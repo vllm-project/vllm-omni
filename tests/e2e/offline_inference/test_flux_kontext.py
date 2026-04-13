@@ -9,8 +9,6 @@ FluxKontext is a text-to-image and image-to-image diffusion model that supports:
 - Image editing with text guidance
 """
 
-import os
-
 import pytest
 from PIL import Image
 from vllm.assets.image import ImageAsset
@@ -18,8 +16,6 @@ from vllm.assets.image import ImageAsset
 from tests.conftest import OmniRunner
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
 
