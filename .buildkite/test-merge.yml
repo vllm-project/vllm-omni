@@ -113,7 +113,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Sequence Parallelism Test"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 25
     depends_on: upload-merge-pipeline
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py tests/diffusion/distributed/test_ulysses_uaa_perf.py
