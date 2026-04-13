@@ -22,8 +22,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio.compliance.kaldi as kaldi
-from librosa.filters import mel as librosa_mel_fn
 from torch import Tensor
+
+from vllm_omni.utils.audio import mel_filter_bank
 
 from .core_vq import DistributedGroupResidualVectorQuantization
 from .whisper_encoder import Conv1d, ConvTranspose1d, WhisperEncoder
@@ -103,14 +104,14 @@ class MelSpectrogramFeatures(nn.Module):
 
         y = audio
         if len(list(self.mel_basis.keys())) == 0:
-            mel = librosa_mel_fn(
+            mel = mel_filter_bank(
                 sr=self.sampling_rate,
                 n_fft=self.filter_length,
                 n_mels=self.n_mel_channels,
                 fmin=self.mel_fmin,
                 fmax=self.mel_fmax,
             )
-            self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)] = torch.from_numpy(mel).float().to(y.device)
+            self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)] = mel.to(y.device)
             self.hann_window[str(y.device)] = torch.hann_window(self.win_length).to(y.device)
 
         y = torch.nn.functional.pad(

@@ -218,14 +218,6 @@ The gradio script supports the following arguments:
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)
 
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
-
 ## Example materials
 
 ??? abstract "gradio_demo.py"
