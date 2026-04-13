@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 import janus
 import torch
 from omegaconf import OmegaConf
+from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -1258,6 +1259,68 @@ class AsyncOmniEngine:
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
 
+    @staticmethod
+    def _strip_single_engine_args(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Remove parent ``EngineArgs`` fields from *kwargs*.
+
+        When ``stage_configs_path`` is set, per-stage engine args are defined
+        in the YAML.  Top-level single-engine fields (``compilation_config``,
+        ``tensor_parallel_size``, …) must not leak into per-stage configs via
+        the ``base_engine_args`` merge in ``load_stage_configs_from_yaml`` —
+        they can cause type errors (e.g. ``compilation_config`` as a JSON
+        string rejected by ``VllmConfig``) or silently override YAML values.
+
+        Logs a warning for any parent field whose value differs from the
+        dataclass default, so users know their explicit overrides are ignored.
+        """
+        # worker_extension_cls is a parent field but must pass through to
+        # diffusion stages for colocate worker setup.
+        _keep = {"worker_extension_cls"}
+        # Orchestrator-level OmniEngineArgs fields that are consumed by
+        # _resolve_stage_configs and must not leak into per-stage configs
+        # (stage_configs_path would trigger the create_model_config guard).
+        _strip_omni = {"stage_configs_path"}
+        # Fields that are always set by callers (via from_cli_args / asdict)
+        # and would always appear as overridden — suppress from the warning
+        # so it only surfaces genuinely surprising overrides.
+        _no_warn = {"model"}
+
+        parent_fields: dict[str, dataclasses.Field] = {f.name: f for f in dataclasses.fields(EngineArgs)}
+        overridden: list[str] = []
+        result: dict[str, Any] = {}
+        for k, v in kwargs.items():
+            if k in _strip_omni:
+                continue
+            if k not in parent_fields or k in _keep:
+                result[k] = v
+                continue
+            # Detect explicitly-set values that differ from the default.
+            # Values may have been through asdict() which converts dataclass
+            # defaults to dicts, so normalise before comparing.
+            field = parent_fields[k]
+            if field.default is not dataclasses.MISSING:
+                default = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                default = field.default_factory()
+            else:
+                default = dataclasses.MISSING
+            if default is dataclasses.MISSING or v is None:
+                continue
+            # Normalise dataclass defaults to dicts for comparison
+            if dataclasses.is_dataclass(default) and not isinstance(default, type):
+                default = dataclasses.asdict(default)
+            if v != default and k not in _no_warn:
+                overridden.append(k)
+
+        if overridden:
+            logger.warning(
+                "stage_configs_path is set — the following top-level engine "
+                "args are ignored (per-stage YAML takes precedence): %s",
+                ", ".join(sorted(overridden)),
+            )
+
+        return result
+
     def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
@@ -1269,12 +1332,17 @@ class AsyncOmniEngine:
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
 
+        if stage_configs_path is not None:
+            base_kwargs = self._strip_single_engine_args(kwargs)
+        else:
+            base_kwargs = kwargs
+
         # Use the legacy config loading path (load_and_resolve_stage_configs).
         # StageConfigFactory wiring will be done in config refactor [2/N].
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
-            kwargs,
+            base_kwargs,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
         )
 
