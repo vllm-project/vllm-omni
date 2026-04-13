@@ -532,6 +532,24 @@ def start_runtime_teardown_container_server(
     run_out = _runtime_teardown_ssh_cmd(run_cmd, step="docker-run")
     if run_out.returncode != 0:
         raise RuntimeError(f"failed to start runtime teardown container: {run_out.stderr.strip()}")
+    run_stdout = (run_out.stdout or "").strip()
+    run_stderr = (run_out.stderr or "").strip()
+    print(
+        f"[runtime-teardown][docker-run] stdout={run_stdout!r} stderr={run_stderr!r}",
+        flush=True,
+    )
+    # Verify container really exists right after docker run.
+    ps_out = _runtime_teardown_ssh_cmd(
+        f"docker ps -a --filter name={shlex.quote(container_name)} --format '{{{{.ID}}}} {{{{.Status}}}} {{{{.Names}}}}'",
+        step="docker-ps-verify",
+    )
+    ps_text = (ps_out.stdout or "").strip()
+    print(f"[runtime-teardown][docker-ps-verify] {ps_text!r}", flush=True)
+    if not ps_text:
+        raise RuntimeError(
+            f"container not found right after docker run: name={container_name}, "
+            f"docker_run_stdout={run_stdout!r}, docker_run_stderr={run_stderr!r}"
+        )
 
     serve_cmd = [
         "python",
@@ -583,7 +601,14 @@ def start_runtime_teardown_container_server(
             ),
             step="docker-exec-tail-serve-log",
         )
-        force_remove_container(container_name)
+        keep_on_failure = os.getenv("RUNTIME_TEARDOWN_KEEP_CONTAINER_ON_FAILURE", "0").strip() == "1"
+        if keep_on_failure:
+            print(
+                f"[runtime-teardown] keep container for debugging: {container_name}",
+                flush=True,
+            )
+        else:
+            force_remove_container(container_name)
         raise RuntimeError(
             "runtime teardown container server startup failed. "
             f"host={host} bind_host={bind_host} port={port}; "

@@ -505,5 +505,6 @@ def test_reliability_fault_runtime_teardown_container_kill_no_orphan_worker(runt
 
         _assert_no_extra_worker_processes(baseline_worker_pids)
     finally:
-        if handle is not None:
+        keep_on_failure = os.getenv("RUNTIME_TEARDOWN_KEEP_CONTAINER_ON_FAILURE", "0").strip() == "1"
+        if handle is not None and not keep_on_failure:
             force_remove_container(handle.container_name)
