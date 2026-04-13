@@ -35,11 +35,12 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
 
-class DiffusionModelRunner:
+class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
 

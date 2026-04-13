@@ -40,6 +40,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
@@ -60,7 +61,7 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
-class GPUARModelRunner(OmniGPUModelRunner):
+class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     Follows the v0.12 two-phase execute/sample flow from GPUModelRunner, and
