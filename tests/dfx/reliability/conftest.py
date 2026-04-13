@@ -396,7 +396,13 @@ def _runtime_teardown_ssh_target() -> str:
 
 def _runtime_teardown_ssh_cmd(remote_cmd: str) -> subprocess.CompletedProcess[str]:
     ssh_target = _runtime_teardown_ssh_target()
-    ssh_opts = shlex.split(os.getenv("RUNTIME_TEARDOWN_SSH_OPTS", ""))
+    default_reuse_opts = (
+        "-o ControlMaster=auto "
+        "-o ControlPersist=10m "
+        "-o ControlPath=/tmp/vllm-rt-ssh-%r@%h:%p"
+    )
+    raw_opts = os.getenv("RUNTIME_TEARDOWN_SSH_OPTS", "").strip()
+    ssh_opts = shlex.split(raw_opts or default_reuse_opts)
     return subprocess.run(
         ["ssh", *ssh_opts, ssh_target, "bash", "-lc", remote_cmd],
         check=False,
