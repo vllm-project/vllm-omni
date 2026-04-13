@@ -390,8 +390,8 @@ def list_process_pids_by_pattern(pattern: str) -> list[int]:
 
 def _runtime_teardown_ssh_target() -> str:
     target = os.getenv("RUNTIME_TEARDOWN_SSH_TARGET", "").strip()
-    # Default to localhost when not provided, so same-host SSH setups work out-of-the-box.
-    return target or "localhost"
+    # Default to root@127.0.0.1 for same-host SSH control path.
+    return target or "root@127.0.0.1"
 
 
 def _runtime_teardown_ssh_cmd(remote_cmd: str) -> subprocess.CompletedProcess[str]:
