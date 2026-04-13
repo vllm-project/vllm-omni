@@ -184,9 +184,14 @@ def _print_gpu_processes() -> None:
     print("=" * 80)
 
 
+_SKIPPED_GPU_CLEANUP_MSG = (
+    "\nSkipping GPU memory cleanup check (typically: instance already up; no check needed between tests)\n"
+)
+
+
 def run_pre_test_cleanup(enable_force: bool = False) -> None:
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print("GPU cleanup disabled")
+        print(_SKIPPED_GPU_CLEANUP_MSG)
         return
 
     print("Pre-test GPU status:")
@@ -204,7 +209,7 @@ def run_pre_test_cleanup(enable_force: bool = False) -> None:
 
 def run_post_test_cleanup(enable_force: bool = False) -> None:
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print("GPU cleanup disabled")
+        print(_SKIPPED_GPU_CLEANUP_MSG)
         return
 
     if torch.cuda.is_available():

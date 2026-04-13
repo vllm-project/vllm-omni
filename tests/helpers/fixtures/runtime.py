@@ -109,7 +109,7 @@ def omni_runner(request: pytest.FixtureRequest, model_prefix: str):
     with omni_fixture_lock:
         model, stage_config_path = request.param
         model = model_prefix + model
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
+        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path) as runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")
