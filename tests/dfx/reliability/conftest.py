@@ -408,7 +408,16 @@ def _runtime_teardown_ssh_cmd(remote_cmd: str, *, step: str | None = None) -> su
     print(f"{step_prefix} target={ssh_target} running remote command...", flush=True)
     try:
         out = subprocess.run(
-            ["ssh", *ssh_opts, ssh_target, "bash", "-lc", remote_cmd],
+            [
+                "ssh",
+                *ssh_opts,
+                ssh_target,
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                remote_cmd,
+            ],
             check=False,
             capture_output=True,
             text=True,
