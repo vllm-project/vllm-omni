@@ -138,6 +138,68 @@ class GPUARModelRunner(OmniGPUModelRunner):
             return sampling_metadata
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
+    def capture_model(self) -> int:
+        result = super().capture_model()
+        self._capture_talker_mtp_graphs()
+        return result
+
+    def _capture_talker_mtp_graphs(self) -> None:
+        from vllm_omni.worker.gpu_model_runner import CUDAGraphWrapper
+
+        if not self.has_talker_mtp or not isinstance(self.talker_mtp, CUDAGraphWrapper):
+            return
+
+        from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+        from vllm.distributed.parallel_state import graph_capture
+
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        num_warmups = self.compilation_config.cudagraph_num_of_warmups
+        capture_sizes = sorted(capture_sizes, reverse=True)
+        logger.info("Capturing talker_mtp graphs for sizes %s", capture_sizes)
+
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with torch.inference_mode(), graph_capture(device=self.device):
+                for bsz in capture_sizes:
+                    _, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
+                        num_tokens=bsz,
+                        num_reqs=bsz,
+                        num_scheduled_tokens_np=np.ones(bsz, dtype=np.int32),
+                        max_num_scheduled_tokens=1,
+                        use_cascade_attn=False,
+                    )
+                    n = batch_desc.num_tokens
+                    ids = self.talker_mtp_input_ids.gpu[:n]
+                    emb = self.talker_mtp_inputs_embeds.gpu[:n]
+                    hid = self.last_talker_hidden.gpu[:n]
+                    ts = self.text_step.gpu[:n]
+
+                    for _ in range(num_warmups):
+                        with set_forward_context(
+                            None,
+                            self.vllm_config,
+                            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                            batch_descriptor=batch_desc,
+                        ):
+                            self.talker_mtp(ids, emb, hid, ts)
+
+                    with set_forward_context(
+                        None,
+                        self.vllm_config,
+                        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                        batch_descriptor=batch_desc,
+                    ):
+                        self.talker_mtp(ids, emb, hid, ts)
+                    torch.cuda.synchronize()
+
+            logger.info("Captured talker_mtp graphs for %d sizes", len(capture_sizes))
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"talker_mtp graph capture failed for a model that declared talker_mtp_graph_safe=True: {e}"
+            ) from e
+        finally:
+            set_cudagraph_capturing_enabled(False)
+
     @torch.inference_mode()
     def execute_model(
         self,
