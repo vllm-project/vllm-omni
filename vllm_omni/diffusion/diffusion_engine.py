@@ -266,8 +266,10 @@ class DiffusionEngine:
         custom_output = output.custom_output or {}
         model_audio_sample_rate = None
         model_fps = None
+        action_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
+            action_payload = outputs.get("actions")
             custom_output.update(outputs.get("custom_output") or {})
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
@@ -361,6 +363,8 @@ class DiffusionEngine:
                     mm_output["audio_sample_rate"] = model_audio_sample_rate
                 if model_fps is not None:
                     mm_output["fps"] = model_fps
+                if action_payload is not None:
+                    mm_output["actions"] = action_payload
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -430,6 +434,18 @@ class DiffusionEngine:
                         mm_output["audio_sample_rate"] = model_audio_sample_rate
                     if model_fps is not None:
                         mm_output["fps"] = model_fps
+                    if action_payload is not None:
+                        sliced_actions = action_payload
+                        if isinstance(action_payload, (list, tuple)):
+                            sliced_actions = action_payload[start_idx:end_idx]
+                            if len(sliced_actions) == 1:
+                                sliced_actions = sliced_actions[0]
+                        elif hasattr(action_payload, "shape") and getattr(action_payload, "shape", None) is not None:
+                            if len(action_payload.shape) > 0 and action_payload.shape[0] >= end_idx:
+                                sliced_actions = action_payload[start_idx:end_idx]
+                                if num_outputs == 1:
+                                    sliced_actions = sliced_actions[0]
+                        mm_output["actions"] = sliced_actions
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,

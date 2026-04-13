@@ -281,6 +281,11 @@ _DIFFUSION_MODELS = {
         "pipeline_hidream_image",
         "HiDreamImagePipeline",
     ),
+    "DreamZeroPipeline": (
+        "dreamzero",
+        "pipeline_dreamzero",
+        "DreamZeroPipeline",
+    ),
 }
 
 
