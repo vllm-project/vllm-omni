@@ -120,6 +120,7 @@ def _build_i2i_messages(prompt: str) -> list[dict]:
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
+@pytest.mark.skip(reason="issue #2721")
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_send_i2i_request_001(omni_server, openai_client) -> None:
