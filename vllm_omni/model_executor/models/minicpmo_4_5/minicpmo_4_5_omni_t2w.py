@@ -42,3 +42,6 @@ class MiniCPMO45OmniT2WForConditionalGeneration(nn.Module, SupportsPP):
 
     def get_input_embeddings(self, input_ids, multimodal_embeddings=None, **kwargs):
         return torch.zeros(input_ids.shape[0], 1, device=input_ids.device)
+
+    def embed_input_ids(self, input_ids, **kwargs):
+        return self.get_input_embeddings(input_ids, **kwargs)

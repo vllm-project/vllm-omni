@@ -256,3 +256,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if hasattr(self, "emb_text") and self.emb_text is not None:
             return self.emb_text(input_ids)
         return torch.zeros(input_ids.shape[0], 1)
+
+    def embed_input_ids(self, input_ids, **kwargs):
+        return self.get_input_embeddings(input_ids, **kwargs)

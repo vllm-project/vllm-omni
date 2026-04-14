@@ -127,7 +127,7 @@ class MiniCPMO26OmniForConditionalGeneration(
             )
             self.model = self.code2wav
         else:
-            raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'thinker', 'talker', 'code2wav'")
+            raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'llm', 'tts', 't2w'")
         
         # Set up intermediate tensors
         self.make_empty_intermediate_tensors = (

@@ -127,12 +127,14 @@ class MiniCPMO45OmniForConditionalGeneration(
             )
             self.model = self.code2wav
         else:
-            raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'thinker', 'talker', 'code2wav'")
+            raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'llm', 'tts', 't2w'")
         
         # Set up intermediate tensors
         self.make_empty_intermediate_tensors = (
             (self.thinker.make_empty_intermediate_tensors) if self.model_stage == "llm" and self.thinker is not None else lambda: None
         )
+
+        self._language_model_names = ["model"]
     
     @cached_property
     def sampler(self):
