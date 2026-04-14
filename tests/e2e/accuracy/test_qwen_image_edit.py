@@ -82,14 +82,17 @@ def _run_diffusers_image_edit(
 ) -> Image.Image:
     _run_pre_test_cleanup(enable_force=True)
     pipe: QwenImageEditPipeline | None = None
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
     try:
         images = input_images[0] if len(input_images) == 1 else input_images
         pipe = QwenImageEditPipeline.from_pretrained(
             model,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-        ).to("cuda")
-        generator = torch.Generator(device="cuda").manual_seed(SEED)
+        ).to(device)
+        pipe.set_progress_bar_config(disable=False)
+        generator = torch.Generator(device=device).manual_seed(SEED)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=prompt,
             image=images,
