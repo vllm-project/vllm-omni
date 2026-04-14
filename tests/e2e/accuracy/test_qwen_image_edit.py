@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import gc
 from io import BytesIO
 from pathlib import Path
@@ -33,12 +32,8 @@ SEED = 1234
 SSIM_THRESHOLD = 0.55
 PSNR_THRESHOLD = 14.0
 
-PROMPT_SINGLE_IMAGE = (
-    "The input is a 2D cartoon bear mascot. Restyle it into a painterly oil artwork with warm colors while preserving the main structure."
-)
-PROMPT_MULTIPLE_IMAGE = (
-    "The first input is a 2D cartoon bear mascot and the second input is a furry rabbit. Blend them into one coherent scene with a cinematic style and consistent lighting."
-)
+PROMPT_SINGLE_IMAGE = "The input is a 2D cartoon bear mascot. Restyle it into a painterly oil artwork with warm colors while preserving the main structure."
+PROMPT_MULTIPLE_IMAGE = "The first input is a 2D cartoon bear mascot and the second input is a furry rabbit. Blend them into one coherent scene with a cinematic style and consistent lighting."
 NEGATIVE_PROMPT = "low quality, blurry, artifacts, distortion"
 QWEN_BEAR_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
 RABBIT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/rabbit.png"

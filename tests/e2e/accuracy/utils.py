@@ -1,17 +1,20 @@
 from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
-import torch
 import pytest
+import torch
 from PIL import Image
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+
 
 def model_output_dir(parent_dir: Path, model: str) -> Path:
     safe_model_name = model.split("/")[-1].replace(".", "_")
     path = parent_dir / safe_model_name
     path.mkdir(parents=True, exist_ok=True)
     return path
+
 
 def assert_similarity(
     *,
@@ -31,25 +34,14 @@ def assert_similarity(
         )
 
     assert vllm_image.size == diffusers_image.size, (
-        "Online and diffusers output sizes mismatch: "
-        f"online={vllm_image.size}, diffusers={diffusers_image.size}"
+        f"Online and diffusers output sizes mismatch: online={vllm_image.size}, diffusers={diffusers_image.size}"
     )
 
     ssim_score, psnr_score = compute_image_ssim_psnr(prediction=vllm_image, reference=diffusers_image)
     print(f"{model_name} similarity metrics:")
+    print(f"  SSIM: value={ssim_score:.6f}, threshold>={ssim_threshold:.6f}, range=[-1, 1], higher_is_better=True")
     print(
-        "  SSIM:"
-        f" value={ssim_score:.6f},"
-        f" threshold>={ssim_threshold:.6f},"
-        " range=[-1, 1],"
-        " higher_is_better=True"
-    )
-    print(
-        "  PSNR:"
-        f" value={psnr_score:.6f} dB,"
-        f" threshold>={psnr_threshold:.6f} dB,"
-        " range=[0, +inf),"
-        " higher_is_better=True"
+        f"  PSNR: value={psnr_score:.6f} dB, threshold>={psnr_threshold:.6f} dB, range=[0, +inf), higher_is_better=True"
     )
 
     assert ssim_score >= ssim_threshold, (
@@ -75,9 +67,8 @@ def compute_image_ssim_psnr(
     psnr_value = float(psnr_metric(pred_tensor, ref_tensor).item())
     return ssim_value, psnr_value
 
+
 def _pil_to_batched_tensor(image: Image.Image) -> torch.Tensor:
     array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
     return tensor
-
-
