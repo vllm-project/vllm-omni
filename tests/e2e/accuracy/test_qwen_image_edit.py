@@ -115,11 +115,6 @@ def _run_diffusers_image_edit(
 
 
 @pytest.fixture(scope="module")
-@pytest.mark.parametrize(
-    "omni_server",
-    [OmniServerParams(model=SINGLE_MODEL)],
-    indirect=True,
-)
 def vllm_omni_output_single_image(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
@@ -154,11 +149,6 @@ def diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image:
 
 
 @pytest.fixture(scope="module")
-@pytest.mark.parametrize(
-    "omni_server",
-    [OmniServerParams(model=MULTIPLE_MODEL)],
-    indirect=True,
-)
 def vllm_omni_output_multiple_image(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
@@ -199,6 +189,11 @@ def diffusers_output_multiple_image(
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize(
+    "omni_server",
+    [OmniServerParams(model=SINGLE_MODEL)],
+    indirect=True,
+)
 def test_qwen_image_edit_single_matches_diffusers(
     diffusers_output_single_image: Image.Image,
     vllm_omni_output_single_image: Image.Image,
@@ -218,6 +213,11 @@ def test_qwen_image_edit_single_matches_diffusers(
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize(
+    "omni_server",
+    [OmniServerParams(model=MULTIPLE_MODEL)],
+    indirect=True,
+)
 def test_qwen_image_edit_multiple_matches_diffusers(
     diffusers_output_multiple_image: Image.Image,
     vllm_omni_output_multiple_image: Image.Image,
