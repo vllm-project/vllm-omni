@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -122,3 +125,49 @@ def create_benchmark_indices(
                 indices.append((test_name, idx))
 
     return indices
+
+
+def run_benchmark(
+    args: list[str],
+    test_name: str,
+    flow: Any,
+    dataset_name: str,
+    num_prompt: int,
+) -> dict[str, Any]:
+    """Run one ``vllm bench serve --omni`` iteration and return parsed metrics."""
+    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
+    if "--result-filename" in args:
+        print(f"The result file will be overwritten by {result_filename}")
+    command = (
+        ["vllm", "bench", "serve", "--omni"]
+        + args
+        + [
+            "--num-warmups",
+            "2",
+            "--save-result",
+            "--result-dir",
+            os.environ.get("BENCHMARK_DIR", "tests"),
+            "--result-filename",
+            result_filename,
+        ]
+    )
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True
+    )
+
+    for line in iter(process.stdout.readline, ""):
+        print(line, end=" ")
+
+    for line in iter(process.stderr.readline, ""):
+        print(line, end=" ")
+
+    if "--result-dir" in command:
+        index = command.index("--result-dir")
+        result_dir = command[index + 1]
+    else:
+        result_dir = "./"
+
+    with open(os.path.join(result_dir, result_filename), encoding="utf-8") as f:
+        result = json.load(f)
+    return result
