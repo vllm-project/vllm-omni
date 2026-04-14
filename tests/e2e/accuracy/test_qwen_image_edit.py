@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 from io import BytesIO
 from pathlib import Path
-from typing import Any
 
 import pytest
 import requests
@@ -13,7 +12,9 @@ from PIL import Image
 
 from tests.conftest import (
     DiffusionResponse,
+    OmniServer,
     OmniServerParams,
+    OpenAIClientHandler,
     _run_post_test_cleanup,
     _run_pre_test_cleanup,
     dummy_messages_from_mix_data,
@@ -41,8 +42,8 @@ RABBIT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-a
 
 def _run_vllm_omni_image_edit(
     *,
-    omni_server: Any,
-    openai_client: Any,
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
     prompt: str,
     input_image_urls: list[str],
     output_path: Path,
@@ -66,7 +67,7 @@ def _run_vllm_omni_image_edit(
         },
     }
 
-    diffusion_response: DiffusionResponse = openai_client.send_diffusion_request(request_config)
+    diffusion_response: DiffusionResponse = openai_client.send_diffusion_request(request_config)[0]
     assert diffusion_response.images is not None
     assert len(diffusion_response.images) == 1
     image = diffusion_response.images[0]
@@ -83,7 +84,7 @@ def _run_diffusers_image_edit(
     output_path: Path,
 ) -> Image.Image:
     _run_pre_test_cleanup(enable_force=True)
-    pipe: Any = None
+    pipe: DiffusionPipeline | None = None
     try:
         inputs: list[Image.Image] = []
         for url in input_image_urls:
@@ -99,7 +100,7 @@ def _run_diffusers_image_edit(
             trust_remote_code=True,
         ).to("cuda")
         generator = torch.Generator(device="cuda").manual_seed(SEED)
-        result = pipe(
+        result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=prompt,
             image=input_image,
             negative_prompt=NEGATIVE_PROMPT,
@@ -125,8 +126,8 @@ def _run_diffusers_image_edit(
 
 @pytest.fixture(scope="module")
 def vllm_omni_output_single_image(
-    omni_server: Any,
-    openai_client: Any,
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
     accuracy_artifact_root: Path,
 ) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, SINGLE_MODEL)
@@ -154,8 +155,8 @@ def diffusers_output_single_image(accuracy_artifact_root: Path) -> Image.Image:
 
 @pytest.fixture(scope="module")
 def vllm_omni_output_multiple_image(
-    omni_server: Any,
-    openai_client: Any,
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
     accuracy_artifact_root: Path,
 ) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)

@@ -29,8 +29,8 @@ def assert_similarity(
     requested_size = (width, height)
     if diffusers_image.size != requested_size:
         pytest.skip(
-            "Diffusers output dimensions do not match requested size; "
-            f"requested={requested_size}, diffusers={diffusers_image.size}"
+            "Skipping as diffusers baseline output is corrupt and not comparable: "
+            f"dimensions do not match requested size; requested={requested_size}, got={diffusers_image.size}."
         )
 
     assert vllm_image.size == diffusers_image.size, (
