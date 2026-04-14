@@ -177,12 +177,10 @@ def _diffusers_output_multiple_image(
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_single_matches_diffusers(
-    run_level: str,
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
 ) -> None:
     vllm_image = _vllm_omni_output_single_image(
-        run_level=run_level,
         accuracy_artifact_root=accuracy_artifact_root,
         qwen_bear_image=qwen_bear_image,
     )
@@ -206,13 +204,11 @@ def test_qwen_image_edit_single_matches_diffusers(
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_multiple_matches_diffusers(
-    run_level: str,
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
     rabbit_image: Image.Image,
 ) -> None:
     vllm_image = _vllm_omni_output_multiple_image(
-        run_level=run_level,
         accuracy_artifact_root=accuracy_artifact_root,
         qwen_bear_image=qwen_bear_image,
         rabbit_image=rabbit_image,
