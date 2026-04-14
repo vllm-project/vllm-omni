@@ -2374,7 +2374,7 @@ class OpenAIClientHandler:
                                 image_url = item.get("image_url", {}).get("url")
                             else:
                                 image_url_obj = getattr(item, "image_url", None)
-                                image_url = hasattr(image_url_obj, "url", None) if image_url_obj else None
+                                image_url = getattr(image_url_obj, "url", None) if image_url_obj else None
                             if image_url and image_url.startswith("data:image"):
                                 b64_data = image_url.split(",", 1)[1]
                                 img = decode_b64_image(b64_data)
