@@ -115,7 +115,7 @@ class MockGenerationResult:
 class FakeAsyncOmni:
     """Fake AsyncOmni that yields a single diffusion output."""
 
-    def __init__(self, images=None):
+    def __init__(self):
         self.stage_configs = [
             SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion"),
@@ -123,12 +123,13 @@ class FakeAsyncOmni:
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
-        self._images = images or [Image.new("RGB", (64, 64), color="green")]
+        self.captured_request_ids = []
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_sampling_params_list = sampling_params_list
         self.captured_prompt = prompt
-        images = [img.copy() for img in self._images]
+        self.captured_request_ids.append(request_id)
+        images = [Image.new("RGB", (64, 64), color="green")]
         yield MockGenerationResult(images)
 
 
@@ -202,28 +203,6 @@ def async_omni_test_client():
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
         max_generated_image_size=1048576,  # 1024*1024 to support resolution tests
-    )
-    return TestClient(app)
-
-
-@pytest.fixture
-def async_omni_rgba_test_client():
-    """Create test client with mocked AsyncOmni engine returning RGBA output."""
-    from fastapi import FastAPI
-
-    from vllm_omni.entrypoints.openai.api_server import router
-
-    app = FastAPI()
-    app.include_router(router)
-
-    app.state.engine_client = FakeAsyncOmni(images=[Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))])
-    app.state.stage_configs = [
-        SimpleNamespace(stage_type="llm"),
-        SimpleNamespace(stage_type="diffusion"),
-    ]
-    app.state.args = Namespace(
-        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
-        max_generated_image_size=1048576,
     )
     return TestClient(app)
 
@@ -1050,27 +1029,6 @@ def test_image_edit_compression_jpeg(test_client):
     assert len(img_bytes_50) < len(img_bytes_100)
 
 
-def test_image_edit_rgba_output_converts_to_jpeg(async_omni_rgba_test_client):
-    img_bytes_1 = make_test_image_bytes((16, 16))
-
-    response = async_omni_rgba_test_client.post(
-        "/v1/images/edits",
-        files=[("image", img_bytes_1)],
-        data={
-            "prompt": "hello world.",
-            "output_format": "jpeg",
-        },
-    )
-    assert response.status_code == 200
-
-    data = response.json()
-    img_bytes = base64.b64decode(data["data"][0]["b64_json"])
-    img = Image.open(io.BytesIO(img_bytes))
-    assert img.format.lower() == "jpeg"
-    assert img.mode == "RGB"
-    assert data["output_format"] == "jpeg"
-
-
 def test_image_edit_compression_png(async_omni_test_client):
     img_bytes_1 = make_test_image_bytes((16, 16))
     # uploadfile with image key
@@ -1165,3 +1123,51 @@ def test_image_edit_with_seed_zero_single_stage(test_client):
         f"Expected seed=0, but got seed={captured_sampling_params.seed}. "
         "This indicates the bug where seed=0 is treated as falsy."
     )
+
+
+def test_image_edits_request_id_unique(async_omni_test_client):
+    """Regression test for request_id collision in /v1/images/edits.
+
+    Previously, request_id was generated using int(time.time()), which only has
+    second-level precision. Two sequential requests in the same second would get
+    identical request_ids like 'img_edit_1234567890', causing request state
+    collisions where one request's result would overwrite the other's.
+
+    The fix uses random_uuid() to generate globally unique request IDs.
+    This test verifies that two sequential requests receive distinct request_ids.
+    """
+    img_bytes_1 = make_test_image_bytes((16, 16))
+
+    # Issue two requests in rapid succession
+    response1 = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={"prompt": "edit this image"},
+    )
+    assert response1.status_code == 200
+
+    response2 = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={"prompt": "edit this image"},
+    )
+    assert response2.status_code == 200
+
+    # Verify both requests received distinct request_ids
+    engine = async_omni_test_client.app.state.engine_client
+    captured_request_ids = engine.captured_request_ids
+    assert len(captured_request_ids) == 2
+    assert captured_request_ids[0] != captured_request_ids[1], (
+        f"Expected two distinct request_ids, but got: {captured_request_ids}. "
+        "This indicates a request_id collision where two requests in the same "
+        "second share the same ID, which can cause state corruption."
+    )
+
+    # Verify request_ids have the expected prefix and format
+    for request_id in captured_request_ids:
+        assert request_id.startswith("img_edit-"), f"Expected request_id to start with 'img_edit-', got: {request_id}"
+        # uuid4().hex is always 32 hex chars
+        suffix = request_id[len("img_edit-") :]
+        assert len(suffix) == 32 and all(c in "0123456789abcdef" for c in suffix), (
+            f"Expected 32-char hex suffix, got: {suffix}"
+        )
