@@ -52,7 +52,7 @@ def _assert_wav_output(output_dir: str) -> None:
 
 
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_custom_voice():
     """CustomVoice single prompt — the most common TTS use case."""
     with tempfile.TemporaryDirectory() as output_dir:
@@ -71,7 +71,7 @@ def test_custom_voice():
 
 
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_voice_design():
     """VoiceDesign single prompt — generates speech from a voice description."""
     with tempfile.TemporaryDirectory() as output_dir:
@@ -90,7 +90,7 @@ def test_voice_design():
 
 
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_base_icl():
     """Base ICL mode — voice cloning with reference audio and transcript."""
     with tempfile.TemporaryDirectory() as output_dir:
@@ -111,7 +111,7 @@ def test_base_icl():
 
 
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_custom_voice_streaming():
     """CustomVoice streaming — exercises the AsyncOmni streaming path."""
     with tempfile.TemporaryDirectory() as output_dir:

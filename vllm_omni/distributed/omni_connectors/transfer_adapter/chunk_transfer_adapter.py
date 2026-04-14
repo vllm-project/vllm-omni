@@ -160,6 +160,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("code_predictor_codes", [])
                 request.prompt_token_ids = new_ids
+                # Keep _all_token_ids in sync so the v2 model runner's
+                # prefill_token_ids length matches prompt_token_ids.
+                request._all_token_ids = list(new_ids)
                 # Preserve previously attached request metadata (e.g. prompt
                 # conditioning tensors) and update only per-chunk fields.
                 prev_info = getattr(request, "additional_information", None)

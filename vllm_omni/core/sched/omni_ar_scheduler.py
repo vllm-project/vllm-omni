@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -26,6 +27,8 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
+VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
+
 
 @dataclass
 class KVCacheTransferData:
@@ -49,6 +52,12 @@ class OmniARScheduler(VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Sync v2 model runner flag — same pattern as gpu_ar_worker.py:98.
+        # Upstream Scheduler.__init__ reads envs.VLLM_USE_V2_MODEL_RUNNER,
+        # but in subprocess contexts that env var may not be set yet.
+        # This ensures schedule() populates prefill_token_ids correctly.
+        if VLLM_OMNI_USE_V2_RUNNER and not self.use_v2_model_runner:
+            self.use_v2_model_runner = True
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -213,6 +222,8 @@ class OmniARScheduler(VLLMScheduler):
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    # Propagate prefill_token_ids from base scheduler for v2 model runner
+                    prefill_token_ids=getattr(nr, "prefill_token_ids", None),
                     additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
                 new_list.append(omni_nr)

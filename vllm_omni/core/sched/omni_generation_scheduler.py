@@ -1,3 +1,4 @@
+import os
 import time
 from collections import defaultdict
 
@@ -24,10 +25,14 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 
 logger = init_logger(__name__)
 
+VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
+
 
 class OmniGenerationScheduler(VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if VLLM_OMNI_USE_V2_RUNNER and not self.use_v2_model_runner:
+            self.use_v2_model_runner = True
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
@@ -303,6 +308,8 @@ class OmniGenerationScheduler(VLLMScheduler):
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    # Propagate prefill_token_ids from base scheduler for v2 model runner
+                    prefill_token_ids=getattr(nr, "prefill_token_ids", None),
                     additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
                 new_list.append(omni_nr)

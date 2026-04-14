@@ -119,17 +119,18 @@ def _estimate_prompt_len(
         return 2048
 
 
-def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
+def get_custom_voice_query(use_batch_sample: bool = False, model_name: str | None = None) -> QueryResult:
     """Build CustomVoice sample inputs.
 
     Args:
         use_batch_sample: When True, return a batch of prompts; otherwise a single prompt.
+        model_name: Override the default HF model path (e.g. with a local path).
 
     Returns:
         QueryResult with Omni inputs and the CustomVoice model path.
     """
     task_type = "CustomVoice"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    model_name = model_name or "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     if use_batch_sample:
         texts = [
             "其实我真的有发现，我是一个特别善于观察别人情绪的人。",
@@ -180,17 +181,18 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
     )
 
 
-def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
+def get_voice_design_query(use_batch_sample: bool = False, model_name: str | None = None) -> QueryResult:
     """Build VoiceDesign sample inputs.
 
     Args:
         use_batch_sample: When True, return a batch of prompts; otherwise a single prompt.
+        model_name: Override the default HF model path (e.g. with a local path).
 
     Returns:
         QueryResult with Omni inputs and the VoiceDesign model path.
     """
     task_type = "VoiceDesign"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    model_name = model_name or "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     if use_batch_sample:
         texts = [
             "哥哥，你回来啦，人家等了你好久好久了，要抱抱！",
@@ -239,18 +241,19 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
     )
 
 
-def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> QueryResult:
+def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl", model_name: str | None = None) -> QueryResult:
     """Build Base (voice clone) sample inputs.
 
     Args:
         use_batch_sample: When True, return a batch of prompts (Case 2).
         mode_tag: "icl" or "xvec_only" to control x_vector_only_mode behavior.
+        model_name: Override the default HF model path (e.g. with a local path).
 
     Returns:
         QueryResult with Omni inputs and the Base model path.
     """
     task_type = "Base"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    model_name = model_name or "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
     ref_audio_single = ref_audio_path_1
     ref_text_single = (
@@ -319,10 +322,11 @@ def _build_inputs(args) -> tuple[str, list]:
         )
 
     query_func = query_map[args.query_type]
+    model_override = args.model if args.model else None
     if args.query_type in {"CustomVoice", "VoiceDesign"}:
-        query_result = query_func(use_batch_sample=args.use_batch_sample)
+        query_result = query_func(use_batch_sample=args.use_batch_sample, model_name=model_override)
     elif args.query_type == "Base":
-        query_result = query_func(use_batch_sample=args.use_batch_sample, mode_tag=args.mode_tag)
+        query_result = query_func(use_batch_sample=args.use_batch_sample, mode_tag=args.mode_tag, model_name=model_override)
     else:
         query_result = query_func()
 
