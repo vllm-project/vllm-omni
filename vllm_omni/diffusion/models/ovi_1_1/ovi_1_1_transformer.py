@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
-from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -10,17 +8,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
 from vllm.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
@@ -902,11 +897,11 @@ class Ovi11Transformer3DModel(nn.Module):
         )
         output = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
         output = output.reshape(
-            batch_size, 
+            batch_size,
             -1,  # out_channels
-            num_frames, 
-            height, 
-            width
+            num_frames,
+            height,
+            width,
         )
 
         if return_dict:

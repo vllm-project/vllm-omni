@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from .ovi_1_1_transformer import Ovi11Transformer3DModel
 from .pipeline_ovi_1_1 import (
     Ovi11Pipeline,
     create_transformer_from_config,
@@ -9,7 +10,6 @@ from .pipeline_ovi_1_1 import (
     load_transformer_config,
     retrieve_latents,
 )
-from .ovi_1_1_transformer import Ovi11Transformer3DModel
 
 __all__ = [
     "Ovi11Pipeline",
