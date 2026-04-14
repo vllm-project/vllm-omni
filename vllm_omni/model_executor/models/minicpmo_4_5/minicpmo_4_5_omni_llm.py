@@ -2767,7 +2767,7 @@ class MiniCPMOOmniImageFeatureInputs(TensorSchema):
     ]
 
 
-def _minicpmo_omni_thinker_field_config(hf_inputs: Mapping[str, torch.Tensor]):
+def _minicpmo_omni_llm_field_config(hf_inputs: Mapping[str, torch.Tensor]):
     """Create field config for MiniCPM-o thinker multimodal inputs."""
     # For MiniCPM-o, pixel_values come preprocessed from image processor
     # tgt_sizes indicates the size of each image after patch embedding
@@ -2823,7 +2823,7 @@ def get_version_by_config(config: PretrainedConfig) -> tuple[int, ...]:
 
 _MAX_FRAMES_PER_VIDEO = 64
 
-class MiniCPMOOmniThinkerProcessingInfo(BaseProcessingInfo):
+class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     """Processing info for MiniCPM-o thinker multimodal processor."""
     audio_pattern = "(<audio>./</audio>)"
     image_pattern = "(<image>./</image>)"
@@ -3064,7 +3064,7 @@ class MiniCPMOOmniThinkerProcessingInfo(BaseProcessingInfo):
 
     
 
-class MiniCPMOOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MiniCPMOOmniThinkerProcessingInfo]):
+class MiniCPMO45OmniLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiniCPMO45OmniLLMProcessingInfo]):
     """Builder for dummy inputs for MiniCPM-o thinker."""
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -3261,7 +3261,7 @@ class MiniCPMOMultiModalDataParser(MultiModalDataParser):
 
         return super()._parse_audio_data(data)
 
-class MiniCPMOOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MiniCPMOOmniThinkerProcessingInfo]):
+class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45OmniLLMProcessingInfo]):
     """Multimodal processor for MiniCPM-o thinker stage."""
 
     def _apply_hf_processor_main(
@@ -3732,11 +3732,11 @@ MiniCPMVImageInputs = Union[MiniCPMVImagePixelInputs, MiniCPMVImageEmbeddingInpu
     
 
 @MULTIMODAL_REGISTRY.register_processor(
-    MiniCPMOOmniThinkerMultiModalProcessor,
-    info=MiniCPMOOmniThinkerProcessingInfo,
-    dummy_inputs=MiniCPMOOmniThinkerDummyInputsBuilder,
+    MiniCPMO45OmniLLMMultiModalProcessor,
+    info=MiniCPMO45OmniLLMProcessingInfo,
+    dummy_inputs=MiniCPMO45OmniLLMDummyInputsBuilder,
 )
-class MiniCPMOOmniThinkerForConditionalGeneration(
+class MiniCPMO45OmniLLMForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE
 ):
     """MiniCPM-o Thinker model: Image preprocessing + Vision encoder + 3D Resampler + LLM.

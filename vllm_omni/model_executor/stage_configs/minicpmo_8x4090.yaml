@@ -13,8 +13,8 @@ stage_args:
       devices: "0,1,2,3"
       max_batch_size: 1
     engine_args:
-      model_stage: thinker
-      model_arch: MiniCPMOOmniForConditionalGeneration
+      model_stage: llm
+      model_arch: MiniCPMO26OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.35
@@ -46,8 +46,8 @@ stage_args:
       devices: "4"
       max_batch_size: 1
     engine_args:
-      model_stage: talker
-      model_arch: MiniCPMOOmniForConditionalGeneration
+      model_stage: tts
+      model_arch: MiniCPMO26OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
@@ -59,7 +59,7 @@ stage_args:
       engine_output_type: latent
       hf_config_name: tts_config
     engine_input_source: [0]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.minicpmo_omni.thinker2talker
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.minicpmo_2_6_omni.llm2tts
     final_output: false
     default_sampling_params:
       temperature: 0.0
@@ -75,8 +75,8 @@ stage_args:
       devices: "4"
       max_batch_size: 1
     engine_args:
-      model_stage: code2wav
-      model_arch: MiniCPMOOmniForConditionalGeneration
+      model_stage: t2w
+      model_arch: MiniCPMO26OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.2
@@ -87,7 +87,7 @@ stage_args:
       hf_config_name: tts_config
       engine_output_type: audio
     engine_input_source: [1]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.minicpmo_omni.talker2code2wav
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.minicpmo_2_6_omni.tts2t2w
     final_output: true
     final_output_type: audio
     default_sampling_params:

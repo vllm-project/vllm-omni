@@ -28,11 +28,11 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.models.minicpmo.minicpmo_omni_thinker import (
+from vllm_omni.model_executor.models.minicpmo_2_6.minicpmo_2_6_omni_llm import (
     ConditionalChatTTSConfig,
     MiniCPMOConfig,
 )
-from vllm_omni.model_executor.models.minicpmo.minicpmo_omni_code2wav import (
+from vllm_omni.model_executor.models.minicpmo_2_6.minicpmo_2_6_omni_t2w import (
     ConditionalChatTTS,
     gen_logits,
 )
@@ -54,7 +54,7 @@ except ImportError:
     instantiate_class = None
 
 
-class MiniCPMOOmniTalkerForConditionalGeneration(nn.Module, SupportsPP):
+class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """MiniCPM-o Talker model: full TTS pipeline from thinker hidden states to audio waveform.
 
     Pipeline:

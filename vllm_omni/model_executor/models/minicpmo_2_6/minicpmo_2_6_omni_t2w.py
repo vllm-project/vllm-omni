@@ -40,7 +40,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.models.minicpmo.minicpmo_omni_thinker import ConditionalChatTTSConfig, MiniCPMOConfig
+from vllm_omni.model_executor.models.minicpmo_2_6.minicpmo_2_6_omni_llm import ConditionalChatTTSConfig, MiniCPMOConfig
 
 try:
     from vector_quantize_pytorch import GroupedResidualFSQ
@@ -60,7 +60,7 @@ logger = init_logger(__name__)
 # No need to import from MiniCPM-o-2_6
 
 
-class MiniCPMOOmniCode2WavForConditionalGeneration(
+class MiniCPMO26OmniT2WForConditionalGeneration(
     nn.Module, SupportsPP
 ):
     """MiniCPM-o Code2Wav model: Mel spectrogram → Audio waveform via Vocos.

@@ -24,12 +24,12 @@ from vllm.model_executor.models.interfaces import SupportsPP
 logger = logging.getLogger(__name__)
 
 
-class MiniCPMOOmniTalkerV45ForConditionalGeneration(nn.Module, SupportsPP):
+class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """MiniCPM-o 4.5 Talker: MiniCPMTTS + Token2wav in a single forward pass."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        from vllm_omni.model_executor.models.minicpmo.minicpmo_omni_thinker import MiniCPMOConfig
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import MiniCPMOConfig
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         self.config = config
         self.vllm_config = vllm_config

@@ -141,31 +141,46 @@ _OMNI_MODELS = {
         "FishSpeechDACDecoder",
     ),
     # MiniCPM-o 2.6 Omni models
-    "MiniCPMOOmniForConditionalGeneration": (
-        "minicpmo",
-        "minicpmo_omni",
-        "MiniCPMOOmniForConditionalGeneration",
+    "MiniCPMO26OmniForConditionalGeneration": (
+        "minicpmo_2_6",
+        "minicpmo_2_6_omni",
+        "MiniCPMO26OmniForConditionalGeneration",
     ),
-    "MiniCPMOOmniThinkerModel": (
-        "minicpmo",
-        "minicpmo_omni_thinker",
-        "MiniCPMOOmniThinkerForConditionalGeneration",
+    "MiniCPMO26OmniLLMModel": (
+        "minicpmo_2_6",
+        "minicpmo_2_6_omni_llm",
+        "MiniCPMO26OmniLLMForConditionalGeneration",
     ),
-    "MiniCPMOOmniTalkerModel": (
-        "minicpmo",
-        "minicpmo_omni_talker",
-        "MiniCPMOOmniTalkerForConditionalGeneration",
+    "MiniCPMO26OmniTTSModel": (
+        "minicpmo_2_6",
+        "minicpmo_2_6_omni_tts",
+        "MiniCPMO26OmniTTSForConditionalGeneration",
     ),
-    "MiniCPMOOmniCode2WavModel": (
-        "minicpmo",
-        "minicpmo_omni_code2wav",
-        "MiniCPMOOmniCode2WavForConditionalGeneration",
+    "MiniCPMO26OmniT2WModel": (
+        "minicpmo_2_6",
+        "minicpmo_2_6_omni_t2w",
+        "MiniCPMO26OmniT2WForConditionalGeneration",
     ),
     # MiniCPM-o 4.5 Omni models
-    "MiniCPMOOmniTalkerV45Model": (
-        "minicpmo",
-        "minicpmo_omni_talker_v45",
-        "MiniCPMOOmniTalkerV45ForConditionalGeneration",
+    "MiniCPMO45OmniForConditionalGeneration": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni",
+        "MiniCPMO45OmniForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniLLMModel": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_llm",
+        "MiniCPMO45OmniLLMForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniTTSModel": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_tts",
+        "MiniCPMO45OmniTTSForConditionalGeneration",
+    ),
+    "MiniCPMO45OmniT2WModel": (
+        "minicpmo_4_5",
+        "minicpmo_4_5_omni_t2w",
+        "MiniCPMO45OmniT2WForConditionalGeneration",
     ),
 }
 
