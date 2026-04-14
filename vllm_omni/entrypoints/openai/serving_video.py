@@ -178,17 +178,24 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
     ) -> VideoGenerationResponse:
         artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+
+        video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        if request.extra_params is not None and isinstance(request.extra_params, dict):
+            if "video_codec_options" in request.extra_params:
+                video_codec_options = request.extra_params["video_codec_options"]
+
         _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
                 b64_json=(
-                    encode_video_base64(video, fps=artifacts.output_fps)
+                    encode_video_base64(video, fps=artifacts.output_fps, video_codec_options=video_codec_options)
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
                         video,
                         fps=artifacts.output_fps,
                         audio=artifacts.audios[idx],
                         audio_sample_rate=artifacts.audio_sample_rate,
+                        video_codec_options=video_codec_options,
                     )
                 )
             )
@@ -219,11 +226,18 @@ class OmniOpenAIServingVideo:
                 len(artifacts.videos),
             )
         audio = artifacts.audios[0]
+
+        video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        if request.extra_params is not None and isinstance(request.extra_params, dict):
+            if "video_codec_options" in request.extra_params:
+                video_codec_options = request.extra_params["video_codec_options"]
+
         _t_encode_start = time.perf_counter()
         video_bytes = _encode_video_bytes(
             artifacts.videos[0],
             fps=artifacts.output_fps,
             **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
+            video_codec_options=video_codec_options,
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
