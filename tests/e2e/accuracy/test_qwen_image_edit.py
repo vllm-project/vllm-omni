@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import gc
-from io import BytesIO
 from pathlib import Path
 
 import pytest
-import requests
 import torch
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers import QwenImageEditPipeline
 from PIL import Image
 
 from benchmarks.accuracy.common import pil_to_data_url
@@ -79,21 +77,14 @@ def _run_diffusers_image_edit(
     *,
     model: str,
     prompt: str,
-    input_image_urls: list[str],
+    input_images: list[Image.Image],
     output_path: Path,
 ) -> Image.Image:
     _run_pre_test_cleanup(enable_force=True)
-    pipe: DiffusionPipeline | None = None
+    pipe: QwenImageEditPipeline | None = None
     try:
-        inputs: list[Image.Image] = []
-        for url in input_image_urls:
-            response = requests.get(url, timeout=60)
-            response.raise_for_status()
-            image = Image.open(BytesIO(response.content)).convert("RGB")
-            image.load()
-            inputs.append(image)
-        input_image = inputs[0] if len(inputs) == 1 else inputs
-        pipe = DiffusionPipeline.from_pretrained(
+        images = input_images[0] if len(input_images) == 1 else input_images
+        pipe = QwenImageEditPipeline.from_pretrained(
             model,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
@@ -101,7 +92,7 @@ def _run_diffusers_image_edit(
         generator = torch.Generator(device="cuda").manual_seed(SEED)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=prompt,
-            image=input_image,
+            image=images,
             negative_prompt=NEGATIVE_PROMPT,
             num_inference_steps=NUM_INFERENCE_STEPS,
             true_cfg_scale=TRUE_CFG_SCALE,
@@ -110,7 +101,7 @@ def _run_diffusers_image_edit(
             height=HEIGHT,
             generator=generator,
         )
-        output_image = result.images[0].convert("RGB")
+        output_image = result.images[0].convert("RGB")  # pyright: ignore[reportAttributeAccessIssue]
         output_image.save(output_path)
         return output_image
     finally:
@@ -148,7 +139,7 @@ def diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image:
     return _run_diffusers_image_edit(
         model=SINGLE_MODEL,
         prompt=PROMPT_SINGLE_IMAGE,
-        input_image_urls=[pil_to_data_url(qwen_bear_image)],
+        input_images=[qwen_bear_image],
         output_path=output_path,
     )
 
@@ -181,7 +172,7 @@ def diffusers_output_multiple_image(
     return _run_diffusers_image_edit(
         model=MULTIPLE_MODEL,
         prompt=PROMPT_MULTIPLE_IMAGE,
-        input_image_urls=[pil_to_data_url(qwen_bear_image), pil_to_data_url(rabbit_image)],
+        input_images=[qwen_bear_image, rabbit_image],
         output_path=output_path,
     )
 
