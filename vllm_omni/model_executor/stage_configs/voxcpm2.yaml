@@ -1,13 +1,13 @@
-# VoxCPM2 native AR single-stage pipeline.
-# Uses native MiniCPM4 base_lm + native VAE decode in one stage.
-# All computation (base_lm, residual_lm, diffusion, VAE) in forward().
+# VoxCPM2 AR pipeline with per-request state batching.
+# Uses native MiniCPM4 base_lm + per-request StaticKVCache.
+# max_batch_size > 1 supported via KV cache save/restore.
 stage_args:
   - stage_id: 0
     stage_type: llm
     is_comprehension: true
     runtime:
       devices: "0"
-      max_batch_size: 1
+      max_batch_size: 4
     engine_args:
       dtype: bfloat16
       model_stage: latent_generator
