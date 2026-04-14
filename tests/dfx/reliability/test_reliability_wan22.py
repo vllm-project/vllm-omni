@@ -119,7 +119,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, open
     [
         pytest.param(
             make_process_kill_fault_injector(
-                grep_patterns="VLLM::Worker",
+                grep_patterns="vllm_omni.entrypoints.cli.main",
                 signal_name="SIGKILL",
                 limit=1,
             ),
