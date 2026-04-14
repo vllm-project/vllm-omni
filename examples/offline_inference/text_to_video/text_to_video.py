@@ -194,25 +194,7 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "int8", "gguf", "awq", "gptq", "bitsandbytes"],
-        help="Quantization method for the transformer. "
-        "fp8/int8: online quantization from BF16/FP16 weights. "
-        "gguf: load GGUF checkpoints. "
-        "awq/gptq/bitsandbytes: load pre-quantized checkpoints.",
-    )
-    parser.add_argument(
-        "--quantization-config",
-        type=str,
-        default=None,
-        help="Per-component quantization config as JSON string. "
-        'Example: \'{"transformer": "fp8", "vae": null}\' or \'{"transformer": {"method": "fp8", "activation_scheme": "static"}}\'.',
-    )
-    parser.add_argument(
-        "--activation-scheme",
-        type=str,
-        default="dynamic",
-        choices=["dynamic", "static"],
-        help="Activation scheme for FP8/INT8 quantization (dynamic or static). Default: dynamic.",
+        choices=["fp8","gguf"],
     )
     return parser.parse_args()
 
@@ -306,7 +288,8 @@ def main():
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
-        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}"
+        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel},"
+        f" Quantization={args.quantization if args.quantization else 'None (BF16)'}"
     )
     if quant_config is not None:
         print(f"  Quantization: {quant_config}")
