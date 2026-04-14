@@ -25,7 +25,9 @@ class PDDisaggregationMixin:
 
     def _init_pd_state(self) -> None:
         """Initialise PD disaggregation state."""
-        self._pd_separation_pair: tuple[int, int] | None = self._detect_pd_separation()
+        self._pd_separation_pair: tuple[int, int] | None = self.detect_pd_separation_from_stage_configs(
+            self.stage_configs
+        )
         self._pd_connector_info: dict[str, Any] | None = None
         self._pd_kv_params_by_req: dict[str, dict[str, Any]] = {}
         self._pd_kv_params_lock = threading.Lock()
@@ -40,11 +42,19 @@ class PDDisaggregationMixin:
                 d_id,
             )
 
-    def _detect_pd_separation(self) -> tuple[int, int] | None:
-        """Scan stage_list for a prefill/decode pair. Returns (p_id, d_id) or None."""
+    @staticmethod
+    def detect_pd_separation_from_stage_configs(stage_configs: list[Any]) -> tuple[int, int] | None:
+        """Scan stage configs for a prefill/decode pair.
+
+        Returns:
+            (prefill_idx, decode_idx) if one pair exists, None if not found.
+
+        Raises:
+            ValueError: if multiple candidate PD pairs are found.
+        """
         prefill_by_id: dict[int, int] = {}
         decode_indices: list[int] = []
-        for i, stage in enumerate(self.stage_configs):
+        for i, stage in enumerate(stage_configs):
             if getattr(stage, "is_prefill_only", False):
                 prefill_by_id[i] = i
                 sid = getattr(stage, "stage_id", i)
@@ -55,7 +65,7 @@ class PDDisaggregationMixin:
 
         pd_pairs: list[tuple[int, int]] = []
         for j in decode_indices:
-            source_ids = getattr(self.stage_configs[j], "engine_input_source", [])
+            source_ids = getattr(stage_configs[j], "engine_input_source", [])
             for src in source_ids:
                 if src in prefill_by_id:
                     pd_pairs.append((prefill_by_id[src], j))

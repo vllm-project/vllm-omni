@@ -80,6 +80,7 @@ from vllm_omni.engine.stage_init_utils import (
     setup_stage_devices,
     terminate_alive_proc,
 )
+from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
     inject_omni_kv_config,
     load_and_resolve_stage_configs,
@@ -1138,17 +1139,10 @@ class AsyncOmniEngine:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
         Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
         """
-        prefill_idx: int | None = None
-        decode_idx: int | None = None
-
-        for i, stage_cfg in enumerate(self.stage_configs):
-            if getattr(stage_cfg, "is_prefill_only", False):
-                prefill_idx = i
-            if getattr(stage_cfg, "is_decode_only", False):
-                decode_idx = i
-
-        if prefill_idx is None or decode_idx is None:
+        pd_pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(self.stage_configs)
+        if pd_pair is None:
             return None
+        prefill_idx, decode_idx = pd_pair
 
         # Extract bootstrap address from prefill stage engine_args
         bootstrap_addr: str | None = None

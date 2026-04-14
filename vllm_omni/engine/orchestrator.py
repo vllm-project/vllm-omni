@@ -378,24 +378,7 @@ class Orchestrator:
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is not None:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
-                logger.warning(
-                    "[Orchestrator][PD] stored kv_transfer_params for req=%s (keys=%s)",
-                    req_id,
-                    list(self._pd_kv_params[req_id].keys()),
-                )
-            else:
-                logger.warning(
-                    "[Orchestrator][PD] prefill stage output for req=%s has no kv_transfer_params; "
-                    "KV transfer may fail. Ensure apply_mooncake_connector_patch() was called.",
-                    req_id,
-                )
-
-        # PD disaggregation: extract KV transfer params from prefill stage output
-        if self._pd_pair is not None and finished and stage_id == self._pd_pair[0]:
-            kv_params = getattr(output, "kv_transfer_params", None)
-            if kv_params is not None:
-                self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
-                logger.warning(
+                logger.debug(
                     "[Orchestrator][PD] stored kv_transfer_params for req=%s (keys=%s)",
                     req_id,
                     list(self._pd_kv_params[req_id].keys()),
@@ -482,8 +465,6 @@ class Orchestrator:
         kv_prefill_params = self._pd_kv_params.pop(req_id, None)
 
         decode_kv_params: dict[str, Any] = {
-            "do_remote_decode": False,
-            "do_remote_prefill": True,
             "transfer_id": f"xfer-{req_id}",
         }
 
@@ -497,7 +478,7 @@ class Orchestrator:
         if kv_prefill_params:
             decode_kv_params.update(kv_prefill_params)
 
-        # Ensure these flags are set correctly after any overlay
+        # Ensure these flags are set correctly after any overlay.
         decode_kv_params["do_remote_prefill"] = True
         decode_kv_params["do_remote_decode"] = False
         if not decode_kv_params.get("transfer_id"):

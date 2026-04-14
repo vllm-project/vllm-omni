@@ -25,10 +25,6 @@ logger = logging.getLogger(__name__)
 _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
 
-# Default max prompt length for code2wav (matches model default max_model_len).
-# Flattened codec codes (seq_len * num_quantizers) must not exceed this.
-_CODE2WAV_MAX_PROMPT_LEN = 65536
-
 
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
     im_start_token_id = 151644
@@ -134,7 +130,7 @@ def _merge_pd_embeddings(
         p_hid = prefill_mm[_HIDDEN_LAYER_KEY].detach().to(device=device, dtype=torch.float)
     except (KeyError, AttributeError, TypeError) as exc:
         available_keys = list(prefill_mm.keys()) if isinstance(prefill_mm, dict) else type(prefill_mm).__name__
-        logger.warning(
+        logger.error(
             "_merge_pd_embeddings: failed to extract prefill embeddings (%s). "
             "Expected keys %r and %r, got: %s. "
             "Falling back to decode-only embeddings – talker user-segment will be degraded.",
