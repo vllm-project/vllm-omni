@@ -27,6 +27,16 @@ def _looks_like_bagel(model_name: str) -> bool:
         return False
 
 
+def _looks_like_audiodit(model_name: str) -> bool:
+    """Best-effort detection for LongCat-AudioDiT (non-diffusers) TTS models."""
+    try:
+        cfg = get_hf_file_to_dict("config.json", model_name)
+        model_type = cfg.get("model_type")
+        return model_type == "audiodit"
+    except Exception:
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
@@ -74,4 +84,4 @@ def is_diffusion_model(model_name: str) -> bool:
 
         # Bagel is not a diffusers pipeline (no model_index.json), but is still a
         # diffusion-style model in vllm-omni. Detect it via config.json.
-    return _looks_like_bagel(model_name)
+    return _looks_like_bagel(model_name) or _looks_like_audiodit(model_name)
