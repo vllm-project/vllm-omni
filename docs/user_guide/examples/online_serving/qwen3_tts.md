@@ -211,14 +211,6 @@ with open("output.wav", "wb") as f:
     f.write(response.content)
 ```
 
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
-
 ## API Reference
 
 ### Voices Endpoint

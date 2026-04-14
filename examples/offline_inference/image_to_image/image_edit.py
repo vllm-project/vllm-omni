@@ -297,8 +297,8 @@ def parse_args() -> argparse.Namespace:
         "--cfg-parallel-size",
         type=int,
         default=1,
-        choices=[1, 2],
-        help="Number of GPUs used for classifier free guidance parallel size.",
+        choices=[1, 2, 3],
+        help="Number of GPUs used for classifier free guidance parallel size (max 3 branches).",
     )
     parser.add_argument(
         "--enforce-eager",

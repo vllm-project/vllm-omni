@@ -1,6 +1,3 @@
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
@@ -10,31 +7,25 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
-# ruff: noqa: E402
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from vllm_omni import Omni
-
 # Use random weights model for CI testing (small, no authentication required)
 models = ["linyueqian/stable_audio_random"]
+
+# omni_runner expects (model, stage_configs_path); single-stage diffusion has no YAML.
+test_params = [(m, None) for m in models]
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "xpu": "B60"})
-@pytest.mark.parametrize("model_name", models)
-def test_stable_audio_model(model_name: str):
-    m = Omni(model=model_name)
-
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_stable_audio_model(omni_runner):
     # Use minimal settings for testing
     # Generate a short 2-second audio clip with minimal inference steps
     audio_start_in_s = 0.0
     audio_end_in_s = 2.0  # Short duration for fast testing
     sample_rate = 44100  # Stable Audio uses 44100 Hz
 
-    outputs = m.generate(
+    outputs = omni_runner.omni.generate(
         prompts={
             "prompt": "The sound of a dog barking",
             "negative_prompt": "Low quality.",
