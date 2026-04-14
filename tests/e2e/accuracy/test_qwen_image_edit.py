@@ -119,8 +119,6 @@ def _vllm_omni_output_single_image(
 ) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, SINGLE_MODEL)
     output_path = output_dir / "vllm_omni_single.png"
-    if output_path.exists():
-        return Image.open(output_path)
     with OmniServer(model=SINGLE_MODEL, serve_args=SERVER_ARGS) as server:
         output = _run_vllm_omni_image_edit(
             omni_server=server,
@@ -134,8 +132,6 @@ def _vllm_omni_output_single_image(
 def _diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image: Image.Image) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, SINGLE_MODEL)
     output_path = output_dir / "diffusers_single.png"
-    if output_path.exists():
-        return Image.open(output_path)
     return _run_diffusers_image_edit(
         model=SINGLE_MODEL,
         pipeline_class=QwenImageEditPipeline,
@@ -152,8 +148,6 @@ def _vllm_omni_output_multiple_image(
 ) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)
     output_path = output_dir / "vllm_omni_multiple.png"
-    if output_path.exists():
-        return Image.open(output_path)
     with OmniServer(model=MULTIPLE_MODEL, serve_args=SERVER_ARGS) as server:
         output = _run_vllm_omni_image_edit(
             omni_server=server,
@@ -169,8 +163,6 @@ def _diffusers_output_multiple_image(
 ) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)
     output_path = output_dir / "diffusers_multiple.png"
-    if output_path.exists():
-        return Image.open(output_path)
     return _run_diffusers_image_edit(
         model=MULTIPLE_MODEL,
         pipeline_class=QwenImageEditPlusPipeline,
