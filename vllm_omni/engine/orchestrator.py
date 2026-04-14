@@ -685,9 +685,12 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
-            # Only pass mm_features to thinker/talker stages that use M-RoPE.
-            # code2wav has no encoder and will crash with a cache miss if mm_features is set.
-            _mm_features = req_state.mm_features if next_client.model_stage != "code2wav" else None
+            _ms = getattr(next_client, "model_stage", None)
+            _eot = getattr(next_client, "engine_output_type", None)
+            _strip_mm = (
+                _ms == "code2wav" or _ms == "talker" or _eot == "audio"
+            )
+            _mm_features = None if _strip_mm else req_state.mm_features
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
                 prompt=next_input,
