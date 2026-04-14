@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import json
 import os
 import time
 from pathlib import Path
@@ -34,6 +35,15 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "hunyuan_video_15_output.mp4",
     },
+    "ltx2": {
+        "height": 512,
+        "width": 512,
+        "num_frames": 65,
+        "num_inference_steps": 30,
+        "guidance_scale": 0.0,
+        "fps": 24,
+        "output": "ltx2_output.mp4",
+    },
 }
 
 
@@ -41,6 +51,8 @@ def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
     if "hunyuan" in model_lower:
         return _MODEL_PRESETS["hunyuan"]
+    if "ltx" in model_lower:
+        return _MODEL_PRESETS["ltx2"]
     return _MODEL_PRESETS["wan"]
 
 
@@ -182,8 +194,25 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "gguf"],
-        help="Quantization method for the transformer (fp8 for online FP8 quantization).",
+        choices=["fp8", "int8", "gguf", "awq", "gptq", "bitsandbytes"],
+        help="Quantization method for the transformer. "
+        "fp8/int8: online quantization from BF16/FP16 weights. "
+        "gguf: load GGUF checkpoints. "
+        "awq/gptq/bitsandbytes: load pre-quantized checkpoints.",
+    )
+    parser.add_argument(
+        "--quantization-config",
+        type=str,
+        default=None,
+        help="Per-component quantization config as JSON string. "
+        'Example: \'{"transformer": "fp8", "vae": null}\' or \'{"transformer": {"method": "fp8", "activation_scheme": "static"}}\'.',
+    )
+    parser.add_argument(
+        "--activation-scheme",
+        type=str,
+        default="dynamic",
+        choices=["dynamic", "static"],
+        help="Activation scheme for FP8/INT8 quantization (dynamic or static). Default: dynamic.",
     )
     return parser.parse_args()
 
@@ -244,8 +273,19 @@ def main():
         omni_kwargs["boundary_ratio"] = args.boundary_ratio
     if args.flow_shift is not None:
         omni_kwargs["flow_shift"] = args.flow_shift
-    if args.quantization is not None:
-        omni_kwargs["quantization"] = args.quantization
+
+    # Handle quantization configuration
+    quant_config = None
+    if args.quantization_config is not None:
+        try:
+            quant_config = json.loads(args.quantization_config)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse --quantization-config as JSON: {e}")
+        omni_kwargs["quantization_config"] = quant_config
+    elif args.quantization is not None:
+        quant_config = {"method": args.quantization, "activation_scheme": args.activation_scheme}
+        omni_kwargs["quantization_config"] = quant_config
+
     if args.cache_backend is not None:
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config
@@ -268,6 +308,8 @@ def main():
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
         f" vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}"
     )
+    if quant_config is not None:
+        print(f"  Quantization: {quant_config}")
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
@@ -285,6 +327,10 @@ def main():
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+    if args.frame_rate is not None:
+        sampling_kwargs["fps"] = args.frame_rate
+    elif args.fps is not None:
+        sampling_kwargs["fps"] = args.fps
 
     generation_start = time.perf_counter()
     frames = omni.generate(

@@ -9,7 +9,7 @@ import json
 import os
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -24,6 +24,9 @@ from torch import nn
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -65,14 +68,20 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
-def create_transformer_from_config(config: dict) -> LTX2VideoTransformer3DModel:
+def create_transformer_from_config(
+    config: dict,
+    quant_config: "QuantizationConfig | None" = None,
+    prefix: str = "transformer",
+) -> LTX2VideoTransformer3DModel:
     """Create LTX2VideoTransformer3DModel from config dict."""
     if not config:
-        return LTX2VideoTransformer3DModel()
+        return LTX2VideoTransformer3DModel(quant_config=quant_config, prefix=prefix)
 
     signature = inspect.signature(LTX2VideoTransformer3DModel.__init__)
     allowed_keys = set(signature.parameters.keys())
     kwargs = {k: v for k, v in config.items() if k in allowed_keys}
+    kwargs["quant_config"] = quant_config
+    kwargs["prefix"] = prefix
     return LTX2VideoTransformer3DModel(**kwargs)
 
 
@@ -212,7 +221,10 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        quant_config = getattr(od_config, "quantization_config", None)
+        self.transformer = create_transformer_from_config(
+            transformer_config, quant_config=quant_config, prefix="transformer"
+        )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only

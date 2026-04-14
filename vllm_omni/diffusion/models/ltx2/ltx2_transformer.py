@@ -17,7 +17,7 @@ import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
@@ -35,6 +35,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -43,6 +44,9 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
 
@@ -147,7 +151,14 @@ class LTX2AdaLayerNormSingle(nn.Module):
             Whether to use additional conditions for normalization or not.
     """
 
-    def __init__(self, embedding_dim: int, num_mod_params: int = 6, use_additional_conditions: bool = False):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_mod_params: int = 6,
+        use_additional_conditions: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.num_mod_params = num_mod_params
 
@@ -156,7 +167,13 @@ class LTX2AdaLayerNormSingle(nn.Module):
         )
 
         self.silu = nn.SiLU()
-        self.linear = nn.Linear(embedding_dim, self.num_mod_params * embedding_dim, bias=True)
+        self.linear = ReplicatedLinear(
+            embedding_dim,
+            self.num_mod_params * embedding_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear",
+        )
 
     def forward(
         self,
@@ -168,11 +185,23 @@ class LTX2AdaLayerNormSingle(nn.Module):
         # No modulation happening here.
         added_cond_kwargs = added_cond_kwargs or {"resolution": None, "aspect_ratio": None}
         embedded_timestep = self.emb(timestep, **added_cond_kwargs, batch_size=batch_size, hidden_dtype=hidden_dtype)
-        return self.linear(self.silu(embedded_timestep)), embedded_timestep
+        linear_out = self.linear(self.silu(embedded_timestep))
+        if isinstance(linear_out, tuple):
+            linear_out = linear_out[0]
+        return linear_out, embedded_timestep
 
 
 class ColumnParallelApproxGELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        *,
+        approximate: str,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -180,6 +209,8 @@ class ColumnParallelApproxGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj",
         )
         self.approximate = approximate
 
@@ -199,6 +230,8 @@ class LTX2FeedForward(nn.Module):
         bias: bool = True,
         dropout: float = 0.0,
         final_dropout: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -210,13 +243,17 @@ class LTX2FeedForward(nn.Module):
         dropout_layer: nn.Module = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias),
+            ColumnParallelApproxGELU(
+                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=f"{prefix}.net.0"
+            ),
             dropout_layer,
             RowParallelLinear(
                 inner_dim,
                 dim_out,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2",
             ),
         ]
         if final_dropout:
@@ -501,6 +538,8 @@ class LTX2Attention(torch.nn.Module):
         norm_elementwise_affine: bool = True,
         rope_type: str = "interleaved",
         processor=None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         if qk_norm != "rms_norm_across_heads":
@@ -530,6 +569,8 @@ class LTX2Attention(torch.nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=heads,
                 bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv",
             )
             self.query_num_heads = self.to_qkv.num_heads
             self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -544,6 +585,8 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q",
             )
             self.to_k = ColumnParallelLinear(
                 self.cross_attention_dim,
@@ -551,6 +594,8 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k",
             )
             self.to_v = ColumnParallelLinear(
                 self.cross_attention_dim,
@@ -558,6 +603,8 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v",
             )
 
         self.heads = self.query_num_heads
@@ -583,6 +630,8 @@ class LTX2Attention(torch.nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
                 ),
                 torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity(),
             ]
@@ -703,6 +752,8 @@ class LTX2VideoTransformerBlock(nn.Module):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         rope_type: str = "interleaved",
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -718,6 +769,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn1",
         )
 
         self.audio_norm1 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -731,6 +784,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_attn1",
         )
 
         # 2. Prompt Cross-Attention
@@ -745,6 +800,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn2",
         )
 
         self.audio_norm2 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -758,6 +815,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_attn2",
         )
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
@@ -773,6 +832,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_to_video_attn",
         )
 
         # Video-to-Audio (v2a) Attention --> Q: Audio; K,V: Video
@@ -787,14 +848,18 @@ class LTX2VideoTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
             qk_norm=qk_norm,
             rope_type=rope_type,
+            quant_config=quant_config,
+            prefix=f"{prefix}.video_to_audio_attn",
         )
 
         # 4. Feedforward layers
         self.norm3 = _make_rms_norm(dim, eps=eps, elementwise_affine=elementwise_affine)
-        self.ff = LTX2FeedForward(dim, activation_fn=activation_fn)
+        self.ff = LTX2FeedForward(dim, activation_fn=activation_fn, quant_config=quant_config, prefix=f"{prefix}.ff")
 
         self.audio_norm3 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
-        self.audio_ff = LTX2FeedForward(audio_dim, activation_fn=activation_fn)
+        self.audio_ff = LTX2FeedForward(
+            audio_dim, activation_fn=activation_fn, quant_config=quant_config, prefix=f"{prefix}.audio_ff"
+        )
 
         # 5. Per-Layer Modulation Parameters
         # Self-Attention / Feedforward AdaLayerNorm-Zero mod params
@@ -1347,6 +1412,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
         timestep_scale_multiplier: int = 1000,
         cross_attn_timestep_scale_multiplier: int = 1000,
         rope_type: str = "interleaved",
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -1394,10 +1461,14 @@ class LTX2VideoTransformer3DModel(nn.Module):
         )
 
         # 1. Patchification input projections
-        self.proj_in = nn.Linear(in_channels, inner_dim)
-        self.audio_proj_in = nn.Linear(audio_in_channels, audio_inner_dim)
+        self.proj_in = ReplicatedLinear(
+            in_channels, inner_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.proj_in"
+        )
+        self.audio_proj_in = ReplicatedLinear(
+            audio_in_channels, audio_inner_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.audio_proj_in"
+        )
 
-        # 2. Prompt embeddings
+        # 2. Prompt embeddings (use ReplicatedLinear for quantization support)
         self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
         self.audio_caption_projection = PixArtAlphaTextProjection(
             in_features=caption_channels, hidden_size=audio_inner_dim
@@ -1406,9 +1477,19 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # 3. Timestep Modulation Params and Embedding
         # 3.1. Global Timestep Modulation Parameters (except for cross-attention) and timestep + size embedding
         # time_embed and audio_time_embed calculate both the timestep embedding and (global) modulation parameters
-        self.time_embed = LTX2AdaLayerNormSingle(inner_dim, num_mod_params=6, use_additional_conditions=False)
+        self.time_embed = LTX2AdaLayerNormSingle(
+            inner_dim,
+            num_mod_params=6,
+            use_additional_conditions=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.time_embed",
+        )
         self.audio_time_embed = LTX2AdaLayerNormSingle(
-            audio_inner_dim, num_mod_params=6, use_additional_conditions=False
+            audio_inner_dim,
+            num_mod_params=6,
+            use_additional_conditions=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_time_embed",
         )
 
         # 3.2. Global Cross Attention Modulation Parameters
@@ -1417,20 +1498,36 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # There are 2 sets of scale/shift parameters for each modality, 1 each for audio-to-video (a2v) and
         # video-to-audio (v2a) cross attention
         self.av_cross_attn_video_scale_shift = LTX2AdaLayerNormSingle(
-            inner_dim, num_mod_params=4, use_additional_conditions=False
+            inner_dim,
+            num_mod_params=4,
+            use_additional_conditions=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.av_cross_attn_video_scale_shift",
         )
         self.av_cross_attn_audio_scale_shift = LTX2AdaLayerNormSingle(
-            audio_inner_dim, num_mod_params=4, use_additional_conditions=False
+            audio_inner_dim,
+            num_mod_params=4,
+            use_additional_conditions=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.av_cross_attn_audio_scale_shift",
         )
         # Gate param for audio-to-video (a2v) cross attn (where the video is the queries (Q) and the audio is the keys
         # and values (KV))
         self.av_cross_attn_video_a2v_gate = LTX2AdaLayerNormSingle(
-            inner_dim, num_mod_params=1, use_additional_conditions=False
+            inner_dim,
+            num_mod_params=1,
+            use_additional_conditions=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.av_cross_attn_video_a2v_gate",
         )
         # Gate param for video-to-audio (v2a) cross attn (where the audio is the queries (Q) and the video is the keys
         # and values (KV))
         self.av_cross_attn_audio_v2a_gate = LTX2AdaLayerNormSingle(
-            audio_inner_dim, num_mod_params=1, use_additional_conditions=False
+            audio_inner_dim,
+            num_mod_params=1,
+            use_additional_conditions=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.av_cross_attn_audio_v2a_gate",
         )
 
         # 3.3. Output Layer Scale/Shift Modulation parameters
@@ -1520,17 +1617,27 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     eps=norm_eps,
                     elementwise_affine=norm_elementwise_affine,
                     rope_type=rope_type,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
         # 6. Output layers
         self.norm_out = nn.LayerNorm(inner_dim, eps=1e-6, elementwise_affine=False)
-        self.proj_out = nn.Linear(inner_dim, out_channels)
+        self.proj_out = ReplicatedLinear(
+            inner_dim, out_channels, bias=False, quant_config=quant_config, prefix=f"{prefix}.proj_out"
+        )
 
         self.audio_norm_out = nn.LayerNorm(audio_inner_dim, eps=1e-6, elementwise_affine=False)
-        self.audio_proj_out = nn.Linear(audio_inner_dim, audio_out_channels)
+        self.audio_proj_out = ReplicatedLinear(
+            audio_inner_dim,
+            audio_out_channels,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_proj_out",
+        )
 
         self.gradient_checkpointing = False
         self._sp_plan = self._build_sp_plan(rope_type)
@@ -1650,8 +1757,16 @@ class LTX2VideoTransformer3DModel(nn.Module):
         )
 
         # 2. Patchify input projections
-        hidden_states = self.proj_in(hidden_states)
-        audio_hidden_states = self.audio_proj_in(audio_hidden_states)
+        proj_in_out = self.proj_in(hidden_states)
+        if isinstance(proj_in_out, tuple):
+            hidden_states = proj_in_out[0]
+        else:
+            hidden_states = proj_in_out
+        audio_proj_in_out = self.audio_proj_in(audio_hidden_states)
+        if isinstance(audio_proj_in_out, tuple):
+            audio_hidden_states = audio_proj_in_out[0]
+        else:
+            audio_hidden_states = audio_proj_in_out
 
         # 3. Prepare timestep embeddings and modulation parameters
         timestep_cross_attn_gate_scale_factor = (
@@ -1763,14 +1878,22 @@ class LTX2VideoTransformer3DModel(nn.Module):
 
         hidden_states = self.norm_out(hidden_states)
         hidden_states = hidden_states * (1 + scale) + shift
-        output = self.proj_out(hidden_states)
+        proj_out_result = self.proj_out(hidden_states)
+        if isinstance(proj_out_result, tuple):
+            output = proj_out_result[0]
+        else:
+            output = proj_out_result
 
         audio_scale_shift_values = self.audio_scale_shift_table[None, None] + audio_embedded_timestep[:, :, None]
         audio_shift, audio_scale = audio_scale_shift_values[:, :, 0], audio_scale_shift_values[:, :, 1]
 
         audio_hidden_states = self.audio_norm_out(audio_hidden_states)
         audio_hidden_states = audio_hidden_states * (1 + audio_scale) + audio_shift
-        audio_output = self.audio_proj_out(audio_hidden_states)
+        audio_proj_out_result = self.audio_proj_out(audio_hidden_states)
+        if isinstance(audio_proj_out_result, tuple):
+            audio_output = audio_proj_out_result[0]
+        else:
+            audio_output = audio_proj_out_result
 
         if not return_dict:
             return (output, audio_output)
