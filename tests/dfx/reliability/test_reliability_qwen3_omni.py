@@ -70,7 +70,7 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
     },
 ]
 
-E2E_STAGE_CONFIGS_DIR = Path(__file__).resolve().parent.parent / "e2e" / "stage_configs"
+E2E_STAGE_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "e2e" / "stage_configs"
 OOM_INJECTION_CONFIG = {
     "target_mem_ratio": 0.95,
     "hold_seconds": 0,
