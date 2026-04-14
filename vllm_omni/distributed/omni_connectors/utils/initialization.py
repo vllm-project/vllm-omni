@@ -23,6 +23,11 @@ logger = get_connector_logger(__name__)
 # collide with request-forwarding endpoints that share the same base port.
 KV_TRANSFER_PORT_OFFSET = 100
 
+# Port stride between TP ranks so each worker binds a unique ZMQ port
+# when TP > 1.  Must be larger than the maximum number of pipeline stages.
+# Formula: zmq_port = base + KV_TRANSFER_PORT_OFFSET + rank * STRIDE + stage
+KV_RANK_PORT_STRIDE = 16
+
 
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,

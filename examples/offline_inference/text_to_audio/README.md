@@ -23,6 +23,7 @@ python text_to_audio.py \
   --guidance-scale 7.0 \
   --audio-length 10.0 \
   --num-inference-steps 100 \
+  --cache-backend tea_cache \
   --output stable_audio_output.wav
 ```
 
@@ -34,4 +35,5 @@ Key arguments:
 - `--guidance-scale`: classifier-free guidance scale.
 - `--audio-length`: audio duration in seconds.
 - `--num-inference-steps`: diffusion sampling steps.(more steps = higher quality, slower).
+- `--cache-backend`: cache acceleration backend. Stable Audio currently supports `tea_cache`.
 - `--output`: path to save the generated WAV file.

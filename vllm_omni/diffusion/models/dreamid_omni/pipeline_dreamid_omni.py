@@ -15,11 +15,6 @@ from tqdm import tqdm
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_cfg_group,
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
-)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -249,6 +244,28 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
 
         return sample_scheduler, timesteps
 
+    def predict_noise(self, **kwargs):
+        pred_vid, pred_audio = self.model(**kwargs)
+        return (pred_vid[0], pred_audio[0])
+
+    def combine_multi_branch_cfg_noise(self, predictions, true_cfg_scale, cfg_normalize=False):
+        vid_pos, audio_pos = predictions[0]
+        vid_neg, audio_neg = predictions[1]
+        vid_ip_neg, _ = predictions[2]
+        _, refaudio_neg = predictions[3]
+
+        pred_video = (
+            vid_neg
+            + true_cfg_scale["video_cfg_scale"] * (vid_pos - vid_neg)
+            + true_cfg_scale["video_ref_cfg_scale"] * (vid_pos - vid_ip_neg)
+        )
+        pred_audio = (
+            audio_neg
+            + true_cfg_scale["audio_cfg_scale"] * (audio_pos - audio_neg)
+            + true_cfg_scale["audio_ref_cfg_scale"] * (audio_pos - refaudio_neg)
+        )
+        return (pred_video, pred_audio)
+
     def diffuse(
         self,
         video_noise: torch.Tensor,
@@ -306,72 +323,22 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
                 "vid_context": [text_embeddings_video_neg],
             }
 
-            if get_classifier_free_guidance_world_size() > 1:
-                # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
-                cfg_group = get_cfg_group()
-                cfg_rank = get_classifier_free_guidance_rank()
+            branches_kwargs = [
+                {"vid": [model_input_video], "audio": [model_input_audio], "t": timestep_input, **pos_args},
+                {"vid": [model_input_video], "audio": [model_input_audio], "t": timestep_input, **neg_args},
+                {"vid": [model_input_video_neg], "audio": [model_input_audio], "t": timestep_input, **pos_args},
+                {"vid": [model_input_video], "audio": [model_input_audio_neg], "t": timestep_input, **pos_args},
+            ]
 
-                if cfg_rank == 0:
-                    pred_vid, pred_audio = self.model(
-                        vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **pos_args
-                    )
-                    pre_vid_ip_neg, _ = self.model(
-                        vid=[model_input_video_neg], audio=[model_input_audio], t=timestep_input, **pos_args
-                    )
-                    pred_vid_0 = pred_vid[0]
-                    pred_audio_0 = pred_audio[0]
-                    pre_vid_ip_0 = pre_vid_ip_neg[0]
-                    pred_refaudio_0 = torch.zeros_like(pred_audio_0)  # dummy tensor
-                else:
-                    pred_vid, pred_audio = self.model(
-                        vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **neg_args
-                    )
-                    _, pred_refaudio_neg = self.model(
-                        vid=[model_input_video], audio=[model_input_audio_neg], t=timestep_input, **pos_args
-                    )
-                    pred_vid_0 = pred_vid[0]
-                    pred_audio_0 = pred_audio[0]
-                    pre_vid_ip_0 = torch.zeros_like(pred_vid_0)  # dummy tensor
-                    pred_refaudio_0 = pred_refaudio_neg[0]
-
-                pred_vid_gathered = cfg_group.all_gather(pred_vid_0, separate_tensors=True)
-                pred_audio_gathered = cfg_group.all_gather(pred_audio_0, separate_tensors=True)
-                pre_vid_ip_gathered = cfg_group.all_gather(pre_vid_ip_0, separate_tensors=True)
-                pred_refaudio_gathered = cfg_group.all_gather(pred_refaudio_0, separate_tensors=True)
-
-                pred_vid_pos = [pred_vid_gathered[0]]
-                pred_vid_neg = [pred_vid_gathered[1]]
-                pred_audio_pos = [pred_audio_gathered[0]]
-                pred_audio_neg = [pred_audio_gathered[1]]
-                pre_vid_ip_neg = [pre_vid_ip_gathered[0]]
-                pred_refaudio_neg = [pred_refaudio_gathered[1]]
-            else:
-                pred_vid_pos, pred_audio_pos = self.model(
-                    vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **pos_args
-                )
-
-                pred_vid_neg, pred_audio_neg = self.model(
-                    vid=[model_input_video], audio=[model_input_audio], t=timestep_input, **neg_args
-                )
-
-                pre_vid_ip_neg, _ = self.model(
-                    vid=[model_input_video_neg], audio=[model_input_audio], t=timestep_input, **pos_args
-                )
-
-                _, pred_refaudio_neg = self.model(
-                    vid=[model_input_video], audio=[model_input_audio_neg], t=timestep_input, **pos_args
-                )
-
-            pred_video_guided = (
-                pred_vid_neg[0]
-                + self.video_cfg_scale * (pred_vid_pos[0] - pred_vid_neg[0])
-                + self.video_ref_cfg_scale * (pred_vid_pos[0] - pre_vid_ip_neg[0])
-            )
-
-            pred_audio_guided = (
-                pred_audio_neg[0]
-                + self.audio_cfg_scale * (pred_audio_pos[0] - pred_audio_neg[0])
-                + self.audio_ref_cfg_scale * (pred_audio_pos[0] - pred_refaudio_neg[0])
+            pred_video_guided, pred_audio_guided = self.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=True,
+                true_cfg_scale={
+                    "video_cfg_scale": self.video_cfg_scale,
+                    "video_ref_cfg_scale": self.video_ref_cfg_scale,
+                    "audio_cfg_scale": self.audio_cfg_scale,
+                    "audio_ref_cfg_scale": self.audio_ref_cfg_scale,
+                },
+                branches_kwargs=branches_kwargs,
             )
             video_noise = scheduler_video.step(
                 pred_video_guided.unsqueeze(0), t_v, video_noise.unsqueeze(0), return_dict=False
