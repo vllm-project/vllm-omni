@@ -182,6 +182,7 @@ markers = [
     "H100: Tests that require H100 GPU",
     "L4: Tests that require L4 GPU",
     "MI325: Tests that require MI325 GPU (AMD/ROCm)",
+    "B60: Tests that require Intel Arc Pro B60 XPU",
     "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: Tests that require A2 NPU",
     "A3: Tests that require A3 NPU",
