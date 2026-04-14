@@ -1,33 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""VoxCPM2 native AR talker — uses native MiniCPM4 base_lm directly.
+"""VoxCPM2 AR talker — PagedAttention pipeline with per-request state.
 
-Uses native VoxCPM2 modules (no PagedAttention, manual KV cache).
-Each AR decode step:
-  feat_encoder → base_lm → FSQ → residual_lm → LocDiT → stop
-
-TODO(PagedAttention): The base_lm is a MiniCPM4 variant (GQA + LongRoPE,
-use_mup=False).  vllm's MiniCPMModel already supports the architecture
-(LongRoPE via Phi3LongRoPEScaledRotaryEmbedding, muP via config), but
-two issues block replacing the native base_lm with a vllm MiniCPM4Model:
-  1. Per-request state isolation — residual_lm and LocDiT diffusion use
-     shared native KV caches; concurrent requests clobber each other.
-     Fix: save/restore residual_lm cache per request, or pool N instances.
-  2. Streaming audio — make_omni_output re-decodes all patches each step.
-     Fix: sliding-window VAE decode (decode_pad pattern from nanovllm).
+Architecture:
+  MiniCPM4PagedForVoxCPM2 (base_lm, 28 layers, PagedAttention + fp32 RoPE)
+  → FSQ → MiniCPM4PagedResidualLM (8 layers, PagedAttention, no RoPE)
+  → LocDiT (CFM solver) → AudioVAE → 48kHz waveform
 """
 
 from __future__ import annotations
 
+import dataclasses
+import os
+import time
 from collections.abc import Iterable
 from typing import Any
 
 import librosa
 import torch
 import torch.nn as nn
+from einops import rearrange
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.minicpm import MiniCPMModel
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -37,9 +31,12 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .voxcpm2_import_utils import import_voxcpm2_core
 
 logger = init_logger(__name__)
+
+_ENABLE_PROFILING = os.environ.get("VOXCPM2_PROFILE", "0") == "1"
 
 
 def _encode_raw_audio(
@@ -51,34 +48,21 @@ def _encode_raw_audio(
     """Encode raw audio samples using the native VoxCPM2 AudioVAE.
 
     Mirrors ``VoxCPM2Model._encode_wav`` but accepts in-memory samples
-    instead of a file path.  This is needed for the OpenAI speech API
-    where ``_resolve_ref_audio`` returns decoded audio data.
-
-    Args:
-        tts: Native VoxCPM2 tts_model instance.
-        samples: Audio samples (mono, float32).
-        sr: Sample rate of the input audio.
-        padding_mode: "right" (default) or "left" padding.
-
-    Returns:
-        audio_feat: (T, P, D) tensor of latent patches.
+    instead of a file path (needed for the OpenAI speech API).
     """
     if isinstance(samples, list):
         audio = torch.tensor(samples, dtype=torch.float32)
     else:
         audio = samples.float()
-
     if audio.ndim == 1:
         audio = audio.unsqueeze(0)
 
-    # Resample to the model's expected encoding sample rate
     encode_sr = tts._encode_sample_rate
     if sr != encode_sr:
         audio_np = audio.squeeze(0).numpy()
         audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=encode_sr)
         audio = torch.from_numpy(audio_np).unsqueeze(0)
 
-    # Pad to patch boundary
     patch_len = tts.patch_size * tts.chunk_size
     if audio.size(1) % patch_len != 0:
         padding_size = patch_len - audio.size(1) % patch_len
@@ -89,47 +73,300 @@ def _encode_raw_audio(
     return feat.view(tts.audio_vae.latent_dim, -1, tts.patch_size).permute(1, 2, 0)
 
 
+# ===================================================================
+#  Per-request state
+# ===================================================================
+
+
+@dataclasses.dataclass
+class _RequestState:
+    request_id: str
+    curr_embed_for_next: torch.Tensor | None = None
+    prev_feat_embed: torch.Tensor | None = None
+    curr_prefix_feat_cond: torch.Tensor | None = None
+    last_audio_patch_gpu: torch.Tensor | None = None
+    precomputed_stop_logits: torch.Tensor | None = None
+    accumulated_patches: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    decode_step_count: int = 0
+    request_start_time: float = 0.0
+    prefill_completed: bool = False
+    prefill_text: str = ""
+    prompt_cache: dict | None = None
+    prefill_masks: tuple | None = None
+    is_stopping: bool = False
+    last_decoded_audio: torch.Tensor | None = None
+
+
+# ===================================================================
+#  Profiling timer
+# ===================================================================
+
+
+class _PerfTimer:
+    __slots__ = ("_enabled", "_timers", "_counts", "_starts", "_pairs")
+
+    def __init__(self, enabled: bool = False):
+        self._enabled = enabled
+        self._timers: dict[str, float] = {}
+        self._counts: dict[str, int] = {}
+        self._starts: dict[str, torch.cuda.Event] = {}
+        self._pairs: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
+    def start(self, name: str) -> None:
+        if not self._enabled:
+            return
+        evt = torch.cuda.Event(enable_timing=True)
+        evt.record()
+        self._starts[name] = evt
+
+    def stop(self, name: str) -> None:
+        if not self._enabled or name not in self._starts:
+            return
+        start_evt = self._starts.pop(name)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        end_evt.record()
+        self._pairs.append((name, start_evt, end_evt))
+
+    def _resolve(self) -> None:
+        if not self._pairs:
+            return
+        torch.cuda.synchronize()
+        for name, s, e in self._pairs:
+            self._timers[name] = self._timers.get(name, 0.0) + s.elapsed_time(e)
+            self._counts[name] = self._counts.get(name, 0) + 1
+        self._pairs.clear()
+
+    def breakdown(self) -> str:
+        if not self._enabled:
+            return ""
+        self._resolve()
+        if not self._timers:
+            return ""
+        total = self._timers.get("decode_step", sum(self._timers.values()))
+        lines = [
+            "=== VoxCPM2 Decode Step Breakdown ===",
+            f"{'Component':<30} | {'ms':>10} | {'%':>6} | {'N':>5} | {'avg':>8}",
+            "-" * 70,
+        ]
+        for name in sorted(self._timers):
+            t, c = self._timers[name], self._counts[name]
+            lines.append(f"{name:<30} | {t:>10.2f} | {t / total * 100:>5.1f}% | {c:>5} | {t / c:>8.3f}")
+        lines.append(f"{'TOTAL':<30} | {total:>10.2f} |")
+        return "\n".join(lines)
+
+    def reset(self) -> None:
+        self._timers.clear()
+        self._counts.clear()
+        self._starts.clear()
+        self._pairs.clear()
+
+
+# ===================================================================
+#  CFM pre-allocated buffers + optimized Euler solver
+# ===================================================================
+
+
+class _CFMBufferManager:
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        feat_dim: int,
+        patch_size: int,
+        dit_hidden_size: int,
+        max_batch_size: int = 1,
+        sway_sampling_coef: float = 1.0,
+    ):
+        n = 2 * max_batch_size  # CFG doubles the batch
+        self.x_in = torch.zeros(n, feat_dim, patch_size, device=device, dtype=dtype)
+        self.mu_in = torch.zeros(n, dit_hidden_size, device=device, dtype=dtype)
+        self.t_in = torch.zeros(n, device=device, dtype=dtype)
+        self.dt_in = torch.zeros(n, device=device, dtype=dtype)
+        self.cond_in = torch.zeros(n, feat_dim, patch_size, device=device, dtype=dtype)
+        self.noise = torch.zeros(max_batch_size, feat_dim, patch_size, device=device, dtype=dtype)
+        self._sway_coef = sway_sampling_coef
+        self._device = device
+        self._dtype = dtype
+        self.t_span_10 = self._make_t_span(10)
+
+    def _make_t_span(self, n: int) -> torch.Tensor:
+        t = torch.linspace(1, 0, n + 1, device=self._device, dtype=self._dtype)
+        return t + self._sway_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+
+    def get_t_span(self, n: int) -> torch.Tensor:
+        return self.t_span_10 if n == 10 else self._make_t_span(n)
+
+
+def _optimized_solve_euler(
+    cfm_module: nn.Module,
+    mu: torch.Tensor,
+    patch_size: int,
+    cond: torch.Tensor,
+    n_timesteps: int,
+    cfg_value: float,
+    buffers: _CFMBufferManager,
+    use_cfg_zero_star: bool = True,
+    cfg_cutoff_ratio: float = 1.0,
+    perf: _PerfTimer | None = None,
+) -> torch.Tensor:
+    estimator = cfm_module.estimator
+    mean_mode = getattr(cfm_module, "mean_mode", False)
+    b = mu.size(0)
+
+    buffers.noise[:b].normal_()
+    x = buffers.noise[:b].clone()
+
+    t_span = buffers.get_t_span(n_timesteps)
+    t, dt = t_span[0], t_span[0] - t_span[1]
+    zero_init_steps = max(1, int(len(t_span) * 0.04))
+    cfg_cutoff_step = max(zero_init_steps + 1, int(len(t_span) * cfg_cutoff_ratio))
+
+    for step in range(1, len(t_span)):
+        if use_cfg_zero_star and step <= zero_init_steps:
+            dphi_dt = torch.zeros_like(x)
+        elif step <= cfg_cutoff_step:
+            buffers.x_in[:b].copy_(x)
+            buffers.x_in[b : 2 * b].copy_(x)
+            buffers.mu_in[:b].copy_(mu)
+            buffers.mu_in[b : 2 * b].zero_()
+            buffers.t_in[:b].fill_(t.item())
+            buffers.t_in[b : 2 * b].fill_(t.item())
+            if mean_mode:
+                buffers.dt_in[:b].fill_(dt.item())
+                buffers.dt_in[b : 2 * b].fill_(dt.item())
+            else:
+                buffers.dt_in.zero_()
+            buffers.cond_in[:b].copy_(cond[:b])
+            buffers.cond_in[b : 2 * b].copy_(cond[:b])
+
+            if perf:
+                perf.start("  cfm.estimator_cfg")
+            raw_out = estimator(
+                buffers.x_in[: 2 * b],
+                buffers.mu_in[: 2 * b],
+                buffers.t_in[: 2 * b],
+                buffers.cond_in[: 2 * b],
+                buffers.dt_in[: 2 * b],
+            )
+            if perf:
+                perf.stop("  cfm.estimator_cfg")
+
+            dphi_dt, cfg_dphi_dt = raw_out[:b], raw_out[b : 2 * b]
+            if use_cfg_zero_star:
+                pos = dphi_dt.reshape(b, -1)
+                neg = cfg_dphi_dt.reshape(b, -1)
+                st = torch.sum(pos * neg, 1, keepdim=True) / (torch.sum(neg**2, 1, keepdim=True) + 1e-8)
+                st = st.view(b, *([1] * (len(dphi_dt.shape) - 1)))
+            else:
+                st = 1.0
+            dphi_dt = cfg_dphi_dt * st + cfg_value * (dphi_dt - cfg_dphi_dt * st)
+        else:
+            buffers.x_in[:b].copy_(x)
+            buffers.mu_in[:b].copy_(mu)
+            buffers.t_in[:b].fill_(t.item())
+            if mean_mode:
+                buffers.dt_in[:b].fill_(dt.item())
+            else:
+                buffers.dt_in[:b].zero_()
+            buffers.cond_in[:b].copy_(cond[:b])
+            if perf:
+                perf.start("  cfm.estimator_nocfg")
+            dphi_dt = estimator(
+                buffers.x_in[:b], buffers.mu_in[:b], buffers.t_in[:b], buffers.cond_in[:b], buffers.dt_in[:b]
+            )
+            if perf:
+                perf.stop("  cfm.estimator_nocfg")
+
+        x = x - dt * dphi_dt
+        t = t - dt
+        if step < len(t_span) - 1:
+            dt = t - t_span[step + 1]
+    return x
+
+
+# ===================================================================
+#  Main talker model
+# ===================================================================
+
+
 class VoxCPM2TalkerForConditionalGeneration(nn.Module):
-    """VoxCPM2 talker using native MiniCPM4 base_lm.
-
-    Loads the full VoxCPM2 model natively and decomposes the AR loop:
-    each vllm decode step runs one iteration of the native generate loop.
-    """
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
 
-        # Flags for OmniGPUModelRunner
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
-        self._accumulated_patches: list[torch.Tensor] = []
 
-        # vllm MiniCPMModel scaffold — needed for warmup/profiling/KV cache
-        # sizing. Not used for actual computation (native modules are used).
-        self.model = MiniCPMModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = MiniCPM4PagedForVoxCPM2(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+        )
+        self.residual_model = MiniCPM4PagedResidualLM(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "residual_model"),
+        )
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-        # Placeholder — actual native model loaded in load_weights
         self._tts: nn.Module | None = None
         self._device = "cuda"
         self._side_dtype = torch.bfloat16
 
-        # Config values
         self._patch_size = getattr(self.config, "patch_size", 4)
         self._feat_dim = getattr(self.config, "feat_dim", 64)
+        self._sample_rate = getattr(self.config, "sample_rate", 48000)
+
         self._inference_timesteps = 10
         self._cfg_value = 2.0
+        self._cfg_cutoff_ratio = 1.0
+        self._vae_decode_interval = 5
+        self._enable_torch_compile = True
+        self._compile_vae = True
+        self._max_decode_steps = 2000
+        self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
 
-        # TODO: implement sliding-window VAE decode (nanovllm pattern)
-        # for O(1) per-step streaming. Current impl re-decodes all patches.
+        self._perf = _PerfTimer(enabled=_ENABLE_PROFILING)
+        self._cfm_buffers: _CFMBufferManager | None = None
+
+        self._active_states: dict[str, _RequestState] = {}
+        self._current_request_id: str | None = None
+        self._pending_requests: list[tuple[str, bool, torch.Tensor | None, int]] = []
+        self._results_queue: list[tuple[str, torch.Tensor | None]] = []
+        self._audio_queue: list[tuple[str, Any]] = []
+        self._deferred_cleanup_ids: set[str] = set()
 
     @property
     def tts(self) -> nn.Module:
         assert self._tts is not None, "Model not loaded yet"
         return self._tts
+
+    # -------------------- request state management --------------------
+
+    def _get_or_create_state(self, request_id: str) -> _RequestState:
+        if request_id not in self._active_states:
+            self._active_states[request_id] = _RequestState(request_id=request_id)
+        return self._active_states[request_id]
+
+    def _switch_to_request(self, request_id: str) -> _RequestState:
+        if request_id != self._current_request_id:
+            self._current_request_id = request_id
+        return self._get_or_create_state(request_id)
+
+    def _cleanup_request(self, request_id: str) -> None:
+        self._active_states.pop(request_id, None)
+        if self._current_request_id == request_id:
+            self._current_request_id = None
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        # Defer cleanup: on_requests_finished is called before forward(),
+        # so we must not delete state that the current step may still need.
+        self._deferred_cleanup_ids.update(finished_req_ids)
+
+    def _flush_deferred_cleanup(self) -> None:
+        for req_id in self._deferred_cleanup_ids:
+            self._cleanup_request(req_id)
+        self._deferred_cleanup_ids.clear()
 
     def _build_prompt_cache(
         self,
@@ -141,20 +378,19 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         The OpenAI speech API sends decoded audio as [samples_list, sr]
         via ``_resolve_ref_audio``, while offline usage sends file paths.
-        This method detects the format and routes accordingly.
         """
         tts = self.tts
 
         def _is_raw_audio(v: Any) -> bool:
-            """Check if value is [samples, sr] from serving_speech."""
+            import numbers
+
             return (
                 isinstance(v, (list, tuple))
                 and len(v) == 2
-                and isinstance(v[1], int)
+                and isinstance(v[1], numbers.Integral)
                 and isinstance(v[0], (list, torch.Tensor))
             )
 
-        # If all inputs are file paths (or None), use native build_prompt_cache
         if not _is_raw_audio(ref_audio) and not _is_raw_audio(prompt_audio):
             return tts.build_prompt_cache(
                 prompt_text=prompt_text,
@@ -162,39 +398,21 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 reference_wav_path=ref_audio,
             )
 
-        # Raw audio path: encode directly
         cache: dict[str, Any] = {}
-
         if ref_audio is not None:
             if _is_raw_audio(ref_audio):
                 samples, sr = ref_audio
-                cache["ref_audio_feat"] = _encode_raw_audio(
-                    tts,
-                    samples,
-                    sr,
-                    padding_mode="right",
-                )
+                cache["ref_audio_feat"] = _encode_raw_audio(tts, samples, sr)
             else:
-                cache["ref_audio_feat"] = tts._encode_wav(
-                    ref_audio,
-                    padding_mode="right",
-                )
+                cache["ref_audio_feat"] = tts._encode_wav(ref_audio, padding_mode="right")
 
         if prompt_audio is not None and prompt_text is not None:
             cache["prompt_text"] = prompt_text
             if _is_raw_audio(prompt_audio):
                 samples, sr = prompt_audio
-                cache["audio_feat"] = _encode_raw_audio(
-                    tts,
-                    samples,
-                    sr,
-                    padding_mode="left",
-                )
+                cache["audio_feat"] = _encode_raw_audio(tts, samples, sr, padding_mode="left")
             else:
-                cache["audio_feat"] = tts._encode_wav(
-                    prompt_audio,
-                    padding_mode="left",
-                )
+                cache["audio_feat"] = tts._encode_wav(prompt_audio, padding_mode="left")
 
         has_ref = "ref_audio_feat" in cache
         has_prompt = "audio_feat" in cache
@@ -207,12 +425,95 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         return cache
 
+    # -------------------- compile setup --------------------
+
+    def _setup_cfm_buffers(self) -> None:
+        if self._cfm_buffers is not None:
+            return
+        tts = self.tts
+        dit_hidden = tts.lm_to_dit_proj.out_features + tts.res_to_dit_proj.out_features
+        self._cfm_buffers = _CFMBufferManager(
+            device=torch.device(self._device),
+            dtype=self._side_dtype,
+            feat_dim=self._feat_dim,
+            patch_size=self._patch_size,
+            dit_hidden_size=dit_hidden,
+            max_batch_size=self._max_batch_size,
+        )
+
+    def _setup_torch_compile(self) -> None:
+        if not self._enable_torch_compile:
+            return
+        tts = self.tts
+        estimator = tts.feat_decoder.estimator
+        if hasattr(estimator, "_compiled"):
+            return
+
+        targets: list[str] = []
+
+        try:
+            tts.feat_decoder.estimator = torch.compile(estimator, mode="reduce-overhead", fullgraph=False)
+            tts.feat_decoder.estimator._compiled = True
+            targets.append("LocDiT")
+        except Exception as e:
+            logger.warning("torch.compile LocDiT failed: %s", e)
+
+        try:
+            if not hasattr(tts.feat_encoder, "_compiled"):
+                tts.feat_encoder = torch.compile(tts.feat_encoder, mode="reduce-overhead", fullgraph=False)
+                tts.feat_encoder._compiled = True
+                targets.append("feat_encoder")
+        except Exception as e:
+            logger.warning("torch.compile feat_encoder failed: %s", e)
+
+        if self._compile_vae:
+            try:
+                if not hasattr(tts.audio_vae, "_compiled"):
+                    tts.audio_vae.decode = torch.compile(tts.audio_vae.decode, mode="reduce-overhead", fullgraph=False)
+                    tts.audio_vae._compiled = True
+                    targets.append("AudioVAE")
+            except Exception as e:
+                logger.warning("torch.compile AudioVAE failed: %s", e)
+
+        if not getattr(self.model, "_selective_compiled", False):
+            try:
+                targets.extend(f"scaffold.{t}" for t in self.model.compile_selective())
+                self.model._selective_compiled = True
+            except Exception as e:
+                logger.warning("scaffold compile failed: %s", e)
+
+        if not getattr(self.residual_model, "_selective_compiled", False):
+            try:
+                targets.extend(f"residual.{t}" for t in self.residual_model.compile_selective())
+                self.residual_model._selective_compiled = True
+            except Exception as e:
+                logger.warning("residual compile failed: %s", e)
+
+        if not getattr(self, "_projections_compiled", False):
+            try:
+                self._compiled_dit_proj = torch.compile(self._dit_proj_fn, mode="default", fullgraph=True)
+                self._compiled_stop_fn = torch.compile(self._stop_fn, mode="default", fullgraph=True)
+                self._projections_compiled = True
+                targets.append("projections")
+            except Exception as e:
+                self._compiled_dit_proj = self._compiled_stop_fn = None
+                logger.warning("projections compile failed: %s", e)
+
+        if targets:
+            logger.info("VoxCPM2: torch.compile applied to: %s", ", ".join(targets))
+
+    def _dit_proj_fn(self, lm_h: torch.Tensor, res_h: torch.Tensor) -> torch.Tensor:
+        tts = self.tts
+        return torch.cat([tts.lm_to_dit_proj(lm_h), tts.res_to_dit_proj(res_h)], dim=-1)
+
+    def _stop_fn(self, lm_h: torch.Tensor) -> torch.Tensor:
+        tts = self.tts
+        return tts.stop_head(tts.stop_actn(tts.stop_proj(lm_h)))
+
     # -------------------- vllm hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
-        """Embed input IDs using native base_lm with scale_emb."""
-        embeds = self.tts.base_lm.embed_tokens(input_ids)
-        return embeds * self.tts.config.lm_config.scale_emb
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
@@ -222,8 +523,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | IntermediateTensors:
-        """Full VoxCPM2 AR step: base_lm → FSQ → residual_lm → diffusion."""
-        # Always run scaffold model to keep FlashInfer/attention happy
+        self._perf.start("forward_total")
+        dev = input_ids.device
+
         model_output = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         if isinstance(model_output, IntermediateTensors):
             return model_output
@@ -231,368 +533,315 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if isinstance(scaffold_hidden, tuple):
             scaffold_hidden = scaffold_hidden[0]
 
-        # Real computation: use native modules
-        has_infos = bool(getattr(self, "_current_step_infos", None))
-        is_prefill = scaffold_hidden.shape[0] > 1
+        # Phase 1: per-request FSQ + residual input
+        token_offset = 0
+        residual_inputs: list[torch.Tensor] = []
+        residual_positions: list[torch.Tensor] = []
+        req_metas: list[tuple] = []
 
-        if is_prefill and has_infos:
-            self._forward_prefill(inputs_embeds, scaffold_hidden.device)
-            # Return scaffold output (right shape for engine) — our side
-            # computation results are stored in instance state
-            return scaffold_hidden
+        for req_id, is_prefill, _req_embeds, n in self._pending_requests:
+            state = self._switch_to_request(req_id)
+            req_hidden = scaffold_hidden[token_offset : token_offset + n]
+            req_pos = positions[token_offset : token_offset + n]
 
-        if not is_prefill and hasattr(self, "_prev_feat_embed"):
-            self._forward_decode(inputs_embeds, scaffold_hidden.device)
-            return scaffold_hidden
+            if is_prefill:
+                res_input, meta = self._prepare_residual_prefill(state, req_hidden, dev)
+            elif state.prefill_completed:
+                res_input, meta = self._prepare_residual_decode(state, req_hidden, dev)
+            else:
+                token_offset += n
+                self._results_queue.append((req_id, None))
+                self._audio_queue.append((req_id, None))
+                continue
 
+            residual_inputs.append(res_input)
+            residual_positions.append(req_pos)
+            req_metas.append((state, is_prefill, meta))
+            token_offset += n
+
+        # Phase 2: batch residual_model forward
+        if residual_inputs:
+            batch_in = torch.cat(residual_inputs, dim=0)
+            batch_pos = torch.cat(residual_positions, dim=0)
+            batch_out = self.residual_model(batch_pos, batch_in)
+
+            # Phase 3: per-request LocDiT + update
+            offset = 0
+            for idx, (state, is_prefill, meta) in enumerate(req_metas):
+                n = residual_inputs[idx].shape[0]
+                res_out = batch_out[offset : offset + n]
+                offset += n
+
+                if is_prefill:
+                    self._finish_prefill(state, meta, res_out, dev)
+                else:
+                    self._finish_decode(state, meta, res_out, dev)
+
+                self._results_queue.append((state.request_id, state.precomputed_stop_logits))
+                self._audio_queue.append((state.request_id, self._collect_audio(state)))
+
+        self._pending_requests.clear()
+        self._flush_deferred_cleanup()
+        self._perf.stop("forward_total")
         return scaffold_hidden
 
-    def _build_prefill_inputs(self, text: str, dev: Any):
-        """Build text_token / audio_feat / masks like native _generate_with_prompt_cache.
+    # -------------------- prefill / decode helpers --------------------
 
-        Returns a dict with keys: text_token, audio_feat, text_mask, audio_mask,
-        prefix_feat_cond. Handles zero-shot, reference (voice clone), continuation,
-        and ref_continuation modes.
-        """
+    def _prepare_residual_prefill(self, state: _RequestState, base_lm_out: torch.Tensor, dev: Any):
         tts = self.tts
-        dtype = self._side_dtype
-        cache = getattr(self, "_prompt_cache", None)
-        mode = cache.get("mode", "continuation") if cache else "zero_shot"
+        text_mask, feat_mask, feat, feat_embed = state.prefill_masks
+        state.prefill_masks = None
 
-        if cache is not None and mode in ("continuation", "ref_continuation"):
-            full_text = cache.get("prompt_text", "") + text
+        tts_len = text_mask.shape[1]
+        scaffold_len = base_lm_out.shape[0]
+
+        if scaffold_len < tts_len:
+            # Voice clone / continuation: scaffold only processed vllm tokens.
+            # Pad to match TTS sequence length (extra positions are masked out).
+            pad = torch.zeros(
+                tts_len - scaffold_len,
+                base_lm_out.shape[-1],
+                device=base_lm_out.device,
+                dtype=base_lm_out.dtype,
+            )
+            enc_out = torch.cat([base_lm_out, pad], dim=0).unsqueeze(0)
         else:
-            full_text = text
+            enc_out = base_lm_out.unsqueeze(0)
 
-        text_token = torch.LongTensor(tts.text_tokenizer(full_text))
-        text_token = torch.cat(
-            [
-                text_token,
-                torch.tensor([tts.audio_start_token], dtype=torch.int32, device=text_token.device),
-            ],
-            dim=-1,
-        )
-        text_length = text_token.shape[0]
-        latent_dim = tts.audio_vae.latent_dim
-        patch_size = tts.patch_size
-
-        if mode in ("zero_shot", "continuation"):
-            prompt_audio_feat = (
-                cache["audio_feat"] if cache else torch.empty((0, patch_size, latent_dim), dtype=torch.float32)
-            )
-            audio_length = prompt_audio_feat.size(0)
-            text_pad_token = torch.zeros(audio_length, dtype=torch.int32)
-            text_pad_feat = torch.zeros((text_length, patch_size, latent_dim), dtype=torch.float32)
-            text_token = torch.cat([text_token, text_pad_token])
-            audio_feat = torch.cat([text_pad_feat, prompt_audio_feat], dim=0)
-            text_mask = torch.cat(
-                [
-                    torch.ones(text_length, dtype=torch.int32),
-                    torch.zeros(audio_length, dtype=torch.int32),
-                ]
-            )
-            audio_mask = torch.cat(
-                [
-                    torch.zeros(text_length, dtype=torch.int32),
-                    torch.ones(audio_length, dtype=torch.int32),
-                ]
-            )
-        elif mode == "reference":
-            ref_audio_feat = cache["ref_audio_feat"]
-            ref_tokens, ref_feats, ref_t_mask, ref_a_mask = tts._make_ref_prefix(ref_audio_feat, text_token.device)
-            text_pad_feat = torch.zeros((text_length, patch_size, latent_dim), dtype=torch.float32)
-            text_token = torch.cat([ref_tokens.cpu(), text_token])
-            audio_feat = torch.cat([ref_feats.cpu(), text_pad_feat], dim=0)
-            text_mask = torch.cat([ref_t_mask.cpu(), torch.ones(text_length, dtype=torch.int32)])
-            audio_mask = torch.cat([ref_a_mask.cpu(), torch.zeros(text_length, dtype=torch.int32)])
-        else:
-            # ref_continuation
-            ref_audio_feat = cache["ref_audio_feat"]
-            prompt_audio_feat = cache["audio_feat"]
-            prompt_audio_length = prompt_audio_feat.size(0)
-            ref_tokens, ref_feats, ref_t_mask, ref_a_mask = tts._make_ref_prefix(ref_audio_feat, text_token.device)
-            prompt_pad_token = torch.zeros(prompt_audio_length, dtype=torch.int32)
-            text_pad_feat = torch.zeros((text_length, patch_size, latent_dim), dtype=torch.float32)
-            text_token = torch.cat([ref_tokens.cpu(), text_token, prompt_pad_token])
-            audio_feat = torch.cat([ref_feats.cpu(), text_pad_feat, prompt_audio_feat], dim=0)
-            text_mask = torch.cat(
-                [
-                    ref_t_mask.cpu(),
-                    torch.ones(text_length, dtype=torch.int32),
-                    torch.zeros(prompt_audio_length, dtype=torch.int32),
-                ]
-            )
-            audio_mask = torch.cat(
-                [
-                    ref_a_mask.cpu(),
-                    torch.zeros(text_length, dtype=torch.int32),
-                    torch.ones(prompt_audio_length, dtype=torch.int32),
-                ]
-            )
-
-        return {
-            "text_token": text_token.unsqueeze(0).to(dev),
-            "audio_feat": audio_feat.unsqueeze(0).to(dev).to(dtype),
-            "text_mask": text_mask.unsqueeze(0).to(dev),
-            "audio_mask": audio_mask.unsqueeze(0).to(dev),
-        }
-
-    def _forward_prefill(self, inputs_embeds: torch.Tensor, dev: Any) -> torch.Tensor:
-        """Prefill: build combined embeds, run base_lm + residual_lm + first diffusion.
-
-        Uses the same path as native ``VoxCPM2Model._inference`` so zero-shot,
-        voice cloning (reference), continuation, and ref_continuation modes
-        all share the same code.
-        """
-        tts = self.tts
-        dtype = self._side_dtype
-        text = getattr(self, "_prefill_text", None)
-        if text is None:
-            # Fallback (should not hit at runtime; preprocess sets this)
-            text = ""
-
-        inputs = self._build_prefill_inputs(text, dev)
-        text_token = inputs["text_token"]
-        feat = inputs["audio_feat"]
-        text_mask = inputs["text_mask"]
-        feat_mask = inputs["audio_mask"]
-
-        # Compose combined_embed exactly like native _inference
-        feat_embed = tts.feat_encoder(feat)
-        feat_embed = tts.enc_to_lm_proj(feat_embed)
-        scale_emb = tts.config.lm_config.scale_emb if tts.config.lm_config.use_mup else 1.0
-        text_embed = tts.base_lm.embed_tokens(text_token) * scale_emb
-        combined_embed = text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed
-
-        # last audio patch becomes initial prefix_feat_cond (zeros for zero-shot,
-        # last reference/prompt patch for voice clone / continuation)
         prefix_feat_cond = (
             feat[:, -1, ...]
             if feat.shape[1] > 0
-            else torch.zeros(1, tts.patch_size, tts.feat_dim, device=dev, dtype=dtype)
+            else torch.zeros(1, self._patch_size, self._feat_dim, device=dev, dtype=self._side_dtype)
         )
-
-        # Base LM prefill
-        tts.base_lm.setup_cache(1, 4096, dev, dtype)
-        enc_out, enc_kv = tts.base_lm(inputs_embeds=combined_embed, is_causal=True)
-        tts.base_lm.kv_cache.fill_caches(enc_kv)
-
-        # FSQ: identity on text positions, quantized on audio positions
         enc_outputs = tts.fsq_layer(enc_out) * feat_mask.unsqueeze(-1) + enc_out * text_mask.unsqueeze(-1)
-        lm_hidden = enc_outputs[:, -1, :]  # [1, H]
+        lm_hidden = enc_outputs[:, -1, :]
 
-        logger.info(
-            "PREFILL: enc shape=%s last_norm=%.4f",
-            enc_outputs.shape,
-            lm_hidden.norm().item(),
-        )
-
-        # Residual LM prefill
-        tts.residual_lm.setup_cache(1, 4096, dev, dtype)
         residual_input = tts.fusion_concat_proj(torch.cat([enc_outputs, feat_mask.unsqueeze(-1) * feat_embed], dim=-1))
-        res_out, res_kv = tts.residual_lm(inputs_embeds=residual_input, is_causal=True)
-        tts.residual_lm.kv_cache.fill_caches(res_kv)
-        residual_hidden = res_out[:, -1, :]  # [1, H]
+        meta = {"lm_hidden": lm_hidden, "prefix_feat_cond": prefix_feat_cond}
+        return residual_input.squeeze(0), meta
 
-        # Precompute stop logits for first compute_logits call
-        stop_logits = tts.stop_head(tts.stop_actn(tts.stop_proj(lm_hidden)))
-        self._precomputed_stop_logits = stop_logits.detach()
-        logger.info("PREFILL stop: %s", stop_logits[0].tolist())
-
-        # First diffusion step
-        dit_h = torch.cat(
-            [
-                tts.lm_to_dit_proj(lm_hidden),
-                tts.res_to_dit_proj(residual_hidden),
-            ],
-            dim=-1,
-        )
-        pred_feat = tts.feat_decoder(
-            mu=dit_h,
-            patch_size=tts.patch_size,
-            cond=prefix_feat_cond.transpose(1, 2).contiguous(),
-            n_timesteps=self._inference_timesteps,
-            cfg_value=self._cfg_value,
-        ).transpose(1, 2)  # [1, P, D]
-
-        with torch.no_grad():
-            curr_embed = tts.enc_to_lm_proj(tts.feat_encoder(pred_feat.unsqueeze(1))).squeeze(1)
-
-        # Store state for decode steps
-        self._curr_embed_for_next = curr_embed.detach()
-        self._prev_feat_embed = curr_embed.detach()
-        self._curr_prefix_feat_cond = pred_feat[0].detach()
-        self._last_audio_patch = pred_feat.reshape(1, -1).detach().cpu().float()
-
-        logger.info(
-            "PREFILL patch: norm=%.4f first3=%s",
-            pred_feat.norm().item(),
-            pred_feat[0, 0, :3].tolist(),
-        )
-
-        return lm_hidden.to(dtype)
-
-    def _forward_decode(self, inputs_embeds: torch.Tensor | None, dev: Any) -> torch.Tensor:
-        """Decode step: base_lm → FSQ → residual_lm → diffusion."""
+    def _prepare_residual_decode(self, state: _RequestState, base_lm_out: torch.Tensor, dev: Any):
         tts = self.tts
-        dtype = self._side_dtype
+        state.decode_step_count += 1
 
-        # 1. Base LM step with curr_embed from previous diffusion
-        curr_embed = self._curr_embed_for_next.to(dev, dtype=dtype)
-        if curr_embed.ndim == 2:
-            curr_embed_3d = curr_embed.unsqueeze(0)  # [1, 1, H]
-        else:
-            curr_embed_3d = curr_embed
+        if state.decode_step_count >= self._max_decode_steps:
+            logger.warning("MAX_DECODE_STEPS for %s (%d), forcing stop", state.request_id, state.decode_step_count)
+            state.is_stopping = True
 
-        step_pos = torch.tensor([tts.base_lm.kv_cache.step()], device=dev)
-        new_hidden = tts.base_lm.forward_step(curr_embed_3d[:, 0, :], step_pos).clone()
+        h = base_lm_out.unsqueeze(0) if base_lm_out.ndim == 1 else base_lm_out
+        lm_h = tts.fsq_layer(h)
+        if lm_h.ndim == 1:
+            lm_h = lm_h.unsqueeze(0)
 
-        # 2. FSQ
-        new_lm_hidden = tts.fsq_layer(new_hidden)
-        if new_lm_hidden.ndim == 1:
-            new_lm_hidden = new_lm_hidden.unsqueeze(0)
+        prev = state.prev_feat_embed.to(self._side_dtype)
+        if prev.ndim == 1:
+            prev = prev.unsqueeze(0)
+        res_input = tts.fusion_concat_proj(torch.cat([lm_h, prev], dim=-1))
+        return res_input, {"new_lm_hidden": lm_h}
 
-        # 3. Residual LM step
-        prev_fe = self._prev_feat_embed.to(dtype)
-        if prev_fe.ndim == 1:
-            prev_fe = prev_fe.unsqueeze(0)
-        res_input = tts.fusion_concat_proj(torch.cat([new_lm_hidden, prev_fe], dim=-1))
-        res_step_pos = torch.tensor([tts.residual_lm.kv_cache.step()], device=dev)
-        new_res_hidden = tts.residual_lm.forward_step(res_input, res_step_pos).clone()
-        if new_res_hidden.ndim == 1:
-            new_res_hidden = new_res_hidden.unsqueeze(0)
-
-        # 4. Diffusion
-        p = self._patch_size
-        pfc = self._curr_prefix_feat_cond.to(dtype).unsqueeze(0)
-
-        dit_h = torch.cat(
-            [
-                tts.lm_to_dit_proj(new_lm_hidden),
-                tts.res_to_dit_proj(new_res_hidden),
-            ],
-            dim=-1,
-        )
-        pred_feat = tts.feat_decoder(
+    def _run_cfm(self, dit_h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if self._cfm_buffers is not None:
+            return _optimized_solve_euler(
+                self.tts.feat_decoder,
+                dit_h,
+                self._patch_size,
+                cond,
+                self._inference_timesteps,
+                self._cfg_value,
+                self._cfm_buffers,
+                cfg_cutoff_ratio=self._cfg_cutoff_ratio,
+                perf=self._perf,
+            ).transpose(1, 2)
+        return self.tts.feat_decoder(
             mu=dit_h,
-            patch_size=p,
-            cond=pfc.transpose(1, 2).contiguous(),
+            patch_size=self._patch_size,
+            cond=cond,
             n_timesteps=self._inference_timesteps,
             cfg_value=self._cfg_value,
-        ).transpose(1, 2)  # [1, P, D]
+        ).transpose(1, 2)
 
-        # 5. feat_encoder → curr_embed
+    def _finish_prefill(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
+        tts = self.tts
+        lm_hidden = meta["lm_hidden"]
+        prefix_feat_cond = meta["prefix_feat_cond"]
+        residual_hidden = res_out[-1:, :]
+
+        state.precomputed_stop_logits = tts.stop_head(tts.stop_actn(tts.stop_proj(lm_hidden))).detach()
+        dit_h = torch.cat([tts.lm_to_dit_proj(lm_hidden), tts.res_to_dit_proj(residual_hidden)], dim=-1)
+
+        self._setup_cfm_buffers()
+        if self._enable_torch_compile:
+            self._setup_torch_compile()
+
+        pred_feat = self._run_cfm(dit_h, prefix_feat_cond.transpose(1, 2).contiguous())
+
         with torch.no_grad():
             curr_embed = tts.enc_to_lm_proj(tts.feat_encoder(pred_feat.unsqueeze(1))).squeeze(1)
 
-        # 6. Stop logits
-        stop_logits = tts.stop_head(tts.stop_actn(tts.stop_proj(new_lm_hidden)))
-        self._precomputed_stop_logits = stop_logits.detach()
+        state.curr_embed_for_next = curr_embed.detach()
+        state.prev_feat_embed = curr_embed.detach()
+        state.curr_prefix_feat_cond = pred_feat[0].detach()
+        state.last_audio_patch_gpu = pred_feat.detach()
+        state.decode_step_count = 0
+        state.request_start_time = time.perf_counter()
+        state.prefill_completed = True
 
-        # 7. Store state
-        self._curr_embed_for_next = curr_embed.detach()
-        self._prev_feat_embed = curr_embed.detach()
-        self._curr_prefix_feat_cond = pred_feat[0].detach()
-        self._last_audio_patch = pred_feat.reshape(1, -1).detach().cpu().float()
+        logger.info("PREFILL[%s]: patch norm=%.4f", state.request_id, pred_feat.norm().item())
+        self._perf.reset()
 
-        return new_lm_hidden[-1:].detach()
+    def _finish_decode(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
+        self._perf.start("decode_step")
+        tts = self.tts
+
+        lm_h = meta["new_lm_hidden"]
+        res_h = res_out.unsqueeze(0) if res_out.ndim == 1 else res_out
+
+        dit_proj = getattr(self, "_compiled_dit_proj", None) or self._dit_proj_fn
+        stop_fn = getattr(self, "_compiled_stop_fn", None) or self._stop_fn
+
+        dit_h = dit_proj(lm_h, res_h)
+        pfc = state.curr_prefix_feat_cond.to(self._side_dtype)
+        if pfc.ndim == 2:
+            pfc = pfc.unsqueeze(0)
+
+        pred_feat = self._run_cfm(dit_h, pfc.transpose(1, 2).contiguous())
+        next_embed = tts.enc_to_lm_proj(tts.feat_encoder(pred_feat.unsqueeze(1))).squeeze(1)
+
+        state.precomputed_stop_logits = stop_fn(lm_h).detach()
+        state.curr_embed_for_next = next_embed.detach()
+        state.prev_feat_embed = next_embed.detach()
+        state.curr_prefix_feat_cond = pred_feat[0].detach()
+        state.last_audio_patch_gpu = pred_feat.detach()
+
+        self._perf.stop("decode_step")
+        if _ENABLE_PROFILING and state.decode_step_count % 20 == 0:
+            logger.info("Step %d[%s]:\n%s", state.decode_step_count, state.request_id, self._perf.breakdown())
+
+    # -------------------- audio collection --------------------
+
+    def _collect_audio(self, state: _RequestState) -> torch.Tensor | None:
+        patch = state.last_audio_patch_gpu
+        if patch is not None:
+            state.last_audio_patch_gpu = None
+            state.accumulated_patches.append(patch.reshape(1, -1).float())
+
+        if not state.accumulated_patches:
+            return None
+
+        n = len(state.accumulated_patches)
+        if n <= 1 or n % self._vae_decode_interval == 0 or state.is_stopping:
+            self._perf.start("vae_decode")
+            all_p = torch.cat(state.accumulated_patches, dim=0)
+            state.accumulated_patches = [all_p]
+            feat = rearrange(all_p.reshape(1, -1, self._feat_dim), "b t d -> b d t")
+            with torch.no_grad():
+                audio = self.tts.audio_vae.decode(feat.to(self._device)).reshape(-1).cpu().float()
+            self._perf.stop("vae_decode")
+            state.last_decoded_audio = audio
+            return audio
+        return state.last_decoded_audio
+
+    # -------------------- compute_logits --------------------
 
     def compute_logits(
-        self,
-        hidden_states: torch.Tensor | OmniOutput,
-        sampling_metadata: Any = None,
+        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
     ) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None:
             return None
 
-        precomputed = getattr(self, "_precomputed_stop_logits", None)
-        if precomputed is not None:
-            self._precomputed_stop_logits = None
-            raw_logits = precomputed[: hidden_states.shape[0]]
-        else:
-            # Fallback for warmup
-            bsz = hidden_states.shape[0]
-            raw_logits = torch.zeros(bsz, 2, device=hidden_states.device)
-            raw_logits[:, 0] = 1.0  # continue
-
-        bsz = raw_logits.shape[0]
-        full_logits = torch.full(
-            (bsz, self.config.vocab_size),
-            float("-inf"),
-            device=raw_logits.device,
-            dtype=raw_logits.dtype,
+        bsz = hidden_states.shape[0]
+        logits = torch.full(
+            (bsz, self.config.vocab_size), float("-inf"), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        full_logits[:, 0] = raw_logits[:, 0]  # continue
-        full_logits[:, 1] = raw_logits[:, 1]  # stop
-        return full_logits
 
-    # -------------------- Omni output --------------------
+        if self._results_queue:
+            for i, (req_id, stop_logits) in enumerate(self._results_queue):
+                if i >= bsz:
+                    break
+                state = self._active_states.get(req_id)
+                if stop_logits is not None:
+                    if state is not None and state.is_stopping:
+                        logits[i, 0] = 0.0
+                        logits[i, 1] = 1.0
+                        state.precomputed_stop_logits = None
+                    else:
+                        logits[i, 0] = stop_logits[0, 0]
+                        logits[i, 1] = stop_logits[0, 1]
+                        if state is not None:
+                            state.is_stopping = bool(stop_logits[0, 1] > stop_logits[0, 0])
+                            state.precomputed_stop_logits = None
+                elif state and state.prefill_completed:
+                    logits[i, 1] = 1.0
+                else:
+                    logits[i, 0] = 1.0
+            self._results_queue.clear()
+        else:
+            logits[:, 0] = 1.0
+        return logits
+
+    # -------------------- omni output --------------------
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
-        hidden = model_outputs
-        patch = getattr(self, "_last_audio_patch", None)
         mm: dict[str, Any] = {}
+        if self._audio_queue:
+            audio_by_req = {rid: audio for rid, audio in self._audio_queue}
+            order = [r for r, _ in self._audio_queue]
+            mm["model_outputs"] = [audio_by_req.get(r) for r in order]
+            mm["sr"] = [torch.tensor(self._sample_rate, dtype=torch.int32) for _ in order]
+            self._audio_queue.clear()
 
-        if patch is not None:
-            self._last_audio_patch = None
-            self._accumulated_patches.append(patch.clone())
-
-        # Decode all accumulated patches → full audio waveform.
-        # TODO: implement sliding-window VAE decode (nanovllm pattern)
-        # for O(1) per-step streaming instead of O(N) re-decode.
-        if self._accumulated_patches:
-            all_p = torch.cat(self._accumulated_patches, dim=0)
-            d = self._feat_dim
-            from einops import rearrange
-
-            feat = rearrange(all_p.float().reshape(1, -1, d), "b t d -> b d t")
-            with torch.no_grad():
-                audio = self.tts.audio_vae.decode(feat.to(self._device)).reshape(-1).detach().cpu().float()
-
-            mm["model_outputs"] = [audio]
-            mm["sr"] = [torch.tensor(48000, dtype=torch.int32)]
-
-        return OmniOutput(
-            text_hidden_states=hidden,
-            multimodal_outputs=mm,
-        )
+        return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=mm)
 
     # -------------------- preprocess / postprocess --------------------
 
     def preprocess(
-        self,
-        input_ids: torch.Tensor,
-        input_embeds: torch.Tensor | None,
-        **info_dict: Any,
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info_dict: Any
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        additional_information = info_dict.get("additional_information")
-        if isinstance(additional_information, dict):
+        additional = info_dict.get("additional_information")
+        if isinstance(additional, dict):
             merged = {k: v for k, v in info_dict.items() if k != "additional_information"}
-            for k, v in additional_information.items():
+            for k, v in additional.items():
                 merged.setdefault(k, v)
             info_dict = merged
 
         span_len = int(input_ids.shape[0])
         dev = input_ids.device
+        req_id = info_dict.get("request_id", "default")
+        is_prefill = span_len > 1
 
-        if span_len > 1:
-            # ---- Prefill ----
-            # Decode the text from input_ids for native-matching tokenization.
-            # Speech API tokenizes with BOS; we use the detokenized string so
-            # native's ``text_tokenizer`` produces the exact same tokens as
-            # ``generate()``.
-            ids = input_ids.tolist()
-            if ids and ids[0] == self.config.bos_token_id:
-                ids = ids[1:]
-            text = self.tts.text_tokenizer.tokenizer.decode(ids, skip_special_tokens=True)
-            self._prefill_text = text
+        if is_prefill:
+            # Evict stale states
+            pending_ids = {rid for rid, *_ in self._pending_requests}
+            pending_ids.add(req_id)
+            if self._current_request_id:
+                pending_ids.add(self._current_request_id)
+            for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
+                self._cleanup_request(rid)
 
-            # Voice clone / continuation: build prompt cache from info_dict.
+            # VoxCPM2Tokenizer does char-level Chinese splitting, so use input_ids directly
+            token_ids = input_ids.tolist()
+            if token_ids and token_ids[0] == self.config.bos_token_id:
+                token_ids = token_ids[1:]
+
+            state = self._get_or_create_state(req_id)
+            state.prefill_text = ""
+            state.accumulated_patches = []
+            state.prefill_completed = False
+            state.decode_step_count = 0
+            state.precomputed_stop_logits = None
+            state.last_audio_patch_gpu = None
+            state.curr_embed_for_next = None
+            state.prev_feat_embed = None
+            state.curr_prefix_feat_cond = None
+            state.is_stopping = False
+            state.last_decoded_audio = None
+
+            # Voice clone / continuation
             ref_audio = info_dict.get("reference_audio") or info_dict.get("ref_audio")
             prompt_audio = info_dict.get("prompt_audio")
             prompt_text = info_dict.get("prompt_text")
@@ -603,68 +852,111 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if isinstance(prompt_text, list):
                 prompt_text = prompt_text[0] if prompt_text else None
 
-            self._prompt_cache = None
+            state.prompt_cache = None
             if ref_audio or (prompt_audio and prompt_text):
                 try:
-                    self._prompt_cache = self._build_prompt_cache(
+                    state.prompt_cache = self._build_prompt_cache(
                         ref_audio=ref_audio,
                         prompt_audio=prompt_audio,
                         prompt_text=prompt_text,
                     )
                 except Exception as e:
-                    logger.warning("build_prompt_cache failed: %s; falling back to zero-shot", e)
-                    self._prompt_cache = None
+                    logger.warning("build_prompt_cache failed: %s", e)
 
-            # Reset per-request state (fresh generation)
-            self._accumulated_patches = []
-            if hasattr(self, "_prev_feat_embed"):
-                del self._prev_feat_embed
-            if hasattr(self, "_curr_embed_for_next"):
-                del self._curr_embed_for_next
-
-            # Store info for forward
-            self._current_step_infos = [{"is_prefill": True}]
-
-            # The scaffold model still needs embeddings sized to span_len for
-            # its warmup/attention bookkeeping. Native modules use the full
-            # (potentially longer) sequence internally. Pass zeros — scaffold
-            # output is discarded.
-            embeds = torch.zeros(
-                span_len,
-                self.config.hidden_size,
-                device=dev,
-                dtype=self._side_dtype,
-            )
-
-            return input_ids, embeds, {}
-
-        # ---- Decode ----
-        curr_embed = getattr(self, "_curr_embed_for_next", None)
-        if curr_embed is not None:
-            inputs_embeds = curr_embed.to(dev, dtype=self._side_dtype).reshape(1, -1)
+            inputs = self._build_prefill_inputs(token_ids, dev, req_id)
+            tts = self.tts
+            feat_embed = tts.enc_to_lm_proj(tts.feat_encoder(inputs["audio_feat"]))
+            text_embed = self.model.embed_input_ids(inputs["text_token"].to(dev))
+            text_mask, feat_mask = inputs["text_mask"], inputs["audio_mask"]
+            embeds = (text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed).squeeze(0)
+            state.prefill_masks = (text_mask, feat_mask, inputs["audio_feat"], feat_embed)
         else:
-            inputs_embeds = torch.zeros(
-                1,
-                self.config.hidden_size,
-                device=dev,
-                dtype=self._side_dtype,
-            )
+            state = self._active_states.get(req_id)
+            curr = state.curr_embed_for_next if state else None
+            if curr is not None:
+                embeds = curr.to(dev, dtype=self._side_dtype).reshape(1, -1)
+            else:
+                embeds = torch.zeros(1, self.config.hidden_size, device=dev, dtype=self._side_dtype)
 
-        self._current_step_infos = [{}]
-        return input_ids, inputs_embeds, {}
+        self._pending_requests.append((req_id, is_prefill, embeds, span_len))
+        return input_ids, embeds, {}
 
     def postprocess(self, hidden_states: torch.Tensor, **info: Any) -> dict[str, Any]:
+        req_id = info.get("request_id", self._current_request_id or "default")
+        if _ENABLE_PROFILING:
+            state = self._active_states.get(req_id)
+            if state and state.decode_step_count > 0:
+                logger.info(
+                    "REQUEST DONE[%s]: %d steps, %.2fs\n%s",
+                    req_id,
+                    state.decode_step_count,
+                    time.perf_counter() - state.request_start_time,
+                    self._perf.breakdown(),
+                )
         return {}
 
-    # -------------------- Weight loading --------------------
+    # -------------------- build prefill inputs --------------------
 
-    # Weight mapping for vllm scaffold
+    def _build_prefill_inputs(self, token_ids: list[int], dev: Any, req_id: str = "default") -> dict:
+        tts = self.tts
+        dtype = self._side_dtype
+        state = self._active_states.get(req_id)
+        cache = state.prompt_cache if state else None
+        mode = cache.get("mode", "continuation") if cache else "zero_shot"
+
+        if cache and mode in ("continuation", "ref_continuation"):
+            prompt_text = cache.get("prompt_text", "")
+            prompt_ids = list(tts.text_tokenizer(prompt_text)) if prompt_text else []
+            all_ids = prompt_ids + token_ids
+        else:
+            all_ids = token_ids
+
+        text_token = torch.tensor(all_ids, dtype=torch.int32)
+        text_token = torch.cat([text_token, torch.tensor([tts.audio_start_token], dtype=torch.int32)], dim=-1)
+        text_len = text_token.shape[0]
+        latent_dim = tts.audio_vae.latent_dim
+        ps = self._patch_size
+
+        if mode in ("zero_shot", "continuation"):
+            audio_feat = cache["audio_feat"] if cache else torch.empty((0, ps, latent_dim), dtype=torch.float32)
+            a_len = audio_feat.size(0)
+            text_token = torch.cat([text_token, torch.zeros(a_len, dtype=torch.int32)])
+            audio_feat = torch.cat([torch.zeros((text_len, ps, latent_dim), dtype=torch.float32), audio_feat])
+            text_mask = torch.cat([torch.ones(text_len, dtype=torch.int32), torch.zeros(a_len, dtype=torch.int32)])
+            audio_mask = torch.cat([torch.zeros(text_len, dtype=torch.int32), torch.ones(a_len, dtype=torch.int32)])
+        elif mode == "reference":
+            ref = cache["ref_audio_feat"]
+            rt, rf, rtm, ram = tts._make_ref_prefix(ref, text_token.device)
+            text_token = torch.cat([rt.cpu(), text_token])
+            audio_feat = torch.cat([rf.cpu(), torch.zeros((text_len, ps, latent_dim), dtype=torch.float32)])
+            text_mask = torch.cat([rtm.cpu(), torch.ones(text_len, dtype=torch.int32)])
+            audio_mask = torch.cat([ram.cpu(), torch.zeros(text_len, dtype=torch.int32)])
+        else:  # ref_continuation
+            ref = cache["ref_audio_feat"]
+            prompt = cache["audio_feat"]
+            p_len = prompt.size(0)
+            rt, rf, rtm, ram = tts._make_ref_prefix(ref, text_token.device)
+            text_token = torch.cat([rt.cpu(), text_token, torch.zeros(p_len, dtype=torch.int32)])
+            audio_feat = torch.cat([rf.cpu(), torch.zeros((text_len, ps, latent_dim), dtype=torch.float32), prompt])
+            ones_t = torch.ones(text_len, dtype=torch.int32)
+            zeros_p = torch.zeros(p_len, dtype=torch.int32)
+            zeros_t = torch.zeros(text_len, dtype=torch.int32)
+            ones_p = torch.ones(p_len, dtype=torch.int32)
+            text_mask = torch.cat([rtm.cpu(), ones_t, zeros_p])
+            audio_mask = torch.cat([ram.cpu(), zeros_t, ones_p])
+
+        return {
+            "text_token": text_token.unsqueeze(0).to(dev),
+            "audio_feat": audio_feat.unsqueeze(0).to(dev).to(dtype),
+            "text_mask": text_mask.unsqueeze(0).to(dev),
+            "audio_mask": audio_mask.unsqueeze(0).to(dev),
+        }
+
+    # -------------------- weight loading --------------------
+
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"base_lm.": "model."})
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load scaffold weights via vllm + native model for computation."""
-
-        # Filter: only pass base_lm weights to the scaffold
         def _base_lm_only(ws):
             for name, tensor in ws:
                 if name.startswith("base_lm."):
@@ -673,21 +965,27 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(_base_lm_only(weights), mapper=self.hf_to_vllm_mapper)
 
-        # Load the full native model for actual computation
         model_path = self.vllm_config.model_config.model
         VoxCPM = import_voxcpm2_core()
         native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
         self._tts = native.tts_model.to("cuda")
         self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
         self._device = "cuda"
-
         self._patch_size = self._tts.patch_size
         self._feat_dim = self._tts.feat_dim
 
+        n = self.residual_model.load_weights_from_native(self._tts.residual_lm)
+        for name, _ in self.residual_model.named_parameters():
+            loaded.add(f"residual_model.{name}")
+        logger.info("VoxCPM2: loaded %d params into paged residual_model", n)
+
+        del self._tts.base_lm
+        self._tts.base_lm = None
+        del self._tts.residual_lm
+        self._tts.residual_lm = None
+        torch.cuda.empty_cache()
+
         logger.info(
-            "Loaded native VoxCPM2 (patch_size=%d, feat_dim=%d, dtype=%s)",
-            self._patch_size,
-            self._feat_dim,
-            self._side_dtype,
+            "Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype
         )
         return loaded
