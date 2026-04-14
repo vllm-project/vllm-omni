@@ -119,7 +119,10 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
 )
-from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+from vllm_omni.quantization.component_config import (
+    PRE_QUANTIZED_METHODS,
+    ComponentQuantizationConfig,
+)
 
 try:
     import flash_attn
@@ -1119,14 +1122,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # remain in BF16 and have no corresponding scale tensors in the
         # checkpoint. Dynamic quantization methods (e.g. --quantization fp8)
         # should also only target the language model.
-        _PRE_QUANTIZED_METHODS = {"modelopt", "modelopt_fp4", "modelopt_mxfp8"}
 
         if isinstance(quant_config, ComponentQuantizationConfig):
             audio_quant_config = quant_config.resolve("audio_tower")
             visual_quant_config = quant_config.resolve("visual")
             language_quant_config = quant_config.resolve("language_model")
         elif quant_config is not None:
-            if quant_config.get_name() in _PRE_QUANTIZED_METHODS:
+            if quant_config.get_name() in PRE_QUANTIZED_METHODS:
                 # Pre-quantized: only the Thinker LM is quantized.
                 # Vision/audio encoder weights are BF16 with no FP8 scales;
                 # passing quant_config to them causes FP8 kernels to run on
