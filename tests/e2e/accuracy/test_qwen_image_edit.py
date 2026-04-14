@@ -29,8 +29,8 @@ NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 GUIDANCE_SCALE = 1.0
 SEED = 1234
-SSIM_THRESHOLD = 0.55
-PSNR_THRESHOLD = 14.0
+SSIM_THRESHOLD = 0.94
+PSNR_THRESHOLD = 28.0
 
 PROMPT_SINGLE_IMAGE = "The input is a 2D cartoon bear mascot. Restyle it into a painterly oil artwork with warm colors while preserving the main structure."
 PROMPT_MULTIPLE_IMAGE = "The first input is a 2D cartoon bear mascot and the second input is a furry rabbit. Blend them into one coherent scene with a cinematic style and consistent lighting."
