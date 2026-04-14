@@ -4,17 +4,16 @@ import gc
 from pathlib import Path
 
 import pytest
+import requests
 import torch
 from diffusers import QwenImageEditPipeline, QwenImageEditPlusPipeline
 from PIL import Image
 
-from benchmarks.accuracy.common import pil_to_data_url
+from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 from tests.conftest import (
     OmniServer,
-    OpenAIClientHandler,
     _run_post_test_cleanup,
     _run_pre_test_cleanup,
-    dummy_messages_from_mix_data,
 )
 from tests.e2e.accuracy.utils import assert_similarity, model_output_dir
 from tests.utils import hardware_test
@@ -25,7 +24,7 @@ WIDTH = 512
 HEIGHT = 512
 NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
-SEED = 1234
+SEED = 42
 SSIM_THRESHOLD = 0.94
 PSNR_THRESHOLD = 28.0
 
@@ -37,32 +36,35 @@ SERVER_ARGS = ["--num-gpus", "1", "--stage-init-timeout", "300", "--init-timeout
 
 def _run_vllm_omni_image_edit(
     *,
-    model: str,
-    openai_client: OpenAIClientHandler,
+    omni_server: OmniServer,
     prompt: str,
-    input_image_urls: list[str],
+    input_images: list[Image.Image],
     output_path: Path,
 ) -> Image.Image:
-    messages = dummy_messages_from_mix_data(
-        image_data_url=input_image_urls,
-        content_text=prompt,
-    )
-
-    request_config = {
-        "model": model,
-        "messages": messages,
-        "extra_body": {
-            "height": HEIGHT,
-            "width": WIDTH,
-            "num_inference_steps": NUM_INFERENCE_STEPS,
+    response = requests.post(
+        f"http://{omni_server.host}:{omni_server.port}/v1/images/edits",
+        data={
+            "model": omni_server.model,
+            "prompt": prompt,
+            "size": f"{WIDTH}x{HEIGHT}",
+            "n": 1,
+            "response_format": "b64_json",
             "negative_prompt": NEGATIVE_PROMPT,
+            "num_inference_steps": NUM_INFERENCE_STEPS,
             "true_cfg_scale": TRUE_CFG_SCALE,
             "seed": SEED,
         },
-    }
-
-    diffusion_response = openai_client.send_diffusion_request(request_config)
-    image = diffusion_response[0].images[0]
+        files=[
+            ("image", (f"image_{index}.png", pil_to_png_bytes(image), "image/png"))
+            for index, image in enumerate(input_images)
+        ],
+        timeout=600,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    assert len(payload["data"]) == 1
+    image = decode_base64_image(payload["data"][0]["b64_json"])
+    image.load()
     image.save(output_path)
     return image
 
@@ -112,7 +114,6 @@ def _run_diffusers_image_edit(
 
 
 def _vllm_omni_output_single_image(
-    run_level: str,
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
 ) -> Image.Image:
@@ -121,12 +122,10 @@ def _vllm_omni_output_single_image(
     if output_path.exists():
         return Image.open(output_path)
     with OmniServer(model=SINGLE_MODEL, serve_args=SERVER_ARGS) as server:
-        openai_client = OpenAIClientHandler(host=server.host, port=server.port, api_key="EMPTY", run_level=run_level)
         output = _run_vllm_omni_image_edit(
-            model=SINGLE_MODEL,
-            openai_client=openai_client,
+            omni_server=server,
             prompt=PROMPT_SINGLE_IMAGE,
-            input_image_urls=[pil_to_data_url(qwen_bear_image)],
+            input_images=[qwen_bear_image],
             output_path=output_path,
         )
     return output
@@ -147,7 +146,6 @@ def _diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image
 
 
 def _vllm_omni_output_multiple_image(
-    run_level: str,
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
     rabbit_image: Image.Image,
@@ -157,12 +155,10 @@ def _vllm_omni_output_multiple_image(
     if output_path.exists():
         return Image.open(output_path)
     with OmniServer(model=MULTIPLE_MODEL, serve_args=SERVER_ARGS) as server:
-        openai_client = OpenAIClientHandler(host=server.host, port=server.port, api_key="EMPTY", run_level=run_level)
         output = _run_vllm_omni_image_edit(
-            model=MULTIPLE_MODEL,
-            openai_client=openai_client,
+            omni_server=server,
             prompt=PROMPT_MULTIPLE_IMAGE,
-            input_image_urls=[pil_to_data_url(qwen_bear_image), pil_to_data_url(rabbit_image)],
+            input_images=[qwen_bear_image, rabbit_image],
             output_path=output_path,
         )
     return output
