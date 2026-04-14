@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
@@ -17,6 +18,7 @@ from vllm.model_executor.models.utils import (
     init_vllm_registered_model,
     maybe_prefix,
 )
+from vllm.multimodal.audio import resample_audio_resampy
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
@@ -58,7 +60,7 @@ class VibeVoiceSpeechConnector(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, output_dim)
-        self.norm = VibeVoiceRMSNorm(output_dim, eps=1e-6)
+        self.norm = RMSNorm(output_dim, eps=1e-6)
         self.fc2 = nn.Linear(output_dim, output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -66,20 +68,6 @@ class VibeVoiceSpeechConnector(nn.Module):
         x = self.norm(x)
         x = self.fc2(x)
         return x
-
-
-class VibeVoiceRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
 
 
 class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin):
@@ -150,8 +138,11 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
         self._audio_normalizer = AudioNormalizer()
         self._audio_module_dtype = torch.float32
         self._lm_dtype = getattr(vllm_config.model_config, "dtype", None) or torch.bfloat16
+        self._noise_scheduler_timesteps: torch.Tensor | None = None
+        self._noise_scheduler_sigmas: torch.Tensor | None = None
+        self._noise_scheduler_num_inference_steps: int | None = None
         self._ensure_audio_module_dtype()
-        self._ensure_noise_scheduler_cpu_state()
+        self._cache_noise_scheduler_sampling_state()
 
     @staticmethod
     def _build_acoustic_tokenizer_config(config_like: object) -> VibeVoiceAcousticTokenizerConfig:
@@ -217,20 +208,36 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
                 if isinstance(value, torch.Tensor) and value.device.type != "cpu":
                     model_outputs[idx] = value.to("cpu")
 
-    def _get_text_embedder(self) -> nn.Module:
-        if hasattr(self.language_model, "model") and hasattr(self.language_model.model, "embed_tokens"):
-            return self.language_model.model.embed_tokens
-        if hasattr(self.language_model, "embed_tokens"):
-            return self.language_model.embed_tokens
-        inner = self.language_model
-        if hasattr(inner, "language_model"):
-            inner = inner.language_model
-        if hasattr(inner, "model") and hasattr(inner.model, "embed_tokens"):
-            return inner.model.embed_tokens
-        raise AttributeError("Unable to locate VibeVoice text embedding layer")
+    def _cache_noise_scheduler_sampling_state(self) -> None:
+        self._ensure_noise_scheduler_cpu_state()
+        self.noise_scheduler.set_timesteps(
+            self.config.diffusion_head_config.ddpm_num_inference_steps,
+            device="cpu",
+        )
+        self._ensure_noise_scheduler_cpu_state()
+        self._noise_scheduler_timesteps = self.noise_scheduler.timesteps.detach().clone()
+        self._noise_scheduler_sigmas = self.noise_scheduler.sigmas.detach().clone()
+        self._noise_scheduler_num_inference_steps = int(self.noise_scheduler.num_inference_steps)
+        self._reset_noise_scheduler_state()
+
+    def _reset_noise_scheduler_state(self) -> None:
+        if (
+            self._noise_scheduler_timesteps is None
+            or self._noise_scheduler_sigmas is None
+            or self._noise_scheduler_num_inference_steps is None
+        ):
+            self._cache_noise_scheduler_sampling_state()
+            return
+        self.noise_scheduler.timesteps = self._noise_scheduler_timesteps
+        self.noise_scheduler.sigmas = self._noise_scheduler_sigmas
+        self.noise_scheduler.num_inference_steps = self._noise_scheduler_num_inference_steps
+        self.noise_scheduler.model_outputs = [None] * int(self.noise_scheduler.config.solver_order)
+        self.noise_scheduler.lower_order_nums = 0
+        self.noise_scheduler._step_index = None
+        self.noise_scheduler._begin_index = None
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
-        return self._get_text_embedder()(input_ids)
+        return self.language_model.embed_input_ids(input_ids)
 
     def get_language_model(self) -> nn.Module:
         return self.language_model
@@ -423,8 +430,6 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
     def _encode_voice_prompt_samples(
         self, voice_samples: list[dict[str, Any]], device: torch.device
     ) -> torch.Tensor | None:
-        import librosa
-
         processed_wavs: list[np.ndarray] = []
         token_lengths: list[int] = []
         for sample in voice_samples:
@@ -436,7 +441,7 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
                 continue
             wav = self._audio_normalizer(wav)
             if sample_rate != self._sample_rate:
-                wav = librosa.resample(wav, orig_sr=sample_rate, target_sr=self._sample_rate)
+                wav = resample_audio_resampy(wav, orig_sr=sample_rate, target_sr=self._sample_rate)
             processed_wavs.append(wav.astype(np.float32))
             token_lengths.append(int(math.ceil(len(wav) / self._speech_tok_compress_ratio)))
 
@@ -482,11 +487,7 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
 
     @torch.no_grad()
     def _sample_speech_latent(self, condition: torch.Tensor) -> torch.Tensor:
-        self._ensure_noise_scheduler_cpu_state()
-        self.noise_scheduler.set_timesteps(
-            self.config.diffusion_head_config.ddpm_num_inference_steps,
-            device="cpu",
-        )
+        self._reset_noise_scheduler_state()
         condition = condition.to(device=next(self.prediction_head.parameters()).device, dtype=self._audio_module_dtype)
         speech = torch.randn(
             condition.shape[0],

@@ -20,6 +20,7 @@ from transformers.utils.hub import cached_file
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
+from vllm.multimodal.audio import resample_audio_resampy
 from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
 from vllm.utils.async_utils import make_async
@@ -44,8 +45,6 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 # TTS Configuration
-_COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
-_OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 TTSModelType = Literal[
     "qwen3_tts",
     "voxtral_tts",
@@ -191,19 +190,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Find and cache the TTS stage (if any) during initialization
         self._tts_stage = self._find_tts_stage()
-        self._is_tts = self._tts_stage is not None
-        self._is_fish_speech = (
-            self._tts_stage is not None
-            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None) == "fish_speech_slow_ar"
-        )
         self._fish_speech_tokenizer = None
         self._vibevoice_processor = None
-
-        self._is_cosyvoice3 = (
-            self._tts_stage is not None
-            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
-            in _COSYVOICE3_TTS_MODEL_STAGES
-        )
         self._cosyvoice3_tokenizer = None
 
         # Determine TTS model type or None
@@ -1037,7 +1025,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if fmt_err:
                 return fmt_err
 
-        if request.voice is not None:
+        elif request.voice is not None:
             voice_name = request.voice.lower()
             if voice_name not in self.uploaded_speakers:
                 return (
@@ -1370,9 +1358,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if wav.size == 0:
                 continue
             if sample_rate != target_sample_rate:
-                import librosa
-
-                wav = librosa.resample(wav, orig_sr=sample_rate, target_sr=target_sample_rate)
+                wav = resample_audio_resampy(wav, orig_sr=sample_rate, target_sr=target_sample_rate)
                 sample_rate = target_sample_rate
             aligned_samples.append(
                 {
