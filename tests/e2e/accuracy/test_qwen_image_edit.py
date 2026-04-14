@@ -112,7 +112,7 @@ def _run_diffusers_image_edit(
 
 
 def _vllm_omni_output_single_image(
-    openai_client: OpenAIClientHandler,
+    run_level: str,
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
 ) -> Image.Image:
@@ -120,7 +120,8 @@ def _vllm_omni_output_single_image(
     output_path = output_dir / "vllm_omni_single.png"
     if output_path.exists():
         return Image.open(output_path)
-    with OmniServer(model=SINGLE_MODEL, serve_args=SERVER_ARGS):
+    with OmniServer(model=SINGLE_MODEL, serve_args=SERVER_ARGS) as server:
+        openai_client = OpenAIClientHandler(host=server.host, port=server.port, api_key="EMPTY", run_level=run_level)
         output = _run_vllm_omni_image_edit(
             model=SINGLE_MODEL,
             openai_client=openai_client,
@@ -146,7 +147,7 @@ def _diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image
 
 
 def _vllm_omni_output_multiple_image(
-    openai_client: OpenAIClientHandler,
+    run_level: str,
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
     rabbit_image: Image.Image,
@@ -155,7 +156,8 @@ def _vllm_omni_output_multiple_image(
     output_path = output_dir / "vllm_omni_multiple.png"
     if output_path.exists():
         return Image.open(output_path)
-    with OmniServer(model=MULTIPLE_MODEL, serve_args=SERVER_ARGS):
+    with OmniServer(model=MULTIPLE_MODEL, serve_args=SERVER_ARGS) as server:
+        openai_client = OpenAIClientHandler(host=server.host, port=server.port, api_key="EMPTY", run_level=run_level)
         output = _run_vllm_omni_image_edit(
             model=MULTIPLE_MODEL,
             openai_client=openai_client,
@@ -187,12 +189,12 @@ def _diffusers_output_multiple_image(
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_single_matches_diffusers(
-    openai_client: OpenAIClientHandler,
+    run_level: str,
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
 ) -> None:
     vllm_image = _vllm_omni_output_single_image(
-        openai_client=openai_client,
+        run_level=run_level,
         accuracy_artifact_root=accuracy_artifact_root,
         qwen_bear_image=qwen_bear_image,
     )
@@ -216,13 +218,13 @@ def test_qwen_image_edit_single_matches_diffusers(
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_multiple_matches_diffusers(
-    openai_client: OpenAIClientHandler,
+    run_level: str,
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
     rabbit_image: Image.Image,
 ) -> None:
     vllm_image = _vllm_omni_output_multiple_image(
-        openai_client=openai_client,
+        run_level=run_level,
         accuracy_artifact_root=accuracy_artifact_root,
         qwen_bear_image=qwen_bear_image,
         rabbit_image=rabbit_image,
