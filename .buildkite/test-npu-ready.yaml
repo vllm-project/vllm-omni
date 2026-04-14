@@ -3,8 +3,6 @@ steps:
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
       resource_class: a2b3-1card
-    env:
-      NPU_COUNT: "1"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
     command: |
       set -ex
