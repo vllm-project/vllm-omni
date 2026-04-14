@@ -141,7 +141,6 @@ steps:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
           - buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-          - buildkite-agent artifact upload "tests/dfx/perf/results/*.html"
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -244,7 +243,7 @@ steps:
       - export DEFAULT_OUTPUT_DIR=tests/dfx/perf/results
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-qwen-image-performance
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-omni-performance
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-testcase-statistics
       - python tools/nightly/generate_nightly_perf_excel.py
       - python tools/nightly/generate_nightly_perf_html.py
       - python tools/nightly/send_nightly_email.py --report-file "tests/dfx/perf/results/*.xlsx, tests/dfx/perf/results/*.html"

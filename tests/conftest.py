@@ -1771,8 +1771,12 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         server_args = params.server_args or []
         if params.use_omni and params.stage_init_timeout is not None:
             server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+        else:
+            server_args = [*server_args, "--stage-init-timeout", "600"]
         if params.init_timeout is not None:
             server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+        else:
+            server_args = [*server_args, "--init-timeout", "900"]
         if params.use_stage_cli:
             if not params.use_omni:
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
@@ -2870,9 +2874,9 @@ class OmniRunner:
         self,
         model_name: str,
         seed: int = 42,
-        stage_init_timeout: int = 300,
+        stage_init_timeout: int = 600,
         batch_timeout: int = 10,
-        init_timeout: int = 300,
+        init_timeout: int = 900,
         shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
         stage_configs_path: str | None = None,

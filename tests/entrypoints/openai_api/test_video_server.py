@@ -766,6 +766,28 @@ def test_extra_params_merged_with_existing_extra_args(test_client, mocker: Mocke
     assert captured.extra_args["zero_steps"] == 2
 
 
+def test_sample_solver_forwarded_via_extra_params(test_client, mocker: MockerFixture):
+    """sample_solver can be passed through existing extra_params for Wan2.2 online serving."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A fox running through snow.",
+            "extra_params": json.dumps({"sample_solver": "euler"}),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.extra_args["sample_solver"] == "euler"
+
+
 # ---------------------------------------------------------------------------
 # Sync endpoint tests (POST /v1/videos/sync)
 # ---------------------------------------------------------------------------

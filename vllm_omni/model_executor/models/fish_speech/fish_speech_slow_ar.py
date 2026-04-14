@@ -194,6 +194,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         self.has_postprocess = True
         self.mtp_hidden_size = int(self.text_config.hidden_size)
         self.talker_mtp_output_key = "audio_codes"
+        self.talker_mtp_graph_safe = True
         self.gpu_resident_buffer_keys: set[str] = {"last_slow_ar_hidden"}
 
         # Qwen3 transformer backbone.
@@ -236,6 +237,8 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
                 slow_ar_config=self.text_config,
                 prefix="fast_ar",
             )
+        if self.talker_mtp_graph_safe:
+            self.fast_ar._disable_compile_for_graph = True
 
         # Constant logit mask: allow only semantic tokens + im_end.
         vocab = int(self.text_config.vocab_size)
@@ -680,18 +683,13 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         inputs_embeds_out = input_embeds.reshape(bsz, -1).clone()
 
         semantic_mask = (input_ids[:, 0] >= self._semantic_begin_id) & (input_ids[:, 0] <= self._semantic_end_id)
-        if semantic_mask.any():
-            semantic_codes = audio_codes[semantic_mask].clamp(min=0)
-            offsets = (
-                torch.arange(self._num_codebooks, device=dev, dtype=semantic_codes.dtype) * self._codebook_size
-            ).unsqueeze(0)
-            codebook_sum = self.codebook_embeddings(semantic_codes + offsets).sum(dim=1).to(dtype=torch.bfloat16)
-
-            # Normalize by sqrt(num_codebooks + 1) as in the reference model
-            # (scale_codebook_embeddings=True for fish_qwen3_omni).
-            inputs_embeds_out[semantic_mask] = (inputs_embeds_out[semantic_mask] + codebook_sum) / math.sqrt(
-                self._num_codebooks + 1
-            )
+        semantic_codes = audio_codes.clamp(min=0, max=self._codebook_size - 1)
+        offsets = (
+            torch.arange(self._num_codebooks, device=dev, dtype=semantic_codes.dtype) * self._codebook_size
+        ).unsqueeze(0)
+        codebook_sum = self.codebook_embeddings(semantic_codes + offsets).sum(dim=1).to(dtype=torch.bfloat16)
+        norm_embeds = (inputs_embeds_out + codebook_sum) / math.sqrt(self._num_codebooks + 1)
+        inputs_embeds_out = torch.where(semantic_mask.unsqueeze(-1), norm_embeds, inputs_embeds_out)
 
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)
 
@@ -802,14 +800,15 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         if truncated:
             logger.info("Truncated %d RoPE cos_sin_cache buffers to bf16 precision", truncated)
 
-        try:
-            self.fast_ar.warmup_compile(
-                device=self.codebook_embeddings.weight.device,
-                dtype=torch.bfloat16,
-                batch_sizes=(1,),
-            )
-        except Exception as exc:
-            logger.warning("Fish Speech Fast AR compile warmup failed: %s", exc)
+        if not getattr(self, "talker_mtp_graph_safe", False):
+            try:
+                self.fast_ar.warmup_compile(
+                    device=self.codebook_embeddings.weight.device,
+                    dtype=torch.bfloat16,
+                    batch_sizes=(1,),
+                )
+            except Exception as exc:
+                logger.warning("Fish Speech Fast AR compile warmup failed: %s", exc)
 
         codec_device = self.codebook_embeddings.weight.device
         _load_dac_codec(
