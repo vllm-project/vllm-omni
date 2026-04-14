@@ -194,11 +194,6 @@ class OmniEngineArgs(EngineArgs):
         Returns:
             OmniModelConfig instance with all configuration fields set
         """
-        if self.stage_configs_path is not None:
-            raise RuntimeError(
-                "create_model_config() should not be called when stage_configs_path is set. "
-                "Per-stage model configs are resolved from the stage config YAML."
-            )
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
