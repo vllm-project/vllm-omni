@@ -29,7 +29,7 @@ SSIM_THRESHOLD = 0.94
 PSNR_THRESHOLD = 28.0
 
 PROMPT_SINGLE_IMAGE = "The input is a 2D cartoon bear mascot. Restyle it into a painterly oil artwork with warm colors while preserving the main structure."
-PROMPT_MULTIPLE_IMAGE = "The first input is a 2D cartoon bear mascot and the second input is a furry rabbit. Blend them into one coherent scene with a cinematic style and consistent lighting."
+PROMPT_MULTIPLE_IMAGE = "Put the cartoon bear mascot and the furry rabbit into one coherent scene with a painterly oil artwork style and consistent lighting."
 NEGATIVE_PROMPT = "low quality, blurry, artifacts, distortion"
 SERVER_ARGS = ["--num-gpus", "1", "--stage-init-timeout", "300", "--init-timeout", "900"]
 
