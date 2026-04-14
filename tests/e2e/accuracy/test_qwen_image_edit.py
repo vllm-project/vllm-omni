@@ -196,8 +196,8 @@ def diffusers_output_multiple_image(
     indirect=True,
 )
 def test_qwen_image_edit_single_matches_diffusers(
-    vllm_omni_output_single_image: Image.Image,
     diffusers_output_single_image: Image.Image,
+    vllm_omni_output_single_image: Image.Image,
 ) -> None:
     assert_similarity(
         model_name=SINGLE_MODEL,
@@ -220,8 +220,8 @@ def test_qwen_image_edit_single_matches_diffusers(
     indirect=True,
 )
 def test_qwen_image_edit_multiple_matches_diffusers(
-    vllm_omni_output_multiple_image: Image.Image,
     diffusers_output_multiple_image: Image.Image,
+    vllm_omni_output_multiple_image: Image.Image,
 ) -> None:
     assert_similarity(
         model_name=MULTIPLE_MODEL,
