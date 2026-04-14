@@ -67,8 +67,10 @@ class Omni(OmniBase):
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         # Expand sampling params for PD disaggregation (user may provide N-1 params)
-        if sampling_params_list is not None and isinstance(sampling_params_list, Sequence) and not isinstance(
-            sampling_params_list, (str, bytes)
+        if (
+            sampling_params_list is not None
+            and isinstance(sampling_params_list, Sequence)
+            and not isinstance(sampling_params_list, (str, bytes))
         ):
             sampling_params_list = self._maybe_expand_sampling_params(list(sampling_params_list))
         sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)

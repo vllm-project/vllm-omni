@@ -11,7 +11,6 @@ The remaining tests exercise PDDisaggregationMixin directly and work
 without spinning up a real engine.
 """
 
-import types
 import uuid
 import warnings
 from queue import Empty, Queue
@@ -406,6 +405,7 @@ def _make_pd_omni(monkeypatch, stage_configs, *, extra_setup=None):
 
     if extra_setup:
         import vllm_omni.entrypoints.omni as omni_module
+
         extra_setup(monkeypatch, omni_module)
 
     return _LightweightOmni()
@@ -712,9 +712,7 @@ class TestPreparePrefillSamplingParams:
 # ===================================================================
 
 
-@pytest.mark.xfail(
-    reason="Requires migration to v1908 Orchestrator architecture (no stage_list / OmniStage)"
-)
+@pytest.mark.xfail(reason="Requires migration to v1908 Orchestrator architecture (no stage_list / OmniStage)")
 class TestSamplingParamsAutoDuplication:
     """When user provides N-1 sampling params (for logical stages), the
     orchestrator should auto-duplicate the thinker params for the decode stage.
@@ -865,9 +863,7 @@ class TestKvCfgToDict:
 # ===================================================================
 
 
-@pytest.mark.xfail(
-    reason="Requires migration to v1908 Orchestrator architecture (no stage_list / OmniStage)"
-)
+@pytest.mark.xfail(reason="Requires migration to v1908 Orchestrator architecture (no stage_list / OmniStage)")
 class TestPDRouting:
     """Test that the scheduling loop correctly routes requests from
     prefill to decode stage with proper kv_transfer_params.
@@ -1112,6 +1108,7 @@ class TestPDYAMLConfig:
         assert stages[1].engine_args.kv_transfer_config.kv_role == "kv_consumer"
         assert stages[0].engine_args.kv_transfer_config.kv_connector == "MooncakeConnector"
         assert stages[1].engine_args.kv_transfer_config.kv_connector == "MooncakeConnector"
+
 
 class TestPrefillStopNeutralization:
     """Tests that _prepare_prefill_sampling_params neutralizes stop

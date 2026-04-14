@@ -209,8 +209,10 @@ class AsyncOmni(EngineClient, OmniBase):
             self._final_output_handler()
 
             # Expand sampling params for PD disaggregation (user may provide N-1 params)
-            if sampling_params_list is not None and isinstance(sampling_params_list, Sequence) and not isinstance(
-                sampling_params_list, (str, bytes)
+            if (
+                sampling_params_list is not None
+                and isinstance(sampling_params_list, Sequence)
+                and not isinstance(sampling_params_list, (str, bytes))
             ):
                 sampling_params_list = self._maybe_expand_sampling_params(list(sampling_params_list))
             sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
@@ -231,14 +233,12 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
-            
+
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
             if self._pd_separation_pair is not None:
                 p_id = self._pd_separation_pair[0]
-                req_sp_list[p_id] = self._prepare_prefill_sampling_params(
-                    request_id, req_sp_list[p_id]
-                )
+                req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
 
             # Add request(s) to stage 0. For streaming inputs, submit
             # chunks incrementally through streaming_update.

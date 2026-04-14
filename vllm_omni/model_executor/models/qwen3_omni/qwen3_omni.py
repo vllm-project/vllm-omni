@@ -1042,8 +1042,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                 "(embed=%d, hidden=%d, mask=%d). "
                 "This usually means _merge_pd_embeddings failed to merge "
                 "prefill embeddings – check PD prefill_mm keys.",
-                segment_end_index, clamped,
-                thinker_embed.shape[0], thinker_hidden.shape[0],
+                segment_end_index,
+                clamped,
+                thinker_embed.shape[0],
+                thinker_hidden.shape[0],
                 multimodal_mask.shape[0],
             )
         segment_end_index = clamped

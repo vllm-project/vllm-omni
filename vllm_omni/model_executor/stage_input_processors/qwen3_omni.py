@@ -138,7 +138,10 @@ def _merge_pd_embeddings(
             "_merge_pd_embeddings: failed to extract prefill embeddings (%s). "
             "Expected keys %r and %r, got: %s. "
             "Falling back to decode-only embeddings – talker user-segment will be degraded.",
-            exc, _EMBED_LAYER_KEY, _HIDDEN_LAYER_KEY, available_keys,
+            exc,
+            _EMBED_LAYER_KEY,
+            _HIDDEN_LAYER_KEY,
+            available_keys,
         )
         return decode_emb, decode_hid
 

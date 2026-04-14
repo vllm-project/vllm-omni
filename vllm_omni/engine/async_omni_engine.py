@@ -25,8 +25,8 @@ from typing import TYPE_CHECKING, Any
 import janus
 import torch
 from omegaconf import OmegaConf
-from vllm.engine.arg_utils import EngineArgs
 from vllm import envs as vllm_envs
+from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -1133,7 +1133,7 @@ class AsyncOmniEngine:
         if cache_config is None and cache_backend not in (None, "", "none"):
             cache_config = AsyncOmniEngine._get_default_cache_config(cache_backend)
         return cache_config
-    
+
     def _detect_pd_config(self) -> dict[str, Any] | None:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
         Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
