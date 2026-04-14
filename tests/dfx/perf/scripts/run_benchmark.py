@@ -40,13 +40,11 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, stage_config_path = request.param
+        test_name, model, serve_extras = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", str(STAGE_INIT_TIMEOUT), "--init-timeout", "900"]
-        if stage_config_path:
-            server_args = ["--stage-configs-path", stage_config_path] + server_args
+        server_args = list(serve_extras) + ["--stage-init-timeout", str(STAGE_INIT_TIMEOUT), "--init-timeout", "900"]
         with OmniServer(model, server_args) as server:
             server.test_name = test_name
             print("OmniServer started successfully")

@@ -5,6 +5,25 @@ from typing import Any
 from tests.conftest import modify_stage_config
 
 
+def flatten_server_serve_args(serve_args: dict[str, Any] | None) -> list[str]:
+    """Turn ``server_params.serve_args`` into CLI tokens (``--flag`` / ``--flag value``)."""
+    if not serve_args:
+        return []
+    out: list[str] = []
+    for key, value in serve_args.items():
+        flag = f"--{key.lstrip('-')}"
+        if isinstance(value, bool):
+            if value:
+                out.append(flag)
+        elif isinstance(value, dict):
+            out.extend([flag, json.dumps(value, ensure_ascii=False, separators=(",", ":"))])
+        elif isinstance(value, list):
+            out.extend([flag, json.dumps(value, ensure_ascii=False, separators=(",", ":"))])
+        else:
+            out.extend([flag, str(value)])
+    return out
+
+
 def load_configs(config_path: str) -> list[dict[str, Any]]:
     try:
         abs_path = Path(config_path).resolve()
@@ -38,25 +57,33 @@ def modify_stage(default_path, updates, deletes):
 def create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
-) -> list[tuple[str, str, str]]:
+) -> list[tuple[str, str, list[str]]]:
+    """Return unique ``(test_name, model, omni_serve_extras)`` for OmniServer.
+
+    ``omni_serve_extras`` is appended after ``serve`` / ``--omni`` / host / port
+    (for example ``--stage-configs-path …`` and/or diffusion ``--tensor-parallel-size``).
+    Timeouts are added by each test harness (perf vs stability).
+    """
     unique_params = []
     seen = set()
     for config in configs:
         test_name = config["test_name"]
-        model = config["server_params"]["model"]
-        stage_config_name = config["server_params"].get("stage_config_name")
+        server_params = config["server_params"]
+        model = server_params["model"]
+        stage_config_name = server_params.get("stage_config_name")
+        extras: list[str] = []
         if stage_config_name:
             stage_config_path = str(stage_configs_dir / stage_config_name)
-            delete = config["server_params"].get("delete", None)
-            update = config["server_params"].get("update", None)
+            delete = server_params.get("delete", None)
+            update = server_params.get("update", None)
             stage_config_path = modify_stage(stage_config_path, update, delete)
-        else:
-            stage_config_path = None
+            extras.extend(["--stage-configs-path", stage_config_path])
+        extras.extend(flatten_server_serve_args(server_params.get("serve_args")))
 
-        server_param = (test_name, model, stage_config_path)
-        if server_param not in seen:
-            seen.add(server_param)
-            unique_params.append(server_param)
+        dedupe_key = (test_name, model, tuple(extras))
+        if dedupe_key not in seen:
+            seen.add(dedupe_key)
+            unique_params.append((test_name, model, extras))
 
     return unique_params
 

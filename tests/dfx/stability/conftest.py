@@ -3,20 +3,115 @@ Stability-specific conftest: when pytest is executed under this directory,
 resource monitoring is started before each test and finalized after each test,
 so each stability test case gets its own HTML report (one report per case).
 No need to wrap pytest with `bash resource_monitor.sh run -- pytest ...`.
+
+Also exposes duration-based stability benchmark helpers (merge/summary/loop)
+used by ``test_stability_*.py`` under ``scripts/``.
 """
 
+from __future__ import annotations
+
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 STABILITY_DIR = Path(__file__).resolve().parent
 RESOURCE_MONITOR_SCRIPT = STABILITY_DIR / "scripts" / "resource_monitor.sh"
 REPO_ROOT = STABILITY_DIR.parent.parent.parent
+
+RunOneBatchFn = Callable[
+    [str, int, str, dict[str, Any], int, float | None, int | None, str, int],
+    dict[str, Any],
+]
+
+
+def merge_batch_results(batch_results: list[dict[str, Any]], total_duration_sec: float) -> dict[str, Any]:
+    if not batch_results:
+        return {"completed": 0, "failed": 0, "duration": total_duration_sec, "errors": []}
+
+    completed = sum(r.get("completed", 0) for r in batch_results)
+    failed = sum(r.get("failed", 0) for r in batch_results)
+    merged: dict[str, Any] = {
+        "completed": completed,
+        "failed": failed,
+        "duration": total_duration_sec,
+        "errors": [],
+    }
+    for r in batch_results:
+        merged["errors"].extend(r.get("errors") or [])
+    return merged
+
+
+def print_merged_report(result: dict[str, Any]) -> None:
+    fmt = "{:<40} {:<10}"
+    fmt_float = "{:<40} {:<10.2f}"
+    completed = result.get("completed", 0)
+    failed = result.get("failed", 0)
+    duration = float(result.get("duration", 0.0) or 0.0)
+    print("\n============ Stability Benchmark Summary ============")
+    print(fmt.format("Successful requests:", completed))
+    print(fmt.format("Failed requests:", failed))
+    print(fmt_float.format("Total duration (s):", duration))
+    print("==================================================\n")
+
+
+def run_stability_benchmark_loop(
+    host: str,
+    port: int,
+    model: str,
+    duration_sec: int | float,
+    params: dict[str, Any],
+    *,
+    request_rate: float | None,
+    max_concurrency: int | None,
+    result_dir: str,
+    num_prompts_per_batch: int,
+    run_one_batch: RunOneBatchFn,
+    result_filename: str | None = None,
+) -> dict[str, Any]:
+    if (request_rate is None) == (max_concurrency is None):
+        raise ValueError("Exactly one of request_rate or max_concurrency must be specified")
+
+    start_time = time.perf_counter()
+    batch_results: list[dict[str, Any]] = []
+    batch_index = 0
+
+    while True:
+        if (time.perf_counter() - start_time) >= duration_sec:
+            break
+        result = run_one_batch(
+            host,
+            port,
+            model,
+            params,
+            num_prompts_per_batch,
+            request_rate,
+            max_concurrency,
+            result_dir,
+            batch_index,
+        )
+        batch_results.append(result)
+        batch_index += 1
+        if (time.perf_counter() - start_time) >= duration_sec:
+            break
+
+    total_duration = time.perf_counter() - start_time
+    merged = merge_batch_results(batch_results, total_duration)
+    print_merged_report(merged)
+
+    if result_filename and result_dir:
+        result_path = Path(result_dir) / result_filename
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2, ensure_ascii=False)
+
+    return merged
 
 
 def _start_resource_monitor():
