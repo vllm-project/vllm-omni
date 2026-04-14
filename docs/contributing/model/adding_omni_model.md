@@ -315,6 +315,12 @@ The registry uses lazy loading, so the model class is imported only when needed.
 
 Create a YAML configuration file in `vllm_omni/model_executor/stage_configs/`. For a complete example, see the [Qwen3-Omni configuration file](gh-file:vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml).
 
+#### Optional: Server-Side Prompt Preprocessing
+
+If your model's AR stage requires a specific prompt format (e.g., chat template with system prompt), you can use `prompt_preprocess_func` to apply the formatting server-side. This keeps the client API clean - clients send raw prompts without needing to know the model's internal formatting requirements.
+
+See `docs/configuration/stage_configs.md` for the `prompt_preprocess_func` reference.
+
 ### Key Configuration Fields
 
 - **`model_stage`**: Which stage to run ("thinker", "talker", "code2wav", etc.)

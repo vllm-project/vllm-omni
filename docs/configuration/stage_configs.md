@@ -143,6 +143,20 @@ A custom Python function hook for the LLM stage (Stage 0) that expands a single 
 
 A custom Python function hook for downstream diffusion stages (Stage 1+) to collect, map, and process the KV caches transferred from the companion requests fired by `prompt_expand_func`. It aggregates the hidden condition states cleanly (e.g., binding them as `cfg_text_past_key_values` and `cfg_text_kv_metadata`), allowing the diffusion runtime to perform CFG smoothly without redundantly evaluating text paths on the DiT workers.
 
+### `prompt_preprocess_func` (Optional)
+
+A custom Python function hook that transforms the raw user prompt before Stage 0 tokenization. This enables server-side chat template application, system prompt prepending, or other prompt formatting without requiring client-side changes.
+
+The function receives the prompt (either a dict with a "prompt" key from the API endpoint, or a raw string) and returns the transformed prompt in the same format.
+
+Example use case: a multi-stage image generation pipeline where Stage 0 is a prompt rewriting LLM (e.g., GLM-Image) that needs chat-formatted input, but the client sends raw text prompts via `/v1/images/generations`.
+
+The function is specified as a dotted Python path in the YAML config:
+
+    prompt_preprocess_func: vllm_omni.model_executor.stage_input_processors.glm_image.preprocess_prompt_for_glm
+
+The preprocessor runs in `_build_add_request_message()` BEFORE `InputProcessor.process_inputs()` tokenizes the prompt. Only one `prompt_preprocess_func` is active at a time (from the last stage that defines it), matching the behavior of `prompt_expand_func`.
+
 ### `runtime`
 
 Configuration for disaggregated execution of the stage, controlling how the stage is deployed and executed.

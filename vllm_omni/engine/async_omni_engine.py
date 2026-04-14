@@ -665,6 +665,8 @@ class AsyncOmniEngine:
 
         async_chunk = self.async_chunk
         prompt_expand_func = None
+        prompt_preprocess_func = None
+
         llm_stage_count = sum(
             1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
         )
@@ -714,6 +716,9 @@ class AsyncOmniEngine:
                     logger.info("[AsyncOmniEngine] Initializing stage %s", configured_stage_id)
                     if metadata.prompt_expand_func is not None:
                         prompt_expand_func = metadata.prompt_expand_func
+
+                    if metadata.prompt_preprocess_func is not None:
+                        prompt_preprocess_func = metadata.prompt_preprocess_func
 
                     if self.single_stage_mode:
                         metadata.runtime_cfg = None
@@ -860,6 +865,8 @@ class AsyncOmniEngine:
         self.stage_vllm_configs = stage_vllm_configs
         self.input_processor = input_processor
         self.prompt_expand_func = prompt_expand_func
+        self.prompt_preprocess_func = prompt_preprocess_func
+
         # TODO(Peiqi): Hack here
         supported_tasks: set[str] = set()
         if any(getattr(stage_client, "is_comprehension", False) for stage_client in initialized_stage_clients):
@@ -971,6 +978,10 @@ class AsyncOmniEngine:
 
         stage_type = self.stage_metadata[0].get("stage_type")
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+            # Apply server-side prompt preprocessing before tokenization.
+            if self.prompt_preprocess_func is not None:
+                prompt = self.prompt_preprocess_func(prompt)
+
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
                 _inject_global_id(prompt, request_id)
