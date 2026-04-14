@@ -1,5 +1,5 @@
 steps:
-  - label: ":buildkit: Build and Push NPU Test Image"
+  - label: ":buildkit: Build and Push NPU Test Image (Test Environment - gy006)"
     key: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
@@ -83,10 +83,10 @@ steps:
       echo "--- Image pushed successfully"
       echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
 
-  - label: "Upload Test Pipeline"
+  - label: "Upload Test Pipeline (gy006 - 1 Card)"
     depends_on: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
+      resource_class: a2b3-1card
     command: |
       buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml
-      

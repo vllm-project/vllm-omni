@@ -1,9 +1,9 @@
 steps:
   # ==================== HK-001 (a2b3) ====================
-  - label: ":buildkit: Build and Push NPU Prod Image (HK-001 a2b3)"
+  - label: ":buildkit: Build and Push NPU Prod Image (HK-001 a2b3 - Default: 1 Card)"
     key: image-build-hk001
     agents:
-      queue: "linux-aarch64-a2b3-1"
+      queue: "linux-aarch64-a2b3"
     plugins:
       - kubernetes:
           metadata:
@@ -45,10 +45,12 @@ steps:
       IMAGE_REGISTRY: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry"
       # buildkitd remote connection
       BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd:1234"
+      NPU_COUNT: "1"  # A2 B3 默认为单卡
     command: |
       set -ex
 
       echo "--- Building and pushing NPU Prod Image (HK-001 a2b3)"
+      echo "NPU Count: $${NPU_COUNT}"
       echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
       echo "buildkitd address: $${BUILDKITD_ADDR}"
 
@@ -83,15 +85,15 @@ steps:
   - label: "Upload Test Pipeline (HK-001)"
     depends_on: image-build-hk001
     agents:
-      queue: "linux-aarch64-a2b3-1"
+      queue: "linux-aarch64-a2b3"
     command: |
       buildkite-agent pipeline upload .buildkite/prod/test-npu-ready-hk001.yaml
 
   # ==================== CN12-001 (a3) ====================
-  - label: ":buildkit: Build and Push NPU Prod Image (CN12-001 a3)"
+  - label: ":buildkit: Build and Push NPU Prod Image (CN12-001 a3 - Default: 2 Cards)"
     key: image-build-cn12001
     agents:
-      queue: "linux-aarch64-a3-2"
+      queue: "linux-aarch64-a3"
     plugins:
       - kubernetes:
           metadata:
@@ -133,10 +135,12 @@ steps:
       IMAGE_REGISTRY: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry"
       # buildkitd remote connection
       BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd:1234"
+      NPU_COUNT: "2"  # A3 默认为双卡
     command: |
       set -ex
 
       echo "--- Building and pushing NPU Prod Image (CN12-001 a3)"
+      echo "NPU Count: $${NPU_COUNT}"
       echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
       echo "buildkitd address: $${BUILDKITD_ADDR}"
 
@@ -174,6 +178,29 @@ steps:
   - label: "Upload Test Pipeline (CN12-001)"
     depends_on: image-build-cn12001
     agents:
-      queue: "linux-aarch64-a3-2"
+      queue: "linux-aarch64-a3"
     command: |
       buildkite-agent pipeline upload .buildkite/prod/test-npu-ready-cn12001.yaml
+
+  # ==================== 动态资源准备 ====================
+  - wait: ~
+
+  - label: "🚀 Ready for Dynamic Resource Testing"
+    command: |
+      echo "--- All images built successfully"
+      echo "NPU configurations ready for dynamic testing"
+      echo "- A2 B3 (HK-001): Default 1 Card"
+      echo "- A3 (CN12-001): Default 2 Cards"
+
+notes: |
+  ## 新队列架构说明
+
+  **主要变更**：
+  - ✅ 按机器类型分组：从 8 个队列减少到 2 个
+  - ✅ A2 B3 默认单卡配置：`huawei.com/ascend-1980: "1"`
+  - ✅ A3 默认双卡配置：`huawei.com/ascend-910-3: "2"`
+
+  **后续计划**：
+  - 📋 第二阶段：实现动态资源分配
+  - 🔄 支持环境变量指定设备数量
+  - 🎯 实现"K8s 控制器根据任务规格创建 Pod"

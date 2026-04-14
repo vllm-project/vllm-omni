@@ -1,0 +1,215 @@
+steps:
+  # ==================== A2 B3 动态资源测试 ====================
+
+  # A2 B3 单卡测试
+  - label: "🧪 NPU Unit Test (A2 B3 - 1 Card)"
+    agents:
+      queue: "linux-aarch64-a2b3"
+      resource_class: a2b3-1card
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    env:
+      NPU_COUNT: "1"
+      NPU_TYPE: "a2b3"
+    command: |
+      set -ex
+
+      echo "--- A2 B3 Single Card Test"
+      echo "NPU Count: $${NPU_COUNT}"
+      echo "NPU Type: $${NPU_TYPE}"
+
+      echo "--- Container information"
+      uname -a
+      python3 --version
+
+      echo "--- Verifying npu-smi"
+      npu-smi info
+
+      echo "--- Running single card tests"
+      timeout 15m pytest -v -s -m 'single_card and a2b3' \
+        --cov=vllm_omni \
+        --cov-report=term-missing
+
+  # A2 B3 2卡测试
+  - label: "🧪 NPU Unit Test (A2 B3 - 2 Cards)"
+    agents:
+      queue: "linux-aarch64-a2b3"
+      resource_class: a2b3-2card
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    env:
+      NPU_COUNT: "2"
+      NPU_TYPE: "a2b3"
+    command: |
+      set -ex
+
+      echo "--- A2 B3 2 Card Test"
+      echo "NPU Count: $${NPU_COUNT}"
+      echo "NPU Type: $${NPU_TYPE}"
+
+      echo "--- Verifying npu-smi"
+      npu-smi info
+
+      echo "--- Running 2 card tests"
+      timeout 20m pytest -v -s -m 'multi_card and a2b3' \
+        --cov=vllm_omni \
+        --cov-report=term-missing
+
+  # A2 B3 4卡测试
+  - label: "🧪 NPU Unit Test (A2 B3 - 4 Cards)"
+    agents:
+      queue: "linux-aarch64-a2b3"
+      resource_class: a2b3-4card
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    env:
+      NPU_COUNT: "4"
+      NPU_TYPE: "a2b3"
+    command: |
+      set -ex
+
+      echo "--- A2 B3 4 Card Test"
+      echo "NPU Count: $${NPU_COUNT}"
+      echo "NPU Type: $${NPU_TYPE}"
+
+      echo "--- Verifying npu-smi"
+      npu-smi info
+
+      echo "--- Running 4 card tests"
+      timeout 30m pytest -v -s -m 'multi_card and a2b3' \
+        --cov=vllm_omni \
+        --cov-report=term-missing
+
+  # A2 B3 8卡测试
+  - label: "🧪 NPU Unit Test (A2 B3 - 8 Cards)"
+    agents:
+      queue: "linux-aarch64-a2b3"
+      resource_class: a2b3-8card
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    env:
+      NPU_COUNT: "8"
+      NPU_TYPE: "a2b3"
+    command: |
+      set -ex
+
+      echo "--- A2 B3 8 Card Test"
+      echo "NPU Count: $${NPU_COUNT}"
+      echo "NPU Type: $${NPU_TYPE}"
+
+      echo "--- Verifying npu-smi"
+      npu-smi info
+
+      echo "--- Running 8 card tests"
+      timeout 45m pytest -v -s -m 'multi_card and a2b3' \
+        --cov=vllm_omni \
+        --cov-report=term-missing
+
+  # ==================== A3 动态资源测试 ====================
+
+  # A3 2卡测试
+  - label: "🧪 NPU Unit Test (A3 - 2 Cards)"
+    agents:
+      queue: "linux-aarch64-a3"
+      resource_class: a3-2card
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    env:
+      NPU_COUNT: "2"
+      NPU_TYPE: "a3"
+    command: |
+      set -ex
+
+      echo "--- A3 Dual Card Test"
+      echo "NPU Count: $${NPU_COUNT}"
+      echo "NPU Type: $${NPU_TYPE}"
+
+      echo "--- Container information"
+      uname -a
+      python3 --version
+
+      echo "--- Verifying npu-smi"
+      npu-smi info
+
+      echo "--- Running dual card tests"
+      timeout 15m pytest -v -s -m 'dual_card and a3' \
+        --cov=vllm_omni \
+        --cov-report=term-missing
+
+  # A3 4卡测试
+  - label: "🧪 NPU Unit Test (A3 - 4 Cards)"
+    agents:
+      queue: "linux-aarch64-a3"
+      resource_class: a3-4card
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    env:
+      NPU_COUNT: "4"
+      NPU_TYPE: "a3"
+    command: |
+      set -ex
+
+      echo "--- A3 4 Card Test"
+      echo "NPU Count: $${NPU_COUNT}"
+      echo "NPU Type: $${NPU_TYPE}"
+
+      echo "--- Verifying npu-smi"
+      npu-smi info
+
+      echo "--- Running 4 card tests"
+      timeout 30m pytest -v -s -m 'multi_card and a3' \
+        --cov=vllm_omni \
+        --cov-report=term-missing
+
+  # A3 8卡测试
+  - label: "🧪 NPU Unit Test (A3 - 8 Cards)"
+    agents:
+      queue: "linux-aarch64-a3"
+      resource_class: a3-8card
+    image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
+    env:
+      NPU_COUNT: "8"
+      NPU_TYPE: "a3"
+    command: |
+      set -ex
+
+      echo "--- A3 8 Card Test"
+      echo "NPU Count: $${NPU_COUNT}"
+      echo "NPU Type: $${NPU_TYPE}"
+
+      echo "--- Verifying npu-smi"
+      npu-smi info
+
+      echo "--- Running 8 card tests"
+      timeout 45m pytest -v -s -m 'multi_card and a3' \
+        --cov=vllm_omni \
+        --cov-report=term-missing
+
+  # ==================== 性能基准测试 ====================
+
+  - wait: ~
+
+  - label: "📊 Performance Benchmark Summary"
+    command: |
+      echo "--- Performance Benchmark Summary"
+      echo ""
+      echo "Queue Architecture:"
+      echo "- A2 B3: linux-aarch64-a2b3 (supports 1,2,4,8 cards)"
+      echo "- A3: linux-aarch64-a3 (supports 2,4,8,16 cards)"
+      echo ""
+      echo "Dynamic Resource Allocation:"
+      echo "- Use agents.resource_class to match resource-classes in values.yaml"
+      echo "- Buildkite agent-stack-k8s will apply matched resource configuration"
+
+notes: |
+  ## 动态资源测试 Pipeline (使用 resource_class)
+
+  **使用方法**：
+  - 队列：`linux-aarch64-a2b3` 或 `linux-aarch64-a3`
+  - 使用 `resource_class` 匹配 values.yaml 中定义的资源类
+  - Buildkite agent-stack-k8s 会自动应用匹配的资源配置
+
+  **资源类对应关系**：
+  | resource_class | NPU 类型 | 卡数 | CPU | 内存 |
+  |----------------|----------|------|-----|------|
+  | a2b3-1card | ascend-1980 | 1 | 23 | 64Gi |
+  | a2b3-2card | ascend-1980 | 2 | 46 | 128Gi |
+  | a2b3-4card | ascend-1980 | 4 | 92 | 256Gi |
+  | a2b3-8card | ascend-1980 | 8 | 184 | 256Gi |
+  | a3-2card | ascend-910-3 | 2 | 78 | 256Gi |
+  | a3-4card | ascend-910-3 | 4 | 156 | 512Gi |
+  | a3-8card | ascend-910-3 | 8 | 312 | 1024Gi |

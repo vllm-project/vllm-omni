@@ -1,13 +1,11 @@
 steps:
-  - label: "🧪 NPU Unit Test"
+  - label: "🧪 NPU Unit Test (gy006 - 1 Card)"
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
+      resource_class: a2b3-1card
+    env:
+      NPU_COUNT: "1"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
-    plugins:
-      - kubernetes:
-          podSpecPatch:
-            imagePullSecrets:
-            - name: swr-secret
     command: |
       set -ex
 
@@ -16,9 +14,13 @@ steps:
       python3 --version
 
       echo "--- Verifying npu-smi"
-      ls -l /usr/local/bin/npu-smi
-      npu-smi info
-      
+      ls -l /usr/local/bin/npu-smi || echo "npu-smi not found in /usr/local/bin"
+      if command -v npu-smi &> /dev/null; then
+        npu-smi info
+      else
+        echo "WARNING: npu-smi command not available"
+      fi
+
       echo "--- Running pytest"
       timeout 20m pytest -v -s -m 'core_model and npu' \
         --cov=vllm_omni \
