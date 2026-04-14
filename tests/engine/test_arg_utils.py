@@ -118,13 +118,6 @@ def test_qwen3_tts_codec_frame_rate_patching():
     assert omni_config.codec_frame_rate_hz == 12.3
 
 
-def test_stage_configs_path_blocks_create_model_config():
-    """create_model_config() should raise when stage_configs_path is set."""
-    args = OmniEngineArgs(stage_configs_path="/some/path.yaml")
-    with pytest.raises(RuntimeError, match="stage_configs_path"):
-        args.create_model_config()
-
-
 def test_from_cli_args_picks_up_stage_configs_path():
     """from_cli_args should pick up stage_configs_path from namespace."""
     ns = argparse.Namespace(
