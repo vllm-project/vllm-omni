@@ -3,7 +3,15 @@
         "test_name": "test_wan22_t2v_stability_v1_videos",
         "server_params": {
             "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-            "serve_args": {}
+            "serve_args": {
+                "ulysses-degree": 4,
+                "vae-patch-parallel-size": 8,
+                "cfg-parallel-size": 2,
+                "tensor-parallel-size": 1,
+                "use-hsdp": true,
+                "vae-use-slicing": true,
+                "vae-use-tiling": true
+            }
         },
         "benchmark_params": [
             {
