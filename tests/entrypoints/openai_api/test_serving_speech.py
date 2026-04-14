@@ -654,6 +654,87 @@ class TestTTSMethods:
         yield server
         server.shutdown()
 
+    def test_normalize_speech_request_preserves_voice_but_adds_lookup(self, speech_server):
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan")
+
+        normalized = speech_server._normalize_speech_request(req)
+
+        assert normalized.voice == "Ryan"
+        assert normalized.voice_lookup == "ryan"
+
+    def test_normalize_speech_request_resolves_uploaded_audio_voice(self, speech_server, mocker: MockerFixture):
+        speech_server.uploaded_speakers = {
+            "custom_voice": {
+                "name": "custom_voice",
+                "file_path": "/tmp/voice_samples/custom_voice.wav",
+                "mime_type": "audio/wav",
+                "embedding_source": "audio",
+                "ref_text": "Uploaded transcript",
+            }
+        }
+        mock_audio = mocker.patch.object(
+            speech_server, "_get_uploaded_audio_data", return_value="data:audio/wav;base64,ZmFrZQ=="
+        )
+        req = OpenAICreateSpeechRequest(input="Hello", voice="CUSTOM_VOICE")
+
+        normalized = speech_server._normalize_speech_request(req)
+
+        assert normalized.voice == "CUSTOM_VOICE"
+        assert normalized.voice_lookup == "custom_voice"
+        assert normalized.ref_audio == "data:audio/wav;base64,ZmFrZQ=="
+        assert normalized.ref_text == "Uploaded transcript"
+        mock_audio.assert_called_once_with("custom_voice")
+
+    def test_normalize_speech_request_resolves_uploaded_embedding_voice(self, speech_server, mocker: MockerFixture):
+        speech_server.uploaded_speakers = {
+            "emb_voice": {
+                "name": "emb_voice",
+                "file_path": "/tmp/voice_samples/emb_voice.safetensors",
+                "mime_type": "application/x-safetensors",
+                "embedding_source": "direct",
+                "cache_status": "ready",
+                "cache_file": "/tmp/voice_samples/emb_voice.safetensors",
+            }
+        }
+        mock_embedding = mocker.patch.object(
+            speech_server, "_get_uploaded_speaker_embedding", return_value=[0.1] * 1024
+        )
+        req = OpenAICreateSpeechRequest(input="Hello", voice="EMB_VOICE", x_vector_only_mode=False)
+
+        normalized = speech_server._normalize_speech_request(req)
+
+        assert normalized.voice == "EMB_VOICE"
+        assert normalized.voice_lookup == "emb_voice"
+        assert normalized.speaker_embedding is not None
+        assert normalized.x_vector_only_mode is True
+        mock_embedding.assert_called_once_with("emb_voice")
+
+    def test_normalize_speech_request_does_not_backfill_uploaded_metadata_when_ref_audio_is_explicit(
+        self, speech_server, mocker: MockerFixture
+    ):
+        speech_server.uploaded_speakers = {
+            "custom_voice": {
+                "name": "custom_voice",
+                "file_path": "/tmp/voice_samples/custom_voice.wav",
+                "mime_type": "audio/wav",
+                "embedding_source": "audio",
+                "ref_text": "Uploaded transcript",
+            }
+        }
+        mock_audio = mocker.patch.object(speech_server, "_get_uploaded_audio_data")
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            voice="CUSTOM_VOICE",
+            ref_audio="data:audio/wav;base64,ZXhwbGljaXQ=",
+        )
+
+        normalized = speech_server._normalize_speech_request(req)
+
+        assert normalized.ref_audio == "data:audio/wav;base64,ZXhwbGljaXQ="
+        assert normalized.ref_text is None
+        assert normalized.resolved_upload_audio is False
+        mock_audio.assert_not_called()
+
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
         # Fixture creates server with stage_configs = [] -> _is_tts should be False
@@ -2258,6 +2339,36 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_uploaded_audio_voice_preserves_auto_clone_params(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        qwen3_tts_server.uploaded_speakers = {
+            "custom_voice": {
+                "name": "custom_voice",
+                "file_path": "/tmp/voice_samples/custom_voice.wav",
+                "mime_type": "audio/wav",
+                "embedding_source": "audio",
+                "ref_text": None,
+                "created_at": 1711234567.89,
+            }
+        }
+        mocker.patch("pathlib.Path.exists", return_value=True)
+        mocker.patch.object(
+            qwen3_tts_server,
+            "_get_uploaded_audio_data",
+            return_value="data:audio/wav;base64,ZmFrZQ==",
+        )
+        qwen3_tts_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.1, 0.2, 0.3], 24000))
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        request = OpenAICreateSpeechRequest(input="hello", voice="CUSTOM_VOICE")
+        _, _, tts_params = asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        assert tts_params["task_type"] == ["Base"]
+        assert tts_params["x_vector_only_mode"] == [True]
+        assert tts_params["voice_created_at"] == [1711234567.89]
+        assert tts_params["ref_audio"] == [[[0.1, 0.2, 0.3], 24000]]
 
     def test_shutdown_is_idempotent(self, mocker: MockerFixture):
         """Calling shutdown() twice should not raise."""

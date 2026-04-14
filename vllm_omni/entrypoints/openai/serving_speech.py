@@ -8,6 +8,7 @@ import re
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,25 @@ _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
+
+
+@dataclass
+class SpeechRequestNormalized:
+    """Canonicalized speech request fields shared by serving paths."""
+
+    input_text: str
+    voice: str | None
+    voice_lookup: str | None
+    task_type: str | None
+    language: str | None
+    instructions: str | None
+    ref_audio: str | None
+    ref_text: str | None
+    speaker_embedding: list[float] | None
+    x_vector_only_mode: bool | None
+    uploaded_speaker_info: dict[str, Any] | None = None
+    resolved_upload_audio: bool = False
+    resolved_upload_embedding: bool = False
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -512,6 +532,76 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error("Could not load embedding for voice %s: %s", voice_name, e)
             return None
 
+    def _normalize_speech_request(self, request: OpenAICreateSpeechRequest) -> SpeechRequestNormalized:
+        """Normalize request fields before validation or model adaptation."""
+        voice = request.voice
+        voice_lookup = request.voice.lower() if request.voice is not None else None
+        task_type = request.task_type
+        pre_resolved_upload_audio = bool(getattr(request, "_auto_resolved_upload_audio", False))
+        pre_resolved_upload_embedding = bool(getattr(request, "_auto_resolved_upload_embedding", False))
+        explicit_ref_audio = request.ref_audio is not None and not pre_resolved_upload_audio
+        explicit_speaker_embedding = request.speaker_embedding is not None and not pre_resolved_upload_embedding
+        ref_audio = request.ref_audio
+        ref_text = request.ref_text.strip() if request.ref_text and request.ref_text.strip() else None
+        speaker_embedding = request.speaker_embedding
+        x_vector_only_mode = request.x_vector_only_mode
+        uploaded_speaker_info = self.uploaded_speakers.get(voice_lookup) if voice_lookup is not None else None
+        resolved_upload_audio = pre_resolved_upload_audio
+        resolved_upload_embedding = pre_resolved_upload_embedding
+
+        if uploaded_speaker_info is not None and not explicit_ref_audio and not explicit_speaker_embedding:
+            if ref_text is None:
+                stored_ref_text = uploaded_speaker_info.get("ref_text")
+                ref_text = (
+                    stored_ref_text.strip() if isinstance(stored_ref_text, str) and stored_ref_text.strip() else None
+                )
+            if ref_audio is None and uploaded_speaker_info.get("embedding_source") != "direct":
+                ref_audio = self._get_uploaded_audio_data(voice_lookup)
+                resolved_upload_audio = ref_audio is not None
+            if speaker_embedding is None and uploaded_speaker_info.get("embedding_source") == "direct":
+                speaker_embedding = self._get_uploaded_speaker_embedding(voice_lookup)
+                resolved_upload_embedding = speaker_embedding is not None
+
+        if (
+            self._tts_model_type in (None, "qwen3_tts")
+            and task_type is None
+            and (ref_audio is not None or ref_text is not None or resolved_upload_embedding)
+        ):
+            task_type = "Base"
+
+        if speaker_embedding is not None:
+            x_vector_only_mode = True
+
+        return SpeechRequestNormalized(
+            input_text=request.input,
+            voice=voice,
+            voice_lookup=voice_lookup,
+            task_type=task_type,
+            language=request.language,
+            instructions=request.instructions,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            speaker_embedding=speaker_embedding,
+            x_vector_only_mode=x_vector_only_mode,
+            uploaded_speaker_info=uploaded_speaker_info,
+            resolved_upload_audio=resolved_upload_audio,
+            resolved_upload_embedding=resolved_upload_embedding,
+        )
+
+    @staticmethod
+    def _apply_normalized_speech_request(
+        request: OpenAICreateSpeechRequest,
+        normalized: SpeechRequestNormalized,
+    ) -> None:
+        """Mutate request so downstream code sees canonicalized fields."""
+        request.task_type = normalized.task_type
+        request.ref_audio = normalized.ref_audio
+        request.ref_text = normalized.ref_text
+        request.speaker_embedding = normalized.speaker_embedding
+        request.x_vector_only_mode = normalized.x_vector_only_mode
+        object.__setattr__(request, "_auto_resolved_upload_audio", normalized.resolved_upload_audio)
+        object.__setattr__(request, "_auto_resolved_upload_embedding", normalized.resolved_upload_embedding)
+
     async def upload_voice(
         self,
         audio_file: UploadFile,
@@ -807,6 +897,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_voxtral_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate Voxtral TTS request parameters. Returns error message or None."""
+        normalized = self._normalize_speech_request(request)
+        self._apply_normalized_speech_request(request, normalized)
+
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
@@ -819,9 +912,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if fmt_err:
                 return fmt_err
 
-        if request.voice is not None:
-            request.voice = request.voice.lower()
-            if self.supported_speakers and request.voice not in self.supported_speakers:
+        if normalized.voice_lookup is not None:
+            if self.supported_speakers and normalized.voice_lookup not in self.supported_speakers:
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         if request.max_new_tokens is not None:
@@ -834,14 +926,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_qwen_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate Qwen TTS request parameters. Returns error message or None."""
-        # Infer Base task when ref_audio or ref_text is provided without explicit task_type.
-        if request.task_type is None and (request.ref_audio is not None or request.ref_text is not None):
-            request.task_type = "Base"
+        normalized = self._normalize_speech_request(request)
+        self._apply_normalized_speech_request(request, normalized)
         task_type = request.task_type or "CustomVoice"
-
-        # Normalize voice to lowercase for case-insensitive matching
-        if request.voice is not None:
-            request.voice = request.voice.lower()
 
         # Validate input is not empty
         if not request.input or not request.input.strip():
@@ -859,7 +946,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
                     "or use a CustomVoice model."
                 )
-            if request.voice is not None and request.voice not in self.supported_speakers:
+            if normalized.voice_lookup is not None and normalized.voice_lookup not in self.supported_speakers:
                 return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate speaker_embedding constraints
@@ -903,7 +990,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Handle the case where request.voice is NOT None
                 pass
                 # voice is not None
-                voice_lower = request.voice.lower()
+                voice_lower = normalized.voice_lookup
                 if voice_lower in self.uploaded_speakers:
                     # Check if data file exists for uploaded speaker
                     speaker_info = self.uploaded_speakers[voice_lower]
@@ -963,26 +1050,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Side effect: if request.voice references an uploaded speaker, resolves
         it to request.ref_audio and request.ref_text for voice cloning.
         """
+        normalized = self._normalize_speech_request(request)
+        self._apply_normalized_speech_request(request, normalized)
+
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
-        # Support uploaded voices: auto-resolve voice → ref_audio + ref_text.
-        if request.voice is not None and request.ref_audio is None:
-            voice_lower = request.voice.lower()
-            if voice_lower in self.uploaded_speakers:
-                speaker_info = self.uploaded_speakers[voice_lower]
-                file_path = Path(speaker_info["file_path"])
-                if not file_path.exists():
-                    return f"Audio file for uploaded voice '{request.voice}' not found on disk"
-                audio_data_url = self._get_uploaded_audio_data(voice_lower)
-                if audio_data_url is None:
-                    return f"Could not load audio for uploaded voice '{request.voice}'"
-                request.ref_audio = audio_data_url
-                # Use ref_text from upload metadata if not provided in request.
-                if not request.ref_text or not request.ref_text.strip():
-                    upload_ref_text = speaker_info.get("ref_text")
-                    if upload_ref_text and upload_ref_text.strip():
-                        request.ref_text = upload_ref_text
+        if normalized.uploaded_speaker_info is not None and request.ref_audio is None and normalized.ref_audio is None:
+            return f"Could not load audio for uploaded voice '{request.voice}'"
 
         if request.ref_audio is not None:
             fmt_err = self._validate_ref_audio_format(request.ref_audio)
@@ -1001,6 +1076,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_cosyvoice3_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate CosyVoice3 request parameters. Returns error message or None."""
+        normalized = self._normalize_speech_request(request)
+        self._apply_normalized_speech_request(request, normalized)
+
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
@@ -1169,82 +1247,81 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Processes each parameter if present, skips if not.
         Values are wrapped in lists as required by the model.
         """
+        normalized = self._normalize_speech_request(request)
         params: dict[str, Any] = {}
 
         # Text content (always required)
-        params["text"] = [request.input]
+        params["text"] = [normalized.input_text]
 
         # Task type
-        if request.task_type is not None:
-            params["task_type"] = [request.task_type]
+        if normalized.task_type is not None:
+            params["task_type"] = [normalized.task_type]
         else:
             params["task_type"] = ["CustomVoice"]
 
         # Language
-        if request.language is not None:
-            params["language"] = [request.language]
+        if normalized.language is not None:
+            params["language"] = [normalized.language]
         else:
             params["language"] = ["Auto"]
 
         # Speaker (voice)
-        if request.voice is not None:
-            params["speaker"] = [request.voice]
+        if normalized.voice is not None:
+            speaker_value = (
+                normalized.voice_lookup if normalized.uploaded_speaker_info is not None else normalized.voice
+            )
+            params["speaker"] = [speaker_value]
 
             # Uploaded voices use task_type="Base" (CustomVoice requires built-in spk_id).
             # If ref_text was provided at upload time, use in-context cloning; otherwise x_vector only.
-            if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
-                speaker_info = self.uploaded_speakers[request.voice.lower()]
+            if normalized.resolved_upload_audio or normalized.resolved_upload_embedding:
+                speaker_info = normalized.uploaded_speaker_info
 
-                # Check if this voice was uploaded with a pre-computed embedding.
-                # Populate request.speaker_embedding so the existing code path
-                # (below) handles voice_clone_prompt and x_vector_only_mode.
-                embedding = self._get_uploaded_speaker_embedding(request.voice)
-                if embedding is not None:
-                    request.speaker_embedding = embedding
+                if normalized.speaker_embedding is not None:
                     params["task_type"] = ["Base"]
-                    logger.info("Auto-set speaker_embedding for uploaded voice: %s", request.voice)
-                else:
-                    audio_data = self._get_uploaded_audio_data(request.voice)
-                    if not audio_data:
-                        raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
-                    stored_ref_text = speaker_info.get("ref_text")
-                    params["ref_audio"] = [audio_data]
+                    logger.info("Auto-set speaker_embedding for uploaded voice: %s", normalized.voice)
+                elif normalized.ref_audio is not None:
+                    params["ref_audio"] = [normalized.ref_audio]
                     params["task_type"] = ["Base"]
                     params["voice_created_at"] = [speaker_info.get("created_at", 0)]
-                    if stored_ref_text:
-                        params["ref_text"] = [stored_ref_text]
+                    if normalized.ref_text:
+                        params["ref_text"] = [normalized.ref_text]
                         params["x_vector_only_mode"] = [False]
                     else:
                         params["x_vector_only_mode"] = [True]
                     logger.info(
-                        "Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text)
+                        "Auto-set ref_audio for uploaded voice: %s (icl=%s)",
+                        normalized.voice,
+                        bool(normalized.ref_text),
                     )
+                else:
+                    raise ValueError(f"Audio file for uploaded voice '{normalized.voice}' is missing or corrupted")
 
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice
 
         # Instructions for style/emotion control
-        if request.instructions is not None:
-            params["instruct"] = [request.instructions]
+        if normalized.instructions is not None:
+            params["instruct"] = [normalized.instructions]
         else:
             params["instruct"] = [""]
 
         # Voice clone: ref_audio resolved in create_speech(), not here.
-        if request.ref_text is not None:
-            params["ref_text"] = [request.ref_text]
-        if request.speaker_embedding is not None:
+        if normalized.ref_text is not None:
+            params["ref_text"] = [normalized.ref_text]
+        if normalized.speaker_embedding is not None:
             # Store as plain float list (not tensor) so it survives msgspec
             # serialization through the EngineCore IPC boundary.  The talker's
             # _build_prompt_embeds converts it back to a tensor on the GPU.
             params["voice_clone_prompt"] = [
                 {
-                    "ref_spk_embedding": list(request.speaker_embedding),
+                    "ref_spk_embedding": list(normalized.speaker_embedding),
                 }
             ]
             # speaker_embedding implies x_vector_only_mode
             params["x_vector_only_mode"] = [True]
-        elif request.x_vector_only_mode is not None:
-            params["x_vector_only_mode"] = [request.x_vector_only_mode]
+        elif normalized.x_vector_only_mode is not None:
+            params["x_vector_only_mode"] = [normalized.x_vector_only_mode]
 
         # Generation parameters
         if request.max_new_tokens is not None:
@@ -1398,6 +1475,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        normalized = self._normalize_speech_request(request)
+        self._apply_normalized_speech_request(request, normalized)
+
         if self._is_fish_speech:
             validation_error = self._validate_fish_tts_request(request)
             if validation_error:
@@ -1413,25 +1493,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("Input text cannot be empty")
             tts_params = {}
             prompt: dict[str, Any] = {"input": request.input}
-            # Resolve ref_audio: explicit request param or uploaded voice
-            ref_src = request.ref_audio
-            if not ref_src and request.voice:
-                vl = request.voice.lower()
-                if vl in self.uploaded_speakers:
-                    sp = self.uploaded_speakers[vl]
-                    if sp.get("embedding_source") == "audio":
-                        ref_src = self._get_uploaded_audio_data(request.voice)
-                        if not ref_src:
-                            raise ValueError(f"Audio for voice '{request.voice}' missing")
-                        prompt["ref_text"] = sp.get("ref_text")
+            ref_src = normalized.ref_audio
+            if normalized.ref_text:
+                prompt["ref_text"] = normalized.ref_text
+            if normalized.uploaded_speaker_info is not None and request.ref_audio is None and ref_src is None:
+                raise ValueError(f"Audio for voice '{request.voice}' missing")
             if ref_src:
                 fmt_err = self._validate_ref_audio_format(ref_src)
                 if fmt_err:
                     raise ValueError(fmt_err)
                 wav, sr = await self._resolve_ref_audio(ref_src)
                 prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
-            if request.ref_text:
-                prompt["ref_text"] = request.ref_text
             if request.language:
                 prompt["lang"] = request.language
             if request.instructions:
