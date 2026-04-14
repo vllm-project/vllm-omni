@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from unittest.mock import MagicMock
-
 import pytest
 from pytest_mock import MockerFixture
 
@@ -55,8 +53,8 @@ class TestDiffusionWorkerCudaProfiler:
         mock_diffusion_worker_dependencies,
     ):
         fake_profiler = mocker.Mock()
-        fake_profiler.start = MagicMock()
-        fake_profiler.stop = MagicMock()
+        fake_profiler.start = mocker.Mock()
+        fake_profiler.stop = mocker.Mock()
         mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.CudaProfilerWrapper",
             return_value=fake_profiler,

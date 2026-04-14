@@ -10,10 +10,9 @@ Regression test for: https://github.com/vllm-project/vllm/issues/34506
   - Interleaved (use_audio_in_video) should also work correctly.
 """
 
-from unittest.mock import Mock
-
 import pytest
 import torch
+from pytest_mock import MockerFixture
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     check_interleaved_audio_video,
     merge_interleaved_embeddings,
@@ -107,7 +106,7 @@ class TestCheckInterleavedAudioVideo:
 # ---------------------------------------------------------------------------
 
 
-def make_mock_model(hidden: int = 8):
+def make_mock_model(mocker: MockerFixture, hidden: int = 8):
     """
     Return a minimal mock of Qwen2_5OmniThinkerForConditionalGeneration
     that has enough structure to run embed_input_ids.
@@ -116,10 +115,10 @@ def make_mock_model(hidden: int = 8):
         Qwen2_5OmniThinkerForConditionalGeneration,
     )
 
-    model = Mock(spec=Qwen2_5OmniThinkerForConditionalGeneration)
+    model = mocker.Mock(spec=Qwen2_5OmniThinkerForConditionalGeneration)
 
     # Config with token IDs
-    cfg = Mock()
+    cfg = mocker.Mock()
     cfg.video_token_index = VIDEO_TOKEN_ID
     cfg.audio_token_index = AUDIO_TOKEN_ID
     model.config = cfg
@@ -130,9 +129,9 @@ def make_mock_model(hidden: int = 8):
         # view with shared memory, which masked_scatter_ cannot handle).
         return ids.float().unsqueeze(-1).expand(-1, hidden).clone()
 
-    lang_model = Mock()
+    lang_model = mocker.Mock()
     lang_model.embed_input_ids = fake_lm_embed
-    model.get_language_model = Mock(return_value=lang_model)
+    model.get_language_model = mocker.Mock(return_value=lang_model)
 
     from vllm.model_executor.models.interfaces import SupportsMultiModal
 
@@ -169,7 +168,7 @@ def build_mm_embeds(audio_n, image_n, video_n, hidden, audio_val=10.0, image_val
 
 
 class TestEmbedInputIds:
-    def _run(self, audio_n, image_n, video_n, hidden=8):
+    def _run(self, mocker: MockerFixture, audio_n, image_n, video_n, hidden=8):
         """
         Run embed_input_ids for a non-interleaved mixed-modality sequence.
         Returns (result_embeds, input_ids, is_multimodal).
@@ -177,33 +176,33 @@ class TestEmbedInputIds:
         input_ids, is_multimodal = make_token_seq(audio_n, image_n, video_n)
         mm_embeds = build_mm_embeds(audio_n, image_n, video_n, hidden)
 
-        model, _ = make_mock_model(hidden)
+        model, _ = make_mock_model(mocker, hidden)
         result = model.embed_input_ids(input_ids, mm_embeds, is_multimodal=is_multimodal)
         return result, input_ids, is_multimodal
 
-    def test_audio_only(self):
+    def test_audio_only(self, mocker: MockerFixture):
         """Audio-only: audio positions get audio embeddings."""
         audio_n, hidden = 5, 8
         audio_val = 10.0
-        result, input_ids, is_multimodal = self._run(audio_n, 0, 0, hidden)
+        result, input_ids, is_multimodal = self._run(mocker, audio_n, 0, 0, hidden)
 
         audio_pos = (input_ids == AUDIO_TOKEN_ID).nonzero(as_tuple=True)[0]
         assert result[audio_pos].allclose(torch.full((audio_n, hidden), audio_val)), (
             "Audio positions should get audio embeddings"
         )
 
-    def test_video_only(self):
+    def test_video_only(self, mocker: MockerFixture):
         """Video-only: video positions get video embeddings."""
         video_n, hidden = 6, 8
         video_val = 30.0
-        result, input_ids, is_multimodal = self._run(0, 0, video_n, hidden)
+        result, input_ids, is_multimodal = self._run(mocker, 0, 0, video_n, hidden)
 
         video_pos = (input_ids == VIDEO_TOKEN_ID).nonzero(as_tuple=True)[0]
         assert result[video_pos].allclose(torch.full((video_n, hidden), video_val)), (
             "Video positions should get video embeddings"
         )
 
-    def test_mixed_modalities_audio_goes_to_audio_pos(self):
+    def test_mixed_modalities_audio_goes_to_audio_pos(self, mocker: MockerFixture):
         """
         Regression test for GitHub issue #34506:
         With audio + image + video (non-interleaved), audio positions must
@@ -212,7 +211,7 @@ class TestEmbedInputIds:
         audio_n, image_n, video_n, hidden = 5, 4, 6, 8
         audio_val, image_val, video_val = 10.0, 20.0, 30.0
 
-        result, input_ids, is_multimodal = self._run(audio_n, image_n, video_n, hidden)
+        result, input_ids, is_multimodal = self._run(mocker, audio_n, image_n, video_n, hidden)
 
         audio_pos = (input_ids == AUDIO_TOKEN_ID).nonzero(as_tuple=True)[0]
         image_pos = (input_ids == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
@@ -233,10 +232,10 @@ class TestEmbedInputIds:
             f"Video emb wrong: expected {video_val}, got mean={mean_v:.1f}"
         )
 
-    def test_text_positions_unchanged(self):
+    def test_text_positions_unchanged(self, mocker: MockerFixture):
         """Text positions should keep their text embeddings."""
         audio_n, image_n, video_n, hidden = 3, 2, 4, 8
-        result, input_ids, is_multimodal = self._run(audio_n, image_n, video_n, hidden)
+        result, input_ids, is_multimodal = self._run(mocker, audio_n, image_n, video_n, hidden)
 
         text_pos = (~is_multimodal).nonzero(as_tuple=True)[0]
         # Text tokens have value TEXT_TOKEN_ID=0, so embed -> 0.0
@@ -244,7 +243,7 @@ class TestEmbedInputIds:
             "Text positions should keep text embeddings"
         )
 
-    def test_interleaved_use_audio_in_video(self):
+    def test_interleaved_use_audio_in_video(self, mocker: MockerFixture):
         """
         Interleaved (use_audio_in_video): video chunks interleaved with audio.
         Video embeddings must go to video positions, audio to audio positions.
@@ -263,7 +262,7 @@ class TestEmbedInputIds:
             torch.full((audio_n, hidden), audio_val),
         ]
 
-        model, _ = make_mock_model(hidden)
+        model, _ = make_mock_model(mocker, hidden)
         result = model.embed_input_ids(input_ids, mm_embeds, is_multimodal=is_multimodal)
 
         video_pos = (input_ids == VIDEO_TOKEN_ID).nonzero(as_tuple=True)[0]

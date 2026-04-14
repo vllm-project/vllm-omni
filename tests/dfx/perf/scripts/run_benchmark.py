@@ -23,6 +23,7 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 CONFIG_FILE_PATH = str(Path(__file__).parent.parent / "tests" / "test.json")
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
+STAGE_INIT_TIMEOUT = 600
 
 
 STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
@@ -43,7 +44,7 @@ def omni_server(request):
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "120", "--init-timeout", "900"]
+        server_args = ["--stage-init-timeout", str(STAGE_INIT_TIMEOUT), "--init-timeout", "900"]
         if stage_config_path:
             server_args = ["--stage-configs-path", stage_config_path] + server_args
         with OmniServer(model, server_args) as server:
@@ -71,6 +72,8 @@ def run_benchmark(
         ["vllm", "bench", "serve", "--omni"]
         + args
         + [
+            "--num-warmups",
+            "2",
             "--save-result",
             "--result-dir",
             os.environ.get("BENCHMARK_DIR", "tests"),

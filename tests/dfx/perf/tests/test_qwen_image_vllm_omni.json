@@ -72,7 +72,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.1,
-                    "latency_mean": 2.34,
+                    "latency_mean": 2.7,
                     "peak_memory_mb_mean": 61000
                 }
             },

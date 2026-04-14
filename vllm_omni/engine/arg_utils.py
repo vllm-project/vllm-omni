@@ -124,6 +124,9 @@ class OmniEngineArgs(EngineArgs):
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
         log_stats: Whether to log engine statistics. Defaults to False.
+        custom_pipeline_args: Dictionary of arguments for custom pipeline
+            initialization (e.g., ``{"pipeline_class": "my.Module"}``).
+            Passed through to the diffusion stage engine.
     """
 
     stage_id: int = 0
@@ -143,6 +146,7 @@ class OmniEngineArgs(EngineArgs):
     stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
+    custom_pipeline_args: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
@@ -190,6 +194,11 @@ class OmniEngineArgs(EngineArgs):
         Returns:
             OmniModelConfig instance with all configuration fields set
         """
+        if self.stage_configs_path is not None:
+            raise RuntimeError(
+                "create_model_config() should not be called when stage_configs_path is set. "
+                "Per-stage model configs are resolved from the stage config YAML."
+            )
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 

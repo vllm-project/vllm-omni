@@ -1015,6 +1015,14 @@ class WanTransformer3DModel(nn.Module):
                 if ".to_out.0." in lookup_name:
                     lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
 
+                # Compatibility: some Wan conversion pipelines still keep
+                # block modulation keys as `blocks.N.modulation` instead of
+                # `blocks.N.scale_shift_table`.
+                if lookup_name.endswith(".modulation"):
+                    modulation_alias = lookup_name[: -len(".modulation")] + ".scale_shift_table"
+                    if modulation_alias in params_dict:
+                        lookup_name = modulation_alias
+
                 if lookup_name not in params_dict:
                     logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
                     continue

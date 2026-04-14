@@ -49,12 +49,14 @@ _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
+_VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
     | _FISH_TTS_MODEL_STAGES
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
+    | _VOXCPM2_TTS_MODEL_STAGES
 )
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -290,6 +292,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "cosyvoice3"
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
+        if model_stage in _VOXCPM2_TTS_MODEL_STAGES:
+            return "voxcpm2"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -787,6 +791,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_fish_tts_request(request)
         if self._tts_model_type == "cosyvoice3":
             return self._validate_cosyvoice3_request(request)
+        if self._tts_model_type == "voxcpm2":
+            return None  # VoxCPM2 accepts any text input
         return self._validate_qwen_tts_request(request)
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
@@ -1024,11 +1030,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
         """
-        model_config = self.model_config
-        connector = MediaConnector(
-            allowed_local_media_path=model_config.allowed_local_media_path,
-            allowed_media_domains=model_config.allowed_media_domains,
-        )
+        # In diffusion mode, model_config may not be available
+        if self._diffusion_mode:
+            connector = MediaConnector()
+        else:
+            model_config = self.model_config
+            connector = MediaConnector(
+                allowed_local_media_path=model_config.allowed_local_media_path,
+                allowed_media_domains=model_config.allowed_media_domains,
+            )
         wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
@@ -1399,8 +1409,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt = await self._build_fish_speech_prompt_async(request, ref_audio_data=ref_audio_data)
             tts_params = {}
         elif self._tts_model_type == "omnivoice":
+            if not request.input or not request.input.strip():
+                raise ValueError("Input text cannot be empty")
             tts_params = {}
-            prompt = request.input  # Diffusion engine takes raw text
+            prompt: dict[str, Any] = {"input": request.input}
+            # Resolve ref_audio: explicit request param or uploaded voice
+            ref_src = request.ref_audio
+            if not ref_src and request.voice:
+                vl = request.voice.lower()
+                if vl in self.uploaded_speakers:
+                    sp = self.uploaded_speakers[vl]
+                    if sp.get("embedding_source") == "audio":
+                        ref_src = self._get_uploaded_audio_data(request.voice)
+                        if not ref_src:
+                            raise ValueError(f"Audio for voice '{request.voice}' missing")
+                        prompt["ref_text"] = sp.get("ref_text")
+            if ref_src:
+                fmt_err = self._validate_ref_audio_format(ref_src)
+                if fmt_err:
+                    raise ValueError(fmt_err)
+                wav, sr = await self._resolve_ref_audio(ref_src)
+                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
+            if request.ref_text:
+                prompt["ref_text"] = request.ref_text
+            if request.language:
+                prompt["lang"] = request.language
+            if request.instructions:
+                prompt["instruct"] = request.instructions
+        elif self._tts_model_type == "voxcpm2":
+            tts_params = {}
+            additional: dict[str, Any] = {}
+            if request.ref_audio is not None:
+                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                additional["reference_audio"] = [[wav_list, sr]]
+            prompt = {"prompt": request.input}
+            if additional:
+                prompt["additional_information"] = additional
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
@@ -1437,6 +1481,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "voxtral_tts"
         elif self._tts_model_type == "cosyvoice3":
             model_type = "cosyvoice3"
+        elif self._tts_model_type == "voxcpm2":
+            model_type = "voxcpm2"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
@@ -1567,13 +1613,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         from vllm_omni.outputs import OmniRequestOutput
 
         try:
+            if not request.input or not request.input.strip():
+                raise ValueError("Input text cannot be empty")
+
             request_id = f"speech-{random_uuid()}"
-            prompt = request.input
+            prompt: dict[str, Any] = {"input": request.input}
+            if request.ref_audio:
+                wav, sr = await self._resolve_ref_audio(request.ref_audio)
+                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
+            if request.ref_text:
+                prompt["ref_text"] = request.ref_text
+            if request.language:
+                prompt["lang"] = request.language
+            if request.instructions:
+                prompt["instruct"] = request.instructions
 
             logger.info(
-                "Diffusion TTS speech request %s: text=%r",
+                "Diffusion TTS speech request %s: text=%r, voice_clone=%s",
                 request_id,
-                prompt[:50] + "..." if len(prompt) > 50 else prompt,
+                request.input[:50] + "..." if len(request.input) > 50 else request.input,
+                "ref_audio" in prompt,
             )
 
             generator = self._diffusion_engine.generate(
