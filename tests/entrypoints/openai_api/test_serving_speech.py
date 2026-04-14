@@ -2161,8 +2161,8 @@ class TestCosyVoice3Serving:
 
     def test_cosyvoice3_stage_registered(self):
         from vllm_omni.entrypoints.openai.serving_speech import (
-            _TTS_MODEL_TYPE_BY_STAGE,
             _TTS_MODEL_STAGES,
+            _TTS_MODEL_TYPE_BY_STAGE,
         )
 
         assert "cosyvoice3_talker" in _TTS_MODEL_STAGES
