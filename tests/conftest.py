@@ -167,7 +167,6 @@ def assert_audio_diffusion_response(
     Validate audio diffusion response.
     """
     raise NotImplementedError("Audio validation is not implemented yet")
-    # consider using assert_audio_valid defined above
 
 
 def _maybe_int(value: Any) -> int | None:
@@ -277,15 +276,32 @@ def assert_video_valid(
                 pass
 
 
-def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
-    """Assert the WAV has the expected sample rate, channel count, and duration."""
+def assert_audio_valid(
+    audio_or_path: Path | np.ndarray,
+    *,
+    sample_rate: int,
+    channels: int,
+    duration_s: float,
+) -> None:
+    """Assert WAV file or (batch, channels, samples) ndarray matches expected audio format."""
+    expected_samples = int(duration_s * sample_rate)
+    if isinstance(audio_or_path, np.ndarray):
+        audio = audio_or_path
+        assert audio.ndim == 3, f"Expected audio ndim=3 (batch, channels, samples), got shape {audio.shape}"
+        assert audio.shape[0] == 1, f"Expected batch size 1, got {audio.shape[0]}"
+        assert audio.shape[1] == channels, f"Expected {channels} channels, got {audio.shape[1]}"
+        assert audio.shape[2] == expected_samples, (
+            f"Expected {expected_samples} samples ({duration_s}s @ {sample_rate} Hz), got {audio.shape[2]}"
+        )
+        return
+
+    path = audio_or_path
     assert path.exists(), f"Audio not found: {path}"
     info = sf.info(str(path))
     assert info.samplerate == sample_rate, f"Expected sample_rate={sample_rate}, got {info.samplerate}"
     assert info.channels == channels, f"Expected {channels} channel(s), got {info.channels}"
-    expected_frames = int(duration_s * sample_rate)
-    assert info.frames == expected_frames, (
-        f"Expected {expected_frames} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
+    assert info.frames == expected_samples, (
+        f"Expected {expected_samples} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
     )
 
 
