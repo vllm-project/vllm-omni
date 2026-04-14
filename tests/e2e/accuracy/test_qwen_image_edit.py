@@ -10,6 +10,7 @@ import torch
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 
+from benchmarks.accuracy.common import pil_to_data_url
 from tests.conftest import (
     DiffusionResponse,
     OmniServer,
@@ -36,8 +37,6 @@ PSNR_THRESHOLD = 14.0
 PROMPT_SINGLE_IMAGE = "The input is a 2D cartoon bear mascot. Restyle it into a painterly oil artwork with warm colors while preserving the main structure."
 PROMPT_MULTIPLE_IMAGE = "The first input is a 2D cartoon bear mascot and the second input is a furry rabbit. Blend them into one coherent scene with a cinematic style and consistent lighting."
 NEGATIVE_PROMPT = "low quality, blurry, artifacts, distortion"
-QWEN_BEAR_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
-RABBIT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/rabbit.png"
 
 
 def _run_vllm_omni_image_edit(
@@ -129,6 +128,7 @@ def vllm_omni_output_single_image(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
     accuracy_artifact_root: Path,
+    qwen_bear_image: Image.Image,
 ) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, SINGLE_MODEL)
     output_path = output_dir / "vllm_omni_single.png"
@@ -136,19 +136,19 @@ def vllm_omni_output_single_image(
         omni_server=omni_server,
         openai_client=openai_client,
         prompt=PROMPT_SINGLE_IMAGE,
-        input_image_urls=[QWEN_BEAR_IMAGE_URL],
+        input_image_urls=[pil_to_data_url(qwen_bear_image)],
         output_path=output_path,
     )
 
 
 @pytest.fixture(scope="module")
-def diffusers_output_single_image(accuracy_artifact_root: Path) -> Image.Image:
+def diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image: Image.Image) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, SINGLE_MODEL)
     output_path = output_dir / "diffusers_single.png"
     return _run_diffusers_image_edit(
         model=SINGLE_MODEL,
         prompt=PROMPT_SINGLE_IMAGE,
-        input_image_urls=[QWEN_BEAR_IMAGE_URL],
+        input_image_urls=[pil_to_data_url(qwen_bear_image)],
         output_path=output_path,
     )
 
@@ -158,6 +158,8 @@ def vllm_omni_output_multiple_image(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
     accuracy_artifact_root: Path,
+    qwen_bear_image: Image.Image,
+    rabbit_image: Image.Image,
 ) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)
     output_path = output_dir / "vllm_omni_multiple.png"
@@ -165,19 +167,21 @@ def vllm_omni_output_multiple_image(
         omni_server=omni_server,
         openai_client=openai_client,
         prompt=PROMPT_MULTIPLE_IMAGE,
-        input_image_urls=[QWEN_BEAR_IMAGE_URL, RABBIT_IMAGE_URL],
+        input_image_urls=[pil_to_data_url(qwen_bear_image), pil_to_data_url(rabbit_image)],
         output_path=output_path,
     )
 
 
 @pytest.fixture(scope="module")
-def diffusers_output_multiple_image(accuracy_artifact_root: Path) -> Image.Image:
+def diffusers_output_multiple_image(
+    accuracy_artifact_root: Path, qwen_bear_image: Image.Image, rabbit_image: Image.Image
+) -> Image.Image:
     output_dir = model_output_dir(accuracy_artifact_root, MULTIPLE_MODEL)
     output_path = output_dir / "diffusers_multiple.png"
     return _run_diffusers_image_edit(
         model=MULTIPLE_MODEL,
         prompt=PROMPT_MULTIPLE_IMAGE,
-        input_image_urls=[QWEN_BEAR_IMAGE_URL, RABBIT_IMAGE_URL],
+        input_image_urls=[pil_to_data_url(qwen_bear_image), pil_to_data_url(rabbit_image)],
         output_path=output_path,
     )
 
