@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any
 
 import PIL.Image
 import torch
@@ -22,9 +22,9 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.ovi_1_1.ovi_1_1_transformer import Ovi11Transformer3DModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
-from vllm_omni.diffusion.models.ovi_1_1.ovi_1_1_transformer import Ovi11Transformer3DModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
@@ -193,11 +193,11 @@ def get_ovi_1_1_pre_process_func(
 class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     """
     Ovi 1.1 Pipeline for video generation.
-    
+
     Compatible with WAN family models with Ovi-specific adaptations.
     Supports Text-to-Video (T2V) and Image-to-Video (I2V) modes.
     """
-    
+
     def __init__(
         self,
         *,
@@ -354,7 +354,7 @@ class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             current_omni_platform.synchronize()
             _t_pipeline_start = time.perf_counter()
             _t_text_enc_start = _t_pipeline_start
-            
+
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
@@ -373,7 +373,7 @@ class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
                 raise ValueError(
                     "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
                 )
-                
+
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
@@ -385,7 +385,7 @@ class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()
-            
+
         multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
         if isinstance(raw_image, list):
@@ -395,16 +395,9 @@ class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
                     """Taking only the first image for now."""
                 )
             raw_image = raw_image[0]
-            
-        if raw_image is None:
-            image = None
-        elif isinstance(raw_image, str):
-            image = PIL.Image.open(raw_image)
-        else:
-            image = cast(PIL.Image.Image | torch.Tensor, raw_image)
 
-        latent_condition = None
-        first_frame_mask = None
+        # TODO: I2V mode - latent_condition and first_frame_mask will be used when I2V is implemented
+        # For now, we only support T2V mode
 
         # T2V mode: standard latent preparation
         num_channels_latents = self.transformer_config["in_channels"]
@@ -419,7 +412,7 @@ class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             generator=generator,
             latents=req.sampling_params.latents,
         )
-        
+
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_latent_prep_ms = (time.perf_counter() - _t_latent_prep_start) * 1000
@@ -429,7 +422,7 @@ class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
-            
+
         with self.progress_bar(total=len(timesteps)) as pbar:
             for t in timesteps:
                 self._current_timestep = t
@@ -439,7 +432,7 @@ class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
                 timestep = t.expand(latents.shape[0])
 
                 do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
-                
+
                 # Prepare kwargs for positive and negative predictions
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
@@ -477,14 +470,14 @@ class Ovi11Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
         self._current_timestep = None
-        
+
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_denoise_ms = (time.perf_counter() - _t_denoise_start) * 1000
 
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
-            
+
         if output_type == "latent":
             output = latents
         else:
