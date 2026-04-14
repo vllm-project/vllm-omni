@@ -5,6 +5,7 @@ import os
 import pytest
 import torch
 
+from tests.conftest import OmniRunner
 from tests.utils import hardware_test
 
 VOXCPM2_MODEL = "openbmb/VoxCPM2"
@@ -24,10 +25,8 @@ SAMPLE_RATE = 48000
 @pytest.fixture(scope="module")
 def voxcpm2_engine():
     """Create VoxCPM2 engine for testing."""
-    from vllm_omni import Omni
-
-    engine = Omni(model=VOXCPM2_MODEL, stage_configs_path=STAGE_CONFIG)
-    yield engine
+    with OmniRunner(VOXCPM2_MODEL, stage_configs_path=STAGE_CONFIG) as runner:
+        yield runner.omni
 
 
 def _extract_audio(multimodal_output: dict) -> torch.Tensor:

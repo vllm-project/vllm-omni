@@ -286,21 +286,23 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
 
-        audio_chunks: list[torch.Tensor | None] = []
+        audio_outputs: list[torch.Tensor | None] = []
         sample_rates: list[torch.Tensor | None] = []
         for info in info_dicts:
             if not isinstance(info, dict):
-                audio_chunks.append(None)
+                audio_outputs.append(None)
                 sample_rates.append(None)
                 continue
-            chunk = info.get("audio_chunk")
-            audio_chunks.append(chunk if isinstance(chunk, torch.Tensor) else None)
+            audio = info.get("audio_history")
+            if not isinstance(audio, torch.Tensor):
+                audio = info.get("audio_chunk")
+            audio_outputs.append(audio if isinstance(audio, torch.Tensor) else None)
             sr = info.get("audio_sr")
             sample_rates.append(sr if isinstance(sr, torch.Tensor) else None)
 
         multimodal_outputs: dict[str, list[torch.Tensor | None]] = {}
-        if any(chunk is not None for chunk in audio_chunks):
-            multimodal_outputs["audio"] = audio_chunks
+        if any(audio is not None for audio in audio_outputs):
+            multimodal_outputs["audio"] = audio_outputs
         if any(sr is not None for sr in sample_rates):
             multimodal_outputs["sr"] = sample_rates
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=multimodal_outputs)
@@ -327,7 +329,7 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
             embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
             return input_ids, embeds, {}
 
-        clear_update = {"audio_chunk": None, "audio_sr": None}
+        clear_update = {"audio_chunk": None, "audio_history": None, "audio_sr": None}
         if span_len > 1:
             embeds, prefill_update = self._build_prefill_embeds(input_ids, info_dict)
             return input_ids, embeds, clear_update | prefill_update
@@ -362,13 +364,22 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
             debug=False,
         )
         if isinstance(audio_chunk, torch.Tensor):
-            audio_chunk = audio_chunk[0].reshape(-1).detach().to(torch.float32)
+            audio_chunk = audio_chunk[0].reshape(-1).detach().to(device="cpu", dtype=torch.float32).contiguous()
         else:
-            audio_chunk = torch.as_tensor(audio_chunk[0], dtype=torch.float32)
+            audio_chunk = torch.as_tensor(audio_chunk[0], dtype=torch.float32).reshape(-1).contiguous()
+
+        audio_history = info_dict.get("audio_history")
+        if isinstance(audio_history, torch.Tensor) and audio_history.numel() > 0:
+            # Match the non-async TTS contract used elsewhere: expose the
+            # latest full waveform snapshot, not just the newest chunk.
+            audio_history = torch.cat((audio_history.reshape(-1).to(torch.float32), audio_chunk), dim=-1)
+        else:
+            audio_history = audio_chunk
 
         update = {
             "acoustic_streaming_cache": cache,
             "audio_chunk": audio_chunk,
+            "audio_history": audio_history,
             "audio_sr": torch.tensor(self._sample_rate, dtype=torch.int32),
         }
         return input_ids, speech_embed, update
@@ -435,7 +446,8 @@ class VibeVoiceTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessM
         for sample in voice_samples:
             if not isinstance(sample, dict):
                 continue
-            wav = np.asarray(sample.get("samples") or [], dtype=np.float32)
+            raw_samples = sample.get("samples")
+            wav = np.asarray(raw_samples if raw_samples is not None else [], dtype=np.float32)
             sample_rate = int(sample.get("sample_rate") or self._sample_rate)
             if wav.size == 0:
                 continue

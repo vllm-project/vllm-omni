@@ -51,6 +51,7 @@ TTSModelType = Literal[
     "fish_tts",
     "cosyvoice3",
     "omnivoice",
+    "voxcpm2",
     "vibevoice_tts",
 ]
 _TTS_MODEL_TYPE_BY_STAGE: dict[str, TTSModelType] = {
@@ -59,6 +60,7 @@ _TTS_MODEL_TYPE_BY_STAGE: dict[str, TTSModelType] = {
     "fish_speech_slow_ar": "fish_tts",
     "cosyvoice3_talker": "cosyvoice3",
     "omnivoice_generator": "omnivoice",
+    "latent_generator": "voxcpm2",
     "vibevoice_tts": "vibevoice_tts",
 }
 _TTS_MODEL_STAGES = set(_TTS_MODEL_TYPE_BY_STAGE)
@@ -778,7 +780,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return self._validate_fish_tts_request(request)
             case "cosyvoice3":
                 return self._validate_cosyvoice3_request(request)
-            case "omnivoice":
+            case "omnivoice" | "voxcpm2":
                 return None
             case "vibevoice_tts":
                 return self._validate_vibevoice_tts_request(request)
@@ -1032,8 +1034,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "VibeVoice-TTS currently supports uploaded voice samples only. "
                     "Provide 'ref_audio' directly or upload a voice and use its name via 'voice'."
                 )
-            if self._get_uploaded_audio_data(voice_name) is None:
-                return f"Audio file for uploaded voice '{request.voice}' is missing or corrupted"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -1353,7 +1353,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         for sample in voice_samples:
             if not isinstance(sample, dict):
                 continue
-            wav = np.asarray(sample.get("samples") or [], dtype=np.float32)
+            raw_samples = sample.get("samples")
+            wav = np.asarray(raw_samples if raw_samples is not None else [], dtype=np.float32)
             sample_rate = int(sample.get("sample_rate") or target_sample_rate)
             if wav.size == 0:
                 continue
@@ -1362,7 +1363,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sample_rate = target_sample_rate
             aligned_samples.append(
                 {
-                    "samples": wav.astype(np.float32).tolist(),
+                    "samples": wav.astype(np.float32, copy=False),
                     "sample_rate": sample_rate,
                 }
             )
@@ -1395,7 +1396,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         processor_voice_samples = None
         if voice_samples:
-            processor_voice_samples = [np.asarray(sample["samples"], dtype=np.float32) for sample in voice_samples]
+            processor_voice_samples = [sample["samples"] for sample in voice_samples]
 
         encoding = processor(
             text=normalized_text,
@@ -1590,6 +1591,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["lang"] = request.language
             if request.instructions:
                 prompt["instruct"] = request.instructions
+        elif model_type == "voxcpm2":
+            tts_params = {}
+            additional: dict[str, Any] = {}
+            if request.ref_audio is not None:
+                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                additional["reference_audio"] = [[wav_list, sr]]
+            prompt = {"prompt": request.input}
+            if additional:
+                prompt["additional_information"] = additional
         elif model_type is None:
             tts_params = {}
             prompt = {"prompt": request.input}

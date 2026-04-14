@@ -72,6 +72,8 @@ def run_benchmark(
         ["vllm", "bench", "serve", "--omni"]
         + args
         + [
+            "--num-warmups",
+            "2",
             "--save-result",
             "--result-dir",
             os.environ.get("BENCHMARK_DIR", "tests"),
