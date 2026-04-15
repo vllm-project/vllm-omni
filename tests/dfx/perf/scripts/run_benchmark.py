@@ -53,18 +53,6 @@ server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 _omni_server_lock = threading.Lock()
 
 
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--test-config-file",
-        action="store",
-        default=None,
-        help=(
-            "Path to Omni/TTS serve benchmark JSON (default: tests/dfx/perf/tests/test_qwen_omni.json). "
-            "Example: --test-config-file tests/dfx/perf/tests/test_tts.json"
-        ),
-    )
-
-
 @pytest.fixture(scope="module")
 def omni_server(request):
     """Start vLLM-Omni server as a subprocess with actual model weights.

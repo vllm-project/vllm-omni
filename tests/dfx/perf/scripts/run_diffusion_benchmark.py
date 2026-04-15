@@ -133,19 +133,6 @@ def _append_to_aggregated_file(record: dict[str, Any]) -> None:
             json.dump(records, f, indent=2, ensure_ascii=False)
 
 
-# Register --test-config-file with pytest so it does not reject the argument.
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--test-config-file",
-        action="store",
-        default=None,
-        help=(
-            "Path to the benchmark config JSON file (required). "
-            "Example: --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json"
-        ),
-    )
-
-
 _server_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
