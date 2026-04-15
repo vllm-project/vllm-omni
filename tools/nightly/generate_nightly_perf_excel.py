@@ -321,7 +321,7 @@ def _load_json_file(path: str) -> dict[str, Any] | list[Any] | None:
 def _parse_from_filename(filename: str) -> dict[str, Any]:
     """Parse test-related metadata from a ``result_test_*.json`` filename.
 
-    Matches ``tests/dfx/perf/scripts/run_benchmark.py`` naming, including optional
+    Matches ``tests/dfx/perf/scripts/test_omni_benchmark.py`` naming, including optional
     ``_in{X}_out{Y}_`` before the timestamp (``na`` when unset).
     """
     name, ext = os.path.splitext(filename)
