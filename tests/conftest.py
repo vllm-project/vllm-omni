@@ -2876,7 +2876,7 @@ class OpenAIClientHandler:
         return f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def openai_client(request: pytest.FixtureRequest, run_level: str):
     """Create OpenAIClientHandler fixture to facilitate communication with OmniServer
     with encapsulated request sending, concurrent requests, response handling, and validation."""
