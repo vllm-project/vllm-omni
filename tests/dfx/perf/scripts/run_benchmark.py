@@ -56,16 +56,41 @@ def omni_server(request):
         print("OmniServer stopped")
 
 
+def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
+    """Make a single path segment safe for result filenames on common filesystems."""
+    if value is None:
+        return default
+    s = str(value).strip()
+    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
+        s = s.replace(bad, "_")
+    return s if s else default
+
+
 def run_benchmark(
     args: list,
     test_name: str,
     flow,
     dataset_name: str,
     num_prompt,
+    *,
+    baseline_config: dict[str, Any] | None = None,
+    sweep_index: int | None = None,
+    request_rate: Any | None = None,
+    max_concurrency: Any | None = None,
+    random_input_len: Any | None = None,
+    random_output_len: Any | None = None,
 ) -> Any:
-    """Run a single benchmark iteration and return the parsed result JSON."""
+    """Run a single benchmark iteration and return the parsed result JSON.
+
+    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the same
+    per-metric resolved thresholds as ``assert_result`` (via ``_baseline_thresholds_for_step``).
+    When ``random_input_len`` / ``random_output_len`` are set, they are also written into the result JSON;
+    omitted keys when not configured.
+    """
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
+    ri = _safe_filename_token(random_input_len)
+    ro = _safe_filename_token(random_output_len)
+    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -97,8 +122,26 @@ def run_benchmark(
     else:
         result_dir = "./"
 
-    with open(os.path.join(result_dir, result_filename), encoding="utf-8") as f:
+    result_path = os.path.join(result_dir, result_filename)
+    with open(result_path, encoding="utf-8") as f:
         result = json.load(f)
+
+    if baseline_config:
+        result["baseline"] = _baseline_thresholds_for_step(
+            baseline_config,
+            sweep_index=sweep_index,
+            request_rate=request_rate,
+            max_concurrency=max_concurrency,
+        )
+    else:
+        result["baseline"] = {}
+    if random_input_len is not None:
+        result["random_input_len"] = random_input_len
+    if random_output_len is not None:
+        result["random_output_len"] = random_output_len
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
     return result
 
 
@@ -164,8 +207,31 @@ def _resolve_baseline_value(
             f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
         )
     if isinstance(baseline_raw, (list, tuple)):
+        if sweep_index is None:
+            raise ValueError("list baseline requires sweep_index")
+        if not (0 <= sweep_index < len(baseline_raw)):
+            raise IndexError(f"baseline list len={len(baseline_raw)} has no index {sweep_index}")
         return baseline_raw[sweep_index]
     return baseline_raw
+
+
+def _baseline_thresholds_for_step(
+    baseline_data: dict[str, Any],
+    *,
+    sweep_index: int | None = None,
+    max_concurrency: Any = None,
+    request_rate: Any = None,
+) -> dict[str, Any]:
+    """Resolve ``test.json`` ``baseline`` block to one threshold per metric (same as ``assert_result``)."""
+    return {
+        metric_name: _resolve_baseline_value(
+            baseline_raw,
+            sweep_index=sweep_index,
+            max_concurrency=max_concurrency,
+            request_rate=request_rate,
+        )
+        for metric_name, baseline_raw in baseline_data.items()
+    }
 
 
 def assert_result(
@@ -179,14 +245,14 @@ def assert_result(
 ) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     baseline_data = params.get("baseline", {})
-    for metric_name, baseline_raw in baseline_data.items():
+    thresholds = _baseline_thresholds_for_step(
+        baseline_data,
+        sweep_index=sweep_index,
+        max_concurrency=max_concurrency,
+        request_rate=request_rate,
+    )
+    for metric_name, baseline_value in thresholds.items():
         current_value = result[metric_name]
-        baseline_value = _resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
-        )
         if "throughput" in metric_name:
             if current_value <= baseline_value:
                 print(
@@ -258,6 +324,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=qps,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
+            baseline_config=params.get("baseline"),
+            sweep_index=i,
+            request_rate=qps,
+            max_concurrency=None,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         assert_result(
             result,
@@ -276,6 +348,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=concurrency,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
+            baseline_config=params.get("baseline"),
+            sweep_index=i,
+            request_rate=None,
+            max_concurrency=concurrency,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         assert_result(
             result,

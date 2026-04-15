@@ -7,6 +7,7 @@ explicitly patch values that differ from vLLM.
 import argparse
 import inspect
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
@@ -164,6 +165,24 @@ def test_stage_configs_path_field():
     """OmniEngineArgs with stage_configs_path should construct without error."""
     args = OmniEngineArgs(stage_configs_path="/some/path.yaml")
     assert args.stage_configs_path == "/some/path.yaml"
+
+
+def test_voxcpm_model_arch_injects_model_type_override(mocker):
+    """Ensure VoxCPM model_arch injects hf_overrides for config resolution."""
+    mocker.patch.object(OmniEngineArgs, "_ensure_omni_models_registered", return_value=True)
+    mocker.patch.object(OmniEngineArgs, "_patch_empty_hf_config")
+    mocker.patch.object(EngineArgs, "create_model_config", return_value=Mock())
+    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", return_value=Mock())
+
+    args = OmniEngineArgs(
+        model="OpenBMB/VoxCPM1.5",
+        model_arch="VoxCPMForConditionalGeneration",
+    )
+    args.create_model_config()
+
+    assert args.hf_overrides["architectures"] == ["VoxCPMForConditionalGeneration"]
+    assert args.hf_overrides["model_type"] == "voxcpm"
+    args._patch_empty_hf_config.assert_called_once_with("voxcpm")
 
 
 def test_strip_single_engine_args():

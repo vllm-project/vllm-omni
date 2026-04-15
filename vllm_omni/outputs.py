@@ -100,6 +100,9 @@ class OmniRequestOutput:
     # memory usage info
     peak_memory_mb: float = 0.0
 
+    # error handling
+    error: str | None = None
+
     @classmethod
     def from_pipeline(
         cls,
