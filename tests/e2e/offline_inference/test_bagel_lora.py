@@ -22,7 +22,6 @@ from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 from pathlib import Path
 
@@ -32,9 +31,9 @@ import torch
 from PIL import Image
 from safetensors.torch import save_file
 
-from tests.conftest import modify_stage_config
+from tests.conftest import OmniRunner, modify_stage_config
 from tests.utils import hardware_test
-from vllm_omni.entrypoints.omni import Omni
+from vllm_omni import Omni
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -154,8 +153,8 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 def test_bagel_lora_scale_and_deactivation(run_level, tmp_path):
     """Validate LoRA effect, bounded perturbation, and clean deactivation."""
     config_path = _resolve_stage_config(BAGEL_STAGE_CONFIG, run_level)
-    omni = Omni(model=MODEL, stage_configs_path=config_path, stage_init_timeout=300)
-    try:
+    with OmniRunner(MODEL, stage_configs_path=config_path) as runner:
+        omni = runner.omni
         lora_request = _make_file_lora_request(tmp_path / "bagel_lora")
 
         # 1) Baseline (no LoRA)
@@ -194,5 +193,3 @@ def test_bagel_lora_scale_and_deactivation(run_level, tmp_path):
 
         # (d) Deactivation fully restores base model
         assert diff_restored == 0.0, f"Base model not restored after LoRA deactivation: diff={diff_restored}"
-    finally:
-        omni.close()

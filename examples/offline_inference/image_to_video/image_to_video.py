@@ -84,6 +84,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--flow-shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
     )
+    parser.add_argument(
+        "--sample-solver",
+        type=str,
+        default="unipc",
+        choices=["unipc", "euler"],
+        help="Sampling solver for Wan2.2 pipelines. Use 'euler' for Lightning/Distill setups.",
+    )
     parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
     parser.add_argument(
@@ -305,6 +312,7 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
+    print(f"  Solver: {args.sample_solver}")
     print(
         f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size},"
         f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size}"
@@ -326,9 +334,14 @@ def main():
             generator=generator,
             guidance_scale=guidance_scale,
             guidance_scale_2=args.guidance_scale_high,
+            boundary_ratio=args.boundary_ratio,
             num_inference_steps=num_inference_steps,
             num_frames=num_frames,
             frame_rate=frame_rate,
+            extra_args={
+                "sample_solver": args.sample_solver,
+                "flow_shift": args.flow_shift,
+            },
         ),
     )
     generation_end = time.perf_counter()

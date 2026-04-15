@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
+from tests.conftest import OmniRunner
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -271,16 +272,11 @@ def clip_bundle() -> tuple[CLIPModel, CLIPProcessor]:
 
 @pytest.fixture(scope="module")
 def omni() -> Generator[Omni, None, None]:
-    engine = Omni(
-        model=MODEL_NAME,
+    with OmniRunner(
+        MODEL_NAME,
         stage_configs_path=str(STAGE_CONFIG_PATH),
-        stage_init_timeout=600,
-        init_timeout=900,
-    )
-    try:
-        yield engine
-    finally:
-        engine.close()
+    ) as runner:
+        yield runner.omni
 
 
 def _extract_generated_image(outputs: list[object]) -> Image.Image:

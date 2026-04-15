@@ -143,7 +143,11 @@ async def async_request_openai_chat_omni_completions(
                 if response.status == 200:
                     handler = StreamedResponseHandler()
                     async for chunk_bytes in response.content.iter_any():
-                        chunk_bytes = chunk_bytes.strip()
+                        # NOTE: Do NOT strip() here; TCP may fragment the SSE messages,
+                        # so stripping here can cause problems depending on how it is split.
+                        #
+                        # Simple example: [b'data: ',  b'{json}\n\n'] <- stripping the first
+                        # chunk will break SSE parsing because the space after 'data:' is required.
                         if not chunk_bytes:
                             continue
 
