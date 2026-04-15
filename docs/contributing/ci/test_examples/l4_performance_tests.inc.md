@@ -1,4 +1,4 @@
-When you want to add L4-level ***performance test*** cases, you can refer to the following format for case addition in tests/dfx/perf/tests/test.json:
+When you want to add L4-level ***performance test*** cases, you can refer to the following format for case addition in `tests/dfx/perf/tests/test_qwen_omni.json` or `tests/dfx/perf/tests/test_tts.json` (selected via `pytest ... run_benchmark.py --test-config-file <path>`):
 
 ```JSON
 {
