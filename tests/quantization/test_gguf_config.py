@@ -18,7 +18,7 @@ from vllm_omni.quantization.gguf_config import (
     dequant_gemm_gguf,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_gguf_config_creation_and_delegation():

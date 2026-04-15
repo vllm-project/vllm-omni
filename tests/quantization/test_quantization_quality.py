@@ -7,7 +7,7 @@ acceptable perceptual distance (LPIPS) of the BF16 baseline.
 Developers adding a new quantization method should:
 1. Add their method + model to QUALITY_CONFIGS below
 2. Set a max_lpips threshold (use 0.15 for image, 0.20 for video as defaults)
-3. Run: pytest tests/diffusion/quantization/test_quantization_quality.py -v -m ""
+3. Run: pytest tests/quantization/test_quantization_quality.py -v -m ""
 4. Paste the output table into their PR description
 
 The test generates outputs with both BF16 and the quantized method using the
@@ -17,10 +17,10 @@ Requirements:
     pip install lpips
 
 Example — run only FP8 tests:
-    pytest tests/diffusion/quantization/test_quantization_quality.py -v -m "" -k "fp8"
+    pytest tests/quantization/test_quantization_quality.py -v -m "" -k "fp8"
 
 Example — run a specific model:
-    pytest tests/diffusion/quantization/test_quantization_quality.py -v -m "" -k "z_image"
+    pytest tests/quantization/test_quantization_quality.py -v -m "" -k "z_image"
 """
 
 from __future__ import annotations

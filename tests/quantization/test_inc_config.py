@@ -4,7 +4,7 @@
 
 import pytest
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_build_quant_config_autoround():

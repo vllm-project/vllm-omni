@@ -263,7 +263,7 @@ outputs = omni.generate(
 
 ### Quality Gate Test (LPIPS)
 
-We provide a pytest-based quality gate at `tests/diffusion/quantization/test_quantization_quality.py`.
+We provide a pytest-based quality gate at `tests/quantization/test_quantization_quality.py`.
 It generates outputs with both BF16 and your quantized method using the same seed, computes
 [LPIPS](https://github.com/richzhang/PerceptualSimilarity) perceptual distance, and **fails if it
 exceeds a threshold**. This is the recommended way to validate that a quantization method does not
@@ -290,13 +290,13 @@ QualityTestConfig(
 pip install lpips
 
 # Run all quality tests
-pytest tests/diffusion/quantization/test_quantization_quality.py -v -m ""
+pytest tests/quantization/test_quantization_quality.py -v -m ""
 
 # Run only your method
-pytest tests/diffusion/quantization/test_quantization_quality.py -v -m "" -k "int8"
+pytest tests/quantization/test_quantization_quality.py -v -m "" -k "int8"
 
 # Run a specific model
-pytest tests/diffusion/quantization/test_quantization_quality.py -v -m "" -k "z_image"
+pytest tests/quantization/test_quantization_quality.py -v -m "" -k "z_image"
 ```
 
 **Step 3: Read the output:**
@@ -364,7 +364,7 @@ aggressive quantization methods (Int8, NVFP4).
 
 1. Run the quality gate test with all layers quantized:
     ```bash
-    pytest tests/diffusion/quantization/test_quantization_quality.py -v -m "" -k "your_model"
+    pytest tests/quantization/test_quantization_quality.py -v -m "" -k "your_model"
     ```
 
 2. If LPIPS exceeds your threshold, try skipping common sensitive layers one at a time:
