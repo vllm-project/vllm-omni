@@ -667,9 +667,14 @@ class DiffusionEngine:
 
         postprocess_start_time = time.perf_counter()
         if self.post_process_func is not None:
+            post_process_accepts_sampling_params = getattr(
+                self,
+                "_post_process_accepts_sampling_params",
+                False,
+            )
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
-            if self._post_process_accepts_sampling_params:
+            if post_process_accepts_sampling_params:
                 outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
             else:
                 outputs = self.post_process_func(output_data)
