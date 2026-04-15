@@ -64,7 +64,7 @@ steps:
       fi
 
       # Build and push to SWR using buildctl
-      # 使用 --cache-from 复用之前构建的镜像层，使用 --cache-to 将缓存写入镜像
+      # 使用 --import-cache 复用之前构建的镜像层，使用 --export-cache 将缓存写入镜像
       export DOCKER_CONFIG=/home/user/.docker
       buildctl \
         --addr="$${BUILDKITD_ADDR}" \
@@ -76,8 +76,8 @@ steps:
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile.npu.test \
-        --cache-from=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache \
-        --cache-to=type=inline \
+        --import-cache type=registry,ref=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache \
+        --export-cache type=registry,ref=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,mode=max \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,push=true \
         --progress=plain
@@ -161,7 +161,7 @@ steps:
       fi
 
       # Build and push to SWR using buildctl
-      # 使用 --cache-from 复用之前构建的镜像层，使用 --cache-to 将缓存写入镜像
+      # 使用 --import-cache 复用之前构建的镜像层，使用 --export-cache 将缓存写入镜像
       export DOCKER_CONFIG=/home/user/.docker
       buildctl \
         --addr="$${BUILDKITD_ADDR}" \
@@ -173,8 +173,8 @@ steps:
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile.npu.test \
-        --cache-from=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache \
-        --cache-to=type=inline \
+        --import-cache type=registry,ref=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache \
+        --export-cache type=registry,ref=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,mode=max \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,push=true \
         --progress=plain
