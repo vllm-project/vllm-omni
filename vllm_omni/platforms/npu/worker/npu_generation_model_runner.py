@@ -196,6 +196,21 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+                token_in_capture = selected_bucket is not None
+                logger.debug(
+                    "logId: 3 code2wav after-dispatch: mode=%s, tokens=%d->%d, bucket=%s, "
+                    "token_in_capture=%s, graph_enabled=%s, cfg_mode=%s, cfg_capture_len=%s, cfg_max_capture=%s",
+                    cudagraph_mode,
+                    num_tokens_unpadded,
+                    dispatch_num_tokens,
+                    selected_bucket,
+                    token_in_capture,
+                    graph_enabled,
+                    getattr(self.compilation_config, "cudagraph_mode", None),
+                    0 if not capture_sizes else len(capture_sizes),
+                    getattr(self.compilation_config, "max_cudagraph_capture_size", None),
+                )
+
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
                     "should_ubatch: %s, num_tokens_across_dp: %s",
@@ -321,6 +336,12 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+        logger.debug(
+            "logId: 5 code2wav before-forward: final_mode=%s, has_encoder_input=%s",
+            cudagraph_mode,
+            has_encoder_input,
+        )
+
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
         with (

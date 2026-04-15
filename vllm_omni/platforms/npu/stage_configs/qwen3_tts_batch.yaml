@@ -16,9 +16,9 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.5
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 2048
+      max_num_batched_tokens: 8192
       max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     output_connectors:
@@ -47,7 +47,7 @@ stage_args:
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.2
+      gpu_memory_utilization: 0.4
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 8192
       max_model_len: 32768
@@ -84,7 +84,6 @@ runtime:
         connector_get_max_wait: 300
         codec_chunk_frames: 25
         codec_left_context_frames: 25
-
   edges:
     - from: 0
       to: 1

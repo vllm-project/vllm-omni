@@ -8,6 +8,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
@@ -21,6 +22,8 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE, NP
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+logger = init_logger(__name__)
 
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
@@ -51,7 +54,13 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # Explicit eager mode: force-disable graph path for stage1.
         if not self._is_code2wav_graph_enabled():
             if getattr(comp_cfg, "cudagraph_mode", None) != CUDAGraphMode.NONE:
+                old_mode = getattr(comp_cfg, "cudagraph_mode", None)
                 comp_cfg.cudagraph_mode = CUDAGraphMode.NONE
+                logger.debug(
+                    "logId: 1 code2wav graph disabled by enforce_eager, mode %s -> %s",
+                    old_mode,
+                    comp_cfg.cudagraph_mode,
+                )
             return
 
         patched = False
@@ -69,7 +78,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         if max_capture <= 32:
             # Keep startup overhead bounded while covering common code2wav lengths.
             scheduler_cap = int(getattr(self.scheduler_config, "max_num_batched_tokens", 4096))
-            max_capture = min(max(scheduler_cap, 2048), 4096)
+            max_capture = min(max(scheduler_cap, 2048), 16384)
             comp_cfg.max_cudagraph_capture_size = max_capture
             patched = True
 
@@ -84,14 +93,52 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             # Rebuild for placeholder/sparse buckets that cannot cover typical code2wav lengths.
             if (len(sizes_list) <= 1 and max_size <= 32) or max_size < 1024:
                 need_rebuild_sizes = True
+            # TODO(code2wav-npu): Expand rebuild criteria to cover the case where
+            # existing buckets are valid but do not reach max_capture (e.g. max_size < max_capture),
+            # otherwise large-token batches may still fall back to eager.
 
         if need_rebuild_sizes:
-            comp_cfg.cudagraph_capture_sizes = list(range(32, max_capture + 1, 32))
+            # Build broader buckets to avoid eager fallback when multi-request
+            # batches push total tokens beyond narrow ranges.
+            focused_min = 1536
+            # TODO(code2wav-npu): Make bucket lower-bound configurable (and/or adaptive).
+            # A fixed 1536 lower bound can over-pad short requests.
+            bucket_step = 256
+            start = focused_min if max_capture >= focused_min else 256
+            comp_cfg.cudagraph_capture_sizes = list(range(start, max_capture + 1, bucket_step))
+            # Keep max capture at max_capture; do not re-clamp to a smaller focused max.
+            comp_cfg.max_cudagraph_capture_size = max_capture
             patched = True
+
+        if patched:
+            logger.debug(
+                "logId: 1 code2wav auto-config patched: "
+                "cudagraph_mode %s -> %s, capture_sizes_len %s -> %s, "
+                "max_capture_size %s -> %s",
+                old_mode,
+                getattr(comp_cfg, "cudagraph_mode", None),
+                0 if old_sizes is None else len(old_sizes),
+                0
+                if getattr(comp_cfg, "cudagraph_capture_sizes", None) is None
+                else len(getattr(comp_cfg, "cudagraph_capture_sizes")),
+                old_max,
+                getattr(comp_cfg, "max_cudagraph_capture_size", None),
+            )
 
     def load_model(self, *args, **kwargs) -> None:
         self._maybe_enable_code2wav_graph()
         NPUModelRunner.load_model(self, *args, **kwargs)
+        capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
+        capture_len = 0 if not capture_sizes else len(capture_sizes)
+        logger.debug(
+            "logId: 2 npu load graph-config: mode=%s, capture_sizes_len=%s, "
+            "max_capture_size=%s, enforce_eager=%s, graph_enabled=%s",
+            getattr(self.compilation_config, "cudagraph_mode", None),
+            capture_len,
+            getattr(self.compilation_config, "max_cudagraph_capture_size", None),
+            getattr(self.model_config, "enforce_eager", None),
+            self._is_code2wav_graph_enabled(),
+        )
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
