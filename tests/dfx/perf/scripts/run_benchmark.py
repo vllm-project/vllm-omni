@@ -64,7 +64,7 @@ def omni_server(request):
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "120", "--init-timeout", "900"]
+        server_args = ["--stage-init-timeout", "300", "--init-timeout", "900"]
         if stage_config_path:
             server_args = ["--stage-configs-path", stage_config_path] + server_args
         with OmniServer(model, server_args) as server:
