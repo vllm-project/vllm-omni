@@ -88,6 +88,11 @@ _DIFFUSION_MODELS = {
         "pipeline_stable_audio",
         "StableAudioPipeline",
     ),
+    "PrismAudioPipeline": (
+        "prismaudio",
+        "pipeline_prismaudio",
+        "PrismAudioPipeline",
+    ),
     "WanImageToVideoPipeline": (
         "wan2_2",
         "pipeline_wan2_2_i2v",
@@ -356,6 +361,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
+    "PrismAudioPipeline": "get_prismaudio_post_process_func",
     "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",

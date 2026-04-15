@@ -23,6 +23,7 @@ nav:
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - MammothModa2-Preview: user_guide/examples/offline_inference/mammothmodal2_preview.md
       - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
+      - PrismAudio Offline Inference: user_guide/examples/offline_inference/prismaudio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Qwen3-TTS: user_guide/examples/offline_inference/qwen3_tts.md

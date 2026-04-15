@@ -49,6 +49,7 @@ th {
 | `FluxPipeline` | FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | ✅︎ | ✅︎ | | ✅︎ |
 | `OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` | ✅︎ | ✅︎ | | ✅︎ |
 | `StableAudioPipeline` | Stable-Audio-Open | `stabilityai/stable-audio-open-1.0` | ✅︎ | ✅︎ | | ✅︎ |
+| `PrismAudioPipeline` | PrismAudio (precomputed-features scope) | local official-config + checkpoint-backed setup | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
@@ -63,3 +64,5 @@ th {
 |`DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` | ✅︎ | | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+`PrismAudioPipeline` currently supports the precomputed-features-first integration scope. See [PrismAudio Offline Inference](../user_guide/examples/offline_inference/prismaudio.md) for the exact request contract and local smoke-test flow.
