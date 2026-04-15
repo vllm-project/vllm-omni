@@ -14,6 +14,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -37,6 +38,8 @@ PROMPTS = [
     "Could you please turn down the music a little bit, I'm trying to concentrate on my work.",
     "It was a dark and stormy night when the old lighthouse keeper heard a knock at the door.",
 ]
+REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+INSTRUCT = "Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
 
 
 @dataclass
@@ -93,27 +96,52 @@ def pcm_bytes_to_duration(num_bytes: int, sample_rate: int = 24000, sample_width
     return num_samples / sample_rate
 
 
+def create_payload(
+    prompt: str,
+    task_type: str = "CustomVoice",
+    voice: str = "vivian",
+    language: str = "English",
+    ref_audio: str | None = None,
+    ref_text: str | None = None,
+) -> dict:
+    payload = {
+        "input": prompt,
+        "language": language,
+        "stream": True,
+        "response_format": "pcm",
+        "task_type": task_type,
+    }
+
+    if task_type == "Base":
+        if not ref_audio:
+            raise ValueError("Base task_type requires --ref-audio (local file path or URL).")
+        payload["ref_audio"] = ref_audio
+        payload["ref_text"] = ref_text or REF_TEXT
+    elif task_type == "CustomVoice":
+        payload["voice"] = voice
+    elif task_type == "VoiceDesign":
+        payload["instructions"] = INSTRUCT
+
+    return payload
+
+
 async def send_tts_request(
     session: aiohttp.ClientSession,
     api_url: str,
     prompt: str,
+    task_type: str = "CustomVoice",
     voice: str = "vivian",
     language: str = "English",
+    ref_audio: str | None = None,
+    ref_text: str | None = None,
     pbar: tqdm | None = None,
 ) -> RequestResult:
     """Send a streaming TTS request and measure latency metrics."""
-    payload = {
-        "input": prompt,
-        "voice": voice,
-        "language": language,
-        "stream": True,
-        "response_format": "pcm",
-    }
-
     result = RequestResult(prompt=prompt)
     st = time.perf_counter()
 
     try:
+        payload = create_payload(prompt, task_type, voice, language, ref_audio, ref_text)
         async with session.post(api_url, json=payload) as response:
             if response.status != 200:
                 result.error = f"HTTP {response.status}: {await response.text()}"
@@ -153,8 +181,11 @@ async def run_benchmark(
     num_prompts: int,
     max_concurrency: int,
     num_warmups: int = 3,
+    task_type: str = "CustomVoice",
     voice: str = "vivian",
     language: str = "English",
+    ref_audio: str | None = None,
+    ref_text: str | None = None,
 ) -> BenchmarkResult:
     """Run benchmark at a given concurrency level."""
     api_url = f"http://{host}:{port}/v1/audio/speech"
@@ -175,7 +206,7 @@ async def run_benchmark(
         warmup_tasks = []
         for i in range(num_warmups):
             prompt = PROMPTS[i % len(PROMPTS)]
-            warmup_tasks.append(send_tts_request(session, api_url, prompt, voice, language))
+            warmup_tasks.append(send_tts_request(session, api_url, prompt, task_type, voice, language, ref_audio, ref_text))
         await asyncio.gather(*warmup_tasks)
         print("  Warmup done.")
 
@@ -189,7 +220,9 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, voice, language, pbar)
+            return await send_tts_request(
+                session, api_url, prompt, task_type, voice, language, ref_audio, ref_text, pbar
+            )
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -298,6 +331,10 @@ async def run_benchmark(
 
 async def main(args):
     all_results = []
+    ref_audio = args.ref_audio
+    if ref_audio and "://" not in ref_audio:
+        # Convert local path to file:// URI for media loader.
+        ref_audio = f"file://{os.path.abspath(ref_audio)}"
 
     for concurrency in args.max_concurrency:
         result = await run_benchmark(
@@ -306,8 +343,11 @@ async def main(args):
             num_prompts=args.num_prompts,
             max_concurrency=concurrency,
             num_warmups=args.num_warmups,
+            task_type=args.task_type,
             voice=args.voice,
             language=args.language,
+            ref_audio=ref_audio,
+            ref_text=args.ref_text,
         )
         result.config_name = args.config_name
         all_results.append(asdict(result))
@@ -334,6 +374,9 @@ def parse_args():
         "--max-concurrency", type=int, nargs="+", default=[1, 4, 10], help="Concurrency levels to test"
     )
     parser.add_argument("--num-warmups", type=int, default=3)
+    parser.add_argument("--task-type", type=str, default="CustomVoice", choices=["CustomVoice", "VoiceDesign", "Base"])
+    parser.add_argument("--ref-audio", type=str, default=None)
+    parser.add_argument("--ref-text", type=str, default=None)
     parser.add_argument("--voice", type=str, default="vivian")
     parser.add_argument("--language", type=str, default="English")
     parser.add_argument(

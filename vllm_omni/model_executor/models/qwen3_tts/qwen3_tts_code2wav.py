@@ -154,10 +154,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         available, falling back to forward-context ubatch_slices when
         micro-batching is active. Returns [ids] for single-request batches.
         """
-        if seq_token_counts is not None and len(seq_token_counts) > 1:
+        if seq_token_counts is not None and len(seq_token_counts) >= 1:
             boundaries = [0]
             for count in seq_token_counts:
-                boundaries.append(boundaries[-1] + count)
+                boundaries.append(boundaries[-1] + max(int(count), 0))
             n = ids.numel()
             return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
         if is_forward_context_available():

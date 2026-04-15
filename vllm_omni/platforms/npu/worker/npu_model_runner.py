@@ -8,7 +8,6 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
@@ -23,11 +22,75 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE, NP
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
-logger = init_logger(__name__)
-
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
+    def _is_code2wav_graph_enabled(self) -> bool:
+        """True only when stage explicitly allows non-eager execution."""
+        if getattr(self.model_config, "model_stage", None) != "code2wav":
+            return False
+        enforce = getattr(self.model_config, "enforce_eager", None)
+        if enforce is None:
+            # Conservative fallback: require non-NONE graph mode.
+            return getattr(self.compilation_config, "cudagraph_mode", None) != CUDAGraphMode.NONE
+        return not bool(enforce)
+
+    def _maybe_enable_code2wav_graph(self) -> None:
+        """Auto-tune ACL graph config for code2wav stage on NPU.
+
+        Rationale:
+        - In practice, code2wav often runs with long token lengths (e.g. 1k~2k+).
+        - If cudagraph mode is NONE or capture sizes are too sparse/small, dispatcher
+          will keep returning eager path (CUDAGraphMode.NONE).
+        - For debug/perf bring-up, we apply conservative defaults only for code2wav.
+        """
+        model_stage = getattr(self.model_config, "model_stage", None)
+        if model_stage != "code2wav":
+            return
+
+        comp_cfg = self.compilation_config
+        # Explicit eager mode: force-disable graph path for stage1.
+        if not self._is_code2wav_graph_enabled():
+            if getattr(comp_cfg, "cudagraph_mode", None) != CUDAGraphMode.NONE:
+                comp_cfg.cudagraph_mode = CUDAGraphMode.NONE
+            return
+
+        patched = False
+        old_mode = getattr(comp_cfg, "cudagraph_mode", None)
+        old_sizes = getattr(comp_cfg, "cudagraph_capture_sizes", None)
+        old_max = getattr(comp_cfg, "max_cudagraph_capture_size", None)
+
+        # If mode is NONE, allow graph execution for code2wav.
+        if old_mode == CUDAGraphMode.NONE:
+            comp_cfg.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            patched = True
+
+        # Ensure a non-trivial capture upper bound.
+        max_capture = int(old_max) if isinstance(old_max, int) and old_max > 0 else 0
+        if max_capture <= 32:
+            # Keep startup overhead bounded while covering common code2wav lengths.
+            scheduler_cap = int(getattr(self.scheduler_config, "max_num_batched_tokens", 4096))
+            max_capture = min(max(scheduler_cap, 2048), 4096)
+            comp_cfg.max_cudagraph_capture_size = max_capture
+            patched = True
+
+        # If capture sizes are empty (or only a tiny placeholder like [1]),
+        # provide dense buckets (32-step) for code2wav.
+        need_rebuild_sizes = False
+        if not old_sizes:
+            need_rebuild_sizes = True
+        elif isinstance(old_sizes, (list, tuple, set)):
+            sizes_list = list(old_sizes)
+            max_size = max(sizes_list) if sizes_list else 0
+            # Rebuild for placeholder/sparse buckets that cannot cover typical code2wav lengths.
+            if (len(sizes_list) <= 1 and max_size <= 32) or max_size < 1024:
+                need_rebuild_sizes = True
+
+        if need_rebuild_sizes:
+            comp_cfg.cudagraph_capture_sizes = list(range(32, max_capture + 1, 32))
+            patched = True
+
     def load_model(self, *args, **kwargs) -> None:
+        self._maybe_enable_code2wav_graph()
         NPUModelRunner.load_model(self, *args, **kwargs)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.

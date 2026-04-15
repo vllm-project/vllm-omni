@@ -160,6 +160,28 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                dispatch_num_tokens = int(num_tokens_unpadded)
+                dispatch_num_scheduled_tokens_np = num_scheduled_tokens_np
+                dispatch_max_num_scheduled_tokens = max_num_scheduled_tokens
+                capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
+                selected_bucket = None
+                graph_enabled = self._is_code2wav_graph_enabled() and (
+                    getattr(self.compilation_config, "cudagraph_mode", None) != CUDAGraphMode.NONE
+                )
+                if graph_enabled and capture_sizes:
+                    try:
+                        valid_sizes = sorted({int(s) for s in capture_sizes if int(s) > 0})
+                        selected_bucket = next((s for s in valid_sizes if s >= dispatch_num_tokens), None)
+                    except Exception:
+                        valid_sizes = []
+                        selected_bucket = None
+                    if selected_bucket is not None and selected_bucket > dispatch_num_tokens:
+                        pad_delta = selected_bucket - dispatch_num_tokens
+                        dispatch_num_tokens = selected_bucket
+                        dispatch_num_scheduled_tokens_np = num_scheduled_tokens_np.copy()
+                        dispatch_num_scheduled_tokens_np[-1] += pad_delta
+                        dispatch_max_num_scheduled_tokens = int(dispatch_num_scheduled_tokens_np.max())
+
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -167,14 +189,13 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                     num_tokens_across_dp,
                     cudagraph_stats,
                 ) = self._determine_batch_execution_and_padding(
-                    num_tokens=num_tokens_unpadded,
+                    num_tokens=dispatch_num_tokens,
                     num_reqs=num_reqs,
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    num_scheduled_tokens_np=dispatch_num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=dispatch_max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
-
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
                     "should_ubatch: %s, num_tokens_across_dp: %s",
@@ -300,7 +321,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
-
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
         with (
