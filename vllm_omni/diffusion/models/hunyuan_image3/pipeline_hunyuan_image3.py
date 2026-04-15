@@ -25,8 +25,8 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .autoencoder import AutoencoderKLConv3D
-from .hunyuan_image_3_tokenizer import TokenizerWrapper
-from .hunyuan_image_3_transformer import (
+from .hunyuan_image3_tokenizer import TokenizerWrapper
+from .hunyuan_image3_transformer import (
     CausalMMOutputWithPast,
     HunyuanImage3ImageProcessor,
     HunyuanImage3Model,
