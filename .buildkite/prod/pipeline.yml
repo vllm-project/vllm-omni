@@ -3,7 +3,7 @@ steps:
   - label: ":buildkit: Build and Push NPU Prod Image (HK-001 a2b3 - Default: 1 Card)"
     key: image-build-hk001
     agents:
-      queue: "linux-aarch64-a2b3"
+      queue: "ascend-a2b3"
     plugins:
       - kubernetes:
           metadata:
@@ -45,13 +45,12 @@ steps:
       IMAGE_REGISTRY: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry"
       # buildkitd remote connection
       BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd:1234"
-      NPU_COUNT: "1"  # A2 B3 默认为单卡
     command: |
       set -ex
 
       echo "--- Building and pushing NPU Prod Image (HK-001 a2b3)"
-      echo "NPU Count: $${NPU_COUNT}"
       echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+      echo "Build cache: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache"
       echo "buildkitd address: $${BUILDKITD_ADDR}"
 
       # Ensure buildctl is available
@@ -65,6 +64,7 @@ steps:
       fi
 
       # Build and push to SWR using buildctl
+      # 使用 --cache-from 复用之前构建的镜像层，使用 --cache-to 将缓存写入镜像
       export DOCKER_CONFIG=/home/user/.docker
       buildctl \
         --addr="$${BUILDKITD_ADDR}" \
@@ -76,16 +76,20 @@ steps:
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile.npu.test \
+        --cache-from=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache \
+        --cache-to=type=inline \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
+        --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,push=true \
         --progress=plain
 
       echo "--- Image pushed successfully"
       echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+      echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache"
 
   - label: "Upload Test Pipeline (HK-001)"
     depends_on: image-build-hk001
     agents:
-      queue: "linux-aarch64-a2b3"
+      queue: "ascend-a2b3"
     command: |
       buildkite-agent pipeline upload .buildkite/prod/test-npu-ready-hk001.yaml
 
@@ -93,7 +97,7 @@ steps:
   - label: ":buildkit: Build and Push NPU Prod Image (CN12-001 a3 - Default: 2 Cards)"
     key: image-build-cn12001
     agents:
-      queue: "linux-aarch64-a3"
+      queue: "ascend-a3"
     plugins:
       - kubernetes:
           metadata:
@@ -135,13 +139,12 @@ steps:
       IMAGE_REGISTRY: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry"
       # buildkitd remote connection
       BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd:1234"
-      NPU_COUNT: "2"  # A3 默认为双卡
     command: |
       set -ex
 
       echo "--- Building and pushing NPU Prod Image (CN12-001 a3)"
-      echo "NPU Count: $${NPU_COUNT}"
       echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+      echo "Build cache: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache"
       echo "buildkitd address: $${BUILDKITD_ADDR}"
 
       # 配置 GitHub 代理（国内集群）
@@ -158,6 +161,7 @@ steps:
       fi
 
       # Build and push to SWR using buildctl
+      # 使用 --cache-from 复用之前构建的镜像层，使用 --cache-to 将缓存写入镜像
       export DOCKER_CONFIG=/home/user/.docker
       buildctl \
         --addr="$${BUILDKITD_ADDR}" \
@@ -169,16 +173,20 @@ steps:
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile.npu.test \
+        --cache-from=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache \
+        --cache-to=type=inline \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
+        --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,push=true \
         --progress=plain
 
       echo "--- Image pushed successfully"
       echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+      echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache"
 
   - label: "Upload Test Pipeline (CN12-001)"
     depends_on: image-build-cn12001
     agents:
-      queue: "linux-aarch64-a3"
+      queue: "ascend-a3"
     command: |
       buildkite-agent pipeline upload .buildkite/prod/test-npu-ready-cn12001.yaml
 

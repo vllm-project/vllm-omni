@@ -1,10 +1,8 @@
 steps:
   - label: "🧪 NPU Unit Test (HK-001 a2b3 - 1 Card)"
     agents:
-      queue: "linux-aarch64-a2b3"
-      resource_class: a2b3-1card
-    env:
-      NPU_COUNT: "1"
+      queue: "ascend-a2b3"
+      resource_class: npu-1
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
     command: |
       set -ex

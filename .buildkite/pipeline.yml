@@ -49,6 +49,7 @@ steps:
 
       echo "--- Building and pushing NPU Test Image"
       echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+      echo "Build cache: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache"
       echo "buildkitd address: $${BUILDKITD_ADDR}"
 
       # 配置 GitHub 代理
@@ -65,6 +66,7 @@ steps:
       fi
 
       # 使用 buildctl 构建并推送到 SWR
+      # 使用 --cache-from 复用之前构建的镜像层，使用 --cache-to 将缓存写入镜像
       export DOCKER_CONFIG=/home/user/.docker
       buildctl \
         --addr="$${BUILDKITD_ADDR}" \
@@ -76,17 +78,21 @@ steps:
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile.npu.test \
+        --cache-from=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache \
+        --cache-to=type=inline \
         --secret id=dockerconfig,src=/home/user/.docker/config.json \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
+        --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,push=true \
         --progress=plain
 
       echo "--- Image pushed successfully"
       echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+      echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache"
 
-  - label: "Upload Test Pipeline (gy006 - 1 Card)"
+  - label: "Upload Test Pipeline (gy006 - 2 Card)"
     depends_on: image-build
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
-      resource_class: a2b3-1card
+      # resource_class: npu-2
     command: |
       buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml

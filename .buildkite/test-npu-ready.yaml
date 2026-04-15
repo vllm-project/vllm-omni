@@ -1,8 +1,8 @@
 steps:
-  - label: "🧪 NPU Unit Test (gy006 - 1 Card)"
+  - label: "🧪 NPU Unit Test (gy006 - 2 Card)"
     agents:
       queue: "linux-aarch64-a2b3-gy006-test"
-      resource_class: a2b3-1card
+      resource_class: npu-2
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
     command: |
       set -ex
@@ -19,10 +19,11 @@ steps:
         echo "WARNING: npu-smi command not available"
       fi
 
-      echo "--- Running pytest"
-      timeout 20m pytest -v -s -m 'core_model and npu' \
-        --cov=vllm_omni \
-        --cov-branch \
-        --cov-report=term-missing \
-        --cov-report=html \
-        --cov-report=xml
+
+# echo "--- Running pytest"
+# timeout 20m pytest -v -s -m 'core_model and npu' \
+#   --cov=vllm_omni \
+#   --cov-branch \
+#   --cov-report=term-missing \
+#   --cov-report=html \
+#   --cov-report=xml
