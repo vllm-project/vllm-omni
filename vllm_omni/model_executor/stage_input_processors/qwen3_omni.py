@@ -152,6 +152,34 @@ def _merge_pd_embeddings(
     return merged_emb, merged_hid
 
 
+def _get_prefill_multimodal_output(prefill_stage: Any, output_index: int) -> dict[str, Any] | None:
+    """Return multimodal_output dict from the PD prefill stage for a given batch index."""
+    try:
+        prefill_eos = prefill_stage.engine_outputs
+        prefill_eo = prefill_eos[min(output_index, len(prefill_eos) - 1)]
+        return prefill_eo.outputs[0].multimodal_output
+    except Exception:
+        return None
+
+
+def _resolve_tts_token_embedding(
+    key: str,
+    *,
+    thinker_mm: dict[str, Any],
+    prefill_mm: dict[str, Any] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return TTS BOS/EOS/PAD embedding tensors for the talker projection path.
+
+    Values are taken from the current thinker (decode) ``multimodal_output``; in
+    PD mode, missing keys may be filled from the paired prefill stage output.
+    """
+    val = thinker_mm.get(key)
+    if val is None and prefill_mm is not None:
+        val = prefill_mm.get(key)
+    return val.detach().to(device=device, dtype=torch.float) if val is not None else None
+
+
 # =========================
 # Thinker -> Talker
 # =========================
@@ -277,43 +305,42 @@ def thinker2talker(
     # Process each thinker output
     for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
-        decode_emb = output.multimodal_output[_EMBED_LAYER_KEY].detach().to(device=device, dtype=torch.float)
-        decode_hid = output.multimodal_output[_HIDDEN_LAYER_KEY].detach().to(device=device, dtype=torch.float)
+        thinker_mm = output.multimodal_output
+        # Full thinker embedding sequence for the talker: single thinker engine in the
+        # non-PD path; after optional merge with prefill-side tensors in PD mode.
+        thinker_emb = thinker_mm[_EMBED_LAYER_KEY].detach().to(device=device, dtype=torch.float)
+        thinker_hid = thinker_mm[_HIDDEN_LAYER_KEY].detach().to(device=device, dtype=torch.float)
 
-        # PD mode: merge prefill prompt embeddings with decode generated embeddings
+        prefill_mm: dict[str, Any] | None = None
         if prefill_stage is not None:
+            prefill_mm = _get_prefill_multimodal_output(prefill_stage, i)
+
+        if prefill_mm is not None:
             expected_total = len(thinker_output.prompt_token_ids) + len(output.token_ids)
             try:
-                prefill_eos = prefill_stage.engine_outputs
-                prefill_eo = prefill_eos[min(i, len(prefill_eos) - 1)]
-                prefill_mm = prefill_eo.outputs[0].multimodal_output
-                decode_emb, decode_hid = _merge_pd_embeddings(
-                    decode_emb, decode_hid, prefill_mm, device, expected_total=expected_total
+                thinker_emb, thinker_hid = _merge_pd_embeddings(
+                    thinker_emb, thinker_hid, prefill_mm, device, expected_total=expected_total
                 )
             except Exception as exc:
                 logger.warning("[PD] Could not merge prefill embeddings: %s", exc)
 
-        # Helper: fetch TTS embed from decode output, fall back to prefill stage output
-        def _tts(key: str) -> torch.Tensor | None:
-            val = output.multimodal_output.get(key)
-            if val is None and prefill_stage is not None:
-                try:
-                    val = prefill_stage.engine_outputs[0].outputs[0].multimodal_output.get(key)
-                except Exception:
-                    pass
-            return val.detach().to(device=device, dtype=torch.float) if val is not None else None
-
         info = {
-            "thinker_prefill_embeddings": decode_emb,
-            "thinker_hidden_states": decode_hid,
+            "thinker_prefill_embeddings": thinker_emb,
+            "thinker_hidden_states": thinker_hid,
             "thinker_sequences": (
                 thinker_output.prompt_token_ids + output.token_ids
             ),  # the thinker_sequences is the whole ids
             "thinker_input_ids": thinker_output.prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
-            "tts_bos_embed": _tts("tts_bos_embed"),
-            "tts_eos_embed": _tts("tts_eos_embed"),
-            "tts_pad_embed": _tts("tts_pad_embed"),
+            "tts_bos_embed": _resolve_tts_token_embedding(
+                "tts_bos_embed", thinker_mm=thinker_mm, prefill_mm=prefill_mm, device=device
+            ),
+            "tts_eos_embed": _resolve_tts_token_embedding(
+                "tts_eos_embed", thinker_mm=thinker_mm, prefill_mm=prefill_mm, device=device
+            ),
+            "tts_pad_embed": _resolve_tts_token_embedding(
+                "tts_pad_embed", thinker_mm=thinker_mm, prefill_mm=prefill_mm, device=device
+            ),
         }
         speaker = extract_speaker_from_prompt(prompt, index=i)
         if speaker is not None:
