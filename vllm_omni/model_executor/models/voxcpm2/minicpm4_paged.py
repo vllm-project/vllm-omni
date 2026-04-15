@@ -307,6 +307,16 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def precompute_fused_qkv(self) -> None:
+        """Materialize fused QKV weights before CUDA Graph capture."""
+        for layer in self.layers:
+            attn = layer.self_attn
+            if attn._fused_qkv_weight is None:
+                attn._fused_qkv_weight = torch.cat(
+                    [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight],
+                    dim=0,
+                ).detach()
+
     def compile_selective(self) -> list[str]:
         """Compile the full model forward as one graph.
 
@@ -410,6 +420,16 @@ class MiniCPM4PagedResidualLM(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def precompute_fused_qkv(self) -> None:
+        """Materialize fused QKV weights before CUDA Graph capture."""
+        for layer in self.layers:
+            attn = layer.self_attn
+            if attn._fused_qkv_weight is None:
+                attn._fused_qkv_weight = torch.cat(
+                    [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight],
+                    dim=0,
+                ).detach()
 
     def compile_selective(self) -> list[str]:
         """Compile the full residual model forward as one graph (same strategy as base_lm)."""
