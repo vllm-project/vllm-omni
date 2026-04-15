@@ -143,6 +143,53 @@ class Flux2Transformer2DModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 ```
 
+#### Customized Pipelines
+For customized pipelines that do not follow the standard `transformer` / `text_encoder` / `vae`
+layout, the pipeline can provide a custom `discover_offload_modules()` implementation.
+
+Bagel is one such example. Its transformer blocks live under `language_model.model`, while
+several Bagel-specific modules (such as `time_embedder`, `vae2llm`, `llm2vae`, `vit_model`, etc.)
+should remain resident on GPU during layerwise offloading. Register
+
+```python
+class Qwen2MoTModel(...):
+    _layerwise_offload_blocks_attrs = ["layers"]
+```
+
+Then, implement discover_offload_modules() on the BagelPipeline to tell the offloader which modules should be treated as offloadable transformer layers and which resident modules should stay on GPU:
+
+```python
+def discover_offload_modules(self) -> PipelineModules:
+    resident_modules = [
+        self.bagel.time_embedder,
+        self.bagel.vae2llm,
+        self.bagel.llm2vae,
+        self.bagel.latent_pos_embed,
+        self.bagel.vit_model,
+        self.bagel.connector,
+        self.bagel.vit_pos_embed,
+    ]
+
+    return PipelineModules(
+        dits=[self.language_model.model],
+        dit_names=["bagel.language_model.model"],
+        encoders=[],
+        encoder_names=[],
+        vae=self.vae,
+        resident_modules=resident_modules,
+        resident_names=resident_names,
+    )
+```
+
+The offloader checks for a pipeline-provided `discover_offload_modules()` first.
+If present, it takes precedence over the default attribute-based discovery.
+
+```python
+# Custom discovery
+custom_discover = getattr(pipeline, "discover_offload_modules", None)
+```
+
+
 ### Limitations
 - Cold start latency increases because of
     1) components are loaded to CPU first at the very first during initialization,
@@ -195,6 +242,7 @@ Factory function `get_offload_backend()` selects the appropriate backend based o
 | StableDiffusion3Pipeline | `stabilityai/stable-diffusion-3.5-medium` | `SD3Transformer2DModel` | - | ✓ | `"transformer_blocks"` |
 | Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
 | Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
+| BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | - | ✓ | `"layers"`, `"customized modules"` |
 
 **Notes:**
 - Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally
