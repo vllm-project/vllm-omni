@@ -700,6 +700,9 @@ class VoxCPMForConditionalGeneration(nn.Module):
             retry_badcase_ratio_threshold = float(self._extract_val(info, "retry_badcase_ratio_threshold", 6.0))
             streaming_prefix_len = int(self._extract_val(info, "streaming_prefix_len", 3))
 
+            voice_name = self._extract_val(info, "voice_name", None)
+            voice_created_at = float(self._extract_val(info, "voice_created_at", 0))
+
             request_key = self._resolve_stream_request_key(info)
             created_temp: str | None = None
 
@@ -734,6 +737,8 @@ class VoxCPMForConditionalGeneration(nn.Module):
                         text=text,
                         prompt_wav_path=prompt_wav_path,
                         prompt_text=prompt_text,
+                        voice_name=voice_name,
+                        voice_created_at=voice_created_at,
                         cfg_value=cfg_value,
                         inference_timesteps=inference_timesteps,
                         min_len=min_len,
@@ -777,6 +782,8 @@ class VoxCPMForConditionalGeneration(nn.Module):
                     text=text,
                     prompt_wav_path=prompt_wav_path,
                     prompt_text=prompt_text,
+                    voice_name=voice_name,
+                    voice_created_at=voice_created_at,
                     cfg_value=cfg_value,
                     inference_timesteps=inference_timesteps,
                     min_len=min_len,

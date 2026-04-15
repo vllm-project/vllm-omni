@@ -32,6 +32,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
 
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .voxcpm2_import_utils import import_voxcpm2_core
@@ -360,6 +361,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
         self._audio_queue: list[tuple[str, Any]] = []
         self._deferred_cleanup_ids: set[str] = set()
+        self._voice_cache = VoiceEmbeddingCache()
 
     @property
     def tts(self) -> nn.Module:
@@ -1042,13 +1044,36 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 prompt_text = prompt_text[0] if prompt_text else None
 
             state.prompt_cache = None
-            if ref_audio or (prompt_audio and prompt_text):
+            voice_name = info_dict.get("voice_name")
+            voice_created_at = float(info_dict.get("voice_created_at", 0))
+            if voice_name and voice_created_at > 0:
+                cache_key = VoiceEmbeddingCache.make_cache_key(
+                    voice_name, xvec_only=False, created_at=voice_created_at,
+                )
+                cached = self._voice_cache.get(cache_key)
+                if cached is not None:
+                    logger.debug("VoxCPM2 voice cache HIT for '%s'", voice_name)
+                    state.prompt_cache = {
+                        k: v.to(self._device) if isinstance(v, torch.Tensor) else v
+                        for k, v in cached.items()
+                    }
+            if state.prompt_cache is None and (ref_audio or (prompt_audio and prompt_text)):
                 try:
                     state.prompt_cache = self._build_prompt_cache(
                         ref_audio=ref_audio,
                         prompt_audio=prompt_audio,
                         prompt_text=prompt_text,
                     )
+                    if voice_name and voice_created_at > 0 and state.prompt_cache:
+                        cache_key = VoiceEmbeddingCache.make_cache_key(
+                            voice_name, xvec_only=False, created_at=voice_created_at,
+                        )
+                        store = {
+                            k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                            for k, v in state.prompt_cache.items()
+                        }
+                        self._voice_cache.put(cache_key, store)
+                        logger.debug("VoxCPM2 voice cache STORE for '%s'", voice_name)
                 except Exception as e:
                     logger.warning("build_prompt_cache failed: %s", e)
 

@@ -7,12 +7,51 @@ from typing import Any
 import torch
 import torch.nn as nn
 from einops import rearrange
+from vllm.logger import init_logger
+
+from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
+
+logger = init_logger(__name__)
 
 
 class _DirectVoxCPMLatentGenerator:
     def __init__(self, tts_model: Any):
         self.tts_model = tts_model
         self.sample_rate = int(getattr(tts_model, "sample_rate", 24000))
+        self._voice_cache = VoiceEmbeddingCache()
+
+    def _resolve_prompt_cache(
+        self,
+        prompt_wav_path: str | None,
+        prompt_text: str | None,
+        voice_name: str | None = None,
+        voice_created_at: float = 0.0,
+    ) -> dict[str, Any] | None:
+        """Build or retrieve a cached prompt_cache dict for voice cloning."""
+        if prompt_wav_path is None or prompt_text is None:
+            return None
+
+        cache_key: str | None = None
+        if voice_name and voice_created_at > 0:
+            cache_key = VoiceEmbeddingCache.make_cache_key(voice_name, xvec_only=False, created_at=voice_created_at)
+            cached = self._voice_cache.get(cache_key)
+            if cached is not None:
+                logger.debug("VoxCPM voice cache HIT for '%s'", voice_name)
+                return cached
+
+        prompt_cache = self.tts_model.build_prompt_cache(
+            prompt_text=prompt_text,
+            prompt_wav_path=prompt_wav_path,
+        )
+
+        if cache_key is not None:
+            self._voice_cache.put(cache_key, {
+                "prompt_text": prompt_cache["prompt_text"],
+                "audio_feat": prompt_cache["audio_feat"].detach().cpu(),
+            })
+            logger.debug("VoxCPM voice cache STORE for '%s'", voice_name)
+
+        return prompt_cache
 
     def generate_latents(
         self,
@@ -20,6 +59,8 @@ class _DirectVoxCPMLatentGenerator:
         text: str,
         prompt_wav_path: str | None = None,
         prompt_text: str | None = None,
+        voice_name: str | None = None,
+        voice_created_at: float = 0.0,
         cfg_value: float = 2.0,
         inference_timesteps: int = 10,
         min_len: int = 2,
@@ -35,12 +76,9 @@ class _DirectVoxCPMLatentGenerator:
         if prompt_wav_path is not None and not os.path.exists(prompt_wav_path):
             raise FileNotFoundError(f"prompt_wav_path does not exist: {prompt_wav_path}")
 
-        prompt_cache = None
-        if prompt_wav_path is not None and prompt_text is not None:
-            prompt_cache = self.tts_model.build_prompt_cache(
-                prompt_text=prompt_text,
-                prompt_wav_path=prompt_wav_path,
-            )
+        prompt_cache = self._resolve_prompt_cache(
+            prompt_wav_path, prompt_text, voice_name, voice_created_at,
+        )
 
         gen_kw = dict(
             target_text=" ".join(text.split()),
@@ -72,6 +110,8 @@ class _DirectVoxCPMLatentGenerator:
         text: str,
         prompt_wav_path: str | None = None,
         prompt_text: str | None = None,
+        voice_name: str | None = None,
+        voice_created_at: float = 0.0,
         cfg_value: float = 2.0,
         inference_timesteps: int = 10,
         min_len: int = 2,
@@ -89,12 +129,9 @@ class _DirectVoxCPMLatentGenerator:
         if prompt_wav_path is not None and not os.path.exists(prompt_wav_path):
             raise FileNotFoundError(f"prompt_wav_path does not exist: {prompt_wav_path}")
 
-        prompt_cache = None
-        if prompt_wav_path is not None and prompt_text is not None:
-            prompt_cache = self.tts_model.build_prompt_cache(
-                prompt_text=prompt_text,
-                prompt_wav_path=prompt_wav_path,
-            )
+        prompt_cache = self._resolve_prompt_cache(
+            prompt_wav_path, prompt_text, voice_name, voice_created_at,
+        )
 
         gen_kw = dict(
             target_text=" ".join(text.split()),

@@ -60,7 +60,7 @@ class TestVoxCPMServing:
     @pytest.mark.parametrize(
         ("request_kwargs", "expected_substring"),
         [
-            ({"voice": "alice"}, "voice"),
+            ({"voice": "alice"}, "not an uploaded voice"),
             ({"instructions": "whisper"}, "instructions"),
             ({"language": "en"}, "language"),
             ({"task_type": "CustomVoice"}, "plain tts"),
@@ -141,3 +141,46 @@ class TestVoxCPMServing:
             "prompt_token_ids": [1],
             "additional_information": tts_params,
         }
+
+    def test_validate_voxcpm_accepts_uploaded_voice(self, voxcpm_server):
+        voxcpm_server.uploaded_speakers["alice"] = {
+            "ref_text": "hello world",
+            "file_path": "/tmp/alice.wav",
+            "created_at": 1000.0,
+        }
+        request = OpenAICreateSpeechRequest(input="test text", voice="alice")
+        assert voxcpm_server._validate_voxcpm_request(request) is None
+
+    def test_validate_voxcpm_rejects_uploaded_voice_without_ref_text(self, voxcpm_server):
+        voxcpm_server.uploaded_speakers["bob"] = {
+            "file_path": "/tmp/bob.wav",
+            "created_at": 1000.0,
+        }
+        request = OpenAICreateSpeechRequest(input="test text", voice="bob")
+        error = voxcpm_server._validate_voxcpm_request(request)
+        assert error is not None
+        assert "ref_text" in error.lower()
+
+    def test_build_tts_params_voxcpm_uploaded_voice_includes_cache_keys(self, voxcpm_server):
+        voxcpm_server.uploaded_speakers["alice"] = {
+            "ref_text": "hello world",
+            "file_path": "/tmp/alice.wav",
+            "created_at": 1234.5,
+            "embedding_source": "audio",
+        }
+        voxcpm_server._get_uploaded_audio_data = lambda name: "data:audio/wav;base64,QUJD"
+
+        request = OpenAICreateSpeechRequest(input="test text", voice="alice")
+        params = voxcpm_server._build_tts_params(request)
+
+        assert params["voice_name"] == ["alice"]
+        assert params["voice_created_at"] == [1234.5]
+        assert params["ref_audio"] == ["data:audio/wav;base64,QUJD"]
+        assert params["ref_text"] == ["hello world"]
+
+    def test_build_tts_params_voxcpm_no_voice_no_cache_keys(self, voxcpm_server):
+        request = OpenAICreateSpeechRequest(input="test text")
+        params = voxcpm_server._build_tts_params(request)
+
+        assert "voice_name" not in params
+        assert "voice_created_at" not in params
