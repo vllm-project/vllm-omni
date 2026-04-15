@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 class PDDisaggregationMixin:
     """Mixin supplying PD disaggregation helpers to OmniBase."""
 
+    def _get_pd_separation_pair(self) -> tuple[int, int] | None:
+        """PD prefill/decode indices when ``_init_pd_state`` ran; else ``None``.
+
+        Partial test doubles may skip ``OmniBase.__init__``; treat missing state as
+        no PD disaggregation instead of raising ``AttributeError``.
+        """
+        return getattr(self, "_pd_separation_pair", None)
+
     def _init_pd_state(self) -> None:
         """Initialise PD disaggregation state."""
         self._pd_separation_pair: tuple[int, int] | None = self.detect_pd_separation_from_stage_configs(
@@ -117,8 +125,9 @@ class PDDisaggregationMixin:
 
     def _validate_pd_separation_config(self) -> None:
         """Validate PD stage configurations are consistent."""
-        assert self._pd_separation_pair is not None
-        p_id, d_id = self._pd_separation_pair
+        pair = self._get_pd_separation_pair()
+        assert pair is not None
+        p_id, d_id = pair
         p_stage = self.stage_configs[p_id]
         d_stage = self.stage_configs[d_id]
 
@@ -168,10 +177,11 @@ class PDDisaggregationMixin:
 
     def _get_pd_connector_info(self) -> dict[str, Any] | None:
         """Extract prefill engine KV connector info."""
-        if self._pd_separation_pair is None:
+        pair = self._get_pd_separation_pair()
+        if pair is None:
             return None
 
-        p_id, _ = self._pd_separation_pair
+        p_id, _ = pair
         p_stage = self.stage_configs[p_id]
 
         ea = p_stage.engine_args
@@ -251,18 +261,17 @@ class PDDisaggregationMixin:
 
     def _is_pd_routing(self, stage_id: int, next_stage_id: int) -> bool:
         """True when edge stage_id → next_stage_id is the prefill→decode boundary."""
-        return self._pd_separation_pair is not None and self._pd_separation_pair == (
-            stage_id,
-            next_stage_id,
-        )
+        pair = self._get_pd_separation_pair()
+        return pair is not None and pair == (stage_id, next_stage_id)
 
     def _maybe_expand_sampling_params(self, sampling_params_list: list) -> list:
         """Auto-duplicate thinker SP for decode stage when user provides N-1 params."""
-        if self._pd_separation_pair is None:
+        pair = self._get_pd_separation_pair()
+        if pair is None:
             return sampling_params_list
         if len(sampling_params_list) != len(self.stage_configs) - 1:
             return sampling_params_list
-        p_id, d_id = self._pd_separation_pair
+        p_id, d_id = pair
         sp_list = list(sampling_params_list)
         sp_list.insert(d_id, sp_list[p_id])
         return sp_list

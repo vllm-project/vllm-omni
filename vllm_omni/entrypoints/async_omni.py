@@ -236,8 +236,9 @@ class AsyncOmni(EngineClient, OmniBase):
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
-            if self._pd_separation_pair is not None:
-                p_id = self._pd_separation_pair[0]
+            pd_pair = self._get_pd_separation_pair()
+            if pd_pair is not None:
+                p_id = pd_pair[0]
                 req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
 
             # Add request(s) to stage 0. For streaming inputs, submit
