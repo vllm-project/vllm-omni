@@ -160,28 +160,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
-                dispatch_num_tokens = int(num_tokens_unpadded)
-                dispatch_num_scheduled_tokens_np = num_scheduled_tokens_np
-                dispatch_max_num_scheduled_tokens = max_num_scheduled_tokens
-                capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
-                selected_bucket = None
-                graph_enabled = self._is_code2wav_graph_enabled() and (
-                    getattr(self.compilation_config, "cudagraph_mode", None) != CUDAGraphMode.NONE
-                )
-                if graph_enabled and capture_sizes:
-                    try:
-                        valid_sizes = sorted({int(s) for s in capture_sizes if int(s) > 0})
-                        selected_bucket = next((s for s in valid_sizes if s >= dispatch_num_tokens), None)
-                    except Exception:
-                        valid_sizes = []
-                        selected_bucket = None
-                    if selected_bucket is not None and selected_bucket > dispatch_num_tokens:
-                        pad_delta = selected_bucket - dispatch_num_tokens
-                        dispatch_num_tokens = selected_bucket
-                        dispatch_num_scheduled_tokens_np = num_scheduled_tokens_np.copy()
-                        dispatch_num_scheduled_tokens_np[-1] += pad_delta
-                        dispatch_max_num_scheduled_tokens = int(dispatch_num_scheduled_tokens_np.max())
-
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -189,23 +167,19 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                     num_tokens_across_dp,
                     cudagraph_stats,
                 ) = self._determine_batch_execution_and_padding(
-                    num_tokens=dispatch_num_tokens,
+                    num_tokens=num_tokens_unpadded,
                     num_reqs=num_reqs,
-                    num_scheduled_tokens_np=dispatch_num_scheduled_tokens_np,
-                    max_num_scheduled_tokens=dispatch_max_num_scheduled_tokens,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
-                token_in_capture = selected_bucket is not None
+                capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
                 logger.debug(
-                    "logId: 3 code2wav after-dispatch: mode=%s, tokens=%d->%d, bucket=%s, "
-                    "token_in_capture=%s, graph_enabled=%s, cfg_mode=%s, cfg_capture_len=%s, cfg_max_capture=%s",
+                    "logId: 3 code2wav after-dispatch: mode=%s, tokens=%d, cfg_mode=%s, cfg_capture_len=%s, "
+                    "cfg_max_capture=%s",
                     cudagraph_mode,
                     num_tokens_unpadded,
-                    dispatch_num_tokens,
-                    selected_bucket,
-                    token_in_capture,
-                    graph_enabled,
                     getattr(self.compilation_config, "cudagraph_mode", None),
                     0 if not capture_sizes else len(capture_sizes),
                     getattr(self.compilation_config, "max_cudagraph_capture_size", None),
