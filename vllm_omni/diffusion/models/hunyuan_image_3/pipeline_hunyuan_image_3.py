@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -90,11 +89,6 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             )
         ]
         quant_config = od_config.quantization_config
-        os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-        logger.info(
-            "Setting attention backend to TORCH_SDPA. "
-            "HunyuanImage3Pipeline only supports TORCH_SDPA to handle mixed causal and full attention."
-        )
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)

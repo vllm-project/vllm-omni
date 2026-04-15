@@ -76,6 +76,23 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe import HunyuanFusedMoE
 
+try:
+    from vllm_omni.diffusion.attention.backends.utils.fa import (
+        flash_attn_func as _flash_attn_func,
+    )
+    from vllm_omni.diffusion.attention.backends.utils.fa import (
+        flash_attn_varlen_func as _flash_attn_varlen_func,
+    )
+except ImportError:
+    _flash_attn_func = None
+    _flash_attn_varlen_func = None
+
+
+def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """FA3 may return (out, lse); FA2 returns out. Unwrap to plain tensor."""
+    return out[0] if isinstance(out, tuple) else out
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -884,17 +901,16 @@ class ImageKVCacheManager:
         key = key.reshape(-1, num_kv_heads, head_dim)
         value = value.reshape(-1, num_kv_heads, head_dim)
 
+        # Cache text KV only. eoi is never attended to in steps 2-50
+        # (last mask column is all-False), so caching it is unnecessary.
         cached_prompt_len = seq_len - self.image_token_len - 1
-        cached_key = [key[:cached_prompt_len], key[seq_len - 1 : seq_len]]
-        cached_value = [value[:cached_prompt_len], value[seq_len - 1 : seq_len]]
+        cached_key = [key[:cached_prompt_len]]
+        cached_value = [value[:cached_prompt_len]]
 
         if bs > 1:
             assert bs == 2, "for cfg case, bs must be 2"
             cached_key.append(key[seq_len : seq_len + cached_prompt_len])
-            cached_key.append(key[-1:])
-
             cached_value.append(value[seq_len : seq_len + cached_prompt_len])
-            cached_value.append(value[-1:])
 
         cached_key = torch.cat(cached_key, dim=0)
         cached_value = torch.cat(cached_value, dim=0)
@@ -909,37 +925,30 @@ class ImageKVCacheManager:
         cached_key, cached_value = self.image_kv_cache_map
         bs, q_len, num_kv_heads, head_dim = key.shape
 
-        cached_prompt_len = cached_key.shape[0] // bs - 1
+        # Cache stores text KV only (no eoi).
+        cached_prompt_len = cached_key.shape[0] // bs
         assert (cached_prompt_len + 1) == (seq_len - q_len), f"{cached_prompt_len + 1} != {seq_len - q_len}"
 
         key = key.reshape(-1, num_kv_heads, head_dim)
         value = value.reshape(-1, num_kv_heads, head_dim)
 
-        new_key = [
-            cached_key[:cached_prompt_len],
-            key[:q_len],
-            cached_key[cached_prompt_len : cached_prompt_len + 1],
-        ]
-        new_value = [
-            cached_value[:cached_prompt_len],
-            value[:q_len],
-            cached_value[cached_prompt_len : cached_prompt_len + 1],
-        ]
+        # Reconstruct KV as [text | image] — no eoi appended.
+        new_key = [cached_key[:cached_prompt_len], key[:q_len]]
+        new_value = [cached_value[:cached_prompt_len], value[:q_len]]
 
         if bs > 1:
             assert bs == 2, "for cfg case, bs must be 2"
-            new_key.append(cached_key[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len])
+            new_key.append(cached_key[cached_prompt_len : 2 * cached_prompt_len])
             new_key.append(key[q_len:])
-            new_key.append(cached_key[-1:])
 
-            new_value.append(cached_value[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len])
+            new_value.append(cached_value[cached_prompt_len : 2 * cached_prompt_len])
             new_value.append(value[q_len:])
-            new_value.append(cached_value[-1:])
 
         new_key = torch.cat(new_key, dim=0)
         new_value = torch.cat(new_value, dim=0)
-        new_key = new_key.reshape(bs, seq_len, num_kv_heads, head_dim)
-        new_value = new_value.reshape(bs, seq_len, num_kv_heads, head_dim)
+        kv_len = cached_prompt_len + q_len  # seq_len - 1 (no eoi)
+        new_key = new_key.reshape(bs, kv_len, num_kv_heads, head_dim)
+        new_value = new_value.reshape(bs, kv_len, num_kv_heads, head_dim)
 
         return new_key.contiguous(), new_value.contiguous()
 
@@ -1045,37 +1054,216 @@ class ImageKVCacheManager:
         else:
             if self.sp_size <= 1:
                 key, value = self._update_image_kv_caches(key, value, seq_len)
+                # KV no longer contains eoi — trim mask's last K column to match.
+                if attention_mask is not None:
+                    attention_mask = attention_mask[..., :-1]
             else:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._sp_get_prompt_kv_caches(key, seq_len)
 
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
-        if self.sp_size > 1:
-            joint_text_key = repeat_kv(joint_text_key, repeat_num)
-            joint_text_value = repeat_kv(joint_text_value, repeat_num)
+        _flash_ok = query.dtype in (torch.float16, torch.bfloat16)
+        _has_fa = _flash_attn_func is not None
+        _has_varlen = _flash_attn_varlen_func is not None
 
-        attention_mask = attention_mask.contiguous()
+        if not first_step and _flash_ok and self.sp_size <= 1 and _has_varlen:
+            # Steps 2-50, best path: packed varlen, one kernel, zero mask, exact.
+            # Q = [timestamp(1) | image(q_len-1)]
+            # timestamp attends to text+ts only; image attends to text+ts+image.
+            # KV already excludes eoi (removed from cache).
+            #
+            # Pack as two sub-sequences in one varlen call:
+            #   sub-seq 0: Q=timestamp(1), KV=text+timestamp(N+1)
+            #   sub-seq 1: Q=image(q_len-1), KV=text+ts+image(kv_len)
+            cached_prompt_len = seq_len - q_len - 1  # text token count
+            ts_kv_len = cached_prompt_len + 1  # text + timestamp itself
+            kv_len = key.shape[1]  # seq_len - 1 (no eoi)
 
-        if self.sp_size <= 1:
-            attn_metadata = AttentionMetadata(
-                attn_mask=attention_mask,
-            )
-        else:
+            outputs = []
+            for b in range(bs):
+                q_packed = query[b]  # (q_len, H, D)
+                k_packed = torch.cat([key[b, :ts_kv_len], key[b]], dim=0)
+                v_packed = torch.cat([value[b, :ts_kv_len], value[b]], dim=0)
+
+                cu_seqlens_q = torch.tensor([0, 1, q_len], dtype=torch.int32, device=query.device)
+                cu_seqlens_k = torch.tensor(
+                    [0, ts_kv_len, ts_kv_len + kv_len],
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+
+                out = _flash_attn_varlen_func(
+                    q_packed.contiguous(),
+                    k_packed.contiguous(),
+                    v_packed.contiguous(),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=q_len - 1,
+                    max_seqlen_k=kv_len,
+                    causal=False,
+                )
+                outputs.append(_unwrap_flash_output(out))
+
+            attn_output = torch.stack(outputs, dim=0)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        elif not first_step and _flash_ok and self.sp_size <= 1:
+            # Steps 2-50, fallback: two Attention layer calls, exact.
+            # Split timestamp and image into separate calls to avoid 4D mask.
+            # KV already excludes eoi (removed from cache).
+            cached_prompt_len = seq_len - q_len - 1
+            ts_kv_len = cached_prompt_len + 1  # text + timestamp itself
+
+            # timestamp(1) -> text+ts(N+1): full attention
+            out_ts = self.attn(query[:, :1], key[:, :ts_kv_len], value[:, :ts_kv_len])
+            # image(q_len-1) -> text+ts+image(kv_len): full attention
+            out_img = self.attn(query[:, 1:], key, value)
+            attn_output = torch.cat([out_ts, out_img], dim=1)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        elif not first_step and _flash_ok and self.sp_size > 1 and _has_fa:
+            # Steps 2-50, SP mode: maskless SP Attention + local timestamp fix.
+            # FlashAttention handles GQA natively — no repeat_kv, no 4D mask.
+            # After Ulysses AllToAll, each rank runs full attention on the
+            # gathered sequence with H/P heads. Timestamp output on rank 0
+            # is wrong (attends to image tokens too), so we fix it locally.
+            #
+            # Padding tokens (<sp_size) participate without mask; impact is
+            # negligible (<0.2% attention mass) and outputs are discarded.
+
+            # Save timestamp Q/KV on rank 0 for local correction
+            if self.sp_rank == 0:
+                q_ts = query[:, :1]
+                k_ts = key[:, :1]
+                v_ts = value[:, :1]
+
+            # SP Attention: full attention, no mask, no repeat_kv
             attn_metadata = AttentionMetadata(
                 joint_query=joint_text_query,
                 joint_key=joint_text_key,
                 joint_value=joint_text_value,
                 joint_strategy="front",
-                attn_mask=attention_mask,
             )
-        # Compute attention using unified attention layer
-        attn_output = self.attn(query, key, value, attn_metadata)
+            attn_output = self.attn(query, key, value, attn_metadata)
 
-        # attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0)
+            # Fix timestamp on rank 0: attend only to text + timestamp
+            if self.sp_rank == 0:
+                k_text_ts = torch.cat([joint_text_key, k_ts], dim=1)
+                v_text_ts = torch.cat([joint_text_value, v_ts], dim=1)
+                ts_out = _flash_attn_func(
+                    q_ts,
+                    k_text_ts,
+                    v_text_ts,
+                    causal=False,
+                    softmax_scale=self.scaling,
+                )
+                attn_output[:, :1] = _unwrap_flash_output(ts_out)
 
-        # attn_output = attn_output.transpose(1, 2).contiguous()  # [bs, q_len, heads, head_dim]
-        attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        elif first_step and _flash_ok and self.sp_size <= 1 and _has_fa:
+            # Step 1, non-SP: causal (text+ts) + full (image).
+            # eoi output is discarded by ragged_final_layer — skip its computation.
+            cached_prompt_len = seq_len - self.image_token_len - 1
+            ts_end = cached_prompt_len + 1  # text + timestamp
+            img_end = seq_len - 1  # before eoi
+
+            # Block 1: text+timestamp — causal attention
+            out_causal = _flash_attn_func(
+                query[:, :ts_end],
+                key[:, :ts_end],
+                value[:, :ts_end],
+                causal=True,
+                softmax_scale=self.scaling,
+            )
+            out_causal = _unwrap_flash_output(out_causal)
+
+            # Block 2: image — full attention to text+ts+image
+            out_image = _flash_attn_func(
+                query[:, ts_end:img_end],
+                key[:, :img_end],
+                value[:, :img_end],
+                causal=False,
+                softmax_scale=self.scaling,
+            )
+            out_image = _unwrap_flash_output(out_image)
+
+            # eoi placeholder — zeros, never used downstream
+            out_eoi = torch.zeros_like(query[:, img_end:])
+
+            attn_output = torch.cat([out_causal, out_image, out_eoi], dim=1)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        elif first_step and _flash_ok and self.sp_size > 1 and _has_fa:
+            # Step 1, SP: causal (text, local) + full (image, SP) + timestamp fix.
+            # Text is computed locally on all ranks. Image goes through SP with
+            # text as joint KV. Timestamp on rank 0 is fixed locally.
+
+            # Block 1: text — causal attention (local, no SP needed)
+            out_text = _flash_attn_func(
+                joint_text_query,
+                joint_text_key,
+                joint_text_value,
+                causal=True,
+                softmax_scale=self.scaling,
+            )
+            out_text = _unwrap_flash_output(out_text)
+
+            # Save timestamp Q/KV on rank 0 for local correction
+            if self.sp_rank == 0:
+                q_ts = query[:, :1]
+                k_ts = key[:, :1]
+                v_ts = value[:, :1]
+
+            # Block 2: image shard — full attention with SP, text as joint KV
+            attn_metadata = AttentionMetadata(
+                joint_query=query[:, :0, :, :],
+                joint_key=joint_text_key,
+                joint_value=joint_text_value,
+                joint_strategy="front",
+            )
+            out_image = self.attn(query, key, value, attn_metadata)
+
+            # Fix timestamp on rank 0: attend only to text + timestamp
+            if self.sp_rank == 0:
+                k_text_ts = torch.cat([joint_text_key, k_ts], dim=1)
+                v_text_ts = torch.cat([joint_text_value, v_ts], dim=1)
+                ts_out = _flash_attn_func(
+                    q_ts,
+                    k_text_ts,
+                    v_text_ts,
+                    causal=False,
+                    softmax_scale=self.scaling,
+                )
+                out_image[:, :1] = _unwrap_flash_output(ts_out)
+
+            attn_output = torch.cat([out_text, out_image], dim=1)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        else:
+            # Dtype/flash fallback: use Attention layer with 4D mask.
+            key = repeat_kv(key, repeat_num)
+            value = repeat_kv(value, repeat_num)
+            if self.sp_size > 1:
+                joint_text_key = repeat_kv(joint_text_key, repeat_num)
+                joint_text_value = repeat_kv(joint_text_value, repeat_num)
+
+            attention_mask = attention_mask.contiguous()
+
+            if self.sp_size <= 1:
+                attn_metadata = AttentionMetadata(
+                    attn_mask=attention_mask,
+                )
+            else:
+                attn_metadata = AttentionMetadata(
+                    joint_query=joint_text_query,
+                    joint_key=joint_text_key,
+                    joint_value=joint_text_value,
+                    joint_strategy="front",
+                    attn_mask=attention_mask,
+                )
+            attn_output = self.attn(query, key, value, attn_metadata)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
         return attn_output
 
 
