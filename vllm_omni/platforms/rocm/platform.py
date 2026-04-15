@@ -16,6 +16,34 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     Inherits all ROCm-specific implementations from vLLM's RocmPlatform,
     and adds Omni-specific interfaces from OmniPlatform.
+
+
+    NOTE: AR Attention Backend Overriding Logic:
+    ------------------------------------------
+    Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
+    However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
+    Therefore, we still use TRITON_ATTN as the default attention backend,
+    when the selected_backend is not specified.
+
+    So the behaviour of the attention backend overriding logic currently lives in
+    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+
+    ```
+    if current_omni_platform.is_rocm():
+        print(f"engine_args: {str(engine_args)}")
+        if engine_args.get("attention_backend") is None:
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            if rocm_aiter_ops.is_enabled():
+                engine_args["attention_backend"] = "ROCM_AITER_FA"
+            # Before vLLM v0.19.0, the default attention backend is TRITON_ATTN for ROCm.
+            # Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
+            # However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
+            # Therefore, we still use TRITON_ATTN as the default attention backend,
+            # when the selected_backend is not specified.
+            engine_args["attention_backend"] = "TRITON_ATTN"
+    ```
+
     """
 
     _omni_enum = OmniPlatformEnum.ROCM

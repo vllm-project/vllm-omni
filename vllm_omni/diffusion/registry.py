@@ -12,6 +12,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 
 logger = init_logger(__name__)
 
@@ -72,6 +73,16 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2_image2video",
         "LTX2ImageToVideoPipeline",
     ),
+    "LTX2TwoStagesPipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2TwoStagesPipeline",
+    ),
+    "LTX2ImageToVideoTwoStagesPipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2ImageToVideoTwoStagesPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -108,8 +119,8 @@ _DIFFUSION_MODELS = {
         "FluxKontextPipeline",
     ),
     "HunyuanImage3ForCausalMM": (
-        "hunyuan_image_3",
-        "pipeline_hunyuan_image_3",
+        "hunyuan_image3",
+        "pipeline_hunyuan_image3",
         "HunyuanImage3Pipeline",
     ),
     "Flux2KleinPipeline": (
@@ -166,6 +177,21 @@ _DIFFUSION_MODELS = {
         "mova",
         "pipeline_mova",
         "MovaPipeline",
+    ),
+    "MagiHumanPipeline": (
+        "magi_human",
+        "pipeline_magi_human",
+        "MagiHumanPipeline",
+    ),
+    "OmniVoicePipeline": (
+        "omnivoice",
+        "pipeline_omnivoice",
+        "OmniVoicePipeline",
+    ),
+    "OmniVoice": (
+        "omnivoice",
+        "pipeline_omnivoice",
+        "OmniVoicePipeline",
     ),
 }
 
@@ -285,7 +311,12 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
         for attr in transformer_attrs:
             if not hasattr(model, attr):
-                continue
+                # Some pipeline like LTX2TwoStagesPipeline have recursive
+                # modules that have the transformer
+                module = find_module_with_attr(model, attr)
+                if module is None:
+                    continue
+                model = module
 
             transformer = getattr(model, attr)
             if transformer is None:
@@ -342,7 +373,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
+    "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
@@ -360,6 +393,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "MOVA": "get_mova_post_process_func",
+    "MagiHumanPipeline": "get_magi_human_post_process_func",
+    "OmniVoicePipeline": "get_omnivoice_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -378,6 +413,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
+    "MagiHumanPipeline": "get_magi_human_pre_process_func",
 }
 
 

@@ -16,7 +16,6 @@ Equivalent to running:
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 import signal
 import socket
 import subprocess
@@ -28,9 +27,9 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from tests.conftest import modify_stage_config
+from tests.conftest import OmniRunner, modify_stage_config
 from tests.utils import hardware_test
-from vllm_omni.entrypoints.omni import Omni
+from vllm_omni import Omni
 from vllm_omni.platforms import current_omni_platform
 
 # Reference pixel data extracted from the known-good output image
@@ -199,14 +198,13 @@ def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
     config_path = _resolve_stage_config(config_path, run_level)
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
-
-    try:
-        generated_image = _generate_bagel_image(omni)
+    with OmniRunner(
+        "ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_bagel_image(runner.omni)
         if run_level == "advanced_model":
             _validate_pixels(generated_image)
-    finally:
-        omni.close()
 
 
 def _wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
@@ -227,6 +225,24 @@ def _wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
         except (TimeoutError, ConnectionRefusedError):
             time.sleep(1)
     return False
+
+
+def _is_mooncake_master_available() -> bool:
+    """Check if mooncake_master binary is present and can actually execute."""
+    import shutil
+
+    binary = shutil.which("mooncake_master")
+    if binary is None:
+        return False
+    try:
+        result = subprocess.run(
+            [binary, "--help"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode != 127
+    except (subprocess.TimeoutExpired, OSError):
+        return True
 
 
 def _cleanup_mooncake_processes(timeout_secs: int = 5) -> None:
@@ -292,6 +308,8 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_text2img_mooncake_connector(run_level):
     """Test Bagel text2img with Mooncake connector for inter-stage communication."""
+    if not _is_mooncake_master_available():
+        pytest.skip("mooncake_master is not available or cannot execute (missing shared libraries like libibverbs)")
     MOONCAKE_HOST = "127.0.0.1"
     MOONCAKE_RPC_PORT = _find_free_port()
     MOONCAKE_HTTP_PORT = _find_free_port()
@@ -299,7 +317,6 @@ def test_bagel_text2img_mooncake_connector(run_level):
 
     mooncake_master_proc = None
     temp_config_file = None
-    omni = None
 
     try:
         _cleanup_mooncake_processes()
@@ -329,15 +346,16 @@ def test_bagel_text2img_mooncake_connector(run_level):
         )
 
         temp_config_file = _resolve_stage_config(temp_config_file, run_level)
-        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file, stage_init_timeout=300)
-
-        generated_image = _generate_bagel_image(omni)
-        if run_level == "advanced_model":
-            _validate_pixels(generated_image)
+        with OmniRunner(
+            "ByteDance-Seed/BAGEL-7B-MoT",
+            stage_configs_path=temp_config_file,
+            stage_init_timeout=300,
+        ) as runner:
+            generated_image = _generate_bagel_image(runner.omni)
+            if run_level == "advanced_model":
+                _validate_pixels(generated_image)
 
     finally:
-        if omni:
-            omni.close()
         if temp_config_file:
             try:
                 os.unlink(temp_config_file)

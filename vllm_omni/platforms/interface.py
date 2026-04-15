@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from enum import Enum
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 from vllm.platforms import Platform
+
+logger = init_logger(__name__)
 
 
 class OmniPlatformEnum(Enum):
@@ -60,7 +64,7 @@ class OmniPlatform(Platform):
     @classmethod
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
         if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
+            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
         raise NotImplementedError(f"Unsupported diffusion model op: {op_name}")
 
     @classmethod
@@ -114,7 +118,28 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def create_autocast_context(
+        cls,
+        *,
+        device_type: str,
+        dtype: torch.dtype,
+        enabled: bool = True,
+    ):
+        if not enabled:
+            return nullcontext()
+
+        try:
+            return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("autocast unavailable for device_type=%s dtype=%s: %s", device_type, dtype, exc)
+            return nullcontext()
+
+    @classmethod
     def supports_cpu_offload(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_float64(cls) -> bool:
         return True
 
     @classmethod

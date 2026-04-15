@@ -28,6 +28,10 @@ def main():
 
         cli_env_setup()
 
+        from vllm_omni.entrypoints.cli.serve import _ensure_vllm_platform
+
+        _ensure_vllm_platform()
+
         parser = FlexibleArgumentParser(
             description="vLLM OMNI CLI",
             epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),

@@ -5,8 +5,8 @@ import argparse
 import re
 import time
 
-import librosa
 from PIL import Image
+from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
@@ -36,8 +36,8 @@ def parse_args() -> argparse.Namespace:
         "--cfg-parallel-size",
         type=int,
         default=1,
-        choices=[1, 2],
-        help="Number of GPUs used for classifier free guidance parallel size.",
+        choices=[1, 2, 3, 4],
+        help="Number of GPUs used for classifier free guidance parallel size (max 4 branches).",
     )
     parser.add_argument(
         "--video-negative-prompt",
@@ -69,7 +69,7 @@ def load_image_and_audio(image_paths, audio_paths):
             image.append(img)
 
     for path in audio_paths:
-        audio_array, sr = librosa.load(path, sr=16000)
+        audio_array, sr = load_audio(path, sr=16000)
         audio_array = audio_array[int(sr * 1) : int(sr * 3)]
         audio.append(audio_array)
     return image, audio
@@ -132,8 +132,8 @@ def main() -> None:
     if not outputs:
         raise RuntimeError("No output returned from DreamID-Omni.")
     output = outputs[0].request_output
-    generated_video = output[0].images[0][0]
-    generated_audio = output[0].images[0][1]
+    generated_video = output.images[0][0]
+    generated_audio = output.images[0][1]
     try:
         from dreamid_omni.utils.io_utils import save_video
     except Exception as e:

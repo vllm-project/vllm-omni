@@ -24,7 +24,9 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
@@ -32,6 +34,46 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
+WAN_SAMPLE_SOLVER_CHOICES = {"unipc", "euler"}
+
+
+def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
+    if sample_solver == "unipc":
+        return FlowUniPCMultistepScheduler(
+            num_train_timesteps=1000,
+            shift=flow_shift,
+            prediction_type="flow_prediction",
+        )
+    if sample_solver == "euler":
+        return WanEulerScheduler(
+            num_train_timesteps=1000,
+            shift=flow_shift,
+        )
+
+    raise ValueError(
+        f"Unsupported Wan sample_solver: {sample_solver}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}"
+    )
+
+
+def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc") -> str:
+    extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+    raw = extra_args.get("sample_solver", default)
+    sample_solver = str(raw).strip().lower()
+    if sample_solver not in WAN_SAMPLE_SOLVER_CHOICES:
+        raise ValueError(f"Invalid sample_solver={raw!r}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}")
+    return sample_solver
+
+
+def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> float:
+    extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+    raw_flow_shift = extra_args.get("flow_shift")
+    if raw_flow_shift is None:
+        raw_flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
+
+    try:
+        return float(raw_flow_shift)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
 
 
 def retrieve_latents(
@@ -121,10 +163,23 @@ def get_wan22_post_process_func(
     def post_process_func(
         video: torch.Tensor,
         output_type: str = "np",
+        sampling_params=None,
     ):
         if output_type == "latent":
             return video
-        return video_processor.postprocess_video(video, output_type=output_type)
+        custom_output = {}
+        if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
+            video, multiplier = interpolate_video_tensor(
+                video,
+                exp=sampling_params.frame_interpolation_exp,
+                scale=sampling_params.frame_interpolation_scale,
+                model_path=sampling_params.frame_interpolation_model_path,
+            )
+            custom_output["video_fps_multiplier"] = multiplier
+        return {
+            "video": video_processor.postprocess_video(video, output_type=output_type),
+            "custom_output": custom_output,
+        }
 
     return post_process_func
 
@@ -272,7 +327,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
@@ -296,13 +351,9 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         else:
             raise RuntimeError("No transformer loaded")
 
-        # Initialize UniPC scheduler
-        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
-        self.scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=1000,
-            shift=flow_shift,
-            prediction_type="flow_prediction",
-        )
+        self._sample_solver = "unipc"
+        self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
+        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
@@ -461,6 +512,13 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
+
+        sample_solver = resolve_wan_sample_solver(req, default=self._sample_solver)
+        flow_shift = resolve_wan_flow_shift(req, self.od_config)
+        if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
+            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+            self._sample_solver = sample_solver
+            self._flow_shift = flow_shift
 
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)

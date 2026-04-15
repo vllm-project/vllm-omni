@@ -88,7 +88,7 @@ runtime:
         connector_get_max_wait: 300
         # Align with Omni: small chunks with sufficient context overlap.
         codec_chunk_frames: 25
-        codec_left_context_frames: 25
+        codec_left_context_frames: 72
 
   edges:
     - from: 0

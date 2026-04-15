@@ -10,7 +10,7 @@ Install dependencies:
 uv pip install -e .
 ```
 
-> **Note:** This includes required libraries such as `librosa`, `soundfile`,
+> **Note:** This includes required libraries such as `soundfile`,
 > `onnxruntime`, `x-transformers`, and `einops` via
 > `requirements/common.txt` and platform-specific requirements files.
 

@@ -64,15 +64,6 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 bash run_curl_multimodal_generation.sh use_image
 ```
 
-
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
-
 ## Modality control
 You can control output modalities to specify which types of output the model should generate. This is useful when you only need text output and want to skip audio generation stages for better performance.
 

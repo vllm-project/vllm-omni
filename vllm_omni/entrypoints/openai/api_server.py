@@ -18,6 +18,7 @@ from http import HTTPStatus
 from typing import Annotated, Any, Literal, cast
 
 import httpx
+import numpy as np
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -353,6 +354,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     try:
         await shutdown_task
     finally:
+        state = getattr(app, "state", None)
+        serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
+        if serving_speech is not None:
+            serving_speech.shutdown()
         sock.close()
 
 
@@ -510,6 +515,13 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
 
+        state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=engine_client,
+            model_name=model_name,
+            stage_configs=diffusion_stage_configs,
+        )
+        state.openai_streaming_speech = None
+
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
@@ -632,6 +644,7 @@ async def omni_init_app_state(
         OpenAIServingResponses(
             engine_client,
             state.openai_serving_models,
+            openai_serving_render=state.openai_serving_render,
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -692,7 +705,8 @@ async def omni_init_app_state(
         OpenAIServingPooling(
             engine_client,
             state.openai_serving_models,
-            supported_tasks=supported_tasks,
+            state.openai_serving_render,
+            supported_tasks=tuple(supported_tasks),
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -739,6 +753,7 @@ async def omni_init_app_state(
     state.openai_serving_tokenization = OpenAIServingTokenization(
         engine_client,
         state.openai_serving_models,
+        state.openai_serving_render,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
@@ -780,6 +795,7 @@ async def omni_init_app_state(
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
         )
         if "generate" in supported_tasks
         else None
@@ -788,6 +804,7 @@ async def omni_init_app_state(
         ServingTokens(
             engine_client,
             state.openai_serving_models,
+            state.openai_serving_render,
             request_logger=request_logger,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -1024,17 +1041,20 @@ async def list_voices(raw_request: Request):
     uploaded_speakers = []
     if hasattr(handler, "uploaded_speakers"):
         for voice_name, info in handler.uploaded_speakers.items():
-            uploaded_speakers.append(
-                {
-                    "name": info.get("name", voice_name),
-                    "consent": info.get("consent", ""),
-                    "created_at": info.get("created_at", 0),
-                    "file_size": info.get("file_size", 0),
-                    "mime_type": info.get("mime_type", ""),
-                    "embedding_source": info.get("embedding_source", "audio"),
-                    "embedding_dim": info.get("embedding_dim"),
-                }
-            )
+            voice_entry = {
+                "name": info.get("name", voice_name),
+                "consent": info.get("consent", ""),
+                "created_at": info.get("created_at", 0),
+                "file_size": info.get("file_size", 0),
+                "mime_type": info.get("mime_type", ""),
+                "embedding_source": info.get("embedding_source", "audio"),
+                "embedding_dim": info.get("embedding_dim"),
+            }
+            if info.get("ref_text"):
+                voice_entry["ref_text"] = info["ref_text"]
+            if info.get("speaker_description"):
+                voice_entry["speaker_description"] = info["speaker_description"]
+            uploaded_speakers.append(voice_entry)
 
     return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
 
@@ -1053,7 +1073,8 @@ async def upload_voice(
     speaker_embedding: str | None = Form(None),
     consent: str = Form(...),
     name: str = Form(...),
-    ref_text: str = Form(None),
+    ref_text: str | None = Form(None),
+    speaker_description: str | None = Form(None),
 ):
     """Upload a new voice for voice cloning.
 
@@ -1072,6 +1093,11 @@ async def upload_voice(
         speaker_embedding: JSON-encoded float list. Mutually exclusive with audio_sample.
         consent: Consent recording ID
         name: Name for the new voice
+        ref_text: Optional transcript of the audio for ICL (in-context
+            learning) mode. When provided, voice clone requests using this
+            voice will produce higher quality results.
+        speaker_description: Optional free-form description of the voice
+            (e.g. "warm speaker", "energetic narrator").
         raw_request: Raw FastAPI request
 
     Returns:
@@ -1089,7 +1115,13 @@ async def upload_voice(
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
-            result = await handler.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+            result = await handler.upload_voice(
+                audio_sample,
+                consent,
+                name,
+                ref_text=ref_text,
+                speaker_description=speaker_description,
+            )
         else:
             return base(raw_request).create_error_response(
                 message="Either 'audio_sample' or 'speaker_embedding' must be provided"
@@ -1252,7 +1284,8 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
-async def generate_images(request: ImageGenerationRequest, raw_request: Request) -> ImageGenerationResponse:
+@with_cancellation
+async def generate_images(request: ImageGenerationRequest, raw_request: Request):
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
@@ -1284,7 +1317,13 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-
+        extra_args = {}
+        if request.use_system_prompt is not None:
+            extra_args["use_system_prompt"] = request.use_system_prompt
+        if request.system_prompt is not None:
+            extra_args["system_prompt"] = request.system_prompt
+        if extra_args:
+            gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora)
         _update_if_not_none(gen_params, "lora_request", lora_request)
@@ -1297,6 +1336,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
+
+        app_state_args = getattr(raw_request.app.state, "args", None)
+        _check_max_generated_image_size(app_state_args, width, height)
+
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
@@ -1387,6 +1430,7 @@ async def edit_images(
     negative_prompt: str | None = Form(None),
     num_inference_steps: int | None = Form(None),
     guidance_scale: float | None = Form(None),
+    strength: float | None = Form(None),
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
     generator_device: str | None = Form(None),
@@ -1482,7 +1526,6 @@ async def edit_images(
             )
 
         # 3.3 Parse and add size if provided
-        max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
         width, height = None, None
         if size.lower() == "auto":
             if resolution is None:
@@ -1492,23 +1535,7 @@ async def edit_images(
         else:
             width, height = parse_size(size)
 
-        # Check max_generated_image_size
-        if max_generated_image_size is not None:
-            if width is not None and height is not None:
-                if width * height > max_generated_image_size:
-                    raise HTTPException(
-                        status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                        f"size of {max_generated_image_size} pixels.",
-                    )
-            elif resolution is not None:
-                # When resolution is set, the output size is resolution * resolution
-                if resolution * resolution > max_generated_image_size:
-                    raise HTTPException(
-                        status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
-                        f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
-                    )
+        _check_max_generated_image_size(app_state_args, width, height, resolution)
 
         size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
         _update_if_not_none(gen_params, "width", width)
@@ -1517,6 +1544,7 @@ async def edit_images(
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", guidance_scale)
+        _update_if_not_none(gen_params, "strength", strength)
         _update_if_not_none(gen_params, "true_cfg_scale", true_cfg_scale)
         # If seed is not provided, generate a random one to ensure
         # a proper generator is initialized in the backend.
@@ -1707,9 +1735,65 @@ async def _generate_with_async_omni(
     return result
 
 
+def _check_max_generated_image_size(
+    app_state_args: Any,
+    width: int | None,
+    height: int | None,
+    resolution: int | None = None,
+) -> None:
+    """Raise 400 if the requested image size exceeds --max-generated-image-size."""
+    max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
+    # Check max_generated_image_size
+    if max_generated_image_size is None:
+        return
+    if width is not None and height is not None:
+        if width * height > max_generated_image_size:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
+                f"size of {max_generated_image_size} pixels.",
+            )
+    elif resolution is not None:
+        # When resolution is set, the output size is resolution * resolution
+        if resolution * resolution > max_generated_image_size:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
+                f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+            )
+
+
 def _update_if_not_none(object: Any, key: str, val: Any) -> None:
     if val is not None:
         setattr(object, key, val)
+
+
+def _normalize_image(image: Any) -> Any:
+    """Normalize a single image output to a PIL-compatible format."""
+    if isinstance(image, Image.Image):
+        return image
+    if not isinstance(image, np.ndarray):
+        raise ValueError(f"Unsupported image type: {type(image)}")
+    if not np.issubdtype(image.dtype, np.integer) and not np.issubdtype(image.dtype, np.floating):
+        raise ValueError(f"Unsupported dtype: {image.dtype}")
+    if isinstance(image, np.ndarray):
+        while image.ndim > 3:
+            image = image[0]
+        if image.min() < 0:
+            if image.min() < -1.01 or image.max() > 1.01:
+                logger.warning(
+                    f"Image float range [{image.min():.2f}, {image.max():.2f}] outside expected [-1, 1]. "
+                    f"Clipping to [-1, 1] before normalization."
+                )
+            image = np.clip(image, -1.0, 1.0) * 0.5 + 0.5
+        elif image.max() > 1.01:
+            logger.warning(
+                f"Image float range [{image.min():.2f}, {image.max():.2f}] outside expected [0, 1]. "
+                f"Clipping to [0, 1] before normalization."
+            )
+        image = (np.clip(image, 0.0, 1.0) * 255).astype(np.uint8)
+        image = Image.fromarray(image)
+    return image
 
 
 def _extract_images_from_result(result: Any) -> list[Any]:
@@ -1722,6 +1806,10 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             images = request_output["images"]
         elif hasattr(request_output, "images") and request_output.images:
             images = request_output.images
+    # Handle when generate more than one image
+    if images and isinstance(images[0], np.ndarray) and images[0].shape[0] > 1 and images[0].ndim == 5:
+        # Unwrap batch: (N, T, H, W, C) -> [img1, img2, ...]
+        images = list(images[0])
     # Flatten nested lists (e.g., from layered models like Qwen-Image-Layered).
     # Note: This only flattens one level deep. Deeper nesting is not supported.
     flattened = []
@@ -1730,7 +1818,7 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             flattened.extend(img)
         else:
             flattened.append(img)
-    return flattened
+    return [_normalize_image(img) for img in flattened]
 
 
 async def _load_input_images(
@@ -1900,18 +1988,6 @@ def video_response_from_request(model_name: str, req: VideoGenerationRequest) ->
     return resp
 
 
-async def decode_and_save_video_output(output: Any, file_name: str) -> str:
-    if not output.b64_json:
-        raise RuntimeError(f"Video output for {file_name} did not include b64_json content.")
-
-    try:
-        video_bytes = base64.b64decode(output.b64_json)
-    except Exception as decode_exc:
-        raise RuntimeError(f"Failed to decode generated video payload for {file_name}") from decode_exc
-
-    return await STORAGE_MANAGER.save(video_bytes, file_name)
-
-
 def _cleanup_video(video_id: str, output_path: str | None):
     try:
         if output_path is not None:
@@ -1935,15 +2011,12 @@ async def _run_video_generation_job(
     started_at = time.perf_counter()
     output_path = None
     try:
-        response = await handler.generate_videos(request, video_id, reference_image=reference_image)
-        if not response.data:
-            raise RuntimeError("Video generation completed but returned no outputs.")
-
-        if (video_count := len(response.data)) > 1:
-            logger.warning("Video request %s generated %s outputs but we only expected one.", video_id, video_count)
+        video_bytes, stage_durations, peak_memory_mb = await handler.generate_video_bytes(
+            request, video_id, reference_image=reference_image
+        )
 
         file_name = f"{video_id}.{job.file_extension}"
-        output_path = await decode_and_save_video_output(response.data[0], file_name)
+        output_path = await STORAGE_MANAGER.save(video_bytes, file_name)
         logger.info("Video request %s persisted %s output file.", video_id, output_path)
 
         await VIDEO_STORE.update_fields(
@@ -1954,6 +2027,8 @@ async def _run_video_generation_job(
                 "file_name": file_name,
                 "completed_at": int(time.time()),
                 "inference_time_s": time.perf_counter() - started_at,
+                "stage_durations": stage_durations,
+                "peak_memory_mb": peak_memory_mb,
             },
         )
     except Exception as exc:
@@ -2000,6 +2075,10 @@ async def _parse_video_form(
     true_cfg_scale: float | None = Form(default=None),
     seed: int | None = Form(default=None),
     negative_prompt: str | None = Form(default=None),
+    enable_frame_interpolation: bool = Form(default=False),
+    frame_interpolation_exp: int = Form(default=1, ge=1),
+    frame_interpolation_scale: float = Form(default=1.0, gt=0.0),
+    frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
 ) -> tuple[VideoGenerationRequest, "OmniOpenAIServingVideo", str, ReferenceImage | None]:
@@ -2036,6 +2115,10 @@ async def _parse_video_form(
         "true_cfg_scale": true_cfg_scale,
         "seed": seed,
         "negative_prompt": negative_prompt,
+        "enable_frame_interpolation": enable_frame_interpolation,
+        "frame_interpolation_exp": frame_interpolation_exp,
+        "frame_interpolation_scale": frame_interpolation_scale,
+        "frame_interpolation_model_path": frame_interpolation_model_path,
         "lora": _parse_form_json(lora, expected_type=dict),
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
     }
@@ -2127,7 +2210,7 @@ async def create_video_sync(
     request_id = f"video_sync-{random_uuid()}"
     started_at = time.perf_counter()
     try:
-        video_bytes = await asyncio.wait_for(
+        video_bytes, stage_durations, peak_memory_mb = await asyncio.wait_for(
             handler.generate_video_bytes(request, request_id, reference_image=reference_image),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
@@ -2153,6 +2236,8 @@ async def create_video_sync(
             "X-Request-Id": request_id,
             "X-Model": effective_model_name,
             "X-Inference-Time-S": f"{inference_time_s:.3f}",
+            "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
+            "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",
         },
     )
 

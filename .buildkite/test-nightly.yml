@@ -1,228 +1,198 @@
+env:
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 60
+
 steps:
-  - label: ":full_moon: Omni Model Test with H100"
-    timeout_in_minutes: 90
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - |
-        pytest -s -v \
-          tests/examples/ \
-          tests/e2e/online_serving/test_*_expansion.py \
-          -m "advanced_model and H100 and omni" --run-level "advanced_model"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
+  # Group: collapses under one heading in the Buildkite UI; child steps still run in parallel.
+  - group: ":card_index_dividers: Omni Model Test"
+    key: nightly-omni-test-group
+    steps:
+      - label: ":full_moon: Omni · Function Test with H100"
+        timeout_in_minutes: 90
+        depends_on: upload-nightly-pipeline
+        # Shared nightly vs PR label conditional; referenced below as *nightly_or_pr_label
+        if: &nightly_or_pr_label 'build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"'
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and H100 and omni" --run-level "advanced_model"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
                   - name: devshm
-                    mountPath: /dev/shm
+                    emptyDir:
+                      medium: Memory
                   - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
 
-  - label: ":full_moon: Omni Model Test with L4"
-    timeout_in_minutes: 90
+      - label: ":full_moon: Omni · Function Test with L4"
+        timeout_in_minutes: 90
+        depends_on: upload-nightly-pipeline
+        if: *nightly_or_pr_label
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and L4 and omni" --run-level "advanced_model"
+        agents:
+          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      - label: ":full_moon: Omni · Doc Test with L4"
+        timeout_in_minutes: 90
+        depends_on: upload-nightly-pipeline
+        if: *nightly_or_pr_label
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/examples/ -m "advanced_model and omni and L4" --run-level "advanced_model"
+        agents:
+          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      - label: ":full_moon: Omni · Doc Test with H100"
+        timeout_in_minutes: 90
+        depends_on: upload-nightly-pipeline
+        if: *nightly_or_pr_label
+        commands:
+          - pytest -s -v tests/examples/ -m "advanced_model and omni and H100" --run-level "advanced_model"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      - label: ":full_moon: Omni · Perf Test"
+        key: nightly-omni-performance
+        timeout_in_minutes: 180
+        depends_on: upload-nightly-pipeline
+        if: *nightly_or_pr_label
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
+          - buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+  # Dynamically appends steps from test-nightly-diffusion.yml into this build (same mechanism as
+  # pipeline.yml → test-ready.yml / test-merge.yml / test-nightly.yml). Foldable groups stay in the
+  # uploaded YAML (Other / Wan / Qwen-Image).
+  - label: ":card_index_dividers: Diffusion Model Test"
+    key: nightly-diffusion-model-test
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    if: *nightly_or_pr_label
     commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-      - pytest -s -v tests/examples/ tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and L4 and omni" --run-level "advanced_model"
+      - buildkite-agent pipeline upload .buildkite/test-nightly-diffusion.yml
     agents:
-      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          shm-size: "8gb"
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-            - "HF_TOKEN"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
+      queue: "cpu_queue_premerge"
 
-  - label: ":full_moon: Diffusion Model Test with H100"
+  - label: ":bar_chart: Testcase Statistics"
+    key: nightly-testcase-statistics
     timeout_in_minutes: 120
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    if: *nightly_or_pr_label
     commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -k "not test_wan22_expansion" -m "advanced_model and diffusion and H100" --run-level "advanced_model"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
-
-  - label: ":full_moon: Diffusion Model (Wan2.2) Test with H100"
-    timeout_in_minutes: 90
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -m "advanced_model" --run-level "advanced_model"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
-
-  - label: ":full_moon: Diffusion Model Test"
-    timeout_in_minutes: 60
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/online_serving/test_*_expansion.py -m "advanced_model and diffusion and L4" --run-level "advanced_model"
-    agents:
-      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          shm-size: "8gb"
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-            - "HF_TOKEN"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
-
-
-  - label: ":full_moon: Doc Example Code Test with H100"
-    timeout_in_minutes: 60
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
-      - pytest -s -v tests/examples/online_serving/test_text_to_image.py tests/examples/offline_inference/test_text_to_image.py -m "advanced_model and example and H100" --run-level "advanced_model"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
-
-  - label: ":full_moon: Omni Model Perf Test & Testcase Statistics with H100"
-    key: nightly-omni-performance
-    timeout_in_minutes: 180
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - export BENCHMARK_DIR=tests/dfx/perf/results
-      - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-      - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
-      - buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
       - python tools/nightly/buildkite_testcase_statistics.py -o tests/dfx/perf/results/buildkite_testcase_statistics.html
       - buildkite-agent artifact upload "tests/dfx/perf/results/*.html"
     agents:
@@ -259,189 +229,13 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: ":full_moon: GEBench Accuracy Test with H100"
-    key: nightly-gebench-accuracy
-    timeout_in_minutes: 60
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/accuracy/test_gebench_h100_smoke.py --run-level advanced_model --gebench-model Qwen/Qwen-Image-2512 --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --accuracy-gpu 0 --gebench-port 8093 --accuracy-workers 1
-      - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gebench_qwen-image-2512/summary*.json"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 1
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
-
-  - label: ":full_moon: GEdit-Bench Accuracy Test with H100"
-    key: nightly-gedit-bench-accuracy
-    timeout_in_minutes: 60
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/accuracy/test_gedit_bench_h100_smoke.py --run-level advanced_model --gedit-model Qwen/Qwen-Image-Edit --accuracy-judge-model QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ --accuracy-gpu 0 --gedit-port 8093 --gedit-samples-per-group 20 --accuracy-workers 1
-      - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gedit_scores_qwen-image-edit/qwen-image-edit_all_all_vie_score_*.csv"
-      - buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/gedit_scores_qwen-image-edit/qwen-image-edit_all_all_summary_*.json"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 1
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
-                    value: "120"
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
-
-  - label: ":full_moon: Wan22 I2V Accuracy Test with H100"
-    key: nightly-wan22-i2v-accuracy
-    timeout_in_minutes: 180
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py --run-level advanced_model
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:c392ce21e9cf9ea65c52b866447793db10e0261c
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
-
-  - label: ":full_moon: Diffusion Perf Test with H100"
-    key: nightly-qwen-image-performance
-    timeout_in_minutes: 180
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-      - export CACHE_DIT_VERSION=1.3.0
-      - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
-      - buildkite-agent artifact upload "tests/dfx/perf/results/benchmark_results_*.json"
-      - buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 4
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
-
   # No need to run this step for PRs with label nightly-test
   - label: ":email: Nightly Collection & Email"
     key: nightly-perf-distribution
     depends_on:
       - nightly-omni-performance
       - nightly-qwen-image-performance
+      - nightly-testcase-statistics
     if: build.env("NIGHTLY") == "1"
     commands:
       - pip install openpyxl
@@ -449,7 +243,7 @@ steps:
       - export DEFAULT_OUTPUT_DIR=tests/dfx/perf/results
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-qwen-image-performance
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-omni-performance
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-testcase-statistics
       - python tools/nightly/generate_nightly_perf_excel.py
       - python tools/nightly/generate_nightly_perf_html.py
       - python tools/nightly/send_nightly_email.py --report-file "tests/dfx/perf/results/*.xlsx, tests/dfx/perf/results/*.html"
