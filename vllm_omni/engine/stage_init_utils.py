@@ -192,8 +192,9 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
 
     custom_process_input_func: Callable | None = None
-    if hasattr(stage_config, "custom_process_input_func"):
-        mod_path, fn_name = stage_config.custom_process_input_func.rsplit(".", 1)
+    _cpif_path = getattr(stage_config, "custom_process_input_func", None)
+    if _cpif_path:
+        mod_path, fn_name = _cpif_path.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
 
     prompt_expand_func: Callable | None = None
