@@ -1471,6 +1471,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
         else:
+            # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
+            # stage whose preprocess requires chat-templated tokens.  The
+            # async-chunk orchestrator prewarms the talker via
+            # compute_talker_prompt_ids_length(), which scans for Qwen
+            # chat-template markers (im_start_token_id 151644).  A raw-text
+            # prompt produces a 1-token placeholder that crashes the talker's
+            # prefill/decode handoff.  Reject early with an actionable message.
+            stage_names = {
+                getattr(getattr(s, "engine_args", None), "model_stage", None) for s in self.engine_client.stage_configs
+            }
+            if "talker" in stage_names:
+                raise ValueError(
+                    "The /v1/audio/speech endpoint is only supported for "
+                    "dedicated TTS models (e.g., Qwen3-TTS, Voxtral, Fish "
+                    "Speech, CosyVoice3, OmniVoice, VoxCPM2). For omni "
+                    "models like Qwen3-Omni, use /v1/chat/completions with "
+                    '\'"modalities": ["audio"]\' instead.'
+                )
             tts_params = {}
             prompt = {"prompt": request.input}
 

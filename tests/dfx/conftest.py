@@ -127,16 +127,86 @@ def create_benchmark_indices(
     return indices
 
 
+def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
+    """Make a single path segment safe for result filenames on common filesystems."""
+    if value is None:
+        return default
+    s = str(value).strip()
+    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
+        s = s.replace(bad, "_")
+    return s if s else default
+
+
+def _resolve_baseline_value(
+    baseline_raw: Any,
+    *,
+    sweep_index: int | None,
+    max_concurrency: Any = None,
+    request_rate: Any = None,
+) -> Any:
+    """Pick the baseline threshold for this sweep step."""
+    if baseline_raw is None:
+        return 100000
+    if isinstance(baseline_raw, dict):
+        if max_concurrency is not None:
+            for key in (max_concurrency, str(max_concurrency)):
+                if key in baseline_raw:
+                    return baseline_raw[key]
+        if request_rate is not None:
+            for key in (request_rate, str(request_rate)):
+                if key in baseline_raw:
+                    return baseline_raw[key]
+        raise KeyError(
+            f"baseline dict has no key for max_concurrency={max_concurrency!r} "
+            f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
+        )
+    if isinstance(baseline_raw, (list, tuple)):
+        if sweep_index is None:
+            raise ValueError("list baseline requires sweep_index")
+        if not (0 <= sweep_index < len(baseline_raw)):
+            raise IndexError(f"baseline list len={len(baseline_raw)} has no index {sweep_index}")
+        return baseline_raw[sweep_index]
+    return baseline_raw
+
+
+def _baseline_thresholds_for_step(
+    baseline_data: dict[str, Any],
+    *,
+    sweep_index: int | None = None,
+    max_concurrency: Any = None,
+    request_rate: Any = None,
+) -> dict[str, Any]:
+    """Resolve baseline config to one threshold per metric for this iteration."""
+    return {
+        metric_name: _resolve_baseline_value(
+            baseline_raw,
+            sweep_index=sweep_index,
+            max_concurrency=max_concurrency,
+            request_rate=request_rate,
+        )
+        for metric_name, baseline_raw in baseline_data.items()
+    }
+
+
 def run_benchmark(
     args: list[str],
     test_name: str,
     flow: Any,
     dataset_name: str,
     num_prompt: int,
+    *,
+    baseline_config: dict[str, Any] | None = None,
+    sweep_index: int | None = None,
+    request_rate: Any | None = None,
+    max_concurrency: Any | None = None,
+    random_input_len: Any | None = None,
+    random_output_len: Any | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics."""
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
+    ri = _safe_filename_token(random_input_len)
+    ro = _safe_filename_token(random_output_len)
+    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -168,6 +238,23 @@ def run_benchmark(
     else:
         result_dir = "./"
 
-    with open(os.path.join(result_dir, result_filename), encoding="utf-8") as f:
+    result_path = os.path.join(result_dir, result_filename)
+    with open(result_path, encoding="utf-8") as f:
         result = json.load(f)
+
+    if baseline_config:
+        result["baseline"] = _baseline_thresholds_for_step(
+            baseline_config,
+            sweep_index=sweep_index,
+            request_rate=request_rate,
+            max_concurrency=max_concurrency,
+        )
+    else:
+        result["baseline"] = {}
+    if random_input_len is not None:
+        result["random_input_len"] = random_input_len
+    if random_output_len is not None:
+        result["random_output_len"] = random_output_len
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
     return result

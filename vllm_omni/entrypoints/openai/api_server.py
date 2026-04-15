@@ -18,6 +18,7 @@ from http import HTTPStatus
 from typing import Annotated, Any, Literal, cast
 
 import httpx
+import numpy as np
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -1767,6 +1768,34 @@ def _update_if_not_none(object: Any, key: str, val: Any) -> None:
         setattr(object, key, val)
 
 
+def _normalize_image(image: Any) -> Any:
+    """Normalize a single image output to a PIL-compatible format."""
+    if isinstance(image, Image.Image):
+        return image
+    if not isinstance(image, np.ndarray):
+        raise ValueError(f"Unsupported image type: {type(image)}")
+    if not np.issubdtype(image.dtype, np.integer) and not np.issubdtype(image.dtype, np.floating):
+        raise ValueError(f"Unsupported dtype: {image.dtype}")
+    if isinstance(image, np.ndarray):
+        while image.ndim > 3:
+            image = image[0]
+        if image.min() < 0:
+            if image.min() < -1.01 or image.max() > 1.01:
+                logger.warning(
+                    f"Image float range [{image.min():.2f}, {image.max():.2f}] outside expected [-1, 1]. "
+                    f"Clipping to [-1, 1] before normalization."
+                )
+            image = np.clip(image, -1.0, 1.0) * 0.5 + 0.5
+        elif image.max() > 1.01:
+            logger.warning(
+                f"Image float range [{image.min():.2f}, {image.max():.2f}] outside expected [0, 1]. "
+                f"Clipping to [0, 1] before normalization."
+            )
+        image = (np.clip(image, 0.0, 1.0) * 255).astype(np.uint8)
+        image = Image.fromarray(image)
+    return image
+
+
 def _extract_images_from_result(result: Any) -> list[Any]:
     images = []
     if hasattr(result, "images") and result.images:
@@ -1777,6 +1806,10 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             images = request_output["images"]
         elif hasattr(request_output, "images") and request_output.images:
             images = request_output.images
+    # Handle when generate more than one image
+    if images and isinstance(images[0], np.ndarray) and images[0].shape[0] > 1 and images[0].ndim == 5:
+        # Unwrap batch: (N, T, H, W, C) -> [img1, img2, ...]
+        images = list(images[0])
     # Flatten nested lists (e.g., from layered models like Qwen-Image-Layered).
     # Note: This only flattens one level deep. Deeper nesting is not supported.
     flattened = []
@@ -1785,7 +1818,7 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             flattened.extend(img)
         else:
             flattened.append(img)
-    return flattened
+    return [_normalize_image(img) for img in flattened]
 
 
 async def _load_input_images(

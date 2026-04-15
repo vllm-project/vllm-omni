@@ -161,6 +161,8 @@ def _run_one_vllm_bench_batch(
             flow=flow,
             dataset_name=dataset_name,
             num_prompt=num_prompts,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         return _normalize_bench_metrics(result)
     except (FileNotFoundError, OSError) as e:

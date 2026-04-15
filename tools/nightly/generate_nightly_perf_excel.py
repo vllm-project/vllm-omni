@@ -319,10 +319,10 @@ def _load_json_file(path: str) -> dict[str, Any] | list[Any] | None:
 
 
 def _parse_from_filename(filename: str) -> dict[str, Any]:
-    """Parse test-related metadata from a result JSON filename.
+    """Parse test-related metadata from a ``result_test_*.json`` filename.
 
-    Expected pattern (after prefix/suffix stripped):
-    <test_name>_<dataset_name>_<max_concurrency>_<num_prompts>_<timestamp>
+    Matches ``tests/dfx/perf/scripts/run_benchmark.py`` naming, including optional
+    ``_in{X}_out{Y}_`` before the timestamp (``na`` when unset).
     """
     name, ext = os.path.splitext(filename)
     if ext != ".json" or not name.startswith(_RESULT_JSON_PREFIX):
@@ -331,22 +331,42 @@ def _parse_from_filename(filename: str) -> dict[str, Any]:
     core = name[len(_RESULT_JSON_PREFIX) :]
     parts = core.split("_")
     if len(parts) < 5:
-        LOGGER.warning("filename '%s' does not match expected pattern, skip parsing test metadata", filename)
+        LOGGER.warning(
+            "filename '%s' does not match expected pattern (need >= 5 segments), skip parsing",
+            filename,
+        )
         return {}
 
-    timestamp = parts[-1]
-    num_prompts_str = parts[-2]
-    max_concurrency_str = parts[-3]
-    dataset_name = parts[-4]
-    test_name = "_".join(parts[:-4]) if parts[:-4] else ""
+    idx = len(parts) - 1
+    timestamp = parts[idx]
+    idx -= 1
 
     parsed: dict[str, Any] = {}
-
     if len(timestamp) >= 15:
         parsed["date"] = timestamp
 
-    if dataset_name in DATASET_NAME_ALLOWED:
-        parsed["dataset_name"] = dataset_name
+    if idx >= 0 and parts[idx].startswith("out"):
+        parsed["random_output_len"] = parts[idx][3:]
+        idx -= 1
+    if idx >= 0 and parts[idx].startswith("in"):
+        parsed["random_input_len"] = parts[idx][2:]
+        idx -= 1
+
+    if idx < 3:
+        LOGGER.warning(
+            "filename '%s' has too few segments after timestamp / optional in-out (idx=%s)",
+            filename,
+            idx,
+        )
+        return parsed
+
+    num_prompts_str = parts[idx]
+    idx -= 1
+    flow_str = parts[idx]
+    idx -= 1
+    dataset_name = parts[idx]
+    idx -= 1
+    test_name = "_".join(parts[: idx + 1]) if idx >= 0 else ""
 
     try:
         parsed["num_prompts"] = int(num_prompts_str)
@@ -354,12 +374,15 @@ def _parse_from_filename(filename: str) -> dict[str, Any]:
         pass
 
     try:
-        parsed["max_concurrency"] = int(max_concurrency_str)
+        parsed["max_concurrency"] = int(flow_str)
     except (TypeError, ValueError):
         pass
 
     if test_name:
         parsed["test_name"] = test_name
+
+    if dataset_name in DATASET_NAME_ALLOWED:
+        parsed["dataset_name"] = dataset_name
 
     return parsed
 

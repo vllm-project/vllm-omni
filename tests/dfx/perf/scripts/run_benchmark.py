@@ -115,8 +115,31 @@ def _resolve_baseline_value(
             f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
         )
     if isinstance(baseline_raw, (list, tuple)):
+        if sweep_index is None:
+            raise ValueError("list baseline requires sweep_index")
+        if not (0 <= sweep_index < len(baseline_raw)):
+            raise IndexError(f"baseline list len={len(baseline_raw)} has no index {sweep_index}")
         return baseline_raw[sweep_index]
     return baseline_raw
+
+
+def _baseline_thresholds_for_step(
+    baseline_data: dict[str, Any],
+    *,
+    sweep_index: int | None = None,
+    max_concurrency: Any = None,
+    request_rate: Any = None,
+) -> dict[str, Any]:
+    """Resolve ``test.json`` ``baseline`` block to one threshold per metric (same as ``assert_result``)."""
+    return {
+        metric_name: _resolve_baseline_value(
+            baseline_raw,
+            sweep_index=sweep_index,
+            max_concurrency=max_concurrency,
+            request_rate=request_rate,
+        )
+        for metric_name, baseline_raw in baseline_data.items()
+    }
 
 
 def assert_result(
@@ -130,14 +153,14 @@ def assert_result(
 ) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     baseline_data = params.get("baseline", {})
-    for metric_name, baseline_raw in baseline_data.items():
+    thresholds = _baseline_thresholds_for_step(
+        baseline_data,
+        sweep_index=sweep_index,
+        max_concurrency=max_concurrency,
+        request_rate=request_rate,
+    )
+    for metric_name, baseline_value in thresholds.items():
         current_value = result[metric_name]
-        baseline_value = _resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
-        )
         if "throughput" in metric_name:
             if current_value <= baseline_value:
                 print(
@@ -209,6 +232,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=qps,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
+            baseline_config=params.get("baseline"),
+            sweep_index=i,
+            request_rate=qps,
+            max_concurrency=None,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         assert_result(
             result,
@@ -227,6 +256,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=concurrency,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
+            baseline_config=params.get("baseline"),
+            sweep_index=i,
+            request_rate=None,
+            max_concurrency=concurrency,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         assert_result(
             result,
