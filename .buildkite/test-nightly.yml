@@ -398,8 +398,8 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: ":full_moon: Diffusion X2I · Perf Test"
-        key: nightly-diffusion-x2i-performance
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test"
+        key: nightly-diffusion-x2iat-performance
         timeout_in_minutes: 180
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
@@ -587,7 +587,7 @@ steps:
     depends_on:
       - nightly-omni-performance
       - nightly-tts-performance
-      - nightly-diffusion-x2i-performance
+      - nightly-diffusion-x2iat-performance
       - nightly-testcase-statistics
     if: build.env("NIGHTLY") == "1"
     commands:
@@ -596,7 +596,7 @@ steps:
       - export DEFAULT_OUTPUT_DIR=tests/dfx/perf/results
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-tts-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2i-performance
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-testcase-statistics
       - python tools/nightly/generate_nightly_perf_excel.py
       - python tools/nightly/generate_nightly_perf_html.py
