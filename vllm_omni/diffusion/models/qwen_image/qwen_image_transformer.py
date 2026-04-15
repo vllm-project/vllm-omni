@@ -744,9 +744,9 @@ class QwenImageTransformerBlock(nn.Module):
 
         self.zero_cond_t = zero_cond_t
 
-    def _modulate(self, x, mod_params, index=None):
+    def _modulate(self, mod_params, index=None):
         """Apply modulation to input tensor"""
-        # x: b l d, shift: b d, scale: b d, gate: b d
+        # shift: b d, scale: b d, gate: b d
         shift, scale, gate = mod_params.chunk(3, dim=-1)
 
         if index is not None:
@@ -778,7 +778,7 @@ class QwenImageTransformerBlock(nn.Module):
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
 
-        return x * (1 + scale_result) + shift_result, gate_result
+        return scale_result, shift_result, gate_result
 
     def forward(
         self,
@@ -804,10 +804,12 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_modulated, img_gate1 = self.img_norm1(hidden_states, img_mod1, modulate_index)
+        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
+        img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
 
         # Process text stream - norm1 + modulation
-        txt_modulated, txt_gate1 = self.txt_norm1(encoder_hidden_states, txt_mod1)
+        txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
+        txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -832,13 +834,16 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2, modulate_index)
+        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
+        img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
 
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
         # Process text stream - norm2 + MLP
-        txt_modulated2, txt_gate2 = self.txt_norm2(encoder_hidden_states, txt_mod2)
+        txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2)
+        txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
+
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 
