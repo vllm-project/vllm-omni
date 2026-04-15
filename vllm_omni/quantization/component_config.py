@@ -23,6 +23,31 @@ if TYPE_CHECKING:
     )
 
 
+# Pre-quantized checkpoints (modelopt FP8/FP4/MXFP8) only quantize the
+# Thinker LM.  Vision and audio encoder weights remain in BF16 with no
+# corresponding scale tensors in the checkpoint.
+PRE_QUANTIZED_METHODS: frozenset[str] = frozenset({"modelopt", "modelopt_fp4", "modelopt_mxfp8"})
+
+
+def resolve_encoder_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Resolve quantization config for vision / audio encoders.
+
+    Returns *None* for pre-quantized methods so that FP8 kernels are never
+    applied to BF16 encoder weights (which lack scale tensors).  All other
+    configs — including ``ComponentQuantizationConfig`` and ``None`` — are
+    returned as-is so the caller can handle them.
+    """
+    if (
+        quant_config is not None
+        and not isinstance(quant_config, ComponentQuantizationConfig)
+        and quant_config.get_name() in PRE_QUANTIZED_METHODS
+    ):
+        return None
+    return quant_config
+
+
 class ComponentQuantizationConfig(QuantizationConfig):
     """Routes quantization to different configs by layer prefix."""
 

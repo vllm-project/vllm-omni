@@ -310,6 +310,39 @@ class TestResolveModelConfigPath:
         assert result is not None
         assert "glm_image.yaml" in result
 
+    def test_voxcpm_transformers_format_resolution(self, mocker: MockerFixture):
+        """Test VoxCPM transformers config resolves to the voxcpm stage config."""
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            side_effect=ValueError("missing transformers config"),
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.file_or_path_exists",
+            side_effect=lambda _model, filename, revision=None: filename == "config.json",
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.get_hf_file_to_dict",
+            return_value={"model_type": "voxcpm"},
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
+            return_value="vllm_omni/model_executor/stage_configs",
+        )
+
+        original_exists = os.path.exists
+
+        def mock_exists(path):
+            if "voxcpm.yaml" in str(path):
+                return True
+            return original_exists(path)
+
+        mocker.patch("os.path.exists", side_effect=mock_exists)
+
+        result = resolve_model_config_path("OpenBMB/VoxCPM1.5")
+
+        assert result is not None
+        assert "voxcpm.yaml" in result
+
 
 class TestLoadAndResolveStageConfigs:
     def test_load_and_resolve_with_kwargs(self):

@@ -325,10 +325,23 @@ steps:
         if: *nightly_or_pr_label
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
           - export CACHE_DIT_VERSION=1.3.0
-          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
-          - buildkite-agent artifact upload "tests/dfx/perf/results/benchmark_results_*.json"
-          - buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+          # [HACK]: run upload in the same command block as pytest.
+          # Because `exit` aborts the entire commands list.
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+            EXIT1=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_edit_vllm_omni.json
+            EXIT2=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_edit_2509_vllm_omni.json
+            EXIT3=$$?
+            if [ $$EXIT1 -eq 0 ] || [ $$EXIT2 -eq 0 ] || [ $$EXIT3 -eq 0 ]; then
+              buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+              buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            fi
+            exit $$((EXIT1 | EXIT2 | EXIT3))
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -339,6 +352,46 @@ steps:
                     resources:
                       limits:
                         nvidia.com/gpu: 4
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      - label: ":full_moon: Diffusion · Qwen-Image · Accuracy Test"
+        key: nightly-qwen-image-accuracy
+        timeout_in_minutes: 180
+        if: *nightly_or_pr_label
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_qwen_image*.py --run-level advanced_model
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
                     volumeMounts:
                       - name: devshm
                         mountPath: /dev/shm

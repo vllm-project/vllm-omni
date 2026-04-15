@@ -7,6 +7,7 @@ explicitly patch values that differ from vLLM.
 import argparse
 import inspect
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
@@ -118,13 +119,6 @@ def test_qwen3_tts_codec_frame_rate_patching():
     assert omni_config.codec_frame_rate_hz == 12.3
 
 
-def test_stage_configs_path_blocks_create_model_config():
-    """create_model_config() should raise when stage_configs_path is set."""
-    args = OmniEngineArgs(stage_configs_path="/some/path.yaml")
-    with pytest.raises(RuntimeError, match="stage_configs_path"):
-        args.create_model_config()
-
-
 def test_from_cli_args_picks_up_stage_configs_path():
     """from_cli_args should pick up stage_configs_path from namespace."""
     ns = argparse.Namespace(
@@ -171,6 +165,24 @@ def test_stage_configs_path_field():
     """OmniEngineArgs with stage_configs_path should construct without error."""
     args = OmniEngineArgs(stage_configs_path="/some/path.yaml")
     assert args.stage_configs_path == "/some/path.yaml"
+
+
+def test_voxcpm_model_arch_injects_model_type_override(mocker):
+    """Ensure VoxCPM model_arch injects hf_overrides for config resolution."""
+    mocker.patch.object(OmniEngineArgs, "_ensure_omni_models_registered", return_value=True)
+    mocker.patch.object(OmniEngineArgs, "_patch_empty_hf_config")
+    mocker.patch.object(EngineArgs, "create_model_config", return_value=Mock())
+    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", return_value=Mock())
+
+    args = OmniEngineArgs(
+        model="OpenBMB/VoxCPM1.5",
+        model_arch="VoxCPMForConditionalGeneration",
+    )
+    args.create_model_config()
+
+    assert args.hf_overrides["architectures"] == ["VoxCPMForConditionalGeneration"]
+    assert args.hf_overrides["model_type"] == "voxcpm"
+    args._patch_empty_hf_config.assert_called_once_with("voxcpm")
 
 
 def test_strip_single_engine_args():

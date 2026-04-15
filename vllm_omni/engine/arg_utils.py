@@ -21,6 +21,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "VoxCPMForConditionalGeneration": "voxcpm",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
@@ -41,6 +42,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
             VoxtralTTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -59,6 +61,7 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("omnivoice", OmniVoiceConfig),
         ("voxtral_tts", VoxtralTTSConfig),
+        ("voxcpm", VoxCPMConfig),
         ("voxcpm2", VoxCPM2Config),
     ]:
         try:
@@ -194,11 +197,6 @@ class OmniEngineArgs(EngineArgs):
         Returns:
             OmniModelConfig instance with all configuration fields set
         """
-        if self.stage_configs_path is not None:
-            raise RuntimeError(
-                "create_model_config() should not be called when stage_configs_path is set. "
-                "Per-stage model configs are resolved from the stage config YAML."
-            )
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 

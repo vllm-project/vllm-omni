@@ -202,7 +202,13 @@ def _coerce_audio_to_numpy(audio: Any) -> np.ndarray:
     return arr.astype(np.float32)
 
 
-def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None) -> bytes:
+def _encode_video_bytes(
+    video: Any,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+) -> bytes:
     """Encode a video payload into MP4 bytes, optionally muxing audio."""
     from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
@@ -213,7 +219,16 @@ def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sa
     frames_np = np.stack(frames, axis=0)
     if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
         frames_np = frames_np[..., :3]
-    frames_u8 = (np.clip(frames_np, 0.0, 1.0) * 255).round().clip(0, 255).astype(np.uint8)
+
+    if frames_np.dtype == np.uint8:
+        frames_u8 = frames_np
+    else:
+        frames_np = np.clip(frames_np, 0.0, 1.0)
+        frames_np *= 255.0
+        frames_u8 = np.round(frames_np).astype(np.uint8)
+
+    # Ensure contiguous memory layout for faster PyAV muxing
+    frames_u8 = np.ascontiguousarray(frames_u8)
 
     audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
 
@@ -222,10 +237,19 @@ def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sa
         audio_np,
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or 24000,
+        video_codec_options=video_codec_options,
     )
 
 
-def encode_video_base64(video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None) -> str:
+def encode_video_base64(
+    video: Any,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
-    video_bytes = _encode_video_bytes(video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate)
+    video_bytes = _encode_video_bytes(
+        video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate, video_codec_options=video_codec_options
+    )
     return base64.b64encode(video_bytes).decode("utf-8")

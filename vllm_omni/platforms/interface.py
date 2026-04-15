@@ -64,7 +64,7 @@ class OmniPlatform(Platform):
     @classmethod
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
         if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
+            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
         raise NotImplementedError(f"Unsupported diffusion model op: {op_name}")
 
     @classmethod

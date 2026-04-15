@@ -18,6 +18,7 @@ from http import HTTPStatus
 from typing import Annotated, Any, Literal, cast
 
 import httpx
+import numpy as np
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -1767,6 +1768,34 @@ def _update_if_not_none(object: Any, key: str, val: Any) -> None:
         setattr(object, key, val)
 
 
+def _normalize_image(image: Any) -> Any:
+    """Normalize a single image output to a PIL-compatible format."""
+    if isinstance(image, Image.Image):
+        return image
+    if not isinstance(image, np.ndarray):
+        raise ValueError(f"Unsupported image type: {type(image)}")
+    if not np.issubdtype(image.dtype, np.integer) and not np.issubdtype(image.dtype, np.floating):
+        raise ValueError(f"Unsupported dtype: {image.dtype}")
+    if isinstance(image, np.ndarray):
+        while image.ndim > 3:
+            image = image[0]
+        if image.min() < 0:
+            if image.min() < -1.01 or image.max() > 1.01:
+                logger.warning(
+                    f"Image float range [{image.min():.2f}, {image.max():.2f}] outside expected [-1, 1]. "
+                    f"Clipping to [-1, 1] before normalization."
+                )
+            image = np.clip(image, -1.0, 1.0) * 0.5 + 0.5
+        elif image.max() > 1.01:
+            logger.warning(
+                f"Image float range [{image.min():.2f}, {image.max():.2f}] outside expected [0, 1]. "
+                f"Clipping to [0, 1] before normalization."
+            )
+        image = (np.clip(image, 0.0, 1.0) * 255).astype(np.uint8)
+        image = Image.fromarray(image)
+    return image
+
+
 def _extract_images_from_result(result: Any) -> list[Any]:
     images = []
     if hasattr(result, "images") and result.images:
@@ -1777,6 +1806,10 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             images = request_output["images"]
         elif hasattr(request_output, "images") and request_output.images:
             images = request_output.images
+    # Handle when generate more than one image
+    if images and isinstance(images[0], np.ndarray) and images[0].shape[0] > 1 and images[0].ndim == 5:
+        # Unwrap batch: (N, T, H, W, C) -> [img1, img2, ...]
+        images = list(images[0])
     # Flatten nested lists (e.g., from layered models like Qwen-Image-Layered).
     # Note: This only flattens one level deep. Deeper nesting is not supported.
     flattened = []
@@ -1785,7 +1818,7 @@ def _extract_images_from_result(result: Any) -> list[Any]:
             flattened.extend(img)
         else:
             flattened.append(img)
-    return flattened
+    return [_normalize_image(img) for img in flattened]
 
 
 async def _load_input_images(
@@ -1955,18 +1988,6 @@ def video_response_from_request(model_name: str, req: VideoGenerationRequest) ->
     return resp
 
 
-async def decode_and_save_video_output(output: Any, file_name: str) -> str:
-    if not output.b64_json:
-        raise RuntimeError(f"Video output for {file_name} did not include b64_json content.")
-
-    try:
-        video_bytes = base64.b64decode(output.b64_json)
-    except Exception as decode_exc:
-        raise RuntimeError(f"Failed to decode generated video payload for {file_name}") from decode_exc
-
-    return await STORAGE_MANAGER.save(video_bytes, file_name)
-
-
 def _cleanup_video(video_id: str, output_path: str | None):
     try:
         if output_path is not None:
@@ -1990,15 +2011,12 @@ async def _run_video_generation_job(
     started_at = time.perf_counter()
     output_path = None
     try:
-        response = await handler.generate_videos(request, video_id, reference_image=reference_image)
-        if not response.data:
-            raise RuntimeError("Video generation completed but returned no outputs.")
-
-        if (video_count := len(response.data)) > 1:
-            logger.warning("Video request %s generated %s outputs but we only expected one.", video_id, video_count)
+        video_bytes, stage_durations, peak_memory_mb = await handler.generate_video_bytes(
+            request, video_id, reference_image=reference_image
+        )
 
         file_name = f"{video_id}.{job.file_extension}"
-        output_path = await decode_and_save_video_output(response.data[0], file_name)
+        output_path = await STORAGE_MANAGER.save(video_bytes, file_name)
         logger.info("Video request %s persisted %s output file.", video_id, output_path)
 
         await VIDEO_STORE.update_fields(
@@ -2009,8 +2027,8 @@ async def _run_video_generation_job(
                 "file_name": file_name,
                 "completed_at": int(time.time()),
                 "inference_time_s": time.perf_counter() - started_at,
-                "stage_durations": response.stage_durations,
-                "peak_memory_mb": response.peak_memory_mb,
+                "stage_durations": stage_durations,
+                "peak_memory_mb": peak_memory_mb,
             },
         )
     except Exception as exc:
@@ -2057,6 +2075,10 @@ async def _parse_video_form(
     true_cfg_scale: float | None = Form(default=None),
     seed: int | None = Form(default=None),
     negative_prompt: str | None = Form(default=None),
+    enable_frame_interpolation: bool = Form(default=False),
+    frame_interpolation_exp: int = Form(default=1, ge=1),
+    frame_interpolation_scale: float = Form(default=1.0, gt=0.0),
+    frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
 ) -> tuple[VideoGenerationRequest, "OmniOpenAIServingVideo", str, ReferenceImage | None]:
@@ -2093,6 +2115,10 @@ async def _parse_video_form(
         "true_cfg_scale": true_cfg_scale,
         "seed": seed,
         "negative_prompt": negative_prompt,
+        "enable_frame_interpolation": enable_frame_interpolation,
+        "frame_interpolation_exp": frame_interpolation_exp,
+        "frame_interpolation_scale": frame_interpolation_scale,
+        "frame_interpolation_model_path": frame_interpolation_model_path,
         "lora": _parse_form_json(lora, expected_type=dict),
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
     }

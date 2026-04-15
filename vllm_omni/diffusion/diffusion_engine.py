@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import queue
 import threading
 import time
@@ -130,6 +131,12 @@ class DiffusionEngine:
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        # Cache whether the model-specific postprocess accepts request-level
+        # sampling params so step() can support both legacy and extended hooks.
+        self._post_process_accepts_sampling_params = bool(
+            self.post_process_func is not None
+            and "sampling_params" in inspect.signature(self.post_process_func).parameters
+        )
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
@@ -166,7 +173,6 @@ class DiffusionEngine:
             exec_total_time=exec_total_time,
             diffusion_engine_start_time=diffusion_engine_start_time,
         )
-
     @staticmethod
     def make_engine(
         config: OmniDiffusionConfig,
@@ -545,6 +551,7 @@ class DiffusionEngine:
         metrics: dict[str, float | int],
         diffusion_output: DiffusionOutput,
         model_outputs_audio: bool,
+        custom_output: dict[str, Any] | None = None,
         request_multimodal_output: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build one public response object from per-request payloads.
@@ -562,6 +569,8 @@ class DiffusionEngine:
                 audio instead of images.
             request_multimodal_output: Optional per-request multimodal payload
                 attached under ``multimodal_output``.
+            custom_output: Optional merged custom output payload to expose on
+                non-audio responses.
 
         Returns:
             The final ``OmniRequestOutput`` for one logical request.
@@ -574,6 +583,7 @@ class DiffusionEngine:
             expect those fields to be available on each logical result.
         """
         request_multimodal_output = request_multimodal_output or {}
+        custom_output = custom_output or diffusion_output.custom_output or {}
 
         if model_outputs_audio:
             request_audio_payload = request_outputs
@@ -607,7 +617,7 @@ class DiffusionEngine:
             trajectory_timesteps=diffusion_output.trajectory_timesteps,
             trajectory_log_probs=diffusion_output.trajectory_log_probs,
             trajectory_decoded=diffusion_output.trajectory_decoded,
-            custom_output=diffusion_output.custom_output or {},
+            custom_output=custom_output,
             multimodal_output=request_multimodal_output,
             stage_durations=diffusion_output.stage_durations,
             peak_memory_mb=diffusion_output.peak_memory_mb,
@@ -632,7 +642,7 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise Exception(f"{output.error}")
+            raise RuntimeError(f"{output.error}")
         logger.info("Generation completed successfully.")
 
         if output.output is None:
@@ -656,12 +666,22 @@ class DiffusionEngine:
             output_data = self._move_output_to_cpu(output_data)
 
         postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
+        if self.post_process_func is not None:
+            # Some video pipelines need request-level controls during
+            # postprocess (for example worker-side frame interpolation).
+            if self._post_process_accepts_sampling_params:
+                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
+            else:
+                outputs = self.post_process_func(output_data)
+        else:
+            outputs = output_data
         audio_payload = None
+        custom_output = output.custom_output or {}
         model_audio_sample_rate = None
         model_fps = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
+            custom_output.update(outputs.get("custom_output") or {})
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
@@ -744,6 +764,7 @@ class DiffusionEngine:
                     metrics=metrics,
                     diffusion_output=output,
                     model_outputs_audio=model_outputs_audio,
+                    custom_output=custom_output,
                     request_multimodal_output=request_multimodal_output,
                 )
             )
