@@ -2397,7 +2397,7 @@ class OpenAIClientHandler:
                                 image_url = item.get("image_url", {}).get("url")
                             else:
                                 image_url_obj = getattr(item, "image_url", None)
-                                image_url = hasattr(image_url_obj, "url", None) if image_url_obj else None
+                                image_url = getattr(image_url_obj, "url", None) if image_url_obj else None
                             if image_url and image_url.startswith("data:image"):
                                 b64_data = image_url.split(",", 1)[1]
                                 img = decode_b64_image(b64_data)
@@ -2703,7 +2703,7 @@ class OpenAIClientHandler:
 
         return responses
 
-    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[DiffusionResponse]:
         """
         Send OpenAI requests for diffusion models.
 
@@ -2711,9 +2711,9 @@ class OpenAIClientHandler:
             request_config: Request configuration dictionary containing parameters like model, messages
             request_num: Number of requests to send concurrently, defaults to 1 (single request)
         Returns:
-            List[OmniResponse]: List of response objects
+            List[DiffusionResponse]: List of response objects
         """
-        responses = []
+        responses: list[DiffusionResponse] = []
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
         extra_body = request_config.get("extra_body", None)
@@ -2876,7 +2876,7 @@ class OpenAIClientHandler:
         return f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def openai_client(request: pytest.FixtureRequest, run_level: str):
     """Create OpenAIClientHandler fixture to facilitate communication with OmniServer
     with encapsulated request sending, concurrent requests, response handling, and validation."""

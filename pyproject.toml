@@ -55,6 +55,7 @@ dev = [
     "pyttsx3>=2.99",
     "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
+    "torchmetrics>=1.4.0", # for accuracy similarity metrics
 ]
 
 demo = [
