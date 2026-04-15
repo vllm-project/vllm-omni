@@ -1406,37 +1406,3 @@ class Wan22Pipeline(
             output=output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
-
-    # ── Temporal PP: local-compute-only forward ──
-
-    def denoise_micro_step(
-        self,
-        *,
-        state: DiffusionRequestState,
-        timestep: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        """Local-compute-only forward for one PP stage at one timestep.
-
-        Unlike ``predict_noise_maybe_with_pp_and_cfg``, this does NOT handle
-        communication (no isend/irecv) or CFG (single branch only).  The model
-        runner owns send/recv timing; this method just runs the transformer's
-        local blocks and returns the raw result.
-
-        Returns:
-            ``IntermediateTensors`` on non-last PP ranks, ``noise_pred`` tensor
-            on the last PP rank.
-        """
-        boundary_timestep = state.extra.get("boundary_timestep")
-        current_model, _ = self._select_model_for_timestep(timestep, boundary_timestep)
-
-        latent_model_input, timestep_tensor = self._prepare_latent_input(state, timestep, current_model.dtype)
-
-        return self.predict_noise(
-            current_model=current_model,
-            intermediate_tensors=intermediate_tensors,
-            hidden_states=latent_model_input,
-            timestep=timestep_tensor,
-            encoder_hidden_states=state.prompt_embeds,
-            return_dict=False,
-        )
