@@ -34,14 +34,27 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class MockVideoResult:
-    def __init__(self, videos, audios=None, sample_rate=None, stage_durations=None, peak_memory_mb=0.0):
+    def __init__(
+        self,
+        videos,
+        audios=None,
+        sample_rate=None,
+        custom_output=None,
+        stage_durations=None,
+        peak_memory_mb=0.0,
+    ):
         self.multimodal_output = {"video": videos}
         if audios is not None:
             self.multimodal_output["audio"] = audios
         if sample_rate is not None:
             self.multimodal_output["audio_sample_rate"] = sample_rate
+        self._custom_output = custom_output or {}
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
+
+    @property
+    def custom_output(self):
+        return self._custom_output
 
 
 class FakeAsyncOmni:
@@ -400,6 +413,67 @@ def test_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.extra_args["flow_shift"] == 0.25
 
 
+def test_frame_interpolation_params_pass_to_diffusion_sampling_params(test_client, mocker: MockerFixture):
+    """Frame interpolation parameters should be forwarded to diffusion worker sampling params."""
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "smooth motion",
+            "fps": "8",
+            "enable_frame_interpolation": "true",
+            "frame_interpolation_exp": "2",
+            "frame_interpolation_scale": "0.5",
+            "frame_interpolation_model_path": "local-rife",
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.enable_frame_interpolation is True
+    assert captured.frame_interpolation_exp == 2
+    assert captured.frame_interpolation_scale == 0.5
+    assert captured.frame_interpolation_model_path == "local-rife"
+
+
+def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker: MockerFixture):
+    fps_values = []
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        import numpy as np
+
+        yield MockVideoResult([np.zeros((1, 64, 64, 3), dtype=np.uint8)], custom_output={"video_fps_multiplier": 2})
+
+    engine.generate = _generate
+
+    def _fake_encode(video, fps, **kwargs):
+        del video, kwargs
+        fps_values.append(fps)
+        return b"fake-video"
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=_fake_encode,
+    )
+
+    response = test_client.post("/v1/videos", data={"prompt": "fps multiplier", "fps": "8"})
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert fps_values == [16]
+
+
 def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFixture):
     audio_sample_rates = []
 
@@ -595,6 +669,10 @@ def test_video_request_validation():
 
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", image_reference={"file_id": "file-1", "image_url": "https://example.com"})
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", frame_interpolation_exp=0)
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", frame_interpolation_scale=0)
 
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
@@ -1032,3 +1110,57 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.num_inference_steps == 30
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
+
+
+def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):
+    """Frame interpolation parameters should be forwarded on the sync path."""
+    encode_mock = _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "smooth sync",
+            "fps": "8",
+            "enable_frame_interpolation": "true",
+            "frame_interpolation_exp": "2",
+            "frame_interpolation_scale": "0.5",
+            "frame_interpolation_model_path": "local-rife",
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.enable_frame_interpolation is True
+    assert captured.frame_interpolation_exp == 2
+    assert captured.frame_interpolation_scale == 0.5
+    assert captured.frame_interpolation_model_path == "local-rife"
+    _, kwargs = encode_mock.call_args
+    assert kwargs["fps"] == 8
+
+
+def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: MockerFixture):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    fps_values = []
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        engine.captured_prompt = prompt
+        engine.captured_sampling_params_list = sampling_params_list
+        yield MockVideoResult([object()], custom_output={"video_fps_multiplier": 2})
+
+    engine.generate = _generate
+
+    def _fake_encode(video, fps, **kwargs):
+        del video, kwargs
+        fps_values.append(fps)
+        return b"fps-multiplied"
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=_fake_encode,
+    )
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "fps multiplier", "fps": "8"})
+
+    assert response.status_code == 200
+    assert response.content == b"fps-multiplied"
+    assert fps_values == [16]
