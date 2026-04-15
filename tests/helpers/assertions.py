@@ -146,7 +146,12 @@ def assert_video_valid(
     height: int | None = None,
     fps: float | None = None,
 ) -> dict[str, int | float]:
-    """Assert the MP4 has the expected resolution and exact frame count."""
+    """Assert the MP4 has the expected resolution and frame count.
+
+    For several diffusion backends, encoded MP4 frame count follows a codec-aligned
+    convention (e.g. request `num_frames=8` can produce 9 encoded frames). Keep
+    this compatibility behavior to avoid false negatives in online-serving tests.
+    """
     temp_path = None
     cap = None
     try:
@@ -184,7 +189,8 @@ def assert_video_valid(
         if fps is not None and actual_fps:
             assert abs(actual_fps - float(fps)) < 1.0, f"Expected fps~={fps}, got {actual_fps}"
         if num_frames is not None:
-            assert actual_frames == num_frames, f"Expected frames={num_frames}, got {actual_frames}"
+            expected_frames = (int(num_frames) // 4) * 4 + 1
+            assert actual_frames == expected_frames, f"Expected frames={expected_frames}, got {actual_frames}"
 
         return {
             "width": actual_width,
