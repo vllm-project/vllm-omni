@@ -13,7 +13,7 @@ import pytest
 from PIL import Image
 from vllm.assets.image import ImageAsset
 
-from tests.conftest import OmniRunner
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 

@@ -797,12 +797,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     elif isinstance(v, dict):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
                     elif isinstance(v, list):
-                        if idx < len(v):
-                            element = v[idx]
-                            if element is not None:
-                                if isinstance(element, torch.Tensor):
-                                    element = element.clone()
-                                mm_payload[k] = element
+                        element = v[idx] if idx < len(v) else v[0]
+                        if element is not None:
+                            if isinstance(element, torch.Tensor):
+                                element = element.clone()
+                            mm_payload[k] = element
                         # Skip None elements: msgspec cannot serialize None
                         # in dict[str, torch.Tensor] typed fields.
                     elif isinstance(v, torch.Tensor):

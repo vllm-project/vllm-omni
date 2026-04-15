@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
-from tests.conftest import OmniRunner
+from tests.helpers.runtime import OmniRunner
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform

@@ -147,7 +147,7 @@ vllm_omni/                                    tests/
                                                    ├── test_zimage_tensor_parallel.py
                                                    ├── test_cache_dit.py
                                                    ├── test_teacache.py
-                                                   ├── test_stable_audio_model.py
+                                                   ├── test_stable_audio_expansion.py
                                                    ├── test_diffusion_cpu_offload.py
                                                    ├── test_diffusion_layerwise_offload.py
                                                    ├── test_diffusion_lora.py

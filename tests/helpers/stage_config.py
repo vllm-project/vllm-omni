@@ -1,6 +1,8 @@
 """Config/message construction helpers used by tests."""
 
-import time
+import atexit
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -143,16 +145,25 @@ def modify_stage_config(
             if key == "stage_args":
                 if value and isinstance(value, dict):
                     stage_args = config.get("stage_args", [])
+                    if not stage_args:
+                        raise ValueError("stage_args does not exist in config")
+
                     for stage_id, delete_paths in value.items():
+                        if not delete_paths:
+                            continue
+
                         target_stage = None
                         for stage in stage_args:
                             if stage.get("stage_id") == int(stage_id):
                                 target_stage = stage
                                 break
+
                         if target_stage is None:
                             continue
-                        for p in delete_paths:
-                            delete_by_path(target_stage, p)
+
+                        for delete_path in delete_paths:
+                            if delete_path:
+                                delete_by_path(target_stage, delete_path)
             elif "." in key:
                 delete_by_path(config, key)
             elif value is None and key in config:
@@ -163,6 +174,9 @@ def modify_stage_config(
             if key == "stage_args":
                 if value and isinstance(value, dict):
                     stage_args = config.get("stage_args", [])
+                    if not stage_args:
+                        raise ValueError("stage_args does not exist in config")
+
                     for stage_id, stage_updates in value.items():
                         target_stage = None
                         for stage in stage_args:
@@ -182,11 +196,22 @@ def modify_stage_config(
             else:
                 config[key] = value
 
-    base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
-    output_path = f"{base_name}_{time.time_ns()}.yaml"
-    with open(output_path, "w", encoding="utf-8") as f:
+    # Unique paths: multiple modify_stage_config calls in one process would collide
+    # if writing next to the source with a coarse timestamp. Use mkstemp and unlink at exit.
+    output_fd, output_path_str = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
+
+    def _unlink_temp_cfg() -> None:
+        try:
+            Path(output_path_str).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    atexit.register(_unlink_temp_cfg)
+
+    with os.fdopen(output_fd, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
-    return output_path
+
+    return str(output_path_str)
 
 
 __all__ = [

@@ -64,6 +64,11 @@ def get_open_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _omni_subprocess_cwd() -> str:
+    """Repo root for ``python -m vllm_omni...`` (legacy conftest lived under ``tests/``; helpers under ``tests/helpers/``)."""
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
 class OmniServerParams(NamedTuple):
     model: str
     port: int | None = None
@@ -123,7 +128,7 @@ class OmniServer:
         self.proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            cwd=_omni_subprocess_cwd(),
         )
 
         max_wait = 1200
@@ -328,17 +333,17 @@ class OmniServerStageCli(OmniServer):
         proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            cwd=_omni_subprocess_cwd(),
         )
         self.stage_procs[stage_id] = proc
         if stage_id == 0:
             self.proc = proc
 
     def _ensure_stage_processes_alive(self) -> None:
-        for _stage_id, proc in self.stage_procs.items():
+        for stage_id, proc in self.stage_procs.items():
             ret = proc.poll()
             if ret is not None:
-                raise RuntimeError(f"Stage {_stage_id} exited with code {ret} before API server became ready.")
+                raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.")
 
     def _start_server(self) -> None:
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
