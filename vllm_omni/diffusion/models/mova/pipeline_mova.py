@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.video_processor import VideoProcessor
+from PIL import Image
 from safetensors.torch import load_file as load_safetensors
 from tqdm import tqdm
 from transformers import T5TokenizerFast, UMT5EncoderModel
@@ -120,6 +121,24 @@ def _prompt_clean(text: str) -> str:
     return text.strip()
 
 
+def _crop_and_resize_image(image: Image.Image, height: int, width: int) -> Image.Image:
+    """Match upstream MOVA's PIL crop-and-resize preprocessing."""
+    image_width, image_height = image.size
+    target_ratio = width / height
+    image_ratio = image_width / image_height
+
+    if image_ratio > target_ratio:
+        cropped_width = int(image_height * target_ratio)
+        left = (image_width - cropped_width) // 2
+        image = image.crop((left, 0, left + cropped_width, image_height))
+    else:
+        cropped_height = int(image_width / target_ratio)
+        top = (image_height - cropped_height) // 2
+        image = image.crop((0, top, image_width, top + cropped_height))
+
+    return image.resize((width, height))
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -138,6 +157,14 @@ class MovaPipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMi
         model_path = od_config.model
         device = get_local_device()
         dtype = od_config.dtype
+        self.parallel_config = od_config.parallel_config
+
+        if getattr(self.parallel_config, "sequence_parallel_size", 1) > 1:
+            raise NotImplementedError(
+                "MOVA does not yet support sequence/context parallel execution in vllm-omni. "
+                "Use single-GPU direct inference for parity checks; upstream SGLang workflow references "
+                "that rely on context parallelism are not directly comparable."
+            )
 
         # Load text encoder + tokenizer (diffusers/transformers native)
         logger.info("Loading text encoder from %s", model_path)
@@ -506,6 +533,9 @@ class MovaPipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMi
         visual_shift = extra.get("visual_shift", 5.0)
         audio_shift = extra.get("audio_shift", 5.0)
         boundary_ratio = extra.get("boundary_ratio", self.boundary_ratio)
+
+        if isinstance(raw_image, Image.Image):
+            raw_image = _crop_and_resize_image(raw_image.convert("RGB"), height=height, width=width)
 
         device = get_local_device()
         use_offload = getattr(self, "_use_cpu_offload", False)
