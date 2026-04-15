@@ -13,8 +13,8 @@ import pytest
 import torch
 
 import tests.helpers.runtime as omni_runtime
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.utils import hardware_test
 from vllm_omni.model_executor.models.voxcpm.voxcpm_runtime_utils import (
     prepare_voxcpm_hf_config_dir,
     resolve_voxcpm_model_dir,

@@ -10,10 +10,10 @@ from diffusers import QwenImageEditPipeline, QwenImageEditPlusPipeline
 from PIL import Image
 
 from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
-from tests.e2e.accuracy.utils import assert_similarity, model_output_dir
+from tests.e2e.accuracy.helpers import assert_similarity, model_output_dir
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
-from tests.utils import hardware_test
 
 SINGLE_MODEL = "Qwen/Qwen-Image-Edit"
 MULTIPLE_MODEL = "Qwen/Qwen-Image-Edit-2509"
