@@ -17,6 +17,11 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.diffusion.memory_profiling import (
+    capture_cuda_memory_snapshot,
+    format_cuda_memory_snapshot,
+    is_memory_profiling_enabled,
+)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
@@ -28,10 +33,28 @@ logger = init_logger(__name__)
 class OmniGenerationScheduler(VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._memory_profiling_enabled = is_memory_profiling_enabled()
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+
+    def _log_allocation_failure(self, request: Request, *, required_tokens: int, token_budget: int) -> None:
+        """Log a memory allocation failure with a CUDA memory snapshot.
+
+        Only emits a log message when :attr:`_memory_profiling_enabled` is True.
+        """
+        if not self._memory_profiling_enabled:
+            return
+        snapshot = capture_cuda_memory_snapshot()
+        snapshot_str = format_cuda_memory_snapshot(snapshot)
+        logger.warning(
+            "Diffusion scheduler allocation failed: request_id=%s required_tokens=%d token_budget=%d %s",
+            request.request_id,
+            required_tokens,
+            token_budget,
+            snapshot_str,
+        )
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -323,15 +346,6 @@ class OmniGenerationScheduler(VLLMScheduler):
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
 
         return scheduler_output
-
-    """
-    Scheduler for the diffusion model.
-    This scheduler is modified to stop the request immediately for the diffusion model.
-    This is because the diffusion model can generate the final image/audio in one step.
-    Note: This is just a minimal modification to the original scheduler,
-    and there should be some further efforts to optimize the scheduler.
-    The original scheduler is still used for the AR model.
-    """
 
     def update_from_output(
         self,
