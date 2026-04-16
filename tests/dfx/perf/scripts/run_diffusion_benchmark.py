@@ -564,24 +564,14 @@ def run_benchmark(
 
     if process.returncode != 0:
         tmp_result_file.unlink(missing_ok=True)
-        print(f"ERROR：Benchmark script exited with code {process.returncode}")
+        print(f"ERROR:Benchmark script exited with code {process.returncode}")
 
     if not tmp_result_file.exists():
         with open(DIFFUSION_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
             template_payload = json.load(f)
-        template_metrics: dict[str, Any] = {}
-        if isinstance(template_payload, list) and template_payload:
-            first_item = template_payload[0]
-            if isinstance(first_item, dict):
-                result_block = first_item.get("result")
-                if isinstance(result_block, dict):
-                    template_metrics = result_block
-        elif isinstance(template_payload, dict):
-            result_block = template_payload.get("result")
-            if isinstance(result_block, dict):
-                template_metrics = result_block
-            else:
-                template_metrics = template_payload
+        # Template schema is fixed and owned by this repo:
+        # ``diffusion_result_template.json`` is a one-item list and metrics live at [0]["result"].
+        template_metrics: dict[str, Any] = template_payload[0]["result"]
         with open(tmp_result_file, "w", encoding="utf-8") as f:
             json.dump(template_metrics, f, ensure_ascii=False, indent=2)
         print(f"Benchmark result file not generated, fallback to template: {tmp_result_file}")

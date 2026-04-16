@@ -150,8 +150,10 @@ def run_benchmark(
         with open(result_path, "w", encoding="utf-8") as f:
             json.dump(template_result, f, ensure_ascii=False, indent=2)
         print(f"Benchmark result file not generated, fallback to template: {result_path}")
-    with open(result_path, encoding="utf-8") as f:
-        result = json.load(f)
+        result = template_result
+    else:
+        with open(result_path, encoding="utf-8") as f:
+            result = json.load(f)
 
     if baseline_config:
         result["baseline"] = _baseline_thresholds_for_step(
