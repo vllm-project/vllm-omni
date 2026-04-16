@@ -323,6 +323,18 @@ def build_vllm_config(
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+
+    # _to_dict serializes dataclass fields (e.g. StructuredOutputsConfig) into
+    # plain dicts.  When OmniEngineArgs is instantiated with the dict, these
+    # fields remain dicts instead of being reconstructed as dataclass objects.
+    # Later, EngineArgs.create_engine_config() does
+    #   self.structured_outputs_config.reasoning_parser = ...
+    # which fails on a plain dict.  Reconstruct the dataclass here.
+    soc = filtered_engine_args_dict.get("structured_outputs_config")
+    if isinstance(soc, dict):
+        from vllm.config import StructuredOutputsConfig
+        filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
+
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
     vllm_config = omni_engine_args.create_engine_config(
         usage_context=UsageContext.LLM_CLASS,
