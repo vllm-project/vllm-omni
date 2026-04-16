@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
+from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -43,6 +44,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
+        # The Omni tensor prefix cache will be allocated
+        # when we initialize the metadata builders if enabled
+        self.omni_prefix_cache = None
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
@@ -69,6 +73,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                                 dtype=sm.dtype,
                                 device=sm.device,
                             )
+
+        # Initialize the wrapper for both multimodal output tensors
+        # and for hidden states to be passed between stages
+        if self.cache_config.enable_prefix_caching:
+            self.omni_prefix_cache = OmniTensorPrefixCache(
+                num_blocks=kv_cache_config.num_blocks,
+                block_size=self.cache_config.block_size,
+                hidden_size=self.model_config.get_hidden_size(),
+                hs_dtype=self.dtype,
+            )
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
@@ -234,6 +248,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # Used for prefix cache
+        if self.omni_prefix_cache is not None:
+            self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -293,6 +311,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
                 continue
+
+            # Since this is the first time the request has been scheduled,
+            # num_computed_tokens > 0 means that we have a hit in prefix
+            # caching; mark it so that we can manage the hidden states
+            # later on as needed.
+            if self.omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
+                self.omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
 
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
@@ -1010,6 +1035,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         multimodal_outputs: object,
         num_scheduled_tokens_np: np.ndarray,
         scheduler_output: "SchedulerOutput",
+        combined_hidden_states: dict[str, torch.Tensor] | None = None,
+        combined_multimodal_outputs: dict[str, object] | None = None,
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
         try:
@@ -1018,21 +1045,31 @@ class OmniGPUModelRunner(GPUModelRunner):
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
                     req_infos = self.model_intermediate_buffer.get(req_id, {})
-                    start_offset = int(self.query_start_loc.cpu[req_index])
-                    sched_tokens = int(num_scheduled_tokens_np[req_index])
-                    s, e = start_offset, start_offset + sched_tokens
-                    # only consider to store data into update dict.
-                    hidden_states_slice = hidden_states[s:e]
+                    if combined_hidden_states:
+                        # Combined hidden states contains all hidden states for every request
+                        hidden_states_slice = combined_hidden_states[req_id]
+                    else:
+                        start_offset = int(self.query_start_loc.cpu[req_index])
+                        sched_tokens = int(num_scheduled_tokens_np[req_index])
+                        s, e = start_offset, start_offset + sched_tokens
+                        # only consider to store data into update dict.
+                        hidden_states_slice = hidden_states[s:e]
+
+                    if combined_multimodal_outputs:
+                        # NOTE this is a bit ugly, but the mm data is structured as a list of
+                        # keys mapping to request IDs, and if enabled, we will always have all
+                        # request IDs in every subdict, including for cache misses.
+                        mm_out = {k: v[req_id] for k, v in combined_multimodal_outputs.items()}
+                    else:
+                        mm_out = multimodal_outputs
                     update_dict = self.model.postprocess(
-                        hidden_states_slice, multimodal_outputs=multimodal_outputs, **req_infos
+                        hidden_states_slice,
+                        multimodal_outputs=mm_out,
+                        **req_infos,
                     )
                     self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
-            logger.error(
-                f"Error merging for requests:{self.input_batch.req_ids} "
-                f"additional information update: {e}, with the multimodal_outputs "
-                f"as {multimodal_outputs}"
-            )
+            logger.error(f"Error merging for requests:{self.input_batch.req_ids} additional information update: {e}")
             import traceback
 
             traceback.print_exc()
@@ -1241,6 +1278,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 span_len = int(e) - int(s)
 
                 # call the custom process function
+                req_infos["request_id"] = req_id
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos

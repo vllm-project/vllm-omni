@@ -34,13 +34,21 @@ class OmniConnectorBase(ABC):
         pass
 
     @abstractmethod
-    def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
+    def get(
+        self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[Any, int] | None:
         """Retrieve Python object and payload size (bytes).
 
         Args:
             from_stage: Source stage identifier
             to_stage: Destination stage identifier
             get_key: Unique request identifier
+            metadata: Optional transport-specific metadata.  When provided,
+                the connector uses it directly (e.g. source_host, source_port,
+                data_size) instead of querying the sender.  For heterogeneous
+                TP the manager may supply partial metadata (host/port only);
+                the connector will query the sender at that address to fill
+                in data_size.
 
         Returns:
             Tuple of (Python object, serialized byte size) if found, None otherwise

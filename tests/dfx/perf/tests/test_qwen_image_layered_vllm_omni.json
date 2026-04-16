@@ -1,0 +1,49 @@
+[
+    {
+        "test_name": "test_qwen_image_layered_single_device",
+        "description": "Single-device baseline",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Qwen/Qwen-Image-Layered",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "640x640_steps20_i2i",
+                "dataset": "random",
+                "task": "i2i",
+                "width": 640,
+                "height": 640,
+                "num-inference-steps": 20,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.02,
+                    "latency_mean": 40.0,
+                    "peak_memory_mb_max": 70000,
+                    "peak_memory_mb_mean": 70000
+                }
+            },
+            {
+                "name": "1024x1024_steps35_i2i",
+                "dataset": "random",
+                "task": "i2i",
+                "width": 1024,
+                "height": 1024,
+                "num-inference-steps": 35,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.005,
+                    "latency_mean": 80.0,
+                    "peak_memory_mb_max": 70000,
+                    "peak_memory_mb_mean": 70000
+                }
+            }
+        ]
+    }
+]

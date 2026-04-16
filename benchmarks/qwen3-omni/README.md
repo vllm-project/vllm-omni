@@ -9,7 +9,7 @@ cd benchmarks/build_dataset
 pip install gdown
 
 # Download SeedTTS test set from Google Drive
-gdown --id 1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
+gdown  1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
 
 # Extract
 tar -xf seedtts_testset.tar

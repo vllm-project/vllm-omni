@@ -31,7 +31,6 @@ from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
-from vllm.v1.metrics.loggers import StatLoggerManager
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
@@ -62,6 +61,7 @@ from vllm_omni.engine.stage_engine_startup import (
 )
 from vllm_omni.engine.stage_init_utils import (
     StartedLlmStage,
+    _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_diffusion_config,
     build_engine_args_dict,
@@ -79,7 +79,10 @@ from vllm_omni.engine.stage_init_utils import (
     setup_stage_devices,
     terminate_alive_proc,
 )
-from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
+from vllm_omni.entrypoints.utils import (
+    inject_omni_kv_config,
+    load_and_resolve_stage_configs,
+)
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
 
@@ -285,7 +288,6 @@ class AsyncOmniEngine:
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
         self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
-        self.log_stats = not bool(getattr(stage0_args, "disable_log_stats", False))
         self.stage_clients: list[Any] = []
         self.stage_vllm_configs: list[Any] = []
         self.output_processors: list[MultimodalOutputProcessor | None] = []
@@ -380,6 +382,12 @@ class AsyncOmniEngine:
                             omni_kv["omni_to_stage"] = omni_to
                             omni_kv.setdefault("stage_id", metadata.stage_id)
                             engine_args_dict["omni_kv_config"] = omni_kv
+                        if self.stage_configs:
+                            _inject_inferred_kv_tp_topology(
+                                engine_args_dict.get("omni_kv_config"),
+                                metadata.stage_id,
+                                self.stage_configs,
+                            )
                         vllm_config, executor_class = build_vllm_config(
                             stage_cfg,
                             self.model,
@@ -415,7 +423,7 @@ class AsyncOmniEngine:
                             addresses, proc, handshake_address = spawn_stage_core(
                                 vllm_config=vllm_config,
                                 executor_class=executor_class,
-                                log_stats=self.log_stats,
+                                log_stats=False,
                             )
                             started_stage = StartedLlmStage(
                                 stage_id=metadata.stage_id,
@@ -426,22 +434,23 @@ class AsyncOmniEngine:
                                 proc=proc,
                             )
                         logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
-                        # Keep the stage-specific device visibility until vLLM
-                        # finishes starting all child processes.
-                        if self.single_stage_mode and self._omni_master_server is not None:
-                            launch_stack.close()
-                        else:
-                            assert proc is not None
-                            assert handshake_address is not None
-                            complete_stage_handshake(
-                                proc, handshake_address, addresses, vllm_config, stage_init_timeout
-                            )
-                        logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
                     finally:
                         if previous_visible_devices is None:
                             current_omni_platform.unset_device_control_env_var()
                         else:
                             current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+                # After StageEngineCoreProc has been spawned it carries its
+                # stage-specific device visibility into descendants, so the
+                # slow HELLO/READY handshake can run without holding the
+                # process-wide launch lock.
+                if self.single_stage_mode and self._omni_master_server is not None:
+                    launch_stack.close()
+                else:
+                    assert proc is not None
+                    assert handshake_address is not None
+                    complete_stage_handshake(proc, handshake_address, addresses, vllm_config, stage_init_timeout)
+                logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
 
             assert started_stage is not None
             return started_stage
@@ -617,7 +626,7 @@ class AsyncOmniEngine:
                 )
             output_processor = MultimodalOutputProcessor(
                 tokenizer=tokenizer,
-                log_stats=self.log_stats,
+                log_stats=False,
                 engine_core_output_type=started.metadata.engine_output_type,
             )
             input_processor = None
@@ -748,10 +757,8 @@ class AsyncOmniEngine:
                                 setup_stage_devices(configured_stage_id, metadata.runtime_cfg)
                                 omni_conn_cfg, omni_from, omni_to = omni_kv_connector
                                 if omni_conn_cfg:
-                                    from vllm_omni.entrypoints.utils import inject_omni_kv_config
-
                                     inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                                inject_kv_stage_info(stage_cfg, configured_stage_id)
+                                inject_kv_stage_info(stage_cfg, configured_stage_id, self.stage_configs)
                                 if self.single_stage_mode:
                                     assert self._omni_master_server is not None
                                     stage_clients[stage_idx] = self._launch_diffusion_stage(
@@ -760,12 +767,14 @@ class AsyncOmniEngine:
                                         self._omni_master_server,
                                     )
                                 else:
+                                    use_inline = True if self.num_stages == 1 else False
                                     stage_clients[stage_idx] = initialize_diffusion_stage(
                                         self.model,
                                         stage_cfg,
                                         metadata,
                                         stage_init_timeout=stage_init_timeout,
                                         batch_size=self.diffusion_batch_size,
+                                        use_inline=use_inline,
                                     )
                                 logger.info(
                                     "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
@@ -872,30 +881,6 @@ class AsyncOmniEngine:
         self.default_sampling_params_list = default_sampling_params_list
         self.stage_metadata = stage_metadata
 
-        # Single StatLoggerManager for the whole pipeline, mirroring how
-        # vLLM AsyncLLM uses one manager with multiple engine indices for DP.
-        # We treat each stage as a separate "engine_idx" so logs are
-        # distinguishable as "Engine 000/001/002/...". Using a single manager
-        # also avoids PrometheusStatLogger registry collisions.
-        self.logger_manager: StatLoggerManager | None = None
-        if self.log_stats:
-            base_vllm_config = next(
-                (cfg for cfg in self.stage_vllm_configs if cfg is not None),
-                None,
-            )
-            if base_vllm_config is not None:
-                try:
-                    self.logger_manager = StatLoggerManager(
-                        vllm_config=base_vllm_config,
-                        engine_idxs=list(range(self.num_stages)),
-                        custom_stat_loggers=None,
-                        enable_default_loggers=True,
-                    )
-                    self.logger_manager.log_engine_initialized()
-                except Exception:
-                    logger.exception("[AsyncOmniEngine] Failed to build StatLoggerManager")
-                    self.logger_manager = None
-
     def _initialize_janus_queues(self) -> None:
         """Initialize janus queues inside orchestrator thread loop context."""
         self.request_queue = janus.Queue()
@@ -912,10 +897,6 @@ class AsyncOmniEngine:
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        # Expose the orchestrator loop so other threads (API server) can
-        # schedule coroutines onto it via run_coroutine_threadsafe, keeping
-        # single-threaded access to StatLoggerManager (mirrors AsyncLLM).
-        self.orchestrator_loop = loop
 
         async def _run_orchestrator() -> None:
             self._initialize_janus_queues()
@@ -929,7 +910,6 @@ class AsyncOmniEngine:
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
-                logger_manager=self.logger_manager,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -1221,6 +1201,8 @@ class AsyncOmniEngine:
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enforce_eager": kwargs.get("enforce_eager", False),
+            "boundary_ratio": kwargs.get("boundary_ratio", None),
+            "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
@@ -1551,29 +1533,6 @@ class AsyncOmniEngine:
     async def abort_async(self, request_ids: list[str]) -> None:
         """Async abort API."""
         self.abort(request_ids)
-
-    async def do_log_stats(self) -> None:
-        """Flush the StatLoggerManager on the orchestrator thread.
-
-        ``StatLoggerManager`` is only safe to access from the orchestrator
-        loop (where ``record()`` runs). Schedule ``log()`` onto that loop
-        via ``run_coroutine_threadsafe`` so all access stays single-threaded,
-        matching upstream vLLM ``AsyncLLM``.
-        """
-        manager = self.logger_manager
-        if manager is None:
-            return
-        loop = getattr(self, "orchestrator_loop", None)
-        if loop is None or not loop.is_running():
-            return
-
-        async def _log() -> None:
-            manager.log()
-
-        try:
-            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_log(), loop))
-        except Exception:
-            logger.exception("[AsyncOmniEngine] do_log_stats failed")
 
     def collective_rpc(
         self,

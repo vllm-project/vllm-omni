@@ -8,26 +8,14 @@ This test verifies that TeaCache acceleration works correctly with diffusion mod
 It uses minimal settings to keep test time short for CI.
 """
 
-import os
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
+from tests.conftest import OmniRunner
 from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.platforms import current_omni_platform
-
-# ruff: noqa: E402
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from vllm_omni import Omni
 from vllm_omni.outputs import OmniRequestOutput
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+from vllm_omni.platforms import current_omni_platform
 
 # Use random weights model for testing
 models = ["riverclouds/qwen_image_random"]
@@ -44,20 +32,17 @@ def test_teacache(model_name: str):
     cache_config = {
         "rel_l1_thresh": 0.2,  # Default threshold
     }
-    m = None
-    try:
-        m = Omni(
-            model=model_name,
-            cache_backend="tea_cache",
-            cache_config=cache_config,
-        )
-
+    with OmniRunner(
+        model_name,
+        cache_backend="tea_cache",
+        cache_config=cache_config,
+    ) as runner:
         # Use minimal settings for fast testing
         height = 256
         width = 256
         num_inference_steps = 4  # Minimal steps for fast test
 
-        outputs = m.generate(
+        outputs = runner.omni.generate(
             "a photo of a cat sitting on a laptop keyboard",
             OmniDiffusionSamplingParams(
                 height=height,
@@ -86,9 +71,3 @@ def test_teacache(model_name: str):
         # Check image size
         assert images[0].width == width
         assert images[0].height == height
-    except Exception as e:
-        print(f"Test failed with error: {e}")
-        raise
-    finally:
-        if m is not None and hasattr(m, "close"):
-            m.close()

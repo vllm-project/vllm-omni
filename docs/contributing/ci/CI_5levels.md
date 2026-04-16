@@ -86,7 +86,8 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
         /tests/e2e/offline_inference/test_{model_name}_expansion.py<br>
         <strong>Performance:</strong><br>
-        /tests/dfx/perf/tests/test.json<br>
+        /tests/dfx/perf/tests/test_qwen_omni.json (Omni), test_tts.json (TTS),<br>
+        and /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
         <strong>Doc Test:</strong><br>
         tests/example/online_serving/test_{model_name}.py<br>
         tests/example/offline_inference/test_{model_name}.py
@@ -242,7 +243,7 @@ vllm_omni/                                    tests/
                                                    ├── test_zimage_tensor_parallel.py
                                                    ├── test_cache_dit.py
                                                    ├── test_teacache.py
-                                                   ├── test_stable_audio_model.py
+                                                   ├── test_stable_audio_expansion.py
                                                    ├── test_diffusion_cpu_offload.py
                                                    ├── test_diffusion_layerwise_offload.py
                                                    ├── test_diffusion_lora.py
@@ -530,13 +531,13 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 ### 3.2 Testing Content and Scope
 
 -   ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
--   ***Performance Testing***: Uses the `tests/dfx/perf/tests/test.json` configuration file to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
+-   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs in the form `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` via `--test-config-file`) to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
 -   ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
 ### 3.3 Test Directory and Execution Files
 
 -   ***Functional Testing***: Same directories as L3.
--   ***Performance Test Configuration***: `tests/dfx/perf/tests/test.json`
+-   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`)
 -   ***Documentation Example Tests***:
 -   -   `tests/example/online_serving/test_{model_name}.py`
     -   `tests/example/offline_inference/test_{model_name}.py`
