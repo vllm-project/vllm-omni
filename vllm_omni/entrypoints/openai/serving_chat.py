@@ -2197,7 +2197,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 
-            # Add reference image if provided
+            # Add reference image if provided (from messages content)
             if pil_images:
                 if len(pil_images) == 1:
                     gen_prompt["multi_modal_data"] = {}
