@@ -1,8 +1,4 @@
-from vllm.model_executor.models.registry import (
-    _VLLM_MODELS,
-    _LazyRegisteredModel,
-    _ModelRegistry,
-)
+from vllm.model_executor.models.registry import _VLLM_MODELS, _LazyRegisteredModel, _ModelRegistry
 
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (
@@ -56,11 +52,6 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "cosyvoice3",
         "CosyVoice3Model",
-    ),
-    "OmniVoiceModel": (
-        "omnivoice",
-        "omnivoice",
-        "OmniVoiceModel",
     ),
     "MammothModa2Qwen2ForCausalLM": (
         "mammoth_moda2",
@@ -174,13 +165,25 @@ _OMNI_MODELS = {
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
     ),
+    ## HyperCLOVAX-SEED-Omni-8B
+    # stage 0 (thinker LLM) — stages 1/2 use DiffusionModelRegistry via model_class_name
+    "HCXVisionV2ForCausalLM": (
+        "hcx_omni",
+        "hcx_omni",
+        "HCXOmniForConditionalGeneration",
+    ),
+    "HCXOmniForCausalLM": (
+        "hcx_omni",
+        "hcx_omni",
+        "HCXOmniForConditionalGeneration",
+    ),
 }
-
 
 _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,
     **_OMNI_MODELS,
 }
+
 
 OmniModelRegistry = _ModelRegistry(
     {

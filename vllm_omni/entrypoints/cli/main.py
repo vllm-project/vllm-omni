@@ -18,19 +18,13 @@ def main():
         from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-        import vllm_omni.entrypoints.cli.benchmark.main
         import vllm_omni.entrypoints.cli.serve
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,
-            vllm_omni.entrypoints.cli.benchmark.main,
         ]
 
         cli_env_setup()
-
-        from vllm_omni.entrypoints.cli.serve import _ensure_vllm_platform
-
-        _ensure_vllm_platform()
 
         parser = FlexibleArgumentParser(
             description="vLLM OMNI CLI",
@@ -49,6 +43,7 @@ def main():
             for cmd in new_cmds:
                 cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
                 cmds[cmd.name] = cmd
+        sys.argv = [a for a in sys.argv if a != "--omni"]
         args = parser.parse_args()
         if args.subparser in cmds:
             cmds[args.subparser].validate(args)

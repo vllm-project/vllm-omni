@@ -1,0 +1,93 @@
+# Stage config for HyperCLOVAX-SEED-Omni-8B CI tests.
+# Verified on 3x 24GB GPU (L4/RTX3090/RTX4090).
+# Stage 0 (thinker): 4xTP → single GPU in CI uses 1xTP
+
+runtime:
+  connectors:
+    shared_memory_connector:
+      extra:
+        shm_threshold_bytes: 65536
+      name: SharedMemoryConnector
+  defaults:
+    max_inflight: 1
+    window_size: -1
+  edges:
+    - { from: 0, to: 1, window_size: -1 }
+    - { from: 0, to: 2, window_size: -1 }
+  enabled: true
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+    engine_args:
+      model_stage: thinker
+      model_arch: HCXVisionV2ForCausalLM
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      tensor_parallel_size: 1
+      max_model_len: 4096
+      max_num_batched_tokens: 4096
+      max_num_seqs: 1
+      gpu_memory_utilization: 0.8
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      limit_mm_per_prompt:
+        audio: 1
+        image: 1
+      load_format: dummy
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.1
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 128
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      engine_output_type: image
+      gpu_memory_utilization: 0.75
+      model_class_name: HyperCLOVAXVisionPipeline
+      model_stage: decoder/vision
+      model_subdir: decoder/vision
+      trust_remote_code: true
+      enforce_eager: true
+    engine_input_source:
+      - 0
+    final_output: true
+    final_output_type: image
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2vision_decoder
+
+  - stage_id: 2
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "2"
+      max_batch_size: 1
+    engine_args:
+      engine_output_type: audio
+      gpu_memory_utilization: 0.4
+      model_class_name: HyperCLOVAXAudioPipeline
+      model_stage: decoder/audio
+      model_subdir: decoder/audio/NCZSCosybigvganDecoder.mar
+      trust_remote_code: true
+      enforce_eager: true
+    engine_input_source:
+      - 0
+    final_output: true
+    final_output_type: audio
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2audio_decoder

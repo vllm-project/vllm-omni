@@ -7,31 +7,25 @@ import inspect
 import queue
 import threading
 import time
-from collections.abc import Iterable
+import weakref
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import PIL.Image
-import torch
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import (
-    DiffusionOutput,
-    DiffusionRequestAbortedError,
-    OmniDiffusionConfig,
-)
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.scheduler import Scheduler, scheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
 logger = init_logger(__name__)
 
@@ -43,33 +37,43 @@ def supports_image_input(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_image_input", False))
 
 
-def supports_audio_input(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return False
-    return bool(getattr(model_cls, "support_audio_input", False))
+@dataclass
+class BackgroundResources:
+    """
+    Used as a finalizer for clean shutdown.
+    Create a BackgroundResources instance to encapsulate all background resources
+    (e.g., the scheduler and worker processes) that need explicit cleanup.
+    This object holds references to external system resources that are not managed
+    by Python's garbage collector (like OS processes, message queues, etc.),
+    so they must be cleaned up manually to avoid resource leaks or zombie processes.
+    """
 
+    scheduler: Scheduler | None = None
+    processes: list[mp.Process] | None = None
 
-def image_color_format(model_class_name: str) -> str:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    return getattr(model_cls, "color_format", "RGB")
-
-
-def supports_audio_output(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return False
-    return bool(getattr(model_cls, "support_audio_output", False))
+    def __call__(self):
+        """Clean up background resources."""
+        if scheduler is not None:
+            try:
+                for _ in range(scheduler.num_workers):
+                    scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
+                scheduler.close()
+            except Exception as exc:
+                logger.warning("Failed to send shutdown signal: %s", exc)
+        for proc in self.processes:
+            if not proc.is_alive():
+                continue
+            proc.join(30)
+            if proc.is_alive():
+                logger.warning("Terminating diffusion worker %s after timeout", proc.name)
+                proc.terminate()
+                proc.join(30)
 
 
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
-    def __init__(
-        self,
-        od_config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ):
+    def __init__(self, od_config: OmniDiffusionConfig):
         """Initialize the diffusion engine.
 
         Args:
@@ -86,17 +90,9 @@ class DiffusionEngine:
             and "sampling_params" in inspect.signature(self.post_process_func).parameters
         )
 
-        executor_class = DiffusionExecutor.get_class(od_config)
-        self.executor = executor_class(od_config)
-        self.step_execution = bool(getattr(od_config, "step_execution", False))
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
-        self.scheduler.initialize(od_config)
-        self._rpc_lock = threading.RLock()
-        self.abort_queue: queue.Queue[str] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
-
+        self._processes: list[mp.Process] = []
+        self._closed = False
+        self._make_client()
         try:
             self._dummy_run()
         except Exception as e:
@@ -322,10 +318,7 @@ class DiffusionEngine:
             return results
 
     @staticmethod
-    def make_engine(
-        config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ) -> DiffusionEngine:
+    def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
         """Factory method to create a DiffusionEngine instance.
 
         Args:
@@ -334,48 +327,14 @@ class DiffusionEngine:
         Returns:
             An instance of DiffusionEngine.
         """
-        return DiffusionEngine(config, scheduler=scheduler)
+        return DiffusionEngine(config)
 
-    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        with self._rpc_lock:
-            target_sched_req_id = self.scheduler.add_request(request)
+    def _make_client(self):
+        # TODO rename it
+        scheduler.initialize(self.od_config)
 
-            # keep scheduling and executing until the target request is finished
-            while True:
-                self._process_aborts_queue()
-                sched_output = self.scheduler.schedule()
-                if sched_output.is_empty:
-                    if target_sched_req_id in sched_output.finished_req_ids:
-                        return self._finalize_finished_request(target_sched_req_id)
-                    if not self.scheduler.has_requests():
-                        raise RuntimeError("Diffusion scheduler has no runnable requests.")
-                    continue
-
-                # NOTE: add_req_and_wait_for_response() is synchronous, and
-                # the scheduler currently enforces _max_batch_size = 1 (see
-                # vllm_omni/diffusion/sched/base_scheduler.py), so we directly
-                # take the single scheduled request here.
-                sched_req_id = sched_output.scheduled_req_ids[0]
-                try:
-                    runner_output = self.execute_fn(sched_output)
-                except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
-                    runner_output = RunnerOutput(
-                        req_id=sched_req_id,
-                        step_index=None,
-                        finished=True,
-                        result=DiffusionOutput(error=str(exc)),
-                    )
-
-                self._process_aborts_queue()
-
-                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-                if target_sched_req_id in finished_req_ids:
-                    return self._finalize_finished_request(
-                        target_sched_req_id,
-                        runner_output=runner_output,
-                        missing_result_error="Diffusion execution finished without a final output.",
-                    )
+        # Get the broadcast handle from the initialized scheduler
+        broadcast_handle = scheduler.get_broadcast_handle()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling on all diffusion workers.
@@ -384,48 +343,167 @@ class DiffusionEngine:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename.
         """
-        if is_start:
-            if profile_prefix is None:
-                profile_prefix = f"diffusion_{int(time.time())}"
-            logger.info(f"Starting diffusion profiling with prefix: {profile_prefix}")
-        else:
-            logger.info("Stopping diffusion profiling...")
+        Start torch profiling on all diffusion workers.
+
+        Creates a directory (if needed) and sets up a base filename template
+        for per-rank profiler traces (typically saved as <template>_rank<N>.json).
+
+        Args:
+            trace_filename: Optional base filename (without extension or rank suffix).
+                            If None, generates one using current timestamp.
+        """
+        if trace_filename is None:
+            trace_filename = f"stage_0_diffusion_{int(time.time())}_rank"
+
+        trace_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
+
+        # Expand ~ and ~user, then make absolute (robust against cwd changes)
+        trace_dir = os.path.expanduser(trace_dir)
+        trace_dir = os.path.abspath(trace_dir)
 
         try:
-            self.collective_rpc(method="profile", args=(is_start, profile_prefix))
+            os.makedirs(trace_dir, exist_ok=True)
+        except OSError as exc:
+            logger.error(f"Failed to create profiler directory {trace_dir}: {exc}")
+            raise
+
+        # Build final template path (without rank or extension — torch.profiler appends those)
+        full_template = os.path.join(trace_dir, trace_filename)
+
+        expected_pattern = f"{full_template}*.json"
+        logger.info(f"Starting diffusion profiling → {expected_pattern}")
+
+        # Also log the absolute directory once (useful in multi-node or containers)
+        logger.debug(f"Profiler output directory: {trace_dir}")
+
+        # Propagate to all workers
+        try:
+            self.collective_rpc(method="start_profile", args=(full_template,))
         except Exception as e:
-            action = "start" if is_start else "stop"
-            logger.error(f"Failed to {action} profiling on workers", exc_info=True)
-            if is_start:
-                raise RuntimeError(f"Could not {action} profiler: {e}") from e
+            logger.error("Failed to start profiling on workers", exc_info=True)
+            raise RuntimeError(f"Could not start profiler: {e}") from e
+
+    def stop_profile(self) -> dict:
+        """
+        Stop profiling on all workers and collect the final trace/table paths.
+
+        The worker (torch_profiler.py) now handles trace export, compression to .gz,
+        and deletion of the original .json file. This method only collects and
+        reports the paths returned by the workers.
+
+        Returns:
+            dict with keys:
+            - "traces": list of final trace file paths (usually .json.gz)
+            - "tables": list of table strings (one per rank)
+        """
+        logger.info("Stopping diffusion profiling and collecting results...")
+
+        try:
+            # Give worker enough time — export + compression + table can be slow
+            results = self.collective_rpc(method="stop_profile", timeout=60000)
+        except Exception:
+            logger.error("Failed to stop profiling on workers", exc_info=True)
+            return {"traces": [], "tables": []}
+
+        output_files = {"traces": [], "tables": []}
+        successful_traces = 0
+
+        if not results:
+            logger.warning("No profiling results returned from any rank")
+            return output_files
+
+        for rank, res in enumerate(results):
+            if not isinstance(res, dict):
+                logger.warning(f"Rank {rank}: invalid result format (got {type(res)})")
+                continue
+
+            # 1. Trace file — should be .json.gz if compression succeeded
+            trace_path = res.get("trace")
+            if trace_path:
+                # We trust the worker — it created/compressed the file
+                logger.info(f"[Rank {rank}] Final trace: {trace_path}")
+                output_files["traces"].append(trace_path)
+                successful_traces += 1
+
+                # Optional: warn if path looks suspicious (e.g. still .json)
+                if not trace_path.endswith((".json.gz", ".json")):
+                    logger.warning(f"Rank {rank}: unusual trace path extension: {trace_path}")
+
+            # 2. Table file — plain text
+            table = res.get("table")
+            if table:
+                output_files["tables"].append(table)
+
+        # Final summary logging
+        num_ranks = len(results)
+        if successful_traces > 0:
+            final_paths_str = ", ".join(output_files["traces"][:3])
+            if len(output_files["traces"]) > 3:
+                final_paths_str += f" ... (+{len(output_files['traces']) - 3} more)"
+
+            logger.info(
+                f"Profiling stopped. Collected {successful_traces} trace file(s) "
+                f"from {num_ranks} rank(s). "
+                f"Final trace paths: {final_paths_str}"
+            )
+        elif output_files["traces"]:
+            logger.info(
+                f"Profiling stopped but no traces were successfully collected. "
+                f"Reported paths: {', '.join(output_files['traces'][:3])}"
+                f"{' ...' if len(output_files['traces']) > 3 else ''}"
+            )
+        else:
+            logger.info("Profiling stopped — no trace files were collected from any rank.")
+
+        if output_files["tables"]:
+            logger.debug(f"Collected {len(output_files['tables'])} profiling table(s)")
+
+        return output_files
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        prompt = "dummy run"
+        # note that num_inference_steps=1 will cause timestep and temb None in the pipeline
         num_inference_steps = 1
-        height = 512
-        width = 512
+        height = 256
+        width = 256
         if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
-            color_format = image_color_format(self.od_config.model_class_name)
-            dummy_image = PIL.Image.new(color_format, (width, height))
-        else:
-            dummy_image = None
 
-        if supports_audio_input(self.od_config.model_class_name):
-            audio_sr = 16000
-            audio_duration_sec = 4
-            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
-            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+            dummy_image = PIL.Image.new("RGB", (width, height), color=(0, 0, 0))
         else:
             dummy_audio = None
+
+        # Collect dummy extra tokens from the pipeline class if available.
+        # Some pipelines (e.g. HyperCLOVAXVisionPipeline) require tokens in
+        # req.extra that are normally populated by stage input processors.
+        model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
+        dummy_extra = {}
+        if model_cls is not None and hasattr(model_cls, "get_dummy_extra"):
+            dummy_extra = model_cls.get_dummy_extra()
 
         prompt: OmniTextPrompt = {
             "prompt": "dummy run",
             "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
         }
+        # For HyperCLOVAX vision/audio decoders, provide dummy tokens in req.extra
+        # since these models receive discrete tokens from the thinker (not text prompts).
+        dummy_extra: dict = {}
+        model_cls = self.od_config.model_class_name
+        if model_cls == "HyperCLOVAXVisionPipeline":
+            # 729 = 27x27 discrete image tokens (DISCRETE_IMAGE_TOKEN_LENGTH)
+            dummy_extra["vision_tokens"] = [0] * 729
+        elif model_cls == "HyperCLOVAXAudioPipeline":
+            # Minimal sequence of audio tokens for warmup
+            dummy_extra["audio_tokens"] = [[0] * 10]
+            dummy_extra["speakers"] = ["fkms"]
+            dummy_extra["formats"] = ["wav"]
+            dummy_extra["ref_audio_tokens"] = [None]
+
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],
+            extra=dummy_extra,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
@@ -441,14 +519,12 @@ class DiffusionEngine:
             ),
         )
         logger.info("dummy run to warm up the model")
-        request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
-        if output.error:
-            raise RuntimeError(f"Dummy run failed: {output.error}")
+        requests = self.pre_process_func([req]) if self.pre_process_func is not None else [req]
+        self.add_req_and_wait_for_response(requests)
 
     def collective_rpc(
         self,
-        method: str,
+        method: str | Callable,
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict | None = None,
@@ -457,7 +533,7 @@ class DiffusionEngine:
         """Call a method on worker processes and get results immediately.
 
         Args:
-            method: The method name (str) to execute on workers
+            method: The method name (str) or callable to execute on workers
             timeout: Optional timeout in seconds
             args: Positional arguments for the method
             kwargs: Keyword arguments for the method
@@ -466,91 +542,61 @@ class DiffusionEngine:
         Returns:
             Single result if unique_reply_rank is provided, otherwise list of results
         """
-        assert isinstance(method, str), "Only string method names are supported for now"
+        if self._closed:
+            raise RuntimeError("DiffusionEngine is closed.")
 
         deadline = None if timeout is None else time.monotonic() + timeout
-        acquired = False
+        kwargs = kwargs or {}
+
+        assert isinstance(method, str)
+        send_method = method
+
+        # Prepare RPC request message
+        rpc_request = {
+            "type": "rpc",
+            "method": send_method,
+            "args": args,
+            "kwargs": kwargs,
+            "output_rank": unique_reply_rank,
+        }
+
         try:
-            if deadline is None:
-                self._rpc_lock.acquire()
-                acquired = True
-            else:
-                lock_timeout = max(0, deadline - time.monotonic())
-                acquired = self._rpc_lock.acquire(timeout=lock_timeout)
-            if not acquired:
-                raise TimeoutError(f"RPC call to {method} timed out waiting for engine lock.")
+            # Broadcast RPC request to all workers via unified message queue
+            scheduler.mq.enqueue(rpc_request)
 
-            rpc_timeout = None if deadline is None else max(0, deadline - time.monotonic())
-            if deadline is not None and rpc_timeout <= 0:
-                raise TimeoutError(f"RPC call to {method} timed out.")
+            # Determine which workers we expect responses from
+            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
 
-            return self.executor.collective_rpc(
-                method=method,
-                timeout=rpc_timeout,
-                args=args,
-                kwargs=kwargs,
-                unique_reply_rank=unique_reply_rank,
-            )
-        finally:
-            if acquired:
-                self._rpc_lock.release()
+            responses = []
+            for _ in range(num_responses):
+                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
+                try:
+                    if scheduler.result_mq is None:
+                        raise RuntimeError("Result queue not initialized")
+
+                    response = scheduler.result_mq.dequeue(timeout=dequeue_timeout)
+
+                    # Check if response indicates an error
+                    if isinstance(response, dict) and response.get("status") == "error":
+                        raise RuntimeError(
+                            f"Worker failed with error '{response.get('error')}', "
+                            "please check the stack trace above for the root cause"
+                        )
+
+                    responses.append(response)
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+
+            return responses[0] if unique_reply_rank is not None else responses
+
+        except Exception as e:
+            logger.error(f"RPC call failed: {e}")
+            raise
 
     def close(self) -> None:
-        if hasattr(self, "scheduler"):
-            self.scheduler.close()
-        if hasattr(self, "executor"):
-            self.executor.shutdown()
+        self._finalizer()
 
     def abort(self, request_id: str | Iterable[str]) -> None:
-        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
-        for req_id in request_ids:
-            self.abort_queue.put(req_id)
-
-    def _process_aborts_queue(self) -> None:
-        if self.abort_queue.empty():
-            return
-
-        request_ids: list[str] = []
-        while not self.abort_queue.empty():
-            ids = self.abort_queue.get_nowait()
-            request_ids.extend((ids,) if isinstance(ids, str) else ids)
-
-        self._abort_requests(request_ids)
-
-    def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
-        request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
-
-        sched_req_ids: list[str] = []
-        for request_id in dict.fromkeys(request_ids):
-            sched_req_id = self.scheduler.get_sched_req_id(request_id)
-            if sched_req_id is not None:
-                sched_req_ids.append(sched_req_id)
-
-        for sched_req_id in dict.fromkeys(sched_req_ids):
-            if self.scheduler.get_request_state(sched_req_id) is not None:
-                self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
-
-    def _finalize_finished_request(
-        self,
-        sched_req_id: str,
-        runner_output: RunnerOutput | None = None,
-        missing_result_error: str = "Diffusion scheduler finished target request without execution output.",
-    ) -> DiffusionOutput:
-        state = self.scheduler.get_request_state(sched_req_id)
-        popped_state = self.scheduler.pop_request_state(sched_req_id)
-        state = state or popped_state
-
-        if state is None:
-            raise RuntimeError(f"Diffusion scheduler lost state for request {sched_req_id}.")
-
-        if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-            request_id = state.req.request_ids[0] if state.req.request_ids else sched_req_id
-            return DiffusionOutput(
-                aborted=True,
-                abort_message=f"Request {request_id} aborted.",
-            )
-
-        if runner_output is not None and runner_output.result is not None:
-            return runner_output.result
-
-        return DiffusionOutput(error=missing_result_error)
+        # TODO implement it
+        logger.warning("DiffusionEngine abort is not implemented yet")
+        pass
