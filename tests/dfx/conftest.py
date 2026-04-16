@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tests.conftest import modify_stage_config
 
 
@@ -258,3 +260,11 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return result
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register shared CLI options for DFX benchmark suites."""
+    parser.addoption(
+        "--test-config-file",
+        action="store",
+        default=None,
+        help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
+    )

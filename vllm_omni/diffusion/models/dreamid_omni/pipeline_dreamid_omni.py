@@ -38,6 +38,21 @@ from vllm_omni.diffusion.models.dreamid_omni.fusion import FusionModel
 logger = logging.getLogger(__name__)
 
 
+def get_dreamid_omni_post_process_func(*args, **kwargs):
+    def post_process(output):
+        if isinstance(output, tuple) and len(output) == 2:
+            video, audio = output
+            return {
+                "video": video,
+                "audio": audio,
+                "audio_sample_rate": 16000,
+                "fps": 24,
+            }
+        return output
+
+    return post_process
+
+
 AUDIO_CONFIG = {
     "patch_size": [1],
     "model_type": "t2a",

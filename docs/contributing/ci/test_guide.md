@@ -45,7 +45,6 @@ Our test scripts use the pytest framework. First, please use `git clone https://
 === "L3 level & L4 level"
 
     ```bash
-    cd tests
     pytest -s -v -m "advanced_model" --run-level=advanced_model
     ```
     If you only want to run L3 test case, you can use:
@@ -60,9 +59,9 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```bash
     pytest -s -v -m "core_model and distributed_cuda and L4"  --run-level=core_model
     ```
-    Note: To run performance tests, use:
+    Note: To run performance tests (defaults to ``test_qwen_omni.json``; use ``--test-config-file tests/dfx/perf/tests/test_tts.json`` for TTS):
     ```bash
-    pytest -s -v perf/scripts/run_benchmark.py
+    pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
     ```
 
     The latest L3 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-merge.yml).
