@@ -461,8 +461,12 @@ class Orchestrator:
         if sp.extra_args is None:
             sp.extra_args = {}
 
-        # Get KV params captured from the prefill output (contains remote_request_id)
+        # Get KV params captured from the prefill output (must include remote_request_id).
         kv_prefill_params = self._pd_kv_params.pop(req_id, None)
+        if not kv_prefill_params or "remote_request_id" not in kv_prefill_params:
+            raise RuntimeError(
+                f"[Orchestrator][PD] Missing prefill kv_transfer_params.remote_request_id for req={req_id}"
+            )
 
         decode_kv_params: dict[str, Any] = {
             "transfer_id": f"xfer-{req_id}",
@@ -474,9 +478,8 @@ class Orchestrator:
         if self._pd_prefill_engine_id:
             decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
 
-        # Overlay any params from the prefill side (includes remote_request_id set by monkey patch)
-        if kv_prefill_params:
-            decode_kv_params.update(kv_prefill_params)
+        # Overlay params from prefill side (includes remote_request_id set by monkey patch).
+        decode_kv_params.update(kv_prefill_params)
 
         # Ensure these flags are set correctly after any overlay.
         decode_kv_params["do_remote_prefill"] = True
@@ -624,7 +627,20 @@ class Orchestrator:
 
             # Use the original user prompt for the decode stage (not processed embeddings)
             original_prompt = req_state.prompt
-            decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
+            raw_decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
+
+            decode_inputs: list[dict[str, Any]] = []
+            for decode_input in raw_decode_inputs:
+                if isinstance(decode_input, dict):
+                    decode_inputs.append(decode_input)
+                    continue
+                prompt_token_ids = getattr(decode_input, "prompt_token_ids", None)
+                if prompt_token_ids is None:
+                    raise TypeError(
+                        "[Orchestrator][PD] decode input must be dict or have prompt_token_ids, "
+                        f"got {type(decode_input).__name__} for req={req_id}"
+                    )
+                decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
 
             for decode_input in decode_inputs:
                 request = build_engine_core_request_from_tokens(
