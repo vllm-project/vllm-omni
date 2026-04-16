@@ -193,7 +193,6 @@ markers = [
     # specified computation resources marks (auto-added)
     "H100: Tests that require H100 GPU",
     "L4: Tests that require L4 GPU",
-    "B60: Tests that require B60",
     "MI325: Tests that require MI325 GPU (AMD/ROCm)",
     "B60: Tests that require Intel Arc Pro B60 XPU",
     "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",

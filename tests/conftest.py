@@ -18,36 +18,34 @@ pytest_plugins = (
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     # Marker for Buildkite log folding before pytest summary lines.
-    terminalreporter.write_sep("-", "Result Summary")
+    terminalreporter.write_line("--- Running Summary")
 
 
-# Backward-compatible re-exports.
+# Backward-compatible lazy re-exports.
 # (Many tests still import from `tests.conftest`; migrate these imports to `tests.helpers.*` over time.)
-from tests.helpers.assertions import (  # noqa: F401,E402
-    assert_audio_speech_response,
-    assert_diffusion_response,
-    assert_image_diffusion_response,
-    assert_image_valid,
-    assert_omni_response,
-    assert_video_diffusion_response,
-    assert_video_valid,
+# Keep these lazy so conftest import does not trigger heavy helper dependencies.
+_ASSERTION_EXPORT_NAMES = (
+    "assert_audio_speech_response",
+    "assert_diffusion_response",
+    "assert_image_diffusion_response",
+    "assert_image_valid",
+    "assert_omni_response",
+    "assert_video_diffusion_response",
+    "assert_video_valid",
 )
-from tests.helpers.media import (  # noqa: F401,E402
-    convert_audio_bytes_to_text,
-    convert_audio_file_to_text,
-    cosine_similarity_text,
-    decode_b64_image,
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
+_MEDIA_EXPORT_NAMES = (
+    "convert_audio_bytes_to_text",
+    "convert_audio_file_to_text",
+    "cosine_similarity_text",
+    "decode_b64_image",
+    "generate_synthetic_audio",
+    "generate_synthetic_image",
+    "generate_synthetic_video",
 )
-from tests.helpers.stage_config import (  # noqa: F401,E402
-    dummy_messages_from_mix_data,
-    modify_stage_config,
+_STAGE_CONFIG_EXPORT_NAMES = (
+    "dummy_messages_from_mix_data",
+    "modify_stage_config",
 )
-
-# Lazy: importing `tests.helpers.runtime` at conftest load runs before session
-# autouse fixtures and can scramble vLLM/vllm_omni init order.
 _RUNTIME_EXPORT_NAMES = (
     "DiffusionResponse",
     "OmniResponse",
@@ -58,15 +56,29 @@ _RUNTIME_EXPORT_NAMES = (
     "OmniServerStageCli",
     "OpenAIClientHandler",
 )
+_LAZY_EXPORT_MODULES = {
+    **{name: "tests.helpers.assertions" for name in _ASSERTION_EXPORT_NAMES},
+    **{name: "tests.helpers.media" for name in _MEDIA_EXPORT_NAMES},
+    **{name: "tests.helpers.stage_config" for name in _STAGE_CONFIG_EXPORT_NAMES},
+    **{name: "tests.helpers.runtime" for name in _RUNTIME_EXPORT_NAMES},
+}
 
 
 def __getattr__(name: str):
-    if name in _RUNTIME_EXPORT_NAMES:
-        import tests.helpers.runtime as _runtime
-
-        return getattr(_runtime, name)
+    module_name = _LAZY_EXPORT_MODULES.get(name)
+    if module_name is not None:
+        module = __import__(module_name, fromlist=[name])
+        return getattr(module, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():
-    return sorted({*globals(), *_RUNTIME_EXPORT_NAMES})
+    return sorted(
+        {
+            *globals(),
+            *_ASSERTION_EXPORT_NAMES,
+            *_MEDIA_EXPORT_NAMES,
+            *_STAGE_CONFIG_EXPORT_NAMES,
+            *_RUNTIME_EXPORT_NAMES,
+        }
+    )

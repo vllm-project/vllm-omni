@@ -73,22 +73,15 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
             if stage_config_path is not None:
                 server_args += ["--stage-configs-path", stage_config_path]
 
-            with (
-                OmniServer(
-                    model,
-                    server_args,
-                    port=port,
-                    env_dict=params.env_dict,
-                    use_omni=params.use_omni,
-                )
-                if port
-                else OmniServer(
-                    model,
-                    server_args,
-                    env_dict=params.env_dict,
-                    use_omni=params.use_omni,
-                )
-            ) as server:
+            kwargs: dict[str, Any] = dict(
+                model=model,
+                serve_args=server_args,
+                env_dict=params.env_dict,
+                use_omni=params.use_omni,
+            )
+            if port is not None:
+                kwargs["port"] = port
+            with OmniServer(**kwargs) as server:
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")

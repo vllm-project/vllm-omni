@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 from PIL import Image
-from transformers import pipeline
 
 from tests.helpers.media import cosine_similarity_text
 
@@ -246,6 +245,8 @@ def _load_gender_pipeline():
         return _GENDER_PIPELINE
     model_name = "7wolf/wav2vec2-base-gender-classification"
     try:
+        from transformers import pipeline
+
         _GENDER_PIPELINE = pipeline(task="audio-classification", model=model_name, device=-1)
         return _GENDER_PIPELINE
     except Exception as exc:  # pragma: no cover
@@ -341,6 +342,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
 
 
 def _assert_preset_voice_gender_from_audio(audio_bytes: bytes | None, voice_name: str | None) -> None:
+    """If ``voice_name`` matches a known preset, assert classifier gender matches (skip when unknown)."""
     if not voice_name or not audio_bytes:
         return
     key = str(voice_name).lower()
@@ -350,7 +352,9 @@ def _assert_preset_voice_gender_from_audio(audio_bytes: bytes | None, voice_name
     estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
     print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
     if estimated_gender != "unknown":
-        assert estimated_gender == expected_gender
+        assert estimated_gender == expected_gender, (
+            f"{voice_name!r} is expected {expected_gender}, but estimated gender is {estimated_gender!r}"
+        )
 
 
 def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
@@ -380,39 +384,67 @@ def _assert_pcm_int16_speech_hnr(audio_bytes: bytes) -> None:
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     hnr = _compute_pcm_hnr_db(pcm_samples)
     print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {_MIN_PCM_SPEECH_HNR_DB} dB)")
-    assert hnr >= _MIN_PCM_SPEECH_HNR_DB
+    assert hnr >= _MIN_PCM_SPEECH_HNR_DB, (
+        f"Audio distortion detected: HNR={hnr:.2f} dB < {_MIN_PCM_SPEECH_HNR_DB} dB. "
+        "Voice clone decoder may be losing ref_code speaker context on later chunks."
+    )
 
 
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
+    """
+    Validate response results.
+
+    Args:
+        response: OmniResponse object
+
+    Raises:
+        AssertionError: When the response does not meet validation criteria
+    """
     assert response.success, "The request failed."
-    e2e_latency = getattr(response, "e2e_latency", None)
+    e2e_latency = response.e2e_latency
     if e2e_latency is not None:
         print(f"the e2e latency is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
+
     if run_level == "advanced_model":
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
             print(f"audio content is: {response.audio_content}")
             speaker = request_config.get("speaker")
             if speaker:
-                _assert_preset_voice_gender_from_audio(response.audio_bytes, speaker)
+                _assert_preset_voice_gender_from_audio(
+                    response.audio_bytes,
+                    speaker,
+                )
+
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
             print(f"text content is: {response.text_content}")
+
+        # Verify image description
+        word_types = ["text", "image", "audio", "video"]
         keywords_dict = request_config.get("key_words", {})
-        for word_type in ["text", "image", "audio", "video"]:
+        for word_type in word_types:
             keywords = keywords_dict.get(word_type)
-            if not keywords:
-                continue
             if "text" in modalities:
-                text_lower = (response.text_content or "").lower()
-                assert any(str(kw).lower() in text_lower for kw in keywords)
+                if keywords:
+                    text_lower = response.text_content.lower()
+                    assert any(str(kw).lower() in text_lower for kw in keywords), (
+                        "The output does not contain any of the keywords."
+                    )
             else:
-                audio_lower = (response.audio_content or "").lower()
-                assert any(str(kw).lower() in audio_lower for kw in keywords)
+                if keywords:
+                    audio_lower = response.audio_content.lower()
+                    assert any(str(kw).lower() in audio_lower for kw in keywords), (
+                        "The output does not contain any of the keywords."
+                    )
+
+        # Verify similarity (Whisper transcript vs streamed/detokenized text)
         if "text" in modalities and "audio" in modalities:
-            assert response.similarity is not None and response.similarity > 0.9
+            assert response.similarity is not None and response.similarity > 0.9, (
+                "The audio content is not same as the text"
+            )
             print(f"similarity is: {response.similarity}")
 
 
