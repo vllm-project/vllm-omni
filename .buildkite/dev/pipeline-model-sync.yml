@@ -1,0 +1,206 @@
+# Model Pre-download Pipeline for vllm-omni
+# This pipeline pre-downloads models and datasets to PVC for faster CI
+#
+# Trigger方式:
+# 1. 定时触发: Buildkite cron (每6小时)
+# 2. 手动触发: buildkite-agent pipeline upload
+
+steps:
+  # ============================================
+  # HK001 集群 - 模型预下载 (ascend-a2b3)
+  # ============================================
+  - label: ":robot: Pre-download Models to HK001 (a2b3)"
+    key: hk001-model-sync
+    agents:
+      queue: "ascend-a2b3"
+    command: |
+      set -ex
+
+      echo "=== Starting model pre-download for HK001 cluster ==="
+
+      # 安装依赖
+      pip install --upgrade pip -q
+      pip install huggingface_hub -q
+
+      # 下载模型到 /root/.cache/huggingface/ (HF_HOME 默认路径)
+      python3 << 'EOF'
+      import json
+      import os
+      
+      from huggingface_hub import snapshot_download
+
+      with open('.buildkite/dev/config/hk001/models.json', 'r') as f:
+          models = json.load(f)
+
+      for model in models:
+          org = model['organization']
+          name = model['model_name']
+          model_id = f"{org}/{name}"
+
+          print(f"Downloading {model_id}...")
+
+          # 下载到 /root/.cache/huggingface/ 目录
+          download_path = f"/root/.cache/huggingface/{org}/{name}"
+          os.makedirs(download_path, exist_ok=True)
+
+          try:
+              snapshot_download(
+                  repo_id=model_id,
+                  local_dir=download_path,
+                  local_dir_use_symlinks=False
+              )
+              print(f"✓ Downloaded: {model_id}")
+          except Exception as e:
+              print(f"✗ Failed to download {model_id}: {e}")
+
+      print("=== Model pre-download completed ===")
+      EOF
+
+  # ============================================
+  # HK001 集群 - 数据集预下载
+  # ============================================
+  - label: ":robot: Pre-download Datasets to HK001 (a2b3)"
+    key: hk001-dataset-sync
+    agents:
+      queue: "ascend-a2b3"
+    command: |
+      set -ex
+
+      echo "=== Starting dataset pre-download for HK001 cluster ==="
+
+      # 安装依赖
+      pip install --upgrade pip -q
+      pip install huggingface_hub -q
+
+      # 下载数据集
+      python3 << 'EOF'
+      import json
+      import os
+      from huggingface_hub import snapshot_download
+
+      with open('.buildkite/dev/config/hk001/datasets.json', 'r') as f:
+          datasets = json.load(f)
+
+      for dataset in datasets:
+          org = dataset['organization']
+          name = dataset['dataset_name']
+          dataset_id = f"{org}/{name}"
+
+          print(f"Downloading dataset: {dataset_id}...")
+
+          # 下载到 /root/.cache/huggingface/datasets/ 目录
+          download_path = f"/root/.cache/huggingface/datasets/{org}/{name}"
+          os.makedirs(download_path, exist_ok=True)
+
+          try:
+              snapshot_download(
+                  repo_id=dataset_id,
+                  local_dir=download_path,
+                  local_dir_use_symlinks=False,
+                  repo_type="dataset"
+              )
+              print(f"✓ Downloaded: {dataset_id}")
+          except Exception as e:
+              print(f"✗ Failed to download {dataset_id}: {e}")
+
+      print("=== Dataset pre-download completed ===")
+      EOF
+
+  # ============================================
+  # CN12-001 集群 - 模型预下载 (ascend-a3)
+  # ============================================
+  - label: ":robot: Pre-download Models to CN12-001 (a3)"
+    key: cn12-001-model-sync
+    agents:
+      queue: "ascend-a3"
+    command: |
+      set -ex
+
+      echo "=== Starting model pre-download for CN12-001 cluster ==="
+
+      # 安装依赖
+      pip install --upgrade pip -q
+      pip install huggingface_hub -q
+
+      # 下载模型
+      python3 << 'EOF'
+      import json
+      import os
+      from huggingface_hub import snapshot_download
+
+      with open('.buildkite/dev/config/cn12-001/models.json', 'r') as f:
+          models = json.load(f)
+
+      for model in models:
+          org = model['organization']
+          name = model['model_name']
+          model_id = f"{org}/{name}"
+
+          print(f"Downloading {model_id}...")
+
+          # 下载到 /root/.cache/huggingface/ 目录
+          download_path = f"/root/.cache/huggingface/{org}/{name}"
+          os.makedirs(download_path, exist_ok=True)
+
+          try:
+              snapshot_download(
+                  repo_id=model_id,
+                  local_dir=download_path,
+                  local_dir_use_symlinks=False
+              )
+              print(f"✓ Downloaded: {model_id}")
+          except Exception as e:
+              print(f"✗ Failed to download {model_id}: {e}")
+
+      print("=== Model pre-download completed ===")
+      EOF
+
+  # ============================================
+  # CN12-001 集群 - 数据集预下载
+  # ============================================
+  - label: ":robot: Pre-download Datasets to CN12-001 (a3)"
+    key: cn12-001-dataset-sync
+    agents:
+      queue: "ascend-a3"
+    command: |
+      set -ex
+
+      echo "=== Starting dataset pre-download for CN12-001 cluster ==="
+
+      # 安装依赖
+      pip install --upgrade pip -q
+      pip install huggingface_hub -q
+
+      # 下载数据集
+      python3 << 'EOF'
+      import json
+      import os
+      from huggingface_hub import snapshot_download
+
+      with open('.buildkite/dev/config/cn12-001/datasets.json', 'r') as f:
+          datasets = json.load(f)
+
+      for dataset in datasets:
+          org = dataset['organization']
+          name = dataset['dataset_name']
+          dataset_id = f"{org}/{name}"
+
+          print(f"Downloading dataset: {dataset_id}...")
+
+          # 下载到 /root/.cache/huggingface/datasets/ 目录
+          download_path = f"/root/.cache/huggingface/datasets/{org}/{name}"
+          os.makedirs(download_path, exist_ok=True)
+
+          try:
+              snapshot_download(
+                  repo_id=dataset_id,
+                  local_dir=download_path,
+                  local_dir_use_symlinks=False,
+                  repo_type="dataset"
+              )
+              print(f"✓ Downloaded: {dataset_id}")
+          except Exception as e:
+              print(f"✗ Failed to download {dataset_id}: {e}")
+
+      print("=== Dataset pre-download completed ===")
+      EOF
