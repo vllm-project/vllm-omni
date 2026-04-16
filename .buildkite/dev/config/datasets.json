@@ -1,0 +1,12 @@
+[
+  {
+    "platform": "huggingface",
+    "organization": "openai",
+    "dataset_name": "gsm8k"
+  },
+  {
+    "platform": "huggingface",
+    "organization": "hiyouga",
+    "dataset_name": "geometry3k"
+  }
+]

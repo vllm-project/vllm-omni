@@ -29,28 +29,33 @@ steps:
               vault.hashicorp.com/secret-volume-path: /home/user/.docker/
               vault.hashicorp.com/tls-skip-verify: "true"
           podSpecPatch:
+            containers:
+            - name: container-0
+              volumeMounts:
+              - name: docker-cache
+                mountPath: /mnt/buildkit-cache
             volumes:
-            - name: token-vol
-              projected:
-                defaultMode: 420
-                sources:
-                - serviceAccountToken:
-                    audience: api
-                    expirationSeconds: 600
-                    path: token
+            - name: docker-cache
+              persistentVolumeClaim:
+                claimName: ascend-gha-runners-gy006
     env:
       VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
       IMAGE_NAME: "vllm-omni-ci-npu"
       IMAGE_REGISTRY: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry"
       # buildkitd 远程连接配置
       BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd:1234"
+      # 本地缓存目录
+      BUILDKIT_CACHE_DIR: "/mnt/buildkit-cache"
     command: |
       set -ex
 
       echo "--- Building and pushing NPU Test Image"
       echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
-      echo "Build cache: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache"
+      echo "Build cache dir: $${BUILDKIT_CACHE_DIR}"
       echo "buildkitd address: $${BUILDKITD_ADDR}"
+
+      # 确保缓存目录存在
+      mkdir -p $${BUILDKIT_CACHE_DIR}
 
       # 配置 GitHub 代理
       git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
@@ -66,7 +71,7 @@ steps:
       fi
 
       # 使用 buildctl 构建并推送到 SWR
-      # 使用 --import-cache 复用之前构建的镜像层，使用 --export-cache 将缓存写入镜像
+      # 使用本地缓存目录，参考 run_npu_test.sh 的方式
       export DOCKER_CONFIG=/home/user/.docker
       buildctl \
         --addr="$${BUILDKITD_ADDR}" \
@@ -78,16 +83,14 @@ steps:
         --local context=. \
         --local dockerfile=./docker \
         --opt filename=Dockerfile.npu.test \
-        --import-cache type=registry,ref=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache \
-        --export-cache type=registry,ref=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,mode=max \
+        --import-cache type=local,src=$${BUILDKIT_CACHE_DIR} \
+        --export-cache type=local,dest=$${BUILDKIT_CACHE_DIR},mode=max \
         --secret id=dockerconfig,src=/home/user/.docker/config.json \
         --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
-        --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache,push=true \
         --progress=plain
 
       echo "--- Image pushed successfully"
       echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
-      echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:build-cache"
 
   - label: "Upload Test Pipeline (gy006 - 2 Card)"
     depends_on: image-build

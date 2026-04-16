@@ -1,0 +1,42 @@
+[
+  {
+    "platform": "huggingface",
+    "organization": "Qwen",
+    "model_name": "Qwen2.5-0.5B-Instruct"
+  },
+  {
+    "platform": "huggingface",
+    "organization": "Qwen",
+    "model_name": "Qwen2.5-VL-3B-Instruct"
+  },
+  {
+    "platform": "huggingface",
+    "organization": "Qwen",
+    "model_name": "Qwen3-30B-A3B-Instruct-2507"
+  },
+  {
+    "platform": "huggingface",
+    "organization": "Qwen",
+    "model_name": "Qwen2.5-1.5B-Instruct"
+  },
+  {
+    "platform": "huggingface",
+    "organization": "Qwen",
+    "model_name": "Qwen2.5-0.5B"
+  },
+  {
+    "platform": "huggingface",
+    "organization": "Skywork",
+    "model_name": "Skywork-Reward-V2-Llama-3.2-1B"
+  },
+  {
+    "platform": "huggingface",
+    "organization": "Qwen",
+    "model_name": "Qwen2.5-7B-Instruct"
+  },
+  {
+    "platform": "huggingface",
+    "organization": "Qwen",
+    "model_name": "Qwen3-8B"
+  }
+]
