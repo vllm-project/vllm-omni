@@ -5,6 +5,7 @@ import os
 import pytest
 import torch
 
+from tests.conftest import OmniRunner
 from tests.utils import hardware_test
 
 VOXCPM2_MODEL = "openbmb/VoxCPM2"
@@ -24,24 +25,24 @@ SAMPLE_RATE = 48000
 @pytest.fixture(scope="module")
 def voxcpm2_engine():
     """Create VoxCPM2 engine for testing."""
-    from vllm_omni import Omni
-
-    engine = Omni(model=VOXCPM2_MODEL, stage_configs_path=STAGE_CONFIG)
-    yield engine
+    with OmniRunner(VOXCPM2_MODEL, stage_configs_path=STAGE_CONFIG) as runner:
+        yield runner.omni
 
 
 def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     """Extract the final complete audio tensor from multimodal output."""
     assert isinstance(multimodal_output, dict), f"Expected dict, got {type(multimodal_output)}"
 
-    # Output processor accumulates per-step full audio under "audio".
-    audio = multimodal_output.get("audio") or multimodal_output.get("model_outputs")
+    # Output processor accumulates per-step audio chunks under "audio".
+    audio = multimodal_output.get("audio")
+    if audio is None:
+        audio = multimodal_output.get("model_outputs")
     assert audio is not None, f"No audio key, got {list(multimodal_output.keys())}"
 
     if isinstance(audio, list):
-        valid = [x for x in audio if isinstance(x, torch.Tensor) and x.numel() > 100]
+        valid = [torch.as_tensor(x).float().cpu().reshape(-1) for x in audio if x is not None]
         assert valid, "No valid audio tensors in output list"
-        audio = valid[-1]
+        audio = torch.cat(valid, dim=0) if len(valid) > 1 else valid[0]
 
     assert isinstance(audio, torch.Tensor), f"Expected Tensor, got {type(audio)}"
     return audio

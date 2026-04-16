@@ -13,7 +13,7 @@ from diffusers.utils.outputs import BaseOutput
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 
-from .hunyuan_image_3_transformer import ImageInfo, JointImageInfo, default
+from .hunyuan_image3_transformer import ImageInfo, JointImageInfo, default
 
 logger = init_logger(__name__)
 

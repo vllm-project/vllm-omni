@@ -5,10 +5,13 @@ import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+import requests
 import torch
+from PIL import Image
 
 from tests.conftest import OmniServer, OmniServerParams
 
@@ -181,6 +184,28 @@ def accuracy_artifact_root() -> Path:
     root = Path(__file__).resolve().parent / "artifacts"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+@pytest.fixture(scope="session")
+def qwen_bear_image(accuracy_artifact_root: Path) -> Image.Image:
+    """Download the Qwen bear image from the URL and save it to the accuracy artifact root."""
+    QWEN_BEAR_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
+    response = requests.get(QWEN_BEAR_IMAGE_URL, timeout=60)
+    response.raise_for_status()
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image.save(accuracy_artifact_root / "qwen_bear.png")
+    return image
+
+
+@pytest.fixture(scope="session")
+def rabbit_image(accuracy_artifact_root: Path) -> Image.Image:
+    """Download the rabbit image from the URL and save it to the accuracy artifact root."""
+    RABBIT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/rabbit.png"
+    response = requests.get(RABBIT_IMAGE_URL, timeout=60)
+    response.raise_for_status()
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image.save(accuracy_artifact_root / "rabbit.png")
+    return image
 
 
 def reset_artifact_dir(path: Path) -> Path:

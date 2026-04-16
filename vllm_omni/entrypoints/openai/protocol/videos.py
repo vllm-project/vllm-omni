@@ -150,6 +150,29 @@ class VideoGenerationRequest(BaseModel):
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
 
+    # vllm-omni extensions for post-generation frame interpolation.
+    enable_frame_interpolation: bool = Field(
+        default=False,
+        description="Enable post-generation RIFE frame interpolation before MP4 encoding.",
+    )
+    frame_interpolation_exp: int = Field(
+        default=1,
+        ge=1,
+        description="Interpolation exponent: 1=2x temporal resolution, 2=4x, etc.",
+    )
+    frame_interpolation_scale: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="RIFE inference scale. Use 0.5 for high-resolution inputs to save memory.",
+    )
+    frame_interpolation_model_path: str | None = Field(
+        default=None,
+        description=(
+            "Local directory or Hugging Face repo ID containing RIFE flownet.pkl weights. "
+            "Defaults to elfgum/RIFE-4.22.lite."
+        ),
+    )
+
     # vllm-omni extension for per-request LoRA.
     lora: dict[str, Any] | None = Field(
         default=None,

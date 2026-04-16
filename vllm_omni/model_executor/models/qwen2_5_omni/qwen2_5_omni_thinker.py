@@ -64,6 +64,10 @@ from vllm.multimodal.processing.processor import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.quantization.component_config import (
+    resolve_encoder_quant_config,
+)
+
 try:
     import flash_attn
 except (ImportError, ModuleNotFoundError):
@@ -359,6 +363,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
         self.quant_config = quant_config
 
+        # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) only quantize
+        # the Thinker LM. Vision encoder weights remain in BF16 with no FP8
+        # scale tensors; passing quant_config causes FP8 kernels to run on
+        # BF16 weights, producing garbage embeddings. Keep None for encoders.
+        visual_quant_config = resolve_encoder_quant_config(quant_config)
+
         with self._mark_tower_model(vllm_config, "audio"):
             if multimodal_config.get_limit_per_prompt("audio"):
                 self.audio_tower = Qwen2_5OmniAudioEncoder(thinker_config.audio_config)
@@ -370,7 +380,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 self.visual = Qwen2_5_VisionTransformer(
                     vision_config=thinker_config.vision_config,
                     norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
-                    quant_config=quant_config,
+                    quant_config=visual_quant_config,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
             else:
