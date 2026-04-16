@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 
 import pytest
-import vllm_omni
 
 from tests.conftest import (
     OmniServerParams,
@@ -28,9 +27,7 @@ QWEN3_OMNI_CONFIG_PATH = str(Path(__file__).parent.parent / "stage_configs" / "q
 QWEN3_OMNI_XPU_CONFIG_PATH = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")
 
 _STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
-_PD_SEP_CONFIG = str(
-    Path(vllm_omni.__file__).parent / "model_executor" / "stage_configs" / "qwen3_omni_moe_pd_separation.yaml"
-)
+_PD_SEP_CONFIG = str(_STAGE_CONFIGS_DIR / "qwen3_omni_moe_pd_ci.yaml")
 
 
 def get_chunk_config(config_path: str | None = None):
