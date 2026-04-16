@@ -15,6 +15,12 @@ pytest_plugins = (
     "tests.helpers.fixtures.runtime",
 )
 
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    # Marker for Buildkite log folding before pytest summary lines.
+    terminalreporter.write_sep("-", "Result Summary")
+
+
 # Backward-compatible re-exports.
 # (Many tests still import from `tests.conftest`; migrate these imports to `tests.helpers.*` over time.)
 from tests.helpers.assertions import (  # noqa: F401,E402
