@@ -63,12 +63,6 @@ def create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
 ) -> list[tuple[str, str, list[str]]]:
-    """Return unique ``(test_name, model, omni_serve_extras)`` for OmniServer.
-
-    ``omni_serve_extras`` is appended after ``serve`` / ``--omni`` / host / port
-    (for example ``--stage-configs-path …`` and/or diffusion ``--tensor-parallel-size``).
-    Timeouts are added by each test harness (perf vs stability).
-    """
     unique_params = []
     seen = set()
     for config in configs:
@@ -260,6 +254,8 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return result
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Register shared CLI options for DFX benchmark suites."""
     parser.addoption(

@@ -59,7 +59,7 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, serve_extras = request.param
+        test_name, model, stage_config_path = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
