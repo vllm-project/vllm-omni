@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Unit tests for ModuleDiscovery and SupportsModuleOffload."""
+
+from typing import ClassVar
+
+import pytest
+from torch import nn
+
+from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
+
+# NOTE: tests for skipped/warned attributes verify the *behavioral*
+# outcome (attribute excluded from results) but do not assert on log
+# output.  vllm's logger sets propagate=False, preventing caplog from
+# capturing records.  See https://github.com/pytest-dev/pytest/issues/3697
+
+
+# ---------------------------------------------------------------------------
+# Test pipelines
+# ---------------------------------------------------------------------------
+
+
+class FallbackPipeline(nn.Module):
+    """Pipeline with standard attribute names (no protocol)."""
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = nn.Linear(10, 10)
+        self.text_encoder = nn.Linear(10, 10)
+        self.text_encoder_2 = nn.Linear(10, 10)
+        self.vae = nn.Linear(10, 10)
+
+
+class NonModuleAttrPipeline(nn.Module):
+    """Pipeline where an attribute is not an nn.Module (fallback path)."""
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = nn.Linear(10, 10)
+        self.text_encoder = "not_a_module"
+        self.vae = nn.Linear(10, 10)
+
+
+class DuplicateAttrPipeline(nn.Module):
+    """Pipeline where two encoder attrs point to the same module."""
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = nn.Linear(10, 10)
+        encoder = nn.Linear(10, 10)
+        self.text_encoder = encoder
+        self.text_encoder_2 = encoder
+        self.vae = nn.Linear(10, 10)
+
+
+class ProtocolPipeline(nn.Module, SupportsModuleOffload):
+    """Pipeline with non-standard names, using the protocol."""
+
+    _dit_modules: ClassVar[list[str]] = ["gen_transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["mllm", "vision_model"]
+    _vae_modules: ClassVar[list[str]] = ["gen_vae"]
+
+    def __init__(self):
+        super().__init__()
+        self.gen_transformer = nn.Linear(10, 10)
+        self.mllm = nn.Linear(10, 10)
+        self.vision_model = nn.Linear(10, 10)
+        self.gen_vae = nn.Linear(10, 10)
+        # Standard name present but NOT declared — should be ignored
+        self.transformer = nn.Linear(10, 10)
+
+
+class MissingAttrPipeline(nn.Module, SupportsModuleOffload):
+    """Pipeline that declares a non-existent attribute."""
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["nonexistent_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = nn.Linear(10, 10)
+        self.vae = nn.Linear(10, 10)
+
+
+class MultiVaePipeline(nn.Module, SupportsModuleOffload):
+    """Pipeline with multiple VAEs."""
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = nn.Linear(10, 10)
+        self.text_encoder = nn.Linear(10, 10)
+        self.vae = nn.Linear(10, 10)
+        self.audio_vae = nn.Linear(10, 10)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackDiscovery:
+    """Test the fallback attribute scan (no SupportsModuleOffload)."""
+
+    def test_discovers_standard_attrs(self):
+        pipeline = FallbackPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert not isinstance(pipeline, SupportsModuleOffload)
+        assert result.dit_names == ["transformer"]
+        assert result.dits[0] is pipeline.transformer
+        assert result.encoder_names == ["text_encoder", "text_encoder_2"]
+        assert result.vaes[0] is pipeline.vae
+
+    def test_deduplicates_encoders(self):
+        pipeline = DuplicateAttrPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert len(result.encoders) == 1
+        assert result.encoder_names == ["text_encoder"]
+
+    def test_skips_non_module_attr(self):
+        pipeline = NonModuleAttrPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert len(result.encoders) == 0
+
+
+class TestProtocolDiscovery:
+    """Test discovery via SupportsModuleOffload protocol."""
+
+    def test_discovers_declared_attrs_and_ignores_undeclared(self):
+        pipeline = ProtocolPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert isinstance(pipeline, SupportsModuleOffload)
+        assert result.dit_names == ["gen_transformer"]
+        assert result.encoder_names == ["mllm", "vision_model"]
+        assert len(result.vaes) == 1
+        # self.transformer exists but is NOT in _dit_modules
+        assert "transformer" not in result.dit_names
+
+    def test_skips_missing_attr(self):
+        pipeline = MissingAttrPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert len(result.encoders) == 0
+
+    def test_multiple_vaes(self):
+        pipeline = MultiVaePipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert len(result.vaes) == 2
+        assert result.vaes[0] is pipeline.vae
+        assert result.vaes[1] is pipeline.audio_vae
