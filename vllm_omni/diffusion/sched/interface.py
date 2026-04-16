@@ -107,6 +107,20 @@ class CachedRequestData:
 
 
 @dataclass
+class RankTask:
+    """One ``(request, chunk, denoising_step)`` triple assigned to a single PP rank for one micro-step.
+
+    Used by temporal-PP schedulers (e.g. ``StreamBatchScheduler``) to tell each rank
+    which work to perform in the current micro-step. Spatial-PP schedulers leave
+    ``DiffusionSchedulerOutput.per_rank_assignment`` as ``None``.
+    """
+
+    sched_req_id: str
+    chunk_idx: int
+    denoising_step: int
+
+
+@dataclass
 class DiffusionSchedulerOutput:
     """Output of a single scheduling cycle."""
 
@@ -116,6 +130,9 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    # Temporal-PP per-rank assignment table. Index = PP rank id. ``None`` entries
+    # mark idle ranks (warmup / cooldown).
+    per_rank_assignment: list[RankTask | None] | None = None
 
     @cached_property
     def scheduled_req_ids(self) -> list[str]:
