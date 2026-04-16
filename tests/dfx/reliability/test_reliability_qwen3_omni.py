@@ -36,41 +36,21 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
         "test_name": "qwen3_omni_reliability_async_chunk",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_config_name": "qwen3_omni_ci.yaml",
-            "update": {
-                "async_chunk": True,
-                "stage_args": {
-                    "0": {
-                        "engine_args.custom_process_next_stage_input_func": (
-                            "vllm_omni.model_executor.stage_input_processors."
-                            "qwen3_omni.thinker2talker_async_chunk"
-                        )
-                    },
-                    "1": {
-                        "engine_args.custom_process_next_stage_input_func": (
-                            "vllm_omni.model_executor.stage_input_processors."
-                            "qwen3_omni.talker2code2wav_async_chunk"
-                        )
-                    },
-                },
-            },
-            "delete": {
-                "stage_args": {
-                    "2": ["custom_process_input_func"],
-                }
-            },
+            "stage_config_name": "qwen3_omni_moe_async_chunk.yaml",
         },
     },
     {
         "test_name": "qwen3_omni_reliability_default",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_config_name": "qwen3_omni_ci.yaml",
+            "stage_config_name": "qwen3_omni_moe.yaml",
         },
     },
 ]
 
-E2E_STAGE_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "e2e" / "stage_configs"
+MODEL_EXECUTOR_STAGE_CONFIGS_DIR = (
+    Path(__file__).resolve().parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
+)
 OOM_INJECTION_CONFIG = {
     "target_mem_ratio": 0.95,
     "hold_seconds": 0,
@@ -126,7 +106,7 @@ def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | Non
     return None
 
 
-QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, E2E_STAGE_CONFIGS_DIR)
+QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, MODEL_EXECUTOR_STAGE_CONFIGS_DIR)
 
 
 @pytest.mark.slow

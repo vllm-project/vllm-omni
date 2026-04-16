@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 
 from tests.conftest import OmniServerParams
-from tests.conftest import modify_stage_config
 from tests.dfx.reliability.conftest import list_remote_process_pids_by_pattern, post_chat_completions_raw
 from vllm_omni.platforms import current_omni_platform
 
@@ -28,20 +27,6 @@ def load_configs(config_path: str) -> list[dict[str, Any]]:
         raise RuntimeError(f"Failed to load configuration file: {str(e)}")
 
 
-def modify_stage(default_path, updates, deletes):
-    kwargs = {}
-    if updates is not None:
-        kwargs["updates"] = updates
-    if deletes is not None:
-        kwargs["deletes"] = deletes
-    if kwargs:
-        path = modify_stage_config(default_path, **kwargs)
-    else:
-        path = default_path
-
-    return path
-
-
 def create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
@@ -54,9 +39,6 @@ def create_unique_server_params(
         stage_config_name = config["server_params"].get("stage_config_name")
         if stage_config_name:
             stage_config_path = str(stage_configs_dir / stage_config_name)
-            delete = config["server_params"].get("delete", None)
-            update = config["server_params"].get("update", None)
-            stage_config_path = modify_stage(stage_config_path, update, delete)
         else:
             stage_config_path = None
 
@@ -75,8 +57,6 @@ def configs_with_platform_stage_configs(configs: list[dict[str, Any]]) -> list[d
         config_copy = json.loads(json.dumps(config))
         if current_omni_platform.is_xpu():
             config_copy["server_params"]["stage_config_name"] = "xpu/qwen3_omni_ci.yaml"
-            config_copy["server_params"].pop("update", None)
-            config_copy["server_params"].pop("delete", None)
         out.append(config_copy)
     return out
 
