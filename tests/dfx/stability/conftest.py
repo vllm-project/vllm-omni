@@ -248,9 +248,11 @@ def omni_server(request: pytest.FixtureRequest):
     """Start OmniServer for stability tests, with per-module timeout override."""
     timeout_args = getattr(request.module, "STABILITY_SERVER_TIMEOUT_ARGS", DEFAULT_STABILITY_SERVER_TIMEOUT_ARGS)
     with _omni_server_lock:
-        test_name, model, serve_extras = request.param
+        test_name, model, stage_config_path = request.param
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
-        server_args = list(serve_extras) + list(timeout_args)
+        server_args = list(timeout_args)
+        if stage_config_path:
+            server_args = ["--stage-configs-path", stage_config_path] + server_args
         with OmniServer(model, server_args) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
