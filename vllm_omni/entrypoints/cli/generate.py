@@ -19,13 +19,24 @@ from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.cli.diffusion_args import (
+    add_diffusion_cfg_parallel_arg,
+    add_diffusion_cpu_offload_arg,
+    add_diffusion_sequence_parallel_args,
+    add_diffusion_vae_memory_args,
+    add_diffusion_vae_patch_parallel_arg,
+    add_diffusion_weight_loading_args,
+    add_stage_configs_path_arg,
+    add_tensor_parallel_size_arg,
+)
+
 logger = init_logger(__name__)
 
 DESCRIPTION = """Generate images from text prompts using diffusion models.
 
 Currently supports text-to-image generation only.
-Other parallel knobs (ulysses, ring, cfg_parallel, vae_patch_parallel)
-are available in the full offline example script.
+Diffusion parallel and memory optimization knobs are shared with
+`vllm serve --omni` where they apply to offline generation.
 
 Examples:
   vllm generate --omni --model Qwen/Qwen-Image \\
@@ -34,6 +45,9 @@ Examples:
   vllm generate --omni --model Qwen/Qwen-Image \\
     --prompt "a sunset over the ocean" --height 512 --width 512 \\
     --num-inference-steps 30 --seed 123
+
+  vllm generate --omni --model Qwen/Qwen-Image \\
+    --prompt "a landscape" --tensor-parallel-size 2 --vae-use-tiling
 """
 
 
@@ -55,9 +69,14 @@ class OmniGenerateCommand(CLISubcommand):
         device_type = current_omni_platform.device_type
         generator = torch.Generator(device=device_type).manual_seed(args.seed)
 
-        # 2. Parallel config (only tensor_parallel_size exposed in MVP)
+        # 2. Parallel config
         parallel_config = DiffusionParallelConfig(
             tensor_parallel_size=args.tensor_parallel_size,
+            ulysses_degree=getattr(args, "ulysses_degree", None) or 1,
+            ring_degree=getattr(args, "ring_degree", None) or 1,
+            ulysses_mode=getattr(args, "ulysses_mode", "strict"),
+            cfg_parallel_size=getattr(args, "cfg_parallel_size", 1),
+            vae_patch_parallel_size=getattr(args, "vae_patch_parallel_size", 1),
         )
 
         # 3. Initialize Omni
@@ -66,6 +85,10 @@ class OmniGenerateCommand(CLISubcommand):
             "parallel_config": parallel_config,
             "enforce_eager": args.enforce_eager,
             "enable_cpu_offload": args.enable_cpu_offload,
+            "vae_use_slicing": getattr(args, "vae_use_slicing", False),
+            "vae_use_tiling": getattr(args, "vae_use_tiling", False),
+            "enable_multithread_weight_load": getattr(args, "enable_multithread_weight_load", True),
+            "num_weight_load_threads": getattr(args, "num_weight_load_threads", 4),
             "mode": "text-to-image",
         }
         if args.stage_configs_path:
@@ -206,28 +229,19 @@ class OmniGenerateCommand(CLISubcommand):
         )
 
         # Hardware / loading
-        parser.add_argument(
-            "--tensor-parallel-size",
-            type=int,
-            default=1,
-            help="Tensor parallelism size (default: 1).",
-        )
-        parser.add_argument(
-            "--stage-configs-path",
-            type=str,
-            default=None,
-            help="Path to stage config YAML.",
-        )
+        add_tensor_parallel_size_arg(parser)
+        add_diffusion_sequence_parallel_args(parser)
+        add_diffusion_cfg_parallel_arg(parser)
+        add_diffusion_vae_patch_parallel_arg(parser)
+        add_stage_configs_path_arg(parser)
         parser.add_argument(
             "--enforce-eager",
             action="store_true",
             help="Disable torch.compile.",
         )
-        parser.add_argument(
-            "--enable-cpu-offload",
-            action="store_true",
-            help="Enable CPU offloading.",
-        )
+        add_diffusion_vae_memory_args(parser)
+        add_diffusion_weight_loading_args(parser)
+        add_diffusion_cpu_offload_arg(parser)
 
         return parser
 

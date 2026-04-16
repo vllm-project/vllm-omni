@@ -17,6 +17,15 @@ from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.cli.diffusion_args import (
+    add_diffusion_cfg_parallel_arg,
+    add_diffusion_cpu_offload_arg,
+    add_diffusion_sequence_parallel_args,
+    add_diffusion_vae_memory_args,
+    add_diffusion_vae_patch_parallel_arg,
+    add_diffusion_weight_loading_args,
+    add_stage_configs_path_arg,
+)
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
 
@@ -104,12 +113,7 @@ class OmniServeCommand(CLISubcommand):
             help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
             "If not specified, will be inferred from model path.",
         )
-        omni_config_group.add_argument(
-            "--stage-configs-path",
-            type=str,
-            default=None,
-            help="Path to the stage configs file. If not specified, the stage configs will be loaded from the model.",
-        )
+        add_stage_configs_path_arg(omni_config_group)
         omni_config_group.add_argument(
             "--stage-id",
             type=int,
@@ -191,33 +195,7 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
         )
-        omni_config_group.add_argument(
-            "--usp",
-            "--ulysses-degree",
-            dest="ulysses_degree",
-            type=int,
-            default=None,
-            help="Ulysses Sequence Parallelism degree for diffusion models. "
-            "Equivalent to setting DiffusionParallelConfig.ulysses_degree.",
-        )
-        omni_config_group.add_argument(
-            "--ulysses-mode",
-            type=str,
-            default="strict",
-            choices=["strict", "advanced_uaa"],
-            help="Ulysses sequence-parallel mode for diffusion models. "
-            "'strict' keeps the original divisibility requirements; "
-            "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
-        )
-        omni_config_group.add_argument(
-            "--ring",
-            "--ring-degree",
-            dest="ring_degree",
-            type=int,
-            default=None,
-            help="Ring Sequence Parallelism degree for diffusion models. "
-            "Equivalent to setting DiffusionParallelConfig.ring_degree.",
-        )
+        add_diffusion_sequence_parallel_args(omni_config_group)
         omni_config_group.add_argument(
             "--quantization-config",
             type=json.loads,
@@ -269,38 +247,13 @@ class OmniServeCommand(CLISubcommand):
         )
 
         # VAE memory optimization parameters
-        omni_config_group.add_argument(
-            "--vae-use-slicing",
-            action="store_true",
-            help="Enable VAE slicing for memory optimization (useful for mitigating OOM issues).",
-        )
-        omni_config_group.add_argument(
-            "--vae-use-tiling",
-            action="store_true",
-            help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
-        )
+        add_diffusion_vae_memory_args(omni_config_group)
 
         # Parallel weight loading (faster diffusion startup)
-        omni_config_group.add_argument(
-            "--disable-multithread-weight-load",
-            action="store_false",
-            dest="enable_multithread_weight_load",
-            default=True,
-            help="Disable multi-threaded safetensors loading (default: enabled with 4 threads).",
-        )
-        omni_config_group.add_argument(
-            "--num-weight-load-threads",
-            type=int,
-            default=4,
-            help="Number of threads for parallel weight loading (default: 4).",
-        )
+        add_diffusion_weight_loading_args(omni_config_group)
 
         # diffusion model offload parameters
-        omni_config_group.add_argument(
-            "--enable-cpu-offload",
-            action="store_true",
-            help="Enable CPU offloading for diffusion models.",
-        )
+        add_diffusion_cpu_offload_arg(omni_config_group)
         omni_config_group.add_argument(
             "--enable-layerwise-offload",
             action="store_true",
@@ -320,22 +273,8 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
         )
-        omni_config_group.add_argument(
-            "--cfg-parallel-size",
-            type=int,
-            default=1,
-            choices=[1, 2],
-            help="Number of devices for CFG parallel computation for diffusion models. "
-            "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
-        )
-        omni_config_group.add_argument(
-            "--vae-patch-parallel-size",
-            type=int,
-            default=1,
-            help="VAE Patch Parallelism degree for diffusion models. "
-            "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
-            "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
-        )
+        add_diffusion_cfg_parallel_arg(omni_config_group)
+        add_diffusion_vae_patch_parallel_arg(omni_config_group)
 
         # Default sampling parameters
         omni_config_group.add_argument(

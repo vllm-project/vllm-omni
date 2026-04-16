@@ -20,7 +20,9 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_GENERATE_PATH = _REPO_ROOT / "vllm_omni" / "entrypoints" / "cli" / "generate.py"
+_CLI_DIR = _REPO_ROOT / "vllm_omni" / "entrypoints" / "cli"
+_GENERATE_PATH = _CLI_DIR / "generate.py"
+_DIFFUSION_ARGS_PATH = _CLI_DIR / "diffusion_args.py"
 
 
 def _stub_package(monkeypatch: pytest.MonkeyPatch, name: str) -> types.ModuleType:
@@ -61,6 +63,15 @@ def _load_generate_module(monkeypatch: pytest.MonkeyPatch):
 
     argparse_utils_mod.FlexibleArgumentParser = FlexibleArgumentParser
     monkeypatch.setitem(sys.modules, "vllm.utils.argparse_utils", argparse_utils_mod)
+
+    diffusion_args_spec = importlib.util.spec_from_file_location(
+        "vllm_omni.entrypoints.cli.diffusion_args",
+        _DIFFUSION_ARGS_PATH,
+    )
+    diffusion_args_module = importlib.util.module_from_spec(diffusion_args_spec)
+    assert diffusion_args_spec.loader is not None
+    monkeypatch.setitem(sys.modules, diffusion_args_spec.name, diffusion_args_module)
+    diffusion_args_spec.loader.exec_module(diffusion_args_module)
 
     spec = importlib.util.spec_from_file_location(
         "vllm_omni.entrypoints.cli.generate",
@@ -154,8 +165,17 @@ def _make_args(output: str, num_images: int = 1) -> argparse.Namespace:
         seed=123,
         num_images=num_images,
         tensor_parallel_size=2,
+        ulysses_degree=None,
+        ulysses_mode="strict",
+        ring_degree=None,
+        cfg_parallel_size=1,
+        vae_patch_parallel_size=1,
         stage_configs_path=None,
         enforce_eager=False,
+        vae_use_slicing=False,
+        vae_use_tiling=False,
+        enable_multithread_weight_load=True,
+        num_weight_load_threads=4,
         enable_cpu_offload=False,
     )
 
@@ -205,6 +225,62 @@ def test_default_args(generate_module):
     assert args.seed == 42
     assert args.num_images == 1
     assert args.output == "output.png"
+    assert args.tensor_parallel_size == 1
+    assert args.ulysses_degree is None
+    assert args.ring_degree is None
+    assert args.ulysses_mode == "strict"
+    assert args.cfg_parallel_size == 1
+    assert args.vae_patch_parallel_size == 1
+    assert args.vae_use_slicing is False
+    assert args.vae_use_tiling is False
+    assert args.enable_multithread_weight_load is True
+    assert args.num_weight_load_threads == 4
+
+
+def test_shared_diffusion_args(generate_module):
+    parser = generate_module.FlexibleArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    generate_module.OmniGenerateCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "generate",
+            "--model",
+            "m",
+            "--prompt",
+            "p",
+            "--tensor-parallel-size",
+            "2",
+            "--usp",
+            "3",
+            "--ulysses-mode",
+            "advanced_uaa",
+            "--ring",
+            "4",
+            "--cfg-parallel-size",
+            "2",
+            "--vae-patch-parallel-size",
+            "2",
+            "--vae-use-slicing",
+            "--vae-use-tiling",
+            "--disable-multithread-weight-load",
+            "--num-weight-load-threads",
+            "8",
+            "--enable-cpu-offload",
+        ]
+    )
+
+    assert args.tensor_parallel_size == 2
+    assert args.ulysses_degree == 3
+    assert args.ulysses_mode == "advanced_uaa"
+    assert args.ring_degree == 4
+    assert args.cfg_parallel_size == 2
+    assert args.vae_patch_parallel_size == 2
+    assert args.vae_use_slicing is True
+    assert args.vae_use_tiling is True
+    assert args.enable_multithread_weight_load is False
+    assert args.num_weight_load_threads == 8
+    assert args.enable_cpu_offload is True
 
 
 def test_single_image_output_without_suffix(generate_module, monkeypatch, tmp_path):
@@ -217,8 +293,45 @@ def test_single_image_output_without_suffix(generate_module, monkeypatch, tmp_pa
     assert (tmp_path / "result.png").exists()
     assert omni_cls.last_init_kwargs["mode"] == "text-to-image"
     assert omni_cls.last_init_kwargs["parallel_config"].tensor_parallel_size == 2
+    assert omni_cls.last_init_kwargs["parallel_config"].ulysses_degree == 1
+    assert omni_cls.last_init_kwargs["parallel_config"].ring_degree == 1
+    assert omni_cls.last_init_kwargs["parallel_config"].cfg_parallel_size == 1
+    assert omni_cls.last_init_kwargs["parallel_config"].vae_patch_parallel_size == 1
+    assert omni_cls.last_init_kwargs["enable_multithread_weight_load"] is True
+    assert omni_cls.last_init_kwargs["num_weight_load_threads"] == 4
     assert omni_cls.last_generate_args[0]["prompt"] == "hello"
     assert omni_cls.last_generate_args[1].num_outputs_per_prompt == 1
+
+
+def test_shared_diffusion_args_passed_to_omni(generate_module, monkeypatch, tmp_path):
+    img = PIL.Image.new("RGB", (64, 64), "blue")
+    omni_cls = _install_cmd_stubs(monkeypatch, _make_outputs([img]))
+
+    args = _make_args(str(tmp_path / "result.png"))
+    args.ulysses_degree = 2
+    args.ulysses_mode = "advanced_uaa"
+    args.ring_degree = 2
+    args.cfg_parallel_size = 2
+    args.vae_patch_parallel_size = 2
+    args.vae_use_slicing = True
+    args.vae_use_tiling = True
+    args.enable_multithread_weight_load = False
+    args.num_weight_load_threads = 8
+    args.enable_cpu_offload = True
+
+    generate_module.OmniGenerateCommand.cmd(args)
+
+    parallel_config = omni_cls.last_init_kwargs["parallel_config"]
+    assert parallel_config.ulysses_degree == 2
+    assert parallel_config.ulysses_mode == "advanced_uaa"
+    assert parallel_config.ring_degree == 2
+    assert parallel_config.cfg_parallel_size == 2
+    assert parallel_config.vae_patch_parallel_size == 2
+    assert omni_cls.last_init_kwargs["vae_use_slicing"] is True
+    assert omni_cls.last_init_kwargs["vae_use_tiling"] is True
+    assert omni_cls.last_init_kwargs["enable_multithread_weight_load"] is False
+    assert omni_cls.last_init_kwargs["num_weight_load_threads"] == 8
+    assert omni_cls.last_init_kwargs["enable_cpu_offload"] is True
 
 
 def test_multi_image_output_without_suffix(generate_module, monkeypatch, tmp_path):
