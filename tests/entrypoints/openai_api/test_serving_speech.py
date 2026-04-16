@@ -684,6 +684,32 @@ class TestTTSMethods:
         assert server._is_tts is True
         assert server._tts_stage is mock_stage
 
+    def test_prepare_speech_rejects_non_tts_omni_model(self, mocker: MockerFixture):
+        """Multi-stage omni models (e.g. Qwen3-Omni) must not use /v1/audio/speech."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None
+
+        # Simulate Qwen3-Omni: multiple stages, none in _TTS_MODEL_STAGES
+        thinker = SimpleNamespace(engine_args=SimpleNamespace(model_stage="thinker"), tts_args={})
+        talker = SimpleNamespace(engine_args=SimpleNamespace(model_stage="talker"), tts_args={})
+        code2wav = SimpleNamespace(engine_args=SimpleNamespace(model_stage="code2wav"), tts_args={})
+        mock_engine_client.stage_configs = [thinker, talker, code2wav]
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        assert server._is_tts is False
+
+        request = OpenAICreateSpeechRequest(input="Hello world")
+        with pytest.raises(ValueError, match="only supported for dedicated TTS models"):
+            asyncio.run(server._prepare_speech_generation(request))
+        server.shutdown()
+
     def test_estimate_prompt_len_fallback(self, speech_server):
         """Test prompt length estimation falls back to 2048 when model is unavailable."""
         tts_params = {"text": ["Hello"], "task_type": ["CustomVoice"]}

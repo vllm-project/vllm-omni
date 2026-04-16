@@ -222,7 +222,8 @@ def extract_qwen_context(
     block = module.transformer_blocks[0]
     img_mod_params = block.img_mod(temb)
     img_mod1, _ = img_mod_params.chunk(2, dim=-1)
-    img_modulated, _ = block.img_norm1(hidden_states, img_mod1)
+    img_scale1, img_shift1, _ = block._modulate(img_mod1)
+    img_modulated = block.img_norm1(hidden_states, img_scale1, img_shift1)
 
     # ============================================================================
     # DEFINE TRANSFORMER EXECUTION (Qwen-specific)
