@@ -5,8 +5,8 @@ Supports vLLM-Omni server backend:
   - vllm-omni (default): starts DiffusionServer via vllm_omni.entrypoints.cli.main,
     benchmarks with diffusion_benchmark_serving.py --backend vllm-omni
 
-A config JSON file is REQUIRED via --config-file:
-  pytest run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+A config JSON file is REQUIRED via --test-config-file:
+  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
 JSON config entries use a "server_type" field, and this runner executes
 the vllm-omni path.
@@ -55,16 +55,16 @@ _BRANCHPOINT_COMMIT_SHA: str | None = None
 
 
 def _get_config_file_from_argv() -> str | None:
-    """Read --config-file from sys.argv at import time so pytest parametrize can use it.
+    """Read --test-config-file from sys.argv at import time so pytest parametrize can use it.
 
     pytest_addoption (below) registers the same flag so pytest does not reject it.
-    Supports both ``--config-file path`` and ``--config-file=path`` forms.
+    Supports both ``--test-config-file path`` and ``--test-config-file=path`` forms.
     Returns None if the flag is not present; callers must handle the missing case.
     """
     for i, arg in enumerate(sys.argv):
-        if arg == "--config-file" and i + 1 < len(sys.argv):
+        if arg == "--test-config-file" and i + 1 < len(sys.argv):
             return sys.argv[i + 1]
-        if arg.startswith("--config-file="):
+        if arg.startswith("--test-config-file="):
             return arg.split("=", 1)[1]
     return None
 
@@ -131,19 +131,6 @@ def _append_to_aggregated_file(record: dict[str, Any]) -> None:
         records.append(record)
         with open(AGGREGATED_RESULT_FILE, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
-
-
-# Register --config-file with pytest so it does not reject the argument.
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--config-file",
-        action="store",
-        default=None,
-        help=(
-            "Path to the benchmark config JSON file (required). "
-            "Example: --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json"
-        ),
-    )
 
 
 _server_lock = threading.Lock()
