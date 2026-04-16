@@ -1,18 +1,18 @@
 [
   {
-    "test_name": "",
-    "backend": "",
-    "timestamp": "",
+    "test_name": null,
+    "backend": null,
+    "timestamp": null,
     "server_params": {
-      "model": "",
+      "model": null,
       "serve_args": {
         "enable-diffusion-pipeline-profiler": false
       }
     },
     "benchmark_params": {
-      "name": "",
-      "dataset": "",
-      "task": "",
+      "name": null,
+      "dataset": null,
+      "task": null,
       "width": 0,
       "height": 0,
       "num-inference-steps": 0,
@@ -40,32 +40,29 @@
       "peak_memory_mb_max": 0,
       "peak_memory_mb_mean": 0,
       "peak_memory_mb_median": 0,
-      "stage_durations_mean": {
-      },
-      "stage_durations_p50": {
-      },
-      "stage_durations_p99": {
-      },
-      "backend": "",
-      "model": "",
-      "dataset": "",
-      "task": ""
+      "stage_durations_mean": {},
+      "stage_durations_p50": {},
+      "stage_durations_p99": {},
+      "backend": null,
+      "model": null,
+      "dataset": null,
+      "task": null
     },
-    "log_file": "",
-    "Model": "",
-    "Framework": "",
-    "Hardware": "",
-    "Deployment": "",
-    "Task": "",
-    "Dataset": "",
-    "resolution": "",
-    "Parallelism": "",
+    "log_file": null,
+    "Model": null,
+    "Framework": null,
+    "Hardware": null,
+    "Deployment": null,
+    "Task": null,
+    "Dataset": null,
+    "resolution": null,
+    "Parallelism": null,
     "max_concurrency": 0,
-    "Cache": "",
-    "Quantization": "",
-    "offload": "",
-    "compile": "",
-    "Attn_backend": "",
+    "Cache": null,
+    "Quantization": null,
+    "offload": null,
+    "compile": null,
+    "Attn_backend": null,
     "num_inference_steps": 0,
     "completed": 0,
     "failed": 0,
@@ -78,15 +75,12 @@
     "peak_memory_mb_max": 0,
     "peak_memory_mb_mean": 0,
     "peak_memory_mb_median": 0,
-    "stage_durations_mean": {
-    },
-    "stage_durations_p50": {
-    },
-    "stage_durations_p99": {
-    },
-    "commit_sha": "",
-    "build_id": "",
-    "build_url": "",
-    "source_file": ""
+    "stage_durations_mean": {},
+    "stage_durations_p50": {},
+    "stage_durations_p99": {},
+    "commit_sha": null,
+    "build_id": null,
+    "build_url": null,
+    "source_file": null
   }
 ]
