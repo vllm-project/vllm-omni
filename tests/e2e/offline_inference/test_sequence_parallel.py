@@ -20,8 +20,8 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 
+from tests.conftest import OmniRunner
 from tests.utils import hardware_test
-from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -92,49 +92,48 @@ def _run_inference(
         warmup: If True, run one warmup iteration before the timed run.
     """
     parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
-    omni = Omni(
-        model=model_name,
-        parallel_config=parallel_config,
-        dtype=dtype,
-        attention_backend=attn_backend,
-    )
-
     try:
-        # Warmup run (not timed)
-        if warmup:
-            _ = omni.generate(
+        with OmniRunner(
+            model_name,
+            parallel_config=parallel_config,
+            dtype=dtype,
+            attention_backend=attn_backend,
+        ) as runner:
+            omni = runner.omni
+            # Warmup run (not timed)
+            if warmup:
+                _ = omni.generate(
+                    PROMPT,
+                    OmniDiffusionSamplingParams(
+                        height=height,
+                        width=width,
+                        num_inference_steps=DEFAULT_STEPS,
+                        guidance_scale=0.0,
+                        generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed + 1000),
+                        num_outputs_per_prompt=1,
+                    ),
+                )
+
+            # Timed run
+            start = time.time()
+            outputs = omni.generate(
                 PROMPT,
                 OmniDiffusionSamplingParams(
                     height=height,
                     width=width,
                     num_inference_steps=DEFAULT_STEPS,
                     guidance_scale=0.0,
-                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed + 1000),
+                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
                     num_outputs_per_prompt=1,
                 ),
             )
+            elapsed_ms = (time.time() - start) * 1000
 
-        # Timed run
-        start = time.time()
-        outputs = omni.generate(
-            PROMPT,
-            OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_inference_steps=DEFAULT_STEPS,
-                guidance_scale=0.0,
-                generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
-                num_outputs_per_prompt=1,
-            ),
-        )
-        elapsed_ms = (time.time() - start) * 1000
-
-        return InferenceResult(
-            images=outputs[0].request_output.images,
-            elapsed_ms=elapsed_ms,
-        )
+            return InferenceResult(
+                images=outputs[0].request_output.images,
+                elapsed_ms=elapsed_ms,
+            )
     finally:
-        omni.close()
         _cleanup_distributed()
 
 

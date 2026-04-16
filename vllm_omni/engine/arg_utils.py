@@ -21,6 +21,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "VoxCPMForConditionalGeneration": "voxcpm",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
@@ -41,6 +42,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
             VoxtralTTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -59,6 +61,7 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("omnivoice", OmniVoiceConfig),
         ("voxtral_tts", VoxtralTTSConfig),
+        ("voxcpm", VoxCPMConfig),
         ("voxcpm2", VoxCPM2Config),
     ]:
         try:
@@ -124,6 +127,9 @@ class OmniEngineArgs(EngineArgs):
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
         log_stats: Whether to log engine statistics. Defaults to False.
+        custom_pipeline_args: Dictionary of arguments for custom pipeline
+            initialization (e.g., ``{"pipeline_class": "my.Module"}``).
+            Passed through to the diffusion stage engine.
     """
 
     stage_id: int = 0
@@ -143,6 +149,7 @@ class OmniEngineArgs(EngineArgs):
     stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
+    custom_pipeline_args: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()

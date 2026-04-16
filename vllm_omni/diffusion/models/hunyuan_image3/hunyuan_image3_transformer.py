@@ -74,7 +74,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe import HunyuanFusedMoE
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
 
 logger = logging.getLogger(__name__)
 
@@ -1684,7 +1684,8 @@ class HunYuanAttention(nn.Module):
         else:
             attn_output = self.attn(q, k, v)
         # For o_proj
-        attn_output = attn_output.view(q.shape[0], -1)
+        # image_attn may return a non-contiguous tensor; reshape is safe here.
+        attn_output = attn_output.reshape(q.shape[0], -1)
         output, _ = self.o_proj(attn_output)
         output = output.reshape(bsz, q_len, -1)
         return output, None, past_key_value

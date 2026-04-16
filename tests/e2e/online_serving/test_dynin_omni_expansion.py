@@ -120,7 +120,7 @@ def _build_i2i_messages(prompt: str) -> list[dict]:
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_send_i2i_request_001(omni_server, openai_client) -> None:
     request_config = {
@@ -136,7 +136,7 @@ def test_send_i2i_request_001(omni_server, openai_client) -> None:
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_send_t2i_request_001(omni_server, openai_client) -> None:
     request_config = {
@@ -149,7 +149,7 @@ def test_send_t2i_request_001(omni_server, openai_client) -> None:
 
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_send_t2s_request_001(omni_server, dynin_t2s_openai_client) -> None:
     request_config = {
