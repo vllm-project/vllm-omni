@@ -61,6 +61,7 @@ from vllm_omni.engine.stage_engine_startup import (
 )
 from vllm_omni.engine.stage_init_utils import (
     StartedLlmStage,
+    _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_diffusion_config,
     build_engine_args_dict,
@@ -78,7 +79,10 @@ from vllm_omni.engine.stage_init_utils import (
     setup_stage_devices,
     terminate_alive_proc,
 )
-from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
+from vllm_omni.entrypoints.utils import (
+    inject_omni_kv_config,
+    load_and_resolve_stage_configs,
+)
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
 
@@ -378,6 +382,12 @@ class AsyncOmniEngine:
                             omni_kv["omni_to_stage"] = omni_to
                             omni_kv.setdefault("stage_id", metadata.stage_id)
                             engine_args_dict["omni_kv_config"] = omni_kv
+                        if self.stage_configs:
+                            _inject_inferred_kv_tp_topology(
+                                engine_args_dict.get("omni_kv_config"),
+                                metadata.stage_id,
+                                self.stage_configs,
+                            )
                         vllm_config, executor_class = build_vllm_config(
                             stage_cfg,
                             self.model,
@@ -747,10 +757,8 @@ class AsyncOmniEngine:
                                 setup_stage_devices(configured_stage_id, metadata.runtime_cfg)
                                 omni_conn_cfg, omni_from, omni_to = omni_kv_connector
                                 if omni_conn_cfg:
-                                    from vllm_omni.entrypoints.utils import inject_omni_kv_config
-
                                     inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                                inject_kv_stage_info(stage_cfg, configured_stage_id)
+                                inject_kv_stage_info(stage_cfg, configured_stage_id, self.stage_configs)
                                 if self.single_stage_mode:
                                     assert self._omni_master_server is not None
                                     stage_clients[stage_idx] = self._launch_diffusion_stage(
