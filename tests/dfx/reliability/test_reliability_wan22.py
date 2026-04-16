@@ -65,9 +65,6 @@ DIFFUSION_VIDEO_PARAMS = [param for param in WAN_PARAMS if supports_video_genera
 
 
 @pytest.mark.slow
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
@@ -110,9 +107,6 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, open
 
 
 @pytest.mark.slow
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",
