@@ -728,7 +728,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         for field_name in self._OPENAI_SAMPLING_FIELDS:
             value = getattr(request, field_name, None)
-            if value is not None:
+            if (value is not None and not isinstance(value, list)) or (isinstance(value, list) and len(value) > 0):
                 setattr(params, field_name, value)
 
         return params
