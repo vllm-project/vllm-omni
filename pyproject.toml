@@ -55,10 +55,22 @@ dev = [
     "pyttsx3>=2.99",
     "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
+    "torchmetrics>=1.4.0", # for accuracy similarity metrics
 ]
 
 demo = [
     "gradio>=6.7.0",
+]
+
+# Seed-TTS serve benchmark WER (BytedanceSpeech/seed-tts-eval run_wer.py protocol).
+seed-tts-eval = [
+    "jiwer>=3.0.0",
+    "zhon>=2.0.0",
+    "zhconv>=1.4.2",
+    "scipy>=1.10.0",
+    "soundfile>=0.12.0",
+    "transformers>=4.36.0",
+    "funasr>=1.0.0",
 ]
 
 docs = [
@@ -182,6 +194,7 @@ markers = [
     "H100: Tests that require H100 GPU",
     "L4: Tests that require L4 GPU",
     "MI325: Tests that require MI325 GPU (AMD/ROCm)",
+    "B60: Tests that require Intel Arc Pro B60 XPU",
     "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: Tests that require A2 NPU",
     "A3: Tests that require A3 NPU",

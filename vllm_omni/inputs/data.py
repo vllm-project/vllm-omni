@@ -227,6 +227,10 @@ class OmniDiffusionSamplingParams:
     frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False
+    enable_frame_interpolation: bool = False
+    frame_interpolation_exp: int = 1
+    frame_interpolation_scale: float = 1.0
+    frame_interpolation_model_path: str | None = None
 
     # Timesteps
     timesteps: torch.Tensor | None = None
