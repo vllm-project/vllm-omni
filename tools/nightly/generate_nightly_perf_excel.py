@@ -665,6 +665,21 @@ def _to_float_if_numeric(value: Any) -> Any:
     return value
 
 
+def _to_excel_compatible(value: Any) -> Any:
+    """Convert non-scalar objects to JSON string for openpyxl cell values."""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(value)
+    if isinstance(value, set):
+        try:
+            return json.dumps(sorted(value), ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+    return value
+
+
 def _write_sheet(
     ws,
     columns: Sequence[str],
@@ -680,6 +695,7 @@ def _write_sheet(
             v = record.get(col)
             if col in numeric_set:
                 v = _to_float_if_numeric(v)
+            v = _to_excel_compatible(v)
             row_values.append(v)
         ws.append(row_values)
 

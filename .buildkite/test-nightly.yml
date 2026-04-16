@@ -110,8 +110,12 @@ steps:
         timeout_in_minutes: 180
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_omni.json
-          - buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json" || true
+            exit $$EXIT
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -177,8 +181,12 @@ steps:
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
-          - buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json" || true
+            exit $$EXIT
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -415,10 +423,8 @@ steps:
             EXIT2=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_2509_vllm_omni.json
             EXIT3=$$?
-            if [ $$EXIT1 -eq 0 ] || [ $$EXIT2 -eq 0 ] || [ $$EXIT3 -eq 0 ]; then
-              buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-              buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            fi
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json" || true
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log" || true
             exit $$((EXIT1 | EXIT2 | EXIT3))
         agents:
           queue: "mithril-h100-pool"

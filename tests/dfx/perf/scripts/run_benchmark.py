@@ -45,6 +45,9 @@ if CONFIG_FILE_PATH is None:
     CONFIG_FILE_PATH = _DEFAULT_CONFIG_FILE
 
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
+STAGE_INIT_TIMEOUT = 600
+OMNI_RESULT_TEMPLATE_PATH = Path(__file__).parent / "result_omni_template.json"
+
 
 STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
 test_params = create_unique_server_params(BENCHMARK_CONFIGS, STAGE_CONFIGS_DIR)
@@ -141,6 +144,13 @@ def run_benchmark(
         result_dir = "./"
 
     result_path = os.path.join(result_dir, result_filename)
+    if not os.path.exists(result_path):
+        with open(OMNI_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
+            template_result: dict[str, Any] = json.load(f)
+        Path(result_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(template_result, f, ensure_ascii=False, indent=2)
+        print(f"Benchmark result file not generated, fallback to template: {result_path}")
     with open(result_path, encoding="utf-8") as f:
         result = json.load(f)
 
