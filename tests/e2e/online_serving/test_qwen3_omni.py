@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import pytest
+import vllm_omni
 
 from tests.conftest import (
     OmniServerParams,
