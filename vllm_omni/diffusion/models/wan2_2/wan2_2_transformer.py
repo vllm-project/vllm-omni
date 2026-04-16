@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import FP32LayerNorm
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -30,6 +29,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -236,9 +236,9 @@ class WanImageEmbedding(nn.Module):
     def __init__(self, in_features: int, out_features: int, pos_embed_seq_len: int | None = None):
         super().__init__()
 
-        self.norm1 = FP32LayerNorm(in_features)
+        self.norm1 = LayerNorm(in_features)
         self.ff = FeedForward(in_features, out_features, mult=1, activation_fn="gelu")
-        self.norm2 = FP32LayerNorm(out_features)
+        self.norm2 = LayerNorm(out_features)
         if pos_embed_seq_len is not None:
             self.pos_embed = nn.Parameter(torch.zeros(1, pos_embed_seq_len, in_features))
         else:
@@ -378,8 +378,12 @@ class WanSelfAttention(nn.Module):
         self.tp_inner_dim = self.num_heads * head_dim
 
         # QK normalization using vLLM's RMSNorm
-        self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
-        self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+        if get_tensor_model_parallel_world_size() > 1:
+            self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+            self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+        else:
+            self.norm_q = RMSNorm(self.tp_inner_dim, eps=eps)
+            self.norm_k = RMSNorm(self.tp_inner_dim, eps=eps)
 
         self.to_out = RowParallelLinear(
             self.inner_dim,
@@ -498,8 +502,12 @@ class WanCrossAttention(nn.Module):
         self.tp_inner_dim = self.num_heads * head_dim
 
         # QK normalization
-        self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
-        self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+        if get_tensor_model_parallel_world_size() > 1:
+            self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+            self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+        else:
+            self.norm_q = RMSNorm(self.tp_inner_dim, eps=eps)
+            self.norm_k = RMSNorm(self.tp_inner_dim, eps=eps)
 
         # Optional added KV projections for I2V (image embeddings)
         self.added_kv_proj_dim = added_kv_proj_dim
@@ -518,7 +526,10 @@ class WanCrossAttention(nn.Module):
                 gather_output=False,
                 return_bias=False,
             )
-            self.norm_added_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+            if get_tensor_model_parallel_world_size() > 1:
+                self.norm_added_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+            else:
+                self.norm_added_k = RMSNorm(self.tp_inner_dim, eps=eps)
         else:
             self.add_k_proj = None
             self.add_v_proj = None
@@ -637,7 +648,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             added_kv_proj_dim=added_kv_proj_dim,
         )
-        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.norm2 = LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
         # 3. Feed-forward
         self.ffn = WanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
