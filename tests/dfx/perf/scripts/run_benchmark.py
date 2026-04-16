@@ -45,7 +45,6 @@ if CONFIG_FILE_PATH is None:
     CONFIG_FILE_PATH = _DEFAULT_CONFIG_FILE
 
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
-STAGE_INIT_TIMEOUT = 600
 OMNI_RESULT_TEMPLATE_PATH = Path(__file__).parent / "result_omni_template.json"
 
 
@@ -67,7 +66,7 @@ def omni_server(request):
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "300", "--init-timeout", "900"]
+        server_args = ["--stage-init-timeout", "600", "--init-timeout", "900"]
         if stage_config_path:
             server_args = ["--stage-configs-path", stage_config_path] + server_args
         with OmniServer(model, server_args) as server:
