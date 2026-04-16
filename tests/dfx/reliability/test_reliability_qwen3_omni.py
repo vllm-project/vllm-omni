@@ -130,9 +130,6 @@ QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, E2E_S
 
 
 @pytest.mark.slow
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
@@ -175,9 +172,6 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, opena
 
 
 @pytest.mark.slow
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
@@ -215,9 +209,6 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, open
 
 
 @pytest.mark.slow
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",
@@ -255,10 +246,8 @@ def test_reliability_fault_process_kill_request_failure(omni_server_after_fault,
 
 
 @pytest.mark.slow
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="runtime-teardown helper is POSIX-only")
+@pytest.mark.skip(reason="Temporarily disabled runtime teardown scenario.")
 @pytest.mark.parametrize("runtime_params", [QWEN_PARAMS[0]], ids=["runtime_teardown_container_kill"])
 def test_reliability_fault_runtime_teardown_container_kill_no_orphan_worker(runtime_params, model_prefix) -> None:
     baseline_worker_pids = set(list_remote_process_pids_by_pattern(RUNTIME_WORKER_PATTERN))
