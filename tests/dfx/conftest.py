@@ -4,6 +4,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tests.conftest import OmniServerParams
 from tests.conftest import modify_stage_config
 from tests.dfx.reliability.conftest import list_remote_process_pids_by_pattern, post_chat_completions_raw
@@ -216,3 +218,13 @@ def create_benchmark_indices(
                 indices.append((test_name, idx))
 
     return indices
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register shared CLI options for DFX benchmark suites."""
+    parser.addoption(
+        "--test-config-file",
+        action="store",
+        default=None,
+        help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
+    )
