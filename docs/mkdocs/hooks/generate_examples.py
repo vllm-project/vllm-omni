@@ -339,7 +339,7 @@ def on_startup(command: Literal["build", "gh-deploy", "serve"], dirty: bool):
             doc_path.parent.mkdir(parents=True)
         # Specify encoding for building on Windows
         with open(doc_path, "w+", encoding="utf-8") as f:
-            f.write(example.generate())
+            f.write(example.generate().rstrip() + "\n")
         logger.debug("Example generated: %s", doc_path.relative_to(ROOT_DIR))
 
     # Update the navigation file
