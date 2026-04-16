@@ -880,109 +880,117 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 # ---------------------------------------------------------------------------
 
 
-class WanT2VDMD2Pipeline(Wan22Pipeline):
-    """Wan 2.1 T2V pipeline for FastGen DMD2-distilled 4-step models.
+def _load_model_index(model: str, local_files_only: bool) -> dict:
+    """Load model_index.json from local path or HF Hub."""
+    if local_files_only:
+        model_index_path = os.path.join(model, "model_index.json")
+        if os.path.exists(model_index_path):
+            with open(model_index_path) as f:
+                return json.load(f)
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
 
-    Three changes from Wan22Pipeline:
-    - FlowMatchEulerDiscreteScheduler(shift=1.0): σ=t exactly, matching the
-      RFNoiseSchedule used during student training.
-    - Training timesteps [999, 937, 833, 624] injected via set_timesteps patch.
-      Euler's default 4-step schedule gives a different distribution.
-    - guidance_scale and negative_prompt are sanitized: teacher CFG is baked
-      into student weights so any user-supplied CFG is silently overridden.
-    """
+            model_index_path = hf_hub_download(model, "model_index.json")
+            with open(model_index_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
-    GUIDANCE_SCALE = 1.0
-    NUM_INFERENCE_STEPS = 4
-    DMD2_TIMESTEPS = [999, 937, 833, 624]
 
-    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
-        super().__init__(od_config=od_config, prefix=prefix)
-        self.scheduler = FlowMatchEulerDiscreteScheduler(
+class DMD2EulerScheduler(FlowMatchEulerDiscreteScheduler):
+    """Euler scheduler that always uses the fixed DMD2 training timestep schedule."""
+
+    def __init__(self, *args, dmd2_timesteps: list[int], **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dmd2_timesteps = dmd2_timesteps
+
+    def set_timesteps(
+        self,
+        num_inference_steps: int | None = None,
+        device: str | torch.device | None = None,
+        **kwargs,
+    ) -> None:
+        super().set_timesteps(timesteps=self._dmd2_timesteps, device=device)
+
+
+class DMD2PipelineMixin:
+    """Mixin for FastGen DMD2-distilled models. Must appear before the base pipeline in MRO."""
+
+    def __init_dmd2__(self) -> None:
+        """Call after super().__init__() to apply DMD2 scheduler and read model_index."""
+        local_files_only = os.path.exists(self.od_config.model)
+        model_index = _load_model_index(self.od_config.model, local_files_only)
+
+        dmd2_timesteps = model_index.get("dmd2_denoising_timesteps", [999, 937, 833, 624])
+        self.num_inference_steps = model_index.get("dmd2_num_inference_steps", 4)
+        shift = model_index.get("dmd2_scheduler_shift", 1.0)
+        self.dmd2_guidance_scale = model_index.get("dmd2_guidance_scale", 1.0)
+
+        self.scheduler = DMD2EulerScheduler(
             num_train_timesteps=1000,
-            shift=1.0,
+            shift=shift,
+            dmd2_timesteps=dmd2_timesteps,
         )
 
-    def _verify_dmd2_request(self, req: OmniDiffusionRequest) -> None:
-        """Sanitize CFG-related fields from the request.
-
-        DMD2 student weights have teacher CFG baked in.  Any CFG-triggering
-        field supplied by the caller would double-guide the model and degrade
-        quality.  We override all of them with a single warning per field.
-        """
+    def _sanitize_dmd2_request(self, req: OmniDiffusionRequest) -> None:
+        """Sanitize CFG-related fields in-place. Mutates req.sampling_params and req.prompts."""
         sp = req.sampling_params
 
-        if sp.guidance_scale_provided and sp.guidance_scale != self.GUIDANCE_SCALE:
+        if sp.num_inference_steps and sp.num_inference_steps != self.num_inference_steps:
             logger.warning(
-                "DMD2: ignoring guidance_scale=%.2f — CFG is baked into student weights. Forcing guidance_scale=%.2f.",
-                sp.guidance_scale,
-                self.GUIDANCE_SCALE,
+                "DMD2: ignoring num_inference_steps=%d, forcing %d.",
+                sp.num_inference_steps,
+                self.num_inference_steps,
             )
-        sp.guidance_scale = self.GUIDANCE_SCALE
+        sp.num_inference_steps = self.num_inference_steps
+
+        if sp.guidance_scale_provided and sp.guidance_scale != self.dmd2_guidance_scale:
+            logger.warning(
+                "DMD2: ignoring guidance_scale=%.2f, forcing %.2f.",
+                sp.guidance_scale,
+                self.dmd2_guidance_scale,
+            )
+        sp.guidance_scale = self.dmd2_guidance_scale
         sp.guidance_scale_provided = False
 
         if sp.guidance_scale_2 is not None:
-            logger.warning("DMD2: ignoring guidance_scale_2 — not supported.")
+            logger.warning("DMD2: ignoring guidance_scale_2.")
             sp.guidance_scale_2 = None
 
-        # Classifier free guidance is baked in the student weights, set all related params to None
         if sp.true_cfg_scale is not None:
-            logger.warning("DMD2: ignoring true_cfg_scale — not supported.")
+            logger.warning("DMD2: ignoring true_cfg_scale.")
             sp.true_cfg_scale = None
 
         sp.do_classifier_free_guidance = False
         sp.is_cfg_negative = False
 
-        # negative_prompt comes from req.prompts, not a forward() param.
-        # Strip it so the parent's encode_prompt never encodes an uncond embedding.
-        fixed_prompts = []
+        fixed = []
         for p in req.prompts:
-            if isinstance(p, dict) and p.get("negative_prompt"):
-                logger.warning("DMD2: ignoring negative_prompt — not supported for DMD2 models.")
+            if isinstance(p, dict) and "negative_prompt" in p:
+                logger.warning("DMD2: ignoring negative_prompt.")
                 p = {k: v for k, v in p.items() if k != "negative_prompt"}
-            fixed_prompts.append(p)
-        req.prompts = fixed_prompts
+            fixed.append(p)
+        req.prompts = fixed
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | None = None,
-        height: int = 480,
-        width: int = 832,
-        num_inference_steps: int = 4,
-        guidance_scale: float | tuple[float, float] = 1.0,
-        frame_num: int = 81,
-        output_type: str | None = "np",
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        attention_kwargs: dict | None = None,
-        **kwargs,
-    ) -> DiffusionOutput:
-        # DMD2: teacher CFG is baked into student weights.
-        # negative_prompt comes from req.prompts — sanitize it there.
-        # guidance_scale is forced to 1.0 regardless of what the caller passed.
-        self._verify_dmd2_request(req)
+    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+        self._sanitize_dmd2_request(req)
+        # Safety: remove DMD2-controlled params from kwargs to avoid TypeError
+        # if a caller passes them explicitly alongside **kwargs.
+        kwargs.pop("guidance_scale", None)
+        kwargs.pop("num_inference_steps", None)
+        return super().forward(
+            req,
+            guidance_scale=self.dmd2_guidance_scale,
+            num_inference_steps=self.num_inference_steps,
+            **kwargs,
+        )
 
-        _orig = self.scheduler.set_timesteps
 
-        def _dmd2_set_timesteps(num_steps, device=None, **kw):
-            _orig(timesteps=self.DMD2_TIMESTEPS, device=device)
+class WanT2VDMD2Pipeline(DMD2PipelineMixin, Wan22Pipeline):
+    """Wan 2.1 T2V pipeline for FastGen DMD2-distilled 4-step models."""
 
-        self.scheduler.set_timesteps = _dmd2_set_timesteps
-        try:
-            return super().forward(
-                req,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=1.0,
-                frame_num=frame_num,
-                output_type=output_type,
-                generator=generator,
-                prompt_embeds=prompt_embeds,
-                attention_kwargs=attention_kwargs,
-                **kwargs,
-            )
-        finally:
-            self.scheduler.set_timesteps = _orig
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__(od_config=od_config, prefix=prefix)
+        self.__init_dmd2__()
