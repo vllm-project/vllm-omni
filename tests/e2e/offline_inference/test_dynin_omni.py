@@ -18,7 +18,6 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
-from tests.conftest import OmniRunner
 from tests.utils import hardware_test
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -37,6 +36,7 @@ DYNIN_CONFIG_PATH = str(_DEFAULT_DYNIN_CONFIG_PATH) if _DEFAULT_DYNIN_CONFIG_PAT
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.omni,
+    pytest.mark.parametrize("omni_runner", test_params, indirect=True),
 ]
 
 
@@ -291,20 +291,11 @@ def _numel(value: Any) -> int:
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("test_config", test_params)
-def test_dynin_t2i_decode_to_image(test_config: tuple[str, str]) -> None:
-    model, stage_config_path = test_config
+def test_dynin_t2i_decode_to_image(omni_runner) -> None:
     _configure_dynin_config_env()
     prompt = _build_t2i_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
 
-    with OmniRunner(
-        model,
-        seed=42,
-        stage_configs_path=stage_config_path,
-        stage_init_timeout=600,
-        init_timeout=600,
-    ) as runner:
-        outputs = runner.generate([prompt])
+    outputs = omni_runner.generate([prompt])
 
     image_output = _find_stage_output(outputs, "image")
     assert image_output is not None
@@ -314,25 +305,16 @@ def test_dynin_t2i_decode_to_image(test_config: tuple[str, str]) -> None:
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("test_config", test_params)
-def test_dynin_mmu_to_text(test_config: tuple[str, str]) -> None:
-    model, stage_config_path = test_config
+def test_dynin_mmu_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
     prompt = _build_mmu_prompt(
         tokenizer=tokenizer,
         question="What is 2 + 2? Answer in one short sentence.",
         dynin_config_path=DYNIN_CONFIG_PATH,
     )
 
-    with OmniRunner(
-        model,
-        seed=42,
-        stage_configs_path=stage_config_path,
-        stage_init_timeout=600,
-        init_timeout=600,
-    ) as runner:
-        outputs = runner.generate([prompt])
+    outputs = omni_runner.generate([prompt])
 
     text_output = _find_stage_output(outputs, "text")
     assert text_output is not None
@@ -341,11 +323,9 @@ def test_dynin_mmu_to_text(test_config: tuple[str, str]) -> None:
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("test_config", test_params)
-def test_dynin_image_to_text(test_config: tuple[str, str]) -> None:
-    model, stage_config_path = test_config
+def test_dynin_image_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
     prompt = _build_mmu_multimodal_prompt(
         tokenizer=tokenizer,
         question="Describe the image briefly in one sentence.",
@@ -353,14 +333,7 @@ def test_dynin_image_to_text(test_config: tuple[str, str]) -> None:
         image=_generate_synthetic_image(),
     )
 
-    with OmniRunner(
-        model,
-        seed=42,
-        stage_configs_path=stage_config_path,
-        stage_init_timeout=600,
-        init_timeout=600,
-    ) as runner:
-        outputs = runner.generate([prompt])
+    outputs = omni_runner.generate([prompt])
 
     text_output = _find_stage_output(outputs, "text")
     assert text_output is not None
@@ -369,11 +342,9 @@ def test_dynin_image_to_text(test_config: tuple[str, str]) -> None:
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("test_config", test_params)
-def test_dynin_speech_to_text(test_config: tuple[str, str]) -> None:
-    model, stage_config_path = test_config
+def test_dynin_speech_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
     prompt = _build_mmu_multimodal_prompt(
         tokenizer=tokenizer,
         question="Transcribe the audio briefly in one sentence.",
@@ -381,14 +352,7 @@ def test_dynin_speech_to_text(test_config: tuple[str, str]) -> None:
         audio=_generate_synthetic_audio(),
     )
 
-    with OmniRunner(
-        model,
-        seed=42,
-        stage_configs_path=stage_config_path,
-        stage_init_timeout=600,
-        init_timeout=600,
-    ) as runner:
-        outputs = runner.generate([prompt])
+    outputs = omni_runner.generate([prompt])
 
     text_output = _find_stage_output(outputs, "text")
     assert text_output is not None
@@ -397,20 +361,11 @@ def test_dynin_speech_to_text(test_config: tuple[str, str]) -> None:
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("test_config", test_params)
-def test_dynin_t2s_decode_to_audio(test_config: tuple[str, str]) -> None:
-    model, stage_config_path = test_config
+def test_dynin_t2s_decode_to_audio(omni_runner) -> None:
     _configure_dynin_config_env()
     prompt = _build_t2s_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
 
-    with OmniRunner(
-        model,
-        seed=42,
-        stage_configs_path=stage_config_path,
-        stage_init_timeout=600,
-        init_timeout=600,
-    ) as runner:
-        outputs = runner.generate([prompt])
+    outputs = omni_runner.generate([prompt])
 
     audio_output = _find_stage_output(outputs, "audio")
     assert audio_output is not None

@@ -39,11 +39,12 @@ from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = logging.getLogger(__name__)
 
 
-class GPUGenerationModelRunner(OmniGPUModelRunner):
+class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     """Generation model runner for vLLM-Omni (non-autoregressive).
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.

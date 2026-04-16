@@ -302,7 +302,7 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict | None = No
     stage_configs = load_stage_configs_from_yaml(
         config_path=stage_config_path,
         base_engine_args=base_engine_args,
-        prefer_stage_engine_args=False,
+        prefer_stage_engine_args=True,
     )
     return stage_configs
 

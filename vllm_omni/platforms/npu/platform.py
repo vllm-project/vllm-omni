@@ -69,6 +69,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         # Try FLASH_ATTN if mindiesd is available, otherwise fall back to SDPA
         if find_spec("mindiesd"):
+            # Configure ASCEND_CUSTOM_OPP_PATH for mindiesd custom ops upon import
+            import mindiesd  # noqa: F401
+
             logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 

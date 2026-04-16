@@ -12,7 +12,6 @@ Note: CUDA-only (>=2 GPUs). We use `enforce_eager=False` (default) to enable
 """
 
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -20,20 +19,13 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
+from tests.conftest import OmniRunner
 from tests.utils import DeviceMemoryMonitor, hardware_test
-from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
-
-# ruff: noqa: E402
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -97,61 +89,61 @@ def _run_zimage_generate(
     device_index = current_omni_platform.current_device()
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
-    m = Omni(
-        model=_get_zimage_model(),
-        parallel_config=DiffusionParallelConfig(
-            tensor_parallel_size=tp_size,
-            vae_patch_parallel_size=vae_patch_parallel_size,
-        ),
-        enforce_eager=enforce_eager,
-        vae_use_tiling=vae_use_tiling,
-    )
     try:
-        # NOTE: Omni closes itself when a generate() call is exhausted.
-        # To avoid measuring teardown time (process shutdown, memory cleanup),
-        # we measure the latency to produce *subsequent* outputs within a single
-        # generator run.
-        #
-        # This also serves as a warmup: the first output may include extra
-        # compilation/caching overhead, while later outputs are closer to
-        # steady-state inference.
-        gen = m.generate(
-            [PROMPT] * num_requests,
-            OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=0.0,
-                seed=seed,
-                num_outputs_per_prompt=1,
+        # Each run needs a distinct DiffusionParallelConfig; use OmniRunner per call (not the
+        # parametrized omni_runner fixture, which is fixed per module).
+        with OmniRunner(
+            _get_zimage_model(),
+            parallel_config=DiffusionParallelConfig(
+                tensor_parallel_size=tp_size,
+                vae_patch_parallel_size=vae_patch_parallel_size,
             ),
-            py_generator=True,
-        )
+            enforce_eager=enforce_eager,
+            vae_use_tiling=vae_use_tiling,
+        ) as runner:
+            # NOTE: Omni closes itself when a generate() call is exhausted.
+            # To avoid measuring teardown time (process shutdown, memory cleanup),
+            # we measure the latency to produce *subsequent* outputs within a single
+            # generator run.
+            #
+            # This also serves as a warmup: the first output may include extra
+            # compilation/caching overhead, while later outputs are closer to
+            # steady-state inference.
+            gen = runner.omni.generate(
+                [PROMPT] * num_requests,
+                OmniDiffusionSamplingParams(
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=0.0,
+                    seed=seed,
+                    num_outputs_per_prompt=1,
+                ),
+                py_generator=True,
+            )
 
-        warmup_output = next(gen)
+            warmup_output = next(gen)
 
-        t_prev = time.perf_counter()
-        per_request_times_s: list[float] = []
-        last_output = warmup_output
-        for _ in range(num_requests - 1):
-            last_output = next(gen)
-            t_now = time.perf_counter()
-            per_request_times_s.append(t_now - t_prev)
-            t_prev = t_now
+            t_prev = time.perf_counter()
+            per_request_times_s: list[float] = []
+            last_output = warmup_output
+            for _ in range(num_requests - 1):
+                last_output = next(gen)
+                t_now = time.perf_counter()
+                per_request_times_s.append(t_now - t_prev)
+                t_prev = t_now
 
-        # Ensure the generator is fully consumed so it can clean up.
-        for _ in gen:
-            pass
+            # Ensure the generator is fully consumed so it can clean up.
+            for _ in gen:
+                pass
 
-        median_time_s = float(np.median(per_request_times_s))
+            median_time_s = float(np.median(per_request_times_s))
 
-        peak_memory_mb = monitor.peak_used_mb
+            peak_memory_mb = monitor.peak_used_mb
 
-        return _extract_single_image([last_output]), median_time_s, peak_memory_mb
+            return _extract_single_image([last_output]), median_time_s, peak_memory_mb
     finally:
         monitor.stop()
-        m.close()
-        cleanup_dist_env_and_memory()
 
 
 @pytest.mark.advanced_model
@@ -159,8 +151,8 @@ def _run_zimage_generate(
 @pytest.mark.parallel
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
-    if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
-        pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
+    if current_omni_platform.is_npu():
+        pytest.skip("Z-Image TP e2e test is only supported on CUDA and ROCm for now.")
     if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 devices.")
 
@@ -211,7 +203,9 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     )
 
     print(f"Z-Image TP perf (lower is better): tp1_time_s={tp1_time_s:.6f}, tp2_time_s={tp2_time_s:.6f}")
-    assert tp2_time_s < tp1_time_s, f"Expected TP=2 to be faster than TP=1 (tp1={tp1_time_s}, tp2={tp2_time_s})"
+    # ROCm is not optimized TP2 can be slower than TP1
+    if not current_omni_platform.is_rocm():
+        assert tp2_time_s < tp1_time_s, f"Expected TP=2 to be faster than TP=1 (tp1={tp1_time_s}, tp2={tp2_time_s})"
 
     print(f"Z-Image TP peak memory (MB): tp1_peak_mem={tp1_peak_mem:.2f}, tp2_peak_mem={tp2_peak_mem:.2f}")
     assert tp2_peak_mem < tp1_peak_mem, (
@@ -221,8 +215,8 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 
 @pytest.mark.integration
 def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
-    if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
-        pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
+    if current_omni_platform.is_npu():
+        pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA and ROCm for now.")
     if not current_omni_platform.is_available() or current_omni_platform.device_count() < 2:
         pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 devices.")
 

@@ -33,6 +33,18 @@ class ReferenceImage:
     data: Image.Image
 
 
+@dataclass
+class VideoGenerationArtifacts:
+    """Normalized outputs and profiler metadata extracted from one request."""
+
+    videos: list[Any]
+    audios: list[Any | None]
+    audio_sample_rate: int
+    output_fps: int
+    stage_durations: dict[str, float]
+    peak_memory_mb: float
+
+
 class OmniOpenAIServingVideo:
     """OpenAI-style video generation handler for omni diffusion models."""
 
@@ -77,12 +89,8 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
-    ) -> tuple[list[Any], list[Any | None], int, int]:
-        """Run the generation pipeline and extract video/audio outputs.
-
-        Returns:
-            Tuple of (videos, audios, audio_sample_rate, output_fps).
-        """
+    ) -> VideoGenerationArtifacts:
+        """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
@@ -105,6 +113,10 @@ class OmniOpenAIServingVideo:
         if vp.fps is not None:
             gen_params.fps = vp.fps
             gen_params.frame_rate = float(vp.fps)
+        gen_params.enable_frame_interpolation = request.enable_frame_interpolation
+        gen_params.frame_interpolation_exp = request.frame_interpolation_exp
+        gen_params.frame_interpolation_scale = request.frame_interpolation_scale
+        gen_params.frame_interpolation_model_path = request.frame_interpolation_model_path
 
         if request.num_inference_steps is not None:
             gen_params.num_inference_steps = request.num_inference_steps
@@ -152,8 +164,15 @@ class OmniOpenAIServingVideo:
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
-        output_fps = vp.fps or self._resolve_fps(result) or 24
-        return videos, audios, audio_sample_rate, output_fps
+        output_fps = (vp.fps or self._resolve_fps(result) or 24) * self._resolve_video_fps_multiplier(result)
+        return VideoGenerationArtifacts(
+            videos=videos,
+            audios=audios,
+            audio_sample_rate=audio_sample_rate,
+            output_fps=output_fps,
+            stage_durations=self._extract_stage_durations(result),
+            peak_memory_mb=self._extract_peak_memory_mb(result),
+        )
 
     async def generate_videos(
         self,
@@ -162,28 +181,38 @@ class OmniOpenAIServingVideo:
         *,
         reference_image: ReferenceImage | None = None,
     ) -> VideoGenerationResponse:
-        videos, audios, audio_sample_rate, output_fps = await self._run_and_extract(
-            request, reference_id, reference_image=reference_image
-        )
+        artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+
+        video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        if request.extra_params is not None and isinstance(request.extra_params, dict):
+            if "video_codec_options" in request.extra_params:
+                video_codec_options = request.extra_params["video_codec_options"]
+
         _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
                 b64_json=(
-                    encode_video_base64(video, fps=output_fps)
-                    if audios[idx] is None
+                    encode_video_base64(video, fps=artifacts.output_fps, video_codec_options=video_codec_options)
+                    if artifacts.audios[idx] is None
                     else encode_video_base64(
                         video,
-                        fps=output_fps,
-                        audio=audios[idx],
-                        audio_sample_rate=audio_sample_rate,
+                        fps=artifacts.output_fps,
+                        audio=artifacts.audios[idx],
+                        audio_sample_rate=artifacts.audio_sample_rate,
+                        video_codec_options=video_codec_options,
                     )
                 )
             )
-            for idx, video in enumerate(videos)
+            for idx, video in enumerate(artifacts.videos)
         ]
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
-        return VideoGenerationResponse(created=int(time.time()), data=video_data)
+        return VideoGenerationResponse(
+            created=int(time.time()),
+            data=video_data,
+            stage_durations=artifacts.stage_durations,
+            peak_memory_mb=artifacts.peak_memory_mb,
+        )
 
     async def generate_video_bytes(
         self,
@@ -191,25 +220,48 @@ class OmniOpenAIServingVideo:
         reference_id: str,
         *,
         reference_image: ReferenceImage | None = None,
-    ) -> bytes:
+    ) -> tuple[bytes, dict[str, float], float]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
-        videos, audios, audio_sample_rate, output_fps = await self._run_and_extract(
-            request, reference_id, reference_image=reference_image
-        )
-        if len(videos) > 1:
+        artifacts = await self._run_and_extract(request, reference_id, reference_image=reference_image)
+        if len(artifacts.videos) > 1:
             logger.warning(
-                "Video request %s generated %d outputs; returning only the first.", reference_id, len(videos)
+                "Video request %s generated %d outputs; returning only the first.",
+                reference_id,
+                len(artifacts.videos),
             )
-        audio = audios[0]
+        audio = artifacts.audios[0]
+
+        video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        if request.extra_params is not None and isinstance(request.extra_params, dict):
+            if "video_codec_options" in request.extra_params:
+                video_codec_options = request.extra_params["video_codec_options"]
+
         _t_encode_start = time.perf_counter()
         video_bytes = _encode_video_bytes(
-            videos[0],
-            fps=output_fps,
-            **({"audio": audio, "audio_sample_rate": audio_sample_rate} if audio is not None else {}),
+            artifacts.videos[0],
+            fps=artifacts.output_fps,
+            **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
+            video_codec_options=video_codec_options,
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
-        return video_bytes
+        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb
+
+    @staticmethod
+    def _resolve_video_fps_multiplier(result: Any) -> int:
+        custom_output = getattr(result, "custom_output", None)
+        if isinstance(custom_output, dict):
+            multiplier = custom_output.get("video_fps_multiplier")
+            if multiplier is not None:
+                return int(multiplier)
+        request_output = getattr(result, "request_output", None)
+        if request_output is not None:
+            custom_output = getattr(request_output, "custom_output", None)
+            if isinstance(custom_output, dict):
+                multiplier = custom_output.get("video_fps_multiplier")
+                if multiplier is not None:
+                    return int(multiplier)
+        return 1
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
@@ -483,3 +535,16 @@ class OmniOpenAIServingVideo:
             return None
 
         return sample_rate if sample_rate > 0 else None
+
+    @staticmethod
+    def _extract_stage_durations(result: Any) -> dict[str, float]:
+        stage_durations = getattr(result, "stage_durations", None)
+        return stage_durations if isinstance(stage_durations, dict) else {}
+
+    @staticmethod
+    def _extract_peak_memory_mb(result: Any) -> float:
+        peak_memory_mb = getattr(result, "peak_memory_mb", 0.0)
+        try:
+            return float(peak_memory_mb or 0.0)
+        except (TypeError, ValueError):
+            return 0.0

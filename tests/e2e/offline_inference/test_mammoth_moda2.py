@@ -23,9 +23,8 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
+from tests.conftest import OmniRunner
 from tests.utils import hardware_test
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -116,8 +115,6 @@ def test_mammothmoda2_t2i_e2e():
       - A fixed set of pixel values matches a golden reference
         (regenerate with ``UPDATE_GOLDEN=1``).
     """
-    from vllm_omni import Omni
-
     if not Path(MODEL_PATH).exists():
         pytest.skip(f"Model weights not found at {MODEL_PATH}")
     if not Path(T2I_STAGE_CONFIG).exists():
@@ -135,8 +132,8 @@ def test_mammothmoda2_t2i_e2e():
     prompt_text = "A cat sitting on a laptop keyboard"
     formatted_prompt = _format_t2i_prompt(prompt_text, ar_width, ar_height)
 
-    omni = Omni(model=MODEL_PATH, stage_configs_path=T2I_STAGE_CONFIG, trust_remote_code=True)
-    try:
+    with OmniRunner(MODEL_PATH, stage_configs_path=T2I_STAGE_CONFIG, trust_remote_code=True) as runner:
+        omni = runner.omni
         # Greedy / deterministic sampling so pixel values are reproducible.
         ar_sampling = SamplingParams(
             temperature=0.0,
@@ -211,5 +208,3 @@ def test_mammothmoda2_t2i_e2e():
                         found_image = True
 
         assert found_image, "No image tensor found in pipeline output"
-    finally:
-        omni.close()

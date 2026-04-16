@@ -23,6 +23,22 @@ LOGGER = logging.getLogger(__name__)
 GREY_BLOCK_FILL = PatternFill(start_color="D3D3D3", fill_type="solid")
 
 # Diffusion sheet columns (Qwen-Image diffusion benchmark).
+# Per-stage latency metrics. Unpack from stage_durations_mean/p50/p99 dicts
+DIFFUSION_STAGE_LATENCY_COLUMNS: tuple[str, ...] = (
+    # "vae.encode_mean",
+    # "vae.encode_p50",
+    # "vae.encode_p99",
+    "vae.decode_mean",
+    "vae.decode_p50",
+    "vae.decode_p99",
+    "diffuse_mean",
+    "diffuse_p50",
+    "diffuse_p99",
+    "text_encoder.forward_mean",
+    "text_encoder.forward_p50",
+    "text_encoder.forward_p99",
+)
+
 DIFFUSION_BENCHMARK_COLUMNS: tuple[str, ...] = (
     "duration",
     "completed_requests",
@@ -36,7 +52,7 @@ DIFFUSION_BENCHMARK_COLUMNS: tuple[str, ...] = (
     "peak_memory_mb_mean",
     "peak_memory_mb_median",
     "slo_attainment_rate",
-)
+) + DIFFUSION_STAGE_LATENCY_COLUMNS
 
 DIFFUSION_NUMERIC_FORMAT_COLUMNS: tuple[str, ...] = DIFFUSION_BENCHMARK_COLUMNS
 
@@ -63,7 +79,7 @@ DIFFUSION_SUMMARY_COLUMNS: tuple[str, ...] = (
     "build_id",
     "build_url",
     "source_file",
-)
+) + DIFFUSION_STAGE_LATENCY_COLUMNS
 
 # Benchmark metric columns: grey the latest row's cell when value changed vs previous date.
 BENCHMARK_COLUMNS: tuple[str, ...] = (
@@ -106,7 +122,7 @@ DATASET_NAME_ALLOWED = ("random", "random-mm")
 
 _COLUMNS_FILENAME = "nightly_perf_summary_columns.txt"
 _RESULT_JSON_PREFIX = "result_test_"
-_DIFFUSION_JSON_PREFIX = "diffusion_perf_"
+_DIFFUSION_RESULT_PREFIX = "diffusion_result_"
 DEFAULT_INPUT_DIR = os.getenv("DEFAULT_INPUT_DIR") if os.getenv("DEFAULT_INPUT_DIR") else "tests"
 DEFAULT_OUTPUT_DIR = os.getenv("DEFAULT_OUTPUT_DIR") if os.getenv("DEFAULT_OUTPUT_DIR") else "tests"
 DEFAULT_DIFFUSION_INPUT_DIR = os.getenv("DIFFUSION_BENCHMARK_DIR")
@@ -252,7 +268,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Directory containing diffusion_perf_*.json files; default is "
+            "Directory containing diffusion_result_*.json files; default is "
             "DIFFUSION_BENCHMARK_DIR, fallback to --input-dir."
         ),
     )
@@ -286,7 +302,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_json_file(path: str) -> dict[str, Any] | None:
+def _load_json_file(path: str) -> dict[str, Any] | list[Any] | None:
     """Safely load a single JSON file; return None and log a warning on failure."""
     try:
         with open(path, encoding="utf-8") as f:
@@ -295,18 +311,18 @@ def _load_json_file(path: str) -> dict[str, Any] | None:
         LOGGER.warning("failed to load json '%s': %s", path, exc)
         return None
 
-    if not isinstance(data, dict):
-        LOGGER.warning("json root in '%s' is not an object, skip", path)
+    if not isinstance(data, (dict, list)):
+        LOGGER.warning("json root in '%s' is not a dict or list, skip", path)
         return None
 
     return data
 
 
 def _parse_from_filename(filename: str) -> dict[str, Any]:
-    """Parse test-related metadata from a result JSON filename.
+    """Parse test-related metadata from a ``result_test_*.json`` filename.
 
-    Expected pattern (after prefix/suffix stripped):
-    <test_name>_<dataset_name>_<max_concurrency>_<num_prompts>_<timestamp>
+    Matches ``tests/dfx/perf/scripts/run_benchmark.py`` naming, including optional
+    ``_in{X}_out{Y}_`` before the timestamp (``na`` when unset).
     """
     name, ext = os.path.splitext(filename)
     if ext != ".json" or not name.startswith(_RESULT_JSON_PREFIX):
@@ -315,22 +331,42 @@ def _parse_from_filename(filename: str) -> dict[str, Any]:
     core = name[len(_RESULT_JSON_PREFIX) :]
     parts = core.split("_")
     if len(parts) < 5:
-        LOGGER.warning("filename '%s' does not match expected pattern, skip parsing test metadata", filename)
+        LOGGER.warning(
+            "filename '%s' does not match expected pattern (need >= 5 segments), skip parsing",
+            filename,
+        )
         return {}
 
-    timestamp = parts[-1]
-    num_prompts_str = parts[-2]
-    max_concurrency_str = parts[-3]
-    dataset_name = parts[-4]
-    test_name = "_".join(parts[:-4]) if parts[:-4] else ""
+    idx = len(parts) - 1
+    timestamp = parts[idx]
+    idx -= 1
 
     parsed: dict[str, Any] = {}
-
     if len(timestamp) >= 15:
         parsed["date"] = timestamp
 
-    if dataset_name in DATASET_NAME_ALLOWED:
-        parsed["dataset_name"] = dataset_name
+    if idx >= 0 and parts[idx].startswith("out"):
+        parsed["random_output_len"] = parts[idx][3:]
+        idx -= 1
+    if idx >= 0 and parts[idx].startswith("in"):
+        parsed["random_input_len"] = parts[idx][2:]
+        idx -= 1
+
+    if idx < 3:
+        LOGGER.warning(
+            "filename '%s' has too few segments after timestamp / optional in-out (idx=%s)",
+            filename,
+            idx,
+        )
+        return parsed
+
+    num_prompts_str = parts[idx]
+    idx -= 1
+    flow_str = parts[idx]
+    idx -= 1
+    dataset_name = parts[idx]
+    idx -= 1
+    test_name = "_".join(parts[: idx + 1]) if idx >= 0 else ""
 
     try:
         parsed["num_prompts"] = int(num_prompts_str)
@@ -338,12 +374,15 @@ def _parse_from_filename(filename: str) -> dict[str, Any]:
         pass
 
     try:
-        parsed["max_concurrency"] = int(max_concurrency_str)
+        parsed["max_concurrency"] = int(flow_str)
     except (TypeError, ValueError):
         pass
 
     if test_name:
         parsed["test_name"] = test_name
+
+    if dataset_name in DATASET_NAME_ALLOWED:
+        parsed["dataset_name"] = dataset_name
 
     return parsed
 
@@ -396,27 +435,29 @@ def _iter_omni_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
         yield record
 
 
-def _parse_diffusion_from_filename(filename: str) -> dict[str, Any]:
-    """Parse diffusion test_name/date from filename: diffusion_perf_<test_name>_<YYYYMMDD-HHMMSS>.json"""
+def _parse_diffusion_result_from_filename(filename: str) -> dict[str, Any]:
+    """Parse test_name/date from filename: diffusion_result_<config_stem>_<YYYYMMDD-HHMMSS>.json"""
     name, ext = os.path.splitext(filename)
-    if ext != ".json" or not name.startswith(_DIFFUSION_JSON_PREFIX):
+    if ext != ".json" or not name.startswith(_DIFFUSION_RESULT_PREFIX):
         return {}
-    core = name[len(_DIFFUSION_JSON_PREFIX) :]
+    core = name[len(_DIFFUSION_RESULT_PREFIX) :]
     parts = core.split("_")
     if len(parts) < 2:
         return {}
     timestamp = parts[-1]
-    test_name = "_".join(parts[:-1]) if parts[:-1] else ""
     parsed: dict[str, Any] = {}
     if len(timestamp) >= 15:
         parsed["date"] = timestamp
-    if test_name:
-        parsed["test_name"] = test_name
     return parsed
 
 
-def _iter_diffusion_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
-    """Iterate over diffusion_perf_*.json files and yield normalized diffusion records."""
+def _iter_diffusion_records(input_dir: str) -> Iterable[dict[str, Any]]:
+    """Iterate over diffusion_result_*.json files and yield normalized records.
+
+    Unlike omni format where each JSON file contains one test case, diffusion format
+    produces a single JSON file containing a list of all test case records.
+    Test params (feature toggles) are NOT embedded in the filename.
+    """
     if not os.path.isdir(input_dir):
         LOGGER.warning("diffusion input dir '%s' does not exist or is not a directory", input_dir)
         return
@@ -424,7 +465,7 @@ def _iter_diffusion_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
     for entry in sorted(os.listdir(input_dir)):
         if not entry.endswith(".json"):
             continue
-        if not entry.startswith(_DIFFUSION_JSON_PREFIX):
+        if not entry.startswith(_DIFFUSION_RESULT_PREFIX):
             continue
         full_path = os.path.join(input_dir, entry)
         if not os.path.isfile(full_path):
@@ -434,23 +475,63 @@ def _iter_diffusion_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
         if data is None:
             continue
 
-        record: dict[str, Any] = dict(data)
-        filename_meta = _parse_diffusion_from_filename(os.path.basename(full_path))
-        if "date" not in record or not record.get("date"):
-            record["date"] = filename_meta.get("date") or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        if "test_name" not in record or not record.get("test_name"):
-            if "test_name" in filename_meta:
-                record["test_name"] = filename_meta["test_name"]
-        record["source_file"] = os.path.basename(full_path)
-        yield record
+        filename_meta = _parse_diffusion_result_from_filename(os.path.basename(full_path))
+
+        if not isinstance(data, list):
+            LOGGER.warning("diffusion result file '%s' root is not a list, skip", full_path)
+            continue
+
+        for record in data:
+            if not isinstance(record, dict):
+                continue
+            record = dict(record)
+            if "date" not in record or not record.get("date"):
+                record["date"] = filename_meta.get("date") or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            record["source_file"] = os.path.basename(full_path)
+            yield record
 
 
-def _collect_records(input_dir: str) -> list[dict[str, Any]]:
+def _collect_omni_records(input_dir: str) -> list[dict[str, Any]]:
     return list(_iter_omni_json_records(input_dir))
 
 
 def _collect_diffusion_records(diffusion_input_dir: str) -> list[dict[str, Any]]:
-    return list(_iter_diffusion_json_records(diffusion_input_dir))
+    """Collect diffusion records from diffusion_result_*.json files.
+    Their format is different from omni JSON files.
+    """
+    return [_process_diffusion_record(r) for r in _iter_diffusion_records(diffusion_input_dir)]
+
+
+def _flatten_stage_durations(record: dict[str, Any]) -> dict[str, Any]:
+    """Flatten stage_durations dict into individual columns matching DIFFUSION_STAGE_LATENCY_COLUMNS."""
+    result = dict(record)
+
+    for prefix in ("stage_durations_mean", "stage_durations_p50", "stage_durations_p99"):
+        durations = result.pop(prefix, None)
+        if not isinstance(durations, dict):
+            continue
+
+        suffix = prefix.replace("stage_durations_", "")  # "mean", "p50", "p99"
+
+        for stage_key, value in durations.items():  # e.g., "SomePipeline.vae.decode_mean": 100.0
+            stage_key = stage_key.split(".", 1)[-1]  # "decode_mean"
+            col_name = f"{stage_key}_{suffix}"
+            if col_name not in DIFFUSION_STAGE_LATENCY_COLUMNS:
+                print(f"skipping stage_key: {col_name}")
+                continue
+            result[col_name] = value
+
+    return result
+
+
+def _process_diffusion_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a diffusion record by merging `result` and flattening stage metrics."""
+    flat = record.copy()
+    flat.update(flat.pop("result", {}))
+    flat = _flatten_stage_durations(flat)
+    flat.pop("benchmark_params", None)
+    flat.pop("server_params", None)
+    return flat
 
 
 def _apply_build_metadata_to_latest_only(
@@ -493,7 +574,7 @@ def _apply_build_metadata_to_latest_only(
 
 def _sort_records_for_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort so that same test configuration is grouped, newest date first within each group."""
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
     return sorted(
         by_date_desc,
         key=_omni_group_key,
@@ -501,7 +582,7 @@ def _sort_records_for_summary(records: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _sort_diffusion_records_for_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
     return sorted(by_date_desc, key=_diffusion_group_key)
 
 
@@ -678,7 +759,7 @@ def generate_excel_report(
     script_dir = os.path.dirname(os.path.abspath(__file__))
     omni_summary_columns = _ensure_omni_summary_columns(_load_summary_columns(script_dir))
 
-    omni_records = _collect_records(input_dir)
+    omni_records = _collect_omni_records(input_dir)
     diffusion_records = _collect_diffusion_records(diffusion_input_dir)
 
     if not omni_records:

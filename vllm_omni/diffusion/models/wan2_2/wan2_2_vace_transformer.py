@@ -239,7 +239,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
             shift = shift.unsqueeze(1)
             scale = scale.unsqueeze(1)
 
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = self.norm_out(hidden_states, scale, shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(

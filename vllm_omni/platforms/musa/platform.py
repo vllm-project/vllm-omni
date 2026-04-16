@@ -39,7 +39,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
         # MUSA uses default implementations for diffusion ops
         if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
+            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
         return super().get_diffusion_model_impl_qualname(op_name)
 
     @classmethod

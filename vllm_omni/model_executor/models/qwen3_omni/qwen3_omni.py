@@ -610,13 +610,14 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         # Speaker token IDs (for voice selection)
         # In Qwen3, speaker_id mapping is in talker_config.speaker_id
+        # Keys are lowercased for case-insensitive matching with serving layer.
         if hasattr(talker_hf_config, "speaker_id") and talker_hf_config.speaker_id:
-            self.tts_text_spk_token_ids = talker_hf_config.speaker_id
+            self.tts_text_spk_token_ids = {k.lower(): v for k, v in talker_hf_config.speaker_id.items()}
         else:
             # Default to audio_start_token_id if no speaker mapping
             self.tts_text_spk_token_ids = {
                 "default": talker_hf_config.audio_start_token_id,
-                "Ethan": talker_hf_config.audio_start_token_id,
+                "ethan": talker_hf_config.audio_start_token_id,
                 "prefix_caching": talker_hf_config.audio_start_token_id,
             }
 
