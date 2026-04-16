@@ -59,12 +59,13 @@ Key arguments:
 - `--negative-prompt`: Optional list of artifacts to suppress.
 - `--boundary-ratio`: Boundary split ratio for two-stage MoE models.
 - `--flow-shift`: Scheduler flow shift (5.0 for 720p, 12.0 for 480p).
+- `--sample-solver`: Wan2.2 sampling solver. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
 - `--num-inference-steps`: Number of denoising steps (default 50).
 - `--fps`: Frames per second for the saved MP4 (requires `diffusers` export_to_video).
 - `--output`: Path to save the generated video.
 - `--vae-use-slicing`: Enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: Enable VAE tiling for memory optimization.
-- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism/cfg_parallel.md).
 - `--tensor-parallel-size`: tensor parallel size (effective for models that support TP, e.g. LTX2).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--use-hsdp`: Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.
@@ -74,3 +75,6 @@ Key arguments:
 
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
+
+For Wan2.2 LightX2V-converted local Diffusers directories and related LoRA
+assets, see the [LoRA guide](../../../docs/user_guide/diffusion/lora.md#wan22-lightx2v-offline-assembly).

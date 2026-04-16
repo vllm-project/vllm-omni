@@ -14,15 +14,16 @@ from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import torch
 import zmq
 import zmq.asyncio
+from PIL import Image
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.utils import shutdown
 
-from vllm_omni.diffusion.data import DiffusionRequestAbortedError, TransformerConfig
+from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
@@ -36,8 +37,6 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
-
-_HANDSHAKE_POLL_TIMEOUT_S = 600
 
 
 class StageDiffusionProc:
@@ -66,47 +65,8 @@ class StageDiffusionProc:
         logger.info("StageDiffusionProc initialized with model: %s", self._model)
 
     def _enrich_config(self) -> None:
-        """Load model metadata from HuggingFace and populate od_config fields.
-
-        Diffusers-style models expose ``model_index.json`` with ``_class_name``.
-        Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
-        so we fall back to reading that and mapping model_type manually.
-        """
-        od_config = self._od_config
-
-        try:
-            config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
-            if config_dict is not None:
-                if od_config.model_class_name is None:
-                    od_config.model_class_name = config_dict.get("_class_name", None)
-                od_config.update_multimodal_support()
-
-                tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
-                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
-            else:
-                raise FileNotFoundError("model_index.json not found")
-        except (AttributeError, OSError, ValueError, FileNotFoundError):
-            cfg = get_hf_file_to_dict("config.json", od_config.model)
-            if cfg is None:
-                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
-
-            od_config.tf_model_config = TransformerConfig.from_dict(cfg)
-            model_type = cfg.get("model_type")
-            architectures = cfg.get("architectures") or []
-
-            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                od_config.model_class_name = "BagelPipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
-            elif model_type == "nextstep":
-                if od_config.model_class_name is None:
-                    od_config.model_class_name = "NextStep11Pipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
-            elif architectures and len(architectures) == 1:
-                od_config.model_class_name = architectures[0]
-            else:
-                raise
+        """Load model metadata from HuggingFace and populate od_config fields."""
+        self._od_config.enrich_config()
 
     # ------------------------------------------------------------------
     # Request processing
@@ -128,6 +88,7 @@ class StageDiffusionProc:
         request_id: str,
         prompt: Any,
         sampling_params_dict: dict,
+        kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and run DiffusionEngine.step()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -136,6 +97,8 @@ class StageDiffusionProc:
             prompts=[prompt],
             sampling_params=sampling_params,
             request_ids=[request_id],
+            request_id=request_id,
+            kv_sender_info=kv_sender_info,
         )
 
         loop = asyncio.get_running_loop()
@@ -150,6 +113,7 @@ class StageDiffusionProc:
         request_id: str,
         prompts: list[Any],
         sampling_params_dict: dict,
+        kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a batched diffusion request and run DiffusionEngine.step().
 
@@ -163,7 +127,9 @@ class StageDiffusionProc:
         request = OmniDiffusionRequest(
             prompts=prompts,
             sampling_params=sampling_params,
-            request_ids=[request_id] * len(prompts),
+            request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
+            request_id=request_id,
+            kv_sender_info=kv_sender_info,
         )
 
         loop = asyncio.get_running_loop()
@@ -174,8 +140,13 @@ class StageDiffusionProc:
         merged_mm: dict[str, Any] = {}
         merged_metrics: dict[str, Any] = {}
         merged_durations: dict[str, float] = {}
+        merged_custom: dict[str, Any] = {}
         peak_mem = 0.0
         latents = None
+        trajectory_latents: list[torch.Tensor] | None = None
+        trajectory_timesteps: list[torch.Tensor] | None = None
+        trajectory_log_probs: torch.Tensor | None = None
+        trajectory_decoded: list[Image.Image] | None = None
         final_output_type = "image"
 
         for r in results:
@@ -183,9 +154,18 @@ class StageDiffusionProc:
             merged_mm.update(r._multimodal_output)
             merged_metrics.update(r.metrics)
             merged_durations.update(r.stage_durations)
+            merged_custom.update(r._custom_output)
             peak_mem = max(peak_mem, r.peak_memory_mb)
             if latents is None and r.latents is not None:
                 latents = r.latents
+            if trajectory_latents is None:
+                trajectory_latents = r.trajectory_latents
+            if trajectory_timesteps is None:
+                trajectory_timesteps = r.trajectory_timesteps
+            if trajectory_log_probs is None:
+                trajectory_log_probs = r.trajectory_log_probs
+            if trajectory_decoded is None:
+                trajectory_decoded = r.trajectory_decoded
             if r.final_output_type != "image":
                 final_output_type = r.final_output_type
 
@@ -195,6 +175,11 @@ class StageDiffusionProc:
             prompt=prompts[0] if len(prompts) == 1 else None,
             metrics=merged_metrics,
             latents=latents,
+            trajectory_latents=trajectory_latents,
+            trajectory_timesteps=trajectory_timesteps,
+            trajectory_log_probs=trajectory_log_probs,
+            trajectory_decoded=trajectory_decoded,
+            custom_output=merged_custom or None,
             multimodal_output=merged_mm or None,
             final_output_type=final_output_type,
             stage_durations=merged_durations,
@@ -325,10 +310,20 @@ class StageDiffusionProc:
 
         tasks: dict[str, asyncio.Task] = {}
 
-        async def _dispatch_request(request_id: str, prompt: Any, sampling_params_dict: dict) -> None:
+        async def _dispatch_request(
+            request_id: str,
+            prompt: Any,
+            sampling_params_dict: dict,
+            kv_sender_info: dict[str, Any] | None = None,
+        ) -> None:
             """Process a single diffusion request and send the response."""
             try:
-                result = await self._process_request(request_id, prompt, sampling_params_dict)
+                result = await self._process_request(
+                    request_id,
+                    prompt,
+                    sampling_params_dict,
+                    kv_sender_info=kv_sender_info,
+                )
                 await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
                 logger.info(
@@ -363,6 +358,7 @@ class StageDiffusionProc:
                             request_id,
                             msg["prompt"],
                             msg["sampling_params"],
+                            msg.get("kv_sender_info"),
                         )
                     )
                     tasks[request_id] = task
@@ -370,9 +366,19 @@ class StageDiffusionProc:
                 elif msg_type == "add_batch_request":
                     request_id = msg["request_id"]
 
-                    async def _dispatch_batch(rid: str, prompts: list, sp_dict: dict) -> None:
+                    async def _dispatch_batch(
+                        rid: str,
+                        prompts: list,
+                        sp_dict: dict,
+                        kv_sender_info: dict[str, Any] | None = None,
+                    ) -> None:
                         try:
-                            result = await self._process_batch_request(rid, prompts, sp_dict)
+                            result = await self._process_batch_request(
+                                rid,
+                                prompts,
+                                sp_dict,
+                                kv_sender_info=kv_sender_info,
+                            )
                             await response_socket.send(encoder.encode({"type": "result", "output": result}))
                         except DiffusionRequestAbortedError as e:
                             logger.info(
@@ -399,6 +405,7 @@ class StageDiffusionProc:
                             request_id,
                             msg["prompts"],
                             msg["sampling_params"],
+                            msg.get("kv_sender_info"),
                         )
                     )
                     tasks[request_id] = task
@@ -531,14 +538,17 @@ class StageDiffusionProc:
 def spawn_diffusion_proc(
     model: str,
     od_config: OmniDiffusionConfig,
+    handshake_address: str | None = None,
+    request_address: str | None = None,
+    response_address: str | None = None,
 ) -> tuple[BaseProcess, str, str, str]:
     """Spawn a StageDiffusionProc subprocess.
 
     Returns ``(proc, handshake_address, request_address, response_address)``.
     """
-    handshake_address = get_open_zmq_ipc_path()
-    request_address = get_open_zmq_ipc_path()
-    response_address = get_open_zmq_ipc_path()
+    handshake_address = handshake_address or get_open_zmq_ipc_path()
+    request_address = request_address or get_open_zmq_ipc_path()
+    response_address = response_address or get_open_zmq_ipc_path()
 
     ctx = get_mp_context()
     proc = ctx.Process(
@@ -567,13 +577,14 @@ def spawn_diffusion_proc(
 def complete_diffusion_handshake(
     proc: BaseProcess,
     handshake_address: str,
+    handshake_timeout: int,
 ) -> None:
     """Wait for the diffusion subprocess to signal READY.
 
     On failure the process is terminated before re-raising.
     """
     try:
-        _perform_diffusion_handshake(proc, handshake_address)
+        _perform_diffusion_handshake(proc, handshake_address, handshake_timeout)
     except Exception:
         shutdown([proc])
         raise
@@ -582,6 +593,7 @@ def complete_diffusion_handshake(
 def _perform_diffusion_handshake(
     proc: BaseProcess,
     handshake_address: str,
+    handshake_timeout: int,
 ) -> None:
     """Run the handshake with the diffusion subprocess."""
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
@@ -589,11 +601,15 @@ def _perform_diffusion_handshake(
         poller.register(handshake_socket, zmq.POLLIN)
         poller.register(proc.sentinel, zmq.POLLIN)
 
-        timeout_ms = _HANDSHAKE_POLL_TIMEOUT_S * 1000
+        timeout_ms = handshake_timeout * 1000
         while True:
             events = dict(poller.poll(timeout=timeout_ms))
             if not events:
-                raise TimeoutError("Timed out waiting for READY from StageDiffusionProc")
+                raise TimeoutError(
+                    f"Timed out waiting for READY from StageDiffusionProc after {handshake_timeout}s. "
+                    f"This typically indicates model loading or warmup is taking too long. "
+                    f"Consider increasing `stage_init_timeout` for large models."
+                )
             if handshake_socket in events:
                 identity, raw = handshake_socket.recv_multipart()
                 msg = msgspec.msgpack.decode(raw)

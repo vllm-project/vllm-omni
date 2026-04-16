@@ -20,6 +20,8 @@ logger = init_logger(__name__)
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
     "OmniVoiceModel": "omnivoice",
+    "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "VoxCPMForConditionalGeneration": "voxcpm",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
@@ -40,6 +42,8 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
             VoxtralTTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
+        from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -57,6 +61,8 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("omnivoice", OmniVoiceConfig),
         ("voxtral_tts", VoxtralTTSConfig),
+        ("voxcpm", VoxCPMConfig),
+        ("voxcpm2", VoxCPM2Config),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -86,7 +92,11 @@ class OmniEngineArgs(EngineArgs):
     Adds omni-specific configuration fields for multi-stage pipeline
     processing and output type specification.
     Args:
-        stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
+        stage_id: Identifier for the stage in a multi-stage pipeline.
+            Defaults to 0 for per-stage engine construction. The CLI-level
+            single-stage selector remains optional on the parsed argparse
+            namespace and should not be forwarded as a nullable per-stage
+            engine argument.
         model_stage: Stage type identifier, e.g., "thinker" or "talker"
             (default: "thinker")
         model_arch: Model architecture name
@@ -105,6 +115,21 @@ class OmniEngineArgs(EngineArgs):
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
             If not specified, will be inferred from model path.
+        omni_master_address: TCP address that the OmniMasterServer (running
+            inside AsyncOmniEngine) listens on for engine core registrations.
+            Required when single-stage mode is active.
+        omni_master_port: TCP port for the OmniMasterServer registration
+            socket.  Required when single-stage mode is active.
+        stage_configs_path: Optional path to a JSON/YAML file containing
+            stage configurations for the multi-stage pipeline. If None,
+            stage configs are resolved from the model's default configuration.
+        output_modalities: Optional list of output modality names to enable
+            (e.g. ["text", "audio"]). If None, all modalities supported by
+            the model are used.
+        log_stats: Whether to log engine statistics. Defaults to False.
+        custom_pipeline_args: Dictionary of arguments for custom pipeline
+            initialization (e.g., ``{"pipeline_class": "my.Module"}``).
+            Passed through to the diffusion stage engine.
     """
 
     stage_id: int = 0
@@ -119,6 +144,12 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     worker_type: str | None = None
     task_type: str | None = None
+    omni_master_address: str | None = None
+    omni_master_port: int | None = None
+    stage_configs_path: str | None = None
+    output_modalities: list[str] | None = None
+    log_stats: bool = False
+    custom_pipeline_args: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()

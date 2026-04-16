@@ -1,9 +1,8 @@
-import sys
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
-from vllm.compilation.cuda_graph import CUDAGraphWrapper as _OriginalCUDAGraphWrapper
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
@@ -36,22 +35,6 @@ else:
     )
 
 logger = init_logger(__name__)
-
-
-class CUDAGraphWrapper(_OriginalCUDAGraphWrapper):
-    def __getattr__(self, key: str) -> Any:
-        # allow accessing the attributes of the runnable.
-        if hasattr(self.runnable, key):
-            return getattr(self.runnable, key)
-        raise AttributeError(f"Attribute {key} not exists in the runnable of cudagraph wrapper")
-
-
-# Patch vLLM's CUDAGraphWrapper with our optimized version
-for _module_name, _module in sys.modules.items():
-    if "vllm" not in _module_name:
-        continue
-    if hasattr(_module, "CUDAGraphWrapper") and _module.CUDAGraphWrapper is _OriginalCUDAGraphWrapper:
-        _module.CUDAGraphWrapper = CUDAGraphWrapper
 
 
 class OmniGPUModelRunner(GPUModelRunner):
@@ -100,11 +83,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.has_talker_mtp = True
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
-            # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
-            # have a separate .talker sub-module.  TTS models' code predictor
-            # has internal AR loops / torch.multinomial — not graph-safe.
             has_separate_talker = getattr(self.model, "talker", None) is not None
-            if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
+            talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
+            if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
                 self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
             # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
             hidden_size = int(
@@ -1260,6 +1241,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 span_len = int(e) - int(s)
 
                 # call the custom process function
+                req_infos["request_id"] = req_id
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos

@@ -357,13 +357,6 @@ curl http://localhost:8091/v1/chat/completions \
 
 ## FAQ
 
-- If you encounter an error about the backend of librosa, try to install ffmpeg with the command below.
-
-```bash
-sudo apt update
-sudo apt install ffmpeg
-```
-
 - If you don’t know how much VRAM is needed for the model or encounter the OOM error, you can try to decrease the max_model_len.
 
 | Stage               | VRAM                         |

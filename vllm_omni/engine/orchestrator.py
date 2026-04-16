@@ -79,7 +79,7 @@ def build_engine_core_request_from_tokens(
         sampling_params=sampling_params,
         pooling_params=pooling_params,
         arrival_time=arrival_time,
-        lora_request=None,
+        lora_request=getattr(params, "lora_request", None),
         cache_salt=None,
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
@@ -246,6 +246,23 @@ class Orchestrator:
                         idle = False
                         req_state = self.request_states.get(output.request_id)
                         if req_state is not None:
+                            if getattr(output, "error", None) is not None:
+                                parent_id = self._companion_to_parent.get(output.request_id, output.request_id)
+                                await self.output_async_queue.put(
+                                    {
+                                        "type": "error",
+                                        "request_id": parent_id,
+                                        "stage_id": stage_id,
+                                        "error": output.error,
+                                    }
+                                )
+                                role_map = self._companion_map.get(parent_id, {})
+                                for cid in role_map.values():
+                                    self.request_states.pop(cid, None)
+                                self._cleanup_companion_state(parent_id)
+                                self.request_states.pop(parent_id, None)
+                                continue
+
                             stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
                             await self._route_output(stage_id, output, req_state, stage_metrics)
                     continue
@@ -477,6 +494,30 @@ class Orchestrator:
             ),
         )
 
+    def _build_kv_sender_info(self, sender_stage_ids: list[int]) -> dict[int, dict[str, Any]] | None:
+        """Build per-request sender info for diffusion KV-transfer receivers."""
+        sender_infos: dict[int, dict[str, Any]] = {}
+        for sender_stage_id in dict.fromkeys(sender_stage_ids):
+            if sender_stage_id < 0 or sender_stage_id >= self.num_stages:
+                continue
+
+            sender_stage = self.stage_clients[sender_stage_id]
+            get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
+            if not callable(get_sender_info):
+                continue
+
+            sender_info = get_sender_info()
+            if not sender_info:
+                logger.warning(
+                    "[Orchestrator] Stage-%s has no KV sender info available",
+                    sender_stage_id,
+                )
+                continue
+
+            sender_infos[sender_stage_id] = sender_info
+
+        return sender_infos or None
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -522,14 +563,22 @@ class Orchestrator:
                         req_id,
                     )
 
+            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [stage_id])
+            kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
             if isinstance(diffusion_prompt, list):
                 await next_client.add_batch_request_async(
                     req_id,
                     diffusion_prompt,
                     params,
+                    kv_sender_info=kv_sender_info,
                 )
             else:
-                await next_client.add_request_async(req_id, diffusion_prompt, params)
+                await next_client.add_request_async(
+                    req_id,
+                    diffusion_prompt,
+                    params,
+                    kv_sender_info=kv_sender_info,
+                )
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 
@@ -731,7 +780,14 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_stage_id]
 
             if next_client.stage_type == "diffusion":
-                await next_client.add_request_async(request_id, req_state.prompt, params)
+                source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [next_stage_id - 1])
+                kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
+                await next_client.add_request_async(
+                    request_id,
+                    req_state.prompt,
+                    params,
+                    kv_sender_info=kv_sender_info,
+                )
                 req_state.stage_submit_ts[next_stage_id] = _time.time()
                 continue
 

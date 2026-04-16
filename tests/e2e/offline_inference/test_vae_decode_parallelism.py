@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import time
 
-from vllm_omni import Omni
+from tests.conftest import OmniRunner
 from vllm_omni.platforms import current_omni_platform
 
 # os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
@@ -72,23 +72,22 @@ def is_nextstep_model(model_name: str) -> bool:
 
 
 def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, vae_patch_parallel_size=1):
-    m = None
-    try:
-        parallel_config = DiffusionParallelConfig(
-            tensor_parallel_size=tp,
-            vae_patch_parallel_size=vae_patch_parallel_size,
-        )
+    parallel_config = DiffusionParallelConfig(
+        tensor_parallel_size=tp,
+        vae_patch_parallel_size=vae_patch_parallel_size,
+    )
 
-        omni_kwargs = {
-            "model": model_configs["model_name"],
-            "vae_use_tiling": using_tile,
-            "parallel_config": parallel_config,
-        }
-        use_nextstep = is_nextstep_model(model_configs["model_name"])
-        if use_nextstep:
-            # NextStep-1.1 requires explicit pipeline class
-            omni_kwargs["model_class_name"] = "NextStep11Pipeline"
-        m = Omni(**omni_kwargs)
+    omni_kwargs = {
+        "vae_use_tiling": using_tile,
+        "parallel_config": parallel_config,
+    }
+    use_nextstep = is_nextstep_model(model_configs["model_name"])
+    if use_nextstep:
+        # NextStep-1.1 requires explicit pipeline class
+        omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+
+    with OmniRunner(model_configs["model_name"], **omni_kwargs) as runner:
+        m = runner.omni
         image = Image.new("RGB", (out_width, out_height), (0, 0, 0))
         start = time.perf_counter()
         outputs = m.generate(
@@ -115,9 +114,6 @@ def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, 
         # frames shape: (batch, num_frames, height, width, channels)
         cost = (end - start) * 1000
         return frames, cost
-    finally:
-        if m is not None:
-            m.close()
         cleanup_dist_env_and_memory()
 
 

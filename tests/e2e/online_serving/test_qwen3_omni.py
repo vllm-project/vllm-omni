@@ -120,7 +120,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     }
 
     # Test single completion
-    openai_client.send_omni_request(request_config)
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.advanced_model

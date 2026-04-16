@@ -178,7 +178,7 @@ def test_client(mock_async_diffusion):
     )
     app.state.args = Namespace(
         default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5}}',
-        max_generated_image_size=4096,  # 64*64
+        max_generated_image_size=1024 * 1792,
     )
 
     return TestClient(app)
@@ -245,7 +245,7 @@ def async_omni_stage_configs_only_client():
     # AsyncOmni exposes stage_configs on the engine instance.
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
-        max_generated_image_size=4096,  # 64*64
+        max_generated_image_size=1024 * 1792,
     )
     return TestClient(app)
 
@@ -390,6 +390,18 @@ def test_image_edits_async_omni_stage_configs_only(async_omni_stage_configs_only
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert len(captured) == 2
+
+
+def test_generate_images_max_size_rejected(async_omni_test_client):
+    """Test that a size exceeding max_generated_image_size returns 400."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "size": "2048x2048",  # 4,194,304 pixels > max_generated_image_size (1,048,576)
+        },
+    )
+    assert response.status_code == 400
 
 
 def test_generate_multiple_images(test_client):
@@ -982,12 +994,13 @@ def test_image_edit_parameter_default_single_stage(test_client):
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
 
+    # Size exceeding max_generated_image_size (1024*1792) returns 400
     response = test_client.post(
         "/v1/images/edits",
         files=[("image", img_bytes_1)],
         data={
             "prompt": "hello world.",
-            "size": "96x96",
+            "size": "2048x2048",
         },
     )
     assert response.status_code == 400
@@ -1152,3 +1165,91 @@ def test_image_edit_with_seed_zero_single_stage(test_client):
         f"Expected seed=0, but got seed={captured_sampling_params.seed}. "
         "This indicates the bug where seed=0 is treated as falsy."
     )
+
+
+def test_normalize_image():
+    """Test _normalize_image with various input types"""
+    import numpy as np
+
+    from vllm_omni.entrypoints.openai.api_server import _normalize_image
+
+    # Test PIL Image input
+    img = Image.new("RGB", (64, 64), color="red")
+    result = _normalize_image(img)
+    assert isinstance(result, Image.Image)
+    assert result.size == (64, 64)
+
+    # Test uint8 numpy array
+    arr = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+    result = _normalize_image(arr)
+    assert isinstance(result, Image.Image)
+    assert result.size == (64, 64)
+
+    # Test float [0, 1] numpy array
+    arr = np.random.rand(64, 64, 3).astype(np.float32)
+    result = _normalize_image(arr)
+    assert isinstance(result, Image.Image)
+    assert result.size == (64, 64)
+
+    # Test float [-1, 1] numpy array
+    arr = np.random.rand(64, 64, 3).astype(np.float32) * 2 - 1
+    result = _normalize_image(arr)
+    assert isinstance(result, Image.Image)
+    assert result.size == (64, 64)
+
+    # Test batch dimensions (1, 1, H, W, C)
+    arr = np.random.randint(0, 255, (1, 1, 64, 64, 3), dtype=np.uint8)
+    result = _normalize_image(arr)
+    assert isinstance(result, Image.Image)
+    assert result.size == (64, 64)
+
+
+def test_extract_images_from_result():
+    """Test _extract_images_from_result with various result formats"""
+    import numpy as np
+
+    from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
+
+    # Test empty result
+    class EmptyResult:
+        pass
+
+    result = EmptyResult()
+    images = _extract_images_from_result(result)
+    assert images == []
+
+    # Test nested batch: [np.array(shape=(3, 64, 64, 3))]
+    batch = np.random.randint(0, 255, (3, 1, 64, 64, 3), dtype=np.uint8)
+
+    class BatchResult:
+        def __init__(self):
+            self.images = [batch]
+
+    result = BatchResult()
+    images = _extract_images_from_result(result)
+    assert len(images) == 3
+    assert all(isinstance(img, Image.Image) for img in images)
+    assert all(img.size == (64, 64) for img in images)
+
+    # Test dict path: result.request_output["images"]
+    class DictRequestOutput:
+        def __init__(self):
+            self.request_output = {"images": [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]}
+
+    result = DictRequestOutput()
+    images = _extract_images_from_result(result)
+    assert len(images) == 1
+    assert isinstance(images[0], Image.Image)
+
+    # Test attribute path: result.request_output.images
+    class AttrRequestOutput:
+        def __init__(self):
+            self.request_output = type(
+                "obj", (), {"images": [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]}
+            )()
+
+    result = AttrRequestOutput()
+    images = _extract_images_from_result(result)
+    assert len(images) == 1
+    assert isinstance(images[0], Image.Image)
+    assert images[0].size == (32, 32)

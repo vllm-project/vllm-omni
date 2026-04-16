@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import queue
 import threading
 import time
@@ -78,6 +79,12 @@ class DiffusionEngine:
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        # Cache whether the model-specific postprocess accepts request-level
+        # sampling params so step() can support both legacy and extended hooks.
+        self._post_process_accepts_sampling_params = bool(
+            self.post_process_func is not None
+            and "sampling_params" in inspect.signature(self.post_process_func).parameters
+        )
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
@@ -143,10 +150,24 @@ class DiffusionEngine:
             output_data = output_data.cpu()
 
         postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
+        if self.post_process_func is not None:
+            # Some video pipelines need request-level controls during
+            # postprocess (for example worker-side frame interpolation).
+            if self._post_process_accepts_sampling_params:
+                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
+            else:
+                outputs = self.post_process_func(output_data)
+        else:
+            outputs = output_data
         audio_payload = None
+        custom_output = output.custom_output or {}
+        model_audio_sample_rate = None
+        model_fps = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
+            custom_output.update(outputs.get("custom_output") or {})
+            model_audio_sample_rate = outputs.get("audio_sample_rate")
+            model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
@@ -192,6 +213,10 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        trajectory_latents=output.trajectory_latents,
+                        trajectory_timesteps=output.trajectory_timesteps,
+                        trajectory_log_probs=output.trajectory_log_probs,
+                        trajectory_decoded=output.trajectory_decoded,
                         multimodal_output={"audio": request_audio_payload},
                         final_output_type="audio",
                         stage_durations=output.stage_durations,
@@ -202,6 +227,10 @@ class DiffusionEngine:
                 mm_output = {}
                 if audio_payload is not None:
                     mm_output["audio"] = audio_payload
+                if model_audio_sample_rate is not None:
+                    mm_output["audio_sample_rate"] = model_audio_sample_rate
+                if model_fps is not None:
+                    mm_output["fps"] = model_fps
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -209,7 +238,11 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
-                        custom_output=output.custom_output or {},
+                        trajectory_latents=output.trajectory_latents,
+                        trajectory_timesteps=output.trajectory_timesteps,
+                        trajectory_log_probs=output.trajectory_log_probs,
+                        trajectory_decoded=output.trajectory_decoded,
+                        custom_output=custom_output,
                         multimodal_output=mm_output,
                         stage_durations=output.stage_durations,
                         peak_memory_mb=output.peak_memory_mb,
@@ -240,6 +273,10 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
+                            trajectory_latents=output.trajectory_latents,
+                            trajectory_timesteps=output.trajectory_timesteps,
+                            trajectory_log_probs=output.trajectory_log_probs,
+                            trajectory_decoded=output.trajectory_decoded,
                             multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
                             stage_durations=output.stage_durations,
@@ -260,6 +297,10 @@ class DiffusionEngine:
                                 if num_outputs == 1:
                                     sliced_audio = sliced_audio[0]
                         mm_output["audio"] = sliced_audio
+                    if model_audio_sample_rate is not None:
+                        mm_output["audio_sample_rate"] = model_audio_sample_rate
+                    if model_fps is not None:
+                        mm_output["fps"] = model_fps
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -267,7 +308,11 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
-                            custom_output=output.custom_output or {},
+                            trajectory_latents=output.trajectory_latents,
+                            trajectory_timesteps=output.trajectory_timesteps,
+                            trajectory_log_probs=output.trajectory_log_probs,
+                            trajectory_decoded=output.trajectory_decoded,
+                            custom_output=custom_output,
                             multimodal_output=mm_output,
                             stage_durations=output.stage_durations,
                             peak_memory_mb=output.peak_memory_mb,
@@ -333,15 +378,11 @@ class DiffusionEngine:
                     )
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
-        """Start or stop torch profiling on all diffusion workers.
+        """Start or stop profiling on all diffusion workers.
 
         Args:
             is_start: True to start profiling, False to stop.
-            profile_prefix: Optional prefix for trace filename (vLLM compat).
-
-        Note:
-            Matches vLLM's worker.profile() signature for consistency.
-            Traces are saved automatically via on_trace_ready callback.
+            profile_prefix: Optional prefix for trace filename.
         """
         if is_start:
             if profile_prefix is None:

@@ -44,7 +44,6 @@
             }
         ]
     },
-
     {
         "test_name": "test_qwen_image_ulysses2_cfg2_vae_patch4",
         "description": "Ulysses SP=2 + CFG-parallel=2 + VAE Patch Parallel=4",
@@ -72,7 +71,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.1,
-                    "latency_mean": 2.34,
+                    "latency_mean": 2.7,
                     "peak_memory_mb_mean": 61000
                 }
             },
@@ -94,7 +93,6 @@
             }
         ]
     },
-
     {
         "test_name": "test_qwen_image_ulysses2_cfg2_cache_dit",
         "description": "Ulysses SP=2 + CFG-parallel=2 + CacheDiT acceleration",

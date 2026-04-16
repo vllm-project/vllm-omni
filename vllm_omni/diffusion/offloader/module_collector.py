@@ -21,7 +21,7 @@ class PipelineModules:
 class ModuleDiscovery:
     """Discovers pipeline components for offloading"""
 
-    DIT_ATTRS = ["transformer", "transformer_2", "dit", "sr_dit", "language_model", "transformer_blocks"]
+    DIT_ATTRS = ["transformer", "transformer_2", "dit", "sr_dit", "language_model", "transformer_blocks", "model"]
     ENCODER_ATTRS = ["text_encoder", "text_encoder_2", "text_encoder_3", "image_encoder"]
     VAE_ATTRS = ["vae", "audio_vae"]
 
