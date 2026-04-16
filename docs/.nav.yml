@@ -15,35 +15,49 @@ nav:
     - Offline Inference:
       - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
       - CosyVoice3: user_guide/examples/offline_inference/cosyvoice3.md
+      - Dynin-Omni Offline End2End Example: user_guide/examples/offline_inference/dynin_omni.md
       - Fish Speech S2 Pro: user_guide/examples/offline_inference/fish_speech.md
       - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
       - Helios Video Generation: user_guide/examples/offline_inference/helios.md
-      - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
+      - HunyuanImage-3.0-Instruct: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
+      - MagiHuman Generation: user_guide/examples/offline_inference/magi_human.md
       - MammothModa2-Preview: user_guide/examples/offline_inference/mammothmodal2_preview.md
       - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
+      - Ming-flash-omni 2.0: user_guide/examples/offline_inference/ming_flash_omni.md
+      - OmniVoice: user_guide/examples/offline_inference/omnivoice.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Qwen3-TTS: user_guide/examples/offline_inference/qwen3_tts.md
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
+      - VACE Video Generation: user_guide/examples/offline_inference/vace.md
+      - VoxCPM Offline Example: user_guide/examples/offline_inference/voxcpm.md
+      - VoxCPM2 Offline Inference (Native AR): user_guide/examples/offline_inference/voxcpm2.md
       - Voxtral TTS Offline Inference: user_guide/examples/offline_inference/voxtral_tts.md
       - X-To-Video-Audio: user_guide/examples/offline_inference/x_to_video_audio.md
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md
+      - Dynin-Omni Online Serving Example: user_guide/examples/online_serving/dynin_omni.md
       - Fish Speech S2 Pro: user_guide/examples/online_serving/fish_speech.md
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
+      - Helios Video Generation via Online API: user_guide/examples/online_serving/helios.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - Online serving Example of vLLM-Omni for MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
+      - Ming-flash-omni 2.0: user_guide/examples/online_serving/ming_flash_omni.md
+      - OmniVoice: user_guide/examples/online_serving/omnivoice.md
+      - OpenAI Chat Completion Client For Multimodal Generation: user_guide/examples/online_serving/openai_chat_completion_client_for_multimodal_generation.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
       - Qwen3-TTS: user_guide/examples/online_serving/qwen3_tts.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
+      - VoxCPM: user_guide/examples/online_serving/voxcpm.md
+      - VoxCPM2 Online Serving: user_guide/examples/online_serving/voxcpm2.md
   - General:
     - usage/*
   - Configuration:
