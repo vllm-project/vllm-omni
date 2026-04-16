@@ -365,28 +365,52 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             if req.sampling_params.kv_metadata and "image_shape" in req.sampling_params.kv_metadata:
                 image_shape = tuple(req.sampling_params.kv_metadata["image_shape"])
 
-            cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None)
+            branch_kvs = getattr(req.sampling_params, "cfg_branch_past_key_values", None) or {}
+            branch_metadata = getattr(req.sampling_params, "cfg_branch_kv_metadata", None) or {}
+            active_branch = getattr(req.sampling_params, "cfg_active_branch", None)
+            branch_roles = getattr(req.sampling_params, "cfg_branch_roles", None) or list(branch_kvs.keys())
+
+            cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None) or branch_kvs.get("cfg_text")
+            cfg_text_metadata = getattr(req.sampling_params, "cfg_text_kv_metadata", None) or branch_metadata.get(
+                "cfg_text"
+            )
+            cfg_img_kv = getattr(req.sampling_params, "cfg_img_past_key_values", None) or branch_kvs.get("cfg_img")
+            cfg_img_metadata = getattr(req.sampling_params, "cfg_img_kv_metadata", None) or branch_metadata.get(
+                "cfg_img"
+            )
+
+            cfg_parallel_contract = (
+                active_branch is not None or bool(branch_roles) or cfg_text_kv is not None or cfg_img_kv is not None
+            )
+            if cfg_parallel_contract:
+                logger.info(
+                    "CFG enabled with injected branch KV context roles=%s active=%s",
+                    branch_roles,
+                    active_branch,
+                )
+
             if cfg_text_kv is not None:
-                logger.info("CFG enabled with multi-KV: using injected cfg_text KV Cache")
                 cfg_text_seq_len = cfg_text_kv.key_cache[0].shape[0]
                 cfg_text_context["past_key_values"] = cfg_text_kv
                 cfg_text_context["kv_lens"] = [cfg_text_seq_len]
-                cfg_text_metadata = getattr(req.sampling_params, "cfg_text_kv_metadata", None)
                 if cfg_text_metadata and "ropes" in cfg_text_metadata:
                     cfg_text_context["ropes"] = cfg_text_metadata["ropes"]
                 else:
                     cfg_text_context["ropes"] = [cfg_text_seq_len]
 
-                cfg_img_kv = getattr(req.sampling_params, "cfg_img_past_key_values", None) or injected_kv
+            if cfg_img_kv is None and cfg_text_kv is not None:
+                cfg_img_kv = injected_kv
+
+            if cfg_img_kv is not None:
                 cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = cfg_img_kv
                 cfg_img_context["kv_lens"] = [cfg_img_seq_len]
-                cfg_img_metadata = getattr(req.sampling_params, "cfg_img_kv_metadata", None)
                 if cfg_img_metadata and "ropes" in cfg_img_metadata:
                     cfg_img_context["ropes"] = cfg_img_metadata["ropes"]
                 else:
                     cfg_img_context["ropes"] = [cfg_img_seq_len]
-            else:
+
+            if not cfg_parallel_contract:
                 logger.warning("CFG is disabled: only single KV cache available")
                 gen_params = BagelGenParams(
                     num_timesteps=gen_params.num_timesteps,
