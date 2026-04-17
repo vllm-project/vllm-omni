@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import contextlib
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -109,6 +111,54 @@ class DiffusionRequestState:
         # A real "new request" signal should eventually come from scheduler/runner state transitions.
         return self.step_index == 0 or self.timesteps is None
 
+    @contextlib.contextmanager
+    def use_chunk(self, chunk: ChunkState) -> Iterator[None]:
+        """Temporarily alias per-chunk fields on ``self`` to a ``ChunkState``'s view.
+
+        Swapped fields: ``latents``, ``step_index``, ``scheduler``.
+
+        Lets ``prepare_encode`` / ``denoise_step`` / ``step_scheduler`` operate
+        per-chunk without any pipeline-side changes. Updates made inside the
+        context are written back to the chunk on exit; the request-level fields
+        are restored.
+        """
+        saved_latents = self.latents
+        saved_step_index = self.step_index
+        saved_scheduler = self.scheduler
+        self.latents = chunk.latents
+        self.step_index = chunk.step_index
+        self.scheduler = chunk.scheduler
+        try:
+            yield
+        finally:
+            chunk.latents = self.latents
+            chunk.step_index = self.step_index
+            chunk.scheduler = self.scheduler
+            self.latents = saved_latents
+            self.step_index = saved_step_index
+            self.scheduler = saved_scheduler
+
+
+@dataclass
+class ChunkState:
+    """Per-chunk state for one in-flight chunk of a streaming request.
+
+    Lives inside ``DiffusionRequestState.extra["chunks"]`` (keyed by
+    ``chunk_idx``). The runner swaps a chunk into the request state via
+    ``state.use_chunk(chunk)`` for the duration of one micro-step's
+    ``denoise_step + step_scheduler`` calls.
+
+    Each chunk owns its own ``scheduler`` instance (deepcopied from the
+    pipeline's scheduler by ``prepare_encode``) because multi-step ODE solvers
+    (e.g. ``FlowUniPCMultistepScheduler``) are stateful — they track per-step
+    ``model_outputs`` that must not leak between chunks.
+    """
+
+    idx: int
+    latents: torch.Tensor | None = None
+    step_index: int = 0
+    scheduler: Any | None = None
+
 
 class BaseRunnerOutput(ABC):
     @abstractmethod
@@ -117,18 +167,26 @@ class BaseRunnerOutput(ABC):
 
 
 @dataclass
-class RunnerOutput(BaseRunnerOutput):
-    """Output of a single denoising step for a request.
+class RunnerOutput:
+    """Output of a single execution step for a request.
 
-    NOTE: `latents` may be None when returned through IPC to avoid
-    serialization overhead. The actual latents are kept in Worker's
-    _request_state_cache.
+    Each scheduler reads the fields it needs:
+
+    - ``StepScheduler`` reads ``step_index`` / ``finished``.
+    - ``StreamBatchScheduler`` reads ``chunk_idx`` / ``step_index`` /
+      ``chunk_completed`` / ``finished``.
+
+    Fields not relevant to an execution path are left as ``None`` / ``False``.
     """
 
     req_id: str
     step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
+
+    # ── Temporal-PP micro-step fields (set by execute_micro_step) ──
+    chunk_idx: int | None = None
+    chunk_completed: bool = False
 
     def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
         return self if self.req_id == sched_req_id else None
