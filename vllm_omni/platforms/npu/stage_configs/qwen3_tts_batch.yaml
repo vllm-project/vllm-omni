@@ -52,8 +52,8 @@ stage_args:
       max_num_batched_tokens: 8192
       max_model_len: 32768
       cudagraph_mode: PIECEWISE
-      max_cudagraph_capture_size: 4096
-      cudagraph_capture_sizes: [1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096]
+      max_cudagraph_capture_size: 8192
+      cudagraph_capture_sizes: [1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096, 4352, 4608, 4864, 5120, 5376, 5632, 5888, 6144, 6400, 6656, 6912, 7168, 7424, 7680, 7936, 8192]
     engine_input_source: [0]
     final_output: true
     final_output_type: audio
