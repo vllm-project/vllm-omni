@@ -24,7 +24,9 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
@@ -575,9 +577,6 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             0: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
             1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
         },
-        "transformer_blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
-        },
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
@@ -667,6 +666,18 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         temb = self.time_embed(timestep, timestep_r=timestep_r)
 
         hidden_states = self.x_embedder(hidden_states)
+
+        # Scatter hidden_states along seq dim for sequence parallelism.
+        # Done here (after x_embedder, before transformer_blocks) so that
+        # CacheDiT sees already-sharded hidden_states when saving
+        # original_hidden_states at the start of CachedBlocks.forward.
+        if get_sequence_parallel_world_size() > 1:
+            hidden_states, _pad_size = sp_shard_with_padding(hidden_states, dim=1)
+            if _pad_size > 0:
+                ctx = get_forward_context()
+                if ctx.sp_original_seq_len is None:
+                    ctx.sp_padding_size = _pad_size
+                    ctx.sp_original_seq_len = hidden_states.shape[1] * get_sequence_parallel_world_size() - _pad_size
 
         encoder_hidden_states = self.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
 
