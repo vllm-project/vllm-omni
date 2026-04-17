@@ -718,11 +718,9 @@ def _log_server_process_tree(server: Any) -> None:
         return
     for pid in pids:
         name, cmdline = _safe_proc_info(pid)
-        logger.info(
-            "[reliability][process-kill] current_server_proc pid=%s name=%s cmdline=%s",
-            pid,
-            name,
-            cmdline,
+        print(
+            f"[reliability][process-kill] current_server_proc pid={pid} name={name} cmdline={cmdline}",
+            flush=True,
         )
 
 
@@ -757,11 +755,9 @@ def make_process_kill_fault_injector(
                 "[reliability][process-kill] no server process tree found; fallback to global pgrep matching"
             )
         for pattern in patterns:
-            logger.info(
-                "[reliability][process-kill] trying pattern=%s signal=%s limit=%s",
-                pattern,
-                signal_name,
-                limit,
+            print(
+                f"[reliability][process-kill] trying pattern={pattern} signal={signal_name} limit={limit}",
+                flush=True,
             )
             pids = inject_process_kill(
                 grep_pattern=pattern,
@@ -784,19 +780,14 @@ def make_process_kill_fault_injector(
                     raise ValueError(f"Unsupported signal_name: {signal_name}")
                 for pid in filtered:
                     name, cmdline = _safe_proc_info(pid)
-                    logger.info(
-                        "[reliability][process-kill] killing pid=%s name=%s signal=%s cmdline=%s",
-                        pid,
-                        name,
-                        signal_name,
-                        cmdline,
+                    print(
+                        f"[reliability][process-kill] killing pid={pid} name={name} signal={signal_name} cmdline={cmdline}",
+                        flush=True,
                     )
                     os.kill(pid, sig)
-                logger.info(
-                    "[reliability][process-kill] matched pattern=%s killed_pids=%s killed_count=%d",
-                    pattern,
-                    filtered,
-                    len(filtered),
+                print(
+                    f"[reliability][process-kill] matched pattern={pattern} killed_pids={filtered} killed_count={len(filtered)}",
+                    flush=True,
                 )
                 return
         logger.warning(
